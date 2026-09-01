@@ -107,6 +107,14 @@ test.describe('mission graph geometry', () => {
       await routeAll(page);
       await page.goto(`/index-live.html#mission=${MISSION_ID}`);
       // Narrow viewports default to the list renderer; the controls only exist on the canvas.
+      // Wait for the lens to have PICKED a renderer before asking which one it
+      // picked. Without this the guard races first paint: `.canvas` is also
+      // absent while the lens is still mounting, so on a slow run the click
+      // fires on a wide viewport and switches the canvas default INTO the list
+      // renderer -- after which `.mnode` never exists and this test fails
+      // ~1 run in 3, for reasons unrelated to geometry.
+      await expect(page.locator('.missionlens')).toBeVisible();
+      await page.waitForFunction(() => !!document.querySelector('.missionlens .canvas, .missionlens .tlt-hd'));
       if ((await page.locator('.missionlens .canvas').count()) === 0) await page.locator('button[title="switch renderer"]').click();
       await expect(page.locator('.missionlens .mnode').first()).toBeVisible();
       const controls = await page.locator('.react-flow__controls').boundingBox();
