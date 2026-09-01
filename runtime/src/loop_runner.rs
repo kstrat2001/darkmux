@@ -2322,21 +2322,35 @@ fn run_with_sleeper(
         // bail shape) and the rarer `"length"` (which would otherwise
         // hit the context-overflow Err path and throw away a perfectly
         // good recovered call).
-        let promotion = response
-            .choices
-            .first_mut()
-            .and_then(|choice| {
-                let info = promote_plain_text_tool_calls(&mut choice.message, &allowed_tool_names)?;
+        let promotion = response.choices.first_mut().map(|choice| {
+            let outcome = promote_plain_text_tool_calls(&mut choice.message, &allowed_tool_names);
+            if outcome.info.is_some() {
                 choice.finish_reason = "tool_calls".to_string();
-                Some(info)
-            });
-        if let Some(info) = promotion {
-            trajectory.append_tool_call_promoted(
-                turns,
-                info.source.as_str(),
-                info.format.as_str(),
-                info.call_count,
-            );
+            }
+            outcome
+        });
+        // (#2230) Both arms are recorded. A promotion carries its skip count so
+        // PARTIAL suppression is visible next to what did run; a non-promotion
+        // that skipped openers gets its own event, because TOTAL suppression is
+        // the case that is otherwise indistinguishable from a turn that emitted
+        // no call at all. Silence on either arm is what would leave a wrong
+        // fence verdict undiagnosable after the fact.
+        if let Some(outcome) = promotion {
+            match outcome.info {
+                Some(info) => trajectory.append_tool_call_promoted(
+                    turns,
+                    info.source.as_str(),
+                    info.format.as_str(),
+                    info.call_count,
+                    outcome.xml_openers_skipped_as_fenced,
+                ),
+                None if outcome.xml_openers_skipped_as_fenced > 0 => trajectory
+                    .append_tool_call_promotion_suppressed(
+                        turns,
+                        outcome.xml_openers_skipped_as_fenced,
+                    ),
+                None => {}
+            }
         }
 
         // (#406) Clear `reasoning_content` from the response message
