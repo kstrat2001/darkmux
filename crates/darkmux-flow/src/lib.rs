@@ -928,10 +928,31 @@ pub const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// out of #2227's scope: `claim_job` issues `XREADGROUP ... BLOCK <block_ms>`,
 /// an INTENTIONALLY long-blocking read that a 1s socket deadline would break,
 /// so bounding that queue needs a per-call-site decision rather than this
-/// constant. `darkmux-fleet`'s `routing.rs` (`wait_for_completion`) is
-/// unbounded too and is NOT a per-call-site problem — it POLLS `XREVRANGE`,
-/// so the standard deadline fits; its `--wait` timeout is checked only at the
-/// top of the loop, which an unbounded read never returns to (#2243).
+/// constant. `darkmux-fleet`'s `routing.rs` (`wait_for_completion`) was
+/// unbounded too and is BOUNDED AGAINST A SILENT PEER as of #2243 — its `--wait`
+/// timeout was checked only at the top of the loop, which an unbounded read
+/// never returned to, so the operator's declared timeout could never fire.
+///
+/// That call site does NOT use this constant for its READS, and the reason is
+/// worth knowing before applying this constant to another POLLING loop. A fixed
+/// per-command deadline shorter than a healthy peer's latency makes every poll
+/// time out, and redis-0.27.6's `Connection::read` answers a timed-out RESPONSE
+/// read with `messages_to_skip += 1`, so the next read DISCARDS a
+/// successfully-parsed reply. A loop that re-issues its command on timeout
+/// creates and consumes that deficit at the same rate and never closes it —
+/// measured, against a peer answering every `XREVRANGE` correctly and in order:
+/// 109ms to `Ok` at 100ms latency, and NEVER at 1200ms latency against a 1000ms
+/// deadline. So `wait_for_completion` derives each poll's read deadline from its
+/// REMAINING WAIT BUDGET instead, and a read that hits it ends the wait. It
+/// still consumes `bound_redis_response` (widened to `pub` for it) for the WRITE
+/// bound.
+///
+/// "BOUNDED" HERE MEANS BOUNDED AGAINST SILENCE, NOT BOUNDED OUTRIGHT — and this
+/// qualifier applies to every entry in the list above, not just that one.
+/// `set_read_timeout` is `SO_RCVTIMEO`: a per-`recv` deadline that fires only on
+/// ZERO BYTES for the duration, restarted by any byte that arrives. It does not
+/// bound a peer that DRIBBLES. Measured: one byte every 400ms into a reply that
+/// never terminates blocked 12s against a declared 2s wait.
 ///
 /// Do not read this list as exhaustive, and do not read this constant as a
 /// standing guarantee that the codebase is bounded: a new call site is
@@ -1008,7 +1029,11 @@ pub fn isolate_test_env_once() {
 /// the same `Duration` for the TCP connect; doubling gives the
 /// handshake the same budget so a healthy peer with a 400ms RTT
 /// completes inside the bound.
-pub(crate) fn open_redis_connection_bounded(
+///
+/// `pub` rather than `pub(crate)` since #2243: `darkmux-fleet`'s
+/// `wait_for_completion` needs the same bounded connect, and reusing this beats
+/// a second copy of the connect budget drifting out of sync with it.
+pub fn open_redis_connection_bounded(
     client: &redis::Client,
     timeout: std::time::Duration,
 ) -> Result<redis::Connection> {
@@ -1065,7 +1090,22 @@ pub(crate) fn open_redis_connection_bounded(
 /// Best-effort by design, matching the serve-side site: a connection kind
 /// that does not support socket deadlines must not turn a working write into
 /// a failure. The bound is a safety net, not a correctness input.
-pub(crate) fn bound_redis_response(conn: &redis::Connection) {
+///
+/// `pub` rather than `pub(crate)` since #2243: `darkmux-fleet`'s
+/// `wait_for_completion` needs the same WRITE bound on its polling connection,
+/// and reusing this beats re-deriving `set_read_timeout(REDIS_RESPONSE_TIMEOUT)`
+/// in another crate. This is not the codebase's only copy — `darkmux-serve` has
+/// a private twin over the same constant (`darkmux-serve/src/lib.rs`), left
+/// alone here because folding it in is a refactor of that crate rather than part
+/// of #2243's fix.
+///
+/// HAZARD, now that any crate can call this: it OVERWRITES the connection's read
+/// deadline with a fixed 1s. Do NOT apply it to a connection that legitimately
+/// blocks longer — `XREADGROUP ... BLOCK <block_ms>` in `darkmux-fleet`'s
+/// `claim_job` is the live example, and a connection whose read deadline is
+/// managed per-call (as `wait_for_completion` does, deriving it from the
+/// remaining wait budget) must set its own AFTER this, not before.
+pub fn bound_redis_response(conn: &redis::Connection) {
     let _ = conn.set_read_timeout(Some(REDIS_RESPONSE_TIMEOUT));
     let _ = conn.set_write_timeout(Some(REDIS_RESPONSE_TIMEOUT));
 }
