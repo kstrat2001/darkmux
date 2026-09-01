@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { memBytes, memPct, memStateCls, reclaimableNote } from "./format";
+import { clkrange, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
 
 // `memStateCls` was ported (format.ts) ahead of its first consumer; #1806
 // Stage 1, then Stage 2/3's `MachineHealthRegion.tsx`, is that consumer —
@@ -135,5 +135,33 @@ describe("reclaimableNote", () => {
     expect(reclaimableNote(null, 1)).toBe("");
     expect(reclaimableNote(1, null)).toBe("");
     expect(reclaimableNote(Number.NaN, 1)).toBe("");
+  });
+});
+
+// (operator, 2026-09-01) These two moved here from `timeline.test.ts`. They
+// were always `clkrange` tests — they just used the fleet header as their
+// vehicle, and that header dropped its range. `clkrange` is still live
+// (`replayMeta.ts` renders it), so the coverage moves rather than dies:
+// deleting it with the header would have left the day-boundary branch
+// untested while a real consumer still depended on it.
+describe("clkrange — day-boundary branch", () => {
+  it("a span crossing a calendar day prefixes each end with its short date", () => {
+    const tMax = Date.now();
+    const range = clkrange(tMax - 1440 * 60000, tMax);
+    // A real 24h span crosses a day boundary in EVERY timezone — assert the
+    // SHAPE, not a literal, so this red-proves against `clkrange` silently
+    // collapsing to the bare form rather than encoding one machine's TZ.
+    expect(range).toMatch(/–/);
+    expect(range.split("–")[0]).toMatch(/^[A-Za-z]{3} \d{1,2} \d{2}:\d{2}:\d{2}$/);
+  });
+
+  it("a same-day span stays bare HH:MM:SS–HH:MM:SS", () => {
+    // Anchored at local noon so a 1h window cannot straddle local midnight in
+    // any real timezone — a TZ-safe way to force the SAME-day branch.
+    const noon = new Date();
+    noon.setHours(12, 0, 0, 0);
+    const anchor = noon.getTime();
+    const range = clkrange(anchor - 60 * 60000, anchor);
+    expect(range.split("–")[0]).not.toMatch(/[A-Za-z]/);
   });
 });

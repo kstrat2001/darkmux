@@ -56,6 +56,41 @@ export function FiltersDialog({
     // ONLY this dialog to `min(90vw, 720px)`; About and Machine info,
     // which share the plain `.dialog` class, are untouched.
     <Dialog id="modalbg" titleId="filters-title" title="filter events" className="dialog--filters">
+      <FiltersBody
+        facets={facets}
+        filters={filters}
+        onToggle={onToggle}
+        onSetQuery={onSetQuery}
+        onOnlyModel={onOnlyModel}
+        onClearAll={onClearAll}
+      />
+    </Dialog>
+  );
+}
+
+/** (operator, 2026-09-01) The dialog's CONTENTS, split out so a phone can
+ *  render them inline in the events pane instead of stacking a modal over a
+ *  small screen. Desktop keeps the modal untouched — `#modalbg` is a named
+ *  e2e surface (`viewer-keyboard.spec.js` drives Escape and focus-restore
+ *  through it), so the dialog path had to stay byte-identical rather than be
+ *  reshaped around the phone. */
+export function FiltersBody({
+  facets,
+  filters,
+  onToggle,
+  onSetQuery,
+  onOnlyModel,
+  onClearAll,
+}: {
+  facets: Facets;
+  filters: FilterState;
+  onToggle: (key: keyof Facets, value: string) => void;
+  onSetQuery: (q: string) => void;
+  onOnlyModel: () => void;
+  onClearAll: () => void;
+}) {
+  return (
+    <>
       <div id="filterbody">
         {GROUPS.map(({ title, key }) => (
           // The activity group alone gets the multi-column grid
@@ -89,7 +124,7 @@ export function FiltersDialog({
           clear all
         </button>
       </div>
-    </Dialog>
+    </>
   );
 }
 

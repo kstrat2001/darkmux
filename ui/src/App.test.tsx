@@ -613,7 +613,7 @@ describe("App", () => {
     expect(document.querySelectorAll(".mach")).toHaveLength(1);
 
     // The timeline spans the day and carries no window control.
-    expect(document.querySelector(".tlhdr span")?.textContent).toMatch(/^activity · /);
+    expect(document.querySelector(".tlhdr span")?.textContent).toBe("activity");
     expect(document.querySelector(".twin")).toBeNull();
     // Both of the day's sessions drew a bar. The NOW-anchored live arm would
     // have filtered every one of them out for ending before `now - 24h`.
