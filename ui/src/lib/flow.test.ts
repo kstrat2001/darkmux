@@ -9,6 +9,8 @@ import {
   buildFlowWindow,
   liveSessionSet,
   flowLiveSessions,
+  bodyTruncated,
+  asRecordArray,
 } from "./flow";
 import { tokensOffMeter } from "../lenses/fleet/savings";
 import type { FlowRecord } from "../types/handwritten";
@@ -336,5 +338,34 @@ describe("liveSessionSet — presence coverage is partial, not all-or-nothing (#
   it("replay mode stays presence-agnostic (flowLiveSessions itself gates off liveMode)", () => {
     const presence = new Set(["a-replayed-session"]);
     expect(liveSessionSet(reviewSession, presence, NOW, false)).toEqual(presence);
+  });
+});
+
+describe("bodyTruncated + asRecordArray through the guard (#2206)", () => {
+  it("bodyTruncated: only a plain-object body with a truthy flag reads truncated", () => {
+    expect(bodyTruncated({ truncated: true })).toBe(true);
+    expect(bodyTruncated({ truncated: false })).toBe(false);
+    expect(bodyTruncated({})).toBe(false);
+    // Every non-object body — including the bare-array shape the other
+    // `/flow/...` callers produce — reads false, exactly as the original
+    // `!body || typeof body !== "object" || Array.isArray(body)` did.
+    expect(bodyTruncated([])).toBe(false);
+    expect(bodyTruncated([{ truncated: true }])).toBe(false);
+    expect(bodyTruncated(null)).toBe(false);
+    expect(bodyTruncated(undefined)).toBe(false);
+    expect(bodyTruncated("truncated")).toBe(false);
+    expect(bodyTruncated(0)).toBe(false);
+  });
+
+  it("asRecordArray: array passthrough, object envelope unwrap, everything else empty", () => {
+    const recs = [{ ts: "2026-08-19T00:00:00Z" }];
+    expect(asRecordArray(recs)).toBe(recs);
+    expect(asRecordArray({ records: recs })).toEqual(recs);
+    expect(asRecordArray({ flow: recs })).toEqual(recs);
+    expect(asRecordArray({})).toEqual([]);
+    expect(asRecordArray(null)).toEqual([]);
+    expect(asRecordArray(undefined)).toEqual([]);
+    expect(asRecordArray("nope")).toEqual([]);
+    expect(asRecordArray(42)).toEqual([]);
   });
 });

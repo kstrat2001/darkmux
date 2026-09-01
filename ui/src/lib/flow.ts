@@ -178,7 +178,10 @@ export function firstRecordDate(records: FlowRecord[]): string | null {
  * backstop's `?since=` fetch, which hits the SAME `/flow/<date>` handler). */
 export function asRecordArray(body: unknown): FlowRecord[] {
   if (Array.isArray(body)) return body as FlowRecord[];
-  if (body && typeof body === "object") {
+  // (#2206) `isPlainObject` is drop-in here: the array case returned above,
+  // and `body && typeof body === "object"` differs from it only on `null`,
+  // which both reject.
+  if (isPlainObject(body)) {
     const obj = body as { records?: FlowRecord[]; flow?: FlowRecord[] };
     return obj.records ?? obj.flow ?? [];
   }

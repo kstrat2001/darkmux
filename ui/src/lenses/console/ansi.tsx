@@ -42,6 +42,20 @@ export const ANSI_SGR_CLASS: Record<number, string> = {
   97: "a-fg15",
 };
 
+/** (#2206/#2207, slop-chop pilot) The loopback spellings an OSC 8 target
+ * may carry. Extracted token-identically from `panelHref`'s inline check. */
+export function isLoopback(hostname: string): boolean {
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]" || hostname === "::1";
+}
+
+/** (#2206/#2207, slop-chop pilot) Is `ch` a CSI final byte (`@`..`~`,
+ * ECMA-48's terminator range)? Extracted token-identically from the SGR
+ * scanner's inline comparison; the `j < text.length` bounds check stays at
+ * the call site, exactly as before. */
+export function isCsiFinalByte(ch: string): boolean {
+  return ch >= "@" && ch <= "~";
+}
+
 /**
  * viewer.html: `function panelHref(raw)`. An OSC 8 target is safe to
  * linkify only when it is http(s). `mission status` bakes ABSOLUTE daemon
@@ -52,14 +66,6 @@ export const ANSI_SGR_CLASS: Record<number, string> = {
  * origin the page itself was loaded from; a foreign origin is left absolute
  * and intact.
  */
-export function isLoopback(hostname: string): boolean {
-  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]" || hostname === "::1";
-}
-
-export function isCsiFinalByte(ch: string): boolean {
-  return ch >= "@" && ch <= "~";
-}
-
 export function panelHref(raw: string): string | null {
   let u: URL;
   try {

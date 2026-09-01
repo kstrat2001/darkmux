@@ -309,6 +309,15 @@ describe("filter session persistence", () => {
     expect([...restoreFilterState(facets, s).act].sort()).toEqual(["a", "b"]);
   });
 
+  it("(#2206) returns the default on stored data that PARSES but is not an object", () => {
+    // Reaches the isPlainObject guard itself — the "{not json" case above
+    // throws inside JSON.parse and never gets there.
+    for (const stored of ["42", '"a string"', "null", "true", "[1,2]"]) {
+      const s = { getItem: () => stored, setItem: () => {} };
+      expect([...restoreFilterState(facets, s).act].sort()).toEqual(["a", "b"]);
+    }
+  });
+
   it("survives storage that throws outright, not merely one that returns null", () => {
     const boom = {
       getItem: () => { throw new Error("blocked"); },

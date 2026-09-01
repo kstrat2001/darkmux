@@ -76,6 +76,12 @@ export interface TokensOffMeter {
   cloudRuns: number;
 }
 
+/** (#2206/#2207, slop-chop pilot) Does this dispatch payload carry ANY
+ * token count? Extracted from the `dispatch.complete` guard below — the
+ * parenthesised half only; `isDispatchComplete` stays at the call site
+ * (the unit of extraction is the concept, not the condition). The `!!`
+ * is the one added token, forced by the boolean return; equivalence over
+ * the full field space is pinned in savings.test.ts. */
 export function hasAnyTokenCounts(p: {
   total_tokens?: number; prompt_tokens?: number;
   completion_tokens?: number; remote_tokens?: number;
@@ -83,6 +89,9 @@ export function hasAnyTokenCounts(p: {
   return !!(p.total_tokens || p.prompt_tokens || p.completion_tokens || p.remote_tokens);
 }
 
+/** (#2206/#2207, slop-chop pilot) A review-path remote complete: remote
+ * tokens present and NO local counts. Extracted from the classifier
+ * below; same `!!` note as `hasAnyTokenCounts`. */
 export function isRemoteOnlyTokens(p: {
   total_tokens?: number; prompt_tokens?: number;
   completion_tokens?: number; remote_tokens?: number;
