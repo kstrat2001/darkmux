@@ -2699,6 +2699,76 @@ fn docker_kill_by_name(container_name: &str) {
     let _ = Command::new("docker").args(["kill", container_name]).output();
 }
 
+/// (#2233) RAII backstop for the container itself, over the window between a
+/// successful `cmd.spawn()` and the point `wait_with_output()` takes
+/// responsibility for it. Same shape `DispatchBookendGuard` uses for the
+/// flow records, applied to the process the dispatch just started.
+///
+/// The gap it closes: the remote-auth stdin block runs IMMEDIATELY after
+/// spawn (before the tailer, the watchdog, and the sampler exist) and carries
+/// two `?` early returns — a missing stdin handle, and a failed/partial
+/// `write_remote_auth_header_stdin`. Both used to return an error to the
+/// caller while the container it had just started was still ALIVE, with
+/// nothing scheduled to stop it: `PidRegistration`'s Drop deregisters only
+/// (its own doc, and `dispatch`'s spawn-site comment, both say a `Child` is
+/// not killed on drop), and the inactivity watchdog — the thing that would
+/// eventually `docker kill` it — has not been spawned yet at that point. The
+/// container went on running (blocked on the stdin it never got, or looping
+/// without auth after the dropped pipe delivered EOF) and held its LMStudio
+/// model load the whole time, which the NEXT dispatch's residency planning
+/// assumes is free. Every `?` BEFORE the spawn is clean — the bookend guard
+/// is armed at `bookend.open` and no container exists yet.
+///
+/// `disarm()` at the hand-off is what keeps a HEALTHY dispatch from killing
+/// its own container at scope exit; see the disarm call site's comment for
+/// why that specific point is the hand-off.
+///
+/// Double-kill is a non-issue: the Drop routes through `docker_kill_by_name`,
+/// which is fire-and-forget (`let _ = …output()`), so killing a container the
+/// watchdog already SIGKILLed — or one that exited on its own — is a docker
+/// CLI error nobody reads, exactly as it already is for the watchdog and the
+/// wait-error teardown racing each other today. No liveness/exit check is
+/// added here on purpose: any such check would be a TOCTOU read on state the
+/// container can change between the check and the kill.
+///
+/// Panic paths come free with the shape (Drop runs on unwind), same as the
+/// bookend guard's — no extra machinery for it.
+struct ContainerKillGuard {
+    container_name: String,
+    armed: bool,
+}
+
+impl ContainerKillGuard {
+    /// Armed on construction — call this the moment the spawn succeeds, so
+    /// there is no window the container exists unguarded.
+    fn new(container_name: String) -> Self {
+        Self { container_name, armed: true }
+    }
+
+    /// Hand the container off — call this ONLY once the container is known
+    /// to have exited, which in practice means a `wait_with_output()` result
+    /// whose `status.success()` is true.
+    ///
+    /// Deliberately NOT "call this when the wait returns": `wait_with_output`
+    /// returning `Ok` proves the docker CLI process ended, not the container.
+    /// A SIGKILL on the CLI pid closes the pipes and returns `Ok` with a
+    /// signal-killed status while the container stays `Up` under dockerd
+    /// (measured — see the NEW-1 comment at the wait site). Disarming on the
+    /// bare `Ok` therefore forfeits exactly the orphan this guard exists to
+    /// catch.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainerKillGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            docker_kill_by_name(&self.container_name);
+        }
+    }
+}
+
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
@@ -3358,6 +3428,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let container_child_pid = child.id();
     let container_child_registration = PidRegistration::new(container_child_pid);
 
+    // (#2233) Armed the moment the container exists, and disarmed only on a
+    // SUCCESS exit status after the wait below (see that site for why a bare
+    // `Ok` is not evidence the container is gone). `PidRegistration` above does NOT
+    // cover this — it deregisters a pid on Drop and never kills anything —
+    // and the inactivity watchdog that would eventually `docker kill` this
+    // container is still ~140 lines away. Without this guard, the two `?`
+    // returns in the remote-auth stdin block immediately below returned an
+    // error while the container ran on, orphaned, holding its LMStudio model
+    // load. Declared after the registration, so reverse-declaration Drop order
+    // stops the container before dropping its pid registration — note that is
+    // a tidy ordering rather than a load-bearing one: the kill is by container
+    // NAME and never consults the registry, and deregistering never touches
+    // docker, so neither order is observable. Do not build on it. See the
+    // guard's own doc.
+    let mut container_kill_guard = ContainerKillGuard::new(container_name.clone());
+
     // (#1187) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
     // before the trajectory tailer starts, before anything else runs. The
     // container's startup code blocks reading stdin until this write (and
@@ -3610,6 +3696,36 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             return Err(e).context("waiting for darkmux-runtime container");
         }
     };
+
+    // (#2233) Disarm ONLY on a proven-clean exit — and note this is the
+    // opposite of where the first version of this fix put it.
+    //
+    // `wait_with_output()` returning `Ok` does NOT mean the container
+    // exited; it means the docker CLI process did. A SIGKILL on the CLI's
+    // pid — which is the only signal `child_registry::kill_all` ever sends,
+    // at all four of its call sites — closes the pipes, returns `Ok` with a
+    // signal-killed status, and leaves the container `Up` under dockerd with
+    // its model still loaded. That is not speculation: the NEW-1 comment a
+    // few dozen lines below records it measured live (`docker ps` showed the
+    // container `Up` after `kill -9` on the CLI pid; `--rm` never fired).
+    //
+    // So a success status is the ONLY evidence the container actually
+    // finished, and it is the only case that disarms. Every non-success path
+    // leaves the guard armed, and its Drop is fire-and-forget
+    // (`docker_kill_by_name` discards both stdout and stderr, emits no flow
+    // record) — so on the paths that already kill (the `Err` arm above, the
+    // interrupt teardown below, the watchdog) it is a silent redundant kill
+    // of a container that is dead or dying. There is no path on which the
+    // status is non-success and the container should stay alive.
+    //
+    // The cost, stated plainly: a healthy dispatch still adds zero
+    // subprocesses; a failing one adds one `docker kill`. That buys the
+    // whole spawn-to-wait span being uniformly armed, with no line whose
+    // POSITION is load-bearing — which is what the previous placement got
+    // wrong, since it rested on the premise this comment just disproved.
+    if output.status.success() {
+        container_kill_guard.disarm();
+    }
 
     // (#2131 review round 2, NEW-1 / NEW-4) The trajectory tailer polls
     // this SAME flag every poll tick and, on catching a signal, kills
