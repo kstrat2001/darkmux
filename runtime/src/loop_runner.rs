@@ -164,8 +164,49 @@ const GENERATION_CHECKPOINT_INTERVAL: u32 = 4000;
 /// **Why 2** — Beat 47/48 showed runs that hit one runaway-reasoning
 /// turn then recovered on the next normal call. A budget of 2 gives
 /// the loop one "free" retry after the first stall, plus a second if
-/// the next turn also stalls. Three consecutive stalls is the
-/// pathology signal — escalate rather than burn more turns trying.
+/// the next turn also stalls. A stall RATE that high is the pathology
+/// signal — escalate rather than burn more turns trying.
+///
+/// # What this budget bounds, and what it does NOT (#2229)
+///
+/// Until #2229 the counter had no pay-down site at all — one `= 0` init
+/// and two `saturating_add` bumps — so it was a LIFETIME budget wearing
+/// CONSECUTIVE wording, and a thousand productive turns between two
+/// unrelated stalls still escalated the dispatch. It now DECAYS BY ONE
+/// (`saturating_sub(1)`) on each dispatching call that opens a fresh
+/// TURN.
+///
+/// **Decay, not a reset to zero.** A hard `= 0` bounds only BACK-TO-BACK
+/// stalls: one dispatched call between two stalls wipes the counter
+/// entirely. Under decay the counter tracks a stall RATE, so:
+///
+/// - **Bounded** — any sustained ratio ABOVE one stall per productive
+///   turn. At 2:1 the counter nets +1 per cycle and reaches the budget;
+///   pinned by `a_two_to_one_stall_ratio_still_escalates`.
+/// - **Bounded** — isolated stalls arbitrarily far apart are now
+///   FORGIVEN rather than escalating, which is #2229's actual bug.
+/// - **NOT bounded — an exact 1:1 alternation** (stall, work, stall,
+///   work, …). The counter oscillates 1,0,1,0 and never reaches the
+///   budget. Measured: a model alternating a stall with one identical
+///   trivial `read` ran 40 turns without escalating, and nothing else in
+///   the loop stops it either — the #418 cycle detector and #419
+///   failure-rate detector are both warn-only, and the HOST inactivity
+///   watchdog is reset by the trivial call's own successful
+///   `tool.completed`. That shape is bounded ONLY by `max_turns` /
+///   `max_cumulative_tokens`, which are operator-opt-in and default
+///   `None`. Closing it needs a second, absolute bound; that is a
+///   deliberately deferred decision, NOT an oversight, and this note is
+///   here so the next reader does not mistake the gap for a claim.
+///
+/// The decay fires only on a call that opened a NEW turn — a #1221
+/// checkpoint continuation is the same logical turn resuming (`turns`
+/// was not incremented for it), and refunding a recovery the same turn
+/// just spent is not progress. That guard is the one asymmetry from
+/// `MAX_CONSECUTIVE_MALFORMED_TURNS` below: that counter increments in
+/// ONE arm and resets in that same arm, so it is genuinely arm-local;
+/// this one increments in TWO arms (the `"tool_calls"` empty-calls
+/// recovery, and the `"length"` arm via `recover_intra_turn_stall`) and
+/// decays in one. Same site, NOT the same shape.
 const MAX_STALL_RECOVERIES: u32 = 2;
 
 /// (#2169 merge-gate finding 4) How many CONSECUTIVE turns of "every
@@ -2222,6 +2263,15 @@ fn run_with_sleeper(
         // production default, so that mismatch is what the viewer normally
         // reads: every continuation's partials filed under a turn that does
         // not exist yet.
+        // (#2229 round-2 blocker 2) Snapshot BEFORE the clear a few lines
+        // below: `resuming_after_checkpoint` is a one-shot latch consumed at
+        // the top of this iteration, so by the time the `"tool_calls"` arm
+        // runs it is always false and cannot answer "was this call a
+        // continuation?". The stall budget's decay is TURN-granular and this
+        // is the only variable that says whether this call opened a new turn
+        // (`turns` incremented, `turn.begin()` ran) or resumed the current
+        // one. Read-only from here down.
+        let opened_a_new_turn = !resuming_after_checkpoint;
         let next_seq = if resuming_after_checkpoint { turns } else { turns + 1 };
         let mut response = if streaming {
             run_streaming_turn(
@@ -2756,13 +2806,19 @@ fn run_with_sleeper(
                         {
                             messages.pop();
                         }
+                        // (#2229) The budget is a stall RATE, not a lifetime
+                        // count — it decays by one per productive turn — so
+                        // the line says so rather than letting an operator
+                        // read `{stall_recoveries_used}` as "this dispatch
+                        // stalled exactly that many times in total".
                         eprintln!(
                             "darkmux-runtime: escalation_triggered — the model returned \
                              finish_reason=tool_calls with no tool calls, and the empty- \
-                             tool-calls recovery budget ({stall_recovery_budget}) is \
-                             exhausted; {stall_recoveries_used} prior recoveries didn't \
-                             break the pattern. Emitting EscalationTriggered for frontier \
-                             handoff. (#2190)"
+                             tool-calls recovery budget \
+                             ({stall_recoveries_used}/{stall_recovery_budget}, decays by \
+                             one per productive turn) is exhausted; the nudge isn't \
+                             breaking the pattern. Emitting EscalationTriggered for \
+                             frontier handoff. (#2190/#2229)"
                         );
                         trajectory.append_escalation_triggered(
                             turns,
@@ -2881,8 +2937,13 @@ fn run_with_sleeper(
                 // that spin QUIETER than the pre-#2169 one-tool-message-
                 // per-call shape, so it needs its own bound. Reset-on-any-
                 // dispatched-call, edge-triggered at `MAX_CONSECUTIVE_
-                // MALFORMED_TURNS`, same shape as `stall_recoveries_used`
-                // just below. Deliberately NOT restored on resume (same
+                // MALFORMED_TURNS`. NOT the same shape as
+                // `stall_recoveries_used` just below (#2229): that counter
+                // has TWO increment sites straddling the turn boundary, so
+                // it PAYS DOWN by one on a turn that opened, rather than
+                // resetting to zero on any dispatched call. Do not
+                // "harmonize" the two — zeroing the stall budget is
+                // exactly the regression #2229's review caught. Deliberately NOT restored on resume (same
                 // "detector state resets fresh" precedent `RunCheckpoint::
                 // pending_tool_calls`'s doc names for cycle_detector/
                 // failure_rate_detector) — a resume that lands mid-spin
@@ -2921,6 +2982,58 @@ fn run_with_sleeper(
                     }
                 } else {
                     consecutive_malformed_turns = 0;
+                    // (#2229) The stall budget pays DOWN on the same signal,
+                    // in the same place — but it is not the same shape as
+                    // the counter above, and the comment that first landed
+                    // here claimed it was. `consecutive_malformed_turns`
+                    // increments in THIS arm and resets in THIS arm, so it
+                    // is genuinely arm-local and `= 0` is right for it.
+                    // `stall_recoveries_used` increments in TWO arms (the
+                    // empty-tool-calls recovery just above, and the
+                    // `"length"` arm via `recover_intra_turn_stall`) and
+                    // pays down only here. Two differences follow:
+                    //
+                    //   1. DECAY, not zero. `MAX_STALL_RECOVERIES`' doc
+                    //      promised a CONSECUTIVE budget while the counter
+                    //      had no pay-down site at all — one `= 0` init and
+                    //      the `saturating_add` bumps — so a dispatch that
+                    //      recovered on turn 5, ran a thousand productive
+                    //      turns, then stalled again on turn 1005 escalated
+                    //      out with the counter still at 1/2. That is
+                    //      #2229's bug. But a hard `= 0` over-corrects: it
+                    //      bounds only BACK-TO-BACK stalls, so ONE
+                    //      dispatched call between two stalls wipes the
+                    //      counter. `saturating_sub(1)` forgives the
+                    //      isolated stall and still lets any sustained rate
+                    //      above 1:1 climb to the bound. The exactly-1:1
+                    //      alternation stays unbounded here by design — see
+                    //      `MAX_STALL_RECOVERIES`' doc for the measured
+                    //      shape and why closing it is deferred rather than
+                    //      forgotten.
+                    //
+                    //   2. TURN-granular, and this site is not that on its
+                    //      own. After `recover_intra_turn_stall` the
+                    //      `"length"` arm sets `resuming_after_checkpoint =
+                    //      turn.has_prefill()`, and a continuation does NOT
+                    //      increment `turns` — so a mid-turn continuation
+                    //      that returns a real tool call lands right here
+                    //      and would refund a recovery the SAME turn spent
+                    //      moments earlier. Proven: turn 1 checkpoints,
+                    //      stalls (budget 1/2), then dispatches, and the
+                    //      escalation slides from turn 3 to turn 4 with turn
+                    //      2 logging 1/2 where it should log 2/2.
+                    //      `opened_a_new_turn` is what makes the granularity
+                    //      real. (The earlier rejection note here claimed
+                    //      the length arm's CHECKPOINT branch was the only
+                    //      mid-turn risk and that this site was already
+                    //      whole-turn — both false; the checkpoint branch
+                    //      never touches this counter, and this site is
+                    //      reached mid-turn.)
+                    //
+                    // The `"stop"` arm still needs nothing: it returns.
+                    if opened_a_new_turn {
+                        stall_recoveries_used = stall_recoveries_used.saturating_sub(1);
+                    }
                 }
 
                 // Dispatch each call; append a `tool` message per
@@ -3459,11 +3572,15 @@ fn run_with_sleeper(
                 // doesn't have to also account for the unproductive
                 // turn that just landed.
                 if stall_recoveries_used >= stall_recovery_budget {
+                    // (#2229) Same wording change as the empty-tool-calls
+                    // arm above: the budget is a decaying RATE, so the line
+                    // says so rather than reading as a lifetime total.
                     eprintln!(
                         "darkmux-runtime: escalation_triggered — intra-turn \
-                         stall recovery budget ({stall_recovery_budget}) exhausted; \
-                         {stall_recoveries_used} prior recoveries didn't break the \
-                         pattern. Emitting EscalationTriggered for frontier handoff."
+                         stall recovery budget ({stall_recoveries_used}/\
+                         {stall_recovery_budget}, decays by one per productive turn) \
+                         is exhausted; the nudge isn't breaking the pattern. \
+                         Emitting EscalationTriggered for frontier handoff. (#2229)"
                     );
                     trajectory.append_escalation_triggered(
                         turns,
@@ -10866,6 +10983,387 @@ mod tests {
             outcome.terminal_reason
         );
         assert_eq!(outcome.turns, MAX_STALL_RECOVERIES + 1);
+    }
+
+    /// (#2229) Sibling of `a_mixed_turn_resets_the_consecutive_malformed_
+    /// counter` above, for the OTHER budget in this loop. The stall budget
+    /// is documented as CONSECUTIVE (`MAX_STALL_RECOVERIES`' own doc: "a
+    /// second if the NEXT TURN also stalls. Three CONSECUTIVE stalls is the
+    /// pathology signal") but was implemented lifetime-cumulative — inited
+    /// to 0 once and only ever `saturating_add`ed, with no reset site
+    /// anywhere in the function. A dispatch that recovered from one empty
+    /// completion on turn 5, ran a thousand productive turns, then hit an
+    /// unrelated empty completion on turn 1005 escalated out, because the
+    /// counter was still sitting at 1/2 with no way back down. That bites
+    /// hardest on the long unattended crawl units, which is exactly where
+    /// an escalation costs the most.
+    ///
+    /// Interleaved stall → productive → stall → productive → stall. Each
+    /// productive turn dispatches a real tool call, so the streak never
+    /// reaches 3 and the run must reach MaxTurns(5) rather than escalating.
+    ///
+    /// Turn discrimination is the pair (`"role":"tool"` count, stall-nudge
+    /// count) in the accumulating request body — the tool count alone
+    /// collides here (a stall turn appends no tool message), so the nudge
+    /// each recovery injects supplies the second coordinate:
+    ///
+    /// ```text
+    /// turn1 (tool 0, nudge 0): STALL      → budget 0→1, +1 nudge
+    /// turn2 (tool 0, nudge 1): productive → decay 1→0, +1 tool msg
+    /// turn3 (tool 1, nudge 1): STALL      → budget 0→1, +1 nudge
+    /// turn4 (tool 1, nudge 2): productive → decay 1→0, +1 tool msg
+    /// turn5 (tool 2, nudge 2): STALL      → budget 0→1, loop continues
+    /// ```
+    ///
+    /// Pre-fix the same five turns run 0→1, 1, 1→2, 2, then `2 >= 2` on
+    /// turn 5 and escalate with `EmptyToolCallsExhausted`.
+    ///
+    /// This test does NOT pin the pay-down's PLACEMENT: it stays green under
+    /// the interesting wrong placement (delete the site in the `"tool_calls"`
+    /// arm, add an unconditional pay-down at the top of every turn). Five
+    /// pre-existing tests catch that mutation, and they are the placement
+    /// pins to run alongside this one:
+    /// `loop_escalates_when_stall_recovery_budget_exhausted`,
+    /// `loop_recovers_from_empty_tool_calls_then_escalates`,
+    /// `max_stall_recoveries_override_changes_the_escalation_point`,
+    /// `genuine_reasoning_bound_cut_still_produces_intra_turn_stall_kind`,
+    /// `escalation_triggered_record_carries_model_and_prompt_tokens`.
+    #[test]
+    #[serial_test::serial]
+    fn a_productive_turn_pays_down_the_stall_recovery_budget() {
+        let server = MockServer::start();
+        // A distinctive fragment of `STALL_NUDGE_MESSAGE` — one occurrence
+        // per recovery already injected. httpmock's `.matches()` takes a
+        // plain `fn(&HttpMockRequest) -> bool` (a non-capturing function
+        // pointer, not a `Fn` closure), so both literals are inlined per
+        // closure rather than parametrized — same constraint the
+        // consecutive-malformed sibling's matchers work around.
+        let _t1 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 0
+            });
+            then.status(200)
+                .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
+        });
+        let _t2 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 1
+            });
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([valid_read_call("call_ok_1", "/workspace/a.txt")])),
+                "tool_calls",
+                100,
+                20,
+            ));
+        });
+        let _t3 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 1
+                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 1
+            });
+            then.status(200)
+                .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
+        });
+        let _t4 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 1
+                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 2
+            });
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([valid_read_call("call_ok_2", "/workspace/b.txt")])),
+                "tool_calls",
+                100,
+                20,
+            ));
+        });
+        let _t5 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 2
+                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 2
+            });
+            then.status(200)
+                .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("stall-budget-reset").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run(
+            &client,
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(5),
+            None,
+            None,
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("must not error");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::MaxTurns,
+            "a productive turn must PAY DOWN the stall-recovery budget, so 5 turns whose \
+             longest stall STREAK is 1 (never reaching the budget of {}) must run to \
+             MaxTurns rather than escalating: {:?}",
+            MAX_STALL_RECOVERIES,
+            outcome.terminal_reason
+        );
+        // Assert the turn count too, the way this test's siblings do —
+        // `MaxTurns` alone would also be produced by the run dying early on
+        // a mock miss (an unmatched request 404s), which is not what this
+        // test is about.
+        assert_eq!(outcome.turns, 5, "all five scripted turns must have run");
+    }
+
+    /// (#2229 round-2 blocker 1) The budget pays DOWN by one per productive
+    /// turn rather than resetting to zero, so it bounds a stall RATE.
+    ///
+    /// Zeroing bounds only BACK-TO-BACK stalls: one dispatched call between
+    /// two stalls wipes the counter, so under `= 0` a model stalling TWICE
+    /// for every productive turn runs 1, 2, 0, 1, 2, 0 … and never
+    /// escalates — it is 67% useless and the loop tolerates it forever.
+    /// Under decay the same model nets +1 per cycle and reaches the bound:
+    ///
+    /// ```text
+    /// turn1 (tool 0, nudge 0): STALL → 0→1
+    /// turn2 (tool 0, nudge 1): STALL → 1→2
+    /// turn3 (tool 0, nudge 2): work  → decay 2→1
+    /// turn4 (tool 1, nudge 2): STALL → 1→2
+    /// turn5 (tool 1, nudge 3): STALL → 2 >= 2, escalate
+    /// ```
+    ///
+    /// The gap this test does NOT close, stated so it is not mistaken for a
+    /// claim: an EXACT 1:1 alternation (stall, work, stall, work, …)
+    /// oscillates 1,0,1,0 and never reaches the bound. Measured — a model
+    /// alternating a stall with one identical trivial `read` ran 40 turns
+    /// without escalating, and nothing else in the loop stops it (the #418
+    /// cycle and #419 failure-rate detectors are warn-only, and the host
+    /// inactivity watchdog is reset by the trivial call's own successful
+    /// `tool.completed`). That shape is bounded only by an operator-set
+    /// `max_turns`/`max_cumulative_tokens`. Closing it needs a second
+    /// absolute bound and is deliberately deferred; see
+    /// `MAX_STALL_RECOVERIES`' doc.
+    ///
+    /// Turn discrimination is the same (tool-message count, nudge count)
+    /// pair the sibling above uses, expressed as a RELATION: with two
+    /// stalls per productive turn, `nudges - 2 * tools` is the number of
+    /// stalls since the last productive turn.
+    #[test]
+    #[serial_test::serial]
+    fn a_two_to_one_stall_ratio_still_escalates() {
+        let server = MockServer::start();
+        let _stall = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                let tools = b.matches("\"role\":\"tool\"").count();
+                let nudges = b.matches("emitted reasoning tokens up to the per-call cap").count();
+                nudges < tools * 2 + 2
+            });
+            then.status(200)
+                .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
+        });
+        let _work = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                let tools = b.matches("\"role\":\"tool\"").count();
+                let nudges = b.matches("emitted reasoning tokens up to the per-call cap").count();
+                nudges >= tools * 2 + 2
+            });
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([valid_read_call("call_trivial", "/workspace/a.txt")])),
+                "tool_calls",
+                100,
+                20,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("stall-ratio").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        // A turn cap well above the expected escalation point, present ONLY
+        // so a regression ends this test instead of running long. A run that
+        // REACHES it has failed: production leaves `max_turns` unset.
+        let outcome = run(
+            &client,
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(20),
+            None,
+            None,
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("must not error");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::EmptyToolCallsExhausted),
+            "two stalls per productive turn nets +1 on the budget each cycle and must \
+             reach the bound; reaching the turn cap instead means the pay-down is a reset \
+             rather than a decay, and the loop tolerates a 67%-useless model forever: {:?}",
+            outcome.terminal_reason
+        );
+        assert_eq!(
+            outcome.turns, 5,
+            "the second stall of the second cycle is the one that finds the budget already \
+             at {MAX_STALL_RECOVERIES}"
+        );
+    }
+
+    /// (#2229 round-2 blocker 2) A checkpoint continuation is the SAME
+    /// logical turn resuming, so it must not erase a recovery that same turn
+    /// already spent.
+    ///
+    /// The reset lives in the `"tool_calls"` arm's `else` (a dispatchable
+    /// call survived the #2169 partition), which reads as turn-granular and
+    /// is not: after `recover_intra_turn_stall`, the length arm sets
+    /// `resuming_after_checkpoint = turn.has_prefill()`, and the top of the
+    /// next iteration then does NOT increment `turns` — the next API call is
+    /// the same logical turn. If that call returns a real tool call it lands
+    /// on the reset and zeroes a budget the length arm spent moments earlier
+    /// inside the very same turn.
+    ///
+    /// The scenario, with calls 1–3 all being turn 1:
+    ///
+    /// ```text
+    /// turn1 call1: length + content at the cap → checkpoint, banks a prefill
+    /// turn1 call2: length + EMPTY             → spends a recovery (0→1)
+    /// turn1 call3: tool_calls + a real call   → the reset site
+    /// turn2      : length + EMPTY             → 1→2
+    /// turn3      : length + EMPTY             → 2 >= 2, escalate
+    /// ```
+    ///
+    /// Turn-granular, that escalates on turn 3. With the reset firing on the
+    /// mid-turn continuation it escalates on turn 4 instead, having silently
+    /// refunded turn 1's own recovery — so `outcome.turns` is what
+    /// discriminates.
+    #[test]
+    #[serial_test::serial]
+    fn a_checkpoint_continuation_does_not_erase_a_recovery_from_the_same_turn() {
+        let server = MockServer::start();
+        // Distinct tokens so the accumulation is never degenerate (the
+        // degeneracy gate would otherwise abandon the prefill and take
+        // `has_prefill()` — and with it the continuation — away). The
+        // PREFILLMARK sentinel is what tells call 2's matcher apart from
+        // call 1's: both see zero tool messages and zero nudges, and only
+        // call 2 sees the banked prefill in the request body.
+        let thought: String = format!(
+            "<think>\nPREFILLMARK {}",
+            (0..60).map(|i| format!("step{i}")).collect::<Vec<_>>().join(" ")
+        );
+        let _open = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 0
+                    && !b.contains("PREFILLMARK")
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some(&thought), None, "length", 100, 200));
+        });
+        let _stall_same_turn = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 0
+                    && b.contains("PREFILLMARK")
+            });
+            then.status(200)
+                .json_body(chat_response_json(None, None, "length", 100, 200));
+        });
+        let _dispatch_same_turn = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 1
+            });
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([valid_read_call("call_same_turn", "/workspace/a.txt")])),
+                "tool_calls",
+                100,
+                20,
+            ));
+        });
+        // Every call after the tool dispatch: a plain useless stall.
+        let _later_stalls = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() >= 1
+            });
+            then.status(200)
+                .json_body(chat_response_json(None, None, "length", 100, 200));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("stall-midturn").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("think then act")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client,
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(10),
+            None,
+            Some(200),
+            Some(200),
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("must not error");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "three useless `length` stalls against a budget of {MAX_STALL_RECOVERIES} must \
+             escalate on the runaway-reasoning kind: {:?}",
+            outcome.terminal_reason
+        );
+        assert_eq!(
+            outcome.turns, 3,
+            "turn 1 spent a recovery at its second call; the THIRD call of that same turn \
+             is a checkpoint continuation, not a new turn, so dispatching a tool there must \
+             not refund it. Escalating on turn 4 means it did."
+        );
     }
 
     /// (#2190) A GENUINE runaway-reasoning cut (`finish_reason=length`, no
