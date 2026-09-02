@@ -1,0 +1,35 @@
+{
+  "_comment": "Site-shaped rule. The prefilter narrows a TypeScript/JavaScript tree to conditions built from several boolean operands; the model judges whether the condition encodes a domain concept that deserves a name. Unlike `swallowed-error`, this pattern is COMMON \u2014 which is what makes it usable as a calibration control.",
+  "id": "unnamed-predicate",
+  "kind": "site",
+  "title": "A compound condition encodes a domain rule that has no name and cannot be tested on its own",
+  "applies_to": [
+    "**/*.ts",
+    "**/*.tsx",
+    "**/*.js",
+    "**/*.mjs",
+    "**/*.cjs"
+  ],
+  "exclude": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/coverage/**",
+    "**/*.d.ts",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/__tests__/**",
+    "**/tests/**",
+    "**/e2e/**"
+  ],
+  "prefilter": [
+    "(&&|\\|\\|)[^&|]*(&&|\\|\\|)",
+    "\\bif\\s*\\([^)]{80,}",
+    "\\?[^:\\n]{50,}:"
+  ],
+  "window": 40,
+  "match": "The site is a condition (an `if`/`while` test, a ternary test, a filter/guard callback, or an early-return test) that combines THREE OR MORE operands, or mixes `&&` with `||`, AND the combination expresses a single domain idea \u2014 eligibility, validity, readiness, permission, staleness \u2014 that appears nowhere as a name in the surrounding lines you were given. The test is whether a reader must mentally evaluate the operators to learn what the condition MEANS: if the meaning is only recoverable by decoding, the concept is unnamed. A condition inside a function can only be exercised by calling that function, so the more setup the enclosing function needs \u2014 I/O, many parameters, mocked collaborators \u2014 the more this condition is effectively untested logic, and the stronger the finding.",
+  "no_match": "The condition is a presence or null guard (`if (!x) return`, `x && x.y && x.y.z`). It is a fallback chain choosing a default (`a || b || 'default'`), which selects a value rather than expressing a rule. Its operands are ALREADY named predicates or well-named booleans (`isActive(u) && hasQuota(u)`) \u2014 the concept is named, only combined. The condition is already assigned to a named local or function and the site merely uses it (`const isEligible = ...; if (isEligible)`) \u2014 that is the FIXED form of this pattern, never a finding. It is a TypeScript narrowing chain the compiler requires inline. It is arithmetic or a range comparison whose meaning is self-evident. Test code, generated code, or a `.d.ts`. The condition already lives in its own small predicate function or pure helper \u2014 that is the fixed form.",
+  "evidence": "The condition, copied verbatim from its opening operand to its last. `line` is where the condition begins.",
+  "why_hint": "Name the domain concept the condition encodes, then PROPOSE an extracted predicate in backticks as a SIGNATURE, not just a name \u2014 camelCase, prefixed `is`/`has`/`can`/`should`, returning a boolean, and taking ONLY the values the condition actually reads rather than a whole object (prefer `isRenewalEligible({status, daysOverdue, balance})` over `isRenewalEligible(subscription)`, because the narrower signature is what makes it testable without fixtures). State in one clause what a reader must currently decode, and in one clause what it would take to test this condition TODAY \u2014 what the enclosing function requires in order to be called at all. Do not speculate about callers or duplicates outside the surrounding lines you were given; if you believe the same condition appears elsewhere, say 'possible duplicate not visible in the surrounding lines you were given'."
+}

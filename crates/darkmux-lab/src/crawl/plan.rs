@@ -1092,6 +1092,41 @@ fn collect_export_strings(v: &serde_json::Value, out: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    // (#2206) Every embedded rule's prefilter must compile as a `regex`
+    // pattern — `plan_site_units` compiles them lazily per crawl, so a bad
+    // pattern in a builtin rule would otherwise surface only at launch. And
+    // the unnamed-predicate prefilter must actually HIT the shapes #2206
+    // names, and be honest about the shapes it lets through: null guards and
+    // default chains pass the prefilter by design — the rule's `no_match`
+    // prose excludes them at judgment, where the model can read intent.
+    #[test]
+    fn every_embedded_prefilter_compiles_and_unnamed_predicate_hits_its_shapes() {
+        let (rules, warnings) = darkmux_crew::rules::load_all(None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut compiled = 0;
+        for rule in rules.values() {
+            for p in &rule.prefilter {
+                Regex::new(p).unwrap_or_else(|e| panic!("rule '{}' prefilter {p:?}: {e}", rule.id));
+                compiled += 1;
+            }
+        }
+        assert!(compiled >= 4, "expected the builtin prefilters to be present, compiled {compiled}");
+
+        let up = &rules["unnamed-predicate"];
+        let res: Vec<Regex> = up.prefilter.iter().map(|p| Regex::new(p).unwrap()).collect();
+        let hits = |line: &str| res.iter().any(|r| r.is_match(line));
+        // the rule's positive shapes
+        assert!(hits(r#"if (status === "active" && daysOverdue < 30 && balance > 0) {"#), "3 operands");
+        assert!(hits("const cls = a && (b || c) ? x : y;"), "mixed && and ||");
+        assert!(hits("if (isVeryLongConditionName(alpha) && anotherVeryLongConditionName(beta) && third(gamma)) {"), "long if");
+        // let through on purpose — excluded by `no_match` at judgment, not here
+        assert!(hits("if (x && x.y && x.y.z) {"), "a null guard passes the prefilter");
+        assert!(hits(r#"const d = a || b || "default";"#), "a default chain passes the prefilter");
+        // genuinely not a candidate
+        assert!(!hits("if (a && b) return;"), "two operands, short: not a candidate");
+        assert!(!hits("const n = items.length;"), "no operators at all");
+    }
+
     use super::*;
     use darkmux_crew::rules::EdgeRuleConfig;
     use darkmux_crew::workspace_spec::EdgeSpec;

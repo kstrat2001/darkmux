@@ -605,6 +605,9 @@ jobs:
               - 'tests/parity/**'
               - 'crates/darkmux-serve/assets/**'
               - '.github/workflows/ci.yml'
+              # (#2212) the slop-chop survey/oracle scripts resolve
+              # `typescript` from ui/node_modules, so they test in this job.
+              - 'scripts/slop-chop/**'
 
       - name: Install bun
         if: steps.filter.outputs.ui == 'true'
@@ -643,6 +646,13 @@ jobs:
         if: steps.filter.outputs.ui == 'true'
         working-directory: ui
         run: bun run test
+
+      # (#2212) slop-chop's mechanical stages: the AST survey and the
+      # truth-table oracle. Plain `node --test` — no vitest, no bundler — and
+      # they import `typescript` from ui/node_modules installed above.
+      - name: slop-chop survey + oracle tests
+        if: steps.filter.outputs.ui == 'true'
+        run: node --test scripts/slop-chop/*.test.mjs
 
       - name: Install parity harness dependencies
         if: steps.filter.outputs.ui == 'true'
