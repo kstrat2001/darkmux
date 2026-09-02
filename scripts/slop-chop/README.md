@@ -23,9 +23,12 @@ and is embedded in the binary like every other builtin rule
 
 ```bash
 cd ui && bun install            # typescript is resolved from ui/node_modules
-node scripts/slop-chop/survey.mjs ui/src/**/*.ts ui/src/**/*.tsx --strip ui/src/ --out /tmp/sites.json
+node scripts/slop-chop/survey.mjs $(find ui/src -name '*.ts' -o -name '*.tsx') --strip ui/src/ --out /tmp/sites.json
 node scripts/slop-chop/oracle.mjs --sites /tmp/sites.json --out /tmp/oracles.json
 ```
+
+`find` rather than `**`: bash without `globstar` expands `**` as `*` and
+silently under-surveys (89 files instead of 163 on `ui/src`).
 
 `survey` prints the site census (by operand count, purity, and the
 provably-equivalent clusters) and writes the **qualifying** sites — 3+ distinct
@@ -43,8 +46,10 @@ strategy inside the existing one — is the operator's (#1352).
 
 ## Where the numbers came from
 
-Measured on darkmux `ui/src` (92 files, 21,515 lines): 197 prefilter hits →
-244 AST sites → 46 qualifying. Judgment refusal 2/2 on a dense 27B model,
+Measured on darkmux `ui/src` on 2026-08-31, BEFORE #2224 extracted eight of
+the sites (92 files, 21,515 lines): 197 prefilter hits → 244 AST sites → 46
+qualifying. The same command on 2026-09-02 gives 253 → 39; the drop in
+qualifying sites is #2224's work, not a regression. Judgment refusal 2/2 on a dense 27B model,
 0/4 on a 35B-A3B MoE — dense parameters, not total parameters, do the
 discriminating. One extraction passed a seven-check gate with 340 tests green
 and shipped as #2224 (six named predicates from eight sites).

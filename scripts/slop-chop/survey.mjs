@@ -39,7 +39,7 @@ export function decompose(node) {
   if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.ExclamationToken) {
     return { op: "not", kid: decompose(node.operand) };
   }
-  return { op: "leaf", text: node.getText().replace(/\s+/g, " ").trim() };
+  return { op: "leaf", text: node.getText().replace(/\s+/g, " ").trim(), node };
 }
 
 /** Distinct leaf texts, in first-seen order. */
@@ -48,6 +48,19 @@ export function leaves(tree) {
   const walk = (t) => (t.op === "leaf" ? acc.push(t.text) : t.op === "not" ? walk(t.kid) : t.kids.forEach(walk));
   walk(tree);
   return [...new Set(acc)];
+}
+
+/** The leaf NODES (one per distinct text, first seen), for node-based classification. */
+export function leafNodes(tree) {
+  const seen = new Map();
+  const walk = (t) => {
+    if (t.op === "leaf") {
+      if (!seen.has(t.text)) seen.set(t.text, t.node);
+    } else if (t.op === "not") walk(t.kid);
+    else t.kids.forEach(walk);
+  };
+  walk(tree);
+  return [...seen.values()];
 }
 
 export function evalTree(t, env) {
@@ -93,6 +106,40 @@ const worst = (a, b) =>
   a === "mutating" || b === "mutating" ? "mutating" : a === "unknown" || b === "unknown" ? "unknown" : "pure";
 
 /**
+ * Classify a leaf by its AST NODE, not its text. The text regex above is kept
+ * for callers that only have a string, but it cannot see compound assignment
+ * (`x += 1`, `x ||= 1` — the `+`/`|` before `=` fell in the regex's own
+ * exclusion class and read as PURE, the unsafe direction) and it mis-reads
+ * `=` or `--` inside string literals as mutation (the conservative
+ * direction). The node knows: an assignment operator token, an `await`, a
+ * `++`/`--`, or a call are structural facts. (Review finding on #2266.)
+ */
+export function classifyNode(node) {
+  let cls = "pure";
+  const bump = (c) => (cls = worst(cls, c));
+  const walk = (n) => {
+    if (ts.isBinaryExpression(n) && isAssignmentOperator(n.operatorToken.kind)) bump("mutating");
+    else if (ts.isAwaitExpression(n)) bump("mutating");
+    else if (
+      (ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&
+      (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken)
+    )
+      bump("mutating");
+    else if (ts.isCallExpression(n) || ts.isNewExpression(n)) {
+      const callee = n.expression.getText().replace(/\s+/g, "");
+      if (!PURE_CALL.test(callee + "(")) bump("unknown");
+    }
+    ts.forEachChild(n, walk);
+  };
+  walk(node);
+  return cls;
+}
+
+function isAssignmentOperator(kind) {
+  return kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment;
+}
+
+/**
  * Scan one source text for condition sites: `if`/`while`/`do` tests and
  * ternary tests whose top-level operator is `&&` or `||` with 2+ distinct
  * operands. (Qualification for the rule — 3+ operands — is the caller's
@@ -111,13 +158,21 @@ export function scanSource(label, text, { tsx = /x$/.test(label) } = {}) {
       if (tree.op === "and" || tree.op === "or") {
         const ls = leaves(tree);
         if (ls.length >= 2) {
+          // `text` is the FULL condition — the oracle re-parses it as the
+          // expression, so it must never be cut. `preview` is the display
+          // form. (The prototype stored only a 240-char slice, which was
+          // harmless as a column and became a data bug the moment the oracle
+          // read it back: a cut inside a string literal still parses under
+          // TypeScript's tolerant parser and yields a plausible wrong table.)
+          const full = cond.getText().replace(/\s+/g, " ");
           sites.push({
             file: label,
             line: src.getLineAndCharacterOfPosition(cond.getStart()).line + 1,
             n: ls.length,
             ops: ls,
-            cls: ls.map(classify).reduce(worst, "pure"),
-            text: cond.getText().replace(/\s+/g, " ").slice(0, 240),
+            cls: leafNodes(tree).map(classifyNode).reduce(worst, "pure"),
+            text: full,
+            preview: full.length > 240 ? full.slice(0, 237) + "..." : full,
             table: truthTable(tree, ls),
           });
         }
@@ -171,7 +226,7 @@ function main(argv) {
   console.log(`by operand count: ${[2, 3, 4, 5].map((k) => `${k}→${sites.filter((s) => s.n === k).length}`).join("  ")}  (>5: ${sites.filter((s) => s.n > 5).length})`);
   console.log("\n--- top sites by operand count ---");
   for (const s of sites.slice(0, 8)) {
-    console.log(`${s.file}:${s.line}  n=${s.n} ${s.cls.padEnd(8)} table=${s.table.length <= 16 ? s.table : s.table.slice(0, 16) + "…"}\n    ${s.text}`);
+    console.log(`${s.file}:${s.line}  n=${s.n} ${s.cls.padEnd(8)} table=${s.table.length <= 16 ? s.table : s.table.slice(0, 16) + "…"}\n    ${s.preview}`);
   }
   const cl = clusters(sites);
   console.log(`\n--- provably-equivalent clusters (non-mutating sites): ${cl.length} ---`);

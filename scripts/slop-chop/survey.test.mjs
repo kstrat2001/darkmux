@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { scanSource, qualifying, classify, clusters } from "./survey.mjs";
+// (review on #2266) node-based classification + full-text oracle contract
 import { oracleFor, oracles } from "./oracle.mjs";
 
 const src = `
@@ -82,4 +83,37 @@ test("clusters group provably-equivalent sites by (n, table)", () => {
   const cl = clusters(sites);
   assert.equal(cl.length, 1, "the two 3-way conjunctions cluster; the disjunction does not");
   assert.equal(cl[0][1].length, 2);
+});
+
+test("site classification is AST-based: compound assignment is mutating, string contents are not", () => {
+  const src = `
+function g(x, a, s) {
+  if (a && (x += 1) && s) return 1;      // compound assignment: mutating
+  if (a && (x ||= 1) && s) return 2;     // logical assignment: mutating
+  if (a && s === "a=b" && x) return 3;   // '=' inside a string: NOT mutation
+  if (a && s === \`\${a}--\${x}\` && x) return 4; // '--' inside a template: NOT mutation
+  if (a && i++ && x) return 5;           // increment: mutating
+}
+`;
+  const by = Object.fromEntries(scanSource("fixture.ts", src).map((st) => [st.line, st.cls]));
+  assert.equal(by[3], "mutating", "x += 1");
+  assert.equal(by[4], "mutating", "x ||= 1");
+  assert.equal(by[5], "pure", "a string containing '=' is pure");
+  assert.equal(by[6], "pure", "a template containing '--' is pure");
+  assert.equal(by[7], "mutating", "i++");
+  // the text-only classifier is still exported and still misses compound assignment —
+  // pinned so nobody reaches for it as the site classifier again
+  assert.equal(classify("(x += 1)"), "pure");
+});
+
+test("survey keeps the FULL condition text; preview is the display cut; the oracle round-trips a long site", () => {
+  const long = Array.from({ length: 12 }, (_, i) => `veryLongOperandName${i}.someProperty === "expectedValue${i}"`).join(" && ");
+  assert.ok(long.length > 240, `fixture must exceed the old 240-char cut (got ${long.length})`);
+  const [site] = scanSource("fixture.ts", `if (${long}) {}`);
+  assert.equal(site.text, long, "text is never truncated");
+  assert.ok(site.preview.length <= 240 && site.preview.endsWith("..."), "preview is the display cut");
+  assert.equal(site.n, 12);
+  const [o] = oracles([site]);
+  assert.equal(o.mismatch, false, "the oracle re-parses the FULL text and agrees with the survey");
+  assert.equal(o.table.length, 1 << 12);
 });

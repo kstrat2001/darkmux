@@ -1,7 +1,7 @@
 {
   "id": "slop-chop",
   "name": "Slop Chop",
-  "description": "DRAFT (#2212). Sweep a corpus for one judgment-bearing rule and land the fixes as ONE cohesive PR. Detection is mechanical (an AST pass, no model); the oracle for each site is computed from the ORIGINAL expression so the model never authors its own expected values; judgment is batched; extraction is agentic and per-MOD (partition under ratification, #2265); every change passes a mechanical gate before it enters the PR. Sites failing the gate stay findings and never block the ones that passed. NOT YET RUNNABLE -- see the `_gaps` block.",
+  "description": "DRAFT (#2212). Sweep a corpus for one judgment-bearing rule and land the fixes as ONE cohesive PR. Detection is mechanical (an AST pass, no model); the oracle for each site is computed from the ORIGINAL expression so the model never authors its own expected values; judgment is batched; extraction is agentic and per-file; every change passes a mechanical gate before it enters the PR. Sites failing the gate stay findings and never block the ones that passed. NOT YET RUNNABLE -- see the `_gaps` block.",
   "schema_version": "3.0",
   "_gaps": [
     "survey/oracle reference scripts/slop-chop/*.mjs which do not exist yet -- they live in a scratchpad prototype and must move into the repo with their own tests",
@@ -147,4 +147,4 @@
       ]
     }
   ]
-}
+}\n

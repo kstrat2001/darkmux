@@ -1114,17 +1114,30 @@ mod tests {
 
         let up = &rules["unnamed-predicate"];
         let res: Vec<Regex> = up.prefilter.iter().map(|p| Regex::new(p).unwrap()).collect();
+        assert_eq!(res.len(), 3);
         let hits = |line: &str| res.iter().any(|r| r.is_match(line));
-        // the rule's positive shapes
-        assert!(hits(r#"if (status === "active" && daysOverdue < 30 && balance > 0) {"#), "3 operands");
+        // Each prefilter gets a positive the OTHER TWO cannot match, so
+        // replacing any one of them with a never-matching pattern fails here
+        // (review finding on #2266: the first version's positives all carried
+        // two operators and were satisfied by prefilter 0 alone).
+        // prefilter 0: two boolean operators on one line
+        let two_ops = r#"if (status === "active" && daysOverdue < 30 && balance > 0) {"#;
+        assert!(res[0].is_match(two_ops) && !res[1].is_match(two_ops) && !res[2].is_match(two_ops), "p0 only");
+        // prefilter 1: a long `if (` — 80+ chars before the closing paren, ONE operator
+        let long_if = "if (subscription.billingModel.effectiveRate.amountInMinorUnits === expectedRate.amountInMinorUnits) {";
+        assert!(res[1].is_match(long_if) && !res[0].is_match(long_if) && !res[2].is_match(long_if), "p1 only");
+        // prefilter 2: a long ternary test — 50+ chars between `?` and `:`, no `&&`/`||`
+        let long_tern = "const label = isEligible ? formatEligibilityLabel(subscription, locale, options) : fallback;";
+        assert!(res[2].is_match(long_tern) && !res[0].is_match(long_tern) && !res[1].is_match(long_tern), "p2 only");
+        // the rule's other positive shape
         assert!(hits("const cls = a && (b || c) ? x : y;"), "mixed && and ||");
-        assert!(hits("if (isVeryLongConditionName(alpha) && anotherVeryLongConditionName(beta) && third(gamma)) {"), "long if");
         // let through on purpose — excluded by `no_match` at judgment, not here
         assert!(hits("if (x && x.y && x.y.z) {"), "a null guard passes the prefilter");
         assert!(hits(r#"const d = a || b || "default";"#), "a default chain passes the prefilter");
         // genuinely not a candidate
         assert!(!hits("if (a && b) return;"), "two operands, short: not a candidate");
         assert!(!hits("const n = items.length;"), "no operators at all");
+        assert!(!hits("const t = ok ? a : b;"), "a short ternary is not a candidate");
     }
 
     use super::*;
