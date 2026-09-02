@@ -489,26 +489,31 @@ fn read_all_json<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Resul
     Ok(results)
 }
 
+/// (#2268) ONE builtin role as embedded in the binary — no user tier, no
+/// env, no `~/.darkmux`, no `.md` attached (the palette lives in the JSON).
+/// For tests that make a claim about the SHIPPED manifest: `load_roles()`
+/// merges the user tier first, so a test through it can be flipped by an
+/// operator's local `crawler.json` override in either direction (proven in
+/// review). `Ok(None)` when `id` is not a builtin; `Err` carries the serde
+/// message when its JSON does not parse, so a broken embedded manifest names
+/// itself instead of reading as "not a builtin".
+pub(crate) fn builtin_role(id: &str) -> Result<Option<Role>> {
+    BUILTIN_ROLES
+        .iter()
+        .find(|(bid, _)| *bid == id)
+        .map(|(_, json)| {
+            serde_json::from_str::<Role>(json)
+                .with_context(|| format!("builtin role `{id}` failed to parse"))
+        })
+        .transpose()
+}
+
 /// Load all roles from the user dir, falling back to built-in templates.
 ///
 /// `DARKMUX_CREW_DIR` overrides the crew root — useful for tests and
 /// non-standard layouts. (The Phase A Era env var was `DARKMUX_CREW_DIR`;
 /// renamed for the Crew doctrine + to fix the typo. Anyone who set the old
 /// one needs to update.)
-/// (#2268) ONE builtin role as embedded in the binary — no user tier, no
-/// env, no `~/.darkmux`, no `.md` attached (the palette lives in the JSON).
-/// For tests that make a claim about the SHIPPED manifest: `load_roles()`
-/// merges the user tier first, so a test through it can be flipped by an
-/// operator's local `crawler.json` override in either direction (proven in
-/// review). `None` when `id` is not a builtin, or when its JSON does not
-/// parse — the latter is what `load_roles` warns about at runtime.
-pub(crate) fn builtin_role(id: &str) -> Option<Role> {
-    BUILTIN_ROLES
-        .iter()
-        .find(|(bid, _)| *bid == id)
-        .and_then(|(_, json)| serde_json::from_str::<Role>(json).ok())
-}
-
 pub fn load_roles() -> Result<Vec<Role>> {
     let roles_dir = roles_dir();
 

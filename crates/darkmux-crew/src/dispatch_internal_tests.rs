@@ -8642,7 +8642,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     // goes through it, in either direction.
     #[test]
     fn the_builtin_crawler_manifest_reaches_the_runtime_with_report_finding() {
-        let crawler = crate::loader::builtin_role("crawler").expect("the crawler role is a builtin and parses");
+        let crawler = crate::loader::builtin_role("crawler")
+            .expect("the embedded crawler manifest parses")
+            .expect("the crawler role is a builtin");
         let result = compute_runtime_allowed_tools(&crawler.tool_palette).expect("crawler declares a palette");
         assert_eq!(result, vec!["read", "search", "bash", "report_finding"], "palette: {:?}", crawler.tool_palette);
     }
