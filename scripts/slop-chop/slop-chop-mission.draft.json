@@ -1,0 +1,150 @@
+{
+  "id": "slop-chop",
+  "name": "Slop Chop",
+  "description": "DRAFT (#2212). Sweep a corpus for one judgment-bearing rule and land the fixes as ONE cohesive PR. Detection is mechanical (an AST pass, no model); the oracle for each site is computed from the ORIGINAL expression so the model never authors its own expected values; judgment is batched; extraction is agentic and per-file; every change passes a mechanical gate before it enters the PR. Sites failing the gate stay findings and never block the ones that passed. NOT YET RUNNABLE -- see the `_gaps` block.",
+  "schema_version": "3.0",
+  "_gaps": [
+    "survey/oracle reference scripts/slop-chop/*.mjs which do not exist yet -- they live in a scratchpad prototype and must move into the repo with their own tests",
+    "the `extract` phase needs N agentic dispatches where N = files-with-candidates, known only AFTER survey. `dispatch.map` is single-shot fan-out (it shares session scoping with dispatch.single_shot), so dynamic agentic fan-out is not expressible declaratively. Precedent: crawl.json ships `phases: []` and builds its unit loop launch-side. Either dispatch.map grows an agentic mode, or extract is launch-owned like crawl's unit loop.",
+    "the committed unnamed-predicate rule is prefilter+model-detection shaped; it must become a JUDGMENT rule (name-or-refuse) now that detection moved to the survey phase",
+    "#2215 -- the inactivity watchdog did not fire on a wedged agentic dispatch. Fine attended, fatal unattended.",
+    "#2216 -- unit bundling is still fixed caps, not derived from the model's window. Not blocking at this corpus size (46 sites, ~30k peak against 262k); blocking for a large corpus.",
+    "(#2265) the extract partition is OPEN: this draft says 'per-file', but the file is the wrong SIZING unit (40 lines or 4,000); the proposal is `mod` \u2014 one site, one change, one oracle, one gate, one terminal \u2014 with the file kept only as an edit-safety batching key. Do not implement extract until #2265 is ratified."
+  ],
+  "inputs": [
+    {
+      "name": "source",
+      "description": "Repo path to sweep.",
+      "required": true
+    },
+    {
+      "name": "rule",
+      "description": "Judgment rule id (e.g. unnamed-predicate).",
+      "required": true
+    },
+    {
+      "name": "profile",
+      "description": "Profile naming the model for the judgment + extraction seats. Dense parameters matter here: a 3B-active MoE scored 0/4 on this judgment where a 27B dense scored 4/4.",
+      "required": true
+    },
+    {
+      "name": "limit",
+      "description": "Max sites this run may touch. Absent = all qualifying.",
+      "required": false
+    },
+    {
+      "name": "dry_run",
+      "description": "Plan and report projected peak context per unit; dispatch nothing.",
+      "required": false
+    }
+  ],
+  "phases": [
+    {
+      "id": "survey",
+      "display_name": "Survey",
+      "description": "mechanical: find candidate sites and compute each one's oracle. No model.",
+      "tasks": [
+        {
+          "id": "survey-sites",
+          "description": "AST pass over the corpus -> qualifying sites",
+          "depends_on": [],
+          "steps": [
+            {
+              "id": "survey-sites-step",
+              "kind": "procedural.shell",
+              "config": {
+                "command": "node scripts/slop-chop/survey.mjs --source \"$SOURCE\" --rule \"$RULE\" --out sites.json"
+              }
+            }
+          ]
+        },
+        {
+          "id": "survey-oracle",
+          "description": "truth table per site, evaluated from the ORIGINAL expression",
+          "depends_on": [
+            "survey-sites"
+          ],
+          "steps": [
+            {
+              "id": "survey-oracle-step",
+              "kind": "procedural.shell",
+              "config": {
+                "command": "node scripts/slop-chop/oracle.mjs --sites sites.json --out oracles.json"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "triage",
+      "display_name": "Triage",
+      "description": "judgment: propose a domain name + narrow signature per site, or REFUSE. The refusal is the filter that decides which sites are worth touching.",
+      "tasks": [
+        {
+          "id": "triage-name",
+          "description": "batched name-or-refuse over the surveyed sites",
+          "depends_on": [],
+          "steps": [
+            {
+              "id": "triage-name-step",
+              "kind": "dispatch.map",
+              "config": {
+                "collection": "$SITES",
+                "user_template": "For this condition, propose a domain name and a signature taking only the values it reads, or REFUSE if the only name available restates the operators.\n\n{item}"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "extract",
+      "display_name": "Extract",
+      "description": "LAUNCH-OWNED (see _gaps): one agentic dispatch per file, each handed its sites, their oracles, and the accepted names. Files are the parallelism boundary -- two agents editing one file collide.",
+      "tasks": []
+    },
+    {
+      "id": "gate",
+      "display_name": "Gate",
+      "description": "mechanical: nothing enters the PR unverified. A site that fails stays a finding.",
+      "tasks": [
+        {
+          "id": "gate-verify",
+          "description": "oracle test green, suite green, typecheck clean, only intended files touched",
+          "depends_on": [],
+          "steps": [
+            {
+              "id": "gate-verify-step",
+              "kind": "procedural.shell",
+              "config": {
+                "command": "node scripts/slop-chop/gate.mjs --oracles oracles.json --source \"$SOURCE\""
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "assemble",
+      "display_name": "Assemble",
+      "description": "one PR per crawl: the changes plus their proof. A crawl is cohesive -- one rule, N applications of the same move, so a reviewer learns the pattern once and spot-checks. The frontier review happens HERE, at the PR, not in the loop.",
+      "tasks": [
+        {
+          "id": "assemble-pr",
+          "description": "branch + PR body naming rule, sites touched, sites refused, sites failed, coverage delta",
+          "depends_on": [],
+          "steps": [
+            {
+              "id": "assemble-pr-step",
+              "kind": "procedural.shell",
+              "config": {
+                "command": "node scripts/slop-chop/assemble.mjs --source \"$SOURCE\" --rule \"$RULE\""
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

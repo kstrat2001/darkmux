@@ -49,6 +49,17 @@ const EMBEDDED_RULES: &[(&str, &str)] = &[
             "/../../templates/builtin/rules/stale-consumer.json"
         )),
     ),
+    (
+        // (#2206) The slop-chop program's first rule and its positive
+        // control: compound conditions are COMMON, so a zero here means the
+        // model is blind, not that the corpus is clean — which is exactly
+        // what `swallowed-error`'s zero could not tell us.
+        "unnamed-predicate",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../templates/builtin/rules/unnamed-predicate.json"
+        )),
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +298,7 @@ mod tests {
     fn embedded_rules_all_parse() {
         let (map, warnings) = load_all(None);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(map.len(), 3, "{:?}", map.keys().collect::<Vec<_>>());
+        assert_eq!(map.len(), 4, "{:?}", map.keys().collect::<Vec<_>>());
         assert_eq!(map["swallowed-error"].kind, RuleKind::Site);
         assert_eq!(map["doc-contradicts-code"].kind, RuleKind::Read);
         assert_eq!(map["stale-consumer"].kind, RuleKind::Edge);
@@ -296,6 +307,17 @@ mod tests {
             "npm"
         );
         assert!(!map["swallowed-error"].prefilter.is_empty());
+        // (#2206) unnamed-predicate is site-shaped and judgment-shaped: a
+        // prefilter to narrow, prose `match`/`no_match` for the model, and a
+        // `why_hint` that demands a SIGNATURE, not just a name.
+        let up = &map["unnamed-predicate"];
+        assert_eq!(up.kind, RuleKind::Site);
+        assert_eq!(up.prefilter.len(), 3, "{:?}", up.prefilter);
+        assert_eq!(up.window, Some(40));
+        assert!(up.matches.as_deref().unwrap_or("").contains("THREE OR MORE operands"));
+        assert!(up.no_match.as_deref().unwrap_or("").contains("null guard"));
+        assert!(up.why_hint.as_deref().unwrap_or("").contains("SIGNATURE"));
+        assert!(up.exclude.iter().any(|g| g.contains("*.test.")), "tests are excluded: {:?}", up.exclude);
     }
 
     #[test]
@@ -321,6 +343,7 @@ mod tests {
         assert!(msg.contains("swallowed-error"), "{msg}");
         assert!(msg.contains("doc-contradicts-code"), "{msg}");
         assert!(msg.contains("stale-consumer"), "{msg}");
+        assert!(msg.contains("unnamed-predicate"), "{msg}");
     }
 
     /// #1959 finding 2: a user-tier override file only names the fields it
@@ -388,7 +411,7 @@ mod tests {
 
         let (map, warnings) = load_all(Some(dir.path()));
         // Embedded rules are still all present.
-        assert_eq!(map.len(), 3);
+        assert_eq!(map.len(), 4);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("broken.json"), "{warnings:?}");
     }

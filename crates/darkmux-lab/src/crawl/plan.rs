@@ -1092,6 +1092,54 @@ fn collect_export_strings(v: &serde_json::Value, out: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    // (#2206) Every embedded rule's prefilter must compile as a `regex`
+    // pattern — `plan_site_units` compiles them lazily per crawl, so a bad
+    // pattern in a builtin rule would otherwise surface only at launch. And
+    // the unnamed-predicate prefilter must actually HIT the shapes #2206
+    // names, and be honest about the shapes it lets through: null guards and
+    // default chains pass the prefilter by design — the rule's `no_match`
+    // prose excludes them at judgment, where the model can read intent.
+    #[test]
+    fn every_embedded_prefilter_compiles_and_unnamed_predicate_hits_its_shapes() {
+        let (rules, warnings) = darkmux_crew::rules::load_all(None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut compiled = 0;
+        for rule in rules.values() {
+            for p in &rule.prefilter {
+                Regex::new(p).unwrap_or_else(|e| panic!("rule '{}' prefilter {p:?}: {e}", rule.id));
+                compiled += 1;
+            }
+        }
+        assert!(compiled >= 4, "expected the builtin prefilters to be present, compiled {compiled}");
+
+        let up = &rules["unnamed-predicate"];
+        let res: Vec<Regex> = up.prefilter.iter().map(|p| Regex::new(p).unwrap()).collect();
+        assert_eq!(res.len(), 3);
+        let hits = |line: &str| res.iter().any(|r| r.is_match(line));
+        // Each prefilter gets a positive the OTHER TWO cannot match, so
+        // replacing any one of them with a never-matching pattern fails here
+        // (review finding on #2266: the first version's positives all carried
+        // two operators and were satisfied by prefilter 0 alone).
+        // prefilter 0: two boolean operators on one line
+        let two_ops = r#"if (status === "active" && daysOverdue < 30 && balance > 0) {"#;
+        assert!(res[0].is_match(two_ops) && !res[1].is_match(two_ops) && !res[2].is_match(two_ops), "p0 only");
+        // prefilter 1: a long `if (` — 80+ chars before the closing paren, ONE operator
+        let long_if = "if (subscription.billingModel.effectiveRate.amountInMinorUnits === expectedRate.amountInMinorUnits) {";
+        assert!(res[1].is_match(long_if) && !res[0].is_match(long_if) && !res[2].is_match(long_if), "p1 only");
+        // prefilter 2: a long ternary test — 50+ chars between `?` and `:`, no `&&`/`||`
+        let long_tern = "const label = isEligible ? formatEligibilityLabel(subscription, locale, options) : fallback;";
+        assert!(res[2].is_match(long_tern) && !res[0].is_match(long_tern) && !res[1].is_match(long_tern), "p2 only");
+        // the rule's other positive shape
+        assert!(hits("const cls = a && (b || c) ? x : y;"), "mixed && and ||");
+        // let through on purpose — excluded by `no_match` at judgment, not here
+        assert!(hits("if (x && x.y && x.y.z) {"), "a null guard passes the prefilter");
+        assert!(hits(r#"const d = a || b || "default";"#), "a default chain passes the prefilter");
+        // genuinely not a candidate
+        assert!(!hits("if (a && b) return;"), "two operands, short: not a candidate");
+        assert!(!hits("const n = items.length;"), "no operators at all");
+        assert!(!hits("const t = ok ? a : b;"), "a short ternary is not a candidate");
+    }
+
     use super::*;
     use darkmux_crew::rules::EdgeRuleConfig;
     use darkmux_crew::workspace_spec::EdgeSpec;
