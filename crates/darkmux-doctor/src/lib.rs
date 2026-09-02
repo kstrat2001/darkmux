@@ -9297,12 +9297,20 @@ mod tests {
 
     // ─── (#1959) check_rules_registry / build_rules_check ───────────────
 
+    // (#2206) The builtin count is READ from the registry, never pinned as a
+    // literal: the old form (`contains('3')`) broke the moment a fourth rule
+    // registered, and its sibling below passed only because "5 rule(s) loaded
+    // (4 built-in" happens to contain the digit it looked for. What these
+    // tests own is the message SHAPE and its internal consistency — total ==
+    // built-in when there is no user tier — not how many rules ship.
     #[test]
-    fn rules_check_passes_with_only_the_three_builtins_and_no_user_tier() {
+    fn rules_check_passes_with_only_the_builtins_and_no_user_tier() {
+        let n = darkmux_crew::rules::load_all(None).0.len();
+        assert!(n >= 4, "expected the builtin rules to be present, got {n}");
         let check = build_rules_check(None);
         assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains('3'), "{}", check.message);
-        assert!(check.message.contains("built-in"), "{}", check.message);
+        let expected = format!("{n} rule(s) loaded ({n} built-in, no user tier)");
+        assert_eq!(check.message, expected);
     }
 
     #[test]
@@ -9315,9 +9323,11 @@ mod tests {
         )
         .unwrap();
 
+        let n = darkmux_crew::rules::load_all(None).0.len();
         let check = build_rules_check(Some(tmp.path()));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains('4'), "{}", check.message);
+        let expected_prefix = format!("{} rule(s) loaded ({n} built-in, 1 user-tier file(s) at ", n + 1);
+        assert!(check.message.starts_with(&expected_prefix), "{}", check.message);
         assert!(check.message.contains("1 user-tier file"), "{}", check.message);
     }
 
