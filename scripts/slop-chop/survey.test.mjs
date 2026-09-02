@@ -117,3 +117,22 @@ test("survey keeps the FULL condition text; preview is the display cut; the orac
   assert.equal(o.mismatch, false, "the oracle re-parses the FULL text and agrees with the survey");
   assert.equal(o.table.length, 1 << 12);
 });
+
+test("a // line comment inside a multi-line condition survives the survey→oracle round-trip", () => {
+  const src = "function h(a, b, c) {\n  if (a && // note\n      b && c) return 1;\n}\n";
+  const [site] = scanSource("fixture.ts", src);
+  assert.deepEqual(site.ops, ["a", "b", "c"]);
+  assert.ok(site.text.includes("\n"), "text keeps the newline that ends the line comment");
+  assert.ok(!site.preview.includes("\n"), "preview is one line");
+  const [o] = oracles([site]);
+  assert.equal(o.mismatch, false);
+  assert.equal(o.table, "00000001");
+});
+
+test("delete and yield are mutating; a tagged template is an unknown call", () => {
+  const src = "function* k(o, a, x, tag) {\n  if (a && delete o.k && x) return 1;\n  if (a && (yield x) && a) return 2;\n  if (a && tag`t` && x) return 3;\n}\n";
+  const by = Object.fromEntries(scanSource("fixture.ts", src).map((st) => [st.line, st.cls]));
+  assert.equal(by[2], "mutating", "delete o.k");
+  assert.equal(by[3], "mutating", "yield");
+  assert.equal(by[4], "unknown", "tag`t`");
+});

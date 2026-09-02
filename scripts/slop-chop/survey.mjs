@@ -119,7 +119,8 @@ export function classifyNode(node) {
   const bump = (c) => (cls = worst(cls, c));
   const walk = (n) => {
     if (ts.isBinaryExpression(n) && isAssignmentOperator(n.operatorToken.kind)) bump("mutating");
-    else if (ts.isAwaitExpression(n)) bump("mutating");
+    else if (ts.isAwaitExpression(n) || ts.isDeleteExpression(n) || ts.isYieldExpression(n)) bump("mutating");
+    else if (ts.isTaggedTemplateExpression(n)) bump("unknown"); // a tagged template IS a call
     else if (
       (ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&
       (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken)
@@ -164,15 +165,20 @@ export function scanSource(label, text, { tsx = /x$/.test(label) } = {}) {
           // harmless as a column and became a data bug the moment the oracle
           // read it back: a cut inside a string literal still parses under
           // TypeScript's tolerant parser and yields a plausible wrong table.)
-          const full = cond.getText().replace(/\s+/g, " ");
+          // Raw, newlines intact: collapsing whitespace would turn a `//`
+          // line comment inside a multi-line condition into a comment that
+          // swallows the rest of the expression when the oracle re-parses
+          // it (review round 2 on #2266). Only `preview` is collapsed.
+          const raw = cond.getText();
+          const flat = raw.replace(/\s+/g, " ");
           sites.push({
             file: label,
             line: src.getLineAndCharacterOfPosition(cond.getStart()).line + 1,
             n: ls.length,
             ops: ls,
             cls: leafNodes(tree).map(classifyNode).reduce(worst, "pure"),
-            text: full,
-            preview: full.length > 240 ? full.slice(0, 237) + "..." : full,
+            text: raw,
+            preview: flat.length > 240 ? flat.slice(0, 237) + "..." : flat,
             table: truthTable(tree, ls),
           });
         }

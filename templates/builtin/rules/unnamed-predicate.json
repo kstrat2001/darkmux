@@ -1,5 +1,5 @@
 {
-  "_comment": "Site-shaped rule. The prefilter narrows a TypeScript/JavaScript tree to conditions built from several boolean operands; the model judges whether the condition encodes a domain concept that deserves a name. Unlike `swallowed-error`, this pattern is COMMON \u2014 which is what makes it usable as a calibration control.",
+  "_comment": "Site-shaped rule. The prefilter narrows a TypeScript/JavaScript tree to conditions built from several boolean operands; the model judges whether the condition encodes a domain concept that deserves a name. Unlike `swallowed-error`, this pattern is COMMON \u2014 which is what makes it usable as a calibration control. Prefilter 3 (`?...{50,}:`) is aimed at long ternary tests but also fires on a long optional chain followed by an object key's colon; that only widens the candidate set, and the AST survey discards non-conditions.",
   "id": "unnamed-predicate",
   "kind": "site",
   "title": "A compound condition encodes a domain rule that has no name and cannot be tested on its own",
