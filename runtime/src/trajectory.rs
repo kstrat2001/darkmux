@@ -149,11 +149,14 @@ impl Trajectory {
     }
 
     /// dispatch.start — first event in the trajectory.
+    /// (#2268) `tools` is the ADVERTISED tool-name list — what the model was
+    /// actually offered, after the allow-list — not what the host requested.
     pub fn append_dispatch_start(
         &mut self,
         model: &str,
         system_chars: usize,
         prompt_chars: usize,
+        tools: &[&str],
     ) {
         self.write_event(&serde_json::json!({
             "type": "dispatch.start",
@@ -161,6 +164,7 @@ impl Trajectory {
             "model": model,
             "system_chars": system_chars,
             "prompt_chars": prompt_chars,
+            "tools": tools,
         }));
     }
 
@@ -1039,11 +1043,26 @@ mod tests {
         assert!(traj_file.exists(), "trajectory file should be created");
     }
 
+    // (#2268) `dispatch.start` records the ADVERTISED tool names, so the
+    // "the model never saw report_finding" class is a grep of the artifact.
+    #[test]
+    fn dispatch_start_records_the_advertised_tools() {
+        let ws = tempfile::Builder::new().prefix("traj-test-tools").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_dispatch_start("m", 1, 1, &["search", "read", "bash", "report_finding"]);
+        drop(t);
+        let traj_file = ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE);
+        let body = fs::read_to_string(&traj_file).unwrap();
+        let first: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(first["type"], "dispatch.start");
+        assert_eq!(first["tools"], serde_json::json!(["search", "read", "bash", "report_finding"]));
+    }
+
     #[test]
     fn append_events_writes_jsonl() {
         let ws = tempfile::Builder::new().prefix("traj-test-2").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_dispatch_start("test-model", 100, 50);
+        t.append_dispatch_start("test-model", 100, 50, &["read", "search"]);
         t.append_model_completed(1, "stop", None, None);
         drop(t);
 
@@ -1290,7 +1309,7 @@ mod tests {
         let bad = Path::new("/proc/cannot-create-this/please");
         let mut t = Trajectory::open(bad);
         // This shouldn't panic or fail:
-        t.append_dispatch_start("model", 0, 0);
+        t.append_dispatch_start("model", 0, 0, &[]);
         // metrics save should also be a no-op:
         let m = Metrics {
             runtime: "darkmux-runtime",

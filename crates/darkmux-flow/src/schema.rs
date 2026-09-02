@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.31.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.32.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -661,6 +661,17 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.31.0";
 //           an existing action. Older readers ignore what they don't
 //           recognize; no struct/field change on `FlowRecord` itself, so
 //           prior AuditFileSink chains survive without rotation.
+//   1.32.0 (#2268): `dispatch start`'s payload gains `tools_requested` —
+//           the tool names the host asked the runtime to advertise
+//           (`--allowed-tools`, derived from the role's palette), or `null`
+//           when the role declares no palette and the runtime's full catalog
+//           applies. The runtime's own trajectory `dispatch.start` gains the
+//           matching `tools` (what was ADVERTISED). Two records, two producers,
+//           so a gap between them is visible in the artifact: the crawler's
+//           `report_finding` was requested and never advertised for every
+//           build from #2182 (2026-08-31) to this one, and nothing recorded
+//           either list. Additive payload key on an existing action; older
+//           readers ignore it.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

@@ -898,6 +898,7 @@
             std::path::Path::new("/tmp/ws"),
             false,
             None,
+            None,
         );
 
         // The wiring itself: this key would be ABSENT entirely if the
@@ -939,6 +940,7 @@
             "sys",
             std::path::Path::new("/tmp/ws"),
             true,
+            None,
             None,
         );
         assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
@@ -8588,4 +8590,62 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             payload.get("host_window").is_none(),
             "unsampled must omit host_window on the FLOW RECORD too, never zero it"
         );
+    
+}
+
+    // (#2268) The requested tool list rides on the dispatch-start record —
+    // `null` when the role declares no palette (full catalog), the names
+    // otherwise — so a request/advertised gap is visible in the artifact.
+    #[test]
+    fn dispatch_start_payload_json_carries_tools_requested_or_null() {
+        let none = dispatch_start_payload_json(
+            "darkmux-runtime:latest",
+            "msg",
+            "sys",
+            std::path::Path::new("/tmp/ws"),
+            false,
+            None,
+            None,
+        );
+        assert!(none["tools_requested"].is_null(), "{}", none);
+        let names = vec!["read".to_string(), "search".to_string(), "bash".to_string(), "report_finding".to_string()];
+        let some = dispatch_start_payload_json(
+            "darkmux-runtime:latest",
+            "msg",
+            "sys",
+            std::path::Path::new("/tmp/ws"),
+            false,
+            None,
+            Some(&names),
+        );
+        assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "report_finding"]));
     }
+
+    // (#2268) The host half of the end-to-end claim: the crawler role's
+    // palette must reach the runtime as `read,search,bash,report_finding`.
+    // Pinned here so a palette or mapping change that drops report_finding
+    // fails a host test, not a crawl.
+    #[test]
+    fn allowed_tools_crawler_palette_names_report_finding_last() {
+        let p = palette(&["read", "exec", "report_finding"], &["edit", "write", "process"]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        assert_eq!(result, vec!["read", "search", "bash", "report_finding"]);
+    }
+
+    // (#2268, review rounds 2-3) The REAL builtin crawler manifest, not a
+    // hand-written mirror of it: a change to templates/builtin/roles/
+    // crawler.json that drops report_finding from `allow` (or moves it to
+    // `deny`) must fail here, not surface as a crawl with no output channel.
+    // Read through `loader::builtin_role`, which parses the EMBEDDED JSON and
+    // nothing else — `load_roles()` merges the operator's user tier first,
+    // and review proved a local `crawler.json` override flips a test that
+    // goes through it, in either direction.
+    #[test]
+    fn the_builtin_crawler_manifest_reaches_the_runtime_with_report_finding() {
+        let crawler = crate::loader::builtin_role("crawler")
+            .expect("the embedded crawler manifest parses")
+            .expect("the crawler role is a builtin");
+        let result = compute_runtime_allowed_tools(&crawler.tool_palette).expect("crawler declares a palette");
+        assert_eq!(result, vec!["read", "search", "bash", "report_finding"], "palette: {:?}", crawler.tool_palette);
+    }
+

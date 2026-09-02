@@ -51,30 +51,55 @@ const READ_MAX_BYTES: usize = 1024 * 1024; // 1 MB
 const BASH_DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// All tools the runtime can dispatch in this phase.
-#[derive(Debug, Clone, Copy)]
-pub enum Tool {
-    Echo,
-    Bash,
-    Read,
-    Write,
-    Edit,
-    Search,
-    ReportFinding,
+/// (#2268) The tool set is declared ONCE: this macro emits the enum,
+/// `Tool::ALL`, `Tool::name`, and `Tool::from_name` from a single
+/// `Variant => "wire_name"` list, so a tool cannot exist in one of them and
+/// not the others. The first version of this fix kept a hand-typed `ALL`
+/// beside the enum and a hand-typed count in a test; review proved that a
+/// variant added to the enum and to every match arm — the edit a developer
+/// is actually compelled to make — left `ALL` stale with the suite green.
+/// Membership is structural now, not asserted. (`description` stays a plain
+/// exhaustive match below: long strings, and the compiler already forces it.)
+macro_rules! tools {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy)]
+        pub enum Tool {
+            $($variant),+
+        }
+
+        impl Tool {
+            /// Every variant, in declaration order — the one list.
+            pub const ALL: &'static [Tool] = &[$(Tool::$variant),+];
+
+            /// The wire name the model calls this tool by.
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(Tool::$variant => $wire),+
+                }
+            }
+
+            /// Resolve a wire name; `None` for a name that is not a tool.
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($wire => Some(Tool::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+tools! {
+    Echo => "echo",
+    Bash => "bash",
+    Read => "read",
+    Write => "write",
+    Edit => "edit",
+    Search => "search",
+    ReportFinding => "report_finding",
 }
 
 impl Tool {
-    pub fn name(self) -> &'static str {
-        match self {
-            Tool::Echo => "echo",
-            Tool::Bash => "bash",
-            Tool::Read => "read",
-            Tool::Write => "write",
-            Tool::Edit => "edit",
-            Tool::Search => "search",
-            Tool::ReportFinding => "report_finding",
-        }
-    }
-
     pub fn description(self) -> &'static str {
         match self {
             Tool::Echo => {
@@ -368,18 +393,6 @@ impl Tool {
         }
     }
 
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "echo" => Some(Tool::Echo),
-            "bash" => Some(Tool::Bash),
-            "read" => Some(Tool::Read),
-            "write" => Some(Tool::Write),
-            "edit" => Some(Tool::Edit),
-            "search" => Some(Tool::Search),
-            "report_finding" => Some(Tool::ReportFinding),
-            _ => None,
-        }
-    }
 }
 
 /// Dispatch a tool by name with raw JSON args. Returns the string the
@@ -936,6 +949,26 @@ fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, hits: &mut Vec<String>,
 
 #[cfg(test)]
 mod tests {
+    // (#2268) `Tool::ALL`, `name`, and `from_name` are generated from one
+    // list by the `tools!` macro, so membership cannot drift and a round-trip
+    // through `from_name` is true by construction (review round 3: such a
+    // test pinned only the one literal it named). What a generated list CAN
+    // still get wrong is the WIRE NAMES themselves — a typo, a duplicate, a
+    // reorder — and those are the model-facing contract. So: a golden of the
+    // whole set, in order. Adding a tool is a deliberate edit here too.
+    #[test]
+    fn the_wire_name_set_is_exactly_this() {
+        let names: Vec<&str> = super::Tool::ALL.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["echo", "bash", "read", "write", "edit", "search", "report_finding"]);
+        // and no two variants share a wire name (a duplicate would also be an
+        // unreachable-pattern error under -D warnings in from_name)
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "duplicate wire name in {names:?}");
+    }
+
+
     use super::*;
     use std::fs;
 

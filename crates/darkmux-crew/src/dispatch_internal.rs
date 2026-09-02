@@ -3532,6 +3532,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &workspace,
         agentic_pm.is_some(),
         opts.max_turns_override,
+        allowed_tools.as_deref(),
     );
     // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
@@ -4465,6 +4466,7 @@ fn dispatch_start_payload_json(
     workspace: &std::path::Path,
     is_agentic_remote: bool,
     max_turns_override: Option<u32>,
+    tools_requested: Option<&[String]>,
 ) -> serde_json::Value {
     serde_json::json!({
         "runtime": "internal",
@@ -4473,6 +4475,12 @@ fn dispatch_start_payload_json(
         // brief + recent-runs rail read `payload.image`; it was a dead
         // reference until now (no path emitted it).
         "image": image,
+        // (#2268) The tool names this dispatch REQUESTED of the runtime
+        // (`--allowed-tools`, from the role's palette); `null` when the role
+        // declares no palette and the runtime's full catalog applies. The
+        // runtime records what it ADVERTISED on its trajectory `dispatch.start`;
+        // a gap between the two is the class that hid `report_finding`.
+        "tools_requested": tools_requested,
         "prompt_chars": message.chars().count(),
         // (#1127) The dispatch prompt text (capped) — run context the viewer
         // renders collapsed. prompt_chars carries the full length.
