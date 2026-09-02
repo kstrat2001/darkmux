@@ -51,48 +51,55 @@ const READ_MAX_BYTES: usize = 1024 * 1024; // 1 MB
 const BASH_DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// All tools the runtime can dispatch in this phase.
-#[derive(Debug, Clone, Copy)]
-pub enum Tool {
-    Echo,
-    Bash,
-    Read,
-    Write,
-    Edit,
-    Search,
-    ReportFinding,
-}
-
-impl Tool {
-    /// (#2268) Every variant, in one place. This is the list the runtime's
-    /// "unknown --allowed-tools name" message and the advertise-every-named-
-    /// tool test both walk, so there is no second hand-typed list to drift
-    /// (the #2195 class). `all_is_exhaustive` in the tests below is a match
-    /// with no wildcard: add a variant to the enum without adding it here
-    /// and that test stops compiling.
-    pub const ALL: &'static [Tool] = &[
-        Tool::Echo,
-        Tool::Bash,
-        Tool::Read,
-        Tool::Write,
-        Tool::Edit,
-        Tool::Search,
-        Tool::ReportFinding,
-    ];
-}
-
-impl Tool {
-    pub fn name(self) -> &'static str {
-        match self {
-            Tool::Echo => "echo",
-            Tool::Bash => "bash",
-            Tool::Read => "read",
-            Tool::Write => "write",
-            Tool::Edit => "edit",
-            Tool::Search => "search",
-            Tool::ReportFinding => "report_finding",
+/// (#2268) The tool set is declared ONCE: this macro emits the enum,
+/// `Tool::ALL`, `Tool::name`, and `Tool::from_name` from a single
+/// `Variant => "wire_name"` list, so a tool cannot exist in one of them and
+/// not the others. The first version of this fix kept a hand-typed `ALL`
+/// beside the enum and a hand-typed count in a test; review proved that a
+/// variant added to the enum and to every match arm — the edit a developer
+/// is actually compelled to make — left `ALL` stale with the suite green.
+/// Membership is structural now, not asserted. (`description` stays a plain
+/// exhaustive match below: long strings, and the compiler already forces it.)
+macro_rules! tools {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy)]
+        pub enum Tool {
+            $($variant),+
         }
-    }
 
+        impl Tool {
+            /// Every variant, in declaration order — the one list.
+            pub const ALL: &'static [Tool] = &[$(Tool::$variant),+];
+
+            /// The wire name the model calls this tool by.
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(Tool::$variant => $wire),+
+                }
+            }
+
+            /// Resolve a wire name; `None` for a name that is not a tool.
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($wire => Some(Tool::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+tools! {
+    Echo => "echo",
+    Bash => "bash",
+    Read => "read",
+    Write => "write",
+    Edit => "edit",
+    Search => "search",
+    ReportFinding => "report_finding",
+}
+
+impl Tool {
     pub fn description(self) -> &'static str {
         match self {
             Tool::Echo => {
@@ -386,18 +393,6 @@ impl Tool {
         }
     }
 
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "echo" => Some(Tool::Echo),
-            "bash" => Some(Tool::Bash),
-            "read" => Some(Tool::Read),
-            "write" => Some(Tool::Write),
-            "edit" => Some(Tool::Edit),
-            "search" => Some(Tool::Search),
-            "report_finding" => Some(Tool::ReportFinding),
-            _ => None,
-        }
-    }
 }
 
 /// Dispatch a tool by name with raw JSON args. Returns the string the
@@ -954,28 +949,20 @@ fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, hits: &mut Vec<String>,
 
 #[cfg(test)]
 mod tests {
-    // (#2268) `Tool::ALL` is the single source for "every tool". Two guards:
-    // the match below has NO wildcard, so a variant added to the enum but not
-    // to `ALL` fails to compile right here; and every entry round-trips
-    // through `from_name`, so `ALL`, `name()`, and `from_name` cannot drift.
+    // (#2268) `Tool::ALL`, `name`, and `from_name` are generated from one
+    // list by the `tools!` macro, so membership cannot drift. What CAN still
+    // drift is a `from_name` alias or a wire-name typo in the list, which
+    // this round-trip pins: every entry resolves back to itself by name.
     #[test]
-    fn all_is_exhaustive_and_round_trips_through_from_name() {
+    fn every_tool_round_trips_through_from_name() {
         for t in super::Tool::ALL {
-            // no wildcard on purpose — see the comment above
-            match t {
-                super::Tool::Echo
-                | super::Tool::Bash
-                | super::Tool::Read
-                | super::Tool::Write
-                | super::Tool::Edit
-                | super::Tool::Search
-                | super::Tool::ReportFinding => {}
-            }
-            let back = super::Tool::from_name(t.name()).unwrap_or_else(|| panic!("`{}` is in ALL but from_name does not resolve it", t.name()));
+            let back = super::Tool::from_name(t.name())
+                .unwrap_or_else(|| panic!("`{}` is in ALL but from_name does not resolve it", t.name()));
             assert_eq!(back.name(), t.name());
         }
-        assert_eq!(super::Tool::ALL.len(), 7, "ALL must list every variant exactly once");
+        assert!(super::Tool::ALL.iter().any(|t| t.name() == "report_finding"), "the crawler's tool is a real tool");
     }
+
 
     use super::*;
     use std::fs;

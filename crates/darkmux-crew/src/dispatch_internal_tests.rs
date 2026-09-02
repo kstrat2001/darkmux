@@ -8631,3 +8631,16 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
         assert_eq!(result, vec!["read", "search", "bash", "report_finding"]);
     }
+
+    // (#2268, review round 2) The REAL builtin crawler manifest, not a
+    // hand-written mirror of it: a change to templates/builtin/roles/
+    // crawler.json that drops report_finding from `allow` (or moves it to
+    // `deny`) must fail here, not surface as a crawl with no output channel.
+    #[test]
+    fn the_builtin_crawler_manifest_reaches_the_runtime_with_report_finding() {
+        let roles = crate::loader::load_roles().expect("builtin roles load");
+        let crawler = roles.iter().find(|r| r.id == "crawler").expect("builtin crawler role exists");
+        let result = compute_runtime_allowed_tools(&crawler.tool_palette).expect("crawler declares a palette");
+        assert_eq!(result, vec!["read", "search", "bash", "report_finding"], "palette: {:?}", crawler.tool_palette);
+    }
+

@@ -1309,8 +1309,12 @@ fn parse_auth_header_json(contents: &str) -> Result<(String, String), String> {
 ///
 /// Rule: catalog ∩ allow (catalog order, as before), then every allowed name
 /// the catalog lacks that `Tool::from_name` resolves (allow order), deduped.
-/// An allowed name nothing resolves is reported and ignored — the host
-/// validates role vocabulary; the runtime must not go silent on a typo.
+/// An allowed name nothing resolves is reported on stderr and ignored — the
+/// host validates role vocabulary, so this is a host/runtime version skew
+/// signal. Note the host keeps a successful unit's stderr only as a byte
+/// count (`stderr_excerpt` is `None` on exit 0), so on the crawl path the
+/// durable signal is the artifact instead: `tools_requested` on the host's
+/// `dispatch start` record versus `tools` on the trajectory's.
 /// `None` (no list) is the full catalog, unchanged.
 fn advertised_tools(full_catalog: &[Tool], allowed: Option<&[String]>) -> Vec<Tool> {
     let mut tools = filter_tools_by_allowed(full_catalog, allowed);
