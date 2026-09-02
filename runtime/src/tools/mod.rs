@@ -950,17 +950,22 @@ fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, hits: &mut Vec<String>,
 #[cfg(test)]
 mod tests {
     // (#2268) `Tool::ALL`, `name`, and `from_name` are generated from one
-    // list by the `tools!` macro, so membership cannot drift. What CAN still
-    // drift is a `from_name` alias or a wire-name typo in the list, which
-    // this round-trip pins: every entry resolves back to itself by name.
+    // list by the `tools!` macro, so membership cannot drift and a round-trip
+    // through `from_name` is true by construction (review round 3: such a
+    // test pinned only the one literal it named). What a generated list CAN
+    // still get wrong is the WIRE NAMES themselves — a typo, a duplicate, a
+    // reorder — and those are the model-facing contract. So: a golden of the
+    // whole set, in order. Adding a tool is a deliberate edit here too.
     #[test]
-    fn every_tool_round_trips_through_from_name() {
-        for t in super::Tool::ALL {
-            let back = super::Tool::from_name(t.name())
-                .unwrap_or_else(|| panic!("`{}` is in ALL but from_name does not resolve it", t.name()));
-            assert_eq!(back.name(), t.name());
-        }
-        assert!(super::Tool::ALL.iter().any(|t| t.name() == "report_finding"), "the crawler's tool is a real tool");
+    fn the_wire_name_set_is_exactly_this() {
+        let names: Vec<&str> = super::Tool::ALL.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["echo", "bash", "read", "write", "edit", "search", "report_finding"]);
+        // and no two variants share a wire name (a duplicate would also be an
+        // unreachable-pattern error under -D warnings in from_name)
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "duplicate wire name in {names:?}");
     }
 
 
