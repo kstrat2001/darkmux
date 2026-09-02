@@ -368,6 +368,13 @@ impl Tool {
         }
     }
 
+    /// (#2268) Every name `from_name` resolves, for the runtime's own
+    /// "unknown --allowed-tools name" message. Keep in sync with `from_name`;
+    /// `every_named_tool_is_advertised_when_the_allow_list_names_it` walks
+    /// the real variants and would catch a tool added to one and not the other.
+    pub const ALL_NAMES: &'static [&'static str] =
+        &["echo", "bash", "read", "write", "edit", "search", "report_finding"];
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "echo" => Some(Tool::Echo),

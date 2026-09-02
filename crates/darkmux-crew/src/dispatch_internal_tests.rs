@@ -898,6 +898,7 @@
             std::path::Path::new("/tmp/ws"),
             false,
             None,
+            None,
         );
 
         // The wiring itself: this key would be ABSENT entirely if the
@@ -939,6 +940,7 @@
             "sys",
             std::path::Path::new("/tmp/ws"),
             true,
+            None,
             None,
         );
         assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
@@ -8588,4 +8590,33 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             payload.get("host_window").is_none(),
             "unsampled must omit host_window on the FLOW RECORD too, never zero it"
         );
+    
+}
+
+    // (#2268) The requested tool list rides on the dispatch-start record —
+    // `null` when the role declares no palette (full catalog), the names
+    // otherwise — so a request/advertised gap is visible in the artifact.
+    #[test]
+    fn dispatch_start_payload_json_carries_tools_requested_or_null() {
+        let none = dispatch_start_payload_json(
+            "darkmux-runtime:latest",
+            "msg",
+            "sys",
+            std::path::Path::new("/tmp/ws"),
+            false,
+            None,
+            None,
+        );
+        assert!(none["tools_requested"].is_null(), "{}", none);
+        let names = vec!["read".to_string(), "search".to_string(), "bash".to_string(), "report_finding".to_string()];
+        let some = dispatch_start_payload_json(
+            "darkmux-runtime:latest",
+            "msg",
+            "sys",
+            std::path::Path::new("/tmp/ws"),
+            false,
+            None,
+            Some(&names),
+        );
+        assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "report_finding"]));
     }

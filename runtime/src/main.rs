@@ -802,7 +802,13 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // no use in real dispatches; sending it adds tool-catalog overhead
     // the model would never invoke.
     let full_catalog = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
-    let tools = filter_tools_by_allowed(&full_catalog, allowed_tools.as_deref());
+    let tools = advertised_tools(&full_catalog, allowed_tools.as_deref());
+    // (#2268) The advertised set is a FACT about this run and belongs in
+    // the artifact: the crawler's `report_finding` was silently absent from
+    // every request for two releases, and the first place that was visible
+    // was the model's own reasoning ("The tools I have are: search, read,
+    // bash"). Recorded on `dispatch.start` so the next such gap is a grep.
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
     // (Security audit, #2114 resume follow-up) Refuses a CROSS-ROLE or
     // CROSS-PROMPT resume — a checkpoint written under a different role,
@@ -886,7 +892,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         .unwrap_or(0);
     let system_chars = initial_messages[0].content.as_deref().map(str::len).unwrap_or(0);
     let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
-    traj.append_dispatch_start(&model, system_chars, prompt_chars);
+    traj.append_dispatch_start(&model, system_chars, prompt_chars, &tool_names);
 
     // (#368) Compaction config from explicit CLI args; no env-var
     // fallback (operator's tuning surface is the profile JSON, not
@@ -1289,6 +1295,43 @@ fn parse_auth_header_json(contents: &str) -> Result<(String, String), String> {
 /// the edit tool because the tool existed in the catalog. With this
 /// filter, denied tools are never in the catalog the LMStudio chat-
 /// completions API sees, so the model cannot call them.
+/// (#2268) The tools this run ADVERTISES to the model. `full_catalog` is the
+/// general-purpose set every role can draw from; an explicit `--allowed-tools`
+/// list is authoritative and may name a tool that is NOT in the catalog
+/// (`report_finding` — crawler-only, deliberately kept out of the general
+/// catalog so a role with an empty palette never sees it). Before this, such
+/// a name was filtered against the catalog and vanished: the host passed
+/// `--allowed-tools read,search,bash,report_finding`, the runtime advertised
+/// `search,read,bash`, and since #2182 derived the execution allow-list from
+/// the ADVERTISED set, so the crawler could neither see nor call the one
+/// tool its role exists for. It had only ever worked because the pre-#2182
+/// structured path executed any `from_name`-resolvable call unadvertised.
+///
+/// Rule: catalog ∩ allow (catalog order, as before), then every allowed name
+/// the catalog lacks that `Tool::from_name` resolves (allow order), deduped.
+/// An allowed name nothing resolves is reported and ignored — the host
+/// validates role vocabulary; the runtime must not go silent on a typo.
+/// `None` (no list) is the full catalog, unchanged.
+fn advertised_tools(full_catalog: &[Tool], allowed: Option<&[String]>) -> Vec<Tool> {
+    let mut tools = filter_tools_by_allowed(full_catalog, allowed);
+    if let Some(names) = allowed {
+        for name in names {
+            if tools.iter().any(|t| t.name() == name) {
+                continue;
+            }
+            match Tool::from_name(name) {
+                Some(t) => tools.push(t),
+                None => eprintln!(
+                    "darkmux-runtime: --allowed-tools names `{name}`, which is not a tool this \
+                     runtime knows; ignoring it (known: {})",
+                    Tool::ALL_NAMES.join(", ")
+                ),
+            }
+        }
+    }
+    tools
+}
+
 fn filter_tools_by_allowed(tools: &[Tool], allowed: Option<&[String]>) -> Vec<Tool> {
     match allowed {
         None => tools.to_vec(),
@@ -1323,6 +1366,49 @@ mod tests {
             !result.iter().any(|t| matches!(t, Tool::Edit | Tool::Write)),
             "filtered catalog must NOT include Edit or Write; got {result:?}"
         );
+    }
+
+    // (#2268) RED before the fix: `report_finding` is a real tool with a
+    // `from_name` mapping, is named by the crawler role's palette, and was
+    // never advertised because it is not in `full_catalog`.
+    #[test]
+    fn every_named_tool_is_advertised_when_the_allow_list_names_it() {
+        let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+        for t in [Tool::Bash, Tool::Read, Tool::Write, Tool::Edit, Tool::Search, Tool::ReportFinding] {
+            let allow = vec![t.name().to_string()];
+            let out = advertised_tools(&full, Some(&allow));
+            assert!(
+                out.iter().any(|x| x.name() == t.name()),
+                "`{}` is named by --allowed-tools but was not advertised: {:?}",
+                t.name(),
+                out.iter().map(|x| x.name()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_tools_keeps_catalog_order_then_appends_extras_in_allow_order() {
+        let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+        let allow: Vec<String> = ["report_finding", "bash", "read", "search"].iter().map(|s| s.to_string()).collect();
+        let names: Vec<&str> = advertised_tools(&full, Some(&allow)).iter().map(|t| t.name()).collect();
+        // the crawler's exact palette: catalog members first in CATALOG order, then the extra
+        assert_eq!(names, vec!["search", "read", "bash", "report_finding"]);
+    }
+
+    #[test]
+    fn advertised_tools_none_is_the_full_catalog_and_never_adds_report_finding() {
+        let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+        let out = advertised_tools(&full, None);
+        assert_eq!(out.len(), 5);
+        assert!(!out.iter().any(|t| matches!(t, Tool::ReportFinding)), "an empty palette must not expose report_finding");
+    }
+
+    #[test]
+    fn advertised_tools_ignores_an_unknown_name_and_dedupes() {
+        let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+        let allow: Vec<String> = ["read", "not_a_tool", "read", "report_finding", "report_finding"].iter().map(|s| s.to_string()).collect();
+        let names: Vec<&str> = advertised_tools(&full, Some(&allow)).iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["read", "report_finding"]);
     }
 
     #[test]
