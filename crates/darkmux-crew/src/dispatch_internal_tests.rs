@@ -8620,3 +8620,14 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
         assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "report_finding"]));
     }
+
+    // (#2268) The host half of the end-to-end claim: the crawler role's
+    // palette must reach the runtime as `read,search,bash,report_finding`.
+    // Pinned here so a palette or mapping change that drops report_finding
+    // fails a host test, not a crawl.
+    #[test]
+    fn allowed_tools_crawler_palette_names_report_finding_last() {
+        let p = palette(&["read", "exec", "report_finding"], &["edit", "write", "process"]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        assert_eq!(result, vec!["read", "search", "bash", "report_finding"]);
+    }

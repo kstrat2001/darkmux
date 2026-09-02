@@ -63,6 +63,24 @@ pub enum Tool {
 }
 
 impl Tool {
+    /// (#2268) Every variant, in one place. This is the list the runtime's
+    /// "unknown --allowed-tools name" message and the advertise-every-named-
+    /// tool test both walk, so there is no second hand-typed list to drift
+    /// (the #2195 class). `all_is_exhaustive` in the tests below is a match
+    /// with no wildcard: add a variant to the enum without adding it here
+    /// and that test stops compiling.
+    pub const ALL: &'static [Tool] = &[
+        Tool::Echo,
+        Tool::Bash,
+        Tool::Read,
+        Tool::Write,
+        Tool::Edit,
+        Tool::Search,
+        Tool::ReportFinding,
+    ];
+}
+
+impl Tool {
     pub fn name(self) -> &'static str {
         match self {
             Tool::Echo => "echo",
@@ -367,13 +385,6 @@ impl Tool {
             ),
         }
     }
-
-    /// (#2268) Every name `from_name` resolves, for the runtime's own
-    /// "unknown --allowed-tools name" message. Keep in sync with `from_name`;
-    /// `every_named_tool_is_advertised_when_the_allow_list_names_it` walks
-    /// the real variants and would catch a tool added to one and not the other.
-    pub const ALL_NAMES: &'static [&'static str] =
-        &["echo", "bash", "read", "write", "edit", "search", "report_finding"];
 
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
@@ -943,6 +954,29 @@ fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, hits: &mut Vec<String>,
 
 #[cfg(test)]
 mod tests {
+    // (#2268) `Tool::ALL` is the single source for "every tool". Two guards:
+    // the match below has NO wildcard, so a variant added to the enum but not
+    // to `ALL` fails to compile right here; and every entry round-trips
+    // through `from_name`, so `ALL`, `name()`, and `from_name` cannot drift.
+    #[test]
+    fn all_is_exhaustive_and_round_trips_through_from_name() {
+        for t in super::Tool::ALL {
+            // no wildcard on purpose — see the comment above
+            match t {
+                super::Tool::Echo
+                | super::Tool::Bash
+                | super::Tool::Read
+                | super::Tool::Write
+                | super::Tool::Edit
+                | super::Tool::Search
+                | super::Tool::ReportFinding => {}
+            }
+            let back = super::Tool::from_name(t.name()).unwrap_or_else(|| panic!("`{}` is in ALL but from_name does not resolve it", t.name()));
+            assert_eq!(back.name(), t.name());
+        }
+        assert_eq!(super::Tool::ALL.len(), 7, "ALL must list every variant exactly once");
+    }
+
     use super::*;
     use std::fs;
 

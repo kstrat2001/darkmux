@@ -1324,7 +1324,7 @@ fn advertised_tools(full_catalog: &[Tool], allowed: Option<&[String]>) -> Vec<To
                 None => eprintln!(
                     "darkmux-runtime: --allowed-tools names `{name}`, which is not a tool this \
                      runtime knows; ignoring it (known: {})",
-                    Tool::ALL_NAMES.join(", ")
+                    Tool::ALL.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
                 ),
             }
         }
@@ -1374,7 +1374,7 @@ mod tests {
     #[test]
     fn every_named_tool_is_advertised_when_the_allow_list_names_it() {
         let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
-        for t in [Tool::Bash, Tool::Read, Tool::Write, Tool::Edit, Tool::Search, Tool::ReportFinding] {
+        for t in Tool::ALL {
             let allow = vec![t.name().to_string()];
             let out = advertised_tools(&full, Some(&allow));
             assert!(
@@ -1389,10 +1389,16 @@ mod tests {
     #[test]
     fn advertised_tools_keeps_catalog_order_then_appends_extras_in_allow_order() {
         let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
-        let allow: Vec<String> = ["report_finding", "bash", "read", "search"].iter().map(|s| s.to_string()).collect();
+        // the crawler's palette as the host actually emits it (`read` → read,search;
+        // `exec` → bash; then report_finding): catalog members come out in CATALOG
+        // order regardless of allow order, then the extra — so report_finding is LAST.
+        let allow: Vec<String> = ["read", "search", "bash", "report_finding"].iter().map(|s| s.to_string()).collect();
         let names: Vec<&str> = advertised_tools(&full, Some(&allow)).iter().map(|t| t.name()).collect();
-        // the crawler's exact palette: catalog members first in CATALOG order, then the extra
         assert_eq!(names, vec!["search", "read", "bash", "report_finding"]);
+        // and allow order does not change that
+        let allow2: Vec<String> = ["report_finding", "bash", "read", "search"].iter().map(|s| s.to_string()).collect();
+        let names2: Vec<&str> = advertised_tools(&full, Some(&allow2)).iter().map(|t| t.name()).collect();
+        assert_eq!(names2, names);
     }
 
     #[test]
