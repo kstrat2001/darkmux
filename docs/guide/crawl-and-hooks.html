@@ -33,7 +33,7 @@
     <div class="label">10 <span class="dot">·</span> advanced</div>
     <h1>Crawl a codebase against your rules, and route what it finds</h1>
 <p class="note"><strong>Beta.</strong> The crawl mission and hooks shipped in 3.4.0 as a public beta: the pieces on this page run and are exercised on darkmux's own code every day, but the mission inputs and the hook record shapes may still change between minor releases without a deprecation period. Mechanical coverage accounting and typed hook kinds are not built yet.</p>
-    <p class="lede">A <strong>crawl</strong> (#1959) is a mission like any other: point it at real source trees, name the rules you want checked, and a local model reads bounded slices of code and reports findings through <code>report_finding</code>. Everything the crawl does streams as ordinary flow records, so the last piece is routing: <strong>hooks</strong> (#2093) match those records against operator rules and POST the matches to your own receiver — loopback on the same machine, or another machine on your own tailnet (#2135 option 2). No external tracker knows darkmux exists, and darkmux never leaves that boundary to reach one.</p>
+    <p class="lede">A <strong>crawl</strong> (#1959) is a mission like any other: point it at real source trees, name the rules you want checked, and a local model reads bounded slices of code and records each match with <code>create_finding</code>. darkmux is the worker here, never the orchestrator: it never reads your tracker, never decides which findings deserve a change, never opens a PR. It does two things with what it observes. First, every accepted call becomes a <strong>finding</strong> — a write-once record you can list and show straight from darkmux, with no hook configured at all (below). Second, everything the crawl does streams as ordinary flow records, so the piece that gets a finding to somewhere you already look is routing: <strong>hooks</strong> (#2093) match those records against operator rules and POST the matches to your own receiver — loopback on the same machine, or another machine on your own tailnet (#2135 option 2). No external tracker knows darkmux exists, and darkmux never leaves that boundary to reach one.</p>
   </div>
 </header>
 
@@ -175,16 +175,130 @@ mission close            <span class="comment"># units_completed/errored/skipped
 
 <section>
   <div class="wrap">
-    <h2>4. Hooks: routing flow records to your own receiver</h2>
+    <h2>4. The finding record</h2>
+    <p><strong>darkmux is the worker, not the orchestrator.</strong> It is asked to observe — a crawl, a review, a one-off dispatch with the right tool granted — and it records what it observed. It never reads a tracker, never decides which observations deserve a change, and never opens a PR: those are the orchestrator's job, whether the orchestrator is a frontier session, a person, or a scheduled mission later on. That's why the record exists independently of hooks: you get a queryable local copy of every finding whether or not you ever configure routing.</p>
+
+    <h3><code>create_finding</code>, and what it produces</h3>
+    <p>The runtime tool a crawler (or any role granted it) calls is <code>create_finding</code> — renamed from <code>report_finding</code> on 2026-09-03: the tool <em>creates</em> a record, a hook is what <em>reports</em> it. A <strong>finding</strong> is an event: it happened at a moment, from a dispatch, and it is never rewritten. Its key is <code>&lt;dispatch&gt;/&lt;seq&gt;</code> — the dispatch that produced it and the ordinal of the acceptance within that dispatch. darkmux does not interpret the emission: a record is metadata (mission, unit, rule, source, sha — whatever the launcher supplied as context) plus the model's arguments verbatim. A finding's location is domain-specific — a line for text, a page for a PDF, a rect for an image — so there's no field for it on darkmux's side to parse.</p>
+
+    <h3><code>finding list</code> / <code>finding show</code> / <code>finding sync</code></h3>
+    <p>Real usage, from the installed binary:</p>
+    <pre><code>$ darkmux finding --help
+Findings (#2265) — what a dispatch OBSERVED, keyed `&lt;dispatch&gt;/&lt;seq&gt;`. A finding is an
+event: written once when an accepted `create_finding` call streams past, never rewritten.
+The flow stream stays the audit trail; this store is the queryable copy the verbs read.
+darkmux never interprets the emission — a record is metadata plus the model's own
+arguments verbatim
+
+Usage: darkmux finding &lt;COMMAND&gt;
+
+Commands:
+  list  List findings in the store, ts-ascending
+  show  Show one finding, whole, by its `&lt;dispatch&gt;/&lt;seq&gt;` key
+  sync  Replay the flow stream into the store — the SECOND producer, for anything the
+        live tailer missed (an older binary, a killed process)
+  help  Print this message or the help of the given subcommand(s)</code></pre>
+    <p>Real output against this machine's store — <code>list</code> reads the store only, never the flow stream, and previews a truncated, compact copy of the raw emission:</p>
+    <pre><code>$ darkmux finding list
+crawl-crawl-1788400556-b1119b-u-0001/1  2026-09-03T01:59:29Z  crawler (qwen3.6-35b-a3b-turboquant-mlx)  [mission=crawl-1788400556-b1119b unit=u-0001 rule=unnamed-predicate]
+    {"evidence":"  const playhead = transport.active &amp;&amp; transport.scrubbed &amp;&amp; transport.t &lt; transport.tM…
+crawl-crawl-1788402801-729335-u-0004/1  2026-09-03T02:42:16Z  crawler (qwen3.6-35b-a3b-turboquant-mlx)  [mission=crawl-1788402801-729335 unit=u-0004 rule=unnamed-predicate]
+    {"evidence":"  const pending = open &amp;&amp; (!daysQuery.data || !missionsQuery.data);","file":"/workspace…
+<span class="comment"># ...6 more rows...</span>
+
+8 finding(s) in ~/.darkmux/findings</code></pre>
+    <p><code>finding show &lt;key&gt;</code> prints one record whole, including the context the launcher supplied and the emission pretty-printed. This one predates the 2026-09-03 rename above, so its <code>tool</code> line still reads <code>report_finding</code> — a fresh dispatch today records <code>create_finding</code> in that same field:</p>
+    <pre><code>$ darkmux finding show crawl-crawl-1788400556-b1119b-u-0001/1
+finding   crawl-crawl-1788400556-b1119b-u-0001/1
+dispatch  crawl-crawl-1788400556-b1119b-u-0001
+seq       1
+recorded  2026-09-03T01:59:29Z
+tool      report_finding
+mission   crawl-1788400556-b1119b
+phase     crawl-1788400556-b1119b-crawl
+step      crawl-1788400556-b1119b-crawl-task-001-step-0001
+proposer  crawler (qwen3.6-35b-a3b-turboquant-mlx) on MacBook-Pro
+context   {"workspace":"darkmux-ui","source":"darkmux","sha":"20c77504...","rule":"unnamed-predicate",
+           "rules":["unnamed-predicate"],"unit":"u-0001","model":"qwen3.6-35b-a3b-turboquant-mlx",
+           "locality":"local","profile":"balanced"}
+
+emitted
+  {
+    "evidence": "  const playhead = transport.active &amp;&amp; transport.scrubbed &amp;&amp; transport.t &lt; transport.tMax ? transport.t : null;",
+    "file": "/workspace/darkmux/ui/src/App.tsx",
+    "line": 206,
+    "pattern": "unnamed-predicate",
+    "why": "The condition combines THREE operands with `&amp;&amp;` to express a \"playhead readiness\"
+           concept — whether there's an active, scrubbed playhead with valid time. Proposed
+           extraction: `isPlayheadReady({ active, scrubbed, t, tMax })`."
+  }</code></pre>
+    <p><code>finding sync</code> is the store's second producer: it replays the flow stream into the store for anything the live tailer missed (an older binary, a killed process), and is idempotent — the store is write-once, so a second pass reports every record as already present rather than creating anything new:</p>
+    <pre><code>$ darkmux finding sync --help
+Replay the flow stream into the store — the SECOND producer, for anything the live
+tailer missed (an older binary, a killed process). Idempotent: the store is write-once,
+so a second pass creates nothing
+
+Usage: darkmux finding sync [OPTIONS]
+
+Options:
+      --since &lt;SINCE&gt;  Only day files on or after this date (`YYYY-MM-DD`)
+      --json           Emit machine-readable JSON instead of styled text (#907)
+  -h, --help           Print help</code></pre>
+
+    <h3>The emission, as it rides the flow record</h3>
+    <p>The finding store is built from the same <code>dispatch.tool</code> flow record hooks route (below). Since FLOW 1.33.0, an accepted <code>create_finding</code> call carries the emission verbatim under <code>payload.emitted</code>, plus <code>payload.emit_seq</code> (the 1-based ordinal within the dispatch). A real record, scrubbed of the local path prefix, for the same finding shown above:</p>
+    <pre><code>{"ts":"2026-09-03T01:59:29Z","action":"dispatch.tool","tier":"local","handle":"crawler",
+ "mission_id":"crawl-1788400556-b1119b","session_id":"crawl-crawl-1788400556-b1119b-u-0001",
+ "model":"qwen3.6-35b-a3b-turboquant-mlx","machine_id":"MacBook-Pro",
+ "payload":{"tool_name":"report_finding","emit_seq":1,"ok":true,
+   "emitted":{"evidence":"  const playhead = transport.active &amp;&amp; transport.scrubbed...",
+              "file":"darkmux/ui/src/App.tsx","line":206,"pattern":"unnamed-predicate",
+              "why":"The condition combines THREE operands with `&amp;&amp;`..."},
+   "context":{"workspace":"darkmux-ui","source":"darkmux","sha":"20c77504...",
+              "rule":"unnamed-predicate","unit":"u-0001"}}}</code></pre>
+    <p>Two things a transform reads from that shape: darkmux never told the transform what's inside <code>emitted</code> — that's the model's own object, whatever fields its <code>create_finding</code> call carried — and every other field (<code>model</code>, <code>machine_id</code>, <code>mission_id</code>, <code>payload.context.*</code>) is provenance darkmux itself supplied. A transform composes a destination's shape entirely from those two halves. Trimmed from a real adapter written against this record shape:</p>
+    <pre><code># tracker-item.jq — a `dispatch.tool` record whose `create_finding` call was
+# accepted  ->  one item for an external receiver.
+def prog: (.payload.context.workspace // "crawl");
+def unit: (.payload.context.unit // "u-0000");
+# The emission, rendered for a reader: an object becomes `key: value` lines.
+def blob: (.payload.emitted
+  | if type == "object" then
+      (to_entries | map("\(.key): \(.value | if type == "string" then . else tojson end)") | join("\n"))
+    else tojson end);
+{
+  summary: "\(prog)-\(unit)-\(.payload.emit_seq // 0)",
+  description: (
+    "crawl: \(prog)\nunit: \(unit)  emit: \(.payload.emit_seq // 0)\n" +
+    "rule: \(.payload.context.rule // "?")\nsource: \(.payload.context.source // "?")\n" +
+    "model: \(.model)  emitted_at: \(.ts)\n\n" + blob
+  ),
+  labels: ["kind:finding", "rule:\(.payload.context.rule // "?")", "crawl:\(prog)"]
+}</code></pre>
+    <p>That's the shape an example receiver in darkmux's own crawl-tracking work expects — cited here as one working adapter, not a destination darkmux knows anything about. Write your own the same way: read <code>payload.context</code> for provenance, read <code>payload.emitted</code> for the model's claim, and compose whatever your receiver wants. See "Transforms" below for how a rule wires <code>transform</code> in, and the three testing tiers for checking one without a live receiver.</p>
+
+    <h3>Mods: how a finding could change</h3>
+    <p class="note"><strong>Landing.</strong> The verbs below are settled design, not yet merged — they're documented here so this page needs only the marker removed once they ship.</p>
+    <p>A <strong>mod</strong> is the other half of the pair: not what was observed, but how it could change — a kit (instructions plus data, in whatever form the proposer chose: a diff, a sentence, pixel data, a config value) enough for an AI to make the change correctly later. Like a finding, darkmux never opens a mod's kit; it mints a key and stores it. A mod may carry <code>for:</code> — zero or more finding references — which is the only stored link between the two records; it lives on the mod, not the finding, because one change can address several observations and one observation can attract several competing proposals. Two producers write the same record: the CLI, for a change made outside darkmux —</p>
+    <pre><code>darkmux mod create --by &lt;actor&gt; [--for &lt;finding&gt;]... [--kit &lt;file&gt;|-] [--attach &lt;path&gt;]...
+darkmux mod list [--for &lt;finding&gt;] [--mission &lt;id&gt;] [--json]
+darkmux mod show &lt;key&gt;</code></pre>
+    <p>— and the runtime tool <code>create_mod</code>, for a change proposed inside a dispatch. Records land at <code>~/.darkmux/mods/&lt;key&gt;/{mod.json, attachments/}</code>, and <code>finding show</code> will list the mods naming a given finding. There is no <code>integrate</code> verb: applying mods onto a workspace is a mission (a worktree step, one step per mod, a coder or shell step doing the apply) that composes from existing pieces, not new CLI surface — so the operator still decides, per integration, whether a local model or a frontier model does the applying.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>5. Hooks: routing flow records to your own receiver</h2>
     <p>Hooks are darkmux's fourth <code>FlowSink</code> kind: match a flow record against operator-configured rules and POST a match verbatim to a receiver you run. <strong>Loopback, or your tailnet — nothing else.</strong> A rule's <code>http</code> target is accepted when it's loopback (<code>127.0.0.1</code>/<code>[::1]</code>/<code>localhost</code>) OR a genuine Tailscale address (an IPv4 in <code>100.64.0.0/10</code>, or a hostname ending in <code>.ts.net</code>) — <code>validate_hook_target_url</code> refuses everything else, checked both when the rule loads and again at every POST. There's no config flag to flip: the URL itself is the decision (a loopback receiver, or a receiver on another machine in the SAME tailnet), and <code>darkmux doctor</code>/<code>flow status</code> show each rule's resolved target kind (<code>loopback</code>/<code>tailnet</code>) so the choice stays visible. darkmux never reaches an external tracker outside that boundary; a tailnet target still requires <code>http://</code> (WireGuard already encrypts and authenticates the peer, so TLS on top buys nothing), and an external (non-tailnet) receiver is a later packet that will require <code>https://</code> plus a mandatory signature.</p>
 
     <h3>The config block</h3>
-    <p><code>config.hooks</code>, same visible-defaults shape as <code>redis</code>/<code>audit</code>. This is the real block from a running machine (URLs are loopback, nothing else to scrub):</p>
+    <p><code>config.hooks</code>, same visible-defaults shape as <code>redis</code>/<code>audit</code>. This is the real block from a running machine, updated to the current tool name (<code>payload.tool_name</code> reads <code>create_finding</code> since the 2026-09-03 rename — if a hooks config you already have still names <code>report_finding</code>, update it; a fresh dispatch never writes that name again):</p>
     <pre><code>{
   "hooks": {
     "enabled": true,
     "rules": [
-      { "match": { "action": "dispatch.tool", "payload.tool_name": "report_finding", "payload.ok": true },
+      { "match": { "action": "dispatch.tool", "payload.tool_name": "create_finding", "payload.ok": true },
         "http": "http://127.0.0.1:8790/events" },
       { "match": { "action": "step *" },
         "http": "http://127.0.0.1:8790/events" },
@@ -233,7 +347,7 @@ mission close            <span class="comment"># units_completed/errored/skipped
     <p>(Keychain item, on the sending machine: <code>security add-generic-password -a $USER -s darkmux-hook-crawl-tracker -w</code>, then paste the shared secret.)</p>
 
     <h3><code>darkmux flow status</code></h3>
-    <p>Real output (Redis section trimmed to the hooks-relevant lines; this machine also runs a Redis sink, irrelevant here):</p>
+    <p>Real output (Redis section trimmed to the hooks-relevant lines; this machine also runs a Redis sink, irrelevant here). Captured before the 2026-09-03 rename, so the rule still shows the old tool name — the shape is unchanged, only the string would now read <code>create_finding</code>:</p>
     <pre><code>darkmux flow status — ⚠ warn
   schema:       1.28.0
   composition:  Tee([LocalFile, Redis, Hooks])
@@ -279,7 +393,7 @@ http.createServer((req, res) => {
     <p>A raw flow record is darkmux's own shape. A real external tracker — Jira, a ticketing API, anything you don't control — wants ITS shape. A <code>transform</code> is a <a href="https://jqlang.org/">jq</a> filter, evaluated in-process (<a href="https://github.com/01mf02/jaq">jaq</a>, pure Rust, no C bindings, no subprocess) at DELIVERY time — record in, request body out. It's a pure function on purpose: no filesystem, no network, no Keychain access from inside the filter itself. Two independent knobs on a rule: <code>transform</code> (the shape) and the destination (<code>http</code> + <code>headers</code>, or <code>file</code> — below) — only the destination ever touches a credential.</p>
     <p><code>transform</code> is a NAME, resolved inside <code>&lt;outbox_dir&gt;/adapters/</code> (normally <code>~/.darkmux/hooks/adapters/</code>) — never a path. A bare filename only; <code>/</code>, <code>\</code>, <code>..</code>, or an absolute string are refused when the rule loads. Absent <code>transform</code> is today's behavior, byte-identical: the record delivered verbatim. The adapter's TEXT is read once at load time and cached — a hand-edited adapter file takes effect on the next config reload, not mid-run; <code>doctor</code>/<code>flow status</code> re-read + re-hash the file live, so a hot edit can show a different hash there than the one actually driving a running sink.</p>
     <p><strong>Reality check before the example: <code>http</code>'s URL policy is UNCHANGED by this packet.</strong> <code>validate_hook_target_url</code> still accepts loopback or a genuine tailnet address ONLY, and still requires the literal <code>http://</code> scheme — an <code>https://your-site.atlassian.net/...</code> target is refused at load, same as before, whole sink down if any rule names one. This packet adds <code>headers</code> (so a rule that already targets a receiver you can reach — loopback, or something on YOUR tailnet — can carry auth) and the <code>file</code> transport (so you can develop + verify an adapter's shape with zero network at all). Reaching a genuine external SaaS endpoint over real <code>https</code> is still refused, pending a separate later packet that pairs it with a MANDATORY signature. The example below targets a tracker reachable on your tailnet (a self-hosted Jira/OpenProject/whatever instance, or an echo receiver) — swap the host for your own tailnet address:</p>
-    <pre><code>{ "match": { "action": "dispatch.tool", "payload.tool_name": "report_finding", "payload.ok": true },
+    <pre><code>{ "match": { "action": "dispatch.tool", "payload.tool_name": "create_finding", "payload.ok": true },
   "http": "http://100.64.1.2:8080/rest/api/3/issue",
   "headers": {
     "Content-Type": "application/json",
@@ -288,15 +402,15 @@ http.createServer((req, res) => {
   },
   "transform": "jira-issue.jq" }</code></pre>
     <p><code>headers</code> is a name -&gt; value map: a plain string is sent as-is; <code>{"keychain_item": "..."}</code> resolves a macOS Keychain generic-password item at delivery time and sends ITS value — the item holds the COMPLETE header value (<code>Basic &lt;base64(email:api-token)&gt;</code>, <code>Bearer &lt;token&gt;</code>, whatever the receiver wants), never a raw token darkmux formats itself, so this stays scheme-agnostic. A Keychain-resolved value never appears in a flow record, a log line, <code>doctor</code> output, or a <code>file</code>-transport dump — those all print <code>"&lt;redacted&gt;"</code> instead. <code>attribution_headers: false</code> on a rule drops the <code>X-Darkmux-*</code> set entirely, for a receiver that rejects unknown headers — useful today on a self-hosted tailnet tracker; load-bearing once a real external target lands.</p>
-    <p><code>~/.darkmux/hooks/adapters/jira-issue.jq</code> — ordinary jq, building Jira's nested <code>fields</code> shape:</p>
+    <p><code>~/.darkmux/hooks/adapters/jira-issue.jq</code> — ordinary jq, building Jira's nested <code>fields</code> shape. The emission rides under <code>payload.emitted</code> (verbatim, since FLOW 1.33.0) — there's no flat <code>payload.evidence</code> to read; the adapter reaches into the model's own object for the field its schema promised:</p>
     <pre><code>{
   fields: {
     project: { key: "OPS" },
-    summary: ("crawl finding: " + .payload.tool_name),
+    summary: ("crawl finding: " + .payload.context.rule),
     description: {
       type: "doc", version: 1,
       content: [{ type: "paragraph",
-                  content: [{ type: "text", text: (.payload.evidence // "") }] }]
+                  content: [{ type: "text", text: (.payload.emitted.evidence // "") }] }]
     },
     issuetype: { name: "Bug" }
   }
@@ -305,9 +419,9 @@ http.createServer((req, res) => {
 
     <h4>Three testing tiers</h4>
     <ol>
-      <li><strong>Adapter alone, no darkmux involved.</strong> Fixtures come free from the flow log: <code>jq -c 'select(.payload.tool_name=="report_finding")' ~/.darkmux/flows/&lt;date&gt;.jsonl | head -1 | jq -f ~/.darkmux/hooks/adapters/jira-issue.jq</code>. jaq isn't byte-for-byte jq on every edge — test with a real <code>jq</code> binary here, since that's the ground truth an adapter author reasons against.</li>
+      <li><strong>Adapter alone, no darkmux involved.</strong> Fixtures come free from the flow log: <code>jq -c 'select(.payload.tool_name=="create_finding")' ~/.darkmux/flows/&lt;date&gt;.jsonl | head -1 | jq -f ~/.darkmux/hooks/adapters/jira-issue.jq</code>. jaq isn't byte-for-byte jq on every edge — test with a real <code>jq</code> binary here, since that's the ground truth an adapter author reasons against.</li>
       <li><strong><code>file</code> transport — darkmux involved, no network.</strong> A rule names <code>file</code> instead of <code>http</code> (exactly one of the two; both or neither is refused at load): each matching delivery writes ONE JSON file into that directory — <code>{delivery_id, target_would_be, headers, body}</code>, secret header values redacted, file mode <code>0o600</code> — and emits <code>hook.dry_run</code> (informational) instead of <code>hook.fired</code>, advancing the cursor same as a real delivery.
-        <pre><code>{ "match": { "action": "dispatch.tool", "payload.tool_name": "report_finding" },
+        <pre><code>{ "match": { "action": "dispatch.tool", "payload.tool_name": "create_finding" },
   "file": "~/darkmux-hook-dryrun",
   "transform": "jira-issue.jq" }</code></pre>
       </li>
@@ -316,7 +430,7 @@ http.createServer((req, res) => {
 
     <h4><code>darkmux doctor</code></h4>
     <p>A rule naming a <code>transform</code> gets an extra clause on its row: the adapter name, whether it exists + parses, and its BLAKE3 content hash (first 16 hex chars) — so a silently-edited adapter is visible without diffing the file by hand. A missing or unparseable adapter is a load-time refusal SCOPED TO THAT RULE — the rest of the sink (every other rule) keeps running, unlike a bad <code>http</code> URL, which still refuses the whole sink.</p>
-    <pre><code>#0: payload.tool_name="report_finding" -> http://100.64.1.2:8080/rest/api/3/issue [tailnet, unsigned], transform: jira-issue.jq (sha256:a1b2c3d4e5f6a7b8) (undelivered: 0)</code></pre>
+    <pre><code>#0: payload.tool_name="create_finding" -> http://100.64.1.2:8080/rest/api/3/issue [tailnet, unsigned], transform: jira-issue.jq (sha256:a1b2c3d4e5f6a7b8) (undelivered: 0)</code></pre>
 
     <h4>Honest limits</h4>
     <ul>
@@ -329,7 +443,7 @@ http.createServer((req, res) => {
 
 <section>
   <div class="wrap">
-    <h2>5. The knobs</h2>
+    <h2>6. The knobs</h2>
     <p>Names and defaults copied verbatim from <code>docs/ENVIRONMENT.md</code>:</p>
     <table>
       <tr><th>Env var</th><th>Default</th><th><code>config.json</code> field</th><th>What it does</th></tr>
