@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.33.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.34.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -690,6 +690,14 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.33.0";
 //           tracker as that preview, cut mid-JSON, and were rejected. The
 //           crawl's product now rides its own field. Additive payload keys
 //           on an existing action; older readers ignore them.
+//   1.34.0 (operator, 2026-09-03): the finding tool is renamed —
+//           `dispatch.tool` records carry `payload.tool_name: "create_finding"`
+//           where they carried `"report_finding"`. No field changed; the
+//           VOCABULARY did: the tool CREATES a record (a hook then reports
+//           it), and it must read like its sibling `create_mod`. Pre-1.0, so
+//           no alias: hook rules matching `payload.tool_name`, the viewer's
+//           record detail, and any transform keying on the old name update
+//           with this version. Historical entries above keep the old name.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

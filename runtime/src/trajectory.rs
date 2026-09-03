@@ -826,7 +826,7 @@ impl Trajectory {
             // A viewer PREVIEW, and only that: cut at MAX_TOOL_ARGS_CHARS.
             "args": cap_chars(args, MAX_TOOL_ARGS_CHARS),
             "args_chars": args_chars,
-            // (#2272) An accepted `report_finding`'s emission — the model's
+            // (#2272) An accepted `create_finding`'s emission — the model's
             // arguments verbatim, an opaque value darkmux never interprets —
             // and its 1-based ordinal in this dispatch. `null` for every
             // other tool and every rejected report. The crawl's product
@@ -1058,18 +1058,18 @@ mod tests {
     }
 
     // (#2268) `dispatch.start` records the ADVERTISED tool names, so the
-    // "the model never saw report_finding" class is a grep of the artifact.
+    // "the model never saw create_finding" class is a grep of the artifact.
     #[test]
     fn dispatch_start_records_the_advertised_tools() {
         let ws = tempfile::Builder::new().prefix("traj-test-tools").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_dispatch_start("m", 1, 1, &["search", "read", "bash", "report_finding"]);
+        t.append_dispatch_start("m", 1, 1, &["search", "read", "bash", "create_finding"]);
         drop(t);
         let traj_file = ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE);
         let body = fs::read_to_string(&traj_file).unwrap();
         let first: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
         assert_eq!(first["type"], "dispatch.start");
-        assert_eq!(first["tools"], serde_json::json!(["search", "read", "bash", "report_finding"]));
+        assert_eq!(first["tools"], serde_json::json!(["search", "read", "bash", "create_finding"]));
     }
 
     #[test]
@@ -1185,7 +1185,7 @@ mod tests {
     #[test]
     fn tool_completed_carries_the_emission_whole_while_args_stays_a_preview() {
         // (#2272) `args` is a 512-char VIEWER PREVIEW and always was. A
-        // `report_finding` call's arguments ARE the crawl's product, and
+        // `create_finding` call's arguments ARE the crawl's product, and
         // nine of nine findings on 2026-09-02 were lost because the only
         // wire copy was that preview, cut mid-JSON. The accepted emission
         // now rides the event verbatim as `emitted`, complete, beside the
@@ -1200,7 +1200,7 @@ mod tests {
         .to_string();
         let emitted: serde_json::Value = serde_json::from_str(&raw_args).unwrap();
         t.append_tool_completed(
-            2, 0, "report_finding", &raw_args,
+            2, 0, "create_finding", &raw_args,
             "Recorded. 1 finding(s) so far, 39 remaining in this run's budget.",
             &ToolOutcome::Ok, Some(&emitted), Some(1),
         );

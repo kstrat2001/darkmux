@@ -325,7 +325,7 @@ impl WorkloadProvider for CodingTaskProvider {
             // run artifact recorded that a dispatch happened and not what it
             // found. Same reasoning as the two above, with more at stake:
             // losing a trajectory costs forensics, losing this costs the
-            // result. Absent for every role that never calls `report_finding`,
+            // result. Absent for every role that never calls `create_finding`,
             // which the `exists()` gate below already handles.
             for (name, dst_name) in [
                 ("trajectory.jsonl", "trajectory.jsonl"),
@@ -715,7 +715,7 @@ fn role_can_modify_files(palette: &darkmux_crew::types::ToolPalette) -> bool {
         palette.allow.iter().any(|a| a == name)
             && !palette.deny.iter().any(|d| d == name)
     };
-    // (#1959) `report_finding` is an EXECUTION surface, not a description.
+    // (#1959) `create_finding` is an EXECUTION surface, not a description.
     //
     // This guard's premise (#341) is sound: a coding-task workload paired with
     // a role that cannot touch files will burn wall-clock narrating a fix it
@@ -723,12 +723,12 @@ fn role_can_modify_files(palette: &darkmux_crew::types::ToolPalette) -> bool {
     // assumes the only way to PRODUCE something is to edit a file.
     //
     // A crawler is deliberately read-only and records each finding through
-    // `report_finding`, which appends to a real artifact the run is measured
+    // `create_finding`, which appends to a real artifact the run is measured
     // by. It is not describing into the void; its output channel simply is not
     // the filesystem. Denying edit/write is the POINT of that role, so a guard
     // that reads it as misconfiguration would make read-only workloads
     // unrepresentable.
-    allows("edit") || allows("write") || allows("report_finding")
+    allows("edit") || allows("write") || allows("create_finding")
 }
 
 /// Reject setupContent keys that would write outside the sandbox dir.

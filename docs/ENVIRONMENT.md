@@ -55,7 +55,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | `DARKMUX_HOOKS_JQ_TIMEOUT_MS` | `5000` | (#2183) Wall-clock cap, in milliseconds, on ONE `transform` evaluation (compile + run, on a background thread — see `docs/guide/crawl-and-hooks.html`'s "Transforms" section). A filter that never terminates (`def rec: rec; rec`) times out here rather than hanging the drainer; the timeout itself is a TERMINAL failure for that line (quarantine + `hook.failed`), never an infinite retry. |
 | `DARKMUX_HOOKS_JQ_MAX_OUTPUT_BYTES` | `1048576` (1 MiB) | (#2183) Hard cap, in bytes, on a `transform`'s produced request body. An adapter that builds an unbounded string is a TERMINAL failure past this cap, not a giant POST. |
 
-**Payload predicates (#1959).** A `hooks.rules[].match` entry can go past the top-level fields (`action`/`session_id`/`mission_id`/`machine_id`/`category`/`level`) into a record's own `payload`, via one or more `"payload.<dotted path>"` keys — each an exact match against a JSON scalar, AND'd with each other and with every other field on the same `match`. A key the record's payload doesn't carry (missing, or the payload isn't even an object) never matches — there's no "absent means match" reading. This is how an external tracker subscribes to a SPECIFIC shape of tool call rather than an entire `action` glob. Example — every ACCEPTED `report_finding` call, whichever mission emitted it:
+**Payload predicates (#1959).** A `hooks.rules[].match` entry can go past the top-level fields (`action`/`session_id`/`mission_id`/`machine_id`/`category`/`level`) into a record's own `payload`, via one or more `"payload.<dotted path>"` keys — each an exact match against a JSON scalar, AND'd with each other and with every other field on the same `match`. A key the record's payload doesn't carry (missing, or the payload isn't even an object) never matches — there's no "absent means match" reading. This is how an external tracker subscribes to a SPECIFIC shape of tool call rather than an entire `action` glob. Example — every ACCEPTED `create_finding` call, whichever mission emitted it:
 
 ```json
 {
@@ -65,7 +65,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
       {
         "match": {
           "action": "dispatch.tool",
-          "payload.tool_name": "report_finding",
+          "payload.tool_name": "create_finding",
           "payload.ok": true
         },
         "http": "http://127.0.0.1:8790/events"
@@ -75,7 +75,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 }
 ```
 
-A rejected citation (a wrong line number, an unresolvable path, a budget already spent) is a FAILED tool call — `report_finding`'s own reply text (`REJECTED: …` / `NOT RECORDED — …`) is classified by the runtime the same way any other tool's failure is, so `payload.ok` is `false` for it and the rule above never fires on it. The record's `payload.context` (present only when the dispatching caller — e.g. the crawl launcher — set `DispatchOpts::record_context`) carries provenance the tool call itself can't know: `workspace`, `source`, `sha`, `rule`, `unit`.
+A rejected citation (a wrong line number, an unresolvable path, a budget already spent) is a FAILED tool call — `create_finding`'s own reply text (`REJECTED: …` / `NOT RECORDED — …`) is classified by the runtime the same way any other tool's failure is, so `payload.ok` is `false` for it and the rule above never fires on it. The record's `payload.context` (present only when the dispatching caller — e.g. the crawl launcher — set `DispatchOpts::record_context`) carries provenance the tool call itself can't know: `workspace`, `source`, `sha`, `rule`, `unit`.
 
 **env → `config.json` field** (the override-tier var → its durable config home):
 

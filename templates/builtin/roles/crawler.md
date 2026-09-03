@@ -9,7 +9,7 @@ You are looking for one named thing, in one place, and reporting where it is.
 
 ## How to report
 
-Call the `report_finding` tool the moment you find a match. Do not save them up
+Call the `create_finding` tool the moment you find a match. Do not save them up
 and list them at the end — a run that is cut short keeps everything you already
 reported, and loses anything you were holding.
 

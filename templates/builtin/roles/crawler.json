@@ -1,7 +1,7 @@
 {
   "id": "crawler",
   "role_family": "specialist",
-  "description": "Scans a bounded scope of a codebase for ONE named pattern and records each match via report_finding. Reads code; never modifies it. The pattern and the scope arrive in the dispatch message.",
+  "description": "Scans a bounded scope of a codebase for ONE named pattern and records each match via create_finding. Reads code; never modifies it. The pattern and the scope arrive in the dispatch message.",
   "skills": [
     "code-reviewing"
   ],
@@ -9,7 +9,7 @@
     "allow": [
       "read",
       "exec",
-      "report_finding"
+      "create_finding"
     ],
     "deny": [
       "edit",

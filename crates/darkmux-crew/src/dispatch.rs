@@ -281,7 +281,7 @@ pub struct DispatchOpts {
     /// (#1959 packet 2) Mount `/workspace` read-only (`-v <ws>:/workspace:ro`)
     /// instead of the default read-write bind. The crawler role reads a
     /// workspace tree it must never modify — a role holding only `read`/`exec`/
-    /// `report_finding` (no `edit`/`write`) is already tool-gated against
+    /// `create_finding` (no `edit`/`write`) is already tool-gated against
     /// writing, but the mount itself is the second, filesystem-level layer:
     /// a `write`/`edit` grant added to the role later, or a shell escape via
     /// `exec`, still can't touch the tree when the mount itself refuses
@@ -295,9 +295,9 @@ pub struct DispatchOpts {
     /// live per-event record the host tailer produces (`dispatch.tool`,
     /// `dispatch.turn`, `telemetry.*`, …). Deliberately NOT scoped to one
     /// action — the hook layer stays event-agnostic; an external tracker
-    /// that wants "an accepted `report_finding` call" subscribes via a
+    /// that wants "an accepted `create_finding` call" subscribes via a
     /// `HookMatch` payload predicate (`"payload.tool_name":
-    /// "report_finding", "payload.ok": true`) against the ordinary
+    /// "create_finding", "payload.ok": true`) against the ordinary
     /// `dispatch.tool` record instead of a bespoke finding action. The
     /// crawl launcher is the one caller that sets this today (`workspace,
     /// source, sha, rule, unit`, per unit); every other caller passes

@@ -208,7 +208,7 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
             return false;
         }
     }
-    // (#1959) Payload predicates — `"payload.tool_name": "report_finding"`
+    // (#1959) Payload predicates — `"payload.tool_name": "create_finding"`
     // etc. on the wire. Every predicate must resolve AND match exactly; a
     // record with no payload at all, or missing the named key, fails
     // every predicate (never treated as "no opinion, so it passes").
@@ -3024,8 +3024,8 @@ mod tests {
     #[test]
     fn payload_predicate_matches_on_tool_name() {
         let mut r = record("dispatch.tool");
-        r.payload = Some(serde_json::json!({"tool_name": "report_finding", "ok": true}));
-        let m = payload_match(&[("tool_name", serde_json::json!("report_finding"))]);
+        r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": true}));
+        let m = payload_match(&[("tool_name", serde_json::json!("create_finding"))]);
         assert!(hook_match(&m, &r));
 
         let m = payload_match(&[("tool_name", serde_json::json!("bash"))]);
@@ -3035,11 +3035,11 @@ mod tests {
     #[test]
     fn payload_predicate_distinguishes_ok_true_from_ok_false() {
         let mut r = record("dispatch.tool");
-        r.payload = Some(serde_json::json!({"tool_name": "report_finding", "ok": true}));
+        r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": true}));
         assert!(hook_match(&payload_match(&[("ok", serde_json::json!(true))]), &r));
         assert!(!hook_match(&payload_match(&[("ok", serde_json::json!(false))]), &r));
 
-        r.payload = Some(serde_json::json!({"tool_name": "report_finding", "ok": false}));
+        r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": false}));
         assert!(hook_match(&payload_match(&[("ok", serde_json::json!(false))]), &r));
         assert!(!hook_match(&payload_match(&[("ok", serde_json::json!(true))]), &r));
     }
@@ -3047,13 +3047,13 @@ mod tests {
     #[test]
     fn payload_predicate_on_a_missing_key_never_matches() {
         let mut r = record("dispatch.tool");
-        r.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        r.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         // `outcome` isn't in this payload at all.
         assert!(!hook_match(&payload_match(&[("outcome", serde_json::json!("ok"))]), &r));
 
         // Nor does a record with no payload whatsoever.
         r.payload = None;
-        assert!(!hook_match(&payload_match(&[("tool_name", serde_json::json!("report_finding"))]), &r));
+        assert!(!hook_match(&payload_match(&[("tool_name", serde_json::json!("create_finding"))]), &r));
     }
 
     #[test]
@@ -3072,7 +3072,7 @@ mod tests {
             action: Some("dispatch.tool".to_string()),
             extras: {
                 let mut e = serde_json::Map::new();
-                e.insert("payload.tool_name".to_string(), serde_json::json!("report_finding"));
+                e.insert("payload.tool_name".to_string(), serde_json::json!("create_finding"));
                 e.insert("payload.ok".to_string(), serde_json::json!(true));
                 e
             },
@@ -3081,7 +3081,7 @@ mod tests {
         let desc = describe_match(&m);
         assert!(desc.contains("action=dispatch.tool"), "{desc}");
         assert!(desc.contains("payload.ok=true"), "{desc}");
-        assert!(desc.contains("payload.tool_name=\"report_finding\""), "{desc}");
+        assert!(desc.contains("payload.tool_name=\"create_finding\""), "{desc}");
         // Sorted by path: "ok" before "tool_name".
         assert!(desc.find("payload.ok").unwrap() < desc.find("payload.tool_name").unwrap(), "{desc}");
     }
@@ -3089,12 +3089,12 @@ mod tests {
     #[test]
     fn payload_predicate_combines_with_action_and_every_other_field_anded() {
         let mut r = record("dispatch.tool");
-        r.payload = Some(serde_json::json!({"tool_name": "report_finding", "ok": true}));
+        r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": true}));
         let m = HookMatch {
             action: Some("dispatch.tool".to_string()),
             extras: {
                 let mut e = serde_json::Map::new();
-                e.insert("payload.tool_name".to_string(), serde_json::json!("report_finding"));
+                e.insert("payload.tool_name".to_string(), serde_json::json!("create_finding"));
                 e.insert("payload.ok".to_string(), serde_json::json!(true));
                 e
             },
@@ -4998,7 +4998,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), Arc::new(NoopSink)).unwrap();
         let mut rec = record("dispatch.tool");
-        rec.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
@@ -5007,7 +5007,7 @@ mod tests {
         // Byte-identical to the record's own JSON shape — no transform
         // ran, so the wire body IS the record, verbatim.
         assert_eq!(delivered["action"], "dispatch.tool");
-        assert_eq!(delivered["payload"]["tool_name"], "report_finding");
+        assert_eq!(delivered["payload"]["tool_name"], "create_finding");
     }
 
     #[test]
@@ -5023,14 +5023,14 @@ mod tests {
         }];
         let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
         let mut rec = record("dispatch.tool");
-        rec.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
         clear_darkmux_home();
         let bodies = receiver.bodies();
         let delivered: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
-        assert_eq!(delivered, serde_json::json!({"summary": "report_finding"}), "transformed body, not the raw record");
+        assert_eq!(delivered, serde_json::json!({"summary": "create_finding"}), "transformed body, not the raw record");
     }
 
     #[test]
@@ -5111,7 +5111,7 @@ mod tests {
         }];
         let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
         let mut rec = record("dispatch.tool");
-        rec.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
@@ -5209,7 +5209,7 @@ mod tests {
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, outbox_dir, report).unwrap();
         let mut rec = record("dispatch.tool");
-        rec.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         sink.write(&rec).unwrap();
         assert!(wait_until(
             || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.dry_run"),
@@ -5220,7 +5220,7 @@ mod tests {
         let entries: Vec<_> = fs::read_dir(&dryrun_dir).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(entries.len(), 1, "one dump file per delivery");
         let dump: serde_json::Value = serde_json::from_str(&fs::read_to_string(entries[0].path()).unwrap()).unwrap();
-        assert_eq!(dump["body"], "{\"summary\":\"report_finding\"}");
+        assert_eq!(dump["body"], "{\"summary\":\"create_finding\"}");
         assert_eq!(dump["headers"]["X-Literal"], "plain", "a literal header is NOT redacted");
         assert_eq!(dump["headers"]["Authorization"], "<redacted>", "a Keychain-referenced header IS redacted");
         assert!(dump["delivery_id"].is_string());

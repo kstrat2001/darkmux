@@ -9,7 +9,7 @@ import type { FlowRecord } from "../types/handwritten";
  * so every tool call in the log read "tool call" with no name, no arguments
  * and no result size. The stream was never the problem: a `dispatch.tool`
  * record carries `tool_name`, the full `args`, `result_chars` and `ok`. For a
- * `report_finding` call those args ARE the finding — file, line, evidence and
+ * `create_finding` call those args ARE the finding — file, line, evidence and
  * reasoning — which is why a crawl's findings were invisible in a viewer that
  * was already receiving all of them.
  *
