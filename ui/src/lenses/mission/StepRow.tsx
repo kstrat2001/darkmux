@@ -13,7 +13,7 @@ import { fmtElapsed, fmtModel, fmtTok, stepLead, stepSeat, type GraphStep, type 
  * so this same renderer also takes a task-level {@link
  * import("./timeline").TaskAggMetrics}, which never tracks tool-calls at
  * the aggregate level — see that type's own doc. */
-type MeterLike = Omit<StepMeter, "tools"> & { tools?: number };
+type MeterLike = Omit<StepMeter, "tools" | "wallMs"> & { tools?: number; wallMs?: number };
 
 export function StepMeterEl({ meter }: { meter: MeterLike | undefined }) {
   if (!meter || !meter.show) return null;
@@ -23,6 +23,14 @@ export function StepMeterEl({ meter }: { meter: MeterLike | undefined }) {
       <span key="g" className="gen">
         <span className="genpulse" />
         {meter.elapsedMs ? fmtElapsed(meter.elapsedMs) : "live"}
+      </span>,
+    );
+  }
+  if (!meter.generating && meter.wallMs) {
+    // (#2269) Finished: the pulse is gone, so the wall time stands alone.
+    children.push(
+      <span key="w" className="wall" title="wall time">
+        {fmtElapsed(meter.wallMs)}
       </span>,
     );
   }

@@ -442,6 +442,38 @@ describe("formatting helpers", () => {
   });
 });
 
+// (#2269) A finished step's row showed no time at all — the meter's timer
+// exists only while generating — so a task's step list read as a set of
+// token counts with no idea which step took the hour.
+describe("stepMeterFor wall time (#2269)", () => {
+  const T0 = 1_756_900_000_000;
+  const base = { tokRun: 0, tokFinal: 10, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, cloud: false, localOk: true };
+  it("a completed step carries its wall time (end − start) and is not generating", () => {
+    const step = { id: "s", label: "u-0001", kind: "dispatch.internal", status: "complete" };
+    const m = { ...base, startTs: T0, endTs: T0 + 335_000, lastTs: T0 + 335_000 };
+    const meter = stepMeterFor(step, { s: m }, T0 + 900_000);
+    expect(meter.generating).toBe(false);
+    expect(meter.elapsedMs).toBe(0);
+    expect(meter.wallMs).toBe(335_000);
+  });
+  it("a running step's wall time is start → now, the same number the pulse shows", () => {
+    const step = { id: "s", label: "u-0002", kind: "dispatch.internal", status: "running" };
+    const m = { ...base, startTs: T0, endTs: 0, lastTs: T0 + 40_000 };
+    const meter = stepMeterFor(step, { s: m }, T0 + 45_000);
+    expect(meter.generating).toBe(true);
+    expect(meter.wallMs).toBe(45_000);
+    expect(meter.elapsedMs).toBe(45_000);
+  });
+  it("falls back to the node's own timestamps when the metrics stream has none", () => {
+    const step = { id: "s", label: "u-0003", kind: "dispatch.internal", status: "complete", startedTs: T0, completedTs: T0 + 120_000 };
+    expect(stepMeterFor(step, {}, T0 + 500_000).wallMs).toBe(120_000);
+  });
+  it("a step that never started has no wall time", () => {
+    const step = { id: "s", label: "u-0004", kind: "dispatch.internal", status: "planned" };
+    expect(stepMeterFor(step, {}, T0).wallMs).toBe(0);
+  });
+});
+
 describe("stepMeterFor liveness", () => {
   const step = { id: "a-step", label: "Shell", kind: "dispatch.internal", status: "running" };
 

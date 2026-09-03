@@ -128,3 +128,59 @@ describe("groupTimeline", () => {
     expect(groupTimeline([], [], {}, 0)).toHaveLength(0);
   });
 });
+
+// (#2269) The task row's timer read the RUNNING step's elapsed — it restarted
+// on every step of a sequential task and vanished once the last step
+// finished — while tokens and turns on the same row were summed.
+describe("taskAggMetrics task-level duration (#2269)", () => {
+  const T0 = 1_756_900_000_000; // epoch ms: `tsToMs` reads small numbers as SECONDS
+  const seq = (s1: Partial<GraphNode["steps"] extends (infer S)[] | undefined ? S : never>, s2: typeof s1, status = "running"): GraphNode => ({
+    id: "t",
+    label: "crawl",
+    kind: "task",
+    status,
+    depth: 1,
+    steps: [
+      { id: "s1", label: "u-0001", kind: "dispatch.internal", status: "complete", ...s1 },
+      { id: "s2", label: "u-0002", kind: "dispatch.internal", status: "running", ...s2 },
+    ],
+  });
+
+  it("spans from the earliest step start to now while any step runs, not from the running step's start", () => {
+    const now = T0 + 100_000;
+    const task = seq({ startedTs: T0, completedTs: T0 + 60_000 }, { startedTs: T0 + 61_000 });
+    const agg = taskAggMetrics(task, {}, now);
+    expect(agg.generating).toBe(true);
+    expect(agg.spanMs).toBe(100_000);
+    expect(agg.elapsedMs).toBe(100_000);
+    expect(agg.sumMs).toBe(60_000 + 39_000);
+  });
+
+  it("keeps a duration once every step is done: earliest start to latest end", () => {
+    const now = T0 + 500_000;
+    const task = seq({ startedTs: T0, completedTs: T0 + 60_000 }, { startedTs: T0 + 61_000, completedTs: T0 + 90_000, status: "complete" }, "complete");
+    const agg = taskAggMetrics(task, {}, now);
+    expect(agg.generating).toBe(false);
+    expect(agg.spanMs).toBe(90_000);
+    expect(agg.sumMs).toBe(60_000 + 29_000);
+  });
+
+  it("prefers the metrics stream's own start/end over the node's timestamps, like the per-step meter does", () => {
+    const now = T0 + 100_000;
+    const task = seq({ startedTs: T0 + 5_000 }, { startedTs: T0 + 70_000 });
+    const metrics: MetricsMap = {
+      s1: { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, cloud: false, localOk: false, startTs: T0, endTs: T0 + 50_000, lastTs: T0 + 50_000 },
+    };
+    const agg = taskAggMetrics(task, metrics, now);
+    expect(agg.spanMs).toBe(100_000);
+    expect(agg.sumMs).toBe(50_000 + 30_000);
+  });
+
+  it("a task whose steps never started has no duration", () => {
+    const task: GraphNode = { id: "t", label: "x", kind: "task", status: "planned", depth: 1, steps: [{ id: "s", label: "s", kind: "dispatch.internal", status: "planned" }] };
+    const agg = taskAggMetrics(task, {}, T0);
+    expect(agg.spanMs).toBe(0);
+    expect(agg.sumMs).toBe(0);
+    expect(agg.elapsedMs).toBe(0);
+  });
+});

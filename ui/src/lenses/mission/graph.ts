@@ -733,6 +733,14 @@ export function stepStartMs(step: GraphStep, m: StepMetrics | undefined): number
   return tsToMs(step.startedTs);
 }
 
+/** (#2269) The step's end, same precedence as {@link stepStartMs}: the
+ * metrics stream's own `endTs` first, the node's `completedTs` as the
+ * fallback. `0` while the step is still running (or never ran). */
+export function stepEndMs(step: GraphStep, m: StepMetrics | undefined): number {
+  if (m && m.endTs) return m.endTs;
+  return tsToMs(step.completedTs);
+}
+
 export interface StepMeter {
   show: boolean;
   tokens: number;
@@ -741,6 +749,11 @@ export interface StepMeter {
   cloud: boolean;
   generating: boolean;
   elapsedMs: number;
+  /** (#2269) The step's own wall time: start → end once finished, start →
+   * now while running (the same number `elapsedMs` pulses with). `0` when
+   * the step never started. Rendered muted on a finished row, where the
+   * pulse — and with it the only time the row had — is gone. */
+  wallMs: number;
 }
 
 /** `stepMeterFor` — mission-graph.html. `lastSignal` reads this port's
@@ -756,7 +769,9 @@ export function stepMeterFor(step: GraphStep, metrics: MetricsMap, now: number):
   const generating = step.status === "running" && freshEnough;
   const startMs = stepStartMs(step, m);
   const elapsedMs = generating && startMs && now ? Math.max(0, now - startMs) : 0;
-  return { show: show || generating, tokens: d.tokens, turns: d.turns, tools: d.tools, cloud: d.cloud, generating, elapsedMs };
+  const endMs = stepEndMs(step, m) || (step.status === "running" && now ? now : 0);
+  const wallMs = startMs && endMs ? Math.max(0, endMs - startMs) : 0;
+  return { show: show || generating, tokens: d.tokens, turns: d.turns, tools: d.tools, cloud: d.cloud, generating, elapsedMs, wallMs };
 }
 
 // ─── step row vocabulary (mission-graph.html: stepLead, stepSeat) ──────────
