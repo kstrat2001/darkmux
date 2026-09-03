@@ -207,7 +207,8 @@ crawl-crawl-1788402801-729335-u-0004/1  2026-09-03T02:42:16Z  crawler (qwen3.6-3
 <span class="comment"># ...6 more rows...</span>
 
 8 finding(s) in ~/.darkmux/findings</code></pre>
-    <p><code>finding show &lt;key&gt;</code> prints one record whole, including the context the launcher supplied and the emission pretty-printed. This one predates the 2026-09-03 rename above, so its <code>tool</code> line still reads <code>report_finding</code> — a fresh dispatch today records <code>create_finding</code> in that same field:</p>
+    <p><code>finding show &lt;key&gt;</code> prints one record whole, including the context the launcher supplied and the emission pretty-printed:</p>
+    <p><em>This record was created before the 2026-09-03 rename, so its <code>tool</code> line still reads <code>report_finding</code>; a fresh dispatch today writes <code>create_finding</code> in that same field. Neither name changes what <code>finding show</code> does with the record — see the <code>finding sync</code> note above.</em></p>
     <pre><code>$ darkmux finding show crawl-crawl-1788400556-b1119b-u-0001/1
 finding   crawl-crawl-1788400556-b1119b-u-0001/1
 dispatch  crawl-crawl-1788400556-b1119b-u-0001
@@ -232,7 +233,7 @@ emitted
            concept — whether there's an active, scrubbed playhead with valid time. Proposed
            extraction: `isPlayheadReady({ active, scrubbed, t, tMax })`."
   }</code></pre>
-    <p><code>finding sync</code> is the store's second producer: it replays the flow stream into the store for anything the live tailer missed (an older binary, a killed process), and is idempotent — the store is write-once, so a second pass reports every record as already present rather than creating anything new:</p>
+    <p><code>finding sync</code> is the store's second producer: it replays the flow stream into the store for anything the live tailer missed (an older binary, a killed process), and is idempotent — the store is write-once, so a second pass reports every record as already present rather than creating anything new. None of these three verbs filter on the tool's name: <code>list</code>/<code>show</code>/<code>sync</code> read whatever the store holds, so a record written under the old <code>report_finding</code> name and one written under <code>create_finding</code> look identical to them — only the record's own <code>tool</code>/<code>payload.tool_name</code> field differs:</p>
     <pre><code>$ darkmux finding sync --help
 Replay the flow stream into the store — the SECOND producer, for anything the live
 tailer missed (an older binary, a killed process). Idempotent: the store is write-once,
@@ -247,6 +248,7 @@ Options:
 
     <h3>The emission, as it rides the flow record</h3>
     <p>The finding store is built from the same <code>dispatch.tool</code> flow record hooks route (below). Since FLOW 1.33.0, an accepted <code>create_finding</code> call carries the emission verbatim under <code>payload.emitted</code>, plus <code>payload.emit_seq</code> (the 1-based ordinal within the dispatch). A real record, scrubbed of the local path prefix, for the same finding shown above:</p>
+    <p><em>Same record, same caveat: captured before the 2026-09-03 rename, so <code>payload.tool_name</code> still reads <code>report_finding</code> here rather than <code>create_finding</code> — see the <code>finding sync</code> note above.</em></p>
     <pre><code>{"ts":"2026-09-03T01:59:29Z","action":"dispatch.tool","tier":"local","handle":"crawler",
  "mission_id":"crawl-1788400556-b1119b","session_id":"crawl-crawl-1788400556-b1119b-u-0001",
  "model":"qwen3.6-35b-a3b-turboquant-mlx","machine_id":"MacBook-Pro",
