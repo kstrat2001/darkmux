@@ -6,6 +6,11 @@
 //! parsed fields, no diff rendering, no verdict — the same discipline
 //! `finding list` applies to an emission.
 //!
+//! `--mission` answers from the mod's own create-time SNAPSHOT of its
+//! findings, not from the finding store as it stands now: a mod created
+//! before its finding was synced carries no mission and will not match. The
+//! snapshot is what makes a mod self-describing, and this is its limit.
+//!
 //! This module is the CLI producer: a change made OUTSIDE darkmux, recorded by
 //! whoever made it. The runtime `create_mod` tool is the second producer, for
 //! a change made inside a dispatch; both write the same record through
@@ -61,13 +66,16 @@ pub fn create(
     let path = mods::record_path_at(&root, &rec.key);
 
     if json {
-        // The path rides ALONGSIDE the record rather than replacing anything
-        // in it, so `--json` stays a superset of what the human mode gives.
-        let mut v = serde_json::to_value(&rec)?;
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("path".to_string(), serde_json::json!(path.to_string_lossy()));
-        }
-        println!("{}", serde_json::to_string_pretty(&v)?);
+        // `path` sits BESIDE the record, never inside it: `record` has to stay
+        // byte-equal to what is on disk, or a consumer that diffs the two sees
+        // a field darkmux invented.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "record": &rec,
+                "path": path.to_string_lossy(),
+            }))?
+        );
         return Ok(0);
     }
 
@@ -138,7 +146,7 @@ pub fn list(for_key: Option<&str>, mission: Option<&str>, json: bool) -> Result<
             0 => String::new(),
             n => format!("  {n} attachment(s)"),
         };
-        println!("{}  {}  {}  [{for_bit}]{attach}\n    {}", m.key, m.ts, m.by, preview(&m.kit));
+        println!("{}  {}  {}  [{for_bit}]{attach}\n    {}", m.key, m.ts, m.by, preview(m.kit.as_deref()));
     }
     println!("\n{} mod(s) in {}", rows.len(), root.display());
     Ok(0)
@@ -147,6 +155,12 @@ pub fn list(for_key: Option<&str>, mission: Option<&str>, json: bool) -> Result<
 /// `mod show <key>` — one record, whole, with the kit printed RAW.
 pub fn show(key: &str, json: bool) -> Result<i32> {
     let root = config_access::mods_dir();
+    // An invalid key and a missing one need different remedies, so they must
+    // not print the same line — the same split `finding show` makes.
+    if !mods::is_safe_key(key) {
+        eprintln!("not a mod key: {key} (expected a minted key, e.g. mod-1788423454-3b4ef1)");
+        return Ok(1);
+    }
     let Some(rec) = mods::load_at(&root, key)? else {
         eprintln!(
             "no mod {key} under {}\n  `darkmux mod list` shows what is recorded.",
@@ -178,6 +192,13 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     if !rec.attachments.is_empty() {
         println!("\nattachments");
         for name in &rec.attachments {
+            // Checked BEFORE the path is joined or stat'd: a recorded name is
+            // data off disk, and only a plain basename addresses a file
+            // inside this mod's own directory.
+            if !mods::is_safe_basename(name) {
+                println!("  {name}  (not a usable file name — skipped)");
+                continue;
+            }
             let path = mods::attachments_dir_at(&root, &rec.key).join(name);
             let size = std::fs::metadata(&path).map(|m| m.len());
             match size {
@@ -188,27 +209,23 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
             }
         }
     }
-    // The kit is the proposer's own. Pretty-printed when it is JSON so it is
-    // readable; raw otherwise. Never interpreted.
+    // The kit is the proposer's own bytes, printed UNINDENTED and unparsed —
+    // so `darkmux mod show <key> | tail -n +N > kit.txt` yields the kit, and
+    // a JSON kit is still the exact JSON that was written.
     println!("\nkit");
-    if rec.kit.is_object() || rec.kit.is_array() {
-        for line in serde_json::to_string_pretty(&rec.kit)?.lines() {
-            println!("  {line}");
+    if let Some(kit) = rec.kit.as_deref() {
+        print!("{kit}");
+        if !kit.ends_with('\n') {
+            println!();
         }
-    } else if let Some(s) = rec.kit.as_str() {
-        for line in s.lines() {
-            println!("  {line}");
-        }
-    } else {
-        println!("  {}", rec.kit);
     }
     Ok(0)
 }
 
 /// A one-line, TRUNCATED preview of the raw kit as compact JSON. Not an
 /// interpretation: whatever the proposer wrote, clipped to fit a line.
-fn preview(kit: &serde_json::Value) -> String {
-    let compact = kit.to_string();
+fn preview(kit: Option<&str>) -> String {
+    let compact: String = kit.unwrap_or("(attachments only)").split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= PREVIEW_CHARS {
         return compact;
     }

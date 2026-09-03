@@ -3,9 +3,15 @@
 //! A mod is a **kit**: instructions plus data, in whatever form the proposer
 //! chose — a diff, a sentence, pixel data, a config value — enough for an AI
 //! to make the change correctly later, given the mod's own context. **darkmux
-//! never types a kit and never opens it.** The kit is stored verbatim: JSON if
-//! the input parsed as JSON, otherwise the text as a string. Nothing reads
-//! inside it.
+//! never types a kit and never opens it.**
+//!
+//! *Verbatim* means BYTE-EXACT, which is why the kit is always a string and is
+//! never parsed on write. An earlier version parsed a JSON-looking kit and
+//! re-serialized it; that silently collapsed duplicate keys and rounded large
+//! integers through `f64`, so the stored kit was not the kit that was written.
+//! A kit is not darkmux's data to normalize. `kit_looks_json` is a reader
+//! HINT computed at write time — it says a parse succeeded once, and promises
+//! nothing about what a reader will get back.
 //!
 //! **The key is MINTED per mod, never derived from a finding.** Two agents
 //! review the same finding at different times; one proposes the code change,
@@ -18,11 +24,24 @@
 //! its mods is DERIVED by scanning mods — nothing is written back onto the
 //! finding, which is an event and is never rewritten.
 //!
+//! `for` keys are CANONICALIZED on create (`<dispatch>/<seq>`, the seq
+//! renumbered), so `sess-a/01` and `sess-a/1` are one address. One finding has
+//! to have one address, or a mod is attached to a finding by one reader and
+//! invisible to another. A key that can address no finding at all is refused
+//! loudly rather than stored as a link nothing can follow.
+//!
 //! For each `for` key that exists in the finding store, the mod copies that
 //! finding's `mission_id`, `context` and `emitted` into its own `context`, so
 //! a reader of the mod never has to go find the finding. A `for` key with no
 //! stored finding is allowed and recorded as `{key, missing: true}` — the mod
 //! is still the change someone proposed.
+//!
+//! **That copy is a SNAPSHOT taken at create time.** It is what makes the mod
+//! self-describing, and it is also the limit: a mod created before its finding
+//! was synced records that finding as missing and carries no mission, so
+//! `mod list --mission` will not see it. The snapshot is never refreshed —
+//! rewriting it would make the mod a mutable view of a record that is itself
+//! an event.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,6 +64,22 @@ pub fn is_safe_key(key: &str) -> bool {
         && !key.contains('/')
         && !key.contains('\\')
         && !key.contains('\0')
+}
+
+/// Whether an attachment file name is safe to write inside a mod's own
+/// `attachments/`.
+///
+/// Deliberately WEAKER than [`is_safe_key`]: a key is a directory name darkmux
+/// mints and controls, so it refuses a leading dot; a file name is the
+/// proposer's, and `.env.example` is an ordinary attachment. Only what could
+/// escape the directory is refused — a separator, `.`, `..`, an empty name.
+pub fn is_safe_basename(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 /// Mint a key for one mod: `mod-<unix-secs>-<6 hex>`.
@@ -116,9 +151,16 @@ pub struct ModRecord {
     /// address three observations.
     #[serde(rename = "for", default)]
     pub r#for: Vec<String>,
-    /// The kit, verbatim: JSON when the input parsed as JSON, else the text as
-    /// a string. **Never interpreted.**
-    pub kit: serde_json::Value,
+    /// The kit, BYTE-EXACT, always a string, never parsed. `None` when no
+    /// kit text was given and the attachments are the whole kit — which is a
+    /// different fact from a kit whose text is empty, so the two are not
+    /// collapsed. A kit whose text is `null` is the four characters `null`.
+    pub kit: Option<String>,
+    /// A reader HINT: the kit text parsed as JSON at write time. It is not a
+    /// promise and nothing in darkmux acts on it — the kit is handed on as
+    /// bytes either way.
+    #[serde(default)]
+    pub kit_looks_json: bool,
     /// Basenames of the files under this mod's `attachments/`.
     #[serde(default)]
     pub attachments: Vec<String>,
@@ -139,6 +181,11 @@ pub enum Materialized {
     Created,
     AlreadyPresent,
 }
+
+/// Where a mod is assembled before it becomes visible. A dot name so it is
+/// never a valid mod key ([`is_safe_key`] refuses a leading dot), which is
+/// what keeps a half-staged mod from ever being read as a record.
+pub const STAGING_DIR: &str = ".staging";
 
 /// The store root: `env(DARKMUX_MODS_DIR) > config.dirs.mods > <darkmux
 /// root>/mods`.
@@ -161,22 +208,42 @@ pub fn attachments_dir_at(root: &Path, key: &str) -> PathBuf {
     record_dir_at(root, key).join("attachments")
 }
 
-/// The kit, verbatim. JSON if the whole input parses as JSON; otherwise the
-/// text as a string. **This is the only decision darkmux makes about a kit,
-/// and it is a storage decision, not an interpretation** — a JSON kit stays
-/// queryable, a prose kit stays exactly the prose that was written.
-pub fn parse_kit(text: &str) -> serde_json::Value {
-    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
+/// Whether a kit's text parses as JSON. A HINT for readers, computed once at
+/// write time and stored — darkmux does not act on the answer, and the kit is
+/// handed on as bytes whichever way it goes.
+pub fn kit_looks_json(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text).is_ok()
 }
 
-/// Copy each named finding's provenance onto the mod. A key with no stored
-/// finding is recorded as missing rather than refused.
+/// One finding, one address. `sess-a/01` and `sess-a/1` name the same finding,
+/// so the seq is renumbered and the pair rejoined — the form every reader
+/// compares against. A key that resolves to no `<dispatch>/<seq>` at all can
+/// address no finding and is refused by the caller.
+pub fn canonical_finding_key(key: &str) -> Option<String> {
+    let (dispatch, seq) = crate::findings::parse_key(key)?;
+    Some(format!("{dispatch}/{seq}"))
+}
+
+/// Canonicalize every `for` key, refusing one that can address no finding.
+/// Loud, because such a key would otherwise be stored as a link nothing could
+/// ever follow.
+pub fn canonical_for_keys(for_keys: &[String]) -> Result<Vec<String>> {
+    for_keys
+        .iter()
+        .map(|k| {
+            canonical_finding_key(k).with_context(|| {
+                format!("not a finding key: {k:?} (expected <dispatch>/<seq>, e.g. sess-abc/1)")
+            })
+        })
+        .collect()
+}
+
+/// Copy each named finding's provenance onto the mod. Keys must already be
+/// canonical (see [`canonical_for_keys`]).
 pub fn finding_context(findings_root: &Path, for_keys: &[String]) -> Result<ModContext> {
     let mut findings = Vec::new();
     for key in for_keys {
         let stored = match crate::findings::parse_key(key) {
-            // An unparseable or unsafe key can address nothing in the store,
-            // so it is missing for the same reason an absent one is.
             None => None,
             Some((dispatch, seq)) => crate::findings::load_at(findings_root, &dispatch, seq)?,
         };
@@ -249,15 +316,23 @@ pub fn create(
         "a mod needs a kit: pass --kit <file>|- and/or --attach <path>"
     );
 
-    // Everything that can fail is checked BEFORE the record dir exists, so a
-    // refusal leaves no half-written mod behind.
+    // Everything that can be checked without touching the store is checked
+    // first; everything that CANNOT is staged (below), so no failure can leave
+    // a half-written mod.
+    let for_keys = canonical_for_keys(for_keys)?;
     let mut names: Vec<String> = Vec::new();
     for path in attachments {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .filter(|n| is_safe_key(n))
-            .with_context(|| format!("attachment has no usable file name: {}", path.display()))?
+            .filter(|n| is_safe_basename(n))
+            .with_context(|| {
+                format!(
+                    "attachment file name is not usable as a name inside the mod \
+(a separator, `.`, `..` or empty): {}",
+                    path.display()
+                )
+            })?
             .to_string();
         anyhow::ensure!(
             !names.contains(&name),
@@ -272,24 +347,63 @@ pub fn create(
         key: key.clone(),
         ts: darkmux_flow::ts_utc_now(),
         by: by.to_string(),
-        r#for: for_keys.to_vec(),
-        kit: kit.map(parse_kit).unwrap_or(serde_json::Value::Null),
+        r#for: for_keys.clone(),
+        // The bytes that came in, unchanged. No parse, no re-serialize.
+        kit: kit.map(str::to_string),
+        kit_looks_json: kit.is_some_and(kit_looks_json),
         attachments: names.clone(),
-        context: finding_context(findings_root, for_keys)?,
+        context: finding_context(findings_root, &for_keys)?,
         schema_version: MOD_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     };
 
-    materialize(root, &record)?;
-    if !attachments.is_empty() {
-        let dest = attachments_dir_at(root, &key);
-        std::fs::create_dir_all(&dest)
-            .with_context(|| format!("creating attachments dir {}", dest.display()))?;
-        for (path, name) in attachments.iter().zip(&names) {
-            std::fs::copy(path, dest.join(name))
-                .with_context(|| format!("copying attachment {}", path.display()))?;
+    // Staged, then renamed into place. The record and its attachments become
+    // visible TOGETHER or not at all: a copy that fails halfway would
+    // otherwise persist a write-once record listing a file that is not on
+    // disk — impossible to complete, and a retry would mint a second key and
+    // leave the broken one behind forever.
+    let staging_root = root.join(STAGING_DIR);
+    let staging = staging_root.join(&key);
+    let staged = (|| -> Result<()> {
+        // Attachments FIRST, then the record that names them, so the last
+        // thing written inside the staging dir is the thing that makes it a
+        // record at all.
+        if !attachments.is_empty() {
+            let dest = staging.join("attachments");
+            std::fs::create_dir_all(&dest)
+                .with_context(|| format!("creating attachments dir {}", dest.display()))?;
+            for (path, name) in attachments.iter().zip(&names) {
+                std::fs::copy(path, dest.join(name))
+                    .with_context(|| format!("copying attachment {}", path.display()))?;
+            }
         }
+        // A minted key never collides, so anything but `Created` means
+        // something else already owns that address — an error, not a shrug,
+        // because the alternative is attaching these files to another mod.
+        anyhow::ensure!(
+            materialize(&staging_root, &record)? == Materialized::Created,
+            "a mod already exists at the minted key {key} — refusing to write over it"
+        );
+        let final_dir = record_dir_at(root, &key);
+        anyhow::ensure!(
+            !final_dir.exists(),
+            "a mod already exists at {} — refusing to write over it",
+            final_dir.display()
+        );
+        // Atomic within one filesystem, and staging lives under the store, so
+        // it always is one.
+        std::fs::rename(&staging, &final_dir).with_context(|| {
+            format!("moving the staged mod into {}", final_dir.display())
+        })?;
+        Ok(())
+    })();
+    if staged.is_err() {
+        // Nothing partial survives a failure — not the record, not the files.
+        let _ = std::fs::remove_dir_all(&staging);
     }
+    // Best-effort tidy; only succeeds when no other create is staging.
+    let _ = std::fs::remove_dir(&staging_root);
+    staged?;
     Ok(record)
 }
 
@@ -306,9 +420,24 @@ pub fn load_at(root: &Path, key: &str) -> Result<Option<ModRecord>> {
     }
     let body =
         std::fs::read_to_string(&path).with_context(|| format!("reading mod {}", path.display()))?;
-    let rec =
+    let rec: ModRecord =
         serde_json::from_str(&body).with_context(|| format!("parsing mod {}", path.display()))?;
+    // A record's key IS its address. If they disagree, the record cannot be
+    // reached by what it claims to be, so it is not served under a name that
+    // does not resolve.
+    if !is_addressable(&rec, key) {
+        return Ok(None);
+    }
     Ok(Some(rec))
+}
+
+/// Whether a record read out of `<root>/<dir_name>` may be served: its `key`
+/// is that directory, and every attachment name is a plain basename. Both are
+/// checked BEFORE anything stats or opens an attachment path.
+fn is_addressable(rec: &ModRecord, dir_name: &str) -> bool {
+    rec.key == dir_name
+        && is_safe_key(&rec.key)
+        && rec.attachments.iter().all(|n| is_safe_basename(n))
 }
 
 /// Every mod in the store, ts-ascending. Unreadable or unparseable files are
@@ -320,11 +449,19 @@ pub fn load_all_at(root: &Path) -> Result<Vec<ModRecord>> {
         return Ok(out);
     };
     for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Skips the staging dir for free, along with anything else that could
+        // not be a mod's address.
+        if !is_safe_key(&name) {
+            continue;
+        }
         let Ok(body) = std::fs::read_to_string(entry.path().join("mod.json")) else {
             continue;
         };
         if let Ok(rec) = serde_json::from_str::<ModRecord>(&body) {
-            out.push(rec);
+            if is_addressable(&rec, &name) {
+                out.push(rec);
+            }
         }
     }
     out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.key.cmp(&b.key)));
@@ -392,16 +529,35 @@ mod tests {
         }
     }
 
+    /// VERBATIM means byte-exact. The earlier version parsed a JSON kit and
+    /// re-serialized it, which silently collapsed duplicate keys and rounded
+    /// large integers through f64 — a kit is not darkmux's data to normalize.
     #[test]
-    fn a_kit_is_kept_verbatim_as_json_when_it_is_json_and_as_a_string_otherwise() {
-        // JSON in, JSON out — queryable, not reshaped.
-        assert_eq!(parse_kit(r#"{"diff": "x"}"#), serde_json::json!({"diff": "x"}));
-        assert_eq!(parse_kit("[1,2]"), serde_json::json!([1, 2]));
-        // Prose in, exactly that prose out. Never parsed into fields, never
-        // trimmed: darkmux does not open a kit.
+    fn a_kit_is_stored_byte_exact_and_is_never_parsed() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+
+        // Two shapes a JSON round trip destroys, plus the exact whitespace.
+        let hostile = "{\n  \"a\": 1,\n  \"a\": 2,\n  \"big\": 12345678901234567890123\n}\n";
+        let rec = create(&mods, &finds, "kain", &[], Some(hostile), &[]).unwrap();
+        assert_eq!(rec.kit.as_deref(), Some(hostile), "the kit is the bytes that came in");
+        assert!(rec.kit_looks_json, "a reader HINT — not a parse, and not a promise");
+        let back = load_at(&mods, &rec.key).unwrap().unwrap();
+        assert_eq!(back.kit.as_deref(), Some(hostile), "byte-exact through disk too");
+
+        // Prose stays prose, with its own whitespace.
         let prose = "rename the predicate, then add a test\n";
-        assert_eq!(parse_kit(prose), serde_json::Value::String(prose.to_string()));
-        assert_eq!(parse_kit("{not json"), serde_json::Value::String("{not json".into()));
+        let rec = create(&mods, &finds, "kain", &[], Some(prose), &[]).unwrap();
+        assert_eq!(rec.kit.as_deref(), Some(prose));
+        assert!(!rec.kit_looks_json);
+
+        // A kit that is literally the text `null` is that text — not a null.
+        let rec = create(&mods, &finds, "kain", &[], Some("null"), &[]).unwrap();
+        assert_eq!(rec.kit.as_deref(), Some("null"));
+        let raw = std::fs::read_to_string(record_path_at(&mods, &rec.key)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["kit"], "null", "stored as a STRING, so `null` is text: {raw}");
     }
 
     #[test]
@@ -485,7 +641,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rec.attachments, vec!["patch.diff", "shot.png"]);
-        assert!(rec.kit.is_null(), "attachments alone are a kit; no kit text was given");
+        assert!(rec.kit.is_none(), "attachments alone are a kit; no kit text was given");
         let dest = attachments_dir_at(&mods, &rec.key);
         assert_eq!(std::fs::read(dest.join("patch.diff")).unwrap(), b"--- a\n+++ b\n");
         assert_eq!(std::fs::read(dest.join("shot.png")).unwrap(), [0x89u8, 0x50, 0x4e, 0x47]);
@@ -503,6 +659,133 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("patch.diff"), "the error names it: {err:#}");
+    }
+
+    /// A copy that fails HALFWAY must leave no record at all. The record is
+    /// write-once, so a persisted mod listing an attachment that is not on
+    /// disk could never be completed — and a retry would mint a second key,
+    /// leaving the broken one behind forever.
+    #[test]
+    fn a_failed_attachment_copy_leaves_no_record_behind() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("ok.diff"), b"--- a\n").unwrap();
+        let unreadable = src.join("unreadable.bin");
+        std::fs::write(&unreadable, b"secret").unwrap();
+        // Readable enough to pass the is-a-file check, unreadable at copy time
+        // — the failure lands BETWEEN the two attachments.
+        std::fs::set_permissions(&unreadable, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+
+        let err = create(
+            &mods,
+            &finds,
+            "kain",
+            &[],
+            Some("kit"),
+            &[src.join("ok.diff"), unreadable.clone()],
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("unreadable.bin"), "the error names it: {err:#}");
+
+        assert!(load_all_at(&mods).unwrap().is_empty(), "no half-written mod is visible");
+        // Nothing at all is left in the store — not a record dir, not staging.
+        let leftovers: Vec<String> = std::fs::read_dir(&mods)
+            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "the store is untouched, got: {leftovers:?}");
+
+        std::fs::set_permissions(&unreadable, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+    }
+
+    /// One finding must have ONE address. `sess-a/01` and `sess-a/1` name the
+    /// same finding, and storing the raw string made a mod attached to the
+    /// finding (context copied, `--mission` matching) yet invisible to
+    /// `list --for sess-a/1` and to that finding's own derived section.
+    #[test]
+    fn create_canonicalizes_for_keys_and_refuses_one_that_cannot_address_a_finding() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, Some("crawl-1"));
+
+        let rec = create(&mods, &finds, "kain", &["sess-a/01".into()], Some("k"), &[]).unwrap();
+        assert_eq!(rec.r#for, vec!["sess-a/1"], "stored in canonical form");
+        assert_eq!(rec.context.findings[0].key, "sess-a/1");
+        assert!(!rec.context.findings[0].missing, "it resolved to the real finding");
+
+        // The one address is the one every reader uses.
+        let all = load_all_at(&mods).unwrap();
+        assert_eq!(mods_for(&all, "sess-a/1").len(), 1, "the derived view finds it");
+
+        // A key that can address no finding is refused LOUDLY at create time,
+        // rather than stored as a link that nothing can ever follow.
+        for bad in ["no-slash", "sess-a/notanumber", "../x/1", "/1"] {
+            let err = create(&mods, &finds, "kain", &[bad.to_string()], Some("k"), &[]).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("finding key"),
+                "the error names the shape for {bad:?}: {err:#}"
+            );
+        }
+    }
+
+    /// A KEY may not start with a dot (it is a directory name darkmux mints).
+    /// A FILE may — `.env.example` is an ordinary attachment. The two rules
+    /// were the same function, so a legitimate dotfile was refused.
+    #[test]
+    fn an_attachment_may_be_a_dotfile_but_never_a_traversal_name() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(".env.example"), b"KEY=value\n").unwrap();
+
+        let rec = create(&mods, &finds, "kain", &[], None, &[src.join(".env.example")]).unwrap();
+        assert_eq!(rec.attachments, vec![".env.example"]);
+        assert_eq!(
+            std::fs::read(attachments_dir_at(&mods, &rec.key).join(".env.example")).unwrap(),
+            b"KEY=value\n"
+        );
+
+        assert!(is_safe_basename(".env.example"));
+        for bad in [".", "..", "a/b", "a\\b", ""] {
+            assert!(!is_safe_basename(bad), "must be refused: {bad:?}");
+        }
+    }
+
+    /// A record's key is also its address on disk. If the two disagree, the
+    /// record cannot be addressed by what it claims to be, so it is skipped
+    /// rather than served under a name that does not resolve.
+    #[test]
+    fn a_record_whose_key_disagrees_with_its_directory_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        let good = create(&mods, &finds, "kain", &[], Some("k"), &[]).unwrap();
+
+        std::fs::create_dir_all(mods.join("mod-liar")).unwrap();
+        std::fs::write(
+            mods.join("mod-liar/mod.json"),
+            serde_json::to_string(&serde_json::json!({
+                "key": good.key, "ts": "2026-09-03T09:00:00Z", "by": "x", "for": [],
+                "kit": "k", "kit_looks_json": false, "attachments": [],
+                "context": {"findings": []}, "schema_version": "1",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let keys: Vec<String> = load_all_at(&mods).unwrap().into_iter().map(|m| m.key).collect();
+        assert_eq!(keys, vec![good.key.clone()], "the impostor is skipped, not served twice");
+        assert!(
+            load_at(&mods, "mod-liar").unwrap().is_none(),
+            "a record that does not own its directory does not resolve there"
+        );
     }
 
     #[test]
@@ -523,7 +806,8 @@ mod tests {
             ts: "2026-09-03T01:00:00Z".into(),
             by: "kain".into(),
             r#for: vec![],
-            kit: serde_json::Value::String("k".into()),
+            kit: Some("k".into()),
+            kit_looks_json: false,
             attachments: vec![],
             context: ModContext::default(),
             schema_version: MOD_SCHEMA_VERSION.into(),
@@ -552,7 +836,8 @@ mod tests {
             ts: ts.into(),
             by: "kain".into(),
             r#for: vec![],
-            kit: serde_json::Value::String("k".into()),
+            kit: Some("k".into()),
+            kit_looks_json: false,
             attachments: vec![],
             context: ModContext::default(),
             schema_version: MOD_SCHEMA_VERSION.into(),

@@ -426,7 +426,9 @@ pub(crate) enum ModCmd {
         /// Only mods naming this finding key.
         #[arg(long = "for")]
         r#for: Option<String>,
-        /// Only mods naming a finding recorded under this mission.
+        /// Only mods naming a finding recorded under this mission. Answered
+        /// from the mod's own create-time snapshot of its findings, so a mod
+        /// created before its finding was synced will not match.
         #[arg(long)]
         mission: Option<String>,
         #[command(flatten)]
