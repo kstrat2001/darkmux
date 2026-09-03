@@ -160,6 +160,21 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     } else {
         println!("  {}", rec.emitted);
     }
+
+    // (#2265) The mods that name this finding — DERIVED by scanning the mod
+    // store, never stored on the finding. A finding is an event and is never
+    // rewritten, so the only stored link lives on the thing created later;
+    // this read turns it around. It prints LAST, so everything above stays
+    // byte-identical to what `finding show` printed before mods existed.
+    let mod_root = config_access::mods_dir();
+    let all_mods = darkmux_crew::mods::load_all_at(&mod_root)?;
+    let naming = darkmux_crew::mods::mods_for(&all_mods, &rec.key);
+    if !naming.is_empty() {
+        println!("\nmods");
+        for m in naming {
+            println!("  {}  {}  {}", m.key, m.ts, m.by);
+        }
+    }
     Ok(0)
 }
 

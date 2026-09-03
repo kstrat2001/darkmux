@@ -437,6 +437,7 @@ src/                          CLI command layer (clap)
   mission_status.rs           `mission status`: the read-only mission board
   lab_cli.rs                  `lab` family — kind-family shape (#1465): `run {<dispatch>·list·inspect·compare}` · `workload list` · `fixture {list·register·unregister}` · `notebook {draft·list}` · `eval <role>` · `loop`/`characterize`/`tune`/`doctor`
   phase_cli.rs                Code-review output rendering (`phase_review_output_at`) for the coder-phase QA gate; the `phase` verb family retired (#1463)
+  mod_cli.rs                  `mod` family (create/list/show over the write-once mod store)
   role_cli.rs                 `role` family (list/show from the SQLite index)
   finding_cli.rs              `finding` family (#2265): `list`/`show` read the write-once finding store; `sync` replays the flow stream into it (the store's second producer, after the dispatch tailer)
   fleet_cli.rs                `machine list/add/remove` roster (the retired `fleet` family folded into `machine`, #1426)

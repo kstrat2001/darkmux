@@ -21,6 +21,12 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "5.0"
+# (#2265) Mod keys are MINTED per mod with the same token scheme
+# `mission_launch::mint_run_id` uses — a blake3 digest over (nanos, pid, an
+# in-process counter) — so two mods minted in the same second are distinct.
+# Already in the lockfile at this version (darkmux-flow, darkmux-lab and the
+# runtime each depend on it directly); this adds no new transitive surface.
+blake3 = "1.5"
 # Phase B (#45) — SQLite-backed derived index over crew manifests.
 rusqlite = { version = "0.31", features = ["bundled"] }
 

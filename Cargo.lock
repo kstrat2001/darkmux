@@ -729,6 +729,7 @@ name = "darkmux-crew"
 version = "3.5.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "darkmux-flow",
  "darkmux-gestalt",
  "darkmux-profiles",

@@ -52,6 +52,9 @@ pub mod index;
 pub mod lessons;
 pub mod lifecycle;
 pub mod loader;
+/// (#2265) The mod record — how something could change, stored write-once
+/// under `<mods dir>/<key>/mod.json` with the mod's own `attachments/`.
+pub mod mods;
 // (#1284 Packet 1) Mission configs — missions as DATA. Schema + loader +
 // built-in transcriptions of `build_review_graph`/`default_phase_graph`'s
 // former hand-built graphs. Packet 3 added `mission_config::interpret`,
