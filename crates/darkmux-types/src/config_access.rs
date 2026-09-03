@@ -965,6 +965,48 @@ fn flows_dir_default() -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp/darkmux-test-isolated/flows")
 }
 
+/// (#2265) The finding-record store — `env(DARKMUX_FINDINGS_DIR) >
+/// config.dirs.findings > <darkmux root>/findings`, the same three-tier shape
+/// every sibling dir resolves through.
+///
+/// One `<dispatch>/<seq>/finding.json` per accepted `create_finding` call. The
+/// flow stream remains the audit trail; this directory is the queryable copy
+/// (`finding list` / `finding show`), so JSON on disk is the truth the same way
+/// it is for roles.
+pub fn findings_dir() -> std::path::PathBuf {
+    pick_dir(
+        env_str("DARKMUX_FINDINGS_DIR"),
+        config().dirs.as_ref().and_then(|d| d.findings.as_deref()),
+        findings_dir_default,
+    )
+}
+
+/// Derived from the SAME root resolution every other darkmux directory
+/// resolves through — `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and
+/// a project-local `./.darkmux` before `~/.darkmux` — mirroring
+/// `hooks_outbox_dir_default`. Reaching straight for `dirs::home_dir()` here
+/// would put a `DARKMUX_HOME`-scoped install's findings in the operator's real
+/// `~/.darkmux/findings`, the bug class #1585 fixed one directory over.
+#[cfg(not(any(test, feature = "test-support")))]
+fn findings_dir_default() -> std::path::PathBuf {
+    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("findings")
+}
+
+/// Test builds must never default onto the operator's real
+/// `~/.darkmux/findings` — same isolation discipline as `lab_dir_default`'s own
+/// test-build variant (#994). A test that DID isolate itself (a `DARKMUX_HOME`
+/// tempdir, or a project-local `./.darkmux`) is honored verbatim, because a
+/// test that isolated itself means it.
+#[cfg(any(test, feature = "test-support"))]
+fn findings_dir_default() -> std::path::PathBuf {
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/findings");
+    }
+    resolved.root.join("findings")
+}
+
 /// (#1585) The lab-run scan root — `env(DARKMUX_LAB_DIR) > config.dirs.lab >
 /// ~/.darkmux/runs`, the same three-tier shape as its nine sibling dirs.
 ///
@@ -1567,6 +1609,40 @@ mod tests {
         // ~/.darkmux/flows default, or the /tmp fallback if HOME is absent).
         assert!(flows_dir().ends_with("flows"), "resolves to a flows dir");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", v); } }
+    }
+
+    /// (#2265) `dirs.findings` resolves through the same three tiers as every
+    /// sibling dir: `env(DARKMUX_FINDINGS_DIR) > config.dirs.findings >
+    /// <root>/findings`. The config tier is exercised through `pick_dir`
+    /// directly (the process-wide `config()` is the empty test tier by
+    /// construction, #811), the way the sibling `pick_dir` test does.
+    #[serial_test::serial]
+    #[test]
+    fn findings_dir_env_then_config_then_default() {
+        let prev = std::env::var("DARKMUX_FINDINGS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_FINDINGS_DIR", "/custom/findings");
+        }
+        assert_eq!(findings_dir(), std::path::PathBuf::from("/custom/findings"));
+
+        unsafe {
+            std::env::remove_var("DARKMUX_FINDINGS_DIR");
+        }
+        // config tier beats the built-in default; env (absent) does not shadow it.
+        assert_eq!(
+            pick_dir(None, Some("/cfg/findings"), findings_dir_default),
+            std::path::PathBuf::from("/cfg/findings")
+        );
+        // Unset everywhere → a real path under the darkmux root, never nothing.
+        assert!(
+            findings_dir().ends_with("findings"),
+            "unset must resolve to a findings dir, not nothing"
+        );
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("DARKMUX_FINDINGS_DIR", v);
+            }
+        }
     }
 
     #[serial_test::serial]

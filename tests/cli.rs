@@ -3932,3 +3932,219 @@ fn dry_run_table_marks_shared_read_pass_rows() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("shared read pass"), "got:\n{stdout}");
 }
+
+// ─── `finding` family (#2265) ────────────────────────────────────────────
+//
+// The finding record is what was observed: an event, keyed `<dispatch>/<seq>`,
+// written once and never rewritten. `finding sync` is the SECOND producer —
+// it replays the flow stream for anything the live tailer missed (an older
+// binary, a killed process) and must be idempotent, because the tailer and it
+// race by design.
+
+/// One flow day file holding the three shapes `sync` has to tell apart: an
+/// accepted `create_finding` with an emission, the pre-2026-09-03
+/// `report_finding` name (historical records carry it; the stream is
+/// append-only), and an accepted call from a runtime that predates FLOW
+/// 1.33.0 and therefore carried no `emitted` at all.
+fn write_finding_day_file(flows: &std::path::Path) {
+    fs::create_dir_all(flows).unwrap();
+    // `mission_id` / `phase_id` are TOP-LEVEL on a flow record; the crawl's
+    // `context` is the launcher's blob (workspace / source / sha / rule / unit)
+    // and carries no mission. A fixture that put the mission inside `context`
+    // would test a shape the producer never emits.
+    let rec = |ts: &str, sess: &str, tool: &str, seq: u64, mission: &str, emitted: Option<serde_json::Value>| {
+        let mut payload = serde_json::json!({
+            "tool_name": tool, "ok": true, "args": "{}",
+            "context": {"unit": "u1", "rule": "unnamed-predicate", "source": "acme"},
+        });
+        if let Some(e) = emitted {
+            payload["emitted"] = e;
+            payload["emit_seq"] = serde_json::json!(seq);
+        }
+        serde_json::json!({
+            "ts": ts, "level": "info", "category": "work", "tier": "local",
+            "stage": "dispatch", "action": "dispatch.tool", "handle": "crawler",
+            "session_id": sess, "model": "darkmux:qwen3.6", "machine_id": "test-machine",
+            "mission_id": mission, "phase_id": format!("{mission}-crawl"),
+            "payload": payload,
+        })
+        .to_string()
+    };
+    let lines = [
+        rec("2026-09-03T01:00:00Z", "sess-a", "create_finding", 1, "crawl-1",
+            Some(serde_json::json!({"file": "a.ts", "line": 4, "why": "unnamed operands"}))),
+        rec("2026-09-03T02:00:00Z", "sess-b", "report_finding", 2, "crawl-2",
+            Some(serde_json::json!({"file": "b.ts", "line": 9}))),
+        // Pre-FLOW-1.33.0: no `emitted` key at all — in the stream, not a record.
+        rec("2026-09-03T03:00:00Z", "sess-c", "create_finding", 3, "crawl-1", None),
+    ];
+    fs::write(flows.join("2026-09-03.jsonl"), lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
+    let home = TempDir::new().unwrap();
+    let flows = home.path().join("flows");
+    write_finding_day_file(&flows);
+
+    let dm = |args: &[&str]| {
+        Command::cargo_bin("darkmux")
+            .unwrap()
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", &flows)
+            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+            .args(args)
+            .output()
+            .expect("darkmux runs")
+    };
+
+    // First pass: two records made, one call that cannot become one.
+    let out = dm(&["finding", "sync", "--json"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("finding sync --json emits JSON");
+    assert_eq!(v["created"], 2, "got: {v}");
+    assert_eq!(v["present"], 0, "got: {v}");
+    assert_eq!(v["skipped_no_emission"], 1, "the pre-1.33.0 call cannot become a record: {v}");
+    assert_eq!(v["scanned"], 3, "got: {v}");
+
+    // On disk where the key says, one file per finding.
+    assert!(home.path().join("findings/sess-a/1/finding.json").exists());
+    assert!(home.path().join("findings/sess-b/2/finding.json").exists());
+    assert!(!home.path().join("findings/sess-c").exists());
+
+    // Second pass: idempotent. Nothing new, both already present.
+    let out = dm(&["finding", "sync", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(v["created"], 0, "a second sync must create nothing: {v}");
+    assert_eq!(v["present"], 2, "got: {v}");
+
+    // The human output NAMES the calls that cannot become records, rather
+    // than dropping them silently.
+    let out = dm(&["finding", "sync"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no emission"), "human output must name the skip: {stdout}");
+
+    // `finding list` reads the STORE, one line per finding, ts-ascending.
+    let out = dm(&["finding", "list"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let rows: Vec<&str> = stdout.lines().filter(|l| l.contains("sess-")).collect();
+    assert_eq!(rows.len(), 2, "one line per finding: {stdout}");
+    assert!(rows[0].contains("sess-a/1"), "ts-ascending, keyed: {stdout}");
+    assert!(rows[0].contains("crawler"), "the proposer is named: {stdout}");
+
+    let out = dm(&["finding", "list", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let arr = v["findings"].as_array().expect("findings array");
+    assert_eq!(arr.len(), 2, "got: {v}");
+    assert_eq!(arr[0]["emitted"]["file"], "a.ts", "the emission rides whole: {v}");
+
+    // The record carries the mission the dispatch ran under as its OWN field —
+    // never read out of the launcher's context blob, which has no mission in it.
+    assert_eq!(arr[0]["mission_id"], "crawl-1", "got: {v}");
+    assert_eq!(arr[0]["phase_id"], "crawl-1-crawl", "got: {v}");
+    assert!(
+        arr[0]["context"].get("mission_id").is_none(),
+        "the launcher's context stays verbatim — no mission injected into it: {v}"
+    );
+
+    // `--mission` selects on that field. THE #2288 live-proof gap: sync made
+    // every record, `--rule` matched them all, and `--mission` matched none,
+    // because the filter read a key `context` never holds.
+    let mission_ids = |args: &[&str]| -> Vec<String> {
+        let out = dm(args);
+        let v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        v["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .map(|f| f["key"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        mission_ids(&["finding", "list", "--mission", "crawl-1", "--json"]),
+        vec!["sess-a/1".to_string()],
+        "--mission must return exactly that mission's findings"
+    );
+    assert_eq!(
+        mission_ids(&["finding", "list", "--mission", "crawl-2", "--json"]),
+        vec!["sess-b/2".to_string()],
+    );
+    assert!(
+        mission_ids(&["finding", "list", "--mission", "no-such-mission", "--json"]).is_empty(),
+        "an unknown mission returns none"
+    );
+
+    // `--dispatch` narrows to one dispatch. Unpinned, the filter could be
+    // `.filter(|_| true)` and nothing would notice.
+    assert_eq!(
+        mission_ids(&["finding", "list", "--dispatch", "sess-b", "--json"]),
+        vec!["sess-b/2".to_string()],
+        "--dispatch must return exactly that dispatch's findings"
+    );
+    assert!(
+        mission_ids(&["finding", "list", "--dispatch", "sess-nope", "--json"]).is_empty(),
+        "an unknown dispatch returns none"
+    );
+    // …and the three filters compose rather than replacing each other.
+    assert!(
+        mission_ids(&["finding", "list", "--mission", "crawl-1", "--dispatch", "sess-b", "--json"])
+            .is_empty(),
+        "filters compose: sess-b is not in crawl-1"
+    );
+
+    // A filter that matches nothing must not read like an EMPTY STORE — the
+    // remedy for the two is different ("your filter matched nothing" vs "run
+    // sync").
+    let out = dm(&["finding", "list", "--mission", "no-such-mission"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no findings match"), "got:\n{stdout}");
+    assert!(
+        !stdout.contains("finding sync"),
+        "the store is NOT empty — do not tell the operator to sync: {stdout}"
+    );
+
+    // A malformed --since would match no day file and exit clean, which reads
+    // exactly like "there are no findings". It must refuse instead.
+    let out = dm(&["finding", "sync", "--since", "last-tuesday"]);
+    assert_ne!(out.status.code(), Some(0), "a non-date --since must not exit clean");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("YYYY-MM-DD"),
+        "the error names the shape: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A key that would escape the store is refused, not resolved.
+    let out = dm(&["finding", "show", "../sess-a/1"]);
+    assert_eq!(out.status.code(), Some(1), "a traversal key must not resolve");
+
+    // The human list names the mission when the finding has one.
+    let out = dm(&["finding", "list", "--mission", "crawl-1"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("crawl-1"), "the mission is shown: {stdout}");
+
+    // Filters otherwise read the record's own context — never the emission.
+    let out = dm(&["finding", "list", "--rule", "nope", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(v["findings"].as_array().unwrap().is_empty(), "got: {v}");
+
+    // `finding show` prints ONE record, addressed by its key.
+    let out = dm(&["finding", "show", "sess-a/1"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("sess-a/1"), "got:\n{stdout}");
+    assert!(stdout.contains("a.ts"), "the emission is shown: {stdout}");
+    assert!(stdout.contains("crawl-1"), "show names the mission: {stdout}");
+    assert!(!stdout.contains("sess-b"), "show is ONE record: {stdout}");
+
+    // A missing key is an error with a clear message, not an empty success.
+    let out = dm(&["finding", "show", "sess-a/99"]);
+    assert_eq!(out.status.code(), Some(1), "a missing finding exits 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sess-a/99"), "the message names the key: {stderr}");
+}

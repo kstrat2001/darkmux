@@ -4422,6 +4422,264 @@
         );
     }
 
+    /// (#2265) The tailer is the LIVE producer of the finding record. An
+    /// accepted finding call streaming past materializes
+    /// `<findings dir>/<dispatch>/<seq>/finding.json` with the emission
+    /// verbatim, and only an accepted finding call does.
+    ///
+    /// Write-once is the load-bearing half: a finding is an EVENT, so a second
+    /// arrival of the same key (the tailer racing `finding sync`, a replayed
+    /// trajectory) must leave the bytes already on disk exactly as they are.
+    #[test]
+    #[serial] // reaches emit() + the findings store; both env dirs are tempdirs
+    fn an_accepted_finding_call_materializes_a_write_once_record() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("findings");
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        let prev_store = std::env::var("DARKMUX_FINDINGS_DIR").ok();
+        let prev_machine = std::env::var("DARKMUX_MACHINE_ID").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+            std::env::set_var("DARKMUX_FINDINGS_DIR", &store);
+            std::env::set_var("DARKMUX_MACHINE_ID", "test-machine");
+        }
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-finding".into(),
+            "crawler".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // A crawl's `context` is the LAUNCHER's blob: workspace / source / sha /
+        // rule / unit. The mission is NOT in it — on the flow record
+        // `mission_id`, `phase_id` and `step_id` are TOP-LEVEL fields, which is
+        // why the finding record has to capture them separately.
+        state.record_context = Some(serde_json::json!({
+            "unit": "u7", "rule": "unnamed-predicate",
+            "source": "acme", "sha": "deadbeef",
+        }));
+        state.mission_id = Some("crawl-1788402801".into());
+        state.phase_id = Some("crawl-1788402801-crawl".into());
+        state.step_id = Some("step-7".into());
+
+        let emitted = serde_json::json!({
+            "file": "/workspace/acme/src/x.ts", "line": 82,
+            "evidence": "  enabled: !a && b !== null && c,",
+            "why": "three unnamed operands", "rect": [0, 0, 10, 10],
+        });
+        let accepted = serde_json::json!({
+            "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_finding",
+            "args": "{\"file\":\"x\"}", "result": "Recorded.", "ok": true,
+            "emitted": emitted, "emit_seq": 4,
+        });
+        state.handle_event(&accepted.to_string());
+
+        let path = store.join("sess-finding").join("4").join("finding.json");
+        let rec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("record written")).unwrap();
+        assert_eq!(rec["key"], "sess-finding/4");
+        assert_eq!(rec["dispatch"], "sess-finding");
+        assert_eq!(rec["seq"], 4);
+        assert_eq!(rec["tool_name"], "create_finding");
+        assert_eq!(rec["schema_version"], "1");
+        assert!(rec["ts"].as_str().is_some_and(|s| !s.is_empty()), "the record's own ts");
+        assert_eq!(rec["proposer"]["handle"], "crawler");
+        assert_eq!(rec["proposer"]["model"], "darkmux:qwen3.6");
+        assert_eq!(rec["proposer"]["machine_id"], "test-machine");
+        assert_eq!(rec["context"]["unit"], "u7", "the crawl's context rides verbatim");
+        assert!(
+            rec["context"].get("mission_id").is_none(),
+            "the mission is NOT in the launcher's context blob: {rec}"
+        );
+        assert_eq!(
+            rec["mission_id"], "crawl-1788402801",
+            "the mission the dispatch ran under is a TOP-LEVEL field on the record: {rec}"
+        );
+        assert_eq!(rec["phase_id"], "crawl-1788402801-crawl", "got: {rec}");
+        assert_eq!(rec["step_id"], "step-7", "got: {rec}");
+        assert_eq!(rec["emitted"], emitted, "the emission is stored untouched");
+
+        // WRITE-ONCE. Mutate the file, replay the identical event, and the
+        // mutation must survive: the record is an event, not a cache.
+        std::fs::write(&path, "{\"key\":\"sentinel\"}").unwrap();
+        state.handle_event(&accepted.to_string());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"key\":\"sentinel\"}",
+            "a second arrival of the same key must NOT overwrite the record on disk"
+        );
+
+        // The pre-2026-09-03 tool name materializes too — historical records
+        // carry it and the stream is never rewritten.
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 1, "tool_name": "report_finding",
+                "args": "{}", "result": "Recorded.", "ok": true,
+                "emitted": {"file": "y.ts"}, "emit_seq": 5,
+            })
+            .to_string(),
+        );
+        assert!(
+            store.join("sess-finding").join("5").join("finding.json").exists(),
+            "report_finding (the old name) must materialize the same record"
+        );
+
+        // A REJECTED citation is a FAILED tool call (`ok: false`) and must make
+        // NO record. Rejections are a real runtime path — a wrong line number,
+        // an unresolvable path, a spent budget — and write-once would make a
+        // bad record permanent.
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":8,"tool_name":"create_finding","args":"{}","result":"REJECTED: line 9999 does not exist","ok":false,"emitted":{"file":"r.ts"},"emit_seq":8}"#,
+        );
+        assert!(
+            !store.join("sess-finding").join("8").exists(),
+            "a rejected (ok:false) finding call must NOT become a record"
+        );
+
+        // A non-emitting call and a non-finding tool make NO record.
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":2,"tool_name":"create_finding","args":"{}","result":"r","ok":true,"emitted":null,"emit_seq":6}"#,
+        );
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":3,"tool_name":"read","args":"{}","result":"r","ok":true,"emitted":{"file":"z"},"emit_seq":7}"#,
+        );
+        assert!(!store.join("sess-finding").join("6").exists(), "emitted:null → no record");
+        assert!(!store.join("sess-finding").join("7").exists(), "a read is not a finding");
+
+        // A plain `darkmux dispatch` runs under no mission at all. The fields
+        // must be explicitly null rather than absent, so "no mission" and "an
+        // older writer that did not know the field" stay distinguishable.
+        let mut solo = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-solo".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        solo.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"create_finding","args":"{}","result":"r","ok":true,"emitted":{"file":"s.ts"},"emit_seq":1}"#,
+        );
+        let solo_rec: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(store.join("sess-solo").join("1").join("finding.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(solo_rec["mission_id"].is_null(), "no mission → explicit null: {solo_rec}");
+        assert!(solo_rec["phase_id"].is_null(), "got: {solo_rec}");
+        assert!(solo_rec["step_id"].is_null(), "got: {solo_rec}");
+        assert!(solo_rec["context"].is_null(), "no launcher context → null: {solo_rec}");
+
+        unsafe {
+            for (k, v) in [
+                ("DARKMUX_FLOWS_DIR", prev_flows),
+                ("DARKMUX_FINDINGS_DIR", prev_store),
+                ("DARKMUX_MACHINE_ID", prev_machine),
+                ("DARKMUX_REDIS_URL", prev_redis),
+            ] {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// (#2265 review) The two stores must never hold DIFFERENT bytes for the
+    /// same emission. The flow record gets `bound_emitted`; the finding record
+    /// must get the SAME value, or an over-cap emission is whole-or-clipped
+    /// depending on which producer wrote it (`sync` replays the flow record,
+    /// so it would store the clipped form while the tailer stored the raw one).
+    ///
+    /// Same class, second case: `merge_record_context` no-ops on a NON-object
+    /// `record_context`, so the flow record gets no `context` at all and
+    /// `sync` stores null. The tailer must make the same judgment.
+    #[test]
+    #[serial] // reaches emit() + the findings store
+    fn the_finding_record_stores_exactly_what_the_flow_record_stores() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("findings");
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        let prev_store = std::env::var("DARKMUX_FINDINGS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+            std::env::set_var("DARKMUX_FINDINGS_DIR", &store);
+        }
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-parity".into(),
+            "crawler".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // A non-object context: the flow record's merge drops it entirely.
+        state.record_context = Some(serde_json::json!("just a string"));
+
+        let over_cap = serde_json::json!({"why": "z".repeat(MAX_EMITTED_BYTES + 10)});
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0,
+                "tool_name": "create_finding", "args": "{}", "result": "Recorded.",
+                "ok": true, "emitted": over_cap, "emit_seq": 1,
+            })
+            .to_string(),
+        );
+
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_store {
+                Some(v) => std::env::set_var("DARKMUX_FINDINGS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FINDINGS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let flow: serde_json::Value = std::fs::read_to_string(&day_file)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["action"] == "dispatch.tool")
+            .expect("a dispatch.tool record");
+        let rec: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(store.join("sess-parity").join("1").join("finding.json"))
+                .expect("record written"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            flow["payload"]["emitted"]["emitted_truncated"],
+            serde_json::json!(true),
+            "fixture must actually exceed the bound, or this test proves nothing"
+        );
+        assert_eq!(
+            rec["emitted"], flow["payload"]["emitted"],
+            "the finding record must store EXACTLY the bounded value the flow record stores"
+        );
+        assert!(
+            flow["payload"].get("context").is_none(),
+            "a non-object record_context is dropped from the flow record"
+        );
+        assert!(
+            rec["context"].is_null(),
+            "…so the finding record must drop it too, not store it verbatim: {rec}"
+        );
+    }
+
     /// (#2272) The forward is bounded — a runaway emission cannot blow a flow
     /// record past what every sink tolerates — but the bound is on the
     /// serialized WHOLE (darkmux does not know the value's fields) and LOUD:

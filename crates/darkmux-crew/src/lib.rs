@@ -45,6 +45,9 @@ pub mod host_probe;
 // `MissionEnvelope::payload` — this crate has no reverse dependency on
 // darkmux-lab, so the mapping lives at the caller (`src/pr_review.rs`).
 pub mod envelope;
+/// (#2265) The finding record — what was observed, stored write-once under
+/// `<findings dir>/<dispatch>/<seq>/finding.json`.
+pub mod findings;
 pub mod index;
 pub mod lessons;
 pub mod lifecycle;

@@ -6243,6 +6243,13 @@ impl TailerState {
                         *lock_deadline(deadline) = new_deadline;
                     }
                 }
+                // (#2265 review) Bound ONCE, then share. The flow record and
+                // the finding record must hold the SAME bytes for an emission
+                // — otherwise an over-cap emission is whole or clipped
+                // depending on which producer wrote it, since `finding sync`
+                // replays the (clipped) flow record while the tailer would
+                // have stored the raw one.
+                let bounded_emission = bound_emitted(event.get("emitted"));
                 let mut payload = serde_json::json!({
                     "tool_seq": event.get("tool_seq"),
                     // (#1483) The AUTHORITATIVE running tool-call count for this
@@ -6267,7 +6274,7 @@ impl TailerState {
                     // so "nothing emitted" and "the image cannot emit" stay
                     // distinguishable downstream. The crawl's product rides
                     // THIS, never the `args` preview above.
-                    "emitted": bound_emitted(event.get("emitted")),
+                    "emitted": bounded_emission.clone(),
                     "emit_seq": event.get("emit_seq"),
                     "result_chars": event.get("result_chars"),
                     // (#2007) The result itself, so a failed tool call can be
@@ -6300,6 +6307,12 @@ impl TailerState {
                     }
                 }
                 self.emit("dispatch.tool", darkmux_flow::Level::Info, payload);
+                // (#2265) The tailer is the LIVE producer of the finding
+                // record. `finding sync` replays the same stream for anything
+                // this missed (an older binary, a killed process); both go
+                // through the same write-once materializer, so the two
+                // producers cannot disagree about what a finding is.
+                self.materialize_finding(&event, tool_ok, &bounded_emission);
             }
             "compaction" => {
                 self.summary.compactions += 1;
@@ -6591,6 +6604,81 @@ impl TailerState {
             self.phase_id.as_deref(),
             Some(payload),
         ));
+    }
+
+    /// (#2265) Materialize the finding record for an accepted finding call.
+    ///
+    /// Three conditions, all required: the tool is a finding tool
+    /// (`create_finding`, or the pre-2026-09-03 `report_finding` — the stream
+    /// is append-only, so the old name stays readable forever), the call
+    /// SUCCEEDED, and the runtime carried a non-null `emitted`. A runtime that
+    /// predates the field sends no key at all; that call exists in the stream
+    /// and cannot become a record, which `finding sync` reports honestly
+    /// rather than inventing an empty one.
+    ///
+    /// **A failure here never fails the dispatch.** The record is a derived
+    /// convenience over the flow stream (which already has the emission, and
+    /// is the audit trail); a full disk or a permission error must not kill
+    /// work in flight. It warns on stderr and returns.
+    ///
+    /// Cost: one `create_dir_all` + one small file write per ACCEPTED finding
+    /// call, and a bare `exists()` on a replay. Nothing on any other tool call.
+    fn materialize_finding(
+        &self,
+        event: &serde_json::Value,
+        tool_ok: bool,
+        bounded_emission: &serde_json::Value,
+    ) {
+        // A REJECTED citation (a wrong line, an unresolvable path, a spent
+        // budget) is a FAILED tool call, and the store is write-once — a bad
+        // record written here would be permanent.
+        if !tool_ok {
+            return;
+        }
+        let tool_name = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+        if !crate::findings::is_finding_tool(tool_name) {
+            return;
+        }
+        if bounded_emission.is_null() {
+            return;
+        }
+        // The SAME value the flow record carries, never the raw event field.
+        let emitted = bounded_emission.clone();
+        let Some(seq) = event.get("emit_seq").and_then(|v| v.as_u64()) else {
+            return;
+        };
+        let record = crate::findings::build_record(
+            &self.session_id,
+            seq,
+            darkmux_flow::ts_utc_now(),
+            tool_name,
+            crate::findings::Proposer {
+                handle: self.role_id.clone(),
+                model: self.model.clone(),
+                machine_id: darkmux_flow::resolve_machine_id(),
+            },
+            crate::findings::Scope {
+                // The dispatch's own scope, from the SAME values every record
+                // this tailer emits carries. Top-level on the flow record, and
+                // deliberately not merged into `context` — that blob is the
+                // launcher's, verbatim.
+                mission_id: self.mission_id.clone(),
+                phase_id: self.phase_id.clone(),
+                step_id: self.step_id.clone(),
+            },
+            // `merge_record_context` drops a NON-object context, so the flow
+            // record has none and `sync` stores null. Make the same judgment
+            // here, or the two producers disagree about the same dispatch.
+            self.record_context.as_ref().filter(|c| c.is_object()).cloned(),
+            emitted,
+        );
+        let root = crate::findings::findings_dir();
+        if let Err(e) = crate::findings::materialize(&root, &record) {
+            eprintln!(
+                "[darkmux] warning: could not write finding {}: {e:#}",
+                record.key
+            );
+        }
     }
 
     /// (#1483) Stamp `step_id` into the payload object so the mission-graph

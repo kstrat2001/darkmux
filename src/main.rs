@@ -36,6 +36,9 @@ pub use darkmux_eureka as eureka;
 // #515 — fleet extracted (deps crew/flow/types all crates now). Re-export
 // keeps crate::fleet::* resolving for serve/phase_cli/notebook/mission_propose.
 pub use darkmux_fleet as fleet;
+// (#2265) `darkmux finding` — the write-once finding store's read verbs plus
+// `sync`, the store's second producer after the live dispatch tailer.
+mod finding_cli;
 // `darkmux machine` roster-facing handlers — split out of main.rs alongside cli/lab_cli.
 mod fleet_cli;
 // #463 workspace split — flow extracted to the darkmux-flow crate. The
@@ -173,6 +176,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             cli::MemoryCmd::Correction { sub } => cmd_correction(sub),
         },
         Cmd::Role { sub } => cmd_role(sub),
+        Cmd::Finding { sub } => cmd_finding(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
         Cmd::Run { sub } => match sub {
             cli::RunFamilyCmd::List { kind, limit, all, json } => {
@@ -841,6 +845,23 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
             id,
             json: cli::JsonFlag { json },
         } => role_cli::role_show(&id, json),
+    }
+}
+
+/// (#2265) The finding family — read the store, and replay the flow stream
+/// into it. Read-only over operator state; `sync` writes only records that are
+/// missing, and never overwrites one that exists.
+fn cmd_finding(sub: cli::FindingCmd) -> Result<i32> {
+    match sub {
+        cli::FindingCmd::List { mission, dispatch, rule, json: cli::JsonFlag { json } } => {
+            finding_cli::list(mission.as_deref(), dispatch.as_deref(), rule.as_deref(), json)
+        }
+        cli::FindingCmd::Show { key, json: cli::JsonFlag { json } } => {
+            finding_cli::show(&key, json)
+        }
+        cli::FindingCmd::Sync { since, json: cli::JsonFlag { json } } => {
+            finding_cli::sync(since.as_deref(), json)
+        }
     }
 }
 
