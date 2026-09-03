@@ -1,12 +1,12 @@
 {
   "id": "crawl",
   "name": "Crawl",
-  "description": "Crawl a workspace with static-analysis rules and record what the crew observes as findings. (#2301) THIS DOCUMENT IS THE CRAWL \u2014 `darkmux mission launch crawl` runs it through the generic launcher; there is no literal routing and no bespoke launcher behind it any more. The `plan` phase holds one `crawl.plan` task per rule, each writing that rule's plan (units of sites at one sha) as its output; the `crawl` phase GROWS one `crawl.unit` task per planned unit from those outputs (#2300) and dispatches each to the `crawler` role against the materialized tree, mounted read-only; the `summarize` phase totals the run and its output becomes the mission's close payload. Disable a rule's task with `\"enabled\": false` (#2299), or deselect it for one launch with `--param rules=a,b` \u2014 either way it is pruned at mint (reason `disabled` / `not_selected`, recorded in `graph-report.json`) and the run's graph shows only the rules that will run. A fourth phase, `follow-on`, is declared OFF (#2302): enabling its one task grows a `coder` dispatch per finding, each carrying that finding's record in its brief and recording its change as a mod.",
+  "description": "Crawl a workspace with static-analysis rules and record what the crew observes as findings. (#2301) THIS DOCUMENT IS THE CRAWL — `darkmux mission launch crawl` runs it through the generic launcher; there is no literal routing and no bespoke launcher behind it any more. The `plan` phase holds one `crawl.plan` task per rule, each writing that rule's plan (units of sites at one sha) as its output; the `crawl` phase GROWS one `crawl.unit` task per planned unit from those outputs (#2300) and dispatches each to the `crawler` role against the materialized tree, mounted read-only; the `summarize` phase totals the run and its output becomes the mission's close payload. Disable a rule's task with `\"enabled\": false` (#2299), or deselect it for one launch with `--param rules=a,b` — either way it is pruned at mint (reason `disabled` / `not_selected`, recorded in `graph-report.json`) and the run's graph shows only the rules that will run. A fourth phase, `follow-on`, is declared OFF (#2302): enabling its one task grows a `coder` dispatch per finding, each carrying that finding's record in its brief and recording its change as a mod.",
   "schema_version": "3.2",
   "inputs": [
     {
       "name": "workspace",
-      "description": "Path to a workspace spec JSON (darkmux_crew::workspace_spec::WorkspaceSpec) \u2014 named sources + include/exclude filters + optional rule-id defaults. REQUIRED: every `crawl.plan` step reads it. A one-shot crawl is a one-SOURCE spec file \u2014 write the spec once and pass it here.",
+      "description": "Path to a workspace spec JSON (darkmux_crew::workspace_spec::WorkspaceSpec) — named sources + include/exclude filters + optional rule-id defaults. REQUIRED: every `crawl.plan` step reads it. A one-shot crawl is a one-SOURCE spec file — write the spec once and pass it here.",
       "required": true
     },
     {
@@ -16,7 +16,7 @@
     },
     {
       "name": "max_sites_per_unit",
-      "description": "(#2190) Cap on how many sites a `site`-kind unit may hold before the planner starts a new one \u2014 the planner also caps on `max_est_tokens_per_unit`, whichever binds first. Absent means the built-in default (40), so a launch with no override plans byte-identically to before this knob existed. A model whose per-turn tool loop stalls on a large unit's read batch (#2190) is a signal to shrink this. Must be a positive integer; `0` or a non-numeric value is refused at param-parse time.",
+      "description": "(#2190) Cap on how many sites a `site`-kind unit may hold before the planner starts a new one — the planner also caps on `max_est_tokens_per_unit`, whichever binds first. Absent means the built-in default (40), so a launch with no override plans byte-identically to before this knob existed. A model whose per-turn tool loop stalls on a large unit's read batch (#2190) is a signal to shrink this. Must be a positive integer; `0` or a non-numeric value is refused at param-parse time.",
       "required": false
     },
     {
@@ -26,12 +26,12 @@
     },
     {
       "name": "no_fetch",
-      "description": "Resolve sources against the mirror as-is, without `git fetch`ing first \u2014 fully offline against whatever's already mirrored. A `git` source with no mirror yet REFUSES instead of cloning; a `path` source's first clone is local-filesystem-only and is exempt.",
+      "description": "Resolve sources against the mirror as-is, without `git fetch`ing first — fully offline against whatever's already mirrored. A `git` source with no mirror yet REFUSES instead of cloning; a `path` source's first clone is local-filesystem-only and is exempt.",
       "required": false
     },
     {
       "name": "dry_run",
-      "description": "(#1959) The generic `mission launch --dry-run` flag, injected as `dry_run=true` by the CLI layer \u2014 never set by hand. Resolves the inputs and prints the task/step graph this launch would mint (including which rules `--param rules=` left out), then mints NOTHING: no mission, no flow records, no planning, no dispatch.",
+      "description": "(#1959) The generic `mission launch --dry-run` flag, injected as `dry_run=true` by the CLI layer — never set by hand. Resolves the inputs and prints the task/step graph this launch would mint (including which rules `--param rules=` left out), then mints NOTHING: no mission, no flow records, no planning, no dispatch.",
       "required": false
     }
   ],
@@ -106,12 +106,12 @@
     {
       "id": "crawl",
       "display_name": "Crawl",
-      "description": "One dispatch per planned unit. Every task here is GROWN (#2300) from its rule's plan at the phase boundary \u2014 the units do not exist until the plan step writes them \u2014 so what this phase declares is one TEMPLATE per rule, not one task per unit.",
+      "description": "One dispatch per planned unit. Every task here is GROWN (#2300) from its rule's plan at the phase boundary — the units do not exist until the plan step writes them — so what this phase declares is one TEMPLATE per rule, not one task per unit.",
       "tasks": [
         {
           "id": "unit-unnamed-predicate",
           "display_name": "Crawl: Name compound predicates",
-          "description": "Dispatch one `unnamed-predicate` unit \u2014 one task per unit the plan above produced.",
+          "description": "Dispatch one `unnamed-predicate` unit — one task per unit the plan above produced.",
           "role_id": "crawler",
           "depends_on": [
             "plan-unnamed-predicate"
@@ -137,7 +137,7 @@
         {
           "id": "unit-swallowed-error",
           "display_name": "Crawl: Swallowed errors",
-          "description": "Dispatch one `swallowed-error` unit \u2014 one task per unit the plan above produced.",
+          "description": "Dispatch one `swallowed-error` unit — one task per unit the plan above produced.",
           "role_id": "crawler",
           "depends_on": [
             "plan-swallowed-error"
@@ -163,7 +163,7 @@
         {
           "id": "unit-doc-contradicts-code",
           "display_name": "Crawl: Doc contradicts code",
-          "description": "Dispatch one `doc-contradicts-code` unit \u2014 one task per unit the plan above produced.",
+          "description": "Dispatch one `doc-contradicts-code` unit — one task per unit the plan above produced.",
           "role_id": "crawler",
           "depends_on": [
             "plan-doc-contradicts-code"
@@ -189,7 +189,7 @@
         {
           "id": "unit-stale-consumer",
           "display_name": "Crawl: Stale consumers",
-          "description": "Dispatch one `stale-consumer` unit \u2014 one task per unit the plan above produced.",
+          "description": "Dispatch one `stale-consumer` unit — one task per unit the plan above produced.",
           "role_id": "crawler",
           "depends_on": [
             "plan-stale-consumer"
@@ -236,13 +236,13 @@
     {
       "id": "follow-on",
       "display_name": "Follow-on",
-      "description": "OFF BY DEFAULT (#2302). One dispatch per finding the crawl recorded: the single task here is a GROW template whose items are the summary's `finding_refs`, so it mints one `coder` step per finding, each handed that finding's stored record through `brief_refs` and pointed at the same materialized tree the finding was observed in. The coder's product is a MOD naming the finding in its `for` \u2014 the durable link back \u2014 not a commit. Its task carries `\"enabled\": false`, so the task and this whole phase are pruned at mint (reason `disabled`, recorded in `graph-report.json`) and the default crawl ends at `summarize`, with the hook \u2192 tracker path as its exit. To turn it on, copy this document to `~/.darkmux/mission-configs/crawl.json` and set `\"enabled\": true`. Two consequences worth knowing before you do. First, this phase then becomes the LAST one, and the close payload is promoted from the last phase's last step output ONLY when that output is a JSON object \u2014 a coder dispatch's output is the model's final text, so `mission close` carries `payload: null` and the crawl summary stops reaching it. The summary is still its own step's output and still on disk; a copy that wants the payload back ends this phase with its own summarizing task. Nothing in darkmux reads `payload.findings` today, so this costs an operator-facing convenience, not a consumer. Second, a `brief_refs` key that names no stored record REFUSES the step loudly rather than dispatching a coder that never saw the finding \u2014 which is the check that the finding store was written before this phase ran.",
+      "description": "OFF BY DEFAULT (#2302). One dispatch per finding the crawl recorded: the single task here is a GROW template whose items are the summary's `finding_refs`, so it mints one `coder` step per finding, each handed that finding's stored record through `brief_refs` and pointed at the same materialized tree the finding was observed in, mounted read-only — the coder proposes, it does not edit. The coder's product is a MOD naming the finding in its `for` — the durable link back — not a commit. Its task carries `\"enabled\": false`, so the task and this whole phase are pruned at mint (reason `disabled`, recorded in `graph-report.json`) and the default crawl ends at `summarize`, with the hook → tracker path as its exit. To turn it on, copy this document to `~/.darkmux/mission-configs/crawl.json` and set `\"enabled\": true`. Two consequences worth knowing before you do. First, this phase then becomes the LAST one, and the close payload is promoted from the last phase's last step output ONLY when that output is a JSON object — a coder dispatch's output is the model's final text, so `mission close` carries `payload: null` and the crawl summary stops reaching it. The summary is still its own step's output and still on disk; a copy that wants the payload back ends this phase with its own summarizing task. Nothing in darkmux reads `payload.findings` today, so this costs an operator-facing convenience, not a consumer. Second, a `brief_refs` key that names no stored record REFUSES the step loudly rather than dispatching a coder that never saw the finding — which is the check that the finding store was written before this phase ran.",
       "tasks": [
         {
           "id": "follow-on",
           "enabled": false,
           "display_name": "Follow-on: make the change one finding describes",
-          "description": "Dispatch one `coder` per finding \u2014 one task per entry in the summary's `finding_refs`. The grown id is the finding's `id` (its key with `/` replaced by `-`, because a key is not one id segment) while `brief_refs` names the `key` itself, which is what the finding store answers to.",
+          "description": "Dispatch one `coder` per finding — one task per entry in the summary's `finding_refs`. The grown id is the finding's `id` (its key with `/` replaced by `-`, because a key is not one id segment) while `brief_refs` names the `key` itself, which is what the finding store answers to.",
           "role_id": "coder",
           "depends_on": [
             "summary"
@@ -259,7 +259,7 @@
                   "key": "{{item.key}}"
                 }
               ],
-              "message": "A finding recorded earlier in this run is appended below. Make the change that finding describes, in the workspace you have been given, and nothing else.\n\n1. Read the file the finding names, around the line it names, before changing anything.\n2. If the finding does not hold against what you read, change nothing and say so.\n3. Otherwise make the smallest change that resolves it.\n4. Record the change by calling `create_mod`, and set its `for` to the finding's key exactly as the block below spells it.\n\nDo not run tests, and do not change anything the finding does not name."
+              "message": "A finding recorded earlier in this run is appended below. Your job is to PROPOSE the change that finding describes, as a mod. The workspace you have been given is the tree the finding was observed in, mounted read-only: you cannot edit it, and you are not meant to.\n\n1. Read the file the finding names, around the line it names.\n2. If the finding does not hold against what you read, record nothing and say why.\n3. Otherwise write the smallest change that resolves it as a unified diff against the file as it is, and call `create_mod` with: `kit` = one sentence saying what to apply and the exact diff; `for` = the finding's key exactly as the block below spells it.\n\nDo not run tests, and do not touch anything the finding does not name. The mod is your product; someone else integrates it."
             }
           },
           "steps": [

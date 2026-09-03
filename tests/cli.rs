@@ -2809,7 +2809,16 @@ fn mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl() {
 
 // ─── #2131: the shared LaunchFinalizeGuard, ported to crawl + generic ─────
 //
-// `crawl_launch.rs` gained the same `LaunchFinalizeGuard` + SIGTERM/SIGHUP
+// (#2131, historical) When this proof was written, `src/crawl_launch.rs` was a
+// separate literal-routed launcher sharing the `LaunchFinalizeGuard`; it and
+// `crawl_launch_tests.rs` were DELETED in #2301 — crawl now runs through the
+// generic launcher this file proves, and its finalize/interrupt coverage lives
+// in `crates/darkmux-lab/src/crawl/unit_step_tests.rs` (the scheduler-level
+// probe that runs plan → unit → summary through `run_step_graph` with an
+// injected dispatch). The paragraph that follows describes the situation as
+// it was, kept because it explains why the live test below exercises the
+// tool-less hosted path rather than a container:
+// (then) `crawl_launch.rs` gained the same `LaunchFinalizeGuard` + SIGTERM/SIGHUP
 // this file adds a live binary-level proof for below (the generic-graph/
 // coder-phase launcher), but does NOT get an equivalent live-dispatch
 // integration test here: crawl's role_id is hardcoded to `"crawler"`
