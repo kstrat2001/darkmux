@@ -1610,7 +1610,7 @@ mod tests {
     // `description`) — a separate, deliberately inverted assertion from
     // the graph-bearing pair above, not folded into their loop.
     #[test]
-    fn crawl_loads_and_builds_without_panicking_despite_zero_phases() {
+    fn crawl_loads_and_builds_a_plan_phase_with_one_constructible_task_per_rule() {
         let registry = crate::mission_launch::all_step_kinds().unwrap();
         let loaded = mission_config::load("crawl").unwrap();
         let show = build_show(
@@ -1623,7 +1623,17 @@ mod tests {
             &[],
         );
         assert_eq!(show.id, "crawl");
-        assert!(show.phases.is_empty(), "crawl carries no graph — see its own description field");
+        // (#2298) One plan phase, one `crawl.plan` task per built-in rule,
+        // every step constructible by the launcher's own registry.
+        assert_eq!(show.phases.len(), 1, "{:?}", show.phases.iter().map(|p| &p.id).collect::<Vec<_>>());
+        let plan = &show.phases[0];
+        assert_eq!(plan.tasks.len(), 4);
+        for task in &plan.tasks {
+            for step in &task.steps {
+                assert_eq!(step.kind, "crawl.plan");
+                assert!(step.constructible, "`crawl.plan` must be registered: step {}", step.id);
+            }
+        }
     }
 
     #[test]

@@ -108,7 +108,7 @@ totals: 79 units, 745560 est_tokens
   "evidence": "The `catch`/`.catch`/`void` line, copied verbatim. `line` is where it appears.",
   "why_hint": "Say what operation failed silently and what downstream code assumes about it."
 }</code></pre>
-    <p><code>match</code>/<code>no_match</code> go to the model verbatim; <code>evidence</code> and <code>why_hint</code> shape what a finding must cite.</p>
+    <p><code>match</code>/<code>no_match</code> go to the model verbatim; <code>evidence</code> and <code>why_hint</code> shape what a finding must cite. Each rule is one <code>crawl.plan</code> task in <code>crawl.json</code>, so a rule you do not want tonight is one <code>"enabled": false</code> away. <code>prefilter</code> takes a list of regexes today; the <code>{"command": …}</code> shape for a linter emitting SARIF is reserved and refused by name until it ships.</p>
 
     <h3>Rule problems surface in <code>darkmux doctor</code></h3>
     <pre><code>✓ rules                  3 rule(s) loaded (3 built-in, no user tier)</code></pre>

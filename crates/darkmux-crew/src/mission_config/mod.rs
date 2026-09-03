@@ -1712,13 +1712,25 @@ mod tests {
     // phases by design. `crawl` gets its own goldens instead.
 
     #[test]
-    fn crawl_builtin_validates_with_zero_error_findings_despite_zero_phases() {
+    fn crawl_builtin_validates_with_zero_error_findings_and_plans_one_task_per_rule() {
         let known = known_kinds();
         let known_refs = known_kinds_refs(&known);
         let cfg = embedded_config("crawl");
         assert_eq!(cfg.id, "crawl");
         assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
-        assert!(cfg.phases.is_empty(), "crawl carries no graph — see its own description field");
+        // (#2298) The plan phase: one `crawl.plan` task per built-in rule,
+        // each step naming its rule. The unit track is still the literal
+        // launcher's until #2300/#2301.
+        assert_eq!(cfg.phases.len(), 1, "one plan phase: {:?}", cfg.phases);
+        let plan = &cfg.phases[0];
+        assert_eq!(plan.id, "plan");
+        let rules: Vec<&str> = plan
+            .tasks
+            .iter()
+            .map(|t| t.steps[0].config["rule"].as_str().expect("each plan step names its rule"))
+            .collect();
+        assert_eq!(rules, vec!["unnamed-predicate", "swallowed-error", "doc-contradicts-code", "stale-consumer"]);
+        assert!(plan.tasks.iter().all(|t| t.steps.len() == 1 && t.steps[0].kind == "crawl.plan"));
         let findings = cfg.validate(&known_refs);
         let errors: Vec<&ValidationFinding> =
             findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();

@@ -168,6 +168,11 @@ pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
     darkmux_lab::lab::review::register_review_kinds(&registry)
         .context("registering review step kinds")?;
     register_coder_phase_step_kinds(&registry).context("registering coder-phase step kinds")?;
+    // (#2298) The crawl's planning as a step kind — one `crawl.plan` task per
+    // rule in `crawl.json`. Registered here so `mission config show crawl`
+    // validates its graph without an unknown-kind warning and so the graph
+    // is constructible the day the literal launcher retires (#2301).
+    darkmux_lab::crawl::plan_step::register_crawl_kinds(&registry).context("registering crawl step kinds")?;
     Ok(registry)
 }
 

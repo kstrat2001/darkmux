@@ -137,11 +137,46 @@ impl Rule {
 /// param (rather than reading `paths::resolve` internally) mirrors
 /// `crate::loader`'s testable shape — this stays unit-testable without
 /// env-var mutation.
+/// (#2298) A rule id is also a file name (`<mission>/plan/<rule>.json`):
+/// one path segment, no separators, no leading dot.
+pub fn is_safe_rule_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('.')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// (#2298 / #2297) The `prefilter` field has ONE implemented shape today: a
+/// list of regex strings. A second shape is reserved — `{"command": "..."}`,
+/// a tool that emits SARIF/JSON sites (semgrep, ast-grep, a linter) — and is
+/// NOT built yet. A rule declaring it must be refused by name at load, never
+/// parsed into an empty list and silently crawled as if it had no prefilter.
+/// Returns the refusal message, or `None` when the shape is the regex list.
+fn unsupported_prefilter_shape(raw: &serde_json::Value, id: &str) -> Option<String> {
+    let pf = raw.get("prefilter")?;
+    let reserved = |v: &serde_json::Value| v.is_object() && v.get("command").is_some();
+    if reserved(pf) || pf.as_array().is_some_and(|a| a.iter().any(reserved)) {
+        return Some(format!(
+            "rule '{id}' declares a `prefilter` of the `{{\"command\": ...}}` shape — a tool-backed \
+             site producer (SARIF/JSON) is reserved by #2297 and not implemented yet; only a list \
+             of regex strings is supported — skipped"
+        ));
+    }
+    None
+}
+
 pub fn load_all(user_dir: Option<&Path>) -> (BTreeMap<String, Rule>, Vec<String>) {
     let mut map = BTreeMap::new();
     let mut warnings = Vec::new();
 
     for (id, json) in EMBEDDED_RULES {
+        if let Some(msg) = serde_json::from_str::<serde_json::Value>(json)
+            .ok()
+            .and_then(|raw| unsupported_prefilter_shape(&raw, id))
+        {
+            warnings.push(msg);
+            continue;
+        }
         match serde_json::from_str::<Rule>(json) {
             Ok(r) => {
                 map.insert((*id).to_string(), r);
@@ -183,6 +218,10 @@ pub fn load_all(user_dir: Option<&Path>) -> (BTreeMap<String, Rule>, Vec<String>
                                 .and_then(|r| serde_json::to_value(r).ok())
                                 .unwrap_or_else(|| serde_json::json!({}));
                             let merged = merge_json_object_shallow(base, override_value);
+                            if let Some(msg) = unsupported_prefilter_shape(&merged, &id) {
+                                warnings.push(format!("user rule {}: {msg}", path.display()));
+                                continue;
+                            }
                             match serde_json::from_value::<Rule>(merged) {
                                 Ok(r) => {
                                     map.insert(id, r);
@@ -266,8 +305,17 @@ pub fn resolve(ids: &[String], user_dir: Option<&Path>) -> Result<(Vec<Rule>, Ve
             None => {
                 let mut known: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
                 known.sort();
+                // (#2298 review) A rule that failed to LOAD is "not found" here
+                // too — a reserved `{"command": ...}` prefilter, a malformed
+                // user file. Its load warning is the reason, so it rides the
+                // error instead of being dropped with the warnings vector.
+                let why: String = warnings
+                    .iter()
+                    .filter(|w| w.contains(&format!("'{id}'")) || w.contains(&format!("{id}.json")))
+                    .map(|w| format!("\n  because: {w}"))
+                    .collect();
                 bail!(
-                    "rule '{id}' not found — known rules: {}",
+                    "rule '{id}' not found — known rules: {}{why}",
                     if known.is_empty() {
                         "(none)".to_string()
                     } else {
@@ -353,6 +401,56 @@ mod tests {
     /// override didn't name (here, `applies_to`/`prefilter`) silently
     /// dropped to its serde default (an empty vec) instead of surviving
     /// from the embedded rule underneath.
+    #[test]
+    fn a_command_shaped_prefilter_is_refused_by_name_not_parsed_as_empty() {
+        let dir = TempDir::new().unwrap();
+        for (file, prefilter) in [
+            ("obj.json", serde_json::json!({"command": "semgrep --config p/ts --sarif"})),
+            ("mixed.json", serde_json::json!(["\\bif\\b", {"command": "ast-grep --json"}])),
+        ] {
+            fs::write(
+                dir.path().join(file),
+                serde_json::json!({
+                    "id": format!("tool-{file}"), "kind": "site", "applies_to": ["**/*.ts"], "prefilter": prefilter
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let (map, warnings) = load_all(Some(dir.path()));
+        assert!(!map.contains_key("tool-obj.json") && !map.contains_key("tool-mixed.json"), "{map:?}");
+        let named: Vec<&String> = warnings.iter().filter(|w| w.contains("#2297") && w.contains("command")).collect();
+        assert_eq!(named.len(), 2, "each refusal names the reserved shape and the issue: {warnings:?}");
+    }
+
+    #[test]
+    fn a_rule_refused_at_load_names_the_reason_when_resolved() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("tool-rule.json"),
+            serde_json::json!({
+                "id": "tool-rule", "kind": "site", "applies_to": ["**/*.ts"],
+                "prefilter": {"command": "semgrep --sarif"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = resolve(&["tool-rule".to_string()], Some(dir.path())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains("#2297") && msg.contains("command"), "the load refusal is the reason: {msg}");
+    }
+
+    #[test]
+    fn rule_ids_usable_as_file_names() {
+        for ok in ["unnamed-predicate", "swallowed_error", "r.1"] {
+            assert!(is_safe_rule_id(ok), "{ok}");
+        }
+        for bad in ["", ".hidden", "a/b", "a b", "..", "a\\b"] {
+            assert!(!is_safe_rule_id(bad), "{bad:?}");
+        }
+    }
+
     #[test]
     fn user_tier_override_merges_named_fields_over_the_embedded_rule() {
         let dir = TempDir::new().unwrap();
