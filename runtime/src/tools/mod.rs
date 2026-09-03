@@ -125,10 +125,12 @@ impl Tool {
                  line's own line number in the file — the same numbering \
                  `search` uses. A read at offset=146 starts at `146: `. \
                  You never have to count lines: the number you need is \
-                 already on the line. When you quote a line as `evidence` \
-                 for `report_finding`, copy only the content AFTER the \
-                 `N: ` prefix, verbatim — the prefix is not part of the \
-                 file.\n\
+                 already on the line. The `N: ` prefix is NOT part of the \
+                 file: never put it in `edit`'s `old_string` or `new_string`, \
+                 never put it in `write`'s `content` (the runtime refuses \
+                 content that still carries it), and when you quote a line \
+                 as `evidence` for `report_finding`, copy only the content \
+                 AFTER the prefix, verbatim.\n\
                  \n\
                  WHEN TO USE limit > 0 (preferred):\n\
                  - After a `search` match at `path:N:content`, read \
@@ -731,9 +733,41 @@ struct WriteArgs {
     content: String,
 }
 
+/// (#2267 review) Does `text` look like a `read` result pasted back — every
+/// non-empty line carrying a `N: ` prefix with consecutive N? Two or more such
+/// lines is the signature; a file whose lines merely start with numbers (a
+/// YAML mapping, a numbered list) does not count up by one from line to line.
+fn looks_like_read_echo(text: &str) -> bool {
+    let mut expected: Option<u64> = None;
+    let mut seen = 0usize;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some((num, rest)) = line.split_once(':') else { return false };
+        if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) || !(rest.is_empty() || rest.starts_with(' ')) {
+            return false;
+        }
+        let n: u64 = match num.parse() { Ok(n) => n, Err(_) => return false };
+        match expected {
+            Some(e) if e != n => return false,
+            _ => {}
+        }
+        expected = Some(n + 1);
+        seen += 1;
+    }
+    seen >= 2
+}
+
 fn execute_write(raw_args: &str, workspace_root: &Path) -> Result<String> {
     let args: WriteArgs = serde_json::from_str(raw_args)
         .with_context(|| format!("parsing write arguments: {raw_args}"))?;
+    if looks_like_read_echo(&args.content) {
+        return Ok("NOT WRITTEN — `content` still carries `read`'s `N: ` line-number prefix on every line. \
+                   The prefix is not part of the file; remove it from each line and call `write` again. \
+                   The file was not changed."
+            .to_string());
+    }
 
     let path = resolve_write(&args.path, workspace_root)?;
 
@@ -766,6 +800,11 @@ struct EditArgs {
 fn execute_edit(raw_args: &str, workspace_root: &Path) -> Result<String> {
     let args: EditArgs = serde_json::from_str(raw_args)
         .with_context(|| format!("parsing edit arguments: {raw_args}"))?;
+    if args.edits.iter().any(|e| looks_like_read_echo(&e.new_string) || looks_like_read_echo(&e.old_string)) {
+        return Ok("NOT EDITED — an `old_string`/`new_string` still carries `read`'s `N: ` line-number prefix on every line. \
+                   The prefix is not part of the file; remove it and call `edit` again. The file was not changed."
+            .to_string());
+    }
 
     if args.edits.is_empty() {
         return Err(anyhow!("edit: edits[] must contain at least one entry"));
@@ -1140,6 +1179,76 @@ mod tests {
         .unwrap();
         assert!(rejected.result.starts_with("REJECTED"), "{}", rejected.result);
         assert!(rejected.emitted.is_none() && rejected.emit_seq.is_none(), "a rejected report emits nothing");
+    }
+
+    // (#2267 review) A source line that ITSELF begins with `N: ` on line N:
+    // the compliant quote (prefix stripped) and the verbatim read quote
+    // (prefix kept) must BOTH be accepted — the first version accepted only
+    // the verbatim one and rejected the form its own description asks for.
+    #[test]
+    fn a_line_that_literally_starts_with_its_own_number_is_accepted_in_both_quote_forms() {
+        let ws = finding_workspace(&numbered_src(90, 82, "82: foo"));
+        let out = tempfile::tempdir().unwrap();
+        let compliant = report(ws.path(), out.path(), 82, "82: foo");
+        assert!(compliant.starts_with("Recorded."), "compliant (stripped) quote must be accepted: {compliant}");
+        let verbatim = report(ws.path(), out.path(), 82, "82: 82: foo");
+        assert!(verbatim.starts_with("Recorded."), "verbatim read quote must be accepted: {verbatim}");
+        let wrong = report(ws.path(), out.path(), 82, "83: 82: foo");
+        assert!(wrong.starts_with("REJECTED"), "a prefix naming another line is still a mismatch: {wrong}");
+    }
+
+    #[test]
+    fn a_leading_space_before_the_prefix_does_not_reject_the_quote() {
+        let ws = finding_workspace(&numbered_src(90, 7, "  if (a && b && c) {"));
+        let out = tempfile::tempdir().unwrap();
+        let r = report(ws.path(), out.path(), 7, " 7:   if (a && b && c) {");
+        assert!(r.starts_with("Recorded."), "{r}");
+    }
+
+    // (#2267 review, MUST FIX) The numbering is on EVERY read, and the coder
+    // role reads then edits/writes. Prose in the description is not a guard:
+    // the runtime refuses to write line-numbered content back into a file.
+    #[test]
+    fn write_refuses_content_that_still_carries_reads_line_prefixes() {
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("a.py"), "x = 1
+y = 2
+").unwrap();
+        let raw = serde_json::json!({"path": "a.py", "content": "1: x = 1\n2: y = 3\n"}).to_string();
+        let r = execute_write(&raw, ws.path()).unwrap();
+        assert!(r.starts_with("NOT WRITTEN"), "{r}");
+        assert!(r.contains("line-number prefix"), "{r}");
+        assert_eq!(fs::read_to_string(ws.path().join("a.py")).unwrap(), "x = 1\ny = 2\n", "the file must be untouched");
+    }
+
+    #[test]
+    fn write_accepts_content_whose_lines_merely_start_with_a_number() {
+        // Not consecutive-from-somewhere, so not a read echo — a real file
+        // may start lines with `N: ` (a YAML mapping, a numbered list).
+        let ws = fresh_workspace();
+        let raw = serde_json::json!({"path": "list.md", "content": "1: apples\n1: pears\n7: plums\n"}).to_string();
+        let r = execute_write(&raw, ws.path()).unwrap();
+        assert!(!r.starts_with("NOT WRITTEN"), "{r}");
+    }
+
+    #[test]
+    fn edit_refuses_a_new_string_that_still_carries_reads_line_prefixes() {
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("a.py"), "x = 1\ny = 2\nz = 3\n").unwrap();
+        let raw = serde_json::json!({
+            "path": "a.py",
+            "edits": [{"old_string": "y = 2\nz = 3", "new_string": "2: y = 20\n3: z = 30"}]
+        })
+        .to_string();
+        let r = execute_edit(&raw, ws.path()).unwrap();
+        assert!(r.starts_with("NOT EDITED"), "{r}");
+        assert_eq!(fs::read_to_string(ws.path().join("a.py")).unwrap(), "x = 1\ny = 2\nz = 3\n");
+    }
+
+    #[test]
+    fn read_tool_description_covers_edit_and_write_not_just_report_finding() {
+        let d = Tool::Read.description();
+        assert!(d.contains("old_string") && d.contains("write"), "the prefix rule must name edit/write: {d}");
     }
 
     #[test]
@@ -2014,16 +2123,26 @@ fn capture_finding_context(
     // naming the WRONG line, which is the error this guard exists to catch, and
     // would also mangle source lines that legitimately begin with digits and a
     // colon.
+    // (#2267 review) Accept EITHER form: the compliant quote (prefix
+    // stripped) and the verbatim read quote (prefix kept). A source line that
+    // itself begins with `{n}: ` on line n makes them differ, and the first
+    // version rejected exactly the form its own description asks for.
     let own_prefix = format!("{n}: ");
-    let quoted = claimed.strip_prefix(own_prefix.as_str()).unwrap_or(claimed);
-    let mismatch = !claimed.trim().is_empty() && quoted.trim() != evidence.trim();
+    let claimed_ns = claimed.trim_start();
+    let stripped = claimed_ns.strip_prefix(own_prefix.as_str()).unwrap_or(claimed_ns);
+    let mismatch = !claimed.trim().is_empty()
+        && stripped.trim() != evidence.trim()
+        && claimed_ns.trim() != evidence.trim();
+    // Set only when the STRIPPED form is the one that matched — a verbatim
+    // quote of a line that itself starts with `{n}: ` carried no read prefix.
+    let evidence_had_line_prefix = stripped.len() != claimed_ns.len() && stripped.trim() == evidence.trim();
     Ok(FindingContext {
         evidence,
         context,
         start,
         end,
         mismatch,
-        evidence_had_line_prefix: quoted.len() != claimed.len(),
+        evidence_had_line_prefix,
     })
 }
 

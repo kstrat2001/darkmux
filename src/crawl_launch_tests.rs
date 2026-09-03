@@ -781,6 +781,11 @@ fn message_builder_edge_shape_includes_library_surface_and_versions() {
     assert!(msg.contains("CHANGELOG.md"), "{msg}");
     assert!(msg.contains("- /workspace/app1/uses.ts:1"), "{msg}");
     assert!(msg.contains("starting with `/workspace/`"), "{msg}");
+    // (#2267 review) The edge shape renders the same `file:line` pointer
+    // through the same helper; pin the numbered-read clause here too, or a
+    // prompt-tightening pass drops it and edge units resume counting.
+    assert!(msg.contains("numbers every line it returns as `N: content`"), "edge prompt must state the numbered form: {msg}");
+    assert!(msg.contains("beginning `<line>: `"), "edge prompt must tell the model where the cited line is: {msg}");
 }
 
 #[test]
