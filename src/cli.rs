@@ -267,6 +267,16 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: RoleCmd,
     },
+    /// Findings (#2265) — what a dispatch OBSERVED, keyed `<dispatch>/<seq>`.
+    /// A finding is an event: written once when an accepted `create_finding`
+    /// call streams past, never rewritten. The flow stream stays the audit
+    /// trail; this store is the queryable copy the verbs read. darkmux never
+    /// interprets the emission — a record is metadata plus the model's own
+    /// arguments verbatim.
+    Finding {
+        #[command(subcommand)]
+        sub: FindingCmd,
+    },
     /// Mission lifecycle — transition missions through their state machine.
     /// Mission status flows: Active ↔ Paused → Finalized (success) or
     /// Aborted (teardown — #1627: a teardown is not a success, and the two
@@ -371,6 +381,43 @@ pub(crate) enum Cmd {
         /// Show what would be installed without writing.
         #[arg(long, short = 'n')]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum FindingCmd {
+    /// List findings in the store, ts-ascending. Reads the store only — it
+    /// never touches the flow stream (that's `sync`'s job). The preview it
+    /// prints is the raw emission, truncated: darkmux does not interpret it.
+    List {
+        /// Only findings whose recorded context names this mission.
+        #[arg(long)]
+        mission: Option<String>,
+        /// Only findings from this dispatch (the key's first half).
+        #[arg(long)]
+        dispatch: Option<String>,
+        /// Only findings whose recorded context names this rule.
+        #[arg(long)]
+        rule: Option<String>,
+        #[command(flatten)]
+        json: JsonFlag,
+    },
+    /// Show one finding, whole, by its `<dispatch>/<seq>` key.
+    Show {
+        /// The finding key, e.g. `sess-abc/1`.
+        key: String,
+        #[command(flatten)]
+        json: JsonFlag,
+    },
+    /// Replay the flow stream into the store — the SECOND producer, for
+    /// anything the live tailer missed (an older binary, a killed process).
+    /// Idempotent: the store is write-once, so a second pass creates nothing.
+    Sync {
+        /// Only day files on or after this date (`YYYY-MM-DD`).
+        #[arg(long)]
+        since: Option<String>,
+        #[command(flatten)]
+        json: JsonFlag,
     },
 }
 

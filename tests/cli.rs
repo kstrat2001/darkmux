@@ -3932,3 +3932,128 @@ fn dry_run_table_marks_shared_read_pass_rows() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("shared read pass"), "got:\n{stdout}");
 }
+
+// ─── `finding` family (#2265) ────────────────────────────────────────────
+//
+// The finding record is what was observed: an event, keyed `<dispatch>/<seq>`,
+// written once and never rewritten. `finding sync` is the SECOND producer —
+// it replays the flow stream for anything the live tailer missed (an older
+// binary, a killed process) and must be idempotent, because the tailer and it
+// race by design.
+
+/// One flow day file holding the three shapes `sync` has to tell apart: an
+/// accepted `create_finding` with an emission, the pre-2026-09-03
+/// `report_finding` name (historical records carry it; the stream is
+/// append-only), and an accepted call from a runtime that predates FLOW
+/// 1.33.0 and therefore carried no `emitted` at all.
+fn write_finding_day_file(flows: &std::path::Path) {
+    fs::create_dir_all(flows).unwrap();
+    let rec = |ts: &str, sess: &str, tool: &str, seq: u64, emitted: Option<serde_json::Value>| {
+        let mut payload = serde_json::json!({
+            "tool_name": tool, "ok": true, "args": "{}",
+            "context": {"mission_id": "crawl-x", "unit": "u1", "rule": "unnamed-predicate"},
+        });
+        if let Some(e) = emitted {
+            payload["emitted"] = e;
+            payload["emit_seq"] = serde_json::json!(seq);
+        }
+        serde_json::json!({
+            "ts": ts, "level": "info", "category": "work", "tier": "local",
+            "stage": "dispatch", "action": "dispatch.tool", "handle": "crawler",
+            "session_id": sess, "model": "darkmux:qwen3.6", "machine_id": "test-machine",
+            "payload": payload,
+        })
+        .to_string()
+    };
+    let lines = [
+        rec("2026-09-03T01:00:00Z", "sess-a", "create_finding", 1,
+            Some(serde_json::json!({"file": "a.ts", "line": 4, "why": "unnamed operands"}))),
+        rec("2026-09-03T02:00:00Z", "sess-b", "report_finding", 2,
+            Some(serde_json::json!({"file": "b.ts", "line": 9}))),
+        // Pre-FLOW-1.33.0: no `emitted` key at all — in the stream, not a record.
+        rec("2026-09-03T03:00:00Z", "sess-c", "create_finding", 3, None),
+    ];
+    fs::write(flows.join("2026-09-03.jsonl"), lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
+    let home = TempDir::new().unwrap();
+    let flows = home.path().join("flows");
+    write_finding_day_file(&flows);
+
+    let dm = |args: &[&str]| {
+        Command::cargo_bin("darkmux")
+            .unwrap()
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", &flows)
+            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+            .args(args)
+            .output()
+            .expect("darkmux runs")
+    };
+
+    // First pass: two records made, one call that cannot become one.
+    let out = dm(&["finding", "sync", "--json"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("finding sync --json emits JSON");
+    assert_eq!(v["created"], 2, "got: {v}");
+    assert_eq!(v["present"], 0, "got: {v}");
+    assert_eq!(v["skipped_no_emission"], 1, "the pre-1.33.0 call cannot become a record: {v}");
+    assert_eq!(v["scanned"], 3, "got: {v}");
+
+    // On disk where the key says, one file per finding.
+    assert!(home.path().join("findings/sess-a/1/finding.json").exists());
+    assert!(home.path().join("findings/sess-b/2/finding.json").exists());
+    assert!(!home.path().join("findings/sess-c").exists());
+
+    // Second pass: idempotent. Nothing new, both already present.
+    let out = dm(&["finding", "sync", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(v["created"], 0, "a second sync must create nothing: {v}");
+    assert_eq!(v["present"], 2, "got: {v}");
+
+    // The human output NAMES the calls that cannot become records, rather
+    // than dropping them silently.
+    let out = dm(&["finding", "sync"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no emission"), "human output must name the skip: {stdout}");
+
+    // `finding list` reads the STORE, one line per finding, ts-ascending.
+    let out = dm(&["finding", "list"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let rows: Vec<&str> = stdout.lines().filter(|l| l.contains("sess-")).collect();
+    assert_eq!(rows.len(), 2, "one line per finding: {stdout}");
+    assert!(rows[0].contains("sess-a/1"), "ts-ascending, keyed: {stdout}");
+    assert!(rows[0].contains("crawler"), "the proposer is named: {stdout}");
+
+    let out = dm(&["finding", "list", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let arr = v["findings"].as_array().expect("findings array");
+    assert_eq!(arr.len(), 2, "got: {v}");
+    assert_eq!(arr[0]["emitted"]["file"], "a.ts", "the emission rides whole: {v}");
+
+    // Filters read the record's own context — never interpreting the emission.
+    let out = dm(&["finding", "list", "--rule", "nope", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(v["findings"].as_array().unwrap().is_empty(), "got: {v}");
+
+    // `finding show` prints ONE record, addressed by its key.
+    let out = dm(&["finding", "show", "sess-a/1"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("sess-a/1"), "got:\n{stdout}");
+    assert!(stdout.contains("a.ts"), "the emission is shown: {stdout}");
+    assert!(!stdout.contains("sess-b"), "show is ONE record: {stdout}");
+
+    // A missing key is an error with a clear message, not an empty success.
+    let out = dm(&["finding", "show", "sess-a/99"]);
+    assert_eq!(out.status.code(), Some(1), "a missing finding exits 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sess-a/99"), "the message names the key: {stderr}");
+}

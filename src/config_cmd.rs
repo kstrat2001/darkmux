@@ -181,6 +181,8 @@ const KEYS: &[(&str, Ty)] = &[
     // means adding it HERE by hand, or the tier exists in the resolver and is
     // unreachable from `config set`/`get`.
     ("dirs.lab", Ty::Str),
+    // (#2265) The finding-record store — see `DirsConfig::findings`.
+    ("dirs.findings", Ty::Str),
     // (#1685) The `gh`-verb allowlist gate — see `CmdConfig`'s own doc.
     ("cmd.enabled", Ty::Bool),
     ("cmd.allowed", Ty::StrList),
