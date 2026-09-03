@@ -4722,3 +4722,34 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
     let out = dm(&["finding", "list", "--json"]);
     assert!(out.status.success(), "the finding verbs still read the store unchanged");
 }
+
+/// (#2265) A mod the host recorded PARTIALLY — a dropped attachment, an
+/// unaddressable `for` key — carries `warnings`. `mod show` must print them:
+/// the field exists so the record is honest about being partial, and a
+/// rendering that hides it makes the record look whole again.
+#[test]
+fn mod_show_prints_the_warnings_of_a_partial_mod() {
+    let home = TempDir::new().unwrap();
+    let dir = home.path().join("mods").join("mod-1788430000-abc123");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mod.json"),
+        r#"{"schema_version":"1","key":"mod-1788430000-abc123","ts":"2026-09-03T10:00:00Z","by":"coder (qwen)",
+            "for":["sess-a/1"],"kit":"apply mod.diff\n","attachments":[],
+            "warnings":["dropped attachment \"mod.diff\": no path/bytes pair"]}"#,
+    )
+    .unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mod", "show", "mod-1788430000-abc123"])
+        .output()
+        .expect("darkmux runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("warnings"), "a partial mod says so: {stdout}");
+    assert!(stdout.contains("dropped attachment \"mod.diff\""), "and names the part: {stdout}");
+    // The kit still ends the output byte-exact — the warnings print ABOVE it.
+    assert!(stdout.ends_with("apply mod.diff\n"), "got: {stdout:?}");
+}
