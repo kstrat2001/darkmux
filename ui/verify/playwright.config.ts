@@ -4,6 +4,10 @@ import { defineConfig } from "@playwright/test";
 // no `test` script pointing here — see `ui/README.md`). Talks to a
 // throwaway daemon the operator/agent starts by hand — port 8790 by
 // default (Packet 1's own proof; never port 8765, the operator's real
+// daemon — EXCEPT via `DARKMUX_VERIFY_PORT=5273`, the vite dev server, which
+// proxies API calls to 8765: `task-row-name.spec.ts` needs a REAL mission (the
+// defect only reproduces on real data), so it is a local-only proof, not CI.
+// #2282.
 // daemon), overridable via `DARKMUX_VERIFY_PORT` so a later lens packet's
 // own live-render spec (e.g. Packet 2's `machine-render.spec.ts`, port
 // 8793 per the overnight runbook's "throwaway daemons on 8793+" boundary)
