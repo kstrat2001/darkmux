@@ -261,6 +261,13 @@ pub(crate) struct StepJson {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TaskJson {
     pub id: String,
+    /// (#2302) The `enabled` FIELD verbatim — `Some(false)` is a task the
+    /// document ships OFF and the mint prunes, `None` is a task that never
+    /// declared the gate (the overwhelming majority) and runs. Surfaced
+    /// because `mission config show` is where an operator answers "what
+    /// would this launch actually do", and a pruned task that renders
+    /// identically to a live one answers it wrong.
+    pub enabled: Option<bool>,
     pub display_name: Option<String>,
     pub description: Option<String>,
     pub depends_on: Vec<String>,
@@ -511,6 +518,7 @@ pub(crate) fn build_show(
                 .iter()
                 .map(|task| TaskJson {
                     id: task.id.clone(),
+                    enabled: task.enabled,
                     display_name: task.display_name.clone(),
                     description: task.description.clone(),
                     depends_on: task.depends_on.clone(),
@@ -745,7 +753,10 @@ fn render_show_text(show: &ConfigShow) -> String {
                 Some(dn) if dn != &task.id => format!(" \"{dn}\""),
                 _ => String::new(),
             };
-            out.push_str(&format!("  task {}{label}{deps}\n", task.id));
+            // (#2302) A task shipped OFF is pruned at mint, so say so on
+            // its own line rather than leaving it to read as live work.
+            let gate = if task.enabled == Some(false) { "  [disabled]" } else { "" };
+            out.push_str(&format!("  task {}{label}{deps}{gate}\n", task.id));
             // Who does it, then what it does: the role line sits directly
             // under its task, ahead of the steps it staffs.
             if let Some(role) = &task.role {

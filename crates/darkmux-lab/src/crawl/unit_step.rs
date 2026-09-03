@@ -89,7 +89,44 @@ const DEFAULT_NO_PROGRESS_TURNS: usize = 8;
 /// [`UnitOutcome`]'s own schema version. Bumped when the shape below
 /// changes; a consumer is strict on REQUIRED fields (a missing one fails
 /// the read by name) and lenient on the rest.
-pub const UNIT_OUTCOME_SCHEMA_VERSION: &str = "1.0";
+pub const UNIT_OUTCOME_SCHEMA_VERSION: &str = "1.1";
+
+/// (#2302) ONE finding a unit's dispatch recorded, named by the key its
+/// store answers to — the address a FOLLOW-ON step hands to `brief_refs`.
+///
+/// The key is `<dispatch session id>/<emit_seq>`, exactly the form
+/// [`darkmux_crew::findings::parse_key`] splits and
+/// [`darkmux_crew::findings::load_at`] resolves: the unit's dispatch owns
+/// the session id, and `emit_seq` is the 1-based ordinal of the acceptance
+/// within that dispatch, which is the finding file's own non-empty-line
+/// ordinal (the runtime writes `emit_seq = count + 1` after appending).
+/// Nothing is re-derived from the model's prose — `file`/`line`/`rule` are
+/// copied off the record the crawl already stamps, so this carries no
+/// interpretation of its own.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct FindingRef {
+    /// `<dispatch>/<seq>` — the finding store's key.
+    pub key: String,
+    /// The same key with `/` replaced by `-`. A grown task's id suffix
+    /// becomes part of a task id and a step id, and `/` in either would
+    /// read as a path separator — so the config's `grow.id` names THIS
+    /// field and `grow.config.brief_refs` names `key`.
+    pub id: String,
+    /// The file the finding names, source-relative (the container prefix
+    /// already stripped), when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    /// The ONE rule id this finding was recorded under.
+    pub rule: String,
+    /// The materialized workspace root the unit was dispatched against —
+    /// the same directory `crawl.unit` mounts, so a follow-on step can
+    /// name it as its `workdir` and see the very tree the finding cites.
+    pub tree_root: String,
+}
 
 /// (#2301) What ONE `crawl.unit` step produces, and the ONLY thing
 /// `crawl.summary` reads. A typed struct, not a JSON blob: the consumer
@@ -110,6 +147,10 @@ pub struct UnitOutcome {
     /// `stop` | `unit_budget_exhausted` | `timeout` | `error`.
     pub result: String,
     /// Accepted `create_finding` calls this unit's dispatch made.
+    ///
+    /// (#2302) A COUNT, and it keeps the name: the retired launcher's
+    /// close payload carried `findings` as a number and readers are keyed
+    /// on it. The findings themselves are named by [`Self::finding_refs`].
     pub findings: u64,
     /// `create_finding` calls the runtime REJECTED — engagement that did
     /// not become a finding, never folded into `findings`.
@@ -141,6 +182,11 @@ pub struct UnitOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "unknown | null"))]
     pub host: Option<Value>,
+    /// (#2302) This unit's accepted findings, named by store key — one per
+    /// `findings`, in the order the dispatch recorded them. Additive in
+    /// schema 1.1; a 1.0 producer simply wrote none.
+    #[serde(default)]
+    pub finding_refs: Vec<FindingRef>,
 }
 
 // ── model-facing message (AI-convention vocabulary; CLAUDE.md's
@@ -476,23 +522,56 @@ fn strip_source_prefix(source_id: &str, raw: &str) -> String {
 
 /// Read this unit's accepted findings, stamp the crawl's provenance onto
 /// each, and write them beside the run as `<unit>.findings.jsonl`.
-/// Returns how many there were.
+/// Returns how many there were AND one [`FindingRef`] per accepted
+/// finding, from the SAME read (#2302). The two are returned separately
+/// rather than as one list because they answer to different guards: the
+/// count is what the unit observed, and stays true even when the keys are
+/// unaddressable.
 ///
 /// The DURABLE record of a finding is the finding store the dispatch
 /// tailer writes (#2265) plus the `dispatch.tool` record its hook
 /// transform reads; this copy is the run-local artifact an operator
 /// inspects, which is why a write failure here is a warning, not a unit
 /// failure.
-fn readback_findings(ctx: &UnitContext, out_dir: &Path, into: &Path, model: Option<&str>) -> usize {
+fn readback_findings(
+    ctx: &UnitContext,
+    out_dir: &Path,
+    into: &Path,
+    model: Option<&str>,
+) -> (usize, Vec<FindingRef>) {
     let findings_path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
     let Ok(body) = std::fs::read_to_string(&findings_path) else {
-        return 0;
+        return (0, Vec::new());
     };
-    let mut n = 0usize;
+    // (#2302) A key's dispatch half becomes a path segment under the
+    // finding store, so a session id that could escape it produces NO refs
+    // at all rather than an unresolvable key a follow-on would refuse on.
+    // The COUNT is unaffected: the unit observed what it observed, whether
+    // or not the observations can be addressed. The crawl mints its own
+    // session ids, so this is a backstop, not an expected path — and it is
+    // loud.
+    let addressable = darkmux_crew::findings::is_safe_dispatch_segment(&ctx.session_id);
+    if !addressable {
+        eprintln!(
+            "{}",
+            darkmux_types::style::warn(&format!(
+                "crawl.unit: session id `{}` is not a finding-store segment — this unit's findings are counted but not addressable",
+                ctx.session_id
+            ))
+        );
+    }
+    let mut refs: Vec<FindingRef> = Vec::new();
+    let mut found = 0usize;
     let mut buf = String::new();
-    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+    // The ordinal is over NON-EMPTY LINES, which is exactly how the runtime
+    // derives the `emit_seq` it stamps on the record it materializes
+    // (`existing.lines().filter(non-empty).count() + 1`). Counting parsed
+    // lines instead would drift the key by one for every line that failed
+    // to parse.
+    for (idx, line) in body.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+        let seq = idx as u64 + 1;
         let Ok(mut rec) = serde_json::from_str::<Value>(line) else { continue };
-        n += 1;
+        found += 1;
         if let Some(obj) = rec.as_object_mut() {
             let raw_file = obj.get(FINDING_FILE_KEY).and_then(Value::as_str).unwrap_or("").to_string();
             obj.insert("file_raw".to_string(), json!(raw_file));
@@ -515,6 +594,17 @@ fn readback_findings(ctx: &UnitContext, out_dir: &Path, into: &Path, model: Opti
             if let Some(m) = model {
                 obj.insert("model".to_string(), json!(m));
             }
+            if addressable {
+                let key = format!("{}/{seq}", ctx.session_id);
+                refs.push(FindingRef {
+                    id: key.replace('/', "-"),
+                    key,
+                    file: obj.get(FINDING_FILE_KEY).and_then(Value::as_str).map(str::to_string),
+                    line: obj.get("line").and_then(Value::as_u64),
+                    rule: rule_id.clone(),
+                    tree_root: ctx.tree_root.display().to_string(),
+                });
+            }
         }
         buf.push_str(&serde_json::to_string(&rec).unwrap_or_default());
         buf.push('\n');
@@ -527,7 +617,7 @@ fn readback_findings(ctx: &UnitContext, out_dir: &Path, into: &Path, model: Opti
             );
         }
     }
-    n
+    (found, refs)
 }
 
 // ── the `crawl.unit` step kind ───────────────────────────────────────────
@@ -820,14 +910,16 @@ impl StepKind for CrawlUnitStepKind {
         }
 
         let exclusions = out_dir.as_deref().map(count_rejected_create_findings).unwrap_or(0);
-        let findings = match &out_dir {
+        // (#2302) ONE read of `findings.jsonl` yields both the count and
+        // the keys.
+        let (findings, finding_refs) = match &out_dir {
             Some(d) => readback_findings(
                 &ctx,
                 d,
                 &run_dir.join(format!("{}.findings.jsonl", ctx.unit_id)),
                 model.as_deref(),
             ),
-            None => 0,
+            None => (0, Vec::new()),
         };
 
         let outcome_record = UnitOutcome {
@@ -855,6 +947,7 @@ impl StepKind for CrawlUnitStepKind {
             // zero".
             detections,
             host,
+            finding_refs,
         };
 
         // A unit that did not converge fails its STEP: the run's outcome
@@ -974,6 +1067,13 @@ pub struct CrawlSummary {
     /// One row per unit, in the order the run's step records were read.
     #[serde(default)]
     pub units: Vec<UnitOutcome>,
+    /// (#2302) Every finding this run recorded, named by store key — the
+    /// union over [`Self::units`] in unit order, and the array a follow-on
+    /// phase GROWS one task from (`grow: { from: "summary", items:
+    /// "finding_refs" }`). `findings` above stays the COUNT under the name
+    /// the retired launcher's close payload used; this is the roster.
+    #[serde(default)]
+    pub finding_refs: Vec<FindingRef>,
 }
 
 /// The source identity a summary reports — id + the sha it was cut at.
@@ -988,7 +1088,7 @@ pub struct PlanSourceRef {
 }
 
 /// [`CrawlSummary`]'s own schema version.
-pub const CRAWL_SUMMARY_SCHEMA_VERSION: &str = "1.0";
+pub const CRAWL_SUMMARY_SCHEMA_VERSION: &str = "1.1";
 
 /// Build the crawl's run totals from what this mission's `crawl.unit`
 /// steps recorded, plus what its `plan/` directory planned.
@@ -1085,6 +1185,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         model: rows.iter().find_map(|r| r.model.clone()),
         profile: resolve_crawler_seat().profile_name,
         sources,
+        finding_refs: rows.iter().flat_map(|r| r.finding_refs.iter().cloned()).collect(),
         units: rows,
     })
 }
@@ -1132,6 +1233,9 @@ fn errored_row(step: &Step) -> UnitOutcome {
         reason: step.output.as_deref().map(str::trim).filter(|o| !o.is_empty()).map(str::to_string),
         detections: None,
         host: None,
+        // (#2302) A row this summary BUILT names no findings: the step
+        // recorded no outcome, so nothing was observed to address.
+        finding_refs: Vec::new(),
     }
 }
 
