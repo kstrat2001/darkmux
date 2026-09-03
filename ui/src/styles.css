@@ -4901,7 +4901,10 @@ body {
   background: var(--ml-panel);
   padding: 8px 10px;
   min-width: 170px;
-  max-width: 260px;
+  /* (#2104) No max-width: the React Flow node's style width (from the
+     layout's `widths`) is the card's width. A CSS cap here is what let the
+     step rows paint past the border — the layout and the card disagreed. */
+  box-sizing: border-box;
   font-family: sans-serif;
   position: relative;
 }
@@ -5149,7 +5152,12 @@ body {
 }
 .missionlens .mn-step-meter {
   margin-left: auto;
-  flex: 0 0 auto;
+  /* (#2104) The meter may shrink and ellipsize — it never paints past the
+     card. `flex: 0 0 auto` + nowrap was the overflow. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   display: inline-flex;
   gap: 6px;
   font: calc(10px * var(--fs-scale))/1 var(--font-mono);

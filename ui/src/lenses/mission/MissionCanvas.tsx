@@ -126,6 +126,10 @@ function toRfNodes(
       id: n.id,
       type: "missionNode",
       position: pos,
+      // (#2104) The card's width is the layout's decision (content class),
+      // not a CSS cap: a card with metric rows is wider than a bare one, and
+      // the phase box and next column were sized around that same number.
+      style: { width: layout.widths[n.id] },
       zIndex: 1,
       data: {
         label: n.label,

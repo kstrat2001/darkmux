@@ -3,6 +3,10 @@ import {
   applyFlowRecord,
   applyRecordToMetrics,
   computeLayout,
+  COL_W,
+  COL_GAP,
+  PHASE_LABEL_W,
+  BAND_PAD,
   drawnEdges,
   fmtElapsed,
   fmtModel,
@@ -102,6 +106,37 @@ describe("computeLayout", () => {
     expect(layout.boxes["p1"]).toBeDefined();
     expect(layout.boxes["p1"].w).toBeGreaterThan(0);
     expect(layout.boxes["p1"].h).toBeGreaterThan(0);
+  });
+});
+
+// (#2104) The canvas painted step rows past the task card's right edge and
+// parked the card one empty column to the right of the phase label.
+describe("computeLayout sizes task cards to their content (#2104)", () => {
+  const withSteps: GraphNode = {
+    ...TASK_A,
+    id: "wide",
+    steps: Array.from({ length: 3 }, (_, i) => ({ id: `w${i}`, label: "crawl.unit", kind: "dispatch.internal", status: "complete" })),
+  };
+  const bare: GraphNode = { ...TASK_A, id: "bare", steps: [] };
+
+  it("column zero starts beside the phase label, not a full column to its right", () => {
+    const layout = computeLayout([PHASE, bare]);
+    expect(layout.positions["bare"].x).toBeLessThan(PHASE_LABEL_W + COL_W);
+    expect(layout.positions["bare"].x).toBeGreaterThanOrEqual(PHASE_LABEL_W);
+  });
+
+  it("a task with step rows gets a card wide enough for a metric row; a bare task keeps the base width", () => {
+    const layout = computeLayout([PHASE, withSteps, bare]);
+    expect(layout.widths["bare"]).toBe(COL_W);
+    expect(layout.widths["wide"]).toBeGreaterThan(COL_W);
+  });
+
+  it("the phase box contains its widest card with padding, and a second column starts past it", () => {
+    const deeper: GraphNode = { ...withSteps, id: "deep", depth: (withSteps.depth || 0) + 1 };
+    const layout = computeLayout([PHASE, withSteps, deeper]);
+    const right = layout.positions["wide"].x + layout.widths["wide"];
+    expect(layout.positions["deep"].x).toBeGreaterThanOrEqual(right + COL_GAP);
+    expect(layout.boxes["p1"].w).toBeGreaterThanOrEqual(layout.positions["deep"].x + layout.widths["deep"] + BAND_PAD);
   });
 });
 
