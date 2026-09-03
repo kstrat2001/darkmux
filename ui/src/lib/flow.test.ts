@@ -11,6 +11,7 @@ import {
   flowLiveSessions,
   bodyTruncated,
   asRecordArray,
+  missionReplayDate,
 } from "./flow";
 import { tokensOffMeter } from "../lenses/fleet/savings";
 import type { FlowRecord } from "../types/handwritten";
@@ -367,5 +368,27 @@ describe("bodyTruncated + asRecordArray through the guard (#2206)", () => {
     expect(asRecordArray(undefined)).toEqual([]);
     expect(asRecordArray("nope")).toEqual([]);
     expect(asRecordArray(42)).toEqual([]);
+  });
+});
+
+describe("missionReplayDate (header owns liveness — a RUNNING mission is live, not a recording)", () => {
+  const rec = (action: string, ts: string) => ({ ts, action } as unknown as FlowRecord);
+  it("is null while the mission has no terminal record, whatever day its records carry", () => {
+    const records = [rec("mission start", "2026-09-03T17:10:00Z"), rec("dispatch.start", "2026-09-03T17:11:00Z")];
+    expect(missionReplayDate(records)).toBeNull();
+  });
+  it("is the earliest record's day once the mission has closed", () => {
+    const records = [
+      rec("dispatch.complete", "2026-09-03T18:00:00Z"),
+      rec("mission start", "2026-09-03T17:10:00Z"),
+      rec("mission close", "2026-09-03T18:01:00Z"),
+    ];
+    expect(missionReplayDate(records)).toBe("2026-09-03");
+  });
+  it("treats an aborted mission as a recording too", () => {
+    expect(missionReplayDate([rec("mission start", "2026-09-02T01:00:00Z"), rec("mission abort", "2026-09-02T01:05:00Z")])).toBe("2026-09-02");
+  });
+  it("is null for an empty slice", () => {
+    expect(missionReplayDate([])).toBeNull();
   });
 });

@@ -176,6 +176,29 @@ export function firstRecordDate(records: FlowRecord[]): string | null {
  * legacy tolerance rather than assuming the shape never changes. Shared by
  * `useFlowWindow` (the day-fetch) and `useLiveTail` (the reconcile
  * backstop's `?since=` fetch, which hits the SAME `/flow/<date>` handler). */
+/** The earliest record's UTC day in a slice, or null. Records from the daemon
+ * are not guaranteed to arrive sorted, so this scans rather than reading the
+ * first element. */
+export function earliestRecordDate(records: FlowRecord[]): string | null {
+  let min = Infinity;
+  for (const r of records) {
+    const t = T(r.ts);
+    if (!Number.isNaN(t) && t < min) min = t;
+  }
+  return Number.isFinite(min) ? new Date(min).toISOString().slice(0, 10) : null;
+}
+
+/** Header owns liveness (operator, 2026-09-03): a mission page is a RECORDING
+ * only once the mission has reached a terminal record; until then it is live,
+ * whatever day its records carry. The dispatch route decides the same thing
+ * from presence; a mission decides it from its own lifecycle records because
+ * a mission's work spans many sessions. Returns the replay day, or null while
+ * the mission is still running. */
+export function missionReplayDate(records: FlowRecord[]): string | null {
+  const terminal = records.some((r) => r.action === "mission close" || r.action === "mission abort");
+  return terminal ? earliestRecordDate(records) : null;
+}
+
 export function asRecordArray(body: unknown): FlowRecord[] {
   if (Array.isArray(body)) return body as FlowRecord[];
   // (#2206) `isPlainObject` is drop-in here: the array case returned above,

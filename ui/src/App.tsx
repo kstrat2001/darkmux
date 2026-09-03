@@ -28,7 +28,7 @@ import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
-import { T, asRecordArray, firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
+import { T, asRecordArray, earliestRecordDate, firstRecordDate, localMachineUid, missionReplayDate, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
@@ -182,8 +182,11 @@ export function App() {
     if (source.kind !== "daemon") return null;
     // A dispatch that is still RUNNING is a live view, not a replay: no day,
     // no badge, no transport over a frozen snapshot (review finding).
-    if (route.kind === "dispatch") return routeRecords.historical ? earliestDate(routeRecords.records) : null;
-    if (route.kind === "mission") return missionRecordsQuery.data?.ok ? earliestDate(asRecordArray(missionRecordsQuery.data.data)) : null;
+    if (route.kind === "dispatch") return routeRecords.historical ? earliestRecordDate(routeRecords.records) : null;
+    // A mission that is still RUNNING is live, not a replay (header owns
+    // liveness): its day is decided by a terminal lifecycle record, not by
+    // the mere presence of records from today.
+    if (route.kind === "mission") return missionRecordsQuery.data?.ok ? missionReplayDate(asRecordArray(missionRecordsQuery.data.data)) : null;
     return null;
   }, [route, source.kind, routeRecords.records, routeRecords.historical, missionRecordsQuery.data]);
   const day = useDay(replayDate);
@@ -860,17 +863,6 @@ function routeChrome(route: Route, targetMachineName: string | null): { crumb: s
  * calls it) know this parameter exists. See `App`'s own
  * `playbackPlayheadMs`/`eventLogRecords` doc for why the event log needs it.
  */
-/** The day of the earliest record with a usable timestamp, or null. Not
- * `firstRecordDate` (file order): a session or mission slice from the daemon
- * is not guaranteed to arrive sorted. */
-function earliestDate(records: FlowRecord[]): string | null {
-  let min = Infinity;
-  for (const r of records) {
-    const t = T(r.ts);
-    if (!Number.isNaN(t) && t < min) min = t;
-  }
-  return Number.isFinite(min) ? new Date(min).toISOString().slice(0, 10) : null;
-}
 
 function renderRoute(
   route: Route,
