@@ -36,6 +36,7 @@
 //! config.json files are untouched).
 
 pub mod interpret;
+pub mod prune;
 pub mod load;
 
 pub use interpret::{interpret, LaunchParams, TaskOverride};
@@ -139,10 +140,20 @@ use std::collections::{BTreeMap, BTreeSet};
 /// and every config that isn't an operator-authored GitHub-CLI verb) is a
 /// pure no-op.
 ///
+/// Bumped to **"3.1"** (#2299) — additive: [`PhaseConfig`], [`TaskConfig`]
+/// and [`StepConfig`] gained the optional `enabled` field (default `true`).
+/// `false` prunes the item when a run is minted (`mission_config::prune`):
+/// it never exists in the run, so the graph shows exactly what will execute
+/// and nothing gray. The resolved-config snapshot every run keeps carries
+/// the flags, and the run's `graph-report.json` names what was pruned and
+/// why. There is deliberately NO CLI override — edit the JSON and run; the
+/// snapshot is the record. A pre-3.1 reader ignores the field and mints
+/// everything, which is the additive contract.
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "3.0";
+pub const MISSION_CONFIG_SCHEMA: &str = "3.1";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -336,6 +347,7 @@ pub fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &s
         return;
     }
     let args_task = TaskConfig {
+        enabled: None,
         id: PANEL_ARGS_TASK_ID.to_string(),
         description: Some("synthetic: the raw text typed after the panel command name (ACP) or the \
                             `--param args=<value>` flag (direct CLI launch)".to_string()),
@@ -344,6 +356,7 @@ pub fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &s
         reads: Vec::new(),
         role_id: None,
         steps: vec![StepConfig {
+            enabled: None,
             id: format!("{PANEL_ARGS_TASK_ID}-step"),
             kind: "procedural.noop".to_string(),
             config: serde_json::json!({"output": args}),
@@ -355,6 +368,7 @@ pub fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &s
     config.phases.insert(
         0,
         PhaseConfig {
+            enabled: None,
             id: "__panel_args_phase__".to_string(),
             description: None,
             display_name: None,
@@ -400,6 +414,12 @@ pub struct MissionInput {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhaseConfig {
     pub id: String,
+    /// (#2299) `false` prunes this item at mint: it never exists in the run —
+    /// not in the task graph, not in the viewer, no record. Absent means
+    /// enabled; the FIELD is the gate, never its presence. Provenance is the
+    /// config snapshot the run keeps, which carries the flag verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// (#1398) Operator-facing short label — `description` is deliberately
@@ -449,6 +469,12 @@ pub struct PhaseConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskConfig {
     pub id: String,
+    /// (#2299) `false` prunes this item at mint: it never exists in the run —
+    /// not in the task graph, not in the viewer, no record. Absent means
+    /// enabled; the FIELD is the gate, never its presence. Provenance is the
+    /// config snapshot the run keeps, which carries the flag verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// (#1398) Operator-facing short label — same overload split as
@@ -509,6 +535,12 @@ pub struct TaskConfig {
 pub struct StepConfig {
     pub id: String,
     pub kind: String,
+    /// (#2299) `false` prunes this item at mint: it never exists in the run —
+    /// not in the task graph, not in the viewer, no record. Absent means
+    /// enabled; the FIELD is the gate, never its presence. Provenance is the
+    /// config snapshot the run keeps, which carries the flag verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub config: serde_json::Value,
     /// (#1684 Packet 2, schema 2.2) The operator sign-off gate. `None` (the
@@ -533,6 +565,27 @@ pub struct StepConfig {
     pub gate: Option<String>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+impl PhaseConfig {
+    /// (#2299) Absent means enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+}
+
+impl TaskConfig {
+    /// (#2299) Absent means enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+}
+
+impl StepConfig {
+    /// (#2299) Absent means enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 /// Severity of a [`ValidationFinding`]. `Error` blocks a config from being
@@ -954,6 +1007,7 @@ mod tests {
 
     fn step(id: &str, kind: &str) -> StepConfig {
         StepConfig {
+            enabled: None,
             id: id.to_string(),
             kind: kind.to_string(),
             config: serde_json::Value::Null,
@@ -968,6 +1022,7 @@ mod tests {
 
     fn task(id: &str, depends_on: &[&str], steps: Vec<StepConfig>) -> TaskConfig {
         TaskConfig {
+            enabled: None,
             id: id.to_string(),
             description: None,
             display_name: None,
@@ -981,6 +1036,7 @@ mod tests {
 
     fn phase(id: &str, tasks: Vec<TaskConfig>) -> PhaseConfig {
         PhaseConfig {
+            enabled: None,
             id: id.to_string(),
             description: None,
             display_name: None,
@@ -1697,6 +1753,7 @@ mod tests {
                 "t1",
                 &[],
                 vec![StepConfig {
+                    enabled: None,
                     id: "s1".to_string(),
                     kind: "dispatch.internal".to_string(),
                     config: serde_json::json!({"role": "coder"}),
@@ -1795,7 +1852,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_3_0() {
+    fn schema_version_constant_is_3_1() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
@@ -1811,7 +1868,10 @@ mod tests {
         //
         // (#1685) Bumped again to "2.3" — additive (`MissionConfig::
         // cmd`), same minor-bump discipline.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "3.0");
+        //
+        // (#2299) Bumped to "3.1" — additive: `enabled` on phases, tasks and
+        // steps, pruned at mint. A pre-3.1 reader ignores it and mints all.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "3.1");
     }
 
     // ── (#1684) `panel` schema field ─────────────────────────────────────

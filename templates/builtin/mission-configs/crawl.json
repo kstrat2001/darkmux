@@ -2,7 +2,7 @@
   "id": "crawl",
   "name": "Crawl",
   "description": "Documentation-only (#1959) — `crawl` carries NO Task/Step graph. `darkmux mission launch crawl` is routed by literal config id in `mission_launch::launch`, BEFORE this document (or any mission-config document) is ever loaded: its Task/Step graph is computed at RUN TIME from a resolved crawl plan, one Task per (source, rule-set) grouping, built fresh from whatever the `workspace`/`rules`/`source`+`rule` inputs below resolve to on THIS invocation — there is nothing static to declare ahead of time the way `coder-phase`'s fixed worktree->coder->verify chain or `review`'s fixed bundle->probe->dedup->judge->verify->synthesis chain can. This file exists purely so `mission config list`/`mission config show crawl` can enumerate crawl's inputs for a curious operator; editing `phases` here has NO effect on what a real crawl launch does — see `src/crawl_launch.rs`'s own module doc for the real launcher.",
-  "schema_version": "3.0",
+  "schema_version": "3.1",
   "inputs": [
     {
       "name": "workspace",

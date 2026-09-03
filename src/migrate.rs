@@ -285,6 +285,7 @@ fn synthesize_config_snapshot(mission_id: &str) -> Result<()> {
         let phase: Phase = serde_json::from_str(&phase_text)
             .with_context(|| format!("parsing phase `{phase_id}` for mission `{mission_id}`"))?;
         phases.push(PhaseConfig {
+            enabled: None,
             id: phase.id,
             description: Some(phase.description),
             display_name: phase.display_name,

@@ -826,7 +826,7 @@ mod tests {
     use std::collections::BTreeMap as Map;
 
     fn step(id: &str, kind: &str, config: serde_json::Value) -> StepConfig {
-        StepConfig { id: id.to_string(), kind: kind.to_string(), config, gate: None, extras: Map::new() }
+        StepConfig { id: id.to_string(), kind: kind.to_string(), config, gate: None, enabled: None, extras: Map::new() }
     }
 
     fn gated_step(id: &str, kind: &str, config: serde_json::Value, gate: &str) -> StepConfig {
@@ -835,6 +835,7 @@ mod tests {
 
     fn task(id: &str, depends_on: &[&str], reads: &[&str], steps: Vec<StepConfig>) -> TaskConfig {
         TaskConfig {
+            enabled: None,
             id: id.to_string(),
             description: None,
             display_name: None,
@@ -847,7 +848,7 @@ mod tests {
     }
 
     fn phase(id: &str, tasks: Vec<TaskConfig>) -> PhaseConfig {
-        PhaseConfig { id: id.to_string(), description: None, display_name: None, tasks, extras: Map::new() }
+        PhaseConfig { id: id.to_string(), description: None, display_name: None, tasks, enabled: None, extras: Map::new() }
     }
 
     fn config(id: &str, panel: Option<PanelConfig>, phases: Vec<PhaseConfig>) -> MissionConfig {

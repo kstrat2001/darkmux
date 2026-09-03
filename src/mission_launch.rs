@@ -518,7 +518,16 @@ pub fn launch(
         &mut config_owned,
         collected.get("args").and_then(|v| v.as_str()).unwrap_or(""),
     );
-    let config: &MissionConfig = &config_owned;
+    // (#2299) `enabled: false` is honored HERE, before anything is minted or
+    // interpreted: a disabled phase/task/step never exists in the run — no
+    // graph node, no record, nothing gray. The ORIGINAL document (flags and
+    // all) is what the config snapshot keeps, so provenance is the snapshot
+    // plus the `graph-report.json` written beside it; the PRUNED document is
+    // what every step below mints from. No CLI override by design — edit the
+    // JSON and run.
+    let config_as_declared: &MissionConfig = &config_owned;
+    let (config_pruned, prune_report) = mission_config::prune::prune_disabled(config_as_declared);
+    let config: &MissionConfig = &config_pruned;
 
     // (#1284 review round 1, consider 11) A config whose graph uses the
     // coder-phase step kinds needs workdir/branch/base to EXECUTE — check
@@ -608,8 +617,13 @@ pub fn launch(
     // any partially-minted Planned phases to Abandoned via its own #1504
     // reconcile) ONLY if minting got far enough to write `mission.json` in
     // the first place; a failure before that point never touched disk.
-    let real_phase_ids =
-        match ensure_mission_and_phases_with_provenance(&mission_id, config, None, Some(spec)) {
+    let real_phase_ids = match ensure_mission_and_phases_with_provenance_and_start_payload(
+        &mission_id,
+        config,
+        None,
+        Some(spec),
+        Some(serde_json::json!({ "graph": prune_report })),
+    ) {
             Ok(v) => v,
             Err(e) => {
                 crew::lifecycle::reconcile_mint_failure(
@@ -632,12 +646,20 @@ pub fn launch(
     //
     // config-snapshot.json — ALWAYS written (fresh mint or relaunch
     // overwrite), regardless of whether the graph turns out executable.
-    if let Err(e) = crew::lifecycle::save_config_snapshot(&mission_id, config)
+    if let Err(e) = crew::lifecycle::save_config_snapshot(&mission_id, config_as_declared)
         .context("persisting config-snapshot.json")
+        .and_then(|()| {
+            crew::lifecycle::save_graph_report(&mission_id, &prune_report)
+                .context("persisting graph-report.json")
+        })
     {
         let mut no_steps = BTreeMap::new();
         reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &[], &mut no_steps, &e);
         return Err(e);
+    }
+
+    if prune_report.pruned_anything() {
+        println!("  {}", style::dim(&format!("graph: {}", prune_report.summary_line())));
     }
 
     let params = build_launch_params(config, &real_phase_ids, &collected);
@@ -1570,6 +1592,19 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
     description: Option<&str>,
     spec: Option<MissionSpec>,
 ) -> Result<BTreeMap<String, String>> {
+    ensure_mission_and_phases_with_provenance_and_start_payload(mission_id, config, description, spec, None)
+}
+
+/// (#2299) The same mint, with an optional payload for the `mission start`
+/// record — the config launcher passes its prune report (`graph`) here so
+/// the record says what the config declared and what was minted.
+pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
+    mission_id: &str,
+    config: &MissionConfig,
+    description: Option<&str>,
+    spec: Option<MissionSpec>,
+    start_payload: Option<serde_json::Value>,
+) -> Result<BTreeMap<String, String>> {
     let real_phase_ids: BTreeMap<String, String> = derive_phase_ids(mission_id, config);
 
     let mission_path = crew::lifecycle::mission_path(mission_id);
@@ -1621,9 +1656,10 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
         crew::lifecycle::save_phase(&p).with_context(|| format!("persisting phase {real_id}"))?;
     }
 
-    crew::lifecycle::mission_start_with_reasoning(
+    crew::lifecycle::mission_start_with_reasoning_and_payload(
         mission_id,
         Some(&format!("launched from config `{}`", config.id)),
+        start_payload,
     )
     .context("starting the newly-minted mission")?;
 

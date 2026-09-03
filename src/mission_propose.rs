@@ -591,6 +591,7 @@ fn build_mission_config(
         .iter()
         .filter_map(|id| by_id.get(id.as_str()))
         .map(|s| PhaseConfig {
+            enabled: None,
             id: s.id.clone(),
             description: Some(s.description.clone()),
             display_name: s.display_name.clone(),

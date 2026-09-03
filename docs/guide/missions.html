@@ -221,6 +221,8 @@ darkmux mission config show review --param review-judge=review-mid</code></pre>
     <h3>Worked example: a minimum-viable mission</h3>
     <p>The smallest useful shape: one config, one phase. Just enough to see the lifecycle move and the cyan records land in the viewer.</p>
 
+    <p>Any phase, task or step may carry <code>"enabled": false</code>. It is pruned when the run is minted, so the run shows exactly what will execute and nothing gray; the run's <code>config-snapshot.json</code> and <code>graph-report.json</code> record what was left out and why, and <code>mission status</code> prints the count. There is no CLI override: edit the config and launch.</p>
+
     <h4>1. Make sure the directory exists</h4>
     <pre><code>mkdir -p ~/.darkmux/mission-configs</code></pre>
 
