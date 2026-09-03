@@ -77,6 +77,19 @@ export interface MissionGraph {
 // left-to-right by `depth` (rebased to the phase's own first column — see
 // the inline comment below) so dependency order reads left-to-right.
 export const COL_W = 260;
+/** (#2104) A task card that carries step rows. Measured on the real
+ * finalized crawl `crawl-1788402801-729335` at desktop width (2026-09-03):
+ * the card's content wanted 338px against a 258px card — the widest metric
+ * row (`4:56 319k tok 7 turns 19 tools`) is ~247px on its own, after a
+ * ~84px step lead and 30px of tree rail. 360 covers that with slack for one
+ * more digit; the meter's CSS ellipsis is the backstop past it. */
+export const TASK_W_WITH_STEPS = 360;
+
+/** (#2104) A card's width is decided by its content class, here, once —
+ * the layout, the React Flow node style and the phase box all read it. */
+export function taskWidth(task: GraphNode): number {
+  return (task.steps || []).length ? TASK_W_WITH_STEPS : COL_W;
+}
 export const COL_GAP = 80;
 // (#2057) These describe the card `.missionlens .mnode` actually draws,
 // measured in a real browser at scale 1 (2026-08-28): a one-step card is
@@ -107,6 +120,8 @@ export interface LayoutBox {
 export interface Layout {
   positions: Record<string, { x: number; y: number }>;
   boxes: Record<string, LayoutBox>;
+  /** (#2104) Per-task card width; the canvas applies it as the node's style width. */
+  widths: Record<string, number>;
 }
 
 export function computeLayout(nodes: GraphNode[]): Layout {
@@ -120,6 +135,7 @@ export function computeLayout(nodes: GraphNode[]): Layout {
 
   const positions: Record<string, { x: number; y: number }> = {};
   const boxes: Record<string, LayoutBox> = {};
+  const widths: Record<string, number> = {};
   let bandTop = 0;
   const phaseList: Array<{ id: string; depth: number }> = phases.length ? phases : [{ id: "__none__", depth: 0 }];
 
@@ -140,23 +156,34 @@ export function computeLayout(nodes: GraphNode[]): Layout {
       (byDepth[d] = byDepth[d] || []).push(t);
     }
     let maxColumnHeight = 0;
+    // (#2104) Column zero starts just past the phase label — it used to
+    // start a full COL_W further right, which read as a layout step missing
+    // (a half-empty phase box with the card parked on its right). Each
+    // column is as wide as its widest card, and the next column starts past
+    // it, so a card sized to its content never overlaps its neighbor.
+    let x = PHASE_LABEL_W + COL_GAP / 2;
+    let rightEdge = x;
     for (let d = 0; d <= maxDepth; d++) {
       const atDepth = byDepth[d] || [];
-      const x = PHASE_LABEL_W + COL_W + d * (COL_W + COL_GAP);
+      let colW = COL_W;
       let yCursor = bandTop + BAND_PAD;
       for (const t of atDepth) {
+        const w = taskWidth(t);
+        widths[t.id] = w;
+        colW = Math.max(colW, w);
         positions[t.id] = { x, y: yCursor };
         yCursor += taskPitch((t.steps || []).length);
       }
       maxColumnHeight = Math.max(maxColumnHeight, yCursor - (bandTop + BAND_PAD));
+      rightEdge = x + colW;
+      x = rightEdge + COL_GAP;
     }
     if (phase.id !== "__none__") {
       positions[phase.id] = { x: 0, y: bandTop + BAND_PAD };
     }
     const bandHeight = Math.max(160, maxColumnHeight + BAND_PAD * 2);
     if (phase.id !== "__none__") {
-      const lastX = PHASE_LABEL_W + COL_W + maxDepth * (COL_W + COL_GAP);
-      boxes[phase.id] = { x: 0, y: bandTop, w: lastX + COL_W + BAND_PAD, h: bandHeight };
+      boxes[phase.id] = { x: 0, y: bandTop, w: rightEdge + BAND_PAD, h: bandHeight };
     }
     bandTop += bandHeight + BAND_GAP;
   }
@@ -168,7 +195,7 @@ export function computeLayout(nodes: GraphNode[]): Layout {
   let widest = 0;
   for (const b of Object.values(boxes)) widest = Math.max(widest, b.w);
   for (const b of Object.values(boxes)) b.w = widest;
-  return { positions, boxes };
+  return { positions, boxes, widths };
 }
 
 // ─── status vocabulary (mission-graph.html: normalizeMissionStatus,
