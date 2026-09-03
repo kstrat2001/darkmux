@@ -1223,7 +1223,13 @@ mod tests {
             "args stays the capped preview it always was"
         );
         assert_eq!(reported["args_chars"], serde_json::json!(raw_args.chars().count()));
-        assert!(read["emitted"].is_null() && read["emit_seq"].is_null(), "every other tool emits nothing");
+        let read = read.as_object().unwrap();
+        assert!(
+            read.contains_key("emitted") && read["emitted"].is_null()
+                && read.contains_key("emit_seq") && read["emit_seq"].is_null(),
+            "every other tool emits nothing — as an EXPLICIT null, key present: the host \
+             reads a missing key as \"this runtime predates the field\": {read:?}"
+        );
     }
 
     #[test]
