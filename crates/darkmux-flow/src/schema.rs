@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.32.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.33.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -672,6 +672,24 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.32.0";
 //           build from #2182 (2026-08-31) to this one, and nothing recorded
 //           either list. Additive payload key on an existing action; older
 //           readers ignore it.
+//   1.33.0 (#2272): `dispatch.tool`'s payload gains `emitted` and `emit_seq`.
+//           `emitted` is an accepted `report_finding` call's arguments
+//           VERBATIM — an opaque value darkmux never interprets: it has no
+//           idea where the record will end up, so it cannot carry knowledge
+//           of any destination; a hook's transform composes that
+//           destination's payload from the record's metadata (mission,
+//           unit, rule, source, sha, model, ts, `emit_seq`) plus this blob.
+//           Bounded on the serialized whole at 64 KiB, and LOUDLY — over
+//           it, the value is `{ "truncated": <prefix>, "emitted_truncated":
+//           true }`. `emit_seq` is the 1-based ordinal of the acceptance
+//           within the dispatch (the runtime's findings-file count, so it
+//           survives a resume). Both are `null` on every other tool call, so
+//           a non-emitting call never reads as a pre-1.33 record. Why: the
+//           record's `args` is (and stays) the runtime's 512-char viewer
+//           preview; nine of nine crawl findings on 2026-09-02 reached the
+//           tracker as that preview, cut mid-JSON, and were rejected. The
+//           crawl's product now rides its own field. Additive payload keys
+//           on an existing action; older readers ignore them.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

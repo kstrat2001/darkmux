@@ -377,19 +377,18 @@ impl Tool {
         }
     }
 
-    pub fn execute(self, raw_args: &str) -> Result<String> {
+    pub fn execute(self, raw_args: &str) -> Result<ToolRun> {
+        let ws = Path::new(DEFAULT_WORKSPACE);
         match self {
-            Tool::Echo => execute_echo(raw_args),
-            Tool::Bash => execute_bash(raw_args, Path::new(DEFAULT_WORKSPACE)),
-            Tool::Read => execute_read(raw_args, Path::new(DEFAULT_WORKSPACE)),
-            Tool::Write => execute_write(raw_args, Path::new(DEFAULT_WORKSPACE)),
-            Tool::Edit => execute_edit(raw_args, Path::new(DEFAULT_WORKSPACE)),
-            Tool::Search => execute_search(raw_args, Path::new(DEFAULT_WORKSPACE)),
-            Tool::ReportFinding => execute_report_finding(
-                raw_args,
-                &crate::trajectory::runtime_dir(),
-                Path::new(DEFAULT_WORKSPACE),
-            ),
+            Tool::Echo => execute_echo(raw_args).map(ToolRun::text),
+            Tool::Bash => execute_bash(raw_args, ws).map(ToolRun::text),
+            Tool::Read => execute_read(raw_args, ws).map(ToolRun::text),
+            Tool::Write => execute_write(raw_args, ws).map(ToolRun::text),
+            Tool::Edit => execute_edit(raw_args, ws).map(ToolRun::text),
+            Tool::Search => execute_search(raw_args, ws).map(ToolRun::text),
+            Tool::ReportFinding => {
+                execute_report_finding(raw_args, &crate::trajectory::runtime_dir(), ws)
+            }
         }
     }
 
@@ -408,16 +407,45 @@ impl Tool {
 /// schema in the result message the model has concrete signal about
 /// what shape is expected. Reduces wasted-turn cycles where the
 /// agent keeps emitting args that don't match the tool contract.
-pub fn dispatch(name: &str, raw_args: &str) -> String {
+pub fn dispatch(name: &str, raw_args: &str) -> ToolRun {
     match Tool::from_name(name) {
         Some(tool) => match tool.execute(raw_args) {
-            Ok(result) => result,
-            Err(e) => format_dispatch_error(tool, name, &e),
+            Ok(run) => run,
+            Err(e) => ToolRun::text(format_dispatch_error(tool, name, &e)),
         },
-        None => format!(
+        None => ToolRun::text(format!(
             "tool '{name}' is not available in this runtime. \
              known tools: echo, bash, read, write, edit, search"
-        ),
+        )),
+    }
+}
+
+/// What one tool call produced: the text that goes back into the
+/// conversation as the `role: tool` message, plus — for an ACCEPTED
+/// `report_finding` call only — the model's emission (#2272).
+///
+/// `emitted` is the tool's arguments exactly as the model sent them, parsed
+/// and nothing more: darkmux does not know what is inside it and must not,
+/// because it has no idea where the record will end up. A hook's transform
+/// composes whatever its destination needs from the record's METADATA (crawl,
+/// unit, rule, source, sha, model, timestamp, `emit_seq`) plus this blob.
+/// Today function calling delivers it as a JSON object; the field's type is
+/// "opaque value", not "finding". The trajectory's `args` is a 512-char
+/// viewer preview and cannot carry it — that is the bug this closes.
+///
+/// `emit_seq` is the 1-based ordinal of this acceptance within the dispatch
+/// (the findings-file count, so it survives a resume). Every other tool, and
+/// every rejected report, carries `None` for both.
+#[derive(Debug)]
+pub struct ToolRun {
+    pub result: String,
+    pub emitted: Option<serde_json::Value>,
+    pub emit_seq: Option<usize>,
+}
+
+impl ToolRun {
+    pub fn text(result: String) -> Self {
+        ToolRun { result, emitted: None, emit_seq: None }
     }
 }
 
@@ -980,13 +1008,13 @@ mod tests {
 
     #[test]
     fn echo_returns_text_arg() {
-        let result = dispatch("echo", r#"{"text": "hello"}"#);
+        let result = dispatch("echo", r#"{"text": "hello"}"#).result;
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn unknown_tool_returns_error_message_not_panic() {
-        let result = dispatch("teleport", r#"{}"#);
+        let result = dispatch("teleport", r#"{}"#).result;
         assert!(result.contains("not available"));
     }
 
@@ -1053,7 +1081,45 @@ mod tests {
             "evidence": evidence, "why": "w",
         })
         .to_string();
-        execute_report_finding(&raw, out, ws).unwrap()
+        execute_report_finding(&raw, out, ws).unwrap().result
+    }
+
+    #[test]
+    fn an_accepted_report_returns_the_emission_verbatim_with_its_ordinal_and_a_rejected_one_returns_none() {
+        // (#2272) The trajectory's `args` is a 512-char viewer preview and
+        // cannot carry a crawl's product. What the model handed the tool
+        // comes back VERBATIM — darkmux does not know what is inside it;
+        // a hook's transform composes the destination payload from the
+        // record's metadata plus this blob — with the per-dispatch ordinal
+        // a transform can interpolate as an emit number.
+        let ws = finding_workspace(&numbered_src(20, 7, "  if (a && b && c) {"));
+        let out = tempfile::tempdir().unwrap();
+        let why = "y".repeat(2_000);
+        let raw = serde_json::json!({
+            "path": "src/a.rs", "line": 7, "pattern": "p",
+            "evidence": "  if (a && b && c) {", "why": why,
+            "extra_the_model_chose_to_add": {"rect": [1, 2, 3, 4]},
+        })
+        .to_string();
+        let run = execute_report_finding(&raw, out.path(), ws.path()).unwrap();
+        assert!(run.result.starts_with("Recorded."), "{}", run.result);
+        let emitted = run.emitted.expect("an accepted report returns its emission");
+        let verbatim: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(emitted, verbatim, "the emission is the model's arguments, untouched: no alias normalization, no dropped keys");
+        assert_eq!(emitted["why"].as_str().unwrap().len(), 2_000);
+        assert_eq!(run.emit_seq, Some(1), "first accepted report in this dispatch");
+
+        let second = execute_report_finding(&raw, out.path(), ws.path()).unwrap();
+        assert_eq!(second.emit_seq, Some(2), "the ordinal is the findings-file count, so it survives a resume");
+
+        let rejected = execute_report_finding(
+            &serde_json::json!({"file": "src/a.rs", "line": 3, "pattern": "p",
+                "evidence": "not what line 3 says", "why": "w"}).to_string(),
+            out.path(), ws.path(),
+        )
+        .unwrap();
+        assert!(rejected.result.starts_with("REJECTED"), "{}", rejected.result);
+        assert!(rejected.emitted.is_none() && rejected.emit_seq.is_none(), "a rejected report emits nothing");
     }
 
     #[test]
@@ -1145,7 +1211,7 @@ mod tests {
             "evidence": "root", "why": "w",
         })
         .to_string();
-        let resp = execute_report_finding(&raw, out.path(), ws.path()).unwrap();
+        let resp = execute_report_finding(&raw, out.path(), ws.path()).unwrap().result;
         assert!(resp.starts_with("REJECTED:"), "context capture must not escape the workspace: {resp}");
     }
 
@@ -1625,7 +1691,7 @@ mod tests {
                 Ok(s) => s,
                 Err(e) => format!("tool '{name}' returned error: {e:#}"),
             },
-            _ => dispatch(name, raw_args),
+            _ => dispatch(name, raw_args).result,
         }
     }
 
@@ -1636,7 +1702,7 @@ mod tests {
         // Malformed JSON: `command` field missing. dispatch should
         // return an error string that includes the bash JSON-Schema
         // so the model can correct on the next turn.
-        let result = dispatch("bash", r#"{"not_command": "ls"}"#);
+        let result = dispatch("bash", r#"{"not_command": "ls"}"#).result;
         assert!(
             result.contains("EXPECTED argument schema for 'bash'"),
             "arg-parse error must include schema-augmentation header. Got: {result}"
@@ -1655,7 +1721,7 @@ mod tests {
     #[test]
     fn dispatch_arg_parse_error_message_includes_schema_for_read() {
         // Read requires `path`, `offset`, `limit`. Sending none of them.
-        let result = dispatch("read", r#"{}"#);
+        let result = dispatch("read", r#"{}"#).result;
         assert!(result.contains("EXPECTED argument schema for 'read'"));
         assert!(result.contains("\"path\""));
         assert!(result.contains("\"offset\""));
@@ -1665,7 +1731,7 @@ mod tests {
 
     #[test]
     fn dispatch_arg_parse_error_message_includes_schema_for_edit() {
-        let result = dispatch("edit", r#"{"path": "/x"}"#); // missing edits[]
+        let result = dispatch("edit", r#"{"path": "/x"}"#).result; // missing edits[]
         assert!(result.contains("EXPECTED argument schema for 'edit'"));
         assert!(result.contains("\"edits\""));
     }
@@ -1687,7 +1753,7 @@ mod tests {
         let result = dispatch(
             "read",
             r#"{"path": "/definitely/not/a/real/path", "offset": 1, "limit": 0}"#,
-        );
+        ).result;
         assert!(
             result.starts_with("tool 'read' returned error:"),
             "non-arg-parse error must keep the wrapper prefix. Got: {result}"
@@ -1701,7 +1767,7 @@ mod tests {
     #[test]
     fn dispatch_successful_call_returns_unaugmented_result() {
         // No error, no schema in output.
-        let result = dispatch("echo", r#"{"text": "hi"}"#);
+        let result = dispatch("echo", r#"{"text": "hi"}"#).result;
         assert_eq!(result, "hi");
         assert!(!result.contains("EXPECTED argument schema"));
     }
@@ -1710,7 +1776,7 @@ mod tests {
     fn dispatch_unknown_tool_does_not_add_schema() {
         // Unknown tools never had a schema-aware path — message
         // shape preserved.
-        let result = dispatch("nonexistent_tool", r#"{}"#);
+        let result = dispatch("nonexistent_tool", r#"{}"#).result;
         assert!(result.contains("not available"));
         assert!(!result.contains("EXPECTED argument schema"));
     }
@@ -1720,7 +1786,7 @@ mod tests {
         // Should preserve serde's specific error message so the model
         // gets BOTH "what was wrong" and "what's expected" in one
         // result.
-        let result = dispatch("echo", r#"{"wrong_field": "hi"}"#);
+        let result = dispatch("echo", r#"{"wrong_field": "hi"}"#).result;
         // serde error names the missing field
         assert!(result.contains("text"), "must mention the expected field name. Got: {result}");
         // schema also included
@@ -1852,7 +1918,7 @@ fn execute_report_finding(
     raw_args: &str,
     out_dir: &Path,
     workspace_root: &Path,
-) -> Result<String> {
+) -> Result<ToolRun> {
     // NEVER return Err from a model-facing tool.
     //
     // Measured on the first live crawl: one malformed call returned an error,
@@ -1865,10 +1931,14 @@ fn execute_report_finding(
     // RESPONSE reads as "try again, differently." So a malformed call gets a
     // teaching response showing exactly what a correct call looks like, and
     // the run continues.
+    // (#2272) The emission, verbatim, kept from the ONE parse the runtime
+    // already does — before the struct below normalizes aliases and drops
+    // whatever keys it does not know. This is what rides the event.
+    let verbatim: Option<serde_json::Value> = serde_json::from_str(raw_args).ok();
     let args: ReportFindingArgs = match serde_json::from_str(raw_args) {
         Ok(a) => a,
         Err(e) => {
-            return Ok(format!(
+            return Ok(ToolRun::text(format!(
                 "NOT RECORDED — I could not read those arguments ({e}). \
                  This tool takes exactly these five keys:\n\
                  \n  {{\"file\": \"crates/foo/src/bar.rs\", \"line\": 147, \
@@ -1877,28 +1947,28 @@ fn execute_report_finding(
                  \"why\": \"<one or two sentences>\"}}\n\
                  \nThe tool IS available — call it again with those keys. \
                  Nothing was counted against your budget."
-            ));
+            )));
         }
     };
     if args.evidence.trim().is_empty() && args.why.trim().is_empty() {
-        return Ok("NOT RECORDED — `evidence` (the source line, copied verbatim) \
+        return Ok(ToolRun::text("NOT RECORDED — `evidence` (the source line, copied verbatim) \
                    and `why` are both required. The tool IS available; call it again \
                    with those fields filled in. Nothing counted against your budget."
-            .to_string());
+            .to_string()));
     }
 
     // "Cite the line", enforced at the tool boundary rather than in triage.
     // A finding that cannot point at code is not a finding, and rejecting it
     // here costs nothing — no frontier token is ever spent on it.
     if args.evidence.trim().is_empty() {
-        return Ok("REJECTED: `evidence` was empty. Copy the source line verbatim \
+        return Ok(ToolRun::text("REJECTED: `evidence` was empty. Copy the source line verbatim \
                    from the file and call again. This did not count against your budget."
-            .to_string());
+            .to_string()));
     }
     if args.line == 0 {
-        return Ok("REJECTED: `line` must be the 1-indexed line where the evidence \
+        return Ok(ToolRun::text("REJECTED: `line` must be the 1-indexed line where the evidence \
                    appears. This did not count against your budget."
-            .to_string());
+            .to_string()));
     }
 
     // Resolve the citation against real source BEFORE anything is recorded. A
@@ -1913,10 +1983,10 @@ fn execute_report_finding(
     ) {
         Ok(c) => c,
         Err(reason) => {
-            return Ok(format!(
+            return Ok(ToolRun::text(format!(
                 "REJECTED: {reason}. Re-check the path and the 1-indexed line, \
                  then call again. This did not count against your budget."
-            ));
+            )));
         }
     };
     // A quote that does not match the cited line is a WRONG LINE NUMBER far more
@@ -1931,13 +2001,13 @@ fn execute_report_finding(
     // rejected and does not count") — the code now keeps that promise.
     if captured.mismatch {
         let actual = captured.evidence.trim();
-        return Ok(format!(
+        return Ok(ToolRun::text(format!(
             "REJECTED: line {} of that file is:\n\n    {actual}\n\n\
              which is not what you quoted. You have most likely cited the wrong \
              line number. Find the line your evidence actually came from and call \
              again with it. This did not count against your budget.",
             args.line
-        ));
+        )));
     }
 
     let path = out_dir.join(FINDINGS_FILE);
@@ -1948,10 +2018,10 @@ fn execute_report_finding(
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let count = existing.lines().filter(|l| !l.trim().is_empty()).count();
     if count >= MAX_FINDINGS_PER_DISPATCH {
-        return Ok(format!(
+        return Ok(ToolRun::text(format!(
             "REJECTED: this run's finding budget ({MAX_FINDINGS_PER_DISPATCH}) is spent. \
              Stop reporting and summarize what you covered and what you did not."
-        ));
+        )));
     }
 
     // `evidence` and `context` are the HARNESS's, read from disk, and by this
@@ -1986,8 +2056,12 @@ fn execute_report_finding(
     // Back-pressure through the return value: the model is TOLD where it stands
     // so it can self-limit, and the cap above enforces it regardless. Soft
     // signal plus hard bound, the same shape as the inactivity budget.
-    Ok(format!(
-        "Recorded. {recorded} finding(s) so far, {remaining} remaining in this run's budget. \
-         Continue examining the scope; report the next one when you find it."
-    ))
+    Ok(ToolRun {
+        result: format!(
+            "Recorded. {recorded} finding(s) so far, {remaining} remaining in this run's budget. \
+             Continue examining the scope; report the next one when you find it."
+        ),
+        emitted: verbatim,
+        emit_seq: Some(recorded),
+    })
 }
