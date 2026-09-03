@@ -8214,11 +8214,21 @@ fn ensure_model_resident(
                      `darkmux machine eject`, then retry. (#2318)",
                     m.context
                 ),
+                // Say only what is known. LMStudio refused the load as
+                // already-resident, and the follow-up `lms ps` probe did not
+                // list it — which is equally consistent with the probe itself
+                // failing (`list_loaded().unwrap_or_default()` yields an empty
+                // list on error) as with a residency the match missed. Asserting
+                // the latter would name a cause this path cannot distinguish;
+                // #2318 is cited as where this was first seen, not as a
+                // diagnosis.
                 None => bail!(
                     "darkmux: loading `{model_key}` at n_ctx={n_ctx} was refused because \
-                     `{identifier}` is already taken, yet no resident matching it came back \
-                     from `lms ps` — a `darkmux:<id>` instance is already resident but was \
-                     not recognized — this is #2318. Original error: {e:#}"
+                     `{identifier}` is already taken, but the follow-up `lms ps` probe \
+                     listed no resident under that identifier — so either the probe failed \
+                     or something holds the identifier that darkmux cannot see. Check \
+                     `lms ps`; evict with `darkmux machine eject` if a stale darkmux \
+                     instance is holding it. (seen in #2318) Original error: {e:#}"
                 ),
             }
         }

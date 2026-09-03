@@ -9565,11 +9565,25 @@ fn already_resident_refusal_recovers_by_reusing() {
 fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     // The refusal is only benign when the resident actually satisfies the
     // declared context. A smaller one is the #1135 class and must stay loud.
+    //
+    // The `list` closure has to mirror the reuse test's: the FIRST read is what
+    // our thread saw (absent, which is why it tried to load at all), and the
+    // re-probe after the refusal is what returns the too-small resident. A
+    // closure that always returns empty takes the `None` arm instead and never
+    // exercises this one at all.
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let mut small = ps_row_2318();
     small.context = 4096;
+    let reads = AtomicUsize::new(0);
     let out = crate::dispatch_internal::ensure_model_resident(
         &pm_2318(),
-        &|| vec![],
+        &|| {
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                Vec::new()
+            } else {
+                vec![small.clone()]
+            }
+        },
         &|_| Ok(()),
         &|_key, identifier, _n_ctx| {
             anyhow::bail!(
@@ -9581,4 +9595,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     let err = format!("{:#}", out.expect_err("a refused load with no usable resident must error"));
     assert!(err.contains("#2318"), "message must name this class, got: {err}");
     assert!(!err.contains("#1139"), "must stop citing #1139 for this case, got: {err}");
+    // Naming BOTH numbers is what proves this arm ran rather than the `None`
+    // one: only the smaller-ctx arm has a resident to report a context for.
+    assert!(err.contains("4096"), "message must name the resident's context, got: {err}");
+    assert!(err.contains("262144"), "message must name the declared n_ctx, got: {err}");
 }
