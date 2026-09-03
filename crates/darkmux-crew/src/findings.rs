@@ -223,6 +223,81 @@ pub fn load_at(root: &Path, dispatch: &str, seq: u64) -> Result<Option<FindingRe
     Ok(Some(rec))
 }
 
+/// Render one stored finding for a dispatch brief (`dispatch --finding <key>`).
+///
+/// **Nothing is summarized and nothing is interpreted.** The record's
+/// `context` (the launcher's blob) and `emitted` (the reporting agent's own
+/// arguments) go in pretty-printed and verbatim, because darkmux does not know
+/// what is inside either and the model reading this is the one that does.
+///
+/// The block is XML-tagged with an inline definition of the two darkmux terms
+/// it cannot avoid using — a model under clean dispatch context has no darkmux
+/// history to ground `finding` or `mod` against (see the model-facing prompt
+/// doctrine in `CLAUDE.md`).
+pub fn brief_block(record: &FindingRecord) -> String {
+    let pretty = |v: &serde_json::Value| {
+        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+    };
+    format!(
+        "<finding key=\"{key}\">\n\
+         <darkmux-term name=\"finding\">something an earlier agent observed and \
+         recorded; it is an event, and it is never rewritten</darkmux-term>\n\
+         <darkmux-term name=\"mod\">a change someone proposes for an observation: \
+         instructions and/or data, enough for whoever applies it later</darkmux-term>\n\
+         \n\
+         Below is that record, verbatim and in full. `context` is what the run \
+         that produced it recorded about where it was looking; `emitted` is the \
+         reporting agent's own arguments. Nothing here has been summarized \
+         or interpreted.\n\
+         \n\
+         context:\n{context}\n\
+         \n\
+         emitted:\n{emitted}\n\
+         </finding>\n\
+         \n\
+         If your work produces a change for this, record it with the \
+         `create_mod` tool and name \"{key}\" in `for`.",
+        key = record.key,
+        context = pretty(&record.context),
+        emitted = pretty(&record.emitted),
+    )
+}
+
+/// Append each named finding's stored record to a dispatch brief, and return
+/// the brief with the canonical keys that were appended.
+///
+/// A key that addresses no stored finding is an ERROR, not a skip: dispatching
+/// with a silently missing block would send the role to work on an observation
+/// it never saw, and the second producer that can fill the store is named in
+/// the message so the operator can act on it.
+pub fn append_to_brief(
+    message: &str,
+    keys: &[String],
+    root: &Path,
+) -> Result<(String, Vec<String>)> {
+    let mut brief = message.to_string();
+    let mut appended = Vec::new();
+    for key in keys {
+        let (dispatch, seq) = parse_key(key).with_context(|| {
+            format!(
+                "--finding {key:?} is not a finding key. A key is `<dispatch>/<seq>`, \
+                 e.g. `sess-abc/1` — `darkmux finding list` shows what is stored."
+            )
+        })?;
+        let record = load_at(root, &dispatch, seq)?.with_context(|| {
+            format!(
+                "no finding {key} under {}\n  `darkmux finding sync` replays the flow \
+                 stream into the store.",
+                root.display()
+            )
+        })?;
+        brief.push_str("\n\n");
+        brief.push_str(&brief_block(&record));
+        appended.push(record.key.clone());
+    }
+    Ok((brief, appended))
+}
+
 /// Split a `<dispatch>/<seq>` key. The dispatch half may itself contain no
 /// slash (session ids never do), so the split is on the LAST separator.
 pub fn parse_key(key: &str) -> Option<(String, u64)> {
@@ -405,6 +480,65 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
 
 #[cfg(test)]
 mod tests {
+    /// (#2265) The WIRING: the operator's own message comes first, then one
+    /// block per finding, in the order named — and the keys come back so the
+    /// dispatch record can say which observations it was briefed on.
+    #[test]
+    fn append_to_brief_puts_each_record_after_the_operators_message_and_refuses_an_absent_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for (d, seq, why) in [("sess-a", 1u64, "first observation"), ("sess-b", 2, "second")] {
+            let rec = build_record(
+                d,
+                seq,
+                "2026-09-03T00:00:00Z".into(),
+                "create_finding",
+                Proposer { handle: "crawler".into(), model: "m".into(), machine_id: None },
+                Scope::default(),
+                None,
+                serde_json::json!({"why": why}),
+            );
+            materialize(root, &rec).unwrap();
+        }
+        let keys = vec!["sess-a/01".to_string(), "sess-b/2".to_string()];
+        let (brief, appended) = append_to_brief("fix this", &keys, root).unwrap();
+        assert!(brief.starts_with("fix this"), "the operator's message comes first: {brief}");
+        assert!(brief.contains("first observation"), "the record is appended: {brief}");
+        assert!(
+            brief.find("first observation") < brief.find("second"),
+            "in the order the operator named them: {brief}"
+        );
+        assert_eq!(appended, vec!["sess-a/1".to_string(), "sess-b/2".to_string()]);
+
+        let err = append_to_brief("fix this", &["sess-a/9".to_string()], root).unwrap_err();
+        assert!(format!("{err:#}").contains("finding sync"), "{err:#}");
+        let shape = append_to_brief("fix this", &["nope".to_string()], root).unwrap_err();
+        assert!(format!("{shape:#}").contains("<dispatch>/<seq>"), "{shape:#}");
+    }
+
+    /// (#2265) The brief block hands the model the record VERBATIM — the
+    /// launcher's context and the reporting agent's own arguments, neither
+    /// summarized — plus the key it must name in a mod's `for`.
+    #[test]
+    fn a_brief_block_carries_the_record_verbatim_and_names_the_key_for_a_mod() {
+        let rec = build_record(
+            "sess-a",
+            7,
+            "2026-09-03T00:00:00Z".into(),
+            "create_finding",
+            Proposer { handle: "crawler".into(), model: "m".into(), machine_id: None },
+            Scope::default(),
+            Some(serde_json::json!({"unit": "u7", "rule": "unnamed-predicate"})),
+            serde_json::json!({"file": "src/x.ts", "line": 82, "why": "three unnamed operands"}),
+        );
+        let block = brief_block(&rec);
+        assert!(block.contains("sess-a/7"), "names the key: {block}");
+        assert!(block.contains("three unnamed operands"), "the emission is present whole: {block}");
+        assert!(block.contains("unnamed-predicate"), "the launcher's context is present: {block}");
+        assert!(block.contains("create_mod"), "tells the model how to record a change: {block}");
+        assert!(block.contains("in `for`"), "and which field names this finding: {block}");
+    }
+
     use super::*;
     use tempfile::TempDir;
 

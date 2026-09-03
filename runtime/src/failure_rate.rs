@@ -250,6 +250,12 @@ pub fn classify_outcome(tool_name: &str, result: &str) -> ToolOutcome {
     if tool_name == "create_finding" && (result.starts_with("REJECTED:") || result.starts_with("NOT RECORDED")) {
         return ToolOutcome::Failed { reason: "the finding's citation did not verify".to_string() };
     }
+    // (#2265) `create_mod` is the same shape for the same reason: it never
+    // returns `Err` either, so its refusal text is classified here. A refused
+    // mod recorded nothing — a genuinely failed tool call.
+    if tool_name == "create_mod" && (result.starts_with("REJECTED:") || result.starts_with("NOT RECORDED")) {
+        return ToolOutcome::Failed { reason: "the mod was refused and recorded nothing".to_string() };
+    }
 
     if tool_name == "bash" {
         if let Some(rest) = result.strip_prefix("exit: ") {
@@ -439,6 +445,24 @@ mod tests {
     /// (hypothetically) or plain prose that merely mentions the word must
     /// not be misclassified. Guards against a future broadening of the
     /// match to `.contains("REJECTED")`.
+    ///
+    /// (#2265) `create_mod` returns the same error-shaped-text-with-Ok as its
+    /// sibling, for the same reason, so it needs the same classification: a
+    /// refused mod is a FAILED tool call, and a recorded one is proof of work.
+    #[test]
+    fn create_mod_not_recorded_is_failed_and_recorded_is_ok() {
+        let refused = "NOT RECORDED — `kit` is required and must not be empty. \
+                       Nothing was recorded.";
+        assert!(matches!(classify_outcome("create_mod", refused), ToolOutcome::Failed { .. }));
+        assert!(!classify_outcome("create_mod", refused).tool_worked());
+        let ok = "Recorded mod 2. Continue with the work you were asked to do.";
+        assert_eq!(classify_outcome("create_mod", ok), ToolOutcome::Ok);
+        assert!(classify_outcome("create_mod", ok).tool_worked());
+        // Scoped to this tool name: another tool's reply that happens to start
+        // the same way is not reclassified.
+        assert_eq!(classify_outcome("bash", "NOT RECORDED — whatever"), ToolOutcome::Ok);
+    }
+
     #[test]
     fn create_finding_classification_is_scoped_to_this_tool_name() {
         let r = "REJECTED: `evidence` was empty.";

@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.34.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.35.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -698,6 +698,26 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.34.0";
 //           no alias: hook rules matching `payload.tool_name`, the viewer's
 //           record detail, and any transform keying on the old name update
 //           with this version. Historical entries above keep the old name.
+//   1.35.0 (#2265): the MOD channel's two additive keys.
+//           `dispatch.tool` records now also carry `payload.tool_name:
+//           "create_mod"` — the runtime tool that records a proposed CHANGE,
+//           the sibling of `create_finding`'s observation. Its accepted calls
+//           ride the SAME `emitted` / `emit_seq` fields 1.33.0 added (the
+//           emission is `{for, kit, attach}` as the model sent it, opaque to
+//           darkmux and never parsed), so no new field is needed for it and a
+//           reader keys on `tool_name` to tell the two channels apart. The
+//           host materializes a mod record from that emission the way it
+//           materializes a finding, so a hook rule matching `{"payload.
+//           tool_name": "create_mod", "payload.ok": true}` sees exactly the
+//           accepted ones.
+//           `dispatch start`'s payload gains `findings_in_brief` — the finding
+//           keys `dispatch --finding <key>` appended to the brief, `[]` on
+//           every other dispatch (present-and-empty rather than absent, so an
+//           older writer's record stays distinguishable). Why its own field:
+//           `prompt` is capped, and a key is the address the finding store
+//           answers to, so "which observations was this dispatch briefed on"
+//           is answerable from the record without recovering it from prose.
+//           Both additive; older readers ignore what they do not recognize.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

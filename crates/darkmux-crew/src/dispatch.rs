@@ -144,6 +144,12 @@ pub(crate) fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
 pub struct DispatchOpts {
     pub role_id: String,
     pub message: String,
+    /// (#2265) Finding keys whose stored records were appended to `message`
+    /// by `dispatch --finding <key>`. Recorded on the `dispatch start` flow
+    /// record so a reader can tell WHICH observations a dispatch was briefed
+    /// on — the brief itself is capped in the record, and a key is the address
+    /// the finding store answers to. Empty on every other path.
+    pub findings_in_brief: Vec<String>,
     pub session_id: Option<String>,
     pub timeout_seconds: u32,
     /// Skip the pre-flight checks. Use only when explicitly debugging.

@@ -51,6 +51,11 @@ use std::path::{Path, PathBuf};
 /// readers stay lenient (unknown fields ride in `extras`).
 pub const MOD_SCHEMA_VERSION: &str = "1";
 
+/// The runtime tool whose accepted calls become mods. Its finding sibling
+/// needs a LIST (the pre-2026-09-03 `report_finding` is in the append-only
+/// stream forever); this tool was born with its name, so there is one.
+pub const MOD_TOOL_NAME: &str = "create_mod";
+
 /// Whether a mod key is safe to use as a PATH SEGMENT under the store.
 ///
 /// Minted keys always are, but a key also arrives from the operator (`mod
@@ -167,6 +172,20 @@ pub struct ModRecord {
     /// Each `for` finding's own provenance, copied at create time.
     #[serde(default)]
     pub context: ModContext,
+    /// The mission / phase / step the DISPATCH that proposed this mod ran
+    /// under — `null` for `mod create` (an external actor belongs to no
+    /// dispatch) and for a plain `darkmux dispatch`. Top-level for the same
+    /// reason a finding's are: `context` is the findings' copied provenance,
+    /// and darkmux does not write its own ids into a blob it copied.
+    ///
+    /// Additive (`Option` reads a record written before them as `None`), so
+    /// the schema version does not move.
+    #[serde(default)]
+    pub mission_id: Option<String>,
+    #[serde(default)]
+    pub phase_id: Option<String>,
+    #[serde(default)]
+    pub step_id: Option<String>,
     pub schema_version: String,
     /// Lenient-on-read overflow, so a newer writer's fields survive a round
     /// trip through an older reader.
@@ -353,38 +372,63 @@ pub fn create(
         kit_looks_json: kit.is_some_and(kit_looks_json),
         attachments: names.clone(),
         context: finding_context(findings_root, &for_keys)?,
+        // `mod create` is the EXTERNAL producer: the change was made outside
+        // darkmux, so there is no dispatch and no mission to name.
+        mission_id: None,
+        phase_id: None,
+        step_id: None,
         schema_version: MOD_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     };
 
-    // Staged, then renamed into place. The record and its attachments become
-    // visible TOGETHER or not at all: a copy that fails halfway would
-    // otherwise persist a write-once record listing a file that is not on
-    // disk — impossible to complete, and a retry would mint a second key and
-    // leave the broken one behind forever.
+    stage_and_commit(root, &record, &|dest| {
+        for (path, name) in attachments.iter().zip(&names) {
+            std::fs::copy(path, dest.join(name))
+                .with_context(|| format!("copying attachment {}", path.display()))?;
+        }
+        Ok(())
+    })?;
+    Ok(record)
+}
+
+/// Assemble one mod under `.staging`, then rename it into place.
+///
+/// Staged, then renamed, so the record and its attachments become visible
+/// TOGETHER or not at all: a copy that fails halfway would otherwise persist a
+/// write-once record listing a file that is not on disk — impossible to
+/// complete, and a retry would mint a second key and leave the broken one
+/// behind forever.
+///
+/// `write_attachments` is handed the staging `attachments/` directory and is
+/// called only when the record names any. It is the ONLY difference between
+/// the two producers: `create` copies from host paths, `create_from_emission`
+/// writes bytes that rode out of a container, where no host path exists.
+fn stage_and_commit(
+    root: &Path,
+    record: &ModRecord,
+    write_attachments: &dyn Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    let key = &record.key;
     let staging_root = root.join(STAGING_DIR);
-    let staging = staging_root.join(&key);
+    let staging = staging_root.join(key);
     let staged = (|| -> Result<()> {
         // Attachments FIRST, then the record that names them, so the last
         // thing written inside the staging dir is the thing that makes it a
         // record at all.
-        if !attachments.is_empty() {
+        if !record.attachments.is_empty() {
             let dest = staging.join("attachments");
             std::fs::create_dir_all(&dest)
                 .with_context(|| format!("creating attachments dir {}", dest.display()))?;
-            for (path, name) in attachments.iter().zip(&names) {
-                std::fs::copy(path, dest.join(name))
-                    .with_context(|| format!("copying attachment {}", path.display()))?;
-            }
+            write_attachments(&dest)?;
         }
         // A minted key never collides, so anything but `Created` means
         // something else already owns that address — an error, not a shrug,
         // because the alternative is attaching these files to another mod.
         anyhow::ensure!(
-            materialize(&staging_root, &record)? == Materialized::Created,
+            materialize(&staging_root, record)? == Materialized::Created,
             "a mod already exists at the minted key {key} — refusing to write over it"
         );
-        let final_dir = record_dir_at(root, &key);
+        let final_dir = record_dir_at(root, key);
         anyhow::ensure!(
             !final_dir.exists(),
             "a mod already exists at {} — refusing to write over it",
@@ -403,7 +447,108 @@ pub fn create(
     }
     // Best-effort tidy; only succeeds when no other create is staging.
     let _ = std::fs::remove_dir(&staging_root);
-    staged?;
+    staged
+}
+
+/// One attachment as it arrived inside a runtime emission: the name it gets
+/// inside the mod, and its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineAttachment {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Decode standard base64. Inline rather than a dependency — the dep set is
+/// deliberately small and this is the whole decoder. The encoder lives in the
+/// runtime (`runtime/src/tools/mod.rs`), which cannot depend on this crate.
+pub fn decode_b64(s: &str) -> Result<Vec<u8>> {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    for c in s.bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = A
+            .iter()
+            .position(|a| *a == c)
+            .with_context(|| format!("not base64: byte {c:?}"))? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// The mod a DISPATCH proposed, from the runtime's emission.
+///
+/// The second producer of the same record: `create` is the external actor's
+/// (`mod create`, a change made outside darkmux), this one is the runtime
+/// tool's. Both mint a key, both stage before they commit, and both copy the
+/// named findings' provenance — the difference is only where the attachments
+/// come from (a path on the host vs bytes that rode the emission out of the
+/// container, which no host path can reach).
+pub fn create_from_emission(
+    root: &Path,
+    findings_root: &Path,
+    by: &str,
+    for_keys: &[String],
+    kit: &str,
+    attachments: &[InlineAttachment],
+    scope: crate::findings::Scope,
+) -> Result<ModRecord> {
+    anyhow::ensure!(!by.trim().is_empty(), "a mod needs a proposer");
+    // The same floor `create` enforces, here too so neither producer can write
+    // a mod that is not a kit. The runtime already refused an empty kit at the
+    // tool boundary, where the model could read the refusal; this is the
+    // backstop, not the message.
+    anyhow::ensure!(!kit.trim().is_empty(), "a mod needs a kit: `kit` was empty");
+    let for_keys = canonical_for_keys(for_keys)?;
+
+    let mut names: Vec<String> = Vec::new();
+    for a in attachments {
+        anyhow::ensure!(
+            is_safe_basename(&a.name),
+            "attachment name is not usable inside the mod (a separator, `.`, `..` or empty): {:?}",
+            a.name
+        );
+        anyhow::ensure!(
+            !names.contains(&a.name),
+            "two attachments share the name {:?} — one would overwrite the other",
+            a.name
+        );
+        names.push(a.name.clone());
+    }
+
+    let key = mint_key();
+    let record = ModRecord {
+        key: key.clone(),
+        ts: darkmux_flow::ts_utc_now(),
+        by: by.to_string(),
+        r#for: for_keys.clone(),
+        // The bytes that came in, unchanged. No parse, no re-serialize.
+        kit: Some(kit.to_string()),
+        kit_looks_json: kit_looks_json(kit),
+        attachments: names.clone(),
+        context: finding_context(findings_root, &for_keys)?,
+        mission_id: scope.mission_id,
+        phase_id: scope.phase_id,
+        step_id: scope.step_id,
+        schema_version: MOD_SCHEMA_VERSION.to_string(),
+        extras: serde_json::Map::new(),
+    };
+
+    stage_and_commit(root, &record, &|dest| {
+        for a in attachments {
+            std::fs::write(dest.join(&a.name), &a.bytes)
+                .with_context(|| format!("writing attachment {:?}", a.name))?;
+        }
+        Ok(())
+    })?;
     Ok(record)
 }
 
@@ -495,6 +640,113 @@ mod tests {
     use super::*;
     use crate::findings;
     use tempfile::TempDir;
+
+    /// (#2265) The runtime producer writes the SAME record the CLI producer
+    /// does — a minted key, canonical `for` keys, the kit byte-exact, the
+    /// findings' provenance copied — plus the dispatch's own scope, and its
+    /// attachments come from BYTES rather than from a host path.
+    #[test]
+    fn a_mod_from_an_emission_carries_the_dispatch_scope_and_byte_identical_attachments() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("mods");
+        let findings_root = tmp.path().join("findings");
+        store_finding(&findings_root, "sess-a", 1, Some("m-9"));
+        let bytes: Vec<u8> = (0u8..=255).collect();
+
+        let rec = create_from_emission(
+            &root,
+            &findings_root,
+            "coder (darkmux:qwen3.6)",
+            &["sess-a/01".to_string()],
+            "{\"n\": 12345678901234567890}",
+            &[InlineAttachment { name: "blob.bin".into(), bytes: bytes.clone() }],
+            findings::Scope {
+                mission_id: Some("m-9".into()),
+                phase_id: Some("p-1".into()),
+                step_id: Some("step-3".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rec.r#for, vec!["sess-a/1".to_string()], "the `for` key is canonicalized");
+        assert_eq!(rec.by, "coder (darkmux:qwen3.6)");
+        assert_eq!(rec.mission_id.as_deref(), Some("m-9"));
+        assert_eq!(rec.phase_id.as_deref(), Some("p-1"));
+        assert_eq!(rec.step_id.as_deref(), Some("step-3"));
+        assert_eq!(rec.context.findings[0].mission_id.as_deref(), Some("m-9"));
+        assert!(!rec.context.findings[0].missing);
+
+        let stored = load_at(&root, &rec.key).unwrap().expect("the mod is readable");
+        assert_eq!(
+            stored.kit.as_deref(),
+            Some("{\"n\": 12345678901234567890}"),
+            "the kit is byte-exact: never parsed, never re-serialized"
+        );
+        assert_eq!(stored.attachments, vec!["blob.bin".to_string()]);
+        assert_eq!(
+            std::fs::read(attachments_dir_at(&root, &rec.key).join("blob.bin")).unwrap(),
+            bytes,
+            "the attachment's bytes survive the round trip"
+        );
+        assert!(!root.join(STAGING_DIR).exists(), "nothing is left staged");
+    }
+
+    /// A kit that is empty, or two attachments that would collide, are refused
+    /// before anything is written — the same floor `create` enforces.
+    #[test]
+    fn an_emission_mod_refuses_an_empty_kit_a_colliding_or_unsafe_attachment_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("mods");
+        let findings_root = tmp.path().join("findings");
+        let one = |name: &str| InlineAttachment { name: name.into(), bytes: vec![1] };
+        let cases: Vec<(&str, Vec<InlineAttachment>)> = vec![
+            ("", vec![]),
+            ("k", vec![one("a.txt"), one("a.txt")]),
+            ("k", vec![one("../escape")]),
+            ("k", vec![one("")]),
+        ];
+        for (kit, attachments) in cases {
+            let err = create_from_emission(
+                &root,
+                &findings_root,
+                "coder (m)",
+                &[],
+                kit,
+                &attachments,
+                findings::Scope::default(),
+            )
+            .expect_err("refused");
+            let _ = err;
+        }
+        assert!(
+            load_all_at(&root).unwrap().is_empty(),
+            "a refused mod writes nothing at all"
+        );
+    }
+
+    #[test]
+    fn base64_round_trips_every_byte_and_every_length() {
+        for n in 0..=32usize {
+            let bytes: Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
+            let encoded = {
+                // the runtime's encoder, mirrored here so the two agree
+                const A: &[u8; 64] =
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                let mut out = String::new();
+                for chunk in bytes.chunks(3) {
+                    let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+                    let v = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+                    out.push(A[(v >> 18) as usize & 63] as char);
+                    out.push(A[(v >> 12) as usize & 63] as char);
+                    out.push(if chunk.len() > 1 { A[(v >> 6) as usize & 63] as char } else { '=' });
+                    out.push(if chunk.len() > 2 { A[v as usize & 63] as char } else { '=' });
+                }
+                out
+            };
+            assert_eq!(decode_b64(&encoded).unwrap(), bytes, "length {n}");
+        }
+        assert!(decode_b64("not base64!").is_err());
+    }
 
     /// A finding in the store, so a mod's `for` has something real to copy.
     fn store_finding(root: &Path, dispatch: &str, seq: u64, mission: Option<&str>) {
@@ -833,6 +1085,9 @@ mod tests {
             kit_looks_json: false,
             attachments: vec![],
             context: ModContext::default(),
+            mission_id: None,
+            phase_id: None,
+            step_id: None,
             schema_version: MOD_SCHEMA_VERSION.into(),
             extras: serde_json::Map::new(),
         };
@@ -863,6 +1118,9 @@ mod tests {
             kit_looks_json: false,
             attachments: vec![],
             context: ModContext::default(),
+            mission_id: None,
+            phase_id: None,
+            step_id: None,
             schema_version: MOD_SCHEMA_VERSION.into(),
             extras: serde_json::Map::new(),
         };

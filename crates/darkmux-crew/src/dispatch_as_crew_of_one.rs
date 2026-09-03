@@ -447,6 +447,7 @@ mod tests {
 
     fn test_opts(role: &str, message: &str) -> DispatchOpts {
         DispatchOpts {
+            findings_in_brief: Vec::new(),
             workspace_read_only: false,
             record_context: None,
             resume_from: None,

@@ -389,6 +389,7 @@ impl StepKind for DispatchInternalStepKind {
         let resume_from = config_str(step, "resume_from").map(std::path::PathBuf::from);
 
         let opts = DispatchOpts {
+            findings_in_brief: Vec::new(),
             workspace_read_only: false,
             record_context: None,
             role_id,

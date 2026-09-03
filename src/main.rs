@@ -139,6 +139,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             role,
             message,
             message_from_file,
+            finding,
             profile,
             session_id,
             timeout,
@@ -155,6 +156,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             role,
             message,
             message_from_file,
+            finding,
             profile,
             session_id,
             timeout,
@@ -1365,6 +1367,7 @@ struct DispatchInvocation {
     role: String,
     message: Option<String>,
     message_from_file: Option<std::path::PathBuf>,
+    finding: Vec<String>,
     profile: Option<String>,
     session_id: Option<String>,
     timeout: u32,
@@ -1389,6 +1392,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         role,
         message,
         message_from_file,
+        finding,
         profile,
         session_id,
         timeout,
@@ -1453,11 +1457,22 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
             buf
         }
     };
+    // (#2265) `--finding <key>` (repeatable): each named finding's stored
+    // record is appended to the brief VERBATIM, after the operator's own
+    // message. A key that addresses no stored finding is refused BEFORE any
+    // dispatch setup — dispatching with a silently missing brief would send
+    // the role to work on an observation it never saw.
+    let (message, finding_keys) = darkmux_crew::findings::append_to_brief(
+        &message,
+        &finding,
+        &darkmux_crew::findings::findings_dir(),
+    )?;
     let opts = crew::dispatch::DispatchOpts {
         workspace_read_only: false,
         record_context: None,
         role_id: role,
         message,
+        findings_in_brief: finding_keys,
         session_id,
         timeout_seconds: timeout,
         skip_preflight,

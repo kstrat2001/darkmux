@@ -12,7 +12,8 @@
       "edit",
       "write",
       "exec",
-      "process"
+      "process",
+      "create_mod"
     ],
     "deny": []
   },

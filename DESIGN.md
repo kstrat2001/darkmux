@@ -488,7 +488,7 @@ A **finding** is what was observed. It is an event: it happened at a moment, fro
 
 A **mod** is how something could change. It is a *kit*: instructions plus data, in whatever form the proposer chose — a diff, a sentence, pixel data, a config value — enough for an AI to make the change correctly later, given the mod's own context. darkmux never types a kit and never opens it. A mod has its own minted key and its own store; it may carry provenance, `for`: zero or more finding references. That is the only stored link between the two records, it lives on the thing created later, and it is a list, because one change can address three observations and one observation can attract three competing changes. The view from a finding to its mods is derived by scanning mods, never stored on the finding.
 
-Two producers write the same mod record: the CLI, for a change made outside darkmux (`darkmux mod create --by <actor> [--for <finding>]... --kit ... [--attach ...]`), and the runtime tool `create_mod`, for a change made inside a dispatch. Whoever made it, the record names the proposer and the time.
+Two producers write the same mod record, and both exist: the CLI, for a change made outside darkmux (`darkmux mod create --by <actor> [--for <finding>]... --kit ... [--attach ...]`), and the runtime tool `create_mod`, for a change made inside a dispatch (its emission rides the same `dispatch.tool` record a finding's does, and the host materializes the record from it — attachments included, since no host path reaches the container's copy of the file). Whoever made it, the record names the proposer and the time.
 
 ### Why the key is minted per mod
 

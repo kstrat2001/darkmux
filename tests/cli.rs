@@ -1680,6 +1680,81 @@ fn dispatch_message_source_contract() {
         );
 }
 
+/// (#2265) `dispatch --finding <key>` refuses a key that addresses no stored
+/// finding, BEFORE any dispatch setup — a silently missing brief would send
+/// the role to work on an observation it never saw. The refusal names the
+/// second producer that can fill the store.
+#[test]
+fn dispatch_finding_refuses_a_key_with_no_stored_record() {
+    let store = TempDir::new().unwrap(); // empty store
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FINDINGS_DIR", store.path())
+        .args(["dispatch", "health-research", "--finding", "sess-x/9", "smoke"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("no finding sess-x/9")
+                .and(predicate::str::contains("darkmux finding sync"))
+                // Refused ahead of the dispatch: the ACK gate never ran, and
+                // nothing reached docker.
+                .and(predicate::str::contains("requires operator acknowledgment").not())
+                .and(predicate::str::contains("docker").not()),
+        );
+
+    // A key of the wrong SHAPE is refused with the form it should have.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FINDINGS_DIR", store.path())
+        .args(["dispatch", "health-research", "--finding", "not-a-key", "smoke"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<dispatch>/<seq>"));
+}
+
+/// (#2265) A key that DOES address a stored finding is loaded and the dispatch
+/// proceeds — proven at the ACK gate, which bails before any Docker work.
+/// `--finding` is repeatable, and both keys resolve.
+#[test]
+fn dispatch_finding_loads_a_stored_record_and_proceeds() {
+    let store = TempDir::new().unwrap();
+    for (dispatch, seq) in [("sess-x", 1u64), ("sess-y", 2)] {
+        let dir = store.path().join(dispatch).join(seq.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            serde_json::json!({
+                "key": format!("{dispatch}/{seq}"),
+                "dispatch": dispatch,
+                "seq": seq,
+                "ts": "2026-09-03T00:00:00Z",
+                "tool_name": "create_finding",
+                "proposer": {"handle": "crawler", "model": "m"},
+                "context": {"unit": "u7"},
+                "emitted": {"file": "src/x.ts", "line": 82, "why": "three unnamed operands"},
+                "schema_version": "1"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let ack_dir = TempDir::new().unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FINDINGS_DIR", store.path())
+        .env("DARKMUX_ACK_DIR", ack_dir.path())
+        .args([
+            "dispatch", "health-research", "--finding", "sess-x/1", "--finding", "sess-y/2",
+            "smoke",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("requires operator acknowledgment")
+                .and(predicate::str::contains("no finding").not()),
+        );
+}
+
 /// (#1426) The POSITIONAL message reaches the dispatch path. `health-research`
 /// is licensed-adjacent, so its ACK gate bails BEFORE any Docker work — a
 /// CI-safe way to prove the positional message was accepted and routed without

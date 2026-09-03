@@ -2982,7 +2982,11 @@ mod tests {
         //   1.32.0: `dispatch start` gains `tools_requested` (#2268).
         //   1.33.0: `dispatch.tool` gains `emitted` + `emit_seq` (#2272).
         //   1.34.0: `payload.tool_name` `create_finding` → `create_finding` (rename).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.34.0");
+        //   1.35.0: the mod channel — `dispatch.tool` also carries
+        //           `tool_name: "create_mod"` (riding 1.33.0's `emitted` /
+        //           `emit_seq`), and `dispatch start` gains
+        //           `findings_in_brief` (#2265).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.35.0");
     }
 
     #[test]
