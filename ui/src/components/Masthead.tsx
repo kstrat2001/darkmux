@@ -120,7 +120,7 @@ export function Masthead({
   route: Route;
   liveStatus: LiveTailStatus;
   /** The day a daemon dispatch/mission page belongs to, once the shell has
-   * derived it from the records; `null` until then (the chip reads "RESULT"
+   * derived it from the records; `null` until then (the chip reads "TODAY"
    * meanwhile) and on every other route. */
   replayDate?: string | null;
 }) {
@@ -131,7 +131,7 @@ export function Masthead({
   // a replay. A dispatch/mission page whose day is known is a recording — the
   // date chip (and, for a dispatch, the transport) carries the mode, and a
   // "● live" beside it would be false. While the day is still unknown (the
-  // subject is running, chip reads RESULT) the page is live and says so.
+  // subject is running, chip reads TODAY) the page is live and says so.
   const live = isLiveRoute(route) && replayDate == null;
 
   const verMeta = injectedMeta("darkmux-version");
@@ -265,7 +265,7 @@ export function Masthead({
 
 /** The masthead's source chip, per route. A live route reads `TODAY`; a
  * playback names its day; a dispatch or mission page names the day the
- * shell derived from its records (`replayDate`) and reads `RESULT` until
+ * shell derived from its records (`replayDate`) and reads `TODAY` until
  * that is known — a finished run is a result, and the date is what the
  * demo shows on the same routes. */
 function srcbadgeText(route: Route, replayDate: string | null = null): string {
@@ -303,8 +303,16 @@ function srcbadgeText(route: Route, replayDate: string | null = null): string {
     return date;
   }
   // A dispatch or mission page names its day once the shell has derived it
-  // from the records; until then it is what the page shows: a RESULT
-  // (operator, 2026-08-28: "instead of replay doesn't result seem better?").
-  if (route.kind === "dispatch" || route.kind === "mission") return replayDate ?? "RESULT";
-  return "TODAY";
+  // from the records (a finished subject is a recording). Until then it is
+  // LIVE, and the live page's word is the same on every route: TODAY. The
+  // word RESULT (operator, 2026-08-28: "instead of replay doesn't result seem
+  // better?") predates the header owning liveness — back then a running
+  // dispatch page showed no badge, so the chip had to say what the page was.
+  // Now the badge says live and the chip says which day, on every route
+  // (operator, 2026-09-04: "shouldn't it be consistent with live TODAY?").
+  if (route.kind === "dispatch" || route.kind === "mission") return replayDate ?? LIVE_CHIP;
+  return LIVE_CHIP;
 }
+
+/** The chip's one word for a live page, whatever the route. */
+export const LIVE_CHIP = "TODAY";

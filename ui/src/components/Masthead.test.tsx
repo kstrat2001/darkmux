@@ -184,10 +184,10 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     vi.unstubAllGlobals();
   });
 
-  it("a daemon dispatch/mission page reads RESULT until the shell knows its day, then the date — the LIVE badge while unknown, no badge once known, never a playback badge", () => {
+  it("a daemon dispatch/mission page reads TODAY (the live word) until the shell knows its day, then the date — the LIVE badge while unknown, no badge once known, never a playback badge", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const unknown = renderMasthead({ kind: "dispatch", dispatchId: "s1" } as never);
-    expect(unknown.container.querySelector(".catalog-toggle")?.textContent).toBe("RESULT");
+    expect(unknown.container.querySelector(".catalog-toggle")?.textContent).toBe("TODAY");
     // (header owns liveness, 2026-09-03) Day unknown ⇒ the subject is still
     // running ⇒ this is a live page ⇒ the same header badge as every lens.
     expect(unknown.container.querySelector("#modebadge")?.textContent).toMatch(/live/i);

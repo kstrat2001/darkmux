@@ -169,7 +169,7 @@ export function App() {
   // dispatch or mission replay does not, so it is derived from the replayed
   // records themselves (the earliest one's day) — the shell then loads that
   // day, the transport appears, and the chip names the date instead of the
-  // bare "RESULT" the demo never showed (operator: "says replay not the
+  // bare "TODAY"-style word the demo never showed (operator: "says replay not the
   // date"). The mission records ride the same `queryKeys.flowMission` slot
   // the mission lens fetches, so this is cache reuse.
   const missionRecordsQuery = useQuery({

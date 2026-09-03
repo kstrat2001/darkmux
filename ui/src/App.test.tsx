@@ -1102,7 +1102,7 @@ describe("App", () => {
     window.location.hash = "#dispatch=s-live";
     renderApp();
     await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
-    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("RESULT"));
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("TODAY"));
     // (header owns liveness, 2026-09-03) Running ⇒ live ⇒ the header badge,
     // the same one every other live page shows. Never the PLAYBACK badge.
     await waitFor(() => expect(document.querySelector("#modebadge")?.textContent).toMatch(/live|reconnecting/i));
@@ -1123,7 +1123,7 @@ describe("App", () => {
     // mission query to have been answered, then a tick for the memo.
     await waitFor(() => expect((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[0]) === "/flow-mission/m-one")).toBe(true));
     await new Promise((r) => setTimeout(r, 50));
-    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("RESULT"));
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("TODAY"));
     expect(document.querySelector("#modebadge")?.textContent?.toLowerCase()).toContain("live");
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
