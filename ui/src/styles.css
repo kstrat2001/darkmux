@@ -1765,43 +1765,40 @@ body {
   color: var(--dim);
   border-left-color: var(--border);
 }
-.labbadge {
+/* ─── The ONE work-status chip (components/WorkStatus.tsx) ──────────────────
+   Every scope — mission, phase, task, step, run — renders its status through
+   this. Five kinds, one palette, one pulse. A call site may add a LAYOUT
+   class (.pill's radius, .labbadge's flex, .mstatus's tracking); it never
+   adds a second color or animation source. The pulse's play state is driven
+   by `data-live` exactly as the run detail's liveness always did; the rules
+   for `.wstatus[data-live]` sit with the liveness pulse further down. */
+.wstatus {
   display: inline-block;
-  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
+  font: 600 calc(10px * var(--fs-scale)) / 1 var(--font-mono);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   padding: 3px 7px;
   border-radius: 3px;
   border: 1px solid var(--border);
+  color: var(--dim);
+  white-space: nowrap;
+}
+.wstatus.is-running { color: var(--run, var(--accent)); border-color: var(--run, var(--accent)); }
+.wstatus.is-done { color: var(--good); border-color: var(--good); }
+.wstatus.is-error { color: var(--bad); border-color: var(--bad); }
+.wstatus.is-stopped { color: var(--warn); border-color: var(--warn); }
+.wstatus.is-idle { color: var(--dim); border-color: var(--border); }
+
+.labbadge {
   flex: 0 0 auto;
 }
-.labbadge.finished,
-.labbadge.complete {
-  color: #5af0a3;
-  border-color: #5af0a3;
-}
-.labbadge.live,
-.labbadge.running {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-.labbadge.error {
-  color: var(--error);
-  border-color: var(--error);
-}
-.labbadge.planned,
-.labbadge.abandoned {
-  color: var(--dim);
-}
+
 /* (#1881) A run this binary could not read the real outcome of — never
    styled like `complete` (green) or folded into the dim planned/abandoned
    look, which would both misreport confidence this reader doesn't have.
    `--warn` (amber) reads as "pay attention," matching how doctor surfaces
    the same condition. */
-.labbadge.unparseable {
-  color: var(--warn);
-  border-color: var(--warn);
-}
+
 .rununtracked {
   font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
   color: var(--dim);
@@ -4090,19 +4087,9 @@ body {
   font-weight: 400;
 }
 .session-run .pill {
-  display: inline-block;
-  font-size: calc(10px * var(--fs-scale));
-  font-weight: 600;
-  padding: 2px 7px;
   border-radius: 10px;
-  border: 1px solid var(--border);
-  color: var(--dim);
   vertical-align: middle;
 }
-.session-run .pill--run { color: var(--run, var(--accent)); border-color: var(--run, var(--accent)); }
-.session-run .pill--done { color: var(--good); border-color: var(--good); }
-.session-run .pill--err { color: var(--bad); border-color: var(--bad); }
-.session-run .pill--canceled { color: var(--warn); border-color: var(--warn); }
 
 /* (#1973) The run brief was six label/value pairs stacked vertically —
    measured 1063x281, using about a quarter of its width and a lot of
@@ -4195,11 +4182,11 @@ body {
    a number — so the animation runs continuously and is PAUSED rather than
    restarted, which would stutter at whatever cadence records happen to arrive
    at and read as a fault rather than as health. */
-.pill[data-live] {
+.wstatus[data-live] {
   animation: pulse-beat 1.6s ease-in-out infinite;
   animation-play-state: paused;
 }
-.pill[data-live="beating"] {
+.wstatus[data-live="beating"] {
   animation-play-state: running;
 }
 /* Quiet: still live, but nothing has landed recently. Held still and hollow —
@@ -4208,8 +4195,8 @@ body {
    than merely un-animated, so the distinction survives for anyone who has
    asked motion to stop — the original dot solved the same problem with
    filled-vs-hollow. */
-.pill[data-live="quiet"],
-.pill[data-live="stale"] {
+.wstatus[data-live="quiet"],
+.wstatus[data-live="stale"] {
   opacity: 0.62;
 }
 @keyframes pulse-beat {
@@ -4226,7 +4213,7 @@ body {
 /* A pulsing dot is decoration for anyone who has asked motion to stop. The
    state stays legible: filled = beating, hollow = quiet. */
 @media (prefers-reduced-motion: reduce) {
-  .pill[data-live] {
+  .wstatus[data-live] {
     animation: none;
   }
 }
@@ -4749,25 +4736,7 @@ body {
   color: var(--fg);
 }
 .missionlens .mstatus {
-  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
-  text-transform: uppercase;
   letter-spacing: 0.08em;
-  padding: 3px 7px;
-  border-radius: 3px;
-  border: 1px solid var(--border);
-  color: var(--dim);
-}
-.missionlens .mstatus.active {
-  color: var(--good);
-  border-color: var(--good);
-}
-.missionlens .mstatus.finalized {
-  color: var(--dim);
-}
-.missionlens .mstatus.aborted,
-.missionlens .mstatus.paused {
-  color: var(--warn);
-  border-color: var(--warn);
 }
 
 @keyframes ml-pulse {

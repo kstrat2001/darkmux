@@ -1,3 +1,4 @@
+import { WorkStatus } from "../../components/WorkStatus";
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
@@ -233,9 +234,7 @@ export function LabRunDetail({
           ‹ runs
         </button>
         {` · ${dir} `}
-        <span className={`labbadge ${isFinished ? "finished" : pollUnreachable ? "error" : "live"}`}>
-          {labBadgeText(isFinished, pollUnreachable)}
-        </span>
+        <WorkStatus status={isFinished ? "finished" : pollUnreachable ? "error" : "live"} label={labBadgeText(isFinished, pollUnreachable)} className="labbadge" />
       </div>
 
       <div className="labpipe">

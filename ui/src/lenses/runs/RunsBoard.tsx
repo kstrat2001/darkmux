@@ -1,3 +1,4 @@
+import { WorkStatus } from "../../components/WorkStatus";
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
@@ -743,7 +744,7 @@ function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boole
         : {})}
     >
       <div className="labrunmain">
-        <span className={`labbadge ${run.status}`}>{runStatusLabel(run)}</span>
+        <WorkStatus status={run.status} label={runStatusLabel(run)} className="labbadge" />
         <span className={`runkind ${run.kind}`}>{run.kind}</span>
         <span className="labruncrew">{run.id}</span>
         {ago && <span className="labrundir">{ago}</span>}
@@ -758,7 +759,7 @@ function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boole
  * (finished/live), distinct from `runStatusBadge`'s six-status badge above
  * (#1881 added `unparseable`). */
 function LabBadge({ finished }: { finished: boolean }) {
-  return <span className={`labbadge ${finished ? "finished" : "live"}`}>{finished ? "finished" : "● live"}</span>;
+  return <WorkStatus status={finished ? "finished" : "live"} label={finished ? "finished" : "● live"} className="labbadge" />;
 }
 
 /** viewer.html: `function renderLabRunRow(run)` (the series-view row, reading

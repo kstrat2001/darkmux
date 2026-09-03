@@ -1,3 +1,4 @@
+import { WorkStatus } from "../../components/WorkStatus";
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
@@ -43,6 +44,13 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  * exercises the populated branch — the empty branch is honest but
  * unexercised by this corpus).
  */
+/** The run detail's `PillCls` predates the shared chip; map it back to the
+ * raw status word the chip's vocabulary reads. The visible text stays
+ * `pillLabel` (pre-uppercased, golden-pinned). */
+function pillStatusWord(cls: "run" | "err" | "done" | "canceled"): string {
+  return cls === "run" ? "running" : cls === "err" ? "error" : cls === "done" ? "complete" : "canceled";
+}
+
 export function SessionReplay({ sessionId, playhead = null }: { sessionId: string; playhead?: number | null }) {
   // (#1972) POLLS while the session is live. Without this the page fetched
   // its records ONCE, which is the defect a live dogfood run exposed: the
@@ -217,13 +225,13 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
             the `{" "}` below — and there must be none before `RUN`. The first
             version added a second and CI caught `RUNNING  RUN ·`, which is
             invisible on screen and unmissable to the golden. */}
-        <span
-          className={`pill pill--${view.header.pillCls}`}
-          data-live={liveness.state}
+        <WorkStatus
+          status={pillStatusWord(view.header.pillCls)}
+          label={view.header.pillLabel}
+          live={liveness.state}
+          className="pill"
           title={liveness.label}
-        >
-          {view.header.pillLabel}
-        </span>{" "}
+        />{" "}
         {/* (#1974) No noun. This view's subject is ONE ROLE EXECUTION — one
             role, one model, its turns, tokens and signals. `RUN` was the one
             word contract 8 says it definitely is not: `run` is the umbrella
