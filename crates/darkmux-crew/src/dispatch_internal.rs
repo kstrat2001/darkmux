@@ -5167,6 +5167,38 @@ const MAX_TRAJ_FIELD_BYTES: usize = 4 * 1024;
 /// truncation here is always visible rather than silent.
 const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
 
+/// (#2272) Bound on the serialized size of an accepted `report_finding`
+/// emission forwarded onto the `dispatch.tool` record. The emission is the
+/// crawl's PRODUCT and must arrive whole — nine of nine findings on
+/// 2026-09-02 were lost because the only wire copy was the 512-char `args`
+/// preview — so this is a runaway guard, not a working limit: a real
+/// emission is a few KiB. Same order as `MAX_TOOL_RESULT_BYTES`.
+const MAX_EMITTED_BYTES: usize = 64 * 1024;
+
+/// (#2272) Forward an emission whole, or cut it LOUDLY. darkmux does not know
+/// what is inside the value — a hook's transform composes the destination
+/// payload from the record's metadata plus this blob — so the bound applies
+/// to the serialized whole, never to fields darkmux would have to understand.
+/// Over the bound, the value becomes `{ "truncated": "<prefix>",
+/// "emitted_truncated": true }` so a reader can tell a whole emission from a
+/// clipped one instead of parsing and hoping. `None` forwards as `null`, so a
+/// non-emitting tool call never reads as a pre-#2272 record.
+fn bound_emitted(v: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(v) = v else { return serde_json::Value::Null };
+    let serialized = v.to_string();
+    if serialized.len() <= MAX_EMITTED_BYTES {
+        return v.clone();
+    }
+    let mut end = MAX_EMITTED_BYTES;
+    while !serialized.is_char_boundary(end) {
+        end -= 1;
+    }
+    serde_json::json!({
+        "truncated": &serialized[..end],
+        "emitted_truncated": true,
+    })
+}
+
 /// Acquire the shared inactivity-deadline lock, recovering from a
 /// poisoned mutex instead of panicking. (#890) This deadline is read by
 /// the hard-kill watchdog thread every tick and written by the tailer on
@@ -6211,7 +6243,7 @@ impl TailerState {
                         *lock_deadline(deadline) = new_deadline;
                     }
                 }
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "tool_seq": event.get("tool_seq"),
                     // (#1483) The AUTHORITATIVE running tool-call count for this
                     // dispatch (monotonic, 1-based) — the viewer's live seat-card
@@ -6225,6 +6257,18 @@ impl TailerState {
                     // here defensively against MAX_TRAJ_FIELD_BYTES for the flow record.
                     "args": cap_json_str(event.get("args"), MAX_TRAJ_FIELD_BYTES),
                     "args_chars": event.get("args_chars"),
+                    // (#2272) An accepted `report_finding`'s emission, whole
+                    // (bounded loudly), plus its 1-based ordinal within this
+                    // dispatch. A runtime that knows the field sends it on
+                    // EVERY tool.completed — `null` for a non-emitting call —
+                    // so it is forwarded exactly as sent; a runtime that
+                    // predates the field (a stale local `darkmux-runtime:
+                    // latest`) sends no key, and the record then has no key,
+                    // so "nothing emitted" and "the image cannot emit" stay
+                    // distinguishable downstream. The crawl's product rides
+                    // THIS, never the `args` preview above.
+                    "emitted": bound_emitted(event.get("emitted")),
+                    "emit_seq": event.get("emit_seq"),
                     "result_chars": event.get("result_chars"),
                     // (#2007) The result itself, so a failed tool call can be
                     // diagnosed from the record instead of only counted. Bound
@@ -6245,6 +6289,16 @@ impl TailerState {
                     "failure_reason": cap_json_str(
                         event.get("failure_reason"), MAX_TRAJ_FIELD_BYTES),
                 });
+                if event.get("emitted").is_none() {
+                    // (#2272) The runtime sent no `emitted` key at all: it
+                    // predates the field. Drop both keys rather than forward
+                    // `null`, so a stale image is visible as an ABSENT field
+                    // and never reads as "this call emitted nothing".
+                    if let Some(map) = payload.as_object_mut() {
+                        map.remove("emitted");
+                        map.remove("emit_seq");
+                    }
+                }
                 self.emit("dispatch.tool", darkmux_flow::Level::Info, payload);
             }
             "compaction" => {

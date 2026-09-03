@@ -789,6 +789,10 @@ impl Trajectory {
     /// a consumer can always truncate, and a consumer cannot un-discard.
     /// `result_chars` remains the TRUE length so that if a cap is ever
     /// introduced its truncation is visible rather than silent.
+    // (#2272) Two more than the lint likes: `emitted` and `emit_seq` are one
+    // event's worth of fields and folding them into a struct would only move
+    // the count, not the shape. Same call as the 40-odd siblings in this crate.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_tool_completed(
         &mut self,
         seq: u32,
@@ -797,6 +801,8 @@ impl Trajectory {
         args: &str,
         result: &str,
         outcome: &crate::failure_rate::ToolOutcome,
+        emitted: Option<&serde_json::Value>,
+        emit_seq: Option<usize>,
     ) {
         // `ok` discriminates success from failure (#469). Additive,
         // backward-compatible field: consumers predating it treat a
@@ -817,8 +823,16 @@ impl Trajectory {
             // The actual arguments, char-boundary-safe truncation to keep a
             // pathological write/edit payload from bloating the trajectory
             // (search/read/exec args are tiny; only file-content args hit this).
+            // A viewer PREVIEW, and only that: cut at MAX_TOOL_ARGS_CHARS.
             "args": cap_chars(args, MAX_TOOL_ARGS_CHARS),
             "args_chars": args_chars,
+            // (#2272) An accepted `report_finding`'s emission — the model's
+            // arguments verbatim, an opaque value darkmux never interprets —
+            // and its 1-based ordinal in this dispatch. `null` for every
+            // other tool and every rejected report. The crawl's product
+            // never rides the preview above.
+            "emitted": emitted,
+            "emit_seq": emit_seq,
             "result_chars": result_chars,
             "result": result,
             // (#2008) The three-way outcome beside the boolean. `ok` answers
@@ -1144,7 +1158,7 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-test-result").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         let failure = "exit: 1\n--- stdout ---\nTests: 2 failed, 86 passed\n--- stderr ---\n";
-        t.append_tool_completed(1, 0, "bash", "{\"command\":\"npm test\"}", failure, &ToolOutcome::Reported { exit_code: 1 });
+        t.append_tool_completed(1, 0, "bash", "{\"command\":\"npm test\"}", failure, &ToolOutcome::Reported { exit_code: 1 }, None, None);
         drop(t);
 
         let body = fs::read_to_string(
@@ -1169,14 +1183,64 @@ mod tests {
     }
 
     #[test]
+    fn tool_completed_carries_the_emission_whole_while_args_stays_a_preview() {
+        // (#2272) `args` is a 512-char VIEWER PREVIEW and always was. A
+        // `report_finding` call's arguments ARE the crawl's product, and
+        // nine of nine findings on 2026-09-02 were lost because the only
+        // wire copy was that preview, cut mid-JSON. The accepted emission
+        // now rides the event verbatim as `emitted`, complete, beside the
+        // preview it never should have depended on.
+        let ws = tempfile::Builder::new().prefix("traj-test-finding").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        let why = "w".repeat(2_000);
+        let raw_args = serde_json::json!({
+            "file": "/workspace/x/src/a.ts", "line": 82, "pattern": "unnamed-predicate",
+            "evidence": "  enabled: !a && b !== null && c,", "why": why,
+        })
+        .to_string();
+        let emitted: serde_json::Value = serde_json::from_str(&raw_args).unwrap();
+        t.append_tool_completed(
+            2, 0, "report_finding", &raw_args,
+            "Recorded. 1 finding(s) so far, 39 remaining in this run's budget.",
+            &ToolOutcome::Ok, Some(&emitted), Some(1),
+        );
+        t.append_tool_completed(
+            2, 1, "read", "{\"path\":\"/workspace/x/src/a.ts\"}", "line one\n",
+            &ToolOutcome::Ok, None, None,
+        );
+        drop(t);
+
+        let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        let mut lines = body.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap());
+        let reported = lines.next().unwrap();
+        let read = lines.next().unwrap();
+
+        assert_eq!(reported["emitted"], emitted, "the emission rides the event whole, verbatim");
+        assert_eq!(reported["emitted"]["why"].as_str().unwrap().len(), 2_000);
+        assert_eq!(reported["emit_seq"], serde_json::json!(1));
+        assert!(
+            reported["args"].as_str().unwrap().chars().count() <= MAX_TOOL_ARGS_CHARS + 1,
+            "args stays the capped preview it always was"
+        );
+        assert_eq!(reported["args_chars"], serde_json::json!(raw_args.chars().count()));
+        let read = read.as_object().unwrap();
+        assert!(
+            read.contains_key("emitted") && read["emitted"].is_null()
+                && read.contains_key("emit_seq") && read["emit_seq"].is_null(),
+            "every other tool emits nothing — as an EXPLICIT null, key present: the host \
+             reads a missing key as \"this runtime predates the field\": {read:?}"
+        );
+    }
+
+    #[test]
     fn tool_completed_emits_ok_discriminator() {
         // (#469) tool.completed carries `ok` so the host watchdog can
         // distinguish a successful tool call (proof-of-work, resets the
         // deadline) from a failed one (does not).
         let ws = tempfile::Builder::new().prefix("traj-test-ok").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_tool_completed(1, 0, "bash", "{\"command\":\"ls\"}", "a.txt\nb.txt\n", &ToolOutcome::Ok);
-        t.append_tool_completed(2, 1, "bash", "{\"command\":\"cat x\"}", "exit: 1\n--- stderr ---\nno such file\n", &ToolOutcome::Failed { reason: "no such file".into() });
+        t.append_tool_completed(1, 0, "bash", "{\"command\":\"ls\"}", "a.txt\nb.txt\n", &ToolOutcome::Ok, None, None);
+        t.append_tool_completed(2, 1, "bash", "{\"command\":\"cat x\"}", "exit: 1\n--- stderr ---\nno such file\n", &ToolOutcome::Failed { reason: "no such file".into() }, None, None);
         drop(t);
 
         let body = fs::read_to_string(
@@ -1205,7 +1269,7 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-test-cap").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         let big = "x".repeat(MAX_TOOL_ARGS_CHARS + 200);
-        t.append_tool_completed(1, 0, "write", &big, "", &ToolOutcome::Ok);
+        t.append_tool_completed(1, 0, "write", &big, "", &ToolOutcome::Ok, None, None);
         drop(t);
         let line: serde_json::Value = serde_json::from_str(
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE))

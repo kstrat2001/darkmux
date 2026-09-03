@@ -1705,7 +1705,8 @@ fn run_with_sleeper(
                 );
             }
             let tool_seq = seq_base + idx as u32;
-            let result = dispatch(&call.function.name, &call.function.arguments);
+            let run = dispatch(&call.function.name, &call.function.arguments);
+            let result = run.result;
             let outcome = crate::failure_rate::classify_outcome(&call.function.name, &result);
             let tool_ok = outcome.tool_worked();
             if let Some(reason) =
@@ -1724,6 +1725,8 @@ fn run_with_sleeper(
                 &call.function.arguments,
                 &result,
                 &outcome,
+                run.emitted.as_ref(),
+                run.emit_seq,
             );
             if tool_ok {
                 last_proof_of_work = std::time::Instant::now();
@@ -3104,7 +3107,8 @@ fn run_with_sleeper(
                             window_size,
                         );
                     }
-                    let result = dispatch(&call.function.name, &call.function.arguments);
+                    let run = dispatch(&call.function.name, &call.function.arguments);
+                    let result = run.result;
                     // (#469/#2008) Classify with the same function the
                     // failure-rate detector uses, and record it on the
                     // trajectory event so the host watchdog can gate its
@@ -3146,6 +3150,8 @@ fn run_with_sleeper(
                         &call.function.arguments,
                         &result,
                         &outcome,
+                        run.emitted.as_ref(),
+                        run.emit_seq,
                     );
                     // (#466/#469) Proof-of-work signal for the inactivity-
                     // approach detector. Mirrors the host-side reset

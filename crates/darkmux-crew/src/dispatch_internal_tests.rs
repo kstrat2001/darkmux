@@ -4327,6 +4327,119 @@
         assert_eq!(record["payload"]["tool_name"], "report_finding");
     }
 
+    /// (#2272) A `report_finding` call's arguments ARE the crawl's product, and
+    /// the `dispatch.tool` record's `args` is a 512-char viewer preview (the
+    /// runtime's `MAX_TOOL_ARGS_CHARS`). Nine of nine findings on 2026-09-02
+    /// reached the tracker as a preview cut mid-JSON and were rejected. The
+    /// runtime now puts the model's emission on the event verbatim as
+    /// `emitted` with its ordinal `emit_seq`; this proves the host forwards
+    /// both WHOLE onto the record, beside the preview.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn a_tool_completed_emission_rides_the_dispatch_tool_record_whole() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-emit".into(),
+            "crawler".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        let why = "y".repeat(2_000);
+        let emitted = serde_json::json!({
+            "file": "/workspace/acme/src/x.ts", "line": 82, "pattern": "unnamed-predicate",
+            "evidence": "  enabled: !a && b !== null && c,", "why": why,
+            "anything_else_the_model_chose": {"rect": [0, 0, 10, 10]},
+        });
+        let preview = "{\"file\":\"/workspace/acme/src/x.ts\",\"line\":82,\"why\":\"yyyyyyyy…";
+        let event = serde_json::json!({
+            "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "report_finding",
+            "args": preview, "args_chars": 2_150,
+            "result": "Recorded. 1 finding(s) so far, 39 remaining in this run's budget.",
+            "ok": true, "emitted": emitted, "emit_seq": 1,
+        });
+        state.handle_event(&event.to_string());
+        // A runtime that knows the field sends it on EVERY tool.completed:
+        // an explicit null for a non-emitting call.
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":1,"tool_name":"read","args":"{\"path\":\"/workspace/acme/src/x.ts\"}","result":"line\n","ok":true,"emitted":null,"emit_seq":null}"#,
+        );
+        // A runtime that PREDATES the field (a stale local image) sends no key.
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":2,"tool_name":"report_finding","args":"{\"file\":\"x\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&day_file)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|v: &serde_json::Value| v["session_id"] == "sess-emit" && v["action"] == "dispatch.tool")
+            .collect();
+        assert_eq!(records.len(), 3, "one dispatch.tool record per tool.completed event");
+
+        let stale = records[2]["payload"].as_object().unwrap();
+        assert!(
+            !stale.contains_key("emitted") && !stale.contains_key("emit_seq"),
+            "a runtime that sent no key yields a record with NO key — a stale image must never read as \"emitted nothing\": {stale:?}"
+        );
+
+        let reported = &records[0]["payload"];
+        assert_eq!(reported["emitted"], emitted, "the emission is forwarded whole, untouched");
+        assert_eq!(reported["emitted"]["why"].as_str().unwrap().len(), 2_000);
+        assert_eq!(reported["emit_seq"], serde_json::json!(1));
+        assert_eq!(reported["args"], preview, "args stays the preview the runtime sent");
+
+        let read = records[1]["payload"].as_object().unwrap();
+        assert!(
+            read.contains_key("emitted") && read["emitted"].is_null() && read["emit_seq"].is_null(),
+            "a non-emitting call from a current runtime carries an EXPLICIT null: {read:?}"
+        );
+    }
+
+    /// (#2272) The forward is bounded — a runaway emission cannot blow a flow
+    /// record past what every sink tolerates — but the bound is on the
+    /// serialized WHOLE (darkmux does not know the value's fields) and LOUD:
+    /// over it, the value is replaced by a prefix plus `emitted_truncated`,
+    /// so a reader can tell a whole emission from a clipped one.
+    #[test]
+    fn an_emission_over_the_bound_is_replaced_by_a_flagged_prefix() {
+        let huge = "z".repeat(MAX_EMITTED_BYTES + 10);
+        let bounded = bound_emitted(Some(&serde_json::json!({"why": huge})));
+        assert_eq!(bounded["emitted_truncated"], serde_json::json!(true));
+        assert!(bounded["truncated"].as_str().unwrap().len() <= MAX_EMITTED_BYTES);
+        assert!(bounded["truncated"].as_str().unwrap().starts_with("{\"why\":\"zzz"));
+
+        let small = serde_json::json!({"file": "a.ts", "line": 1, "why": "w"});
+        assert_eq!(bound_emitted(Some(&small)), small, "under the bound: untouched, no flag");
+        assert!(bound_emitted(None).is_null());
+    }
+
     /// The other half of the same contract: `record_context: None` (every
     /// caller that doesn't set `DispatchOpts::record_context`) must leave
     /// NO `context` key at all — not `null`, not an empty object. A caller
