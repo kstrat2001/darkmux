@@ -203,7 +203,8 @@ export function App() {
   // `t < tMax`, not just `scrubbed`: after a play-through the playhead rests
   // at the loaded day's end with `scrubbed` still true, and the cut would
   // return by the transport's own primary gesture (review finding).
-  const playhead = transport.active && transport.scrubbed && transport.t < transport.tMax ? transport.t : null;
+  const isPlayheadReady = transport.active && transport.scrubbed && transport.t < transport.tMax;
+  const playhead = isPlayheadReady ? transport.t : null;
   // (mainstay-unification finding) `MissionGraphLens` owns the mission
   // events DATA pipeline (flow-mission + flow-today + live-tail, deduped,
   // mission-scoped) and reports its result here via `onMissionEvents` —
