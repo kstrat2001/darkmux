@@ -4227,8 +4227,29 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
         "rename the predicate, then add a test\n",
     );
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let key_a = String::from_utf8_lossy(&out.stdout).lines().next().unwrap().to_string();
+    // stdout is the KEY, alone, on the last line — the orchestrator pipes it
+    // straight into `mod show <key>` / `--for`. Anything else it has to say
+    // (the path it wrote, a missing `for`) goes to stderr, so `$(...)` around
+    // this command captures a key and never a path.
+    let key_a = String::from_utf8_lossy(&out.stdout).lines().last().unwrap().trim().to_string();
     assert!(key_a.starts_with("mod-"), "create prints the minted key: {key_a}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        key_a,
+        "stdout is the key ALONE — a path on it would be captured by `$(darkmux mod create …)`"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("mod.json"),
+        "the path it wrote is still reported, on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The captured line is directly usable as an address.
+    let out_show = dm(&["mod", "show", &key_a]);
+    assert!(
+        out_show.status.success(),
+        "`mod show $(darkmux mod create …)` must work: {}",
+        String::from_utf8_lossy(&out_show.stderr)
+    );
     let rec: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(home.path().join("mods").join(&key_a).join("mod.json")).unwrap(),
     )
@@ -4255,7 +4276,7 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
         "--attach", src.join("shot.png").to_str().unwrap(),
     ]);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let key_b = String::from_utf8_lossy(&out.stdout).lines().next().unwrap().to_string();
+    let key_b = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let attach_dir = home.path().join("mods").join(&key_b).join("attachments");
     assert_eq!(
         fs::read(attach_dir.join("patch.diff")).unwrap(),
@@ -4276,7 +4297,7 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
         &["mod", "create", "--by", "kain", "--for", "sess-a/1", "--kit", "-"],
         "just add a comment",
     );
-    let key_a2 = String::from_utf8_lossy(&out.stdout).lines().next().unwrap().to_string();
+    let key_a2 = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert_ne!(key_a, key_a2, "the key is MINTED per mod — the second must not overwrite the first");
     assert!(home.path().join("mods").join(&key_a).join("mod.json").exists());
     assert!(home.path().join("mods").join(&key_a2).join("mod.json").exists());
@@ -4288,8 +4309,27 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
     );
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("sess-z/9"), "a missing finding is named, not silent: {stdout}");
-    let key_z = stdout.lines().next().unwrap().to_string();
+    let key_z = stdout.trim().to_string();
+    assert!(key_z.starts_with("mod-"), "stdout is still the key alone: {stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("sess-z/9"),
+        "a missing finding is named, not silent — on stderr, so stdout stays pipeable: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--json` is where the path lives, beside the record itself.
+    let out = dm_stdin(
+        &["mod", "create", "--by", "kain", "--kit", "-", "--json"],
+        "a standalone kit",
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("--json emits JSON");
+    let key_j = v["key"].as_str().expect("the key").to_string();
+    assert_eq!(
+        v["path"].as_str().expect("--json carries the path"),
+        home.path().join("mods").join(&key_j).join("mod.json").to_str().unwrap()
+    );
+    assert_eq!(v["by"], "kain", "the whole record is still there: {v}");
 
     // A mod with neither instructions nor data is not a kit.
     let out = dm(&["mod", "create", "--by", "kain"]);
@@ -4302,7 +4342,7 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
             serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("--json emits JSON");
         v["mods"].as_array().unwrap().iter().map(|m| m["key"].as_str().unwrap().to_string()).collect()
     };
-    assert_eq!(keys(&["mod", "list", "--json"]).len(), 4, "every mod, ts-ascending");
+    assert_eq!(keys(&["mod", "list", "--json"]).len(), 5, "every mod, ts-ascending");
     assert_eq!(
         keys(&["mod", "list", "--for", "sess-a/1", "--json"]).len(),
         2,
@@ -4322,7 +4362,7 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
     // A filter that matches nothing must not read like an EMPTY STORE.
     let out = dm(&["mod", "list", "--for", "sess-nope/1"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("no mods match — 4 in the store"), "got:\n{stdout}");
+    assert!(stdout.contains("no mods match — 5 in the store"), "got:\n{stdout}");
     assert!(!stdout.contains("mod create"), "the store is NOT empty: {stdout}");
 
     // The human list previews the RAW kit and names the mod's findings.

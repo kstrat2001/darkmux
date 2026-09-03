@@ -58,11 +58,25 @@ pub fn create(
         attachments,
     )?;
 
+    let path = mods::record_path_at(&root, &rec.key);
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&rec)?);
+        // The path rides ALONGSIDE the record rather than replacing anything
+        // in it, so `--json` stays a superset of what the human mode gives.
+        let mut v = serde_json::to_value(&rec)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("path".to_string(), serde_json::json!(path.to_string_lossy()));
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(0);
     }
 
+    // **stdout is the KEY, alone.** The caller of this verb is usually an
+    // orchestrator that pipes the output straight into `mod show <key>`, a
+    // `--for`, or a tracker — so a second stdout line would be captured by
+    // `$(darkmux mod create …)` and turn a key into a key-plus-a-path.
+    // Everything else this command has to say goes to stderr, where it is
+    // still visible to a person and invisible to a substitution.
     println!("{}", rec.key);
     // A `for` key with no stored finding is allowed — the change was still
     // proposed — but it is named, because the usual cause is a typo and a
@@ -70,12 +84,9 @@ pub fn create(
     let missing: Vec<&str> =
         rec.context.findings.iter().filter(|f| f.missing).map(|f| f.key.as_str()).collect();
     if !missing.is_empty() {
-        println!(
-            "  note: no stored finding for {} — recorded as missing",
-            missing.join(", ")
-        );
+        eprintln!("note: no stored finding for {} — recorded as missing", missing.join(", "));
     }
-    println!("  {}", mods::record_path_at(&root, &rec.key).display());
+    eprintln!("recorded {}", path.display());
     Ok(0)
 }
 
