@@ -1913,7 +1913,7 @@ mod tests {
         // rule, a `crawl.unit` GROW template per rule growing from that
         // rule's own plan task, and one `crawl.summary`.
         let phase_ids: Vec<&str> = cfg.phases.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(phase_ids, vec!["plan", "crawl", "summarize"], "{phase_ids:?}");
+        assert_eq!(phase_ids, vec!["plan", "crawl", "summarize", "follow-on"], "{phase_ids:?}");
         const RULES: [&str; 4] =
             ["unnamed-predicate", "swallowed-error", "doc-contradicts-code", "stale-consumer"];
 
@@ -1945,6 +1945,40 @@ mod tests {
         let summarize = &cfg.phases[2];
         assert_eq!(summarize.tasks.len(), 1);
         assert_eq!(summarize.tasks[0].steps[0].kind, "crawl.summary");
+
+        // (#2302) The follow-on phase: ONE grow template, OFF, growing a
+        // `coder` dispatch per finding the summary named. `enabled: false`
+        // prunes the task at mint and rule 2 then prunes the emptied phase,
+        // so the default crawl still ends at `summarize` — asserted live in
+        // `mission_config::prune`'s own tests and in `tests/cli.rs`.
+        let follow_on = &cfg.phases[3];
+        assert_eq!(follow_on.tasks.len(), 1);
+        let t = &follow_on.tasks[0];
+        assert_eq!(t.enabled, Some(false), "the follow-on ships OFF; the FIELD is the gate");
+        assert_eq!(t.role_id.as_deref(), Some("coder"));
+        assert_eq!(t.depends_on, vec!["summary".to_string()]);
+        assert_eq!(t.steps.len(), 1);
+        assert_eq!(t.steps[0].kind, "dispatch.internal");
+        let grow = t.grow.as_ref().expect("the follow-on is a grow template");
+        assert_eq!(grow.from, "summary");
+        assert_eq!(
+            grow.items, "finding_refs",
+            "the summary's ROSTER of findings, not its `findings` COUNT"
+        );
+        assert_eq!(
+            grow.id,
+            "{{item.id}}",
+            "the id is the key with `/` swapped out — a key is not one id segment"
+        );
+        assert_eq!(
+            grow.config["brief_refs"],
+            serde_json::json!([{"kind": "finding", "key": "{{item.key}}"}]),
+            "each grown step carries the finding it was grown from"
+        );
+        assert_eq!(grow.config["workdir"], serde_json::json!("{{item.tree_root}}"));
+        let message = grow.config["message"].as_str().expect("the follow-on brief");
+        assert!(message.contains("create_mod"), "the coder's product is a mod: {message}");
+        assert!(message.contains("`for`"), "named for the finding: {message}");
         let findings = cfg.validate(&known_refs);
         let errors: Vec<&ValidationFinding> =
             findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();

@@ -432,6 +432,7 @@ fn outcome_json(unit: &str, result: &str, findings: u64, tokens: u64, wall_ms: u
             reason: None,
             detections: None,
             host: None,
+            finding_refs: Vec::new(),
         },
         darkmux_crew::step_output::Producer::default(),
     )
@@ -831,4 +832,212 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
     let bad = summary.units.iter().find(|u| u.result == "error").expect("the failed unit has a row");
     assert_eq!(bad.unit, "u-0002");
     assert!(bad.reason.as_deref().is_some_and(|r| r.contains("u-0002")), "{bad:?}");
+}
+
+// ── (#2302) the outcome NAMES its findings ───────────────────────────────
+
+/// A unit's outcome carries one [`FindingRef`] per accepted finding, keyed
+/// the way the finding store is keyed, and the summary's roster is the
+/// union of those in unit order.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 2, 0);
+    let kind =
+        CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("stop", 1, 1, 10), out.clone())));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let body = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+
+    assert_eq!(body.findings, 2, "the count and the roster come from ONE read");
+    assert_eq!(body.finding_refs.len(), 2, "one ref per accepted finding");
+    let session = format!("crawl-{MISSION}-u-0001");
+    assert_eq!(
+        body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+        vec![format!("{session}/1"), format!("{session}/2")],
+        "`<dispatch>/<emit_seq>`, 1-based over non-empty lines — the runtime's own ordinal"
+    );
+    assert_eq!(
+        body.finding_refs[0].id,
+        format!("crawl-{MISSION}-u-0001-1"),
+        "`/` swapped for `-`: the id becomes a task id suffix"
+    );
+    assert_eq!(body.finding_refs[0].file.as_deref(), Some("src/a.ts"), "the container prefix is stripped");
+    assert_eq!(body.finding_refs[0].line, Some(1));
+    assert_eq!(body.finding_refs[1].line, Some(2), "each line's own number, in record order");
+    assert_eq!(body.finding_refs[0].rule, "unnamed-predicate");
+    assert_eq!(
+        body.finding_refs[0].tree_root,
+        ws.path().join("tree").to_string_lossy(),
+        "the materialized root a follow-on step names as its workdir"
+    );
+
+    // And every key ADDRESSES a record: it parses, and it resolves through
+    // the store the dispatch tailer writes.
+    let store = TempDir::new().unwrap();
+    for r in &body.finding_refs {
+        let (dispatch, seq) =
+            darkmux_crew::findings::parse_key(&r.key).unwrap_or_else(|| panic!("`{}` must be a finding key", r.key));
+        assert_eq!(dispatch, session);
+        darkmux_crew::findings::materialize(
+            store.path(),
+            &darkmux_crew::findings::FindingRecord {
+                key: r.key.clone(),
+                dispatch: dispatch.clone(),
+                seq,
+                ts: "2026-09-04T00:00:00Z".into(),
+                tool_name: "create_finding".into(),
+                proposer: darkmux_crew::findings::Proposer {
+                    handle: "crawler".into(),
+                    model: "m-1".into(),
+                    machine_id: None,
+                },
+                mission_id: Some(MISSION.into()),
+                phase_id: Some(PHASE.into()),
+                step_id: Some("unit-step".into()),
+                context: serde_json::json!({"unit": "u-0001"}),
+                emitted: serde_json::json!({"why": "w"}),
+                schema_version: darkmux_crew::findings::FINDING_SCHEMA_VERSION.into(),
+                extras: serde_json::Map::new(),
+            },
+        )
+        .expect("the tailer's own write");
+        let back = darkmux_crew::findings::load_at(store.path(), &dispatch, seq)
+            .unwrap()
+            .unwrap_or_else(|| panic!("`{}` must resolve — `brief_refs` refuses a key that does not", r.key));
+        assert_eq!(back.key, r.key);
+    }
+}
+
+/// The summary's roster is the union over units, in unit order — and its
+/// `findings` COUNT still means what the retired launcher's close payload
+/// meant.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn the_summary_unions_the_units_finding_refs_in_unit_order() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+
+    let mk = |unit: &str, refs: usize| {
+        let body: Vec<serde_json::Value> = (1..=refs)
+            .map(|i| {
+                serde_json::json!({
+                    "key": format!("crawl-{MISSION}-{unit}/{i}"),
+                    "id": format!("crawl-{MISSION}-{unit}-{i}"),
+                    "file": "src/a.ts", "line": i, "rule": "unnamed-predicate", "tree_root": "/t"
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schema_version": UNIT_OUTCOME_SCHEMA_VERSION, "unit": unit, "rule": "unnamed-predicate",
+            "source": "app", "result": "stop", "findings": refs, "findings_rejected": 0,
+            "wall_ms": 1, "prompt_tokens": 1, "completion_tokens": 1, "model": "m-1",
+            "out_dir": "/o", "finding_refs": body
+        })
+    };
+    let wrap = |v: serde_json::Value| {
+        darkmux_crew::step_output::Output::wrap(
+            UNIT_OUTCOME_KIND,
+            v,
+            darkmux_crew::step_output::Producer::default(),
+        )
+        .to_output_string()
+        .unwrap()
+    };
+    save_unit_step(MISSION, PHASE, "s-a", NodeStatus::Complete, Some(&wrap(mk("u-0001", 2))));
+    save_unit_step(MISSION, PHASE, "s-b", NodeStatus::Complete, Some(&wrap(mk("u-0002", 1))));
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.findings, 3, "the count is the sum");
+    assert_eq!(
+        s.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+        vec![
+            format!("crawl-{MISSION}-u-0001/1"),
+            format!("crawl-{MISSION}-u-0001/2"),
+            format!("crawl-{MISSION}-u-0002/1"),
+        ],
+        "the union, in unit order"
+    );
+    assert_eq!(s.schema_version, CRAWL_SUMMARY_SCHEMA_VERSION);
+}
+
+/// The `emit_seq` a key carries is the ordinal over NON-EMPTY LINES — the
+/// runtime's own — not over the lines that happened to parse. A line the
+/// host cannot read still consumed an ordinal in the container.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_key_keeps_the_runtimes_ordinal_even_when_a_line_does_not_parse() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = ws.path().join("out");
+    let rt = out.join(".darkmux-runtime");
+    fs::create_dir_all(&rt).unwrap();
+    // Line 2 is not JSON: the runtime counted it, this reader cannot use it.
+    fs::write(
+        rt.join("findings.jsonl"),
+        "{\"file\":\"/workspace/app/src/a.ts\",\"line\":1,\"pattern\":\"unnamed-predicate\",\"evidence\":\"e\",\"why\":\"w\"}\n\
+         {truncated\n\
+         {\"file\":\"/workspace/app/src/c.ts\",\"line\":3,\"pattern\":\"unnamed-predicate\",\"evidence\":\"e\",\"why\":\"w\"}\n",
+    )
+    .unwrap();
+
+    let kind =
+        CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("stop", 1, 1, 10), out.clone())));
+    let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let body = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+
+    assert_eq!(body.findings, 2, "only the readable lines are counted");
+    let session = format!("crawl-{MISSION}-u-0001");
+    assert_eq!(
+        body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+        vec![format!("{session}/1"), format!("{session}/3")],
+        "the second ref keys /3 — the unreadable line took /2 in the container"
+    );
+}
+
+/// A session id that could not be a path segment under the finding store
+/// produces NO refs — a key nothing can resolve is worse than none — while
+/// the COUNT stays honest about what the unit observed.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn an_unaddressable_session_id_yields_no_refs_but_still_counts_the_findings() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    // The session id is `crawl-<mission>-<unit id>`, so a unit id holding a
+    // separator is the one input that can make it unaddressable.
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u/0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 2, 0);
+    let kind =
+        CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("stop", 1, 1, 10), out.clone())));
+    let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u/0001" }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let body = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+
+    assert!(
+        !darkmux_crew::findings::is_safe_dispatch_segment(&format!("crawl-{MISSION}-u/0001")),
+        "the fixture's premise: this session id cannot be a store segment"
+    );
+    assert_eq!(body.findings, 2, "the unit observed two findings, addressable or not");
+    assert!(body.finding_refs.is_empty(), "and named none of them: {:?}", body.finding_refs);
 }

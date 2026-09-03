@@ -81,14 +81,20 @@ pub fn is_macos_firmlink(p: &Path) -> bool {
 ///
 /// Call sites:
 /// - `crew::dispatch_internal::dispatch` (internal runtime path)
+///
+/// (#2302) The messages below name the WORKDIR, never a CLI flag: a
+/// workdir reaches this validator from a `--workdir` flag, from a Task,
+/// and — since the crawl's follow-on template — from a mission step's own
+/// `config.workdir`. An operator reading a failed step should not be sent
+/// looking for a flag they never typed.
 /// - `fleet::handle_claimed_job` (runner side; validates `WorkJob.workdir`
 ///   before invoking the dispatch path that consumes it)
 pub fn validate_workdir(path: &Path) -> Result<PathBuf> {
     if let Some(offending) = first_user_symlink_in(path)
-        .with_context(|| format!("checking --workdir for symlinks: {}", path.display()))?
+        .with_context(|| format!("checking the workdir for symlinks: {}", path.display()))?
     {
         bail!(
-            "--workdir traverses an operator-named symlink at {} — refusing to follow.\n  \
+            "workdir traverses an operator-named symlink at {} — refusing to follow.\n  \
              Use the real directory path directly to prevent unintended r/w. \
              (macOS firmlinks /tmp, /var, /etc are tolerated; user-named symlinks anywhere \
              in the path are not.)",
@@ -97,13 +103,15 @@ pub fn validate_workdir(path: &Path) -> Result<PathBuf> {
     }
     let resolved = path.canonicalize().with_context(|| {
         format!(
-            "--workdir path does not exist or cannot be resolved: {}",
+            "workdir path does not exist or cannot be resolved: {} \
+             (from the step's `config.workdir`, the task, or `--workdir`)",
             path.display()
         )
     })?;
     if !resolved.is_dir() {
         return Err(anyhow!(
-            "--workdir path is not a directory: {}",
+            "workdir path is not a directory: {} \
+             (from the step's `config.workdir`, the task, or `--workdir`)",
             resolved.display()
         ));
     }
@@ -186,7 +194,7 @@ pub fn validate_remote_workdir_in(path: &Path, canon_base: &Path) -> Result<Path
         .with_context(|| format!("checking --workdir for symlinks: {}", path.display()))?
     {
         bail!(
-            "--workdir traverses an operator-named symlink at {} — refusing to follow. \
+            "workdir traverses an operator-named symlink at {} — refusing to follow. \
              Queue-originated dispatches must use real directory paths under the \
              worktrees base.",
             offending.display()
@@ -196,13 +204,14 @@ pub fn validate_remote_workdir_in(path: &Path, canon_base: &Path) -> Result<Path
     // 2. Must exist and be a directory.
     let resolved = path.canonicalize().with_context(|| {
         format!(
-            "--workdir path does not exist or cannot be resolved: {}",
+            "workdir path does not exist or cannot be resolved: {} \
+             (from the queued job's `workdir`)",
             path.display()
         )
     })?;
     if !resolved.is_dir() {
         return Err(anyhow!(
-            "--workdir path is not a directory: {}",
+            "workdir path is not a directory: {} (from the queued job's `workdir`)",
             resolved.display()
         ));
     }
@@ -307,6 +316,26 @@ mod tests {
     }
 
     // ─── validate_workdir (the operator-facing API) ───────────────────
+
+    /// (#2302) The refusal names the WORKDIR, not a flag. A mission step
+    /// sets `config.workdir` (the crawl's follow-on template does), and an
+    /// operator reading that step's failure must not be sent looking for a
+    /// `--workdir` they never typed.
+    #[test]
+    fn a_bad_workdir_names_the_field_not_a_cli_flag() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("nope");
+        let err = format!("{:#}", validate_workdir(&missing).unwrap_err());
+        assert!(err.contains("workdir path does not exist"), "{err}");
+        assert!(err.contains("config.workdir"), "it names where a workdir comes from: {err}");
+        assert!(!err.contains("--workdir path"), "no CLI-flag vocabulary: {err}");
+
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let err = format!("{:#}", validate_workdir(&file).unwrap_err());
+        assert!(err.contains("workdir path is not a directory"), "{err}");
+        assert!(!err.contains("--workdir path"), "no CLI-flag vocabulary: {err}");
+    }
 
     #[test]
     fn validate_workdir_accepts_real_directory() {

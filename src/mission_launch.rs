@@ -3371,6 +3371,70 @@ mod tests {
     use std::io::Write as _;
     use tempfile::{NamedTempFile, TempDir};
 
+    /// (#2302) What the close payload actually does with a LAST step that
+    /// is a dispatch. The rule is "promote the last phase's last step
+    /// output when it is a JSON OBJECT", and a `dispatch.internal` step's
+    /// output is the model's final text — so an enabled crawl follow-on
+    /// (which becomes the last phase) closes with NO payload, rather than
+    /// with the follow-on's outcome. Pinned here because the follow-on
+    /// phase's own description and DESIGN.md both state it; a prose claim
+    /// about a promotion rule should be executable.
+    #[test]
+    fn a_last_step_whose_output_is_prose_promotes_no_close_payload() {
+        let cfg: mission_config::MissionConfig = serde_json::from_value(serde_json::json!({
+            "id": "m", "name": "M", "schema_version": "3.2", "inputs": [],
+            "phases": [{"id": "p", "tasks": [{"id": "t", "steps": [
+                {"id": "s", "kind": "dispatch.internal", "config": {}}
+            ]}]}]
+        }))
+        .unwrap();
+        let real_phase_ids: BTreeMap<String, String> = [("p".to_string(), "m-1-p".to_string())].into();
+        let task = crew::types::Task {
+            id: "m-1-t".into(),
+            phase_id: "m-1-p".into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["m-1-s".into()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mk = |status: crew::types::NodeStatus, output: &str| {
+            let step = Step {
+                id: "m-1-s".into(),
+                task_id: "m-1-t".into(),
+                kind: "dispatch.internal".into(),
+                gate: None,
+                status,
+                config: serde_json::json!({}),
+                started_ts: None,
+                completed_ts: None,
+                output: Some(output.to_string()),
+            };
+            let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into();
+            run_summary_payload(&cfg, &real_phase_ids, std::slice::from_ref(&task), &steps)
+        };
+
+        assert!(
+            mk(crew::types::NodeStatus::Complete, "I made the change and recorded it as a mod.").is_none(),
+            "a coder's final text is not a JSON object, so nothing is promoted"
+        );
+        assert!(
+            mk(crew::types::NodeStatus::Error, "step `m-1-s`: no finding sess-a/1 in the store").is_none(),
+            "and an errored last step promotes nothing either"
+        );
+        // The control: the summarizing shape a copy would end with DOES
+        // promote, which is why the remedy in the docs is what it is.
+        assert_eq!(
+            mk(crew::types::NodeStatus::Complete, r#"{"findings":2}"#),
+            Some(serde_json::json!({"findings": 2})),
+            "a JSON-object output still promotes — the rule is the shape, not the kind"
+        );
+    }
+
     /// Isolates both the crew root (mission/phase/config JSON) and the flow
     /// sink to TempDirs — mirrors `envelope.rs`'s own `CrewGuard`. Every
     /// test using this MUST be `#[serial_test::serial]` since env-var

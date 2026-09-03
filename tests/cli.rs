@@ -4040,8 +4040,51 @@ fn crawl_dry_run_prints_the_graph_the_launch_would_mint() {
     for want in ["Plan", "Crawl", "Summarize", "crawl.plan", "crawl.unit", "crawl.summary"] {
         assert!(stdout.contains(want), "dry run never mentioned `{want}`:\n{stdout}");
     }
+    // (#2302) The follow-on phase ships OFF, so it is PRUNED at mint and
+    // the default graph ends at Summarize — never drawn gray.
+    assert!(
+        !stdout.contains("Follow-on"),
+        "the follow-on task is `enabled: false`, so its phase is pruned:\n{stdout}"
+    );
+    assert!(
+        stdout.trim_end().ends_with("[crawl.summary]"),
+        "and the default graph still ENDS at the summary, whose output is the close payload:\n{stdout}"
+    );
     // Nothing was minted, and nothing was planned.
     assert!(!workdir.path().join("missions").exists(), "a dry run mints nothing");
+}
+
+/// (#2302) The same document with the follow-on task turned ON — a
+/// user-tier copy of `crawl.json`, which is exactly how an operator enables
+/// it — shows the template in the graph it would mint.
+#[test]
+fn crawl_dry_run_shows_the_follow_on_template_when_a_user_tier_copy_enables_it() {
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    write_app_repo(&app, "^1.0.0");
+    write_lib_repo(&lib, "1.2.0");
+    let spec_path = workdir.path().join("workspace.json");
+    write_workspace_spec(&spec_path, workdir.path(), &app, &lib);
+
+    // The built-in document, copied to the user tier with ONE field flipped.
+    let mut doc: serde_json::Value = serde_json::from_str(include_str!(
+        "../templates/builtin/mission-configs/crawl.json"
+    ))
+    .expect("the built-in crawl config parses");
+    let phases = doc["phases"].as_array_mut().unwrap();
+    let follow_on = phases.last_mut().expect("the follow-on phase");
+    assert_eq!(follow_on["id"], serde_json::json!("follow-on"));
+    follow_on["tasks"][0]["enabled"] = serde_json::json!(true);
+    let config_dir = workdir.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("crawl.json"), doc.to_string()).unwrap();
+
+    let out = crawl_dry_run(&workdir, &spec_path, &[]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Follow-on"), "the enabled phase is in the graph:\n{stdout}");
+    assert!(stdout.contains("dispatch.internal"), "and its step is a coder dispatch:\n{stdout}");
 }
 
 #[test]
@@ -4164,6 +4207,201 @@ fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {
     assert_eq!(grown[0]["items"].as_u64().unwrap() as usize, units.len());
     assert_eq!(grown[0]["minted"].as_array().unwrap().len(), units.len(), "one task per unit");
     assert_eq!(grown[0]["from"], serde_json::json!("plan-swallowed-error"));
+}
+
+/// (#2302) `mission config show crawl --json` says which tasks the mint
+/// would prune. The follow-on ships OFF; every other task in the document
+/// declares no gate at all and runs.
+#[test]
+fn mission_config_show_names_the_follow_on_task_as_disabled() {
+    let home = TempDir::new().unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "config", "show", "crawl", "--json"])
+        .output()
+        .expect("mission config show crawl --json runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("--json is JSON");
+    let phases = v["phases"].as_array().expect("phases");
+    let follow_on = phases.last().expect("the follow-on phase");
+    assert_eq!(follow_on["id"], serde_json::json!("follow-on"));
+    assert_eq!(
+        follow_on["tasks"][0]["enabled"],
+        serde_json::json!(false),
+        "the gate is VISIBLE, not inferred from the description: {follow_on}"
+    );
+    for phase in &phases[..phases.len() - 1] {
+        for task in phase["tasks"].as_array().unwrap() {
+            assert_eq!(
+                task["enabled"],
+                serde_json::Value::Null,
+                "a task that declares no gate reports none: {task}"
+            );
+        }
+    }
+}
+
+/// (#2302) The FOLLOW-ON seam end to end through the CLI: a producer whose
+/// wrapped output names findings, and a template that grows one
+/// `dispatch.internal` step per finding carrying that finding's key in
+/// `config.brief_refs`.
+///
+/// The finding store is left EMPTY on purpose. `brief_refs` resolution
+/// refuses a key that addresses no stored record, and it refuses BEFORE any
+/// model or container work, so the refusal is both the proof that the
+/// substituted ref reached `dispatch.internal` and the proof of the
+/// readiness guard the follow-on phase leans on — with no docker, no model
+/// and no dispatch anywhere in this test.
+#[test]
+#[serial_test::serial]
+fn a_template_grows_one_dispatch_per_finding_carrying_its_key_in_brief_refs() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let findings = TempDir::new().unwrap();
+
+    // The producer's output: the SAME envelope `crawl.summary` writes — a
+    // wrapped body whose top-level `finding_refs` is the array to map over.
+    let summary_body = serde_json::json!({
+        "findings": 2,
+        "finding_refs": [
+            {"key": "sess-a/1", "id": "sess-a-1", "file": "src/a.ts", "line": 7,
+             "rule": "unnamed-predicate", "tree_root": home.path().to_string_lossy()},
+            {"key": "sess-a/2", "id": "sess-a-2", "file": "src/b.ts", "line": 9,
+             "rule": "unnamed-predicate", "tree_root": home.path().to_string_lossy()},
+        ],
+    });
+    let summary_output = serde_json::json!({
+        "schema_version": "1.0",
+        "kind": "crawl.summary",
+        "producer": {"mission": "m", "task": "summary", "step": "summary-step", "machine_id": "t"},
+        "produced_at": "2026-09-04T00:00:00Z",
+        "body": summary_body,
+    })
+    .to_string();
+
+    // An ENDPOINT profile, so nothing here is a local placement and the
+    // scheduler never tries to make a model resident. Nothing is ever
+    // called at this URL: `brief_refs` resolution refuses first.
+    let profiles = home.path().join("profiles.json");
+    fs::write(
+        &profiles,
+        serde_json::json!({
+            "schema_version": "1.5",
+            "default_profile": "stub",
+            "profiles": {"stub": {"models": [
+                {"id": "stub-model", "n_ctx": 8000, "endpoint": {"url": "http://127.0.0.1:9"}}
+            ]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("follow-on-e2e.json"),
+        serde_json::json!({
+            "id": "follow-on-e2e",
+            "name": "Follow-on E2E",
+            "schema_version": "3.2",
+            "inputs": [],
+            "phases": [
+                {"id": "summarize", "tasks": [{
+                    "id": "summary",
+                    "steps": [{"id": "summary-step", "kind": "procedural.noop",
+                               "config": {"output": summary_output}}]
+                }]},
+                {"id": "follow-on", "tasks": [{
+                    "id": "follow-on",
+                    "role_id": "coder",
+                    "depends_on": ["summary"],
+                    "grow": {"from": "summary", "items": "finding_refs", "id": "{{item.id}}",
+                             "config": {
+                                 "workdir": "{{item.tree_root}}",
+                                 "brief_refs": [{"kind": "finding", "key": "{{item.key}}"}],
+                                 "message": "make the change the finding describes",
+                                 "profile_name": "stub",
+                                 "skip_preflight": true
+                             }},
+                    "steps": [{"id": "follow-on-step", "kind": "dispatch.internal", "config": {}}]
+                }]}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_FINDINGS_DIR", findings.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .env("DARKMUX_PROFILES", &profiles)
+        .args(["mission", "launch", "follow-on-e2e"])
+        .output()
+        .expect("mission launch follow-on-e2e runs");
+    let combined =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    // Two tasks grew, from the summary, one per finding.
+    let mission_dir = one_mission_dir(&home);
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(mission_dir.join("graph-report.json")).unwrap()).unwrap();
+    let grown = report["grown"].as_array().expect("growth is recorded");
+    assert_eq!(grown.len(), 1, "{report}");
+    assert_eq!(grown[0]["from"], serde_json::json!("summary"), "grown from the SUMMARY: {report}");
+    assert_eq!(grown[0]["items"].as_u64().unwrap(), 2);
+    let minted: Vec<&str> = grown[0]["minted"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(minted.len(), 2, "{report}");
+    assert!(minted[0].ends_with("follow-on-sess-a-1"), "the id is `/`-free: {report}");
+    assert!(minted[1].ends_with("follow-on-sess-a-2"), "the id is `/`-free: {report}");
+    assert!(minted.iter().all(|m| !m.contains('/')), "a task id is one segment: {report}");
+
+    // Each grown step config carries the SUBSTITUTED ref and its provenance.
+    let steps_dir = mission_dir.join("steps");
+    let phase_dir = fs::read_dir(&steps_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().ends_with("-follow-on"))
+        .expect("a follow-on phase dir under steps/");
+    let mut seen: Vec<String> = Vec::new();
+    let mut refusals: Vec<String> = Vec::new();
+    for entry in fs::read_dir(&phase_dir).unwrap() {
+        let step: serde_json::Value = serde_json::from_str(&fs::read_to_string(entry.unwrap().path()).unwrap()).unwrap();
+        assert_eq!(step["kind"], serde_json::json!("dispatch.internal"));
+        assert_eq!(step["status"], serde_json::json!("error"), "an unresolvable ref refuses the step: {step}");
+        refusals.push(step["output"].as_str().unwrap_or_default().to_string());
+        assert_eq!(step["config"]["grown_from"]["task"], serde_json::json!("summary"));
+        let refs = step["config"]["brief_refs"].as_array().expect("the grown ref");
+        assert_eq!(refs.len(), 1, "{step}");
+        assert_eq!(refs[0]["kind"], serde_json::json!("finding"));
+        seen.push(refs[0]["key"].as_str().unwrap().to_string());
+        assert_eq!(
+            step["config"]["workdir"],
+            serde_json::json!(home.path().to_string_lossy()),
+            "the finding's own tree is the follow-on's workdir: {step}"
+        );
+    }
+    seen.sort();
+    assert_eq!(seen, vec!["sess-a/1".to_string(), "sess-a/2".to_string()], "one step per finding, keyed");
+
+    // And with nothing in the store, each step REFUSES BY NAME — before any
+    // container work, which is the readiness guard stated out loud.
+    assert!(
+        combined.contains("2 errored"),
+        "both follow-on steps must refuse, and the run must say so:\n{combined}"
+    );
+    let all = refusals.join("\n");
+    for key in ["sess-a/1", "sess-a/2"] {
+        assert!(all.contains(key), "the refusal names the key it could not resolve:\n{all}");
+    }
+    assert!(all.contains("no finding"), "and names the STORE it looked in:\n{all}");
+    let lower = all.to_lowercase();
+    assert!(!lower.contains("docker"), "nothing downstream of resolution was reached:\n{all}");
 }
 
 // ─── `finding` family (#2265) ────────────────────────────────────────────
