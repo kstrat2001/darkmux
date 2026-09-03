@@ -133,7 +133,7 @@ describe("RunsBoard", () => {
     renderBoard();
     await waitFor(() => expect(screen.getByText("m-broken")).toBeInTheDocument());
     const badge = screen.getByText("unparseable");
-    expect(badge).toHaveClass("labbadge", "unparseable");
+    expect(badge).toHaveClass("wstatus", "is-idle", "s-unparseable");
   });
 
   /** (#1907) The badge's CLASS stays keyed on `run.status` (so the dim
@@ -151,10 +151,10 @@ describe("RunsBoard", () => {
     await waitFor(() => expect(screen.getByText("aborted-1")).toBeInTheDocument());
 
     const abortedBadge = screen.getByText("aborted");
-    expect(abortedBadge).toHaveClass("labbadge", "abandoned");
+    expect(abortedBadge).toHaveClass("wstatus", "is-stopped", "s-abandoned");
 
     const staleBadge = screen.getByText("no ending recorded");
-    expect(staleBadge).toHaveClass("labbadge", "abandoned");
+    expect(staleBadge).toHaveClass("wstatus", "is-stopped", "s-abandoned");
 
     expect(screen.queryByText("abandoned", { selector: ".labbadge" })).not.toBeInTheDocument();
   });

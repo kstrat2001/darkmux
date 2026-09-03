@@ -8,6 +8,7 @@
  * it.
  */
 import { StepMeterEl, StepRow } from "./StepRow";
+import { WorkStatus } from "../../components/WorkStatus";
 import { groupTimeline, type TaskAggMetrics } from "./timeline";
 import type { GraphEdge, GraphNode, MetricsMap } from "./graph";
 
@@ -116,7 +117,7 @@ export function MissionTimelineView({
             <span className="tlph-name" title={phase.description || phase.label}>
               {phase.label}
             </span>
-            <span className="tlph-tag">{phase.status}</span>
+            <WorkStatus status={phase.status} className="tlph-tag" />
           </div>
           <div className="tltasks">
             {tasks.length ? (

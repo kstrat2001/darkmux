@@ -59,6 +59,7 @@ import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
 import { getSource } from "../../lib/source";
+import { WorkStatus } from "../../components/WorkStatus";
 import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
 import { MissionCanvas } from "./MissionCanvas";
 import { MissionTimelineView } from "./MissionTimelineView";
@@ -630,7 +631,7 @@ export function MissionGraphLens({
         <span className="midname" title={graph.mission_id}>
           {graph.mission_id}
         </span>
-        <span className={`mstatus ${status}`}>{status}</span>
+        <WorkStatus status={status} className="mstatus" />
         <MeterEl tot={tot} />
         <ProcEl proc={proc} />
         {/* (#2032 packet 2) No daemon behind a static build to refetch
