@@ -1618,12 +1618,13 @@ mod tests {
     }
 
     // (#2301) `crawl` is an ordinary graph-bearing config now — plan,
-    // crawl, summarize — so this asserts its whole shape rather than the
-    // "no graph by design" inversion #1959 needed. Kept separate from the
-    // pair above because it checks the per-rule track structure, not just
-    // that the document builds.
+    // crawl, summarize, and (#2302) a follow-on phase that ships OFF — so
+    // this asserts its whole shape rather than the "no graph by design"
+    // inversion #1959 needed. Kept separate from the pair above because it
+    // checks the per-rule track structure, not just that the document
+    // builds.
     #[test]
-    fn crawl_loads_and_builds_a_plan_phase_with_one_constructible_task_per_rule() {
+    fn crawl_shows_four_phases_every_step_constructible_and_the_follow_on_task_disabled() {
         let registry = crate::mission_launch::all_step_kinds().unwrap();
         let loaded = mission_config::load("crawl").unwrap();
         let show = build_show(
@@ -1636,24 +1637,49 @@ mod tests {
             &[],
         );
         assert_eq!(show.id, "crawl");
-        // (#2298 + #2301) Three phases: one `crawl.plan` task per built-in
-        // rule, one `crawl.unit` GROW template per rule, one
-        // `crawl.summary`. Every step constructible by the launcher's own
-        // registry — a crawl kind that failed to register would leave a
-        // config that cannot execute.
+        // (#2298 + #2301 + #2302) Four phases: one `crawl.plan` task per
+        // built-in rule, one `crawl.unit` GROW template per rule, one
+        // `crawl.summary`, and one `dispatch.internal` follow-on template.
+        // Every step constructible by the launcher's own registry — a crawl
+        // kind that failed to register would leave a config that cannot
+        // execute, and that holds for the follow-on too even though it
+        // ships off: `enabled` gates the MINT, never whether the kind is
+        // registered.
         let ids: Vec<&str> = show.phases.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, vec!["plan", "crawl", "summarize"], "{ids:?}");
+        assert_eq!(ids, vec!["plan", "crawl", "summarize", "follow-on"], "{ids:?}");
         let kinds_of = |i: usize| -> Vec<&str> {
             show.phases[i].tasks.iter().flat_map(|t| t.steps.iter()).map(|s| s.kind.as_str()).collect()
         };
         assert_eq!(kinds_of(0), vec!["crawl.plan"; 4]);
         assert_eq!(kinds_of(1), vec!["crawl.unit"; 4]);
         assert_eq!(kinds_of(2), vec!["crawl.summary"]);
+        assert_eq!(kinds_of(3), vec!["dispatch.internal"]);
         for phase in &show.phases {
             for step in phase.tasks.iter().flat_map(|t| t.steps.iter()) {
                 assert!(step.constructible, "`{}` must be registered: step {}", step.kind, step.id);
             }
         }
+
+        // (#2302) `show` REPORTS the gate. The follow-on ships off, so it is
+        // pruned at mint and must not read as live work here; every other
+        // task in the document declares no gate at all and runs.
+        assert_eq!(
+            show.phases[3].tasks[0].enabled,
+            Some(false),
+            "the follow-on task ships disabled, and `show` says so"
+        );
+        for phase in &show.phases[..3] {
+            for task in &phase.tasks {
+                assert_eq!(task.enabled, None, "task `{}` declares no gate", task.id);
+            }
+        }
+
+        // The same fact in the TEXT view, which is what an operator reads.
+        let text = render_show_text(&show);
+        assert!(
+            text.contains("task follow-on") && text.contains("[disabled]"),
+            "the text view marks the disabled task:\n{text}"
+        );
     }
 
     #[test]
