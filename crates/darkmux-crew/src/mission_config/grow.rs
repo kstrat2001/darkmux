@@ -64,8 +64,14 @@ pub struct Grown {
     pub task_template: String,
     /// The `grow.from` task id whose output was read.
     pub from: String,
-    /// Path that task's last step output named.
-    pub source_path: String,
+    /// (#2301) What the producing step's output NAMED — the path when it
+    /// named one (a `ref`, or a bare path), otherwise the output itself.
+    /// Renamed from `source_path` in #2301: a producer that wraps its
+    /// output (`step_output::Output`) emits a `{"ref": {"path": …}}`
+    /// pointer, so the raw output string stopped being a path and a field
+    /// called `source_path` started holding JSON. This holds the RESOLVED
+    /// name, which is a path whenever there was one.
+    pub source: String,
     /// How many items the artifact's `items` array held.
     pub items: usize,
     /// The real task ids minted, in item order.

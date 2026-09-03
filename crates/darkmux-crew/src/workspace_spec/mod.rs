@@ -110,7 +110,7 @@ pub struct EdgeSpec {
 /// named edges. Deliberately carries an optional `rules` array (a list of
 /// rule ids) even though `WorkspaceSpec` itself never interprets it — the
 /// crawl launcher reads it as a default rule binding when its own
-/// `--param rules=` is absent (see `src/crawl_launch.rs`'s input docs);
+/// `--param rules=` is absent (see `crawl.json`'s own `rules` input);
 /// any other mission is free to ignore the field entirely. This is the
 /// one deliberate crawl-shaped field on an otherwise fully generic type,
 /// and is documented here as exactly that, not hidden in `extras`.

@@ -205,7 +205,7 @@ const RESUME_CHECKPOINT_CONTAINER_PATH: &str = "/darkmux-out/checkpoint.json";
 /// under a dispatch's `host_out` (see `RESUME_CHECKPOINT_CONTAINER_PATH`'s
 /// own doc for the container-side mount path). Named once here so
 /// `stage_resume_checkpoint` and its tests don't hand-duplicate the literal.
-/// `pub` (not `pub(crate)`) so `src/crawl_launch.rs`'s `--param resume=`
+/// `pub` (not `pub(crate)`) so the crawl's per-unit resume (#2303)
 /// planner — a different crate — can probe `<out_dir>/checkpoint.json`
 /// without re-typing the literal.
 pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";

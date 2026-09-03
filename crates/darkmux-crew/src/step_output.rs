@@ -30,9 +30,10 @@
 //! - a bare path string — the crawl plan's shape today.
 //!
 //! **Integrity.** Every envelope carries `hash` — blake3 over its own
-//! body, canonicalized through `serde_json::Value` so field order can never
-//! change the digest — and [`Output::read`] recomputes it and refuses a
-//! mismatch. A consumer has to be able to tell a COMPLETE file from a
+//! body in a canonical form ([`body_hash`]: object keys sorted, all the way
+//! down; array order left alone, because it is data) so field order can
+//! never change the digest — and [`Output::read`] recomputes it and refuses
+//! a mismatch. A consumer has to be able to tell a COMPLETE file from a
 //! partial one, and a STALE copy from the current one, whatever moved it
 //! there; a length check cannot, and a timestamp lies. Bodies are written
 //! once (tmp + rename) and never rewritten, so a body whose hash disagrees
@@ -79,14 +80,23 @@ pub struct Producer {
 }
 
 impl Producer {
-    /// The producer triple for a step, with `machine_id` read from the one
-    /// place every other darkmux surface reads it.
+    /// The producer triple for a step, with `machine_id` resolved the SAME
+    /// way every flow record resolves it.
+    ///
+    /// `darkmux_flow::resolve_machine_id`, not
+    /// `config_access::machine_id` — the latter stops at
+    /// `env > config.machine_id` and returns `None` when neither is set,
+    /// which is the ordinary case on a machine that never named itself.
+    /// Flow records fall back to the hostname, so using the narrower
+    /// resolver here left `producer.machine_id` empty while every record
+    /// beside it said `laptop`, and this struct's own doc claims the two
+    /// are the same identity (#2301 review).
     pub fn of(mission: &str, task: &str, step: &str) -> Self {
         Self {
             mission: mission.to_string(),
             task: task.to_string(),
             step: step.to_string(),
-            machine_id: darkmux_types::config_access::machine_id().unwrap_or_default(),
+            machine_id: darkmux_flow::resolve_machine_id().unwrap_or_default(),
         }
     }
 }
@@ -112,11 +122,63 @@ pub struct Output<T> {
     pub body: T,
 }
 
-/// The digest a body is identified by: blake3 over the body canonicalized
-/// through `serde_json::Value`, whose object keys are sorted, so a
-/// producer's struct field order and a reader's parse order agree.
+/// The digest a body is identified by: blake3 over the body written in a
+/// CANONICAL form — every object's keys emitted in sorted order, all the
+/// way down — so a producer's struct field order and a reader's parse
+/// order can never disagree.
+///
+/// **Why the sort is explicit rather than inherited from `serde_json::Map`.**
+/// `serde_json::Map` is a `BTreeMap` by default (already sorted) but an
+/// `IndexMap` (insertion-ordered) when anything in the build enables
+/// serde_json's `preserve_order` feature — and cargo unifies features
+/// across a workspace, so whether that happens is a property of WHO ELSE
+/// is being compiled, not of this crate. In darkmux's own tree
+/// `agent-client-protocol` turns it on, which is why this digest was
+/// stable under `cargo test -p darkmux-crew` and unstable under
+/// `cargo test --workspace` (#2301 CI). A hash whose value depends on the
+/// feature graph is not a hash. This function therefore never relies on
+/// the map's own ordering.
 pub fn body_hash(body: &serde_json::Value) -> String {
-    blake3::hash(serde_json::to_string(body).unwrap_or_default().as_bytes()).to_hex().to_string()
+    let mut canonical = String::new();
+    write_canonical(body, &mut canonical);
+    blake3::hash(canonical.as_bytes()).to_hex().to_string()
+}
+
+/// Write `v` in canonical form: objects with their keys sorted, arrays in
+/// their own (meaningful) order, scalars as serde_json writes them.
+/// Recursive on purpose — a top-level-only sort would leave every nested
+/// object's digest at the mercy of the map type.
+fn write_canonical(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                // Through serde_json so escaping matches the wire form.
+                out.push_str(&serde_json::Value::String(key.clone()).to_string());
+                out.push(':');
+                write_canonical(&map[key], out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        // Numbers, strings, bools and null have exactly one serde_json
+        // spelling each; there is nothing to canonicalize.
+        other => out.push_str(&other.to_string()),
+    }
 }
 
 impl<T: Serialize> Output<T> {
@@ -380,9 +442,93 @@ mod tests {
     fn field_order_never_changes_the_digest() {
         // The canonicalization is what makes the check usable at all: a
         // producer's struct order and a reader's parse order must agree.
+        //
+        // Parsed from STRINGS with the keys deliberately out of order, so
+        // this holds whether `serde_json::Map` is a sorted `BTreeMap` (the
+        // default) or an insertion-ordered `IndexMap` (what serde_json's
+        // `preserve_order` feature makes it — which `agent-client-protocol`
+        // enables, and cargo unifies across the workspace). This test
+        // failed under `cargo test --workspace` and passed under
+        // `cargo test -p darkmux-crew` before the digest sorted keys
+        // itself (#2301 CI).
         let a: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
         let b: serde_json::Value = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
         assert_eq!(body_hash(&a), body_hash(&b));
         assert_ne!(body_hash(&a), body_hash(&serde_json::json!({"a": 1, "b": 3})));
+    }
+
+    #[test]
+    fn the_digest_sorts_nested_objects_too_and_keeps_array_order() {
+        // Mutation guard for a top-level-only sort: every object below the
+        // root is reordered here, including ones inside an array. A
+        // non-recursive canonicalizer passes the test above and fails this.
+        let a: serde_json::Value = serde_json::from_str(
+            r#"{"z":{"inner_b":2,"inner_a":1},"items":[{"y":2,"x":1},{"n":null,"m":[3,4]}],"a":"s"}"#,
+        )
+        .unwrap();
+        let b: serde_json::Value = serde_json::from_str(
+            r#"{"a":"s","items":[{"x":1,"y":2},{"m":[3,4],"n":null}],"z":{"inner_a":1,"inner_b":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(body_hash(&a), body_hash(&b), "nested key order must not move the digest");
+
+        // ARRAY order is meaningful and must still change it — a
+        // canonicalizer that sorted arrays would silently accept a
+        // reordered units list as the same plan.
+        let reordered: serde_json::Value =
+            serde_json::from_str(r#"{"a":"s","items":[{"m":[3,4],"n":null},{"x":1,"y":2}],"z":{"inner_a":1,"inner_b":2}}"#)
+                .unwrap();
+        assert_ne!(body_hash(&a), body_hash(&reordered), "array order is data, not formatting");
+        let inner_swapped: serde_json::Value =
+            serde_json::from_str(r#"{"a":"s","items":[{"x":1,"y":2},{"m":[4,3],"n":null}],"z":{"inner_a":1,"inner_b":2}}"#)
+                .unwrap();
+        assert_ne!(body_hash(&a), body_hash(&inner_swapped), "and so is order INSIDE a nested array");
+    }
+
+    #[test]
+    fn a_key_needing_escaping_hashes_through_its_wire_spelling() {
+        // The key is written through serde_json, so a quote or a backslash
+        // in a key cannot forge a colliding canonical string.
+        let a: serde_json::Value = serde_json::from_str(r#"{"a\"b":1,"c":2}"#).unwrap();
+        let b: serde_json::Value = serde_json::from_str(r#"{"c":2,"a\"b":1}"#).unwrap();
+        assert_eq!(body_hash(&a), body_hash(&b));
+        assert_ne!(body_hash(&a), body_hash(&serde_json::json!({"a\"b": 1, "c": 3})));
+        // A key whose TEXT carries the delimiters must not collide with a
+        // differently-shaped object: the wire spelling keeps them apart.
+        assert_ne!(body_hash(&a), body_hash(&serde_json::json!({"a": 1, "b": 1, "c": 2})));
+    }
+
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME + DARKMUX_MACHINE_ID, process-globals
+    fn the_producer_names_the_same_machine_a_flow_record_would() {
+        // (#2301 review) With no config and no env, `config_access::
+        // machine_id()` is `None` — the ordinary case. The producer must
+        // still name the machine, because a record written beside it does.
+        let home = tempfile::TempDir::new().unwrap();
+        let prior_home = std::env::var("DARKMUX_HOME").ok();
+        let prior_id = std::env::var("DARKMUX_MACHINE_ID").ok();
+        std::env::set_var("DARKMUX_HOME", home.path());
+        std::env::remove_var("DARKMUX_MACHINE_ID");
+
+        let p = Producer::of("m-1", "t-1", "s-1");
+        assert!(!p.machine_id.is_empty(), "a producer with no config still names its machine");
+        assert_eq!(
+            Some(p.machine_id.clone()),
+            darkmux_flow::resolve_machine_id(),
+            "and names the SAME one a flow record written beside it would"
+        );
+
+        // And an operator-named machine still wins, same as on a record.
+        std::env::set_var("DARKMUX_MACHINE_ID", "studio");
+        assert_eq!(Producer::of("m", "t", "s").machine_id, "studio");
+
+        match prior_id {
+            Some(v) => std::env::set_var("DARKMUX_MACHINE_ID", v),
+            None => std::env::remove_var("DARKMUX_MACHINE_ID"),
+        }
+        match prior_home {
+            Some(v) => std::env::set_var("DARKMUX_HOME", v),
+            None => std::env::remove_var("DARKMUX_HOME"),
+        }
     }
 }

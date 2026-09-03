@@ -429,6 +429,7 @@ fn outcome_json(unit: &str, result: &str, findings: u64, tokens: u64, wall_ms: u
         workspace: "fixture-ws".into(),
         sha: "a".repeat(40),
         rest_ms: 0,
+            reason: None,
             detections: None,
             host: None,
         },
@@ -452,7 +453,16 @@ fn the_summary_totals_every_unit_and_keeps_the_retired_launchers_payload_keys() 
         NodeStatus::Complete,
         Some(&outcome_json("u-0002", "unit_budget_exhausted", 0, 50, 0)),
     );
-    save_unit_step(MISSION, PHASE, "u3", NodeStatus::Error, None);
+    // (#2301 review) The scheduler writes a failing kind's ERROR TEXT into
+    // `step.output` — an errored unit has a non-empty, non-`UnitOutcome`
+    // output. `output: None` is a shape production never produces.
+    save_unit_step(
+        MISSION,
+        PHASE,
+        "u3",
+        NodeStatus::Error,
+        Some("`crawl.unit`: unit `u-0003` ended `timeout` — dispatch ended `timeout`"),
+    );
 
     let s = summarize_mission(MISSION).unwrap();
     assert_eq!(s.units_completed, 1);
@@ -468,6 +478,59 @@ fn the_summary_totals_every_unit_and_keeps_the_retired_launchers_payload_keys() 
     assert_eq!(s.units_skipped, 0);
     assert_eq!(s.mission_id, MISSION);
     assert_eq!(s.units.len(), 3);
+    let errored = s.units.iter().find(|u| u.result == "error").expect("the errored unit has a row");
+    assert!(
+        errored.reason.as_deref().is_some_and(|r| r.contains("timeout")),
+        "the scheduler's error text is carried as the row's reason: {errored:?}"
+    );
+}
+
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn an_errored_unit_never_refuses_the_whole_summary() {
+    // (#2301 review, MUST FIX) The defect this kills: reading EVERY unit
+    // step's output typed meant one failed unit — whose output is the
+    // scheduler's error text, not a `UnitOutcome` — made `summarize_mission`
+    // return `Err`, so the summary step errored and the mission closed with
+    // NO payload at all. A run with one bad unit must still summarize.
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", "stop", 2, 10, 10)));
+    let mut errored = Step {
+        id: "u2".into(),
+        task_id: "u2-task".into(),
+        kind: CRAWL_UNIT_KIND.into(),
+        gate: None,
+        status: NodeStatus::Error,
+        // What the grow seam stamped, and what the scheduler recorded.
+        config: serde_json::json!({"unit": "u-0002", "rule": "swallowed-error"}),
+        started_ts: None,
+        completed_ts: None,
+        output: Some("`crawl.unit`: unit `u-0002` ended `error` — container refused".into()),
+    };
+    darkmux_crew::lifecycle::save_step(MISSION, PHASE, &errored).unwrap();
+
+    let s = summarize_mission(MISSION).expect("one errored unit must not refuse the run's summary");
+    assert_eq!(s.units_completed, 1);
+    assert_eq!(s.units_errored, 1);
+    assert_eq!(s.findings, 2, "the good unit's numbers still count");
+    assert_eq!(s.stopped_by, "error");
+    let row = s.units.iter().find(|u| u.result == "error").unwrap();
+    assert_eq!(row.unit, "u-0002", "the row names the UNIT (from config), not the step id");
+    assert_eq!(row.rule.as_deref(), Some("swallowed-error"));
+    assert!(row.reason.as_deref().is_some_and(|r| r.contains("container refused")), "{row:?}");
+
+    // A step still RUNNING at summary time is neither complete nor a
+    // failure of the read — it simply never settled.
+    errored.id = "u3".into();
+    errored.task_id = "u3-task".into();
+    errored.status = NodeStatus::Running;
+    errored.output = None;
+    errored.config = serde_json::json!({"unit": "u-0003"});
+    darkmux_crew::lifecycle::save_step(MISSION, PHASE, &errored).unwrap();
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units.iter().filter(|u| u.result == "not_run").count(), 1);
 }
 
 #[test]
@@ -482,6 +545,8 @@ fn a_malformed_unit_output_is_refused_naming_the_missing_field() {
         MISSION,
         PHASE,
         "u1",
+        // COMPLETE: the only status whose output is read typed, so this is
+        // where real producer drift is caught.
         NodeStatus::Complete,
         // A correctly-wrapped envelope whose BODY is missing `findings`.
         Some(
@@ -524,6 +589,14 @@ fn a_unit_step_holding_someone_elses_output_is_refused_naming_both_kinds() {
     );
     let err = format!("{:#}", summarize_mission(MISSION).unwrap_err());
     assert!(err.contains("crawl.summary") && err.contains(UNIT_OUTCOME_KIND), "{err}");
+    // (#2301 review) Assert the KIND refusal specifically. Without this the
+    // test passes on the body-parse error path too, so deleting the kind
+    // check would leave it green — it would be testing that something went
+    // wrong, not that the graph was named as mis-wired.
+    assert!(
+        err.contains("the graph wires this step to the wrong producer"),
+        "the refusal must be the kind check, not a body-parse error: {err}"
+    );
 }
 
 #[test]
@@ -569,4 +642,193 @@ fn the_summary_reads_the_runs_own_plan_files_for_what_was_planned() {
     assert_eq!(s.est_tokens, 400);
     assert_eq!(s.workspace, "fixture-ws");
     assert_eq!(s.sources[0].id, "app");
+}
+
+// ── the kinds through the REAL scheduler (#2301 review) ──────────────────
+//
+// `with_dispatch` had no caller outside the per-kind unit tests, so nothing
+// exercised `crawl.unit` and `crawl.summary` the way a run does: through
+// `run_step_graph`, where the scheduler — not the test — decides a step's
+// status and writes its `output`. That gap is exactly what hid the errored-
+// unit defect (the scheduler records a failing kind's ERROR TEXT as the
+// step's output; no unit test produced that shape). This runs the real
+// graph.
+
+/// A `ModelHost` that is never expected to be used: these kinds declare no
+/// model, so a call here means the scheduler took a residency path this
+/// graph should not have.
+struct UnusedHost;
+impl darkmux_gestalt::ModelHost for UnusedHost {
+    fn list_resident(&mut self) -> std::result::Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError> {
+        Ok(vec![])
+    }
+    fn list_catalog(&mut self) -> std::result::Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError> {
+        Ok(vec![])
+    }
+    fn load(
+        &mut self,
+        model_key: &str,
+        _identifier: &str,
+        _min_ctx: u32,
+        _deadline: darkmux_gestalt::Deadline,
+    ) -> std::result::Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+        Err(darkmux_gestalt::HostError::UnknownModel { model_key: model_key.to_string() })
+    }
+    fn unload(
+        &mut self,
+        _target: &darkmux_gestalt::plan::OwnedTarget,
+        _deadline: darkmux_gestalt::Deadline,
+    ) -> std::result::Result<(), darkmux_gestalt::HostError> {
+        Ok(())
+    }
+}
+
+fn graph_task(id: &str, step_id: &str, depends_on: &[&str]) -> Task {
+    Task {
+        id: id.into(),
+        phase_id: PHASE.into(),
+        description: String::new(),
+        display_name: None,
+        step_ids: vec![step_id.into()],
+        depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+        reads: Vec::new(),
+        role_id: Some("crawler".into()),
+        profile_name: None,
+        workdir: None,
+        image: None,
+    }
+}
+
+fn graph_step(id: &str, task_id: &str, kind: &str, config: serde_json::Value) -> Step {
+    Step {
+        id: id.into(),
+        task_id: task_id.into(),
+        kind: kind.into(),
+        gate: None,
+        status: NodeStatus::Planned,
+        config,
+        started_ts: None,
+        completed_ts: None,
+        output: None,
+    }
+}
+
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn two_units_and_a_summary_run_through_the_real_scheduler() {
+    // One unit converges, one fails. The run must still summarize, and the
+    // summary must count 1 complete + 1 errored — the shape the pre-review
+    // code turned into a refused summary and an empty close payload.
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 1, 0);
+
+    // The dispatch converges for u-0001 and refuses for the second unit,
+    // keyed on what the step actually asked for.
+    let dispatched: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = dispatched.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+        seen.lock().unwrap().push(opts.session_id.clone().unwrap_or_default());
+        ok_result(envelope("stop", 40, 8, 1_234), out.clone())
+    }));
+
+    let registry = StepKindRegistry::with_builtins();
+    registry.register(Arc::new(kind)).unwrap();
+    registry.register(Arc::new(CrawlSummaryStepKind)).unwrap();
+
+    // u-0002 is NOT in the plan, so its step fails inside the kind — a real
+    // `Err` the scheduler turns into `status: Error` + the error text as
+    // the step's `output`, which is the production shape under test.
+    //
+    // `summary` declares NO `depends_on`, exactly as `crawl.json` does, and
+    // is run in a SECOND `run_step_graph` call — the phase boundary. That
+    // is not incidental: a summary that depended on the unit tasks would be
+    // SKIPPED (left `Planned`) the moment any one of them errored, since
+    // the scheduler drops every task whose dependency chain includes a dead
+    // one. Ordering the summary by PHASE instead of by dependency is what
+    // makes a run with a failed unit still produce a close payload.
+    let tasks: Vec<Task> = vec![
+        graph_task("unit-a", "unit-a-step", &[]),
+        graph_task("unit-b", "unit-b-step", &[]),
+        graph_task("summary", "summary-step", &[]),
+    ];
+    let mut steps: BTreeMap<String, Step> = [
+        graph_step(
+            "unit-a-step",
+            "unit-a",
+            CRAWL_UNIT_KIND,
+            serde_json::json!({"plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"}),
+        ),
+        graph_step(
+            "unit-b-step",
+            "unit-b",
+            CRAWL_UNIT_KIND,
+            serde_json::json!({"plan": plan.to_string_lossy(), "unit": "u-0002", "rule": "unnamed-predicate"}),
+        ),
+        graph_step("summary-step", "summary", CRAWL_SUMMARY_KIND, serde_json::json!({})),
+    ]
+    .into_iter()
+    .map(|s| (s.id.clone(), s))
+    .collect();
+    let tasks_by_id: BTreeMap<String, Task> = tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
+
+    let host_factory = || -> Box<dyn darkmux_gestalt::ModelHost> { Box::new(UnusedHost) };
+    let est = darkmux_gestalt::FixedEstimator(Default::default());
+
+    // One `run_step_graph` call per phase, in order — what
+    // `mission_launch::launch` does (#2300).
+    let run_phase = |steps: &mut BTreeMap<String, Step>| {
+        darkmux_crew::scheduler::run_step_graph(
+            steps,
+            &tasks_by_id,
+            &registry,
+            &darkmux_gestalt::Facts::default(),
+            &est,
+            1,
+            &host_factory,
+            &mut |_record| {},
+            &mut |step| {
+                let _ = darkmux_crew::lifecycle::save_step(MISSION, PHASE, step);
+            },
+            None,
+            None,
+            &[],
+        )
+        .expect("the graph run itself completes — a failed STEP is not a failed run");
+    };
+    let summary_step_only = steps.remove("summary-step").expect("seeded above");
+    run_phase(&mut steps);
+    steps.insert("summary-step".into(), summary_step_only);
+    run_phase(&mut steps);
+
+    // The scheduler's own shape, asserted rather than assumed: the failed
+    // unit's output is its error TEXT, not a `UnitOutcome`.
+    let unit_b = &steps["unit-b-step"];
+    assert_eq!(unit_b.status, NodeStatus::Error);
+    let text = unit_b.output.as_deref().expect("the scheduler records the error text as the output");
+    assert!(text.contains("u-0002"), "{text}");
+    assert!(serde_json::from_str::<serde_json::Value>(text).is_err(), "and it is not JSON: {text}");
+
+    assert_eq!(steps["unit-a-step"].status, NodeStatus::Complete);
+    assert_eq!(dispatched.lock().unwrap().len(), 1, "only the unit that resolved ever dispatched");
+
+    // The summary ran, and read both.
+    let summary_step = &steps["summary-step"];
+    assert_eq!(summary_step.status, NodeStatus::Complete, "output: {:?}", summary_step.output);
+    let summary = darkmux_crew::step_output::Output::<CrawlSummary>::read(
+        summary_step.output.as_deref().expect("the summary produced output"),
+        CRAWL_SUMMARY_OUTPUT_KIND,
+    )
+    .expect("the summary's own output is a typed CrawlSummary")
+    .body;
+    assert_eq!(summary.units_completed, 1);
+    assert_eq!(summary.units_errored, 1);
+    assert_eq!(summary.findings, 1, "the converged unit's finding still counts");
+    assert_eq!(summary.stopped_by, "error");
+    let bad = summary.units.iter().find(|u| u.result == "error").expect("the failed unit has a row");
+    assert_eq!(bad.unit, "u-0002");
+    assert!(bad.reason.as_deref().is_some_and(|r| r.contains("u-0002")), "{bad:?}");
 }

@@ -59,24 +59,21 @@
       <li><code>rules</code>: rule ids, resolved like roles: <code>~/.darkmux/rules/</code> first, then the built-ins.</li>
     </ul>
 
-    <h3>Preview the plan with <code>--dry-run</code></h3>
-    <p>Resolve the spec and see what would run, with nothing minted and nothing dispatched:</p>
-    <pre><code>darkmux mission launch crawl --param workspace=/path/to/darkmux-self.json --dry-run</code></pre>
-    <pre><code>darkmux mission launch crawl --dry-run — darkmux-self
-planned_at: 2026-08-29T15:05:33Z
-written to: (not written — pass --param plan_out=&lt;path&gt; to write)
-
-sources
-  darkmux          2b4e38b5   in_scope=326 out_of_scope=551
-
-by rule
-  doc-contradicts-code     units=77   files=272      est_tokens=728457
-  swallowed-error          units=2    sites=23       est_tokens=17103
-
-totals: 79 units, 745560 est_tokens
-  skipped: (none)
-  edges: (none)</code></pre>
-    <p>A <strong>unit</strong> is one bounded dispatch's worth of work; the token estimate is what you'd spend before committing a single dispatch.</p>
+    <h3>Preview the graph with <code>--dry-run</code></h3>
+    <p>Nothing minted, nothing dispatched. Tracks <code>--param rules=</code> leaves out are gone from the graph, not greyed out:</p>
+    <pre><code>darkmux mission launch crawl --param workspace=/path/to/darkmux-self.json --param rules=swallowed-error --dry-run</code></pre>
+    <pre><code>graph: 3 of 9 steps minted (6 left out by config)
+graph:
+  phase Plan (1 task(s))
+    task Plan: Swallowed errors
+      step plan-swallowed-error-step [crawl.plan]
+  phase Crawl (1 task(s))
+    task Crawl: Swallowed errors role=crawler depends_on=["plan-swallowed-error"]
+      step unit-swallowed-error-step [crawl.unit]
+  phase Summarize (1 task(s))
+    task Summary
+      step summary-step [crawl.summary]</code></pre>
+    <p>The Crawl phase declares one <em>template</em> per rule, grown into one task per planned unit at run time. A <strong>unit</strong> is one bounded dispatch's worth of work; the plan carries each one's token estimate.</p>
     <div class="callout">
       <strong><code>workspace=</code> takes a file path, not inline JSON.</strong>
       <p style="margin: 8px 0 0;">Passing the JSON text itself fails with <code>No such file or directory</code>, quoting the JSON back inside the error. Write the spec to a file and pass its path.</p>
@@ -87,9 +84,10 @@ totals: 79 units, 745560 est_tokens
 <section>
   <div class="wrap">
     <h2>2. Rules: a template kind, like roles</h2>
-    <p>A <strong>rule</strong> is a named property bound to files by glob, in the same registry shape roles use: built-ins at <code>templates/builtin/rules/</code>, overridable by id at <code>~/.darkmux/rules/&lt;id&gt;.json</code>. Three ship today:</p>
+    <p>A <strong>rule</strong> is a named property bound to files by glob, in the same registry shape roles use: built-ins at <code>templates/builtin/rules/</code>, overridable by id at <code>~/.darkmux/rules/&lt;id&gt;.json</code>. Four ship today, one plan task each:</p>
     <table>
       <tr><th>Rule</th><th>Kind</th><th>What it looks for</th></tr>
+      <tr><td><code>unnamed-predicate</code></td><td><code>site</code></td><td>A compound boolean condition inlined into a branch instead of named, so its reason is nowhere written down.</td></tr>
       <tr><td><code>swallowed-error</code></td><td><code>site</code></td><td>A <code>catch</code>/<code>.catch(...)</code>/<code>void somePromise()</code> site where the failure is neither rethrown, logged, nor checked by the caller.</td></tr>
       <tr><td><code>doc-contradicts-code</code></td><td><code>read</code></td><td>A doc comment or README claim the adjacent code visibly does not do.</td></tr>
       <tr><td><code>stale-consumer</code></td><td><code>edge</code></td><td>A consumer's pinned dependency range excludes a library version whose imported symbols changed shape.</td></tr>
@@ -119,11 +117,11 @@ totals: 79 units, 745560 est_tokens
 <section>
   <div class="wrap">
     <h2>3. Running a unit</h2>
-    <p>Drop <code>--dry-run</code> to dispatch instead of previewing. This mints a real mission, clones or reuses the tree, and dispatches one unit per planned row through the same container path <code>darkmux dispatch</code> uses. A unit can run for minutes, so narrow the scope with <code>--param rules=</code> — the rules you do not name are pruned before anything is minted.</p>
+    <p>Drop <code>--dry-run</code> to dispatch. This mints a real mission, clones or reuses the tree, and dispatches one unit per planned row through the same container path <code>darkmux dispatch</code> uses. A unit can run for minutes, so narrow the scope with <code>--param rules=</code>.</p>
     <pre><code>darkmux mission launch crawl --param workspace=/path/to/darkmux-self.json --param rules=swallowed-error</code></pre>
 
     <h3>The record sequence</h3>
-    <p>Generic mission and dispatch bookends wrap the crawl-specific work, per unit:</p>
+    <p>Generic mission and dispatch bookends wrap each unit:</p>
     <pre><code>mission start          <span class="comment"># operator-tier: the graph this run minted (and what it pruned)</span>
 phase start
 step complete           <span class="comment"># one per rule: the plan it wrote</span>
@@ -159,14 +157,14 @@ mission close            <span class="comment"># units_completed/errored/skipped
  "payload":{"units_in_plan":70,"units_selected":2,"units_not_run":68,
             "units_completed":2,"units_errored":0,"findings":2,
             "wall_ms":349707,"tokens_per_hour":7875514,"stopped_by":"done"}}</code></pre>
-    <p><code>wall_ms</code> includes rest time; subtract <code>rest_ms</code> for model-only time. The close payload is the run's own <code>crawl.summary</code> step, so the same numbers are readable as a step output too.</p>
+    <p><code>wall_ms</code> includes rest time; subtract <code>rest_ms</code> for model-only time. The close payload IS the run's own <code>crawl.summary</code> step output.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>4. Findings and mods</h2>
-    <p>The runtime tool is <code>create_finding</code> (renamed from <code>report_finding</code> on 2026-09-03). Each accepted call writes one record at <code>~/.darkmux/findings/&lt;dispatch&gt;/&lt;seq&gt;/finding.json</code>: the context the launcher supplied (mission, unit, rule, source, sha) plus the model's emission verbatim. darkmux never interprets the emission and never rewrites the record.</p>
+    <p>The runtime tool is <code>create_finding</code> (renamed from <code>report_finding</code> on 2026-09-03). Each accepted call writes one record at <code>~/.darkmux/findings/&lt;dispatch&gt;/&lt;seq&gt;/finding.json</code>: the context the crawl supplied (mission, unit, rule, source, sha) plus the model's emission verbatim. darkmux never interprets the emission and never rewrites the record.</p>
     <p><code>finding list [--mission &lt;id&gt;|--dispatch &lt;id&gt;|--rule &lt;id&gt;] [--json]</code> reads the store, one row per record with a truncated preview of the emission:</p>
     <pre><code>$ darkmux finding list
 crawl-crawl-1788400556-b1119b-u-0001/1  2026-09-03T01:59:29Z  crawler (qwen3.6-35b-a3b-turboquant-mlx)  [mission=crawl-1788400556-b1119b unit=u-0001 rule=unnamed-predicate]

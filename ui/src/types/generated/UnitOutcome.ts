@@ -29,4 +29,10 @@ findings: bigint,
  * `create_finding` calls the runtime REJECTED — engagement that did
  * not become a finding, never folded into `findings`.
  */
-findings_rejected: bigint, wall_ms: bigint, prompt_tokens: bigint, completion_tokens: bigint, model: string | null, out_dir: string, rules: Array<string>, workspace: string, sha: string, rest_ms: bigint, detections: unknown | null, host: unknown | null, };
+findings_rejected: bigint, wall_ms: bigint, prompt_tokens: bigint, completion_tokens: bigint, model: string | null, out_dir: string, rules: Array<string>, workspace: string, sha: string, rest_ms: bigint, 
+/**
+ * Why this unit did not produce numbers, when it did not: the step
+ * kind's own error text, as the scheduler recorded it. Present only on
+ * a row the summary built from an ERRORED step (#2301 review).
+ */
+reason: string | null, detections: unknown | null, host: unknown | null, };

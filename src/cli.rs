@@ -747,8 +747,10 @@ pub(crate) enum MissionCmd {
         timeout: Option<u32>,
         /// (#1959) Resolve config + inputs, mint NOTHING, emit NO flow
         /// records, dispatch NOTHING — print what would run and exit.
-        /// `crawl` prints the plan table (writes it to disk only when
-        /// `--param plan_out=<path>` names a destination); `review`
+        /// (#2301) `crawl` prints its task/step graph like any other
+        /// config — including which rule tracks `--param rules=` left out;
+        /// the retired launcher's in-process plan table and
+        /// `--param plan_out=` are gone with it. `review`
         /// prints resolved inputs and, when the source is a local
         /// worktree, the bundle count (a GitHub source says the count
         /// isn't computed in dry-run — that would cost a network fetch

@@ -23,5 +23,5 @@ pub mod plan_step;
 
 /// (#2301) The crawl's DISPATCH half — `crawl.unit` + `crawl.summary`.
 /// With these, `crawl.json` IS the crawl: the literal-routed launcher
-/// (`src/crawl_launch.rs`) is retired.
+/// (`src/crawl_launch.rs`, deleted in #2301) is retired.
 pub mod unit_step;

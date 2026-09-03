@@ -130,6 +130,11 @@ pub struct UnitOutcome {
     pub sha: String,
     #[serde(default)]
     pub rest_ms: u64,
+    /// Why this unit did not produce numbers, when it did not: the step
+    /// kind's own error text, as the scheduler recorded it. Present only on
+    /// a row the summary built from an ERRORED step (#2301 review).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "unknown | null"))]
     pub detections: Option<Value>,
@@ -842,6 +847,9 @@ impl StepKind for CrawlUnitStepKind {
             workspace: ctx.workspace.clone(),
             sha: ctx.sha.clone(),
             rest_ms,
+            // A row this kind produced itself always has its numbers; only
+            // the summary's errored rows carry a reason.
+            reason: None,
             // Present only when the dispatch actually produced them — an
             // omitted key reads as "never sampled", a null as "sampled
             // zero".
@@ -1001,20 +1009,37 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
     for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
         let Ok(steps) = darkmux_crew::lifecycle::load_steps_for_phase(mission_id, &phase.id) else { continue };
         for step in steps.iter().filter(|s| s.kind == CRAWL_UNIT_KIND) {
-            match step.output.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+            // (#2301 review, MUST FIX) Branch on STATUS, not on whether an
+            // output is present. The scheduler writes a failing kind's own
+            // ERROR TEXT into `step.output` (`scheduler.rs`'s `Err` arm),
+            // so an errored unit has a non-empty output that is not a
+            // `UnitOutcome` — reading every output typed made ONE failed
+            // unit refuse the whole summary, and with it the mission's
+            // close payload. A `Complete` step is the only one that
+            // promised numbers, so it is the only one read typed (and a
+            // drifted producer is still refused there); anything else is an
+            // errored row carrying that text as its `reason`.
+            if step.status != darkmux_crew::types::NodeStatus::Complete {
+                rows.push(errored_row(step));
+                continue;
+            }
+            let raw = step.output.as_deref().map(str::trim).filter(|o| !o.is_empty());
+            match raw {
                 Some(raw) => {
                     let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(raw, UNIT_OUTCOME_KIND)
                         .with_context(|| {
                             format!(
-                                "`{CRAWL_SUMMARY_KIND}`: step `{}` recorded an output that is not a \
-                                 `UnitOutcome` — every `{CRAWL_UNIT_KIND}` output is read through \
-                                 that struct, so a producer that drifted is refused here rather \
-                                 than summarized as zeros",
+                                "`{CRAWL_SUMMARY_KIND}`: step `{}` completed but recorded an output \
+                                 that is not a `UnitOutcome` — every `{CRAWL_UNIT_KIND}` output is \
+                                 read through that struct, so a producer that drifted is refused \
+                                 here rather than summarized as zeros",
                                 step.id
                             )
                         })?;
                     rows.push(parsed.body);
                 }
+                // Complete with nothing recorded: not drift, just nothing
+                // to add. Counted, with no numbers claimed.
                 None => rows.push(errored_row(step)),
             }
         }
@@ -1064,17 +1089,34 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
     })
 }
 
-/// The honest zero row for a unit step that recorded no output at all —
+/// The honest zero row for a unit step that produced no `UnitOutcome` —
 /// its kind returned `Err`, so its numbers never existed.
+///
+/// The unit id comes from the step's own `config.unit` (what the grow seam
+/// stamped there), falling back to the step id: a summary that named the
+/// step instead of the unit would be unjoinable against the plan, which is
+/// the one thing an operator wants from a failed row. The scheduler's
+/// recorded error text becomes `reason`, so the run says WHY without
+/// anyone opening a second file.
 fn errored_row(step: &Step) -> UnitOutcome {
+    let unit = step
+        .config
+        .get("unit")
+        .and_then(Value::as_str)
+        .filter(|u| !u.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| step.id.clone());
+    let rule = step.config.get("rule").and_then(Value::as_str).map(str::to_string);
     UnitOutcome {
         schema_version: UNIT_OUTCOME_SCHEMA_VERSION.to_string(),
-        unit: step.id.clone(),
-        rule: None,
+        unit,
+        rules: rule.iter().cloned().collect(),
+        rule,
         source: String::new(),
         result: match step.status {
             darkmux_crew::types::NodeStatus::Abandoned => "interrupted".to_string(),
             darkmux_crew::types::NodeStatus::Error => "error".to_string(),
+            // Planned/Running at summary time: the step never settled.
             _ => "not_run".to_string(),
         },
         findings: 0,
@@ -1084,10 +1126,10 @@ fn errored_row(step: &Step) -> UnitOutcome {
         completion_tokens: 0,
         model: None,
         out_dir: String::new(),
-        rules: Vec::new(),
         workspace: String::new(),
         sha: String::new(),
         rest_ms: 0,
+        reason: step.output.as_deref().map(str::trim).filter(|o| !o.is_empty()).map(str::to_string),
         detections: None,
         host: None,
     }

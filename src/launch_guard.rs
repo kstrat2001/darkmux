@@ -1,13 +1,13 @@
 //! Shared RAII finalize guard for every `darkmux mission launch` launcher
 //! (#2131), extracted from `review_finalize_guard.rs` (#2124/#2130) once a
-//! second launcher (the retired `crawl_launch.rs`, SIGINT-only) and a third with NO
+//! second launcher (the crawl launcher, SIGINT-only — retired in #2301) and a third with NO
 //! guard at all (`mission_launch.rs` — generic graphs + coder-phase) proved
 //! the shape needed to be shared rather than reinvented per launcher.
 //!
 //! **Why a closure-parameterized guard, not one hardcoded to a Mission
 //! envelope type.** The three launchers finalize completely differently —
 //! `mission_launch_review.rs` writes a `ReviewEnvelope`-derived
-//! `MissionEnvelope`, `crawl_launch.rs` wrote a crawl summary + its own
+//! `MissionEnvelope`, the retired crawl launcher wrote a crawl summary + its own
 //! `mission_terminal_with_reasoning_and_payload` call, `mission_launch.rs`
 //! writes either a gate banner (coder-phase, no finalize at all on the
 //! happy path) or a generic `build_envelope`/`finalize_mission`. Rather
@@ -25,7 +25,7 @@
 //! of them can run as a plain child of a non-interactive wrapper script,
 //! and a Ctrl-C that tears down the wrapper's controlling terminal sends
 //! SIGHUP to darkmux the same way regardless of which launcher is running.
-//! `crawl_launch.rs` previously installed SIGINT only (this is the #2131
+//! the crawl launcher previously installed SIGINT only (this is the #2131
 //! fix for that gap).
 //!
 //! **Reaping — by pid, never by process group.** Unchanged from
@@ -41,7 +41,7 @@
 //! durable — see that function's own doc for why this is a launcher
 //! decision, not something the guard forces unconditionally in `close`. A
 //! launcher whose dispatch is a plain synchronous loop with its own
-//! between-units polling seam (`crawl_launch.rs`, retired in #2301) never needed to call it at
+//! between-units polling seam (the crawl launcher's, retired in #2301) never needed to call it at
 //! all — its own loop already stops cleanly once `close` runs.
 
 use std::any::Any;
@@ -89,7 +89,7 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// A no-op when no signal was observed (checks `darkmux_types::interrupt::
 /// is_set()` itself) — safe to call unconditionally after a normal
 /// completion; only a launcher that actually abandoned a worker thread
-/// needed to call it at all (`crawl_launch.rs`'s synchronous, self-polling
+/// needed to call it at all (the retired crawl launcher's synchronous, self-polling
 /// loop never does).
 pub(crate) fn reap_and_exit_on_signal() {
     if !darkmux_types::interrupt::is_set() {
@@ -208,7 +208,7 @@ mod tests {
     /// calls `simulate_sigterm_for_test`/`simulate_sighup_for_test`, which
     /// invoke the handler function DIRECTLY and would stay green even if
     /// `arm()` had never called `install_term()`/`install_hup()` at all —
-    /// exactly the gap that let reverting `crawl_launch.rs` to SIGINT-only
+    /// exactly the gap that let reverting the crawl launcher to SIGINT-only
     /// leave 44/44 tests green. This test sends REAL OS signals (via
     /// `kill -TERM`/`kill -HUP` against this process's own pid — the root
     /// `darkmux` binary crate has no direct `libc` dependency to `raise(2)`

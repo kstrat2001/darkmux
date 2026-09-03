@@ -3,7 +3,7 @@
 //! rules) into a deterministic `Plan` of work units with token estimates.
 //! NO model dispatch happens here; this is the mechanical, free-to-compute
 //! half of the crawler (prefilters, globs, the npm range check) that the
-//! launcher's (`src/crawl_launch.rs`) dispatch loop consumes.
+//! `crawl.unit` step kind (`unit_step.rs`) consumes, one unit per step.
 
 use darkmux_crew::workspace_spec::{glob, Materialized, MaterializedSource};
 use darkmux_crew::rules::{Rule, RuleKind};
@@ -37,7 +37,7 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024;
 /// whichever first". These are the DEFAULTS `PlanParams::default()`
 /// resolves to; an operator overrides either via `--param
 /// max_sites_per_unit=`/`--param max_est_tokens_per_unit=` on `mission
-/// launch crawl` (#2190) — see `src/crawl_launch.rs`.
+/// launch crawl` (#2190) — see `crawl.json`'s own `inputs`.
 pub const MAX_SITES_PER_UNIT: usize = 40;
 pub const MAX_SITE_TOKENS_PER_UNIT: usize = 16_000;
 /// Edge units cap at 80 sites (spilling into more units beyond that).

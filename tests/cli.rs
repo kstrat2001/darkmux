@@ -5066,7 +5066,11 @@ fn mission_launch_grows_one_task_per_plan_unit_with_provenance() {
     assert_eq!(grown[0]["from"], serde_json::json!("plan-task"));
     assert_eq!(grown[0]["task_template"], serde_json::json!("unit-task"));
     assert_eq!(grown[0]["items"], serde_json::json!(2));
-    assert_eq!(grown[0]["source_path"], serde_json::json!(plan_path.display().to_string()));
+    // (#2301) `source_path` -> `source`, holding the RESOLVED name: a
+    // wrapped producer's output is a `{"ref": …}` pointer, so the raw
+    // output string stopped being a path.
+    assert_eq!(grown[0]["source"], serde_json::json!(plan_path.display().to_string()));
+    assert!(grown[0]["source_path"].is_null(), "the old key is renamed, not aliased");
     assert_eq!(grown[0]["minted"].as_array().unwrap().len(), 2);
 
     // One `mission.grow` flow record naming the same facts.

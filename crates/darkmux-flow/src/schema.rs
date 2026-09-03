@@ -775,11 +775,11 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.39.0";
 //   1.38.0 (#2300): a new `mission.grow` action, emitted by the generic
 //           config launcher once per GROWTH EVENT — one per `grow` template
 //           expanded at a phase boundary. Payload:
-//           `{phase, task_template, from, source_path, items, minted,
-//           reason}`. `phase` is the real phase id the copies were minted
+//           `{phase, task_template, from, source, items, minted, reason}`
+//           (`source` was `source_path` until 1.39.0 — see that entry). `phase` is the real phase id the copies were minted
 //           into; `task_template` the document id of the task declaring
 //           `grow`; `from` the producing task id whose last step output was
-//           read; `source_path` the path that output named; `items` how
+//           read; `source` what that output named; `items` how
 //           many entries the artifact's array held; `minted` the real task
 //           ids grown, in item order. `reason` is `"grew_nothing"` when the
 //           artifact held zero items (a real outcome — a plan that planned
@@ -795,17 +795,28 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.39.0";
 //               `sources`. It could not: a crawl's units do not exist until
 //               its plan steps run, which is after the mint. It carries the
 //               generic `graph` (1.37.0) like every other config.
-//           (b) Those keys, and every key the retired launcher's `mission
-//               close` payload carried (`units_completed`/`units_errored`/
-//               `units_interrupted`/`units_budget_exhausted`/
-//               `units_skipped`/`units_not_run`, `findings`,
-//               `prompt_tokens`, `completion_tokens`, `wall_ms`,
-//               `tokens_per_hour`, `stopped_by`, `model`, `profile`), are
-//               still on `mission close` — produced by the run's own
-//               `crawl.summary` step, which the generic launcher promotes
-//               to the close payload. Same names, same meanings; only the
-//               producer changed. `units_skipped` is now always 0 (there is
-//               no between-units skip loop left to stop early).
+//           (b) `mission close` GAINS A PAYLOAD on every generic
+//               config, not just crawl — a GENERIC WIDENING, stated as
+//               such: the launcher now promotes its LAST phase's last step
+//               `output` to the `mission close` payload whenever that
+//               output is a JSON object (unwrapping a `step_output::Output`
+//               envelope's `body` when it is one). Before this the generic
+//               path always closed with a `null` payload, so ANY config
+//               whose final step emits a JSON object — a
+//               `procedural.shell` echoing one included — now has a
+//               populated close payload. Readers must not assume the crawl
+//               shape from the presence of a payload; read the config id.
+//               Crawl is the first consumer: every key the retired
+//               launcher's close payload carried (`units_completed`/
+//               `units_errored`/`units_interrupted`/
+//               `units_budget_exhausted`/`units_skipped`/`units_not_run`,
+//               `findings`, `prompt_tokens`, `completion_tokens`,
+//               `wall_ms`, `tokens_per_hour`, `stopped_by`, `model`,
+//               `profile`), plus the `mission start` keys (a) lists, is
+//               there — produced by the run's own `crawl.summary` step.
+//               Same names, same meanings; only the producer changed.
+//               `units_skipped` is now always 0 (there is no between-units
+//               skip loop left to stop early).
 //           (c) The bespoke per-unit `step start`/`step complete` PAYLOADS
 //               the launcher wrote (`workspace`/`unit`/`source`/`sha`/
 //               `rule`/`rules`/`kind`/`est_tokens`/`findings`/`exclusions`/
@@ -817,6 +828,17 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.39.0";
 //               keys was documentation (`docs/guide/crawl-and-hooks.html`),
 //               audited and updated in the same change — no viewer, serve
 //               or doctor code read them.
+//           (d) `mission.grow`'s payload key `source_path` is RENAMED to
+//               `source` (and the same rename applies to
+//               `graph-report.json`'s `grown[]`). 1.38.0 documented it as
+//               "the path that output named", which stopped being true the
+//               moment a producer wrapped its output: `crawl.plan` emits a
+//               `{"ref": {"path": …}}` pointer, so a field called
+//               `source_path` began holding JSON. The new key holds the
+//               RESOLVED name — the path whenever the output named one,
+//               otherwise the output itself. Renamed rather than aliased:
+//               1.38.0 is days old, unreleased, and had no consumers
+//               outside this repo.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

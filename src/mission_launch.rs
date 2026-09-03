@@ -579,7 +579,7 @@ pub fn launch(
     // (#2131 review round 4, F2) SIGINT + SIGTERM + SIGHUP — this launcher
     // (generic graphs + coder-phase) previously installed no signal
     // handling at all, the gap #2124 fixed for `mission_launch_review.rs`
-    // and #1959 fixed (SIGINT only) for `crawl_launch.rs`. Installed HERE
+    // and #1959 fixed (SIGINT only) for the retired crawl launcher. Installed HERE
     // — ahead of `mint_run_id` below, matching `mission_launch_review.rs`'s
     // `run_dispatch`, which arms before ITS mint too — not merely ahead of
     // the config-snapshot write / interpret / freeform-mint /
@@ -701,12 +701,11 @@ pub fn launch(
             eprintln!("{}", style::dim(&format!("mission launch: task persist warning: {e:#}")));
         }
     }
-    // (#2300) The phase record names the tasks it owns. `crawl_launch.rs`
-    // has always written this (it builds `task_ids` per group and saves the
-    // phase); the generic launcher never did, so the field meant different
-    // things depending on which launcher minted the run. It means the same
-    // thing on both now — which is a precondition for #2301 folding crawl
-    // onto this path. Growth appends to it at the phase boundary.
+    // (#2300) The phase record names the tasks it owns. The generic
+    // launcher never wrote it, so the field used to mean different things
+    // depending on which launcher minted the run — the precondition #2301
+    // needed before folding crawl onto this path (done; the crawl launcher
+    // is gone). Growth appends to it at the phase boundary.
     for phase in &config.phases {
         let Some(real_phase_id) = real_phase_ids.get(&phase.id) else { continue };
         let ids: Vec<String> = tasks
@@ -1174,7 +1173,7 @@ pub fn launch(
                         "phase": event.phase,
                         "task_template": event.task_template,
                         "from": event.from,
-                        "source_path": event.source_path,
+                        "source": event.source,
                         "items": event.items,
                         "minted": event.minted,
                     });
@@ -1208,7 +1207,7 @@ pub fn launch(
                     // The mint already wrote this phase's declared task ids
                     // (see `write_phase_task_ids` at the mint), so growth
                     // APPENDS — the field then reads the same on this
-                    // launcher as it already does on `crawl_launch.rs`,
+                    // launcher as it did on the retired crawl launcher,
                     // which builds `task_ids` per group and saves the phase
                     // (the one launcher that has always written it). #2301
                     // folds the two into one path; the field has to mean
@@ -1638,7 +1637,7 @@ fn grow_phase(
                 last_step.status
             );
         }
-        let source_path = last_step
+        let from_output = last_step
             .output
             .as_deref()
             .map(str::trim)
@@ -1657,16 +1656,19 @@ fn grow_phase(
         // naming a file, or a bare path — `resolve_output_doc` reads all
         // three, and `items_from_artifact` looks inside a typed envelope's
         // `body` when it finds one.
-        let (doc, whence) = crew::step_output::resolve_output_doc(&source_path).with_context(|| {
+        let (doc, whence) = crew::step_output::resolve_output_doc(&from_output).with_context(|| {
             format!(
- "mission launch: task `{}` grows from `{}`, whose output names `{source_path}`",
+ "mission launch: task `{}` grows from `{}`, whose output names `{from_output}`",
                 task_cfg.id, spec.from
             )
         })?;
         let items = crew::mission_config::items_from_artifact(&doc, &spec.items, &whence)
             .with_context(|| format!("mission launch: growing task `{}`", task_cfg.id))?;
 
-        let growth = crew::mission_config::grow_task(task_cfg, spec, items, &source_path)
+        // `{{from.output}}` renders the producer's output VERBATIM — a
+        // consumer reads it through `Output::read`, which takes a `ref`, a
+        // bare path or inline JSON alike.
+        let growth = crew::mission_config::grow_task(task_cfg, spec, items, &from_output)
             .with_context(|| format!("mission launch: growing task `{}`", task_cfg.id))?;
         let (grown_tasks, grown_steps) = mission_config::interpret::interpret_grown(
             &growth.tasks,
@@ -1693,7 +1695,9 @@ fn grow_phase(
                 phase: real_phase_id.to_string(),
                 task_template: task_cfg.id.clone(),
                 from: spec.from.clone(),
-                source_path,
+                // (#2301) The RESOLVED name, not the raw output string —
+                // a wrapped producer's output is a `{"ref": …}` pointer.
+                source: whence,
                 items: items.len(),
                 minted: grown_tasks.iter().map(|t| t.id.clone()).collect(),
             },
@@ -1709,8 +1713,9 @@ fn grow_phase(
 /// Warn-and-continue, never fatal: `task_ids` is a rendering convenience
 /// (`mission status`, the graph lens), and every Task record on disk
 /// already carries its own `phase_id`, so a failed write costs a nicety,
-/// not correctness. Mirrors `crawl_launch.rs`'s `phase.task_ids = ...;
-/// save_phase(&phase)` — the one launcher that has always written it.
+/// not correctness. #2300 added this so the field meant the same thing on
+/// the generic path as on the crawl launcher, which had always written it;
+/// #2301 retired that launcher, so this is now the only writer.
 fn write_phase_task_ids(mission_id: &str, phase_id: &str, ids: Vec<String>) {
     let result = load_phase_for_brief(mission_id, phase_id).and_then(|mut phase| {
         phase.task_ids = ids;

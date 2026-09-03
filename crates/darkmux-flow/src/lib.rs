@@ -2997,12 +2997,13 @@ mod tests {
         //           event, naming the template, the producing task, the
         //           artifact path, the item count and the real task ids
         //           minted from it (#2300).
-        //   1.39.0: the crawl's payloads move — `mission start` drops the
-        //           launcher's crawl keys (a crawl's units do not exist
-        //           until its plan steps run), `mission close` carries the
-        //           SAME keys produced by the run's own `crawl.summary`
-        //           step, and the bespoke per-unit step payloads are gone
-        //           (#2301).
+        //   1.39.0: `mission close` gains a payload on EVERY generic config
+        //           (the last phase's last step output, when it is a JSON
+        //           object — a generic widening, not a crawl feature); the
+        //           crawl's own payloads move onto it, `mission start`
+        //           drops the retired launcher's crawl keys, the bespoke
+        //           per-unit step payloads are gone, and `mission.grow`'s
+        //           `source_path` is renamed `source` (#2301).
         assert_eq!(FLOW_SCHEMA_VERSION, "1.39.0");
     }
 
