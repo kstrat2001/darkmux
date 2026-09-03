@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.37.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.38.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -772,6 +772,20 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.37.0";
 //           is written beside the run's config snapshot as
 //           `graph-report.json`; `mission status` reads that file. Additive:
 //           older readers ignore the key.
+//   1.38.0 (#2300): a new `mission.grow` action, emitted by the generic
+//           config launcher once per GROWTH EVENT — one per `grow` template
+//           expanded at a phase boundary. Payload:
+//           `{phase, task_template, from, source_path, items, minted,
+//           reason}`. `phase` is the real phase id the copies were minted
+//           into; `task_template` the document id of the task declaring
+//           `grow`; `from` the producing task id whose last step output was
+//           read; `source_path` the path that output named; `items` how
+//           many entries the artifact's array held; `minted` the real task
+//           ids grown, in item order. `reason` is `"grew_nothing"` when the
+//           artifact held zero items (a real outcome — a plan that planned
+//           nothing — never an error) and `null` otherwise. Additive: a
+//           reader that does not know the action already treats `action` as
+//           a free-form string.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

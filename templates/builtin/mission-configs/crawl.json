@@ -2,7 +2,7 @@
   "id": "crawl",
   "name": "Crawl",
   "description": "Crawl a workspace with static-analysis rules and record what the crew observes as findings. (#2298) The `plan` phase holds one `crawl.plan` task per rule; each writes the plan for that rule (units of sites at one sha) as its output. Today `darkmux mission launch crawl` is still routed by literal config id to `src/crawl_launch.rs`, which plans every rule together and drives the units itself; #2300 grows the unit track from each plan step's output and #2301 retires the literal launcher, at which point this document IS the crawl. Disable a rule's task with `\"enabled\": false` (#2299); it is pruned at mint and the run shows only the rules that will run.",
-  "schema_version": "3.1",
+  "schema_version": "3.2",
   "inputs": [
     {
       "name": "workspace",

@@ -668,7 +668,12 @@ pub fn launch(
     }
 
     let params = build_launch_params(config, &real_phase_ids, &collected);
-    let (tasks, mut steps, interpret_warnings) =
+    // (#2300) `tasks`/`all_steps` are the STATICALLY DECLARED graph — every
+    // task the document mints up front. A task declaring `grow` is a
+    // template and is deliberately absent from both: its copies are minted
+    // at the phase boundary, from an earlier phase's step output, into the
+    // cumulative `steps`/`run_tasks` maps the phase loop below carries.
+    let (mut tasks, all_steps, interpret_warnings) =
         match mission_config::interpret(config, &params).context("interpreting mission config graph") {
             Ok(v) => v,
             Err(e) => {
@@ -726,16 +731,20 @@ pub fn launch(
     // here (as `all_known`) rather than re-deriving a second hand-maintained
     // "what can this launcher construct" list.
     let all_known: &[&str] = &known_kinds;
-    let executable = steps.values().all(|s| all_known.contains(&s.kind.as_str()));
+    // (#2300) `declared` is the statically-minted step map; the phase loop
+    // below MOVES each phase's steps out of it into the cumulative `steps`
+    // map it actually runs, so growth can add to that map between phases.
+    let mut declared = all_steps;
+    let executable = declared.values().all(|s| all_known.contains(&s.kind.as_str()));
     if !executable {
         for task in &tasks {
             for step_id in &task.step_ids {
-                if let Some(step) = steps.get(step_id) {
+                if let Some(step) = declared.get(step_id) {
                     let _ = crew::lifecycle::save_step(&mission_id, &task.phase_id, step);
                 }
             }
         }
-        let unknown: Vec<&str> = steps
+        let unknown: Vec<&str> = declared
             .values()
             .map(|s| s.kind.as_str())
             .filter(|k| !all_known.contains(k))
@@ -870,7 +879,7 @@ pub fn launch(
     // `mission run`'s own default (see `launch`'s doc — `review` resolves
     // its own 3600 default in `mission_launch_review::launch` instead).
     let timeout_seconds = timeout_seconds.unwrap_or(600);
-    let uses_coder_phase_kinds = steps.values().any(|s| CODER_PHASE_TIER3_KINDS.contains(&s.kind.as_str()));
+    let uses_coder_phase_kinds = declared.values().any(|s| CODER_PHASE_TIER3_KINDS.contains(&s.kind.as_str()));
     let coder_handles = if uses_coder_phase_kinds {
         // (#1433 follow-up) Still inside the strand window — a registration
         // failure (a missing input, a mission/phase read error) reconciles the
@@ -883,7 +892,7 @@ pub fn launch(
             &real_phase_ids,
             &collected,
             timeout_seconds,
-            &mut steps,
+            &mut declared,
         ) {
             Ok(h) => Some(h),
             Err(e) => {
@@ -901,7 +910,7 @@ pub fn launch(
                 // "launcher exited before a terminal outcome was recorded"
                 // abort text.
                 guard.close(|| {
-                    reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e)
+                    reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut declared, &e)
                 });
                 return Err(e);
             }
@@ -995,8 +1004,18 @@ pub fn launch(
     // condition it checked for can no longer occur. Removed with the reuse
     // path itself.
 
-    let tasks_by_id: BTreeMap<String, crew::types::Task> =
-        tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
+    // (#2300) CUMULATIVE, not the whole graph up front. The phase loop
+    // below adds one phase's tasks (declared, then grown) before running
+    // it, so `gather_inputs` still sees every earlier phase's completed
+    // steps — that is what carries a producing step's output across the
+    // boundary — while the scheduler only ever has THIS phase's `Planned`
+    // steps to pick up.
+    let mut tasks_by_id: BTreeMap<String, crew::types::Task> = BTreeMap::new();
+    let mut steps: BTreeMap<String, crew::types::Step> = BTreeMap::new();
+    // Document task id -> real task id(s), for resolving a grown copy's
+    // inherited `depends_on`/`reads` at the boundary.
+    let grow_real_ids = mission_config::interpret::real_task_ids(config, &params);
+    let mut grown_events: Vec<crew::mission_config::grow::Grown> = Vec::new();
     let facts = crew::step_kinds::Facts::default();
     let est = crew::step_kinds::FixedEstimator::default();
     // (#1400) Tracks which phases this dispatch has already lazy-started —
@@ -1073,7 +1092,138 @@ pub fn launch(
             decision
         })
     };
-    let graph_result = crew::scheduler::run_step_graph(
+    // (#2300) ONE `run_step_graph` call PER PHASE, in config order —
+    // previously one call over the whole interpreted graph. The scheduler
+    // takes its task map by shared reference, so the graph cannot grow
+    // mid-run; the phase boundary is the only place a task minted from a
+    // step's OUTPUT can enter. **Trade, stated plainly:** cross-phase
+    // parallelism is gone. Two phases whose tasks have no edge between
+    // them used to be able to overlap; now phase N+1 starts only after
+    // phase N's last step settles. That is acceptable because phases are
+    // sequential by design in this codebase already (`phase_order` /
+    // `lazy_close_prior_phases` assume a strictly linear order, #1341),
+    // and parallelism lives INSIDE a phase, where the wave scheduler runs
+    // every independent task concurrently exactly as before.
+    let mut graph_result: Result<crew::scheduler::SchedulerReport> =
+        Ok(crew::scheduler::SchedulerReport::default());
+    for phase in &config.phases {
+        let Some(real_phase_id) = real_phase_ids.get(&phase.id).cloned() else {
+            continue;
+        };
+
+        // Growth first: a template's copies must exist before this phase's
+        // tasks are handed to the scheduler.
+        match grow_phase(
+            phase,
+            &real_phase_id,
+            &grow_real_ids,
+            &tasks_by_id,
+            &steps,
+            all_known,
+        ) {
+            Ok(grown) => {
+                for (event, grown_tasks, grown_steps) in grown {
+                    if event.minted.is_empty() {
+                        // A plan that planned nothing is a real outcome,
+                        // not a failure: the phase simply has no work.
+                        println!(
+                            "  {}",
+                            style::dim(&format!(
+                                "graph: `{}` grew nothing from `{}` (0 items) — phase `{}` has no                                  work (grew_nothing)",
+                                event.task_template, event.from, real_phase_id
+                            ))
+                        );
+                    } else {
+                        println!(
+                            "  {}",
+                            style::dim(&format!(
+                                "graph: grew {} task(s) from `{}` into phase `{}`",
+                                event.minted.len(),
+                                event.from,
+                                real_phase_id
+                            ))
+                        );
+                    }
+                    bookend.emit_now(mission_bookend_record(
+                        flow::Level::Info,
+                        "mission.grow",
+                        config_id,
+                        &mission_id,
+                        serde_json::json!({
+                            "phase": event.phase,
+                            "task_template": event.task_template,
+                            "from": event.from,
+                            "source_path": event.source_path,
+                            "items": event.items,
+                            "minted": event.minted,
+                            "reason": if event.minted.is_empty() { Some("grew_nothing") } else { None },
+                        }),
+                    ));
+                    for task in &grown_tasks {
+                        if let Err(e) = crew::lifecycle::save_task(&mission_id, task) {
+                            eprintln!(
+                                "{}",
+                                style::dim(&format!("mission launch: grown task persist warning: {e:#}"))
+                            );
+                        }
+                    }
+                    for step in grown_steps.values() {
+                        if let Err(e) = crew::lifecycle::save_step(&mission_id, &real_phase_id, step) {
+                            eprintln!(
+                                "{}",
+                                style::dim(&format!("mission launch: grown step persist warning: {e:#}"))
+                            );
+                        }
+                    }
+                    // (#2300) Deliberately NOT written into the phase
+                    // record's `task_ids`. Nothing populates that field on
+                    // any launcher today (`new_planned_phase` mints it
+                    // empty and no path ever fills it — grep it), so
+                    // writing ONLY the grown subset there would turn a
+                    // uniformly-empty field into one that lies: a reader
+                    // would see a phase listing two of its five tasks and
+                    // have no way to tell that from a phase with two. The
+                    // grown tasks' own records are on disk (`save_task`
+                    // just below, each carrying its phase id), and the
+                    // per-copy provenance is in `graph-report.json` plus
+                    // the `mission.grow` record. Populating `task_ids` for
+                    // every task on every launcher is its own change.
+                    for task in grown_tasks {
+                        tasks_by_id.insert(task.id.clone(), task.clone());
+                        tasks.push(task);
+                    }
+                    steps.extend(grown_steps);
+                    grown_events.push(event);
+                }
+            }
+            Err(e) => {
+                graph_result = Err(e);
+                break;
+            }
+        }
+
+        // Then this phase's statically-declared tasks, moved out of the
+        // mint-time map into the cumulative one the scheduler runs.
+        for task in tasks.iter().filter(|t| t.phase_id == real_phase_id) {
+            if tasks_by_id.contains_key(&task.id) {
+                continue;
+            }
+            for step_id in &task.step_ids {
+                if let Some(step) = declared.remove(step_id) {
+                    steps.insert(step_id.clone(), step);
+                }
+            }
+            tasks_by_id.insert(task.id.clone(), task.clone());
+        }
+
+        if !steps.values().any(|s| s.status == crew::types::NodeStatus::Planned) {
+            // Nothing new to run in this phase (every earlier step is
+            // already terminal and this phase minted none) — skip the
+            // scheduler setup rather than spinning an empty wave.
+            continue;
+        }
+
+        graph_result = crew::scheduler::run_step_graph(
         &mut steps,
         &tasks_by_id,
         &registry,
@@ -1134,7 +1284,30 @@ pub fn launch(
         Some(instrumented_gate.as_mut()),
         None,
         &seed_artifacts,
-    );
+        );
+        if graph_result.is_err() {
+            break;
+        }
+    }
+
+    // (#2300) Growth happens long after the mint, so `graph-report.json`
+    // (written at mint time, #2299) is loaded, appended to and saved —
+    // never rewritten from the prune report, which would drop anything a
+    // concurrent writer added.
+    if !grown_events.is_empty() {
+        match crew::lifecycle::load_graph_report(&mission_id) {
+            Ok(Some(mut report)) => {
+                report.grown.extend(grown_events.iter().cloned());
+                if let Err(e) = crew::lifecycle::save_graph_report(&mission_id, &report) {
+                    eprintln!("{}", style::dim(&format!("mission launch: graph-report warning: {e:#}")));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{}", style::dim(&format!("mission launch: graph-report read warning: {e:#}")));
+            }
+        }
+    }
 
     // (#1406, F4) A scheduler-level `Err` mid-run would otherwise `?`-return
     // here with NO finalize, stranding the mission Active with `Running`
@@ -1336,6 +1509,149 @@ pub fn launch(
     // (#2131) A no-op unless a signal was actually observed.
     crate::launch_guard::reap_and_exit_on_signal();
     Ok(exit_code)
+}
+
+/// (#2300) Expand every `grow` template a phase declares, from the output
+/// an EARLIER phase's producing task already wrote.
+///
+/// Returns one triple per template: the provenance event, the real Tasks,
+/// and the real Steps. A template that grows ZERO tasks still returns an
+/// event (with an empty `minted`) — a plan that planned nothing is a
+/// recorded outcome, never a silent no-op.
+///
+/// Every failure mode here is an `Err` naming the task AND the path, never
+/// a panic and never a quiet zero: the producer never ran, produced no
+/// output, named a path that isn't there, or wrote something that isn't
+/// the JSON shape the template asked for.
+type GrowthBatch = (
+    crew::mission_config::grow::Grown,
+    Vec<crew::types::Task>,
+    BTreeMap<String, crew::types::Step>,
+);
+
+fn grow_phase(
+    phase: &mission_config::PhaseConfig,
+    real_phase_id: &str,
+    real_task_ids: &BTreeMap<String, Vec<String>>,
+    tasks_by_id: &BTreeMap<String, crew::types::Task>,
+    steps: &BTreeMap<String, crew::types::Step>,
+    all_known: &[&str],
+) -> Result<Vec<GrowthBatch>> {
+    let mut out: Vec<GrowthBatch> = Vec::new();
+    for task_cfg in &phase.tasks {
+        let Some(spec) = &task_cfg.grow else { continue };
+
+        let real_from = real_task_ids
+            .get(&spec.from)
+            .and_then(|ids| ids.first())
+            .ok_or_else(|| {
+                anyhow!(
+ "mission launch: task `{}` grows from `{}`, which minted no task in this run (pruned by `enabled: \
+  false`, or itself a `grow` template)",
+                    task_cfg.id,
+                    spec.from
+                )
+            })?;
+        let producer = tasks_by_id.get(real_from).ok_or_else(|| {
+            anyhow!(
+ "mission launch: task `{}` grows from `{}` (real id `{real_from}`), which has not run — a `grow.from` \
+  must name a task in an EARLIER phase",
+                task_cfg.id,
+                spec.from
+            )
+        })?;
+        let last_step_id = producer.step_ids.last().ok_or_else(|| {
+            anyhow!(
+ "mission launch: task `{}` grows from `{}`, which has no steps and so produces no output",
+                task_cfg.id,
+                spec.from
+            )
+        })?;
+        let last_step = steps.get(last_step_id).ok_or_else(|| {
+            anyhow!(
+ "mission launch: task `{}` grows from `{}`, whose last step `{last_step_id}` is not in this run's \
+  graph",
+                task_cfg.id,
+                spec.from
+            )
+        })?;
+        if last_step.status != crew::types::NodeStatus::Complete {
+            bail!(
+ "mission launch: task `{}` grows from `{}`, whose last step `{last_step_id}` ended {:?}, not Complete \
+  — nothing was produced to grow from",
+                task_cfg.id,
+                spec.from,
+                last_step.status
+            );
+        }
+        let source_path = last_step
+            .output
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+ "mission launch: task `{}` grows from `{}`, whose last step `{last_step_id}` completed with no output — a producing step's output must be the PATH to the \
+                     JSON artifact to grow from",
+                    task_cfg.id,
+                    spec.from
+                )
+            })?
+            .to_string();
+
+        let raw = std::fs::read_to_string(&source_path).with_context(|| {
+            format!(
+ "mission launch: task `{}` grows from `{}`, whose output names `{source_path}` — a producing step's \
+  output must be a readable path to a JSON file",
+                task_cfg.id, spec.from
+            )
+        })?;
+        let doc: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+            format!(
+ "mission launch: task `{}` grows from `{}`, whose output names `{source_path}`, which is not valid \
+  JSON",
+                task_cfg.id, spec.from
+            )
+        })?;
+        let items = crew::mission_config::items_from_artifact(&doc, &spec.items, &source_path)
+            .with_context(|| format!("mission launch: growing task `{}`", task_cfg.id))?;
+
+        let growth = crew::mission_config::grow_task(task_cfg, spec, items)
+            .with_context(|| format!("mission launch: growing task `{}`", task_cfg.id))?;
+        let (grown_tasks, grown_steps) = mission_config::interpret::interpret_grown(
+            &growth.tasks,
+            &phase.id,
+            real_phase_id,
+            real_task_ids,
+        )
+        .with_context(|| format!("mission launch: interpreting grown copies of `{}`", task_cfg.id))?;
+
+        // Same gate the statically-declared graph passes before it runs —
+        // a grown step naming a kind this binary can't construct must fail
+        // loudly here, not deep inside the scheduler.
+        if let Some(bad) = grown_steps.values().find(|s| !all_known.contains(&s.kind.as_str())) {
+            bail!(
+ "mission launch: task `{}` grew step `{}` of kind `{}`, which this launcher cannot construct",
+                task_cfg.id,
+                bad.id,
+                bad.kind
+            );
+        }
+
+        out.push((
+            crew::mission_config::grow::Grown {
+                phase: real_phase_id.to_string(),
+                task_template: task_cfg.id.clone(),
+                from: spec.from.clone(),
+                source_path,
+                items: items.len(),
+                minted: grown_tasks.iter().map(|t| t.id.clone()).collect(),
+            },
+            grown_tasks,
+            grown_steps,
+        ));
+    }
+    Ok(out)
 }
 
 fn bool_param(collected: &BTreeMap<String, serde_json::Value>, key: &str) -> bool {

@@ -843,6 +843,7 @@ mod tests {
             reads: reads.iter().map(|s| s.to_string()).collect(),
             role_id: None,
             steps,
+            grow: None,
             extras: Map::new(),
         }
     }

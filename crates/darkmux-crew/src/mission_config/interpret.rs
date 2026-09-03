@@ -127,6 +127,16 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
     for phase in &config.phases {
         let real_phase_id = substitute_phase_id(&phase.id, params);
         for task_cfg in &phase.tasks {
+            // (#2300) A task declaring `grow` is a TEMPLATE, not a task: its
+            // real copies are minted at the phase boundary, once the `from`
+            // task's output exists (see `mission_config::grow`). It maps to
+            // ZERO real ids here, which is why `validate` makes naming a
+            // template in `depends_on`/`reads` an Error — an edge to a
+            // template can only ever resolve to nothing.
+            if task_cfg.grow.is_some() {
+                expansion_of.insert(task_cfg.id.clone(), Vec::new());
+                continue;
+            }
             let override_ = params.task_overrides.get(&task_cfg.id);
             let real_task_id = substitute_id(&task_cfg.id, &phase.id, &real_phase_id);
             let mut step_ids = Vec::with_capacity(task_cfg.steps.len());
@@ -199,6 +209,96 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
     }
 
     Ok((tasks, steps, warnings))
+}
+
+/// (#2300) Document task id -> the real Task id(s) it mints, WITHOUT
+/// building the graph — the map [`interpret_grown`] needs to resolve a
+/// grown copy's inherited `depends_on`/`reads`. A `grow` template maps to
+/// an empty vec here for the same reason it does inside [`interpret`].
+pub fn real_task_ids(
+    config: &MissionConfig,
+    params: &LaunchParams,
+) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for phase in &config.phases {
+        let real_phase_id = substitute_phase_id(&phase.id, params);
+        for task_cfg in &phase.tasks {
+            let real = if task_cfg.grow.is_some() {
+                Vec::new()
+            } else {
+                vec![substitute_id(&task_cfg.id, &phase.id, &real_phase_id)]
+            };
+            out.insert(task_cfg.id.clone(), real);
+        }
+    }
+    out
+}
+
+/// (#2300) Interpret already-grown, concrete [`TaskConfig`]s into real
+/// `Task`/`Step` values for ONE phase — the phase-boundary counterpart to
+/// [`interpret`], which mints only the statically-declared graph.
+///
+/// `real_ids` is [`real_task_ids`]'s map, used to resolve each copy's
+/// inherited `depends_on`/`reads` (which name DOCUMENT task ids, exactly
+/// as they do in [`interpret`]). An entry resolving to zero real ids
+/// contributes no edge; a name absent from the map is an error, same as
+/// in [`interpret`]'s own second pass.
+///
+/// The same id rules apply as everywhere else: the placeholder-prefix
+/// substitution runs over both task and step ids, and duplicate rendered
+/// ids are refused rather than silently collapsing.
+pub fn interpret_grown(
+    grown: &[super::TaskConfig],
+    doc_phase_id: &str,
+    real_phase_id: &str,
+    real_ids: &BTreeMap<String, Vec<String>>,
+) -> Result<(Vec<Task>, BTreeMap<String, Step>)> {
+    let mut tasks: Vec<Task> = Vec::new();
+    let mut steps: BTreeMap<String, Step> = BTreeMap::new();
+    for task_cfg in grown {
+        let real_task_id = substitute_id(&task_cfg.id, doc_phase_id, real_phase_id);
+        let mut step_ids = Vec::with_capacity(task_cfg.steps.len());
+        for step_cfg in &task_cfg.steps {
+            let real_step_id = substitute_id(&step_cfg.id, doc_phase_id, real_phase_id);
+            step_ids.push(real_step_id.clone());
+            push_step(
+                &mut steps,
+                &real_step_id,
+                &real_task_id,
+                &step_cfg.kind,
+                step_cfg.config.clone(),
+                step_cfg.gate.clone(),
+            )?;
+        }
+        push_task(
+            &mut tasks,
+            &real_task_id,
+            real_phase_id,
+            task_cfg.description.clone().unwrap_or_default(),
+            task_cfg.display_name.clone(),
+            step_ids,
+            None,
+            task_cfg.role_id.as_deref(),
+        )?;
+        let resolve = |relation: &str, entries: &[String]| -> Result<Vec<String>> {
+            let mut resolved: Vec<String> = Vec::new();
+            for dep in entries {
+                match real_ids.get(dep) {
+                    Some(ids) => resolved.extend(ids.iter().cloned()),
+                    None => bail!(
+                        "grown task `{}` {relation} unknown task id `{dep}` — the config must \
+                         validate cleanly (MissionConfig::validate) before interpretation",
+                        task_cfg.id
+                    ),
+                }
+            }
+            Ok(resolved)
+        };
+        let last = tasks.last_mut().expect("just pushed");
+        last.depends_on = resolve("depends_on", &task_cfg.depends_on)?;
+        last.reads = resolve("reads", &task_cfg.reads)?;
+    }
+    Ok((tasks, steps))
 }
 
 /// (#1284 review round 2, consider 4) Every launcher-supplied key must
@@ -393,6 +493,7 @@ mod tests {
             reads: Vec::new(),
             role_id: role_id.map(String::from),
             steps,
+            grow: None,
             extras: Map::new(),
         }
     }

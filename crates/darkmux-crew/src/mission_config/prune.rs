@@ -49,9 +49,36 @@ pub struct PruneReport {
     pub steps_minted: usize,
     #[serde(default)]
     pub pruned: Vec<Pruned>,
+    /// (#2300) One entry per growth event, appended AFTER the mint — a
+    /// `grow` template's copies are minted at a phase boundary, long after
+    /// this report is first written, so the launcher loads, appends and
+    /// saves. Empty on every run whose config declares no `grow`, and on
+    /// every pre-#2300 report (serde default), which is why it never
+    /// changes the pruning numbers above: growth ADDS tasks the config
+    /// never counted, pruning REMOVES ones it did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grown: Vec<super::grow::Grown>,
 }
 
 impl PruneReport {
+    /// (#2300) The one-line human summary of what a run GREW, or `None`
+    /// when nothing did. Separate from [`summary_line`](Self::summary_line)
+    /// on purpose: that one counts what the CONFIG declared against what
+    /// was minted from it, and a grown task was never in the config's
+    /// count at all.
+    pub fn grown_line(&self) -> Option<String> {
+        if self.grown.is_empty() {
+            return None;
+        }
+        Some(
+            self.grown
+                .iter()
+                .map(|g| format!("grew {} task(s) from {}", g.minted.len(), g.from))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
     /// True when the config asked for something to be left out.
     pub fn pruned_anything(&self) -> bool {
         !self.pruned.is_empty()
@@ -218,6 +245,7 @@ mod tests {
             role_id: None,
             steps,
             enabled,
+            grow: None,
             extras: Map::new(),
         }
     }

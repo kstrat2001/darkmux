@@ -5008,3 +5008,234 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
     let human_out = String::from_utf8_lossy(&human.stdout);
     assert!(human_out.contains("1 of 4 steps minted (3 left out by config)"), "got:\n{human_out}");
 }
+
+// ── (#2300) growth: a step's OUTPUT grows tasks into the graph ───────────
+//
+// The invariant under test is the SEAM, not any one mission: phase 1 writes
+// a JSON artifact and returns its path as the step's `output`; phase 2
+// declares a `grow` template naming phase 1's task; the launcher reads that
+// artifact at the phase boundary and mints one copy of the template per
+// item. Everything here is `procedural.shell`/`procedural.noop`, so no
+// model, no container and no network is involved.
+
+/// Writes a two-phase config where `plan-task` emits `units` and
+/// `unit-task` grows over them. Returns (home, flows) tempdirs.
+fn grow_fixture(units_json: &str, config_extra: &str) -> (TempDir, TempDir, std::path::PathBuf) {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let plan_path = home.path().join("plan.json");
+    fs::write(&plan_path, units_json).unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    // `procedural.shell`'s output is the command's stdout, so echoing the
+    // path IS "the step's output is a path to a JSON file" — the contract
+    // every producing step honors (`crawl.plan` writes `plan/<rule>.json`
+    // and returns that path).
+    let config_json = format!(
+        r#"{{
+        "id": "grow-test",
+        "name": "Grow Test",
+        "schema_version": "3.2",
+        "phases": [
+          {{
+            "id": "plan",
+            "tasks": [{{
+              "id": "plan-task",
+              "steps": [{{
+                "id": "plan-step",
+                "kind": "procedural.shell",
+                "config": {{ "command": "echo {plan}" }}
+              }}]
+            }}]
+          }},
+          {{
+            "id": "units",
+            "tasks": [{{
+              "id": "unit-task",
+              "depends_on": ["plan-task"],
+              "grow": {{
+                "from": "plan-task",
+                "items": "units",
+                "id": "{{{{item.id}}}}",
+                "config": {{ "unit": "{{{{item.id}}}}", "rule": "{{{{item.rule}}}}" }}
+              }},
+              "steps": [{{ "id": "unit-step", "kind": "procedural.noop", "config": {{}} }}]
+            }}]
+          }}
+        ]{extra}
+    }}"#,
+        plan = plan_path.display(),
+        extra = config_extra,
+    );
+    fs::write(config_dir.join("grow-test.json"), config_json).unwrap();
+    (home, flows, plan_path)
+}
+
+fn launch_grow(home: &TempDir, flows: &TempDir) -> std::process::Output {
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "grow-test"])
+        .output()
+        .unwrap()
+}
+
+fn one_mission_dir(home: &TempDir) -> std::path::PathBuf {
+    let missions = home.path().join("missions");
+    let mut entries: Vec<_> = fs::read_dir(&missions)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", missions.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    entries.sort();
+    assert_eq!(entries.len(), 1, "expected exactly one minted mission: {entries:?}");
+    entries.pop().unwrap()
+}
+
+fn flow_actions(flows: &TempDir) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(flows.path()).unwrap().filter_map(|e| e.ok()) {
+        let Ok(text) = fs::read_to_string(entry.path()) else { continue };
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn mission_launch_grows_one_task_per_plan_unit_with_provenance() {
+    let (home, flows, plan_path) = grow_fixture(
+        r#"{"units":[{"id":"u-1","rule":"r"},{"id":"u-2","rule":"r"}]}"#,
+        "",
+    );
+    let out = launch_grow(&home, &flows);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "launch failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let dir = one_mission_dir(&home);
+    // Phase ids are composed from the real mission id at mint, so the
+    // grown phase's directory name is `<mission id>-units`, not `units`.
+    let mission_id = dir.file_name().unwrap().to_string_lossy().to_string();
+    let grown_phase = format!("{mission_id}-units");
+    // Two grown tasks on disk, in the GROWN phase, one per unit.
+    for unit in ["u-1", "u-2"] {
+        let task = dir.join("tasks").join(&grown_phase).join(format!("unit-task-{unit}.json"));
+        assert!(task.is_file(), "missing grown task record {}\n{stdout}", task.display());
+        let step_path = dir.join("steps").join(&grown_phase).join(format!("unit-step-{unit}.json"));
+        let step: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&step_path).unwrap()).unwrap();
+        assert_eq!(step["config"]["unit"], serde_json::json!(unit), "step: {step}");
+        assert_eq!(step["config"]["rule"], serde_json::json!("r"), "step: {step}");
+        assert_eq!(step["config"]["grown_from"]["task"], serde_json::json!("plan-task"));
+        assert_eq!(step["config"]["grown_from"]["item"], serde_json::json!(unit));
+        assert_eq!(step["status"], serde_json::json!("complete"), "the grown step must RUN: {step}");
+    }
+    // The template itself is never minted.
+    assert!(
+        !dir.join("tasks").join(&grown_phase).join("unit-task.json").is_file(),
+        "the `grow` template must not be minted as a task of its own"
+    );
+
+    // graph-report.json carries the growth event.
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("graph-report.json")).unwrap()).unwrap();
+    let grown = report["grown"].as_array().expect("graph-report has a `grown` section");
+    assert_eq!(grown.len(), 1, "report: {report}");
+    assert_eq!(grown[0]["from"], serde_json::json!("plan-task"));
+    assert_eq!(grown[0]["task_template"], serde_json::json!("unit-task"));
+    assert_eq!(grown[0]["items"], serde_json::json!(2));
+    assert_eq!(grown[0]["source_path"], serde_json::json!(plan_path.display().to_string()));
+    assert_eq!(grown[0]["minted"].as_array().unwrap().len(), 2);
+
+    // One `mission.grow` flow record naming the same facts.
+    let records = flow_actions(&flows);
+    let grow_records: Vec<_> = records.iter().filter(|r| r["action"] == "mission.grow").collect();
+    assert_eq!(grow_records.len(), 1, "records: {records:?}");
+    let payload = &grow_records[0]["payload"];
+    assert_eq!(payload["from"], serde_json::json!("plan-task"));
+    assert_eq!(payload["items"], serde_json::json!(2));
+    assert_eq!(payload["minted"].as_array().unwrap().len(), 2);
+
+    // `mission status` names the growth.
+    let status = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .args(["mission", "status"])
+        .output()
+        .unwrap();
+    let status_out = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_out.contains("grew 2 task(s) from plan-task"),
+        "mission status must name the growth, got:\n{status_out}"
+    );
+}
+
+#[test]
+fn mission_launch_grows_nothing_from_an_empty_plan_and_still_completes() {
+    let (home, flows, _) = grow_fixture(r#"{"units":[]}"#, "");
+    let out = launch_grow(&home, &flows);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "an empty plan is a real outcome, not a failure:\n{stdout}");
+    assert!(
+        stdout.contains("grew nothing") && stdout.contains("grew_nothing"),
+        "the zero-item outcome must be named, got:\n{stdout}"
+    );
+    let dir = one_mission_dir(&home);
+    let mission_id = dir.file_name().unwrap().to_string_lossy().to_string();
+    let grown_dir = dir.join("tasks").join(format!("{mission_id}-units"));
+    assert!(
+        !grown_dir.exists() || fs::read_dir(&grown_dir).unwrap().next().is_none(),
+        "zero items must mint zero tasks"
+    );
+    let records = flow_actions(&flows);
+    let grow = records.iter().find(|r| r["action"] == "mission.grow").expect("a grow record");
+    assert_eq!(grow["payload"]["reason"], serde_json::json!("grew_nothing"), "{grow}");
+    assert_eq!(grow["payload"]["items"], serde_json::json!(0));
+}
+
+#[test]
+fn mission_launch_fails_loudly_when_the_producer_output_is_not_a_json_path() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    // The producing step completes fine — it just echoes a path that does
+    // not exist. A silent zero-task growth here is exactly the failure the
+    // retired `expand` primitive shipped; this must be an error naming the
+    // task AND the path.
+    let config_json = r#"{
+        "id": "grow-test",
+        "name": "Grow Test",
+        "schema_version": "3.2",
+        "phases": [
+          { "id": "plan", "tasks": [{ "id": "plan-task", "steps": [
+              { "id": "plan-step", "kind": "procedural.shell",
+                "config": { "command": "echo /nope/not-a-plan.json" } }]}]},
+          { "id": "units", "tasks": [{ "id": "unit-task", "depends_on": ["plan-task"],
+              "grow": { "from": "plan-task", "items": "units", "id": "{{item.id}}", "config": {} },
+              "steps": [{ "id": "unit-step", "kind": "procedural.noop", "config": {} }]}]}
+        ]
+    }"#;
+    fs::write(config_dir.join("grow-test.json"), config_json).unwrap();
+
+    let out = launch_grow(&home, &flows);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "a missing artifact must fail the run, got:\n{combined}");
+    assert!(
+        combined.contains("unit-task") && combined.contains("/nope/not-a-plan.json"),
+        "the error must name the task and the path, got:\n{combined}"
+    );
+}
