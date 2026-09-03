@@ -323,7 +323,8 @@ export function EventLogColumn({
     // for a value the operator deliberately deselected last session. Applying
     // first, then letting the ledger mark everything seen, keeps both correct.
     const pending = pendingPicksRef.current;
-    if (pending && (facets.act.length || facets.cat.length || facets.tier.length || facets.src.length)) {
+    const facetsHaveArrived = facets.act.length || facets.cat.length || facets.tier.length || facets.src.length;
+    if (pending && facetsHaveArrived) {
       pendingPicksRef.current = null;
       const restored = applyStoredPicks(pending, facets);
       for (const k of ["act", "cat", "tier", "src"] as const) {
