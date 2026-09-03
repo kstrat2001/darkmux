@@ -9373,3 +9373,230 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(result, vec!["read", "search", "bash", "create_finding"], "palette: {:?}", crawler.tool_palette);
     }
 
+
+
+// ─── #2318: consecutive dispatches on one profile re-issued `lms load` ───
+//
+// Six `dispatch.internal` steps grew in one phase on profile `coder-qwen38`
+// (`qwen/qwen3.8-27b` @ n_ctx 262144). One completed; the other five errored
+// before dispatch with `lms load` refusing:
+//
+//   Error: A model with identifier darkmux:qwen/qwen3.8-27b already exists.
+//
+// The filed hypothesis was that a `/` in the model id defeats the resident
+// match. `slash_bearing_resident_is_recognized` below is that hypothesis
+// written as a test, over the machine's REAL `lms ps` row — it passes, so the
+// hypothesis is false. The mission's own step records name the real cause: all
+// six steps ran as concurrent siblings in one wave, every one of them read
+// residency before any load had landed, and every one of them then minted the
+// same identifier and called `lms load`.
+
+/// The verbatim `lms ps --json` row for the resident in the failing run.
+fn ps_row_2318() -> darkmux_types::LoadedModel {
+    darkmux_types::LoadedModel {
+        identifier: "darkmux:qwen/qwen3.8-27b".to_string(),
+        model: "qwen/qwen3.8-27b".to_string(),
+        status: "idle".to_string(),
+        size: "16.08 GB".to_string(),
+        context: 262144,
+    }
+}
+
+fn pm_2318() -> darkmux_types::ProfileModel {
+    darkmux_types::ProfileModel {
+        id: "qwen/qwen3.8-27b".to_string(),
+        n_ctx: Some(262144),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn slash_bearing_resident_is_recognized() {
+    // The CONTROL for the filed hypothesis. A slash-bearing id is owned,
+    // matched and ctx-sufficient exactly like a slash-free one.
+    let row = ps_row_2318();
+    assert!(darkmux_gestalt::is_darkmux_owned(&row.identifier));
+    assert_eq!(
+        darkmux_gestalt::namespaced_identifier("qwen/qwen3.8-27b", None),
+        row.identifier
+    );
+    assert!(crate::dispatch_internal::is_reloadable_target(
+        &row.model,
+        &row.identifier,
+        "qwen/qwen3.8-27b",
+        None
+    ));
+    // The slash-free id the same mission's seven `crawl.unit` steps used.
+    assert!(crate::dispatch_internal::is_reloadable_target(
+        "qwen3.6-35b-a3b-turboquant-mlx",
+        "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+        "qwen3.6-35b-a3b-turboquant-mlx",
+        None
+    ));
+}
+
+#[test]
+fn planner_reuses_a_slash_bearing_resident() {
+    // Planner-level control: the gestalt residency arbiter reaches Reuse for
+    // the slash-bearing row, no load action.
+    let row = ps_row_2318();
+    let resident = darkmux_gestalt::ResidentFact {
+        identifier: row.identifier.clone(),
+        model_key: row.model.clone(),
+        ctx: row.context,
+        est_bytes: Some(16_081_678_492),
+    };
+    let placement = darkmux_gestalt::Placement {
+        model_key: "qwen/qwen3.8-27b".to_string(),
+        identifier: darkmux_gestalt::namespaced_identifier("qwen/qwen3.8-27b", None),
+        min_ctx: 262_144,
+        seat: "step:2318".to_string(),
+    };
+    assert_eq!(
+        darkmux_gestalt::decide_residency(&[resident], &placement),
+        darkmux_gestalt::ResidencyDecision::Reuse {
+            identifier: "darkmux:qwen/qwen3.8-27b".to_string(),
+            resident_ctx: 262_144,
+        }
+    );
+}
+
+#[test]
+fn identifier_already_resident_classifies_the_real_refusal() {
+    assert!(crate::dispatch_internal::identifier_already_resident(
+        "`lms load` exited with exit status: 1: Error: A model with identifier \
+         darkmux:qwen/qwen3.8-27b already exists."
+    ));
+    // Unrelated load failures must NOT take the reuse arm.
+    assert!(!crate::dispatch_internal::identifier_already_resident(
+        "`lms load` exited with exit status: 1: Error: insufficient memory"
+    ));
+    assert!(!crate::dispatch_internal::identifier_already_resident(
+        "model `qwen/qwen3.8-27b` was not found by LMStudio"
+    ));
+}
+
+#[test]
+#[serial_test::serial]
+fn concurrent_siblings_issue_exactly_one_load() {
+    // RED before the fix: six sibling steps, model absent, every thread reads
+    // residency before any load lands → six `lms load` calls against the same
+    // identifier, five of which LMStudio refuses. GREEN after: the preflight
+    // serializes, so one loads and five reuse.
+    use std::sync::{Arc, Mutex};
+    let resident: Arc<Mutex<Vec<darkmux_types::LoadedModel>>> = Arc::new(Mutex::new(Vec::new()));
+    let loads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let pm = pm_2318();
+    std::thread::scope(|scope| {
+        for _ in 0..6 {
+            let resident = Arc::clone(&resident);
+            let loads = Arc::clone(&loads);
+            let pm = pm.clone();
+            scope.spawn(move || {
+                crate::dispatch_internal::ensure_model_resident(
+                    &pm,
+                    &|| resident.lock().unwrap().clone(),
+                    &|_| Ok(()),
+                    &|_key, identifier, _n_ctx| {
+                        // Every ATTEMPT is recorded, not just the one that
+                        // wins: six siblings each launching a 16 GB `lms load`
+                        // of the same weights is the defect, whether or not the
+                        // losers later recover.
+                        loads.lock().unwrap().push(identifier.to_string());
+                        // The host admits the first load of an identifier and
+                        // refuses every later one, exactly as LMStudio did.
+                        let mut held = resident.lock().unwrap();
+                        if held.iter().any(|m: &darkmux_types::LoadedModel| m.identifier == identifier) {
+                            anyhow::bail!(
+                                "`lms load` exited with exit status: 1: Error: A model with \
+                                 identifier {identifier} already exists."
+                            );
+                        }
+                        // A real load is not instantaneous; the window it opens
+                        // is the whole bug.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        held.push(ps_row_2318());
+                        Ok(())
+                    },
+                )
+                .expect("every sibling must reach a resident model");
+            });
+        }
+    });
+    assert_eq!(
+        loads.lock().unwrap().as_slice(),
+        &["darkmux:qwen/qwen3.8-27b".to_string()],
+        "six concurrent siblings must ATTEMPT exactly ONE load of the shared identifier"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn already_resident_refusal_recovers_by_reusing() {
+    // The cross-process half: another darkmux loaded the model between our read
+    // and our load, so `lms load` is refused. A resident that satisfies the
+    // declared context IS the thing to reuse — the refusal must not fail the
+    // dispatch.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let reads = AtomicUsize::new(0);
+    let out = crate::dispatch_internal::ensure_model_resident(
+        &pm_2318(),
+        &|| {
+            // First read: absent (what our thread saw). Later reads: present.
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                Vec::new()
+            } else {
+                vec![ps_row_2318()]
+            }
+        },
+        &|_| Ok(()),
+        &|_key, identifier, _n_ctx| {
+            anyhow::bail!(
+                "`lms load` exited with exit status: 1: Error: A model with identifier \
+                 {identifier} already exists."
+            )
+        },
+    );
+    assert!(out.is_ok(), "expected reuse, got {:?}", out.err().map(|e| format!("{e:#}")));
+}
+
+#[test]
+#[serial_test::serial]
+fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
+    // The refusal is only benign when the resident actually satisfies the
+    // declared context. A smaller one is the #1135 class and must stay loud.
+    //
+    // The `list` closure has to mirror the reuse test's: the FIRST read is what
+    // our thread saw (absent, which is why it tried to load at all), and the
+    // re-probe after the refusal is what returns the too-small resident. A
+    // closure that always returns empty takes the `None` arm instead and never
+    // exercises this one at all.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut small = ps_row_2318();
+    small.context = 4096;
+    let reads = AtomicUsize::new(0);
+    let out = crate::dispatch_internal::ensure_model_resident(
+        &pm_2318(),
+        &|| {
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                Vec::new()
+            } else {
+                vec![small.clone()]
+            }
+        },
+        &|_| Ok(()),
+        &|_key, identifier, _n_ctx| {
+            anyhow::bail!(
+                "`lms load` exited with exit status: 1: Error: A model with identifier \
+                 {identifier} already exists."
+            )
+        },
+    );
+    let err = format!("{:#}", out.expect_err("a refused load with no usable resident must error"));
+    assert!(err.contains("#2318"), "message must name this class, got: {err}");
+    assert!(!err.contains("#1139"), "must stop citing #1139 for this case, got: {err}");
+    // Naming BOTH numbers is what proves this arm ran rather than the `None`
+    // one: only the smaller-ctx arm has a resident to report a context for.
+    assert!(err.contains("4096"), "message must name the resident's context, got: {err}");
+    assert!(err.contains("262144"), "message must name the declared n_ctx, got: {err}");
+}
