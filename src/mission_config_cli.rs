@@ -936,6 +936,7 @@ mod tests {
             reads: Vec::new(),
             role_id: role_id.map(str::to_string),
             steps,
+            grow: None,
             extras: Default::default(),
         }
     }

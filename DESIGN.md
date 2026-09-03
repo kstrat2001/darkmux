@@ -525,7 +525,7 @@ Semantic rules with no cheap prefilter (`doc-contradicts-code`) are the part a l
 crawl.json ──prune(enabled)──▶ minted run: plan phase, one task per LIVE rule
                                   │  config-snapshot.json (declared), graph-report.json (what was left out)
                                   ▼
-  crawl.plan (per rule) ──▶ plan/<rule>.json ─── output = path ──▶ [#2300] unit tasks grown per plan unit,
+  crawl.plan (per rule) ──▶ plan/<rule>.json ─── output = path ──▶ unit tasks GROWN per plan unit,
                                                                      each tagged with its rule (a TRACK)
                                                                              │
                               crawler role reads the rule's match/no_match/evidence text, one unit per task
@@ -542,7 +542,7 @@ crawl.json ──prune(enabled)──▶ minted run: plan phase, one task per LI
                                                         create_mod / mod create ──▶ ~/.darkmux/mods/<key>/ (kit + attachments)
 ```
 
-Two things in that picture are design, not delivery, as of this writing: the arrow from a plan step's output to grown unit tasks (#2300: today `src/crawl_launch.rs` reads the plan in Rust and drives the units itself, and `mission launch crawl` is routed to it by literal config id), and the follow-on step per finding (#2302). Tracks run in parallel under machine-aware admission (#2303), fail independently, and resume alone; a minted step records the plan it came from and, later, the admission decision that scheduled it, so the operator never wonders where a step came from.
+The grow arrow is delivered (#2300): a task in a mission config may declare `grow`, and the generic launcher expands it at the phase boundary — see "Mission configs: a step's output grows the graph" below. What is still design as of this writing: `crawl.json`'s unit phase does not declare `grow` yet, because the unit step kind does not exist (#2301 — today `src/crawl_launch.rs` reads the plan in Rust and drives the units itself, and `mission launch crawl` is routed to it by literal config id), and the follow-on step per finding (#2302). Tracks run in parallel under machine-aware admission (#2303), fail independently, and resume alone; a minted step records the plan it came from and, later, the admission decision that scheduled it, so the operator never wonders where a step came from.
 
 ### What each record is for
 
@@ -550,7 +550,9 @@ Two things in that picture are design, not delivery, as of this writing: the arr
 |---|---|---|---|
 | `config-snapshot.json` | mint | provenance; `mission status` | mission id |
 | `graph-report.json` | mint (prune) | `mission status`; the `mission start` record carries the same object | mission id |
-| `plan/<rule>.json` | `crawl.plan` step | the grow seam (#2300); `--param plan=` reuse today | mission id + rule |
+| `plan/<rule>.json` | `crawl.plan` step | the grow seam (`grow.from`, #2300); `--param plan=` reuse today | mission id + rule |
+| `grown_from` on a grown step's `config` | the grow seam | the on-disk step record; `graph-report.json` carries the same triple per copy | `{task, item, index}` |
+| `graph-report.json`'s `grown[]` | the grow seam (appended post-mint) | `mission status`; the `mission.grow` flow record carries the same facts | mission id |
 | `dispatch.tool` record with `emitted` | the runtime, via `create_finding` | hooks (external trackers); `finding sync` | dispatch session + `emit_seq` |
 | `findings/<dispatch>/<seq>/finding.json` | `finding sync` (the tailer) | `finding list/show`; `dispatch --finding`; brief refs | `<dispatch>/<seq>` |
 | `mods/<key>/mod.json` + `attachments/` | `mod create`; `create_mod` | `mod list/show`; `dispatch --mod`; the integration mission | minted `mod-<secs>-<hex>` |
@@ -591,6 +593,21 @@ Tokens on the local seat versus the frontier seat per crawl PR. The frontier-onl
 ### Mission configs: a disabled step never exists in the run
 
 A phase, task or step in a mission config may carry `enabled: false`. It is pruned when the run is minted, before anything is interpreted or persisted, so the run's graph is exactly what will execute. There is no gray state: a nightly crawl config with ten plan tasks and six enabled shows six. A task whose steps were all disabled goes with them, a phase whose tasks all went goes too, and a task whose every dependency was pruned is pruned in turn, while one live dependency keeps it and it simply sees fewer inputs. Provenance is the resolved-config snapshot the run already keeps, which carries the flags verbatim, plus a `graph-report.json` beside it naming what was declared, what was minted, and each pruned item's reason; `mission status` prints the one-line count and the `mission start` record carries the same report. There is deliberately no CLI override. The config is the only place a run's shape comes from: edit the JSON, run, and the snapshot records it.
+
+### Mission configs: a step's output grows the graph
+
+A task may declare `grow` instead of being a task:
+
+```json
+"grow": { "from": "plan-task", "items": "units", "id": "{{item.id}}",
+          "config": { "unit": "{{item.id}}", "rule": "{{item.rule}}" } }
+```
+
+The task is then a **template** and is never minted. After the phase containing `from` completes, the launcher reads that task's last step `output` as a path to a JSON file — the contract every producing step honors — loads it, takes the array at `items`, and mints one copy of the template, with all its steps, per item. `{{item.<field>}}` renders from the item's own top-level scalar fields, into the copy's id suffix and into every step's config; a whole-string placeholder keeps the field's JSON type, so a number stays a number. Zero items mints zero copies, and the phase is explicitly started and completed with `grew_nothing` recorded rather than failing — a phase with no steps is invisible to the step-driven phase open/close, so without that it would sit `Planned` all run and be swept to `Abandoned` by the finalize backstop, recording a failure where the plan simply planned nothing. Every other way this can go wrong — the producer never ran, produced no output, named a path that isn't there, or wrote a shape the template didn't ask for — is a loud error naming the task and the path, never a quiet zero. That is deliberate: the retired `expand` primitive (schema 1.1–1.4) shipped for two schema versions silently expanding to nothing, and the whole point of `grow` is that its input is produced by the run rather than handed in at launch.
+
+**Growth happens at a phase boundary, and that is a real trade.** `run_step_graph` takes its task map by shared reference, so the graph cannot grow mid-run. The generic launcher therefore runs one graph call per phase, in config order, and expands a phase's templates just before minting it. The cost: two phases with no edge between them no longer overlap. That is acceptable because phases are already sequential by design here (`phase_order` and the lazy phase-close logic both assume a strictly linear order), and parallelism lives *inside* a phase, where the wave scheduler still runs every independent task concurrently.
+
+Provenance is on the record, not in the operator's head: every grown step's `config` carries `grown_from: {task, item, index}`, and the item's `rule` lands on `config.rule` through the template. Neither is *rendered* yet — the graph lens builds its step rows without `config`, and `finding list` reads the unit and rule out of a finding's own context — so surfacing them in the viewer, which is what would let an operator filter a run by track, is follow-up. What is readable today: the run's `graph-report.json` gains a `grown` entry per growth event naming the template, the producer, the artifact path, the item count and the real task ids minted; one `mission.grow` flow record carries the same facts live; the phase record's `task_ids` lists the grown tasks alongside the phase's declared ones (the generic launcher writes that field now, matching `crawl_launch.rs`); and `mission status` prints "grew N task(s) from `<from>`".
 
 ## ACP: darkmux inside the editor
 

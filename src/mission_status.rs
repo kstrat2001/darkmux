@@ -624,6 +624,13 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             if let Some(g) = v.graph.as_ref().filter(|g| g.pruned_anything()) {
                 println!("      {} {}", style::dim("·"), style::dim(&format!("graph: {}", g.summary_line())));
             }
+            // (#2300) Growth is the opposite direction from pruning — tasks
+            // the config never counted, minted at a phase boundary from a
+            // step's output — so it gets its own line rather than being
+            // folded into the "N of M steps minted" arithmetic above.
+            if let Some(line) = v.graph.as_ref().and_then(|g| g.grown_line()) {
+                println!("      {} {}", style::dim("·"), style::dim(&format!("graph: {line}")));
+            }
             for d in &v.drifts {
                 // The ⚠ marks the warning, not each of its lines — continuation
                 // lines get blank space in the marker column so one wrapped

@@ -35,10 +35,12 @@
 //! (Rust-only rename; the serde field stays `mission`, so operator
 //! config.json files are untouched).
 
+pub mod grow;
 pub mod interpret;
 pub mod prune;
 pub mod load;
 
+pub use grow::{grow_task, items_from_artifact, GrownFrom};
 pub use interpret::{interpret, LaunchParams, TaskOverride};
 pub use load::{has_non_user_fallback, list_ids, load, LoadedMissionConfig, MissionConfigSource};
 
@@ -150,10 +152,31 @@ use std::collections::{BTreeMap, BTreeSet};
 /// snapshot is the record. A pre-3.1 reader ignores the field and mints
 /// everything, which is the additive contract.
 ///
+/// Bumped to **"3.2"** (#2300) — additive: [`TaskConfig`] gained the optional
+/// `grow` field ([`GrowSpec`]). A task declaring it is a TEMPLATE, never
+/// minted itself: at the boundary of the phase that owns it, the launcher
+/// reads the `from` task's last step `output` as a PATH to a JSON file,
+/// takes the array at `items`, and mints one copy of the template (all its
+/// steps) per item. `{{item.<field>}}` in `id`/`config` renders from the
+/// item's own top-level scalar fields.
+///
+/// This is NOT the schema-1.1 `expand`/`ExpansionSpec` primitive coming
+/// back (removed in 2.0 above, and deliberately not resurrected). That one
+/// was fed by a LAUNCH PARAM — a collection the launcher already held
+/// before the run started — which is exactly why both production launchers
+/// always handed it an empty map and nothing ever grew. `grow` is fed by a
+/// STEP'S OUTPUT, produced by work the run itself did: the fan-out cannot
+/// be known at launch time, because the plan it fans out over does not
+/// exist yet. Different input, different lifetime, different mechanism.
+///
+/// A pre-3.2 reader ignores the field and mints nothing for that task,
+/// which is the additive contract (the template is not executable on its
+/// own in any reader).
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "3.1";
+pub const MISSION_CONFIG_SCHEMA: &str = "3.2";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -363,6 +386,7 @@ pub fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &s
             gate: None,
             extras: BTreeMap::new(),
         }],
+        grow: None,
         extras: BTreeMap::new(),
     };
     config.phases.insert(
@@ -516,6 +540,63 @@ pub struct TaskConfig {
     /// purely positional intra-task ordering).
     #[serde(default)]
     pub steps: Vec<StepConfig>,
+    /// (#2300, schema 3.2) Run-time fan-out: this task is a TEMPLATE grown
+    /// into N real copies from an upstream step's OUTPUT. See [`GrowSpec`].
+    /// `None` (every pre-3.2 document) means the task mints exactly once,
+    /// as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grow: Option<GrowSpec>,
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+/// (#2300) The map-shaped fan-out a [`TaskConfig`] declares: one copy of
+/// this task per item in an artifact an EARLIER phase produced.
+///
+/// ```json
+/// "grow": {
+///   "from": "crawl-plan-task",
+///   "items": "units",
+///   "id": "{{item.id}}",
+///   "config": { "unit": "{{item.id}}", "rule": "{{item.rule}}" }
+/// }
+/// ```
+///
+/// **Where the data comes from.** `from` names a task in an EARLIER phase
+/// (a same-phase or later-phase `from` is a validation `Error` — the
+/// producer must have run before the consumer's phase is minted, and
+/// growth happens at the phase boundary). That task's LAST step `output`
+/// is read as a PATH to a JSON file — the contract every producing step
+/// honors (`crawl.plan` writes `plan/<rule>.json` and returns that path).
+/// `items` names a TOP-LEVEL key of that file whose value is an array.
+///
+/// **What gets minted.** One copy of the whole task — every step, in
+/// order — per item. The template itself is never minted. Zero items
+/// mints zero copies and the phase completes with a recorded reason
+/// (`grew_nothing`), which is a real outcome, not a failure.
+///
+/// **Templating.** `id` renders into the copy's task-id SUFFIX
+/// (`<template id>-<rendered>`; each step id gets the same suffix), and
+/// every key of `config` is merged into EVERY step's `config` in the copy.
+/// `{{item.<field>}}` substitutes the item's own top-level SCALAR fields
+/// (string/number/bool); naming an object or array field is an error, not
+/// a stringified blob.
+///
+/// **Edges.** `depends_on`/`reads` declared on the template apply to every
+/// copy; copies never depend on each other, so a track fails alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowSpec {
+    /// Task id, in an EARLIER phase, whose last step output is the path to
+    /// the JSON artifact to grow from.
+    pub from: String,
+    /// Top-level key of that artifact holding the array of items.
+    pub items: String,
+    /// Per-copy task-id suffix template, e.g. `"{{item.id}}"`.
+    pub id: String,
+    /// Templates merged into every step's `config` in each copy. An object;
+    /// anything else is a validation `Error`.
+    #[serde(default)]
+    pub config: serde_json::Value,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
@@ -713,9 +794,18 @@ impl MissionConfig {
         let mut seen_step_ids: BTreeSet<&str> = BTreeSet::new();
         let mut all_task_ids: BTreeSet<&str> = BTreeSet::new();
 
-        for phase in &self.phases {
+        // (#2300) Task id -> the index of the phase that declares it, so a
+        // `grow.from` can be checked for the ONE relation that makes growth
+        // possible: the producer's phase must have already run.
+        let mut phase_index_of_task: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut grow_templates: BTreeSet<&str> = BTreeSet::new();
+        for (pi, phase) in self.phases.iter().enumerate() {
             for task in &phase.tasks {
                 all_task_ids.insert(task.id.as_str());
+                phase_index_of_task.entry(task.id.as_str()).or_insert(pi);
+                if task.grow.is_some() {
+                    grow_templates.insert(task.id.as_str());
+                }
             }
         }
 
@@ -797,6 +887,107 @@ impl MissionConfig {
                 // per-item at interpret time — retired with the expansion
                 // primitive; every task's steps are now real from the
                 // document, so the exemption's premise is gone too.)
+                // (#2300) `grow` — the run-time fan-out. Every check here
+                // is an Error, not a Warning: a growth spec that can't
+                // resolve doesn't degrade, it mints ZERO tasks, and a phase
+                // that silently mints nothing is exactly the failure mode
+                // the retired `expand` primitive shipped for two schema
+                // versions (see MISSION_CONFIG_SCHEMA's 2.0 note).
+                if let Some(grow) = &task.grow {
+                    let grow_path = format!("{task_path}.grow");
+                    if grow.from.trim().is_empty() {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{grow_path}.from"),
+                            message: format!("task \"{}\" declares `grow` with an empty `from`", task.id),
+                        });
+                    } else if grow.from == task.id {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{grow_path}.from"),
+                            message: format!("task \"{}\" grows from itself", task.id),
+                        });
+                    } else {
+                        match phase_index_of_task.get(grow.from.as_str()) {
+                            None => findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: format!("{grow_path}.from"),
+                                message: format!(
+                                    "task \"{}\" grows from unknown task id \"{}\"",
+                                    task.id, grow.from
+                                ),
+                            }),
+                            Some(&from_pi) if from_pi >= pi => findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: format!("{grow_path}.from"),
+                                message: format!(
+ "task \"{}\" (phase \"{}\") grows from task \"{}\", which is declared in the {} phase \"{}\" — growth \
+  happens at a PHASE BOUNDARY, so the producing task must live in an EARLIER phase or its output does \
+  not exist yet when this phase is minted",
+                                    task.id,
+                                    phase.id,
+                                    grow.from,
+                                    if from_pi == pi { "same" } else { "later" },
+                                    self.phases[from_pi].id
+                                ),
+                            }),
+                            Some(_) => {}
+                        }
+                    }
+                    if grow.items.trim().is_empty() {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{grow_path}.items"),
+                            message: format!(
+ "task \"{}\" declares `grow` with an empty `items` — name the top-level key of the produced JSON \
+  holding the array to map over",
+                                task.id
+                            ),
+                        });
+                    }
+                    if grow.id.trim().is_empty() {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{grow_path}.id"),
+                            message: format!(
+ "task \"{}\" declares `grow` with an empty `id` — every copy needs a distinct id suffix (e.g. \"{{{{item.id}}}}\")",
+                                task.id
+                            ),
+                        });
+                    }
+                    if !grow.config.is_null() && !grow.config.is_object() {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{grow_path}.config"),
+                            message: format!(
+ "task \"{}\" declares `grow.config` as {}, but it must be an object — its keys are merged into every \
+  grown step's config",
+                                task.id,
+                                if grow.config.is_array() { "an array" } else { "a scalar" }
+                            ),
+                        });
+                    }
+                }
+
+                // (#2300) A grow template is not a real task at run time —
+                // its copies do not exist until the phase boundary — so
+                // nothing can name it as a dependency and get an edge.
+                for (relation, entries) in [("depends_on", &task.depends_on), ("reads", &task.reads)] {
+                    for dep in entries {
+                        if grow_templates.contains(dep.as_str()) {
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: format!("{task_path}.{relation}"),
+                                message: format!(
+ "task \"{}\" {relation} \"{dep}\", which is a `grow` TEMPLATE — a template is never minted, so this \
+  edge would resolve to nothing. Name the template's own `grow.from` producer instead",
+                                    task.id
+                                ),
+                            });
+                        }
+                    }
+                }
+
                 if task.steps.is_empty() {
                     findings.push(ValidationFinding {
                         severity: FindingSeverity::Error,
@@ -1030,6 +1221,7 @@ mod tests {
             reads: Vec::new(),
             role_id: None,
             steps,
+            grow: None,
             extras: BTreeMap::new(),
         }
     }
@@ -1864,7 +2056,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_3_1() {
+    fn schema_version_constant_is_3_2() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
@@ -1883,7 +2075,140 @@ mod tests {
         //
         // (#2299) Bumped to "3.1" — additive: `enabled` on phases, tasks and
         // steps, pruned at mint. A pre-3.1 reader ignores it and mints all.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "3.1");
+        //
+        // (#2300) Bumped to "3.2" — additive: `TaskConfig::grow`, the
+        // run-time fan-out fed by a step's OUTPUT. A pre-3.2 reader ignores
+        // the field and mints nothing for the template, which is correct:
+        // a template is not executable on its own in any reader.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "3.2");
+    }
+
+    // ── (#2300) `grow` — the run-time fan-out ────────────────────────────
+
+    fn grow_doc(from_phase: &str, consumer_phase: &str) -> MissionConfig {
+        // `p1` produces; the template lives in whichever phase the caller
+        // names, so a same-phase / later-phase `from` is expressible.
+        let producer = task("plan-task", &[], vec![step("plan-step", "procedural.shell")]);
+        let mut template = task("unit-task", &[], vec![step("unit-step", "procedural.noop")]);
+        template.grow = Some(GrowSpec {
+            from: "plan-task".into(),
+            items: "units".into(),
+            id: "{{item.id}}".into(),
+            config: serde_json::json!({ "unit": "{{item.id}}" }),
+            extras: BTreeMap::new(),
+        });
+        let mut phases = vec![phase("p1", vec![]), phase("p2", vec![])];
+        for p in &mut phases {
+            if p.id == from_phase {
+                p.tasks.push(producer.clone());
+            }
+            if p.id == consumer_phase {
+                p.tasks.push(template.clone());
+            }
+        }
+        MissionConfig { phases, ..doc(Vec::new()) }
+    }
+
+    fn grow_errors(config: &MissionConfig) -> Vec<String> {
+        config
+            .validate(&["procedural.shell", "procedural.noop"])
+            .into_iter()
+            .filter(|f| f.severity == FindingSeverity::Error)
+            .map(|f| format!("{}: {}", f.path, f.message))
+            .collect()
+    }
+
+    #[test]
+    fn a_grow_block_parses_off_the_wire_and_round_trips() {
+        let json = r#"{
+            "id": "g", "name": "G", "phases": [
+              {"id": "p1", "tasks": [{"id": "plan-task", "steps": [
+                 {"id": "plan-step", "kind": "procedural.shell", "config": {}}]}]},
+              {"id": "p2", "tasks": [{"id": "unit-task",
+                 "grow": {"from": "plan-task", "items": "units", "id": "{{item.id}}",
+                          "config": {"unit": "{{item.id}}", "rule": "{{item.rule}}"}},
+                 "steps": [{"id": "unit-step", "kind": "procedural.noop", "config": {}}]}]}
+            ]}"#;
+        let cfg: MissionConfig = serde_json::from_str(json).expect("a 3.2 document parses");
+        let grow = cfg.phases[1].tasks[0].grow.as_ref().expect("grow parsed");
+        assert_eq!(grow.from, "plan-task");
+        assert_eq!(grow.items, "units");
+        assert_eq!(grow.id, "{{item.id}}");
+        assert_eq!(grow.config["rule"], serde_json::json!("{{item.rule}}"));
+        // Round-trip: `grow` survives a save/load cycle unchanged.
+        let again: MissionConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(again, cfg);
+        assert!(grow_errors(&cfg).is_empty(), "{:?}", grow_errors(&cfg));
+    }
+
+    #[test]
+    fn a_task_with_no_grow_omits_the_key_entirely() {
+        // Additive contract: a pre-3.2 document round-trips byte-identically.
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![task("t", &[], vec![step("s", "procedural.noop")])],
+        )]);
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(!text.contains("grow"), "an absent grow must not serialize: {text}");
+    }
+
+    #[test]
+    fn a_same_phase_grow_from_is_an_error_naming_the_phase_boundary() {
+        let errs = grow_errors(&grow_doc("p2", "p2"));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("same phase"), "{errs:?}");
+        assert!(errs[0].contains("PHASE BOUNDARY"), "{errs:?}");
+    }
+
+    #[test]
+    fn a_later_phase_grow_from_is_an_error() {
+        let errs = grow_errors(&grow_doc("p2", "p1"));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("later phase"), "{errs:?}");
+    }
+
+    #[test]
+    fn an_earlier_phase_grow_from_validates_clean() {
+        assert!(grow_errors(&grow_doc("p1", "p2")).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_or_self_referential_grow_from_is_an_error() {
+        let mut cfg = grow_doc("p1", "p2");
+        cfg.phases[1].tasks[0].grow.as_mut().unwrap().from = "nope".into();
+        assert!(grow_errors(&cfg).iter().any(|e| e.contains("unknown task id")), "{:?}", grow_errors(&cfg));
+        cfg.phases[1].tasks[0].grow.as_mut().unwrap().from = "unit-task".into();
+        assert!(grow_errors(&cfg).iter().any(|e| e.contains("grows from itself")), "{:?}", grow_errors(&cfg));
+    }
+
+    #[test]
+    fn empty_grow_fields_and_a_non_object_config_are_errors() {
+        let mut cfg = grow_doc("p1", "p2");
+        {
+            let g = cfg.phases[1].tasks[0].grow.as_mut().unwrap();
+            g.items = "  ".into();
+            g.id = String::new();
+            g.config = serde_json::json!([1, 2]);
+        }
+        let errs = grow_errors(&cfg);
+        assert_eq!(errs.len(), 3, "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("grow.items")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("grow.id")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("must be an object")), "{errs:?}");
+    }
+
+    #[test]
+    fn depending_on_a_grow_template_is_an_error() {
+        // The template is never minted, so the edge could only resolve to
+        // nothing — silently, which is the whole failure class #2300 exists
+        // not to repeat.
+        let mut cfg = grow_doc("p1", "p2");
+        let mut consumer = task("after", &["unit-task"], vec![step("after-step", "procedural.noop")]);
+        consumer.reads = vec!["unit-task".into()];
+        cfg.phases.push(phase("p3", vec![consumer]));
+        let errs = grow_errors(&cfg);
+        assert_eq!(errs.len(), 2, "one per relation: {errs:?}");
+        assert!(errs.iter().all(|e| e.contains("grow` TEMPLATE")), "{errs:?}");
     }
 
     // ── (#1684) `panel` schema field ─────────────────────────────────────

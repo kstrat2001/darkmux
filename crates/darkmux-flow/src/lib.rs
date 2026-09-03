@@ -2993,7 +2993,11 @@ mod tests {
         //   1.37.0: `mission start` gains `graph` on config-launched runs —
         //           what the config declared vs what was minted, and every
         //           `enabled: false` item pruned with its reason (#2299).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.37.0");
+        //   1.38.0: a new `mission.grow` action — one record per growth
+        //           event, naming the template, the producing task, the
+        //           artifact path, the item count and the real task ids
+        //           minted from it (#2300).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.38.0");
     }
 
     #[test]
