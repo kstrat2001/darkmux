@@ -126,7 +126,13 @@ export function Masthead({
 }) {
   const queryClient = useQueryClient();
   const [spinning, setSpinning] = useState(false);
-  const live = isLiveRoute(route);
+  // (header owns liveness, operator 2026-09-03) The badge is the ONE liveness
+  // indicator on every page: shown on every daemon-backed route that is not
+  // a replay. A dispatch/mission page whose day is known is a recording — the
+  // date chip (and, for a dispatch, the transport) carries the mode, and a
+  // "● live" beside it would be false. While the day is still unknown (the
+  // subject is running, chip reads RESULT) the page is live and says so.
+  const live = isLiveRoute(route) && replayDate == null;
 
   const verMeta = injectedMeta("darkmux-version");
   const schemaMeta = injectedMeta("darkmux-flow-schema");

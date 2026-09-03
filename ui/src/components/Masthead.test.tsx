@@ -184,11 +184,13 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     vi.unstubAllGlobals();
   });
 
-  it("a daemon dispatch/mission page reads RESULT until the shell knows its day, then the date — and never a playback badge", () => {
+  it("a daemon dispatch/mission page reads RESULT until the shell knows its day, then the date — the LIVE badge while unknown, no badge once known, never a playback badge", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const unknown = renderMasthead({ kind: "dispatch", dispatchId: "s1" } as never);
     expect(unknown.container.querySelector(".catalog-toggle")?.textContent).toBe("RESULT");
-    expect(unknown.container.querySelector("#modebadge")).toBeNull();
+    // (header owns liveness, 2026-09-03) Day unknown ⇒ the subject is still
+    // running ⇒ this is a live page ⇒ the same header badge as every lens.
+    expect(unknown.container.querySelector("#modebadge")?.textContent).toMatch(/live/i);
     unknown.unmount();
     const known = renderMasthead({ kind: "mission", missionId: "m1", stepId: null } as never, "live", "2026-08-07");
     expect(known.container.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07");
@@ -237,3 +239,17 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     vi.unstubAllGlobals();
   });
 });
+// (header owns liveness, operator 2026-09-03) The live badge is GLOBAL chrome:
+// it renders on every daemon-backed route, the mission and dispatch pages
+// included — no lens paints its own.
+describe("live badge on every daemon-backed route", () => {
+  it("renders on the mission route", () => {
+    const { container } = renderMasthead({ kind: "mission", missionId: "m1", stepId: null } as Route, "live");
+    expect(container.querySelector("#modebadge")?.textContent).toMatch(/live/i);
+  });
+  it("renders on the dispatch route, and reflects a dropped stream", () => {
+    const { container } = renderMasthead({ kind: "dispatch", dispatchId: "d1" } as Route, "reconnecting");
+    expect(container.querySelector("#modebadge")?.textContent).toMatch(/reconnecting/i);
+  });
+});
+

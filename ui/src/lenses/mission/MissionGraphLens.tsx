@@ -49,29 +49,16 @@
  *   alone misses them. SAME `queryKeys.flowDate` key `useFlowWindow` (always
  *   mounted at `App.tsx`) already populates — TanStack dedupes, no second
  *   request.
- * - Live tail: this component mounts its OWN `useLiveTail(true)` — the
- *   SHARED SSE primitive (`lib/sse.ts`/`hooks/useLiveTail.ts`), the same one
- *   `App.tsx` mounts for the fleet window, feeding the SAME
- *   `queryKeys.flowTail(date)` cache shape. `App.tsx` never runs its own
- *   copy for THIS route (`isLiveRoute` still excludes `mission` — the
- *   fleet-wide rolling window `useFlowWindow` feeds is not what this lens
- *   needs), so there is exactly one open EventSource while this lens is
- *   mounted, never two.
- *
- * All three record sources are folded through the SAME pure functions
- * (`recordInMission`/`applyFlowRecord`/`applyRecordToMetrics`) regardless of
- * which endpoint they came from — mission-graph.html's own design (backfill
- * and live records share one `recordInMission` filter and one metrics
- * accumulator); this port keeps that by re-deriving from the full known
- * record set on every change (a pure fold) rather than the legacy page's
- * imperative per-record `setState` reducer — see `graph.ts`'s own module doc.
+ * - Live tail: NONE of its own (since 2026-09-03). `App.tsx` mounts the
+ *   one `useLiveTail` for every live route, this one included; this lens
+ *   reads the `flowTail` cache slot that mount writes. The header badge is
+ *   the liveness indicator; this lens paints no pill.
  */
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
 import { getSource } from "../../lib/source";
-import { useLiveTail } from "../../hooks/useLiveTail";
 import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
 import { MissionCanvas } from "./MissionCanvas";
 import { MissionTimelineView } from "./MissionTimelineView";
@@ -85,7 +72,6 @@ import {
   normalizeMissionStatus,
   recordInMission,
   seedMetricsFromGraph,
-  statusRank,
   type GraphStep,
   type MetricsMap,
   type MissionGraph,
@@ -369,7 +355,10 @@ export function MissionGraphLens({
   // here). `flowTailQuery` reads the SAME cache slot `useLiveTail` writes,
   // via `skipToken` (never fetches on its own), matching `useFlowWindow`'s
   // own precedent for reading a tail it doesn't own.
-  const liveStatus = useLiveTail(daemonBacked);
+  // (header owns liveness, 2026-09-03) No lens-local tail: the app-level
+  // `useLiveTail` in `App.tsx` runs on this route now (`isLiveRoute`) and
+  // writes the `flowTail` slot read below; the masthead's `#modebadge` is the
+  // one liveness indicator.
   const flowTailQuery = useQuery<FlowRecord[]>({ queryKey: queryKeys.flowTail(today), queryFn: skipToken });
 
   const [ownedBy, setOwnedBy] = useState<string | null>(null);
@@ -634,11 +623,6 @@ export function MissionGraphLens({
   const useTimeline = timelineActive(viewMode, isMobile);
   const tot = missionTotals(metrics);
   const status = normalizeMissionStatus(graph.mission_status);
-  // Static builds never show the live pill. `useLiveTail(false)` never opens
-  // a connection and its status stays at its `useState` INITIAL value —
-  // `"live"`, forever (see that hook's own doc) — which would otherwise
-  // render a confident "● live" on a page with no daemon anywhere near it.
-  const showLivePill = daemonBacked && !(liveStatus === "live" && statusRank(status) >= 2);
 
   return (
     <div className="missionlens">
@@ -647,9 +631,6 @@ export function MissionGraphLens({
           {graph.mission_id}
         </span>
         <span className={`mstatus ${status}`}>{status}</span>
-        {showLivePill ? (
-          <span className={`livepill${liveStatus === "live" ? " on" : " off"}`}>{liveStatus === "live" ? "● live" : "○ reconnecting"}</span>
-        ) : null}
         <MeterEl tot={tot} />
         <ProcEl proc={proc} />
         {/* (#2032 packet 2) No daemon behind a static build to refetch

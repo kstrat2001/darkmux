@@ -221,15 +221,10 @@ export type Route =
  * SAME rolling `useFlowWindow` this app has no separate playback data
  * pipeline for yet (see `PlaybackLens`'s own module doc).
  *
- * `mission` stays excluded even though `MissionGraphLens` (#1868) genuinely
- * IS live (it runs its own SSE subscription): the App-level tail this flag
- * gates is scoped to the FLEET-WIDE two-day window `useFlowWindow` builds,
- * which the mission lens doesn't need — it mounts its OWN
- * `useLiveTail(true)` call, the same shared primitive, independently (see
- * `MissionGraphLens.tsx`'s own doc). Two mounts of the SAME hook against the
- * SAME `queryKeys.flowTail(date)` slot would be redundant, not wrong, but
- * this app never does both at once: the App-level copy is gated off here
- * specifically so only the lens's own copy runs while this route is active. */
+ * `mission` and `dispatch` WERE excluded (the mission lens mounted its own
+ * `useLiveTail`, so the app-level copy was gated off to avoid two mounts on
+ * one cache slot); since 2026-09-03 the app-level tail is the only mount and
+ * the header badge is the only liveness indicator — see the body. */
 export function isLiveRoute(route: Route): boolean {
   // (#1801) A daemon-less build is NEVER live, on any lens. Legacy's gate is
   // GLOBAL — `wantsPlayback = injectedMode==="play" || !!flowSrc || !!cq`
@@ -245,7 +240,16 @@ export function isLiveRoute(route: Route): boolean {
   // — a page asserting there is something to reconnect TO, on a marketing
   // site with no daemon anywhere near it.
   if (getSource().kind === "static") return false;
-  return route.kind !== "playback" && route.kind !== "dispatch" && route.kind !== "mission";
+  // (header owns liveness, operator 2026-09-03 — "no snowflakes") Every
+  // daemon-backed route except playback is live: the masthead's `#modebadge`,
+  // the app-level tail and the presence poll run on the mission and dispatch
+  // pages exactly as on fleet/runs/machine/console. `mission` and `dispatch`
+  // used to be excluded so a lens could mount its OWN tail and paint its OWN
+  // pill; the header then went dark on those pages while the card said
+  // "● live" — the inconsistency this removes. The mission lens reads the
+  // same `flowTail` cache slot the app-level tail writes, so nothing is lost
+  // by having one mount instead of two.
+  return route.kind !== "playback";
 }
 
 /** Should the event-log column (`components/EventLogColumn.tsx` — the

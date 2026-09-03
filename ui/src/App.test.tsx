@@ -344,7 +344,12 @@ describe("App", () => {
   // the badge unconditionally made a replay route claim `● live` with no
   // stream, no reconcile, and no liveness of any kind — #1480's dishonesty
   // pointed the other way.
-  it("shows no live badge on a replay route, where no tail is running", async () => {
+  // (header owns liveness, operator 2026-09-03) A daemon dispatch page whose
+  // day is NOT yet known is a live page like any other: the app-level tail
+  // runs there and the header says so. (It used to be excluded so the lens
+  // could own liveness; see `isLiveRoute`.) The replay case — day known,
+  // transport shown — is covered below ("names its day in the chip").
+  it("shows the live badge on a dispatch page whose day is not yet known", async () => {
     window.location.hash = "#session=abc-123";
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -354,7 +359,7 @@ describe("App", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(container.querySelector(".crumbbar, #stage")).toBeTruthy());
-    expect(container.querySelector("#modebadge")).toBeNull();
+    await waitFor(() => expect(container.querySelector("#modebadge")).toBeTruthy());
   });
 
   it("DOES show the live badge on a live route — the inverted case", async () => {
@@ -1074,7 +1079,7 @@ describe("App", () => {
     }
   });
 
-  it("a dispatch that is still running is a live view: no date, no playback badge, no transport", async () => {
+  it("a dispatch that is still running is a live view: no date, the LIVE badge, no transport", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -1091,7 +1096,9 @@ describe("App", () => {
     renderApp();
     await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
     await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("RESULT"));
-    expect(document.querySelector("#modebadge")).toBeNull();
+    // (header owns liveness, 2026-09-03) Running ⇒ live ⇒ the header badge,
+    // the same one every other live page shows. Never the PLAYBACK badge.
+    await waitFor(() => expect(document.querySelector("#modebadge")?.textContent).toMatch(/live|reconnecting/i));
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
 

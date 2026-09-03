@@ -484,8 +484,13 @@ describe("isLiveRoute — a daemon-less build is never live, on any lens", () =>
 
   it("historical routes are non-live either way — the kind test still stands on its own", () => {
     expect(isLiveRoute({ kind: "playback", date: "2026-08-07" })).toBe(false);
-    expect(isLiveRoute({ kind: "dispatch", dispatchId: "s1" })).toBe(false);
-    expect(isLiveRoute({ kind: "mission", missionId: "m1", stepId: null })).toBe(false);
+    // (header owns liveness, operator 2026-09-03: "no snowflakes") A mission or
+    // dispatch page behind a daemon IS live — the header badge, the app-level
+    // tail and the presence poll run there exactly as on every other lens.
+    // These two used to be excluded so the lens could mount its OWN tail and
+    // paint its OWN pill; that is the inconsistency this flips.
+    expect(isLiveRoute({ kind: "dispatch", dispatchId: "s1" })).toBe(true);
+    expect(isLiveRoute({ kind: "mission", missionId: "m1", stepId: null })).toBe(true);
   });
 
   it("an unrelated darkmux meta does not make a page static — flow-src is the signal", () => {

@@ -497,3 +497,14 @@ describe("MissionGraphLens step drill-in (#2189)", () => {
     expect(document.querySelector(".tlt-step")).not.toBeNull();
   });
 });
+// (header owns liveness, operator 2026-09-03) The lens no longer paints its
+// own connection pill; the masthead's `#modebadge` is the one liveness
+// indicator on every page.
+describe("no lens-local liveness pill", () => {
+  it("renders no .livepill", async () => {
+    const { container } = renderLens();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(container.querySelector(".livepill")).toBeNull();
+  });
+});
+
