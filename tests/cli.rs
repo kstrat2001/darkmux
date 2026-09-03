@@ -4885,3 +4885,125 @@ fn mod_show_prints_the_warnings_of_a_partial_mod() {
     // The kit still ends the output byte-exact — the warnings print ABOVE it.
     assert!(stdout.ends_with("apply mod.diff\n"), "got: {stdout:?}");
 }
+
+/// (#2299) `enabled: false` is honored at mint: the disabled step never exists
+/// in the run, the config snapshot keeps the flag, `graph-report.json` names
+/// what was pruned and why, the `mission start` record carries the same
+/// report, and `mission status` counts it. No CLI override exists: the config
+/// is the only place the run's shape comes from.
+#[test]
+fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    // 4 steps declared, 1 disabled; a task that depends only on the disabled
+    // task goes with it; the freeform phase stays.
+    let config_json = r#"{
+        "id": "enabled-test",
+        "name": "Enabled Test",
+        "schema_version": "3.1",
+        "phases": [{
+            "id": "p1",
+            "tasks": [
+                {"id": "t-off", "enabled": false, "steps": [{"id": "s-off", "kind": "procedural.noop"}]},
+                {"id": "t-on", "steps": [
+                    {"id": "s-on-1", "kind": "procedural.noop"},
+                    {"id": "s-on-2", "kind": "procedural.noop", "enabled": false}
+                ]},
+                {"id": "t-orphan", "depends_on": ["t-off"], "steps": [{"id": "s-orphan", "kind": "procedural.noop"}]}
+            ]
+        }]
+    }"#;
+    fs::write(config_dir.join("enabled-test.json"), config_json).unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "enabled-test", "--timeout", "60"])
+        .output()
+        .expect("darkmux mission launch runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("graph: 1 of 4 steps minted (2 disabled in config)"), "got:\n{stdout}");
+
+    // One mission on disk; its report and snapshot say what happened.
+    let missions_dir = home.path().join("missions");
+    let mission_dir = fs::read_dir(&missions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.is_dir())
+        .expect("one mission dir");
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(mission_dir.join("graph-report.json")).unwrap()).unwrap();
+    assert_eq!(report["steps_in_config"], 4);
+    assert_eq!(report["steps_minted"], 1);
+    assert_eq!(report["tasks_minted"], 1);
+    let pruned: Vec<(String, String)> = report["pruned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["id"].as_str().unwrap().to_string(), p["reason"].as_str().unwrap().to_string()))
+        .collect();
+    assert!(pruned.contains(&("t-off".into(), "disabled".into())), "{pruned:?}");
+    assert!(pruned.contains(&("s-on-2".into(), "disabled".into())), "{pruned:?}");
+    assert!(pruned.contains(&("t-orphan".into(), "all_dependencies_pruned".into())), "{pruned:?}");
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(mission_dir.join("config-snapshot.json")).unwrap()).unwrap();
+    assert_eq!(snapshot["phases"][0]["tasks"][0]["enabled"], false, "the snapshot keeps the DECLARED config");
+    assert_eq!(snapshot["phases"][0]["tasks"].as_array().unwrap().len(), 3);
+    // The pruned items left no task record behind — nothing gray on disk.
+    // Task records live under `tasks/<phase-id>/`; walk one level down.
+    let task_files: Vec<String> = fs::read_dir(mission_dir.join("tasks"))
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .flat_map(|phase_dir| {
+                    fs::read_dir(phase_dir.path())
+                        .map(|dd| dd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(task_files.iter().any(|f| f.contains("t-on")), "{task_files:?}");
+    assert!(!task_files.iter().any(|f| f.contains("t-off") || f.contains("t-orphan")), "{task_files:?}");
+
+    // The `mission start` record carries the same report.
+    let mut day = String::new();
+    for e in fs::read_dir(flows.path()).unwrap().filter_map(|e| e.ok()) {
+        day.push_str(&fs::read_to_string(e.path()).unwrap());
+    }
+    let start = day
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|r| r["action"] == "mission start")
+        .expect("a mission start record");
+    assert_eq!(start["payload"]["graph"]["steps_minted"], 1, "{start}");
+    assert_eq!(start["payload"]["graph"]["steps_in_config"], 4);
+
+    // `mission status` counts it, human and JSON.
+    let status = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&status.stdout)).unwrap();
+    assert_eq!(v["missions"][0]["graph"]["steps_in_config"], 4, "{v}");
+    assert_eq!(v["missions"][0]["graph"]["steps_minted"], 1);
+    let human = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--all"])
+        .output()
+        .unwrap();
+    let human_out = String::from_utf8_lossy(&human.stdout);
+    assert!(human_out.contains("1 of 4 steps minted (2 disabled in config)"), "got:\n{human_out}");
+}

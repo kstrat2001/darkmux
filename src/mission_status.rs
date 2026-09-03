@@ -41,6 +41,10 @@ struct MissionView<'a> {
     planned: usize,
     abandoned: usize,
     drifts: Vec<Drift>,
+    /// (#2299) What the config declared vs what was minted — `None` for a
+    /// run minted by a path that never prunes (crew-of-one, review) or one
+    /// that predates the report.
+    graph: Option<crew::mission_config::prune::PruneReport>,
 }
 
 fn is_terminal(s: PhaseStatus) -> bool {
@@ -447,6 +451,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
                 planned: ss.iter().filter(|s| s.status == PhaseStatus::Planned).count(),
                 abandoned: ss.iter().filter(|s| s.status == PhaseStatus::Abandoned).count(),
                 drifts: detect_drift(m, &ss, now, stale_days),
+                graph: crew::lifecycle::load_graph_report(&m.id).ok().flatten(),
                 m,
             }
         })
@@ -613,6 +618,11 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
                 // age or the progress, because it is the one column whose
                 // information the others already carry.
                 println!("{row}");
+            }
+            // (#2299) A run whose config left steps out says so in one dim
+            // line; nothing gray is ever drawn for the pruned steps themselves.
+            if let Some(g) = v.graph.as_ref().filter(|g| g.pruned_anything()) {
+                println!("      {} {}", style::dim("·"), style::dim(&format!("graph: {}", g.summary_line())));
             }
             for d in &v.drifts {
                 // The ⚠ marks the warning, not each of its lines — continuation
@@ -862,6 +872,9 @@ fn board_json(views: &[MissionView]) -> serde_json::Value {
                     "total": v.total, "complete": v.complete, "running": v.running,
                     "planned": v.planned, "abandoned": v.abandoned,
                 },
+                // (#2299) present only for a config-launched run: what the
+                // config declared, what was minted, and what was pruned + why.
+                "graph": v.graph,
                 "drift": v.drifts.iter().map(|d| serde_json::json!({
                     "kind": d.kind, "detail": d.detail, "suggest": d.suggest,
                 })).collect::<Vec<_>>(),
@@ -1232,6 +1245,7 @@ mod tests {
             planned: 0,
             abandoned: 0,
             drifts: Vec::new(),
+            graph: None,
         }
     }
 

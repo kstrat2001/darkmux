@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.36.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.37.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -757,6 +757,21 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.36.0";
 //           gap. No runner record can therefore carry these refs at all, and
 //           none reads `[]` for a routed ref dispatch that silently lost its
 //           blocks.
+//   1.37.0 (#2299): `mission start`'s payload gains `graph` on every run
+//           minted by `mission launch <config>` (the generic config launcher;
+//           NOT the crew-of-one dispatch, the review launcher, or the crawl
+//           launcher, which mint their graphs without a document to prune):
+//           `{phases_in_config, phases_minted, tasks_in_config, tasks_minted,
+//           steps_in_config, steps_minted, pruned: [{id, kind, reason}]}`.
+//           A mission config item with `enabled: false` is PRUNED before the
+//           run is minted — it never exists in the run, no record, nothing
+//           gray — so this object is the only place a reader can learn that
+//           the config declared more than the run shows. `reason` is one of
+//           `disabled`, `parent_pruned`, `all_steps_pruned`,
+//           `all_tasks_pruned`, `all_dependencies_pruned`. The same report
+//           is written beside the run's config snapshot as
+//           `graph-report.json`; `mission status` reads that file. Additive:
+//           older readers ignore the key.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

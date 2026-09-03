@@ -917,6 +917,7 @@ mod tests {
 
     fn step(id: &str, kind: &str) -> StepConfig {
         StepConfig {
+            enabled: None,
             id: id.to_string(),
             kind: kind.to_string(),
             config: serde_json::Value::Null,
@@ -927,6 +928,7 @@ mod tests {
 
     fn task(id: &str, role_id: Option<&str>, steps: Vec<StepConfig>) -> TaskConfig {
         TaskConfig {
+            enabled: None,
             id: id.to_string(),
             description: None,
             display_name: None,
@@ -940,6 +942,7 @@ mod tests {
 
     fn phase(id: &str, tasks: Vec<crate::crew::mission_config::TaskConfig>) -> PhaseConfig {
         PhaseConfig {
+            enabled: None,
             id: id.to_string(),
             description: None,
             display_name: None,

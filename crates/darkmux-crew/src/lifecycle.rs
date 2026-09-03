@@ -158,6 +158,30 @@ pub fn load_envelope(mission_id: &str) -> Result<Option<crate::envelope::Mission
 /// mutable source live), applied one level up: even if the operator later
 /// edits or deletes the source `~/.darkmux/mission-configs/<id>.json`,
 /// this instance keeps its own record of the graph shape it actually ran.
+/// (#2299) The mint's prune report — what the config declared, what was
+/// minted, and every item left out with its reason. Written beside the
+/// config snapshot so `mission status` can say "12 steps in the config, 4
+/// minted" without a graph ever drawing a disabled step.
+pub fn graph_report_path(mission_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("graph-report.json")
+}
+
+pub fn save_graph_report(mission_id: &str, report: &crate::mission_config::prune::PruneReport) -> Result<()> {
+    save_json(&graph_report_path(mission_id), report)
+}
+
+/// `Ok(None)` when the run predates the report or was minted by a path
+/// that never prunes (a crew-of-one dispatch, the review launcher).
+pub fn load_graph_report(mission_id: &str) -> Result<Option<crate::mission_config::prune::PruneReport>> {
+    let path = graph_report_path(mission_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let report = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(report))
+}
+
 pub fn config_snapshot_path(mission_id: &str) -> PathBuf {
     mission_dir(mission_id).join("config-snapshot.json")
 }

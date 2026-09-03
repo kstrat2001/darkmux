@@ -2990,7 +2990,10 @@ mod tests {
         //           `brief_refs: [{kind, key}]` — findings AND mods, one
         //           provenance list. The old key is dropped, not aliased: it
         //           had zero consumers and was one version old (#2295).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.36.0");
+        //   1.37.0: `mission start` gains `graph` on config-launched runs —
+        //           what the config declared vs what was minted, and every
+        //           `enabled: false` item pruned with its reason (#2299).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.37.0");
     }
 
     #[test]

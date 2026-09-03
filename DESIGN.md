@@ -506,6 +506,11 @@ There is no `integrate` verb. If darkmux integrates mods, that is a mission: a s
 
 Tokens on the local seat versus the frontier seat per crawl PR. The frontier-only baseline (a Sonnet agent doing both creation and integration for seven findings, PR #2285) is the number every local-seat experiment is compared against.
 
+
+### Mission configs: a disabled step never exists in the run
+
+A phase, task or step in a mission config may carry `enabled: false`. It is pruned when the run is minted, before anything is interpreted or persisted, so the run's graph is exactly what will execute. There is no gray state: a nightly crawl config with ten plan tasks and six enabled shows six. A task whose steps were all disabled goes with them, a phase whose tasks all went goes too, and a task whose every dependency was pruned is pruned in turn, while one live dependency keeps it and it simply sees fewer inputs. Provenance is the resolved-config snapshot the run already keeps, which carries the flags verbatim, plus a `graph-report.json` beside it naming what was declared, what was minted, and each pruned item's reason; `mission status` prints the one-line count and the `mission start` record carries the same report. There is deliberately no CLI override. The config is the only place a run's shape comes from: edit the JSON, run, and the snapshot records it.
+
 ## ACP: darkmux inside the editor
 
 `darkmux acp` speaks the [Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol) over stdio, so an editor like Zed can drive darkmux from its own agent panel — you type `/review` in the editor and a local crew works the PR, with progress rendering in the panel rather than a terminal you have to go find.
