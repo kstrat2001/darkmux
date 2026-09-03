@@ -5361,7 +5361,17 @@ body {
 }
 .missionlens .tltask .tlt-hd {
   display: grid;
-  grid-template-columns: auto 1fr auto auto auto;
+  /* (#2280) The name column has a floor and the meter column gives way —
+     `1fr`/`auto` alone let the meter's `nowrap` intrinsic width (wall time +
+     tokens + turns) claim whatever it wants from an `auto` grid track,
+     because grid track sizing reads an item's max-content width regardless
+     of any `flex` property on the item — `flex` only governs sizing inside
+     a FLEX container, and this is a grid one. `minmax(10ch, 1fr)` on the
+     name is the actual floor; `minmax(0, auto)` on the meter is what lets
+     its track shrink below max-content so `.tlt-meter-cell`'s own
+     `min-width: 0` + `overflow: hidden` (below) can take effect. */
+  grid-template-columns: auto minmax(10ch, 1fr) auto minmax(0, auto) auto;
+  grid-template-areas: "dot name count meter chev";
   align-items: center;
   gap: 9px;
   padding: 10px 11px;
@@ -5369,6 +5379,7 @@ body {
   min-height: 44px;
 }
 .missionlens .tltask .tlt-hd .tlt-dot {
+  grid-area: dot;
   flex: 0 0 auto;
   width: 7px;
   height: 7px;
@@ -5398,6 +5409,7 @@ body {
   opacity: 0.6;
 }
 .missionlens .tltask .tlt-name {
+  grid-area: name;
   font: 600 calc(12px * var(--fs-scale))/1.3 var(--font-mono);
   color: var(--fg);
   overflow: hidden;
@@ -5406,13 +5418,23 @@ body {
   min-width: 0;
 }
 .missionlens .tltask .tlt-count {
+  grid-area: count;
   font: calc(10px * var(--fs-scale))/1 var(--font-mono);
   color: var(--dim);
   white-space: nowrap;
 }
 .missionlens .tltask .tlt-hd .tlt-meter-cell {
+  grid-area: meter;
   display: inline-flex;
   min-width: 0;
+  /* (#2280) The cell itself must be allowed to shrink + clip — the grid
+     track alone (`minmax(0, auto)` above) only permits the TRACK to
+     shrink; without this the cell's own content still forces intrinsic
+     width. The child `.mn-step-meter` (shared rule, #2104/#2281) already
+     ellipsizes from the right once it's actually squeezed, so a tight row
+     loses "turns"/"tools" first and keeps the time + tokens — same
+     precedent as the step rows. */
+  overflow: hidden;
 }
 /* (#2269) A finished step's (or task's) wall time — the pulse is gone, the
    number stays, muted so the live pulse still reads as the loud one. */
@@ -5424,6 +5446,7 @@ body {
   margin-left: 0;
 }
 .missionlens .tltask .tlt-chev {
+  grid-area: chev;
   flex: 0 0 auto;
   color: var(--dim);
   font-size: calc(11px * var(--fs-scale));
@@ -5482,6 +5505,20 @@ body {
   }
   .missionlens .body {
     flex-direction: column;
+  }
+  /* (#2280) On the phone, the meter gets its own line under the name
+     rather than fighting the name for the row's single line. The dot
+     column is skipped on the meter row (the leading `.` track) so the
+     meter reads as indented under the name, not flush with the dot. */
+  .missionlens .tltask .tlt-hd {
+    grid-template-columns: auto minmax(10ch, 1fr) auto auto;
+    grid-template-areas:
+      "dot name count chev"
+      ".   meter meter meter";
+    row-gap: 4px;
+  }
+  .missionlens .tltask .tlt-hd .tlt-meter-cell {
+    justify-content: flex-start;
   }
 }
 
