@@ -239,6 +239,13 @@ pub struct DirsConfig {
     /// copy `finding list` / `finding show` read, the same way roles are JSON
     /// on disk rather than a derived-only view.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub findings: Option<String>,
+    /// (#2265) Where mod records live — `<root>/mods` by default, one
+    /// `<key>/mod.json` per `mod create`, plus that mod's own `attachments/`.
+    /// A mod is a KIT: instructions plus data, opaque to darkmux. Its key is
+    /// MINTED per mod, never derived from a finding, so two agents proposing
+    /// different changes for the same observation produce two records rather
+    /// than the second overwriting the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub mods: Option<String>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 

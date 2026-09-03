@@ -183,6 +183,8 @@ const KEYS: &[(&str, Ty)] = &[
     ("dirs.lab", Ty::Str),
     // (#2265) The finding-record store — see `DirsConfig::findings`.
     ("dirs.findings", Ty::Str),
+    // (#2265) The mod-record store — see `DirsConfig::mods`.
+    ("dirs.mods", Ty::Str),
     // (#1685) The `gh`-verb allowlist gate — see `CmdConfig`'s own doc.
     ("cmd.enabled", Ty::Bool),
     ("cmd.allowed", Ty::StrList),

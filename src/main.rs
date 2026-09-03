@@ -39,6 +39,9 @@ pub use darkmux_fleet as fleet;
 // (#2265) `darkmux finding` — the write-once finding store's read verbs plus
 // `sync`, the store's second producer after the live dispatch tailer.
 mod finding_cli;
+// (#2265) `darkmux mod` — the mod store's CLI producer plus its read verbs.
+// A mod is a KIT: instructions plus data, opaque to darkmux.
+mod mod_cli;
 // `darkmux machine` roster-facing handlers — split out of main.rs alongside cli/lab_cli.
 mod fleet_cli;
 // #463 workspace split — flow extracted to the darkmux-flow crate. The
@@ -177,6 +180,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         },
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Finding { sub } => cmd_finding(sub),
+        Cmd::Mod { sub } => cmd_mod(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
         Cmd::Run { sub } => match sub {
             cli::RunFamilyCmd::List { kind, limit, all, json } => {
@@ -845,6 +849,21 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
             id,
             json: cli::JsonFlag { json },
         } => role_cli::role_show(&id, json),
+    }
+}
+
+/// (#2265) The mod family — record how something could change, and read what
+/// was recorded. The kit is stored and printed verbatim; darkmux never opens
+/// one.
+fn cmd_mod(sub: cli::ModCmd) -> Result<i32> {
+    match sub {
+        cli::ModCmd::Create { by, r#for, kit, attach, json: cli::JsonFlag { json } } => {
+            mod_cli::create(&by, &r#for, kit.as_deref(), &attach, json)
+        }
+        cli::ModCmd::List { r#for, mission, json: cli::JsonFlag { json } } => {
+            mod_cli::list(r#for.as_deref(), mission.as_deref(), json)
+        }
+        cli::ModCmd::Show { key, json: cli::JsonFlag { json } } => mod_cli::show(&key, json),
     }
 }
 

@@ -277,6 +277,16 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: FindingCmd,
     },
+    /// Mods (#2265) — how something COULD change. A mod is a KIT: instructions
+    /// plus data, in whatever form the proposer chose, enough for an AI to
+    /// make the change correctly later. darkmux never types a kit and never
+    /// opens it. Its key is MINTED per mod, never derived from a finding, so
+    /// two agents proposing different changes for one observation produce two
+    /// records rather than the second overwriting the first.
+    Mod {
+        #[command(subcommand)]
+        sub: ModCmd,
+    },
     /// Mission lifecycle — transition missions through their state machine.
     /// Mission status flows: Active ↔ Paused → Finalized (success) or
     /// Aborted (teardown — #1627: a teardown is not a success, and the two
@@ -381,6 +391,59 @@ pub(crate) enum Cmd {
         /// Show what would be installed without writing.
         #[arg(long, short = 'n')]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ModCmd {
+    /// Record one mod. Every call MINTS A NEW KEY — idempotence is
+    /// deliberately not a goal, because two agents proposing for the same
+    /// finding at different times are two mods.
+    Create {
+        /// Who proposed it — a role handle plus model for a darkmux seat, or
+        /// a plain name (`sonnet`, `kain`) for an external actor.
+        #[arg(long)]
+        by: String,
+        /// A finding this mod addresses. Repeatable, and may be empty: a mod
+        /// need not name one. A key with no stored finding is recorded as
+        /// missing rather than refused.
+        #[arg(long = "for")]
+        r#for: Vec<String>,
+        /// The kit — a file path, or `-` to read stdin. Stored as the raw
+        /// text, byte for byte: always a string, never parsed, never
+        /// reformatted, whatever it looks like. At least one of `--kit` /
+        /// `--attach` is required.
+        #[arg(long)]
+        kit: Option<String>,
+        /// A file to copy into the mod's own `attachments/`. Repeatable.
+        #[arg(long)]
+        attach: Vec<std::path::PathBuf>,
+        #[command(flatten)]
+        json: JsonFlag,
+    },
+    /// List mods in the store, ts-ascending. The preview it prints is the raw
+    /// kit, truncated: darkmux does not interpret it.
+    List {
+        /// Only mods naming this finding key.
+        #[arg(long = "for")]
+        r#for: Option<String>,
+        /// Only mods naming a finding recorded under this mission. Answered
+        /// from the mod's own create-time snapshot of its findings, so a mod
+        /// created before its finding was synced will not match.
+        #[arg(long)]
+        mission: Option<String>,
+        #[command(flatten)]
+        json: JsonFlag,
+    },
+    /// Show one mod, whole, by its minted key. The kit is printed as its own
+    /// bytes, with nothing added — but this rendering is for reading. To get
+    /// the kit back byte for byte in a script, use the JSON channel:
+    /// `darkmux mod show <key> --json | jq -j .kit`.
+    Show {
+        /// The mod key, e.g. `mod-1788000000-a1b2c3`.
+        key: String,
+        #[command(flatten)]
+        json: JsonFlag,
     },
 }
 

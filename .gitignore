@@ -96,6 +96,10 @@ ui/verify/.gallery/
 *.scratch
 *.scratch.*
 
+# Left in the REPO ROOT by `cargo test --test cli` (a crew-index SQLite file a
+# test opens relative to cwd). Root-scoped, per the `/runs/` note above.
+/tracker.db
+
 # cargo-mutants run output — local build logs (accidentally committed in #1636)
 mutants.out/
 mutants.out.old/

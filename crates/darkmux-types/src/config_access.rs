@@ -1007,6 +1007,45 @@ fn findings_dir_default() -> std::path::PathBuf {
     resolved.root.join("findings")
 }
 
+/// (#2265) The mod-record store — `env(DARKMUX_MODS_DIR) > config.dirs.mods >
+/// <darkmux root>/mods`, the same three-tier shape as `findings_dir`.
+///
+/// One `<key>/mod.json` per mod, plus that mod's `attachments/`. A mod is a
+/// KIT — instructions plus data, in whatever form the proposer chose. darkmux
+/// never types a kit and never opens it; this accessor only says where the
+/// kits live.
+pub fn mods_dir() -> std::path::PathBuf {
+    pick_dir(
+        env_str("DARKMUX_MODS_DIR"),
+        config().dirs.as_ref().and_then(|d| d.mods.as_deref()),
+        mods_dir_default,
+    )
+}
+
+/// Derived from the SAME root resolution every other darkmux directory
+/// resolves through — `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and
+/// a project-local `./.darkmux` before `~/.darkmux`. Mirrors
+/// `findings_dir_default`.
+#[cfg(not(any(test, feature = "test-support")))]
+fn mods_dir_default() -> std::path::PathBuf {
+    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("mods")
+}
+
+/// Test builds must never default onto the operator's real `~/.darkmux/mods`
+/// — same isolation discipline as `findings_dir_default`'s own test-build
+/// variant. A test that DID isolate itself (a `DARKMUX_HOME` tempdir, or a
+/// project-local `./.darkmux`) is honored verbatim, because a test that
+/// isolated itself means it.
+#[cfg(any(test, feature = "test-support"))]
+fn mods_dir_default() -> std::path::PathBuf {
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/mods");
+    }
+    resolved.root.join("mods")
+}
+
 /// (#1585) The lab-run scan root — `env(DARKMUX_LAB_DIR) > config.dirs.lab >
 /// ~/.darkmux/runs`, the same three-tier shape as its nine sibling dirs.
 ///
@@ -1641,6 +1680,38 @@ mod tests {
         if let Some(v) = prev {
             unsafe {
                 std::env::set_var("DARKMUX_FINDINGS_DIR", v);
+            }
+        }
+    }
+
+    /// (#2265) `dirs.mods` resolves through the same three tiers as
+    /// `dirs.findings`: `env(DARKMUX_MODS_DIR) > config.dirs.mods >
+    /// <root>/mods`. Same shape, same reason.
+    #[serial_test::serial]
+    #[test]
+    fn mods_dir_env_then_config_then_default() {
+        let prev = std::env::var("DARKMUX_MODS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_MODS_DIR", "/custom/mods");
+        }
+        assert_eq!(mods_dir(), std::path::PathBuf::from("/custom/mods"));
+
+        unsafe {
+            std::env::remove_var("DARKMUX_MODS_DIR");
+        }
+        // config tier beats the built-in default; env (absent) does not shadow it.
+        assert_eq!(
+            pick_dir(None, Some("/cfg/mods"), mods_dir_default),
+            std::path::PathBuf::from("/cfg/mods")
+        );
+        // Unset everywhere → a real path under the darkmux root, never nothing.
+        assert!(
+            mods_dir().ends_with("mods"),
+            "unset must resolve to a mods dir, not nothing"
+        );
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("DARKMUX_MODS_DIR", v);
             }
         }
     }

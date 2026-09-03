@@ -4118,9 +4118,40 @@ fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // A key that would escape the store is refused, not resolved.
-    let out = dm(&["finding", "show", "../sess-a/1"]);
+    // A key that would escape the store is refused, not resolved — proved
+    // against a record that DOES exist at the escaped path. The store is
+    // `<home>/findings`, so `../x/1` addresses `<home>/x/1`, the store's own
+    // parent. Without the key check this read would succeed and print a file
+    // from outside the store; an assertion that planted nothing there would
+    // have passed on the absence instead of on the refusal.
+    fs::create_dir_all(home.path().join("x/1")).unwrap();
+    fs::write(
+        home.path().join("x/1/finding.json"),
+        serde_json::json!({
+            "key": "x/1", "dispatch": "x", "seq": 1, "ts": "2026-09-03T00:00:00Z",
+            "tool_name": "create_finding",
+            "proposer": {"handle": "outside-the-store", "model": "m"},
+            "context": serde_json::Value::Null,
+            "emitted": {"file": "ESCAPED-THE-STORE.ts"},
+            "schema_version": "1",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = dm(&["finding", "show", "../x/1"]);
     assert_eq!(out.status.code(), Some(1), "a traversal key must not resolve");
+    let escaped_stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        escaped_stdout.is_empty(),
+        "nothing from outside the store is printed: {escaped_stdout}"
+    );
+    let escaped_stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        escaped_stderr.contains("not a finding key"),
+        "the key is INVALID, not merely missing — a 'no finding <key>' message would mean \
+the key was ACCEPTED and only the file happened to be absent: {escaped_stderr}"
+    );
+    assert!(!escaped_stderr.contains("ESCAPED-THE-STORE"), "got: {escaped_stderr}");
 
     // The human list names the mission when the finding has one.
     let out = dm(&["finding", "list", "--mission", "crawl-1"]);
@@ -4147,4 +4178,323 @@ fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
     assert_eq!(out.status.code(), Some(1), "a missing finding exits 1");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("sess-a/99"), "the message names the key: {stderr}");
+}
+
+// ─── `mod` family (#2265) ────────────────────────────────────────────────
+//
+// A mod is how something COULD change: a KIT of instructions plus data, in
+// whatever form the proposer chose. darkmux never types a kit and never opens
+// it. The key is MINTED per mod, never derived from a finding, so two agents
+// proposing for one observation produce two records rather than one
+// overwriting the other. The view from a finding to its mods is DERIVED by
+// scanning mods — nothing is written back onto the finding.
+
+#[test]
+fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods() {
+    let home = TempDir::new().unwrap();
+    let flows = home.path().join("flows");
+    write_finding_day_file(&flows);
+
+    let dm = |args: &[&str]| {
+        Command::cargo_bin("darkmux")
+            .unwrap()
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", &flows)
+            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+            .args(args)
+            .output()
+            .expect("darkmux runs")
+    };
+    // Same invocation, with a kit piped on stdin.
+    let dm_stdin = |args: &[&str], stdin: &str| {
+        Command::cargo_bin("darkmux")
+            .unwrap()
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", &flows)
+            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+            .args(args)
+            .write_stdin(stdin)
+            .output()
+            .expect("darkmux runs")
+    };
+
+    // The findings the mods will name have to exist first.
+    assert!(dm(&["finding", "sync"]).status.success());
+
+    // ── create, from stdin ────────────────────────────────────────────────
+    let out = dm_stdin(
+        &["mod", "create", "--by", "sonnet", "--for", "sess-a/1", "--kit", "-"],
+        "rename the predicate, then add a test\n",
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // stdout is the KEY, alone, on the last line — the orchestrator pipes it
+    // straight into `mod show <key>` / `--for`. Anything else it has to say
+    // (the path it wrote, a missing `for`) goes to stderr, so `$(...)` around
+    // this command captures a key and never a path.
+    let key_a = String::from_utf8_lossy(&out.stdout).lines().last().unwrap().trim().to_string();
+    assert!(key_a.starts_with("mod-"), "create prints the minted key: {key_a}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        key_a,
+        "stdout is the key ALONE — a path on it would be captured by `$(darkmux mod create …)`"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("mod.json"),
+        "the path it wrote is still reported, on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The captured line is directly usable as an address.
+    let out_show = dm(&["mod", "show", &key_a]);
+    assert!(
+        out_show.status.success(),
+        "`mod show $(darkmux mod create …)` must work: {}",
+        String::from_utf8_lossy(&out_show.stderr)
+    );
+    let rec: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(home.path().join("mods").join(&key_a).join("mod.json")).unwrap(),
+    )
+    .expect("the record is on disk where the key says");
+    assert_eq!(rec["by"], "sonnet");
+    assert_eq!(rec["for"], serde_json::json!(["sess-a/1"]));
+    // The kit is kept VERBATIM — prose stays the prose that was written.
+    assert_eq!(rec["kit"], "rename the predicate, then add a test\n");
+    // The named finding's own provenance is copied on, so a reader of the mod
+    // never has to go find the finding.
+    assert_eq!(rec["context"]["findings"][0]["mission_id"], "crawl-1");
+    assert_eq!(rec["context"]["findings"][0]["emitted"]["file"], "a.ts");
+
+    // ── create, from a file, with two attachments ─────────────────────────
+    let src = home.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    // Duplicate keys and an integer past f64 — both survive a byte-exact
+    // store and neither survives a parse/re-serialize round trip.
+    let kit_text = "{\n  \"diff\": \"--- a\",\n  \"diff\": \"+++ b\",\n  \"n\": 12345678901234567890123\n}\n";
+    fs::write(src.join("kit.json"), kit_text).unwrap();
+    fs::write(src.join("patch.diff"), b"--- a\n+++ b\n").unwrap();
+    fs::write(src.join("shot.png"), [0x89u8, 0x50, 0x4e, 0x47, 0x0d]).unwrap();
+    let out = dm(&[
+        "mod", "create", "--by", "kain", "--for", "sess-b/2",
+        "--kit", src.join("kit.json").to_str().unwrap(),
+        "--attach", src.join("patch.diff").to_str().unwrap(),
+        "--attach", src.join("shot.png").to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let key_b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let attach_dir = home.path().join("mods").join(&key_b).join("attachments");
+    assert_eq!(
+        fs::read(attach_dir.join("patch.diff")).unwrap(),
+        b"--- a\n+++ b\n",
+        "an attachment is copied byte for byte"
+    );
+    assert_eq!(fs::read(attach_dir.join("shot.png")).unwrap(), [0x89u8, 0x50, 0x4e, 0x47, 0x0d]);
+    // A JSON-looking kit is stored as the RAW TEXT, byte for byte — parsing
+    // and re-serializing it would collapse duplicate keys and round large
+    // integers, so a kit is never parsed on write.
+    let rec_b: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(home.path().join("mods").join(&key_b).join("mod.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        rec_b["kit"].as_str().expect("the kit is ALWAYS a string"),
+        kit_text,
+        "byte-exact: the file's own bytes, not a re-serialization"
+    );
+    assert_eq!(rec_b["kit_looks_json"], true, "a reader hint, computed once at write time");
+    assert_eq!(rec_b["attachments"], serde_json::json!(["patch.diff", "shot.png"]));
+
+    // ── two creates for ONE finding are two mods ──────────────────────────
+    let out = dm_stdin(
+        &["mod", "create", "--by", "kain", "--for", "sess-a/1", "--kit", "-"],
+        "just add a comment",
+    );
+    let key_a2 = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_ne!(key_a, key_a2, "the key is MINTED per mod — the second must not overwrite the first");
+    assert!(home.path().join("mods").join(&key_a).join("mod.json").exists());
+    assert!(home.path().join("mods").join(&key_a2).join("mod.json").exists());
+
+    // A `for` key with no stored finding is allowed, recorded, and NAMED.
+    let out = dm_stdin(
+        &["mod", "create", "--by", "kain", "--for", "sess-z/9", "--kit", "-"],
+        "for something not in the store",
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let key_z = stdout.trim().to_string();
+    assert!(key_z.starts_with("mod-"), "stdout is still the key alone: {stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("sess-z/9"),
+        "a missing finding is named, not silent — on stderr, so stdout stays pipeable: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--json` is where the path lives, beside the record itself.
+    let out = dm_stdin(
+        &["mod", "create", "--by", "kain", "--kit", "-", "--json"],
+        "a standalone kit",
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("--json emits JSON");
+    let key_j = v["record"]["key"].as_str().expect("the key").to_string();
+    let path_j = home.path().join("mods").join(&key_j).join("mod.json");
+    assert_eq!(v["path"].as_str().expect("--json carries the path"), path_j.to_str().unwrap());
+    assert_eq!(v["record"]["by"], "kain", "the whole record is there: {v}");
+    // `path` sits BESIDE the record, never inside it: the printed record has
+    // to carry exactly the stored record's fields and nothing darkmux added.
+    // Compared as VALUES (both parsed) — this pins the field set, not the
+    // formatting, which pretty-printing changes either way.
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path_j).unwrap()).unwrap();
+    assert_eq!(v["record"], on_disk, "the printed record has the stored record's fields");
+
+    // A non-canonical finding key is CANONICALIZED on create, so one finding
+    // has one address: `sess-a/01` must be findable as `sess-a/1` by both the
+    // filter and the finding's own derived section.
+    let out = dm_stdin(
+        &["mod", "create", "--by", "zero-padded", "--for", "sess-a/01", "--kit", "-"],
+        "same finding, padded key",
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let key_pad = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let rec_pad: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(home.path().join("mods").join(&key_pad).join("mod.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rec_pad["for"], serde_json::json!(["sess-a/1"]), "stored canonical");
+
+    // A key that can address no finding is refused loudly, not stored as a
+    // link nothing can follow.
+    let out = dm_stdin(&["mod", "create", "--by", "kain", "--for", "no-slash", "--kit", "-"], "x");
+    assert_ne!(out.status.code(), Some(0), "an unaddressable --for must not be stored");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("finding key"),
+        "the error names the shape: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A mod with neither instructions nor data is not a kit.
+    let out = dm(&["mod", "create", "--by", "kain"]);
+    assert_ne!(out.status.code(), Some(0), "a mod needs a kit or an attachment");
+
+    // ── list ──────────────────────────────────────────────────────────────
+    let keys = |args: &[&str]| -> Vec<String> {
+        let out = dm(args);
+        let v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("--json emits JSON");
+        v["mods"].as_array().unwrap().iter().map(|m| m["key"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(keys(&["mod", "list", "--json"]).len(), 6, "every mod, ts-ascending");
+    let for_a = keys(&["mod", "list", "--for", "sess-a/1", "--json"]);
+    assert_eq!(for_a.len(), 3, "one observation can attract competing changes");
+    assert!(
+        for_a.contains(&key_pad),
+        "the canonicalized `sess-a/01` mod is found under `sess-a/1`: {for_a:?}"
+    );
+    // The QUERY is canonicalized too. Canonicalizing only on write left one
+    // finding with two addresses from the reader's side: the mod created with
+    // `--for sess-a/01` was invisible to `--for sess-a/01`.
+    assert_eq!(
+        keys(&["mod", "list", "--for", "sess-a/01", "--json"]),
+        for_a,
+        "a non-canonical query returns exactly what the canonical one does"
+    );
+    // An unaddressable query is refused loudly — an empty result would read
+    // as "no mods for that finding" when the key names no finding at all.
+    let out = dm(&["mod", "list", "--for", "no-slash", "--json"]);
+    assert_ne!(out.status.code(), Some(0), "an unaddressable --for must not exit clean");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("finding key"),
+        "the error names the shape: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(keys(&["mod", "list", "--for", "sess-b/2", "--json"]), vec![key_b.clone()]);
+    // `--mission` matches through the `for` finding's OWN recorded mission.
+    assert_eq!(keys(&["mod", "list", "--mission", "crawl-2", "--json"]), vec![key_b.clone()]);
+    assert_eq!(keys(&["mod", "list", "--mission", "crawl-1", "--json"]).len(), 3);
+    assert!(
+        !keys(&["mod", "list", "--mission", "crawl-1", "--json"]).contains(&key_z),
+        "a mod whose finding is not in the store belongs to no mission"
+    );
+    assert!(keys(&["mod", "list", "--mission", "no-such-mission", "--json"]).is_empty());
+    assert!(keys(&["mod", "list", "--for", "sess-nope/1", "--json"]).is_empty());
+
+    // A filter that matches nothing must not read like an EMPTY STORE.
+    let out = dm(&["mod", "list", "--for", "sess-nope/1"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no mods match — 6 in the store"), "got:\n{stdout}");
+    assert!(!stdout.contains("mod create"), "the store is NOT empty: {stdout}");
+
+    // The human list previews the RAW kit and names the mod's findings.
+    let out = dm(&["mod", "list", "--for", "sess-a/1"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("rename the predicate"), "the raw kit is previewed: {stdout}");
+    assert!(stdout.contains("sess-a/1"), "the `for` keys are shown: {stdout}");
+
+    // ── show ──────────────────────────────────────────────────────────────
+    let out = dm(&["mod", "show", &key_b]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&key_b) && stdout.contains("kain"), "got:\n{stdout}");
+    assert!(stdout.contains("sess-b/2"), "show names the findings: {stdout}");
+    assert!(stdout.contains("patch.diff") && stdout.contains("bytes"), "attachments + sizes: {stdout}");
+    assert!(
+        stdout.contains("\"diff\": \"--- a\",\n  \"diff\": \"+++ b\""),
+        "the kit is printed as its own bytes, duplicate keys and all: {stdout}"
+    );
+    assert!(
+        stdout.contains("12345678901234567890123"),
+        "an integer past f64 survives, because nothing parsed it: {stdout}"
+    );
+    // Nothing is appended to the kit. The fixture ends in a newline, so the
+    // output ends in exactly one — a second would be a byte darkmux invented.
+    assert!(stdout.ends_with("}\n"), "the kit's own bytes end the output: {stdout:?}");
+    assert!(!stdout.contains(&key_a), "show is ONE record: {stdout}");
+
+    let out = dm(&["mod", "show", "mod-nope"]);
+    assert_eq!(out.status.code(), Some(1), "a missing mod exits 1");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("mod-nope"), "the message names the key");
+
+    // A key that would escape the store is refused, proved against a record
+    // that DOES exist at the escaped path — the store is `<home>/mods`, so
+    // `../x-mod` addresses `<home>/x-mod`, its parent.
+    fs::create_dir_all(home.path().join("x-mod")).unwrap();
+    fs::write(
+        home.path().join("x-mod/mod.json"),
+        serde_json::json!({
+            "key": "x-mod", "ts": "2026-09-03T00:00:00Z", "by": "outside-the-store",
+            "for": [], "kit": "ESCAPED-THE-STORE", "attachments": [],
+            "context": {"findings": []}, "schema_version": "1",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = dm(&["mod", "show", "../x-mod"]);
+    assert_eq!(out.status.code(), Some(1), "a traversal key must not resolve");
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty(), "nothing outside the store is printed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not a mod key"),
+        "the key is INVALID, not merely missing — the two need different remedies: {stderr}"
+    );
+    assert!(!stderr.contains("ESCAPED-THE-STORE"), "got: {stderr}");
+
+    // ── the derived view: `finding show` lists the mods that name it ──────
+    let out = dm(&["finding", "show", "sess-a/1"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\nmods\n"), "the section is present: {stdout}");
+    assert!(
+        stdout.contains(&key_a) && stdout.contains(&key_a2) && stdout.contains(&key_pad),
+        "every mod naming this finding is listed, canonicalized one included: {stdout}"
+    );
+    assert!(!stdout.contains(&key_b), "only the mods naming THIS finding: {stdout}");
+    // Nothing is written back onto the finding — the view is derived.
+    let on_disk = fs::read_to_string(home.path().join("findings/sess-a/1/finding.json")).unwrap();
+    assert!(!on_disk.contains("mod-"), "the finding record is never rewritten: {on_disk}");
+
+    // A finding with no mods prints no section at all.
+    let out = dm(&["finding", "show", "sess-b/2"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&key_b), "sess-b/2's own mod is listed: {stdout}");
+    let out = dm(&["finding", "list", "--json"]);
+    assert!(out.status.success(), "the finding verbs still read the store unchanged");
 }
