@@ -2979,6 +2979,8 @@ mod tests {
         //           sampler periodic SAMPLE curve); `dispatch complete`/
         //           `dispatch error` (and the envelope) gain `host_window`.
         //           Additive; same free-form `payload` blob. See schema.rs.
+        //   1.32.0: `dispatch start` gains `tools_requested` (#2268).
+        //   1.33.0: `dispatch.tool` gains `emitted` + `emit_seq` (#2272).
         assert_eq!(FLOW_SCHEMA_VERSION, "1.33.0");
     }
 

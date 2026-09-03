@@ -3108,7 +3108,7 @@ fn run_with_sleeper(
                         );
                     }
                     let run = dispatch(&call.function.name, &call.function.arguments);
-            let result = run.result;
+                    let result = run.result;
                     // (#469/#2008) Classify with the same function the
                     // failure-rate detector uses, and record it on the
                     // trajectory event so the host watchdog can gate its

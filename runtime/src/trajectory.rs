@@ -1187,9 +1187,9 @@ mod tests {
         // (#2272) `args` is a 512-char VIEWER PREVIEW and always was. A
         // `report_finding` call's arguments ARE the crawl's product, and
         // nine of nine findings on 2026-09-02 were lost because the only
-        // wire copy was that preview, cut mid-JSON. The accepted finding
-        // now rides the event as its own structured `finding` object,
-        // complete, beside the preview it never should have depended on.
+        // wire copy was that preview, cut mid-JSON. The accepted emission
+        // now rides the event verbatim as `emitted`, complete, beside the
+        // preview it never should have depended on.
         let ws = tempfile::Builder::new().prefix("traj-test-finding").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         let why = "w".repeat(2_000);

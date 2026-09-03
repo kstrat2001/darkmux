@@ -4366,8 +4366,14 @@
             "ok": true, "emitted": emitted, "emit_seq": 1,
         });
         state.handle_event(&event.to_string());
+        // A runtime that knows the field sends it on EVERY tool.completed:
+        // an explicit null for a non-emitting call.
         state.handle_event(
-            r#"{"type":"tool.completed","seq":1,"tool_seq":1,"tool_name":"read","args":"{\"path\":\"/workspace/acme/src/x.ts\"}","result":"line\n","ok":true}"#,
+            r#"{"type":"tool.completed","seq":1,"tool_seq":1,"tool_name":"read","args":"{\"path\":\"/workspace/acme/src/x.ts\"}","result":"line\n","ok":true,"emitted":null,"emit_seq":null}"#,
+        );
+        // A runtime that PREDATES the field (a stale local image) sends no key.
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":2,"tool_name":"report_finding","args":"{\"file\":\"x\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
         );
 
         unsafe {
@@ -4395,7 +4401,13 @@
             .filter_map(|l| serde_json::from_str(l).ok())
             .filter(|v: &serde_json::Value| v["session_id"] == "sess-emit" && v["action"] == "dispatch.tool")
             .collect();
-        assert_eq!(records.len(), 2, "one dispatch.tool record per tool.completed event");
+        assert_eq!(records.len(), 3, "one dispatch.tool record per tool.completed event");
+
+        let stale = records[2]["payload"].as_object().unwrap();
+        assert!(
+            !stale.contains_key("emitted") && !stale.contains_key("emit_seq"),
+            "a runtime that sent no key yields a record with NO key — a stale image must never read as \"emitted nothing\": {stale:?}"
+        );
 
         let reported = &records[0]["payload"];
         assert_eq!(reported["emitted"], emitted, "the emission is forwarded whole, untouched");
@@ -4403,9 +4415,11 @@
         assert_eq!(reported["emit_seq"], serde_json::json!(1));
         assert_eq!(reported["args"], preview, "args stays the preview the runtime sent");
 
-        let read = &records[1]["payload"];
-        assert!(read["emitted"].is_null() && read["emit_seq"].is_null(),
-            "a non-emitting tool call carries null, never a missing key that reads as an old record");
+        let read = records[1]["payload"].as_object().unwrap();
+        assert!(
+            read.contains_key("emitted") && read["emitted"].is_null() && read["emit_seq"].is_null(),
+            "a non-emitting call from a current runtime carries an EXPLICIT null: {read:?}"
+        );
     }
 
     /// (#2272) The forward is bounded — a runaway emission cannot blow a flow

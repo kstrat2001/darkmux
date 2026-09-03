@@ -6243,7 +6243,7 @@ impl TailerState {
                         *lock_deadline(deadline) = new_deadline;
                     }
                 }
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "tool_seq": event.get("tool_seq"),
                     // (#1483) The AUTHORITATIVE running tool-call count for this
                     // dispatch (monotonic, 1-based) — the viewer's live seat-card
@@ -6259,8 +6259,14 @@ impl TailerState {
                     "args_chars": event.get("args_chars"),
                     // (#2272) An accepted `report_finding`'s emission, whole
                     // (bounded loudly), plus its 1-based ordinal within this
-                    // dispatch. `null` for every other tool call. The crawl's
-                    // product rides THIS, never the `args` preview above.
+                    // dispatch. A runtime that knows the field sends it on
+                    // EVERY tool.completed — `null` for a non-emitting call —
+                    // so it is forwarded exactly as sent; a runtime that
+                    // predates the field (a stale local `darkmux-runtime:
+                    // latest`) sends no key, and the record then has no key,
+                    // so "nothing emitted" and "the image cannot emit" stay
+                    // distinguishable downstream. The crawl's product rides
+                    // THIS, never the `args` preview above.
                     "emitted": bound_emitted(event.get("emitted")),
                     "emit_seq": event.get("emit_seq"),
                     "result_chars": event.get("result_chars"),
@@ -6283,6 +6289,16 @@ impl TailerState {
                     "failure_reason": cap_json_str(
                         event.get("failure_reason"), MAX_TRAJ_FIELD_BYTES),
                 });
+                if event.get("emitted").is_none() {
+                    // (#2272) The runtime sent no `emitted` key at all: it
+                    // predates the field. Drop both keys rather than forward
+                    // `null`, so a stale image is visible as an ABSENT field
+                    // and never reads as "this call emitted nothing".
+                    if let Some(map) = payload.as_object_mut() {
+                        map.remove("emitted");
+                        map.remove("emit_seq");
+                    }
+                }
                 self.emit("dispatch.tool", darkmux_flow::Level::Info, payload);
             }
             "compaction" => {
