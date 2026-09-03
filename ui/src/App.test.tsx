@@ -1008,7 +1008,11 @@ describe("App", () => {
   // day from the replayed records, loads it, and gets the transport (dispatch)
   // and the dated chip with the playback badge (both). Daemon routes are not
   // static, so these run before the static cases below.
-  function mockDaemonReplay() {
+  // `missionClosed` (default true): the mission slice carries a terminal
+  // `mission close` record, so the mission page is a RECORDING that names
+  // its day. Pass false for a mission still running — header owns liveness,
+  // and a running mission is live whatever day its records carry.
+  function mockDaemonReplay(missionClosed = true) {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -1016,6 +1020,9 @@ describe("App", () => {
         const recs = [
           { ts: "2026-08-07T09:00:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", mission_id: "m-one" },
           { ts: "2026-08-07T09:30:00.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", mission_id: "m-one" },
+          ...(missionClosed
+            ? [{ ts: "2026-08-07T09:31:00.000Z", category: "mission", action: "mission close", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "m-one" }]
+            : []),
         ];
         if (path === "/flow-session/s1") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         if (path === "/flow-mission/m-one") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
@@ -1102,7 +1109,26 @@ describe("App", () => {
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
 
-  it("a daemon mission page names its day in the chip, with NO playback badge and no transport", async () => {
+  it("a daemon mission page that is still RUNNING is live: the badge shows and the chip carries no date", async () => {
+    // (header owns liveness, operator 2026-09-04: "live would be shown
+    // instead of date") The mission below has records from 2026-08-07 but no
+    // terminal record, so it is a live view — the ONE liveness badge shows
+    // and the chip does not name a day. Before this, any mission with
+    // records read as a recording and the header hid the badge.
+    mockDaemonReplay(false);
+    window.location.hash = "#mission=m-one";
+    renderApp();
+    // Settle first: every page is live before its data arrives, so a badge
+    // read before the mission slice lands proves nothing. Wait for the
+    // mission query to have been answered, then a tick for the memo.
+    await waitFor(() => expect((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[0]) === "/flow-mission/m-one")).toBe(true));
+    await new Promise((r) => setTimeout(r, 50));
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("RESULT"));
+    expect(document.querySelector("#modebadge")?.textContent?.toLowerCase()).toContain("live");
+    expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
+  });
+
+  it("a daemon mission page names its day in the chip once the mission has CLOSED, with NO playback badge and no transport", async () => {
     // (operator, 2026-09-01) A mission is an overview, not a scrubbable
     // recording — playback lives in the drill-in detail view. So the badge
     // was not merely redundant here, it was FALSE: a `▶` glyph promising a
