@@ -120,15 +120,11 @@ pub(crate) enum Cmd {
         #[arg(long = "finding", value_name = "KEY")]
         finding: Vec<String>,
         /// (#2295) Append a stored mod's record to the brief — repeatable.
-        /// The mod is the HOW (a change someone already proposed); this hands
-        /// the role the kit BYTE-EXACT, unparsed, plus its attached files,
-        /// which are bind-mounted read-only at
-        /// `/darkmux-mods/<key>/attachments/` and named by that path in the
-        /// block. A key with no stored mod is refused loudly rather than
-        /// dispatched with a silently missing brief — `darkmux mod list`
-        /// shows what is stored. When both flags are given, the finding
-        /// blocks come first, then the mod blocks, each in the order given.
-        #[arg(long = "mod", value_name = "KEY")]
+        ///
+        /// The help text is FORMATTED from `mods::CONTAINER_MODS_BASE` rather
+        /// than spelling the mount path by hand (#2295 review, NIT c), so the
+        /// CLI cannot come to advertise a directory the mounts do not use.
+        #[arg(long = "mod", value_name = "KEY", long_help = darkmux_crew::mods::dispatch_mod_flag_help())]
         mod_key: Vec<String>,
         /// (#1054) Select a named profile from the machine's registry for this
         /// dispatch's model + context-window resolution, instead of the

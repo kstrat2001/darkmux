@@ -3754,7 +3754,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         mod_attachment_mounts: crate::brief_refs::mod_attachment_mounts(
             &opts.brief_refs,
             &crate::mods::mods_dir(),
-        ),
+        )?,
         inject,
         runtime_binary: if inject {
             Some(ensure_runtime_binary_cached(&darkmux_image)?)

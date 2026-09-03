@@ -390,8 +390,24 @@ impl StepKind for DispatchInternalStepKind {
         // (#2295) The finding / mod records the brief carries, read back off
         // the step config. The step config is this list's HOME: the
         // crew-of-one graph writes it from the CLI flags, and a mission graph
-        // writes it directly. Empty when the step names none.
+        // writes it directly.
+        //
+        // (#2295 review, CRITICAL 1) Resolution and the APPEND happen HERE,
+        // not at the CLI — this is the one point every producer of the field
+        // converges on, and appending at the CLI meant a mission graph that
+        // set `config.brief_refs` got the read-only mount and the provenance
+        // stamp with NO block in its brief and no missing-key refusal. It runs
+        // before `dispatch` is called, so a key that addresses no stored
+        // record still fails the step before the ack gate and before any
+        // container work. The CANONICAL refs (the key as the record spells it)
+        // are what get stamped and mounted.
         let brief_refs = crate::brief_refs::from_json(step.config.get("brief_refs"));
+        let (message, brief_refs) = crate::brief_refs::append_to_brief(
+            &message,
+            &brief_refs,
+            &crate::brief_refs::StoreDirs::resolved(),
+        )
+        .with_context(|| format!("step `{}`: resolving the brief's records", step.id))?;
 
         let opts = DispatchOpts {
             brief_refs,

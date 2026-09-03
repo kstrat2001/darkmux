@@ -1916,6 +1916,63 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
         prompt.contains("/darkmux-mods/mod-9-pin/attachments/fix.patch"),
         "the mod block names its attachment by the container path it is mounted at: {start}"
     );
+    // (#2295 review, CRITICAL 1) EXACTLY once. Resolution moved from the CLI
+    // down to the step kind so a mission graph gets its blocks too; if the CLI
+    // kept appending as well, a `darkmux dispatch --finding` would send the
+    // model the same record twice and nothing above would notice.
+    assert_eq!(
+        prompt.matches("MARKER-three-unnamed-operands").count(),
+        1,
+        "the finding block is appended exactly once: {start}"
+    );
+    assert_eq!(
+        prompt.matches("MARKER-name-the-three-operands").count(),
+        1,
+        "and the mod block exactly once: {start}"
+    );
+    assert_eq!(
+        prompt.matches("<mod key=\"mod-9-pin\">").count(),
+        1,
+        "one mod block, not two: {start}"
+    );
+}
+
+/// (#2295 review, CRITICAL 1) The refs cannot ride the fleet work queue — its
+/// job shape has no field for them and the peer's stores are its own — so a
+/// remote `--machine` dispatch that names one is refused rather than routed
+/// with its blocks silently missing. Refused BEFORE the ack gate, like every
+/// other brief-ref refusal.
+#[test]
+fn dispatch_refuses_a_record_ref_routed_to_another_machine() {
+    let store = TempDir::new().unwrap();
+    let dir = store.path().join("sess-r").join("1");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("finding.json"),
+        serde_json::json!({
+            "key": "sess-r/1", "dispatch": "sess-r", "seq": 1,
+            "ts": "2026-09-04T00:00:00Z", "tool_name": "create_finding",
+            "proposer": {"handle": "h", "model": "m"},
+            "context": {}, "emitted": {"why": "x"}, "schema_version": "1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FINDINGS_DIR", store.path())
+        .env("DARKMUX_MACHINE_ID", "this-one")
+        .args([
+            "dispatch", "health-research", "--finding", "sess-r/1", "--machine", "some-other-mac",
+            "smoke",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("cannot be routed to another machine")
+                .and(predicate::str::contains("requires operator acknowledgment").not()),
+        );
 }
 
 /// (#1426) The POSITIONAL message reaches the dispatch path. `health-research`

@@ -743,15 +743,20 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.36.0";
 //           daemon, or any hook rule read it), it shipped one version ago, and
 //           a rename while nothing reads it costs nothing — carrying a second
 //           spelling forever would.
-//           The 1.35.0 carve-out carries forward UNCHANGED: a CROSS-MACHINE
-//           (`--machine`) dispatch still carries the record's text — it is
-//           inside `message` — but not the refs, because `WorkJob` does not
-//           have the field, and adding it there is a wire break
-//           (`deny_unknown_fields` + a coordinated `WORK_JOB_SCHEMA_VERSION`
-//           bump that would reject EVERY job from a peer on the old version)
-//           for a provenance field. A runner's record therefore reads `[]`
-//           for a `--finding`/`--mod` dispatch routed to it; the brief it
-//           worked from is unaffected.
+//           The 1.35.0 cross-machine carve-out CHANGES SHAPE. Resolution moved
+//           from the CLI down to the step kind (the one point every producer
+//           of a `brief_refs` step config goes through — before that move a
+//           mission graph setting the field got the stamp and no block), so a
+//           `--machine` dispatch no longer carries the record's text inside
+//           `message`. `WorkJob` still has no field for the refs — adding one
+//           is a wire break (`deny_unknown_fields` + a coordinated
+//           `WORK_JOB_SCHEMA_VERSION` bump that would reject EVERY job from a
+//           peer on the old version) — so rather than route a brief whose
+//           blocks are silently missing, the CLI now REFUSES
+//           `--finding`/`--mod` together with a remote `--machine`, naming the
+//           gap. No runner record can therefore carry these refs at all, and
+//           none reads `[]` for a routed ref dispatch that silently lost its
+//           blocks.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
