@@ -4928,7 +4928,7 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("graph: 1 of 4 steps minted (2 disabled in config)"), "got:\n{stdout}");
+    assert!(stdout.contains("graph: 1 of 4 steps minted (3 left out by config)"), "got:\n{stdout}");
 
     // One mission on disk; its report and snapshot say what happened.
     let missions_dir = home.path().join("missions");
@@ -4951,6 +4951,7 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
     assert!(pruned.contains(&("t-off".into(), "disabled".into())), "{pruned:?}");
     assert!(pruned.contains(&("s-on-2".into(), "disabled".into())), "{pruned:?}");
     assert!(pruned.contains(&("t-orphan".into(), "all_dependencies_pruned".into())), "{pruned:?}");
+    assert!(pruned.contains(&("s-orphan".into(), "parent_pruned".into())), "{pruned:?}");
     let snapshot: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(mission_dir.join("config-snapshot.json")).unwrap()).unwrap();
     assert_eq!(snapshot["phases"][0]["tasks"][0]["enabled"], false, "the snapshot keeps the DECLARED config");
@@ -5005,5 +5006,5 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
         .output()
         .unwrap();
     let human_out = String::from_utf8_lossy(&human.stdout);
-    assert!(human_out.contains("1 of 4 steps minted (2 disabled in config)"), "got:\n{human_out}");
+    assert!(human_out.contains("1 of 4 steps minted (3 left out by config)"), "got:\n{human_out}");
 }

@@ -158,6 +158,16 @@ pub fn load_envelope(mission_id: &str) -> Result<Option<crate::envelope::Mission
 /// mutable source live), applied one level up: even if the operator later
 /// edits or deletes the source `~/.darkmux/mission-configs/<id>.json`,
 /// this instance keeps its own record of the graph shape it actually ran.
+pub fn config_snapshot_path(mission_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("config-snapshot.json")
+}
+
+/// Persist a mission config snapshot via the same atomic-rename
+/// `save_json` every other entity in this module uses.
+pub fn save_config_snapshot(mission_id: &str, config: &crate::mission_config::MissionConfig) -> Result<()> {
+    save_json(&config_snapshot_path(mission_id), config)
+}
+
 /// (#2299) The mint's prune report — what the config declared, what was
 /// minted, and every item left out with its reason. Written beside the
 /// config snapshot so `mission status` can say "12 steps in the config, 4
@@ -180,16 +190,6 @@ pub fn load_graph_report(mission_id: &str) -> Result<Option<crate::mission_confi
     let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let report = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(report))
-}
-
-pub fn config_snapshot_path(mission_id: &str) -> PathBuf {
-    mission_dir(mission_id).join("config-snapshot.json")
-}
-
-/// Persist a mission config snapshot via the same atomic-rename
-/// `save_json` every other entity in this module uses.
-pub fn save_config_snapshot(mission_id: &str, config: &crate::mission_config::MissionConfig) -> Result<()> {
-    save_json(&config_snapshot_path(mission_id), config)
 }
 
 /// Load a mission's persisted config snapshot, if one exists. A

@@ -57,12 +57,15 @@ impl PruneReport {
         !self.pruned.is_empty()
     }
 
-    /// The one-line human summary every surface prints the same way.
+    /// The one-line human summary every surface prints the same way. Every
+    /// number is a STEP count, so the units never mix: the parenthetical is
+    /// the steps the config left out, whatever rule removed each one.
     pub fn summary_line(&self) -> String {
-        let disabled = self.pruned.iter().filter(|p| p.reason == "disabled").count();
         format!(
-            "{} of {} steps minted ({} disabled in config)",
-            self.steps_minted, self.steps_in_config, disabled
+            "{} of {} steps minted ({} left out by config)",
+            self.steps_minted,
+            self.steps_in_config,
+            self.steps_in_config.saturating_sub(self.steps_minted)
         )
     }
 }
@@ -135,8 +138,11 @@ pub fn prune_disabled(config: &MissionConfig) -> (MissionConfig, PruneReport) {
             break;
         }
         for id in newly {
-            report.pruned.push(Pruned { id: id.clone(), kind: "task".into(), reason: "all_dependencies_pruned".into() });
-            pruned_tasks.insert(id);
+            // The task's steps go with it, reported like every other child.
+            let task = out_phases.iter().flat_map(|p| p.tasks.iter()).find(|t| t.id == id).cloned();
+            if let Some(task) = task {
+                prune_task_with_children(&task, "all_dependencies_pruned", &mut report, &mut pruned_tasks);
+            }
         }
         for phase in &mut out_phases {
             phase.tasks.retain(|t| !pruned_tasks.contains(&t.id));
@@ -263,7 +269,7 @@ mod tests {
         assert_eq!(minted, vec!["s1", "s3", "s4"]);
         assert_eq!((report.steps_in_config, report.steps_minted), (4, 3));
         assert_eq!(reasons(&report), vec![("s2".to_string(), "disabled".to_string())]);
-        assert_eq!(report.summary_line(), "3 of 4 steps minted (1 disabled in config)");
+        assert_eq!(report.summary_line(), "3 of 4 steps minted (1 left out by config)");
     }
 
     #[test]
@@ -303,6 +309,14 @@ mod tests {
             "pruning runs to a fixpoint: {:?}",
             reasons(&report)
         );
+        assert!(
+            reasons(&report).contains(&("s-only-a".to_string(), "parent_pruned".to_string()))
+                && reasons(&report).contains(&("s-chained".to_string(), "parent_pruned".to_string())),
+            "a rule-3 casualty's steps are reported like every other child: {:?}",
+            reasons(&report)
+        );
+        let pruned_steps = report.pruned.iter().filter(|p| p.kind == "step").count();
+        assert_eq!(pruned_steps, report.steps_in_config - report.steps_minted, "every pruned step is listed");
         let a_or_b = &pruned.phases[0].tasks[1];
         assert_eq!(a_or_b.depends_on, vec!["b".to_string()], "the pruned id is dropped from the survivor's list");
         // The interpreter must accept the pruned document as-is.
