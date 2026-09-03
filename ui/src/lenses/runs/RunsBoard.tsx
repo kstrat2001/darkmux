@@ -353,7 +353,8 @@ export function RunsBoard({
       suppressResyncRef.current = false;
       return;
     }
-    if (initialKind === kind && initialRun === labRunDir && initialMachineUid === machineUid) return;
+    const deepLinkUnchanged = initialKind === kind && initialRun === labRunDir && initialMachineUid === machineUid;
+    if (deepLinkUnchanged) return;
     setKind(initialKind);
     setSeries(false);
     setShowAll(false);
