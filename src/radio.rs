@@ -497,7 +497,7 @@ fn extract_fenced_json_block(raw: &str) -> Option<String> {
 /// operator-tunable.
 pub fn dispatch_router_call(message: &str) -> Result<String> {
     let opts = crate::crew::dispatch::DispatchOpts {
-        findings_in_brief: Vec::new(),
+        brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
         resume_from: None,

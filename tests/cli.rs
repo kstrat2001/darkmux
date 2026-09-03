@@ -1712,6 +1712,36 @@ fn dispatch_finding_refuses_a_key_with_no_stored_record() {
         .stderr(predicate::str::contains("<dispatch>/<seq>"));
 }
 
+/// (#2295) The same refusal rule for the second record kind: `dispatch --mod
+/// <key>` with a key that addresses no stored mod refuses BEFORE any dispatch
+/// setup. Proven by ABSENCE — the ACK gate this role would otherwise hit, and
+/// any docker work, must both be unreached.
+#[test]
+fn dispatch_mod_refuses_a_key_with_no_stored_record() {
+    let store = TempDir::new().unwrap(); // empty store
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_MODS_DIR", store.path())
+        .args(["dispatch", "health-research", "--mod", "mod-1-nope", "smoke"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("no mod mod-1-nope")
+                .and(predicate::str::contains("darkmux mod list"))
+                .and(predicate::str::contains("requires operator acknowledgment").not())
+                .and(predicate::str::contains("docker").not()),
+        );
+
+    // A key that could escape the store is refused as a key, never read.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_MODS_DIR", store.path())
+        .args(["dispatch", "health-research", "--mod", "../etc", "smoke"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not a mod key"));
+}
+
 /// (#2265) A key that DOES address a stored finding is loaded and the dispatch
 /// proceeds — proven at the ACK gate, which bails before any Docker work.
 /// `--finding` is repeatable, and both keys resolve.
@@ -1767,14 +1797,19 @@ fn dispatch_finding_loads_a_stored_record_and_proceeds() {
 /// and they stayed green, and the crew-of-one graph could drop the keys (it
 /// did) with nothing to catch it. Here: `prompt_chars` must exceed the
 /// operator's own message, proving the finding block was appended, and
-/// `findings_in_brief` must name the key, proving the hand-off survived every
+/// `brief_refs` must name the records, proving the hand-off survived every
 /// hop.
+///
+/// (#2295) Extended to BOTH record kinds in one dispatch: a finding and a mod,
+/// in the order given, with the mod's attachment named by the container path
+/// it is mounted at.
 #[test]
 fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
     let stub = RespondingStubServer::start();
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
     let findings = TempDir::new().unwrap();
+    let mods = TempDir::new().unwrap();
 
     let profiles_path = home.path().join("profiles.json");
     fs::write(&profiles_path, responding_endpoint_profiles_json(stub.port)).unwrap();
@@ -1796,6 +1831,25 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
     )
     .unwrap();
 
+    // A mod in the store, with its own distinctive kit and one attachment.
+    let mod_dir = mods.path().join("mod-9-pin");
+    fs::create_dir_all(mod_dir.join("attachments")).unwrap();
+    fs::write(mod_dir.join("attachments").join("fix.patch"), b"body").unwrap();
+    fs::write(
+        mod_dir.join("mod.json"),
+        serde_json::json!({
+            "key": "mod-9-pin", "ts": "2026-09-04T00:00:00Z", "by": "sonnet",
+            "for": ["sess-pin/4"],
+            "kit": "MARKER-name-the-three-operands",
+            "kit_looks_json": false,
+            "attachments": ["fix.patch"],
+            "context": {"findings": []},
+            "schema_version": "1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
     let message = "fix it";
     // `review-judge` is TOOL-LESS, so this takes the light single-shot hosted
     // path (a host `curl` to the stub) rather than a `darkmux-runtime`
@@ -1805,8 +1859,12 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
         .env("DARKMUX_PROFILES", &profiles_path)
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_FINDINGS_DIR", findings.path())
+        .env("DARKMUX_MODS_DIR", mods.path())
         .env("DARKMUX_REDIS_URL", "")
-        .args(["dispatch", "review-judge", "--finding", "sess-pin/4", "--skip-preflight", message])
+        .args([
+            "dispatch", "review-judge", "--finding", "sess-pin/4", "--mod", "mod-9-pin",
+            "--skip-preflight", message,
+        ])
         .assert()
         .success();
 
@@ -1826,9 +1884,13 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
     let start = start.expect("a `dispatch start` flow record");
     let payload = &start["payload"];
     assert_eq!(
-        payload["findings_in_brief"],
-        serde_json::json!(["sess-pin/4"]),
-        "the keys must survive the CLI -> crew-of-one -> step-kind hand-off: {start}"
+        payload["brief_refs"],
+        serde_json::json!([
+            {"kind": "finding", "key": "sess-pin/4"},
+            {"kind": "mod", "key": "mod-9-pin"},
+        ]),
+        "both refs must survive the CLI -> crew-of-one -> step-kind hand-off, \
+         in the order given: {start}"
     );
     let prompt_chars = payload["prompt_chars"].as_u64().expect("prompt_chars");
     assert!(
@@ -1837,9 +1899,22 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
          longer than the operator's own {} chars): {start}",
         message.chars().count()
     );
+    let prompt = payload["prompt"].as_str().unwrap_or_default();
     assert!(
-        payload["prompt"].as_str().unwrap_or_default().contains("MARKER-three-unnamed-operands"),
+        prompt.contains("MARKER-three-unnamed-operands"),
         "the record's own prompt carries the finding's emission verbatim: {start}"
+    );
+    assert!(
+        prompt.contains("MARKER-name-the-three-operands"),
+        "and the mod's kit, byte-exact: {start}"
+    );
+    assert!(
+        prompt.find("MARKER-three-unnamed-operands") < prompt.find("MARKER-name-the-three-operands"),
+        "the blocks follow the order the refs were given: {start}"
+    );
+    assert!(
+        prompt.contains("/darkmux-mods/mod-9-pin/attachments/fix.patch"),
+        "the mod block names its attachment by the container path it is mounted at: {start}"
     );
 }
 

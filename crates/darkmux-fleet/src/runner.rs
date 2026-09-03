@@ -312,7 +312,7 @@ impl WorkJob {
             // finding's record inside `message`; only the keys field — this
             // machine's provenance note about where that text came from — does
             // not cross the queue, because `WorkJob` does not carry it.
-            findings_in_brief: Vec::new(),
+            brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,
             resume_from: None,

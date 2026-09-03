@@ -356,14 +356,17 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Miss
     // config the same way as every other optional `DispatchOpts` field
     // here; read back by `DispatchInternalStepKind::run` in
     // `step_kinds/builtins.rs`.
-    // (#2265 review, CRITICAL 8) `--finding <key>` keys, threaded the same
-    // way. This graph copies `DispatchOpts` into the step config FIELD BY
-    // FIELD, so a field added to `DispatchOpts` and not added HERE is silently
-    // dropped on the ONLY path a top-level `darkmux dispatch` takes — which is
-    // what made the flow record's `findings_in_brief` an empty list on every
-    // real `--finding` dispatch while the brief itself carried the blocks.
-    if !opts.findings_in_brief.is_empty() {
-        config["findings_in_brief"] = serde_json::Value::from(opts.findings_in_brief.clone());
+    // (#2295) `--finding <key>` / `--mod <key>` refs, threaded the same way.
+    // This graph copies `DispatchOpts` into the step config FIELD BY FIELD, so
+    // a field added to `DispatchOpts` and not added HERE is silently dropped
+    // on the ONLY path a top-level `darkmux dispatch` takes — which is what
+    // made the flow record's ref list an empty list on every real `--finding`
+    // dispatch while the brief itself carried the blocks (#2265 review,
+    // CRITICAL 8). The step config is the ref list's HOME: a mission graph
+    // sets `brief_refs` on its own steps directly, and the verb flags are only
+    // how the crew-of-one graph gets there.
+    if !opts.brief_refs.is_empty() {
+        config["brief_refs"] = crate::brief_refs::to_json(&opts.brief_refs);
     }
     if let Some(resume_from) = &opts.resume_from {
         config["resume_from"] = serde_json::Value::String(resume_from.display().to_string());
@@ -456,7 +459,7 @@ mod tests {
 
     fn test_opts(role: &str, message: &str) -> DispatchOpts {
         DispatchOpts {
-            findings_in_brief: Vec::new(),
+            brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,
             resume_from: None,
@@ -705,21 +708,34 @@ mod tests {
         // doc — every existing mission/coder-phase/review caller never sets
         // this key; the crew-of-one graph always does.
         assert_eq!(step.config["preserve_dispatch_result"], true);
-        // (#2265 review, CRITICAL 8) `--finding` keys ride the config too. A
-        // field on `DispatchOpts` that is not copied HERE is dropped on the
-        // only path `darkmux dispatch` takes, which is what left the flow
-        // record's `findings_in_brief` empty on every real `--finding` run
-        // while the brief itself carried the blocks.
+        // (#2295) `--finding` / `--mod` refs ride the config too. A field on
+        // `DispatchOpts` that is not copied HERE is dropped on the only path
+        // `darkmux dispatch` takes, which is what left the flow record's ref
+        // list empty on every real `--finding` run while the brief itself
+        // carried the blocks (#2265 review, CRITICAL 8).
         assert!(
-            step.config.get("findings_in_brief").is_none(),
-            "no key at all when no finding was named: {:?}",
+            step.config.get("brief_refs").is_none(),
+            "no key at all when no record was named: {:?}",
             step.config
         );
-        opts.findings_in_brief = vec!["sess-a/1".into(), "sess-b/2".into()];
+        opts.brief_refs = vec![
+            crate::brief_refs::BriefRef::finding("sess-a/1"),
+            crate::brief_refs::BriefRef::mod_("mod-1-aaa"),
+        ];
         let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-frozen-1");
         assert_eq!(
-            step.config["findings_in_brief"],
-            serde_json::json!(["sess-a/1", "sess-b/2"])
+            step.config["brief_refs"],
+            serde_json::json!([
+                {"kind": "finding", "key": "sess-a/1"},
+                {"kind": "mod", "key": "mod-1-aaa"},
+            ]),
+            "both kinds, in the order given"
+        );
+        // The step kind must read back exactly what was written — the two
+        // halves of the hand-off asserted against each other, not separately.
+        assert_eq!(
+            crate::brief_refs::from_json(step.config.get("brief_refs")),
+            opts.brief_refs
         );
     }
 

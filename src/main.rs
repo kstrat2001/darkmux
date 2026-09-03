@@ -140,6 +140,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             message,
             message_from_file,
             finding,
+            mod_key,
             profile,
             session_id,
             timeout,
@@ -157,6 +158,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             message,
             message_from_file,
             finding,
+            mod_key,
             profile,
             session_id,
             timeout,
@@ -1368,6 +1370,7 @@ struct DispatchInvocation {
     message: Option<String>,
     message_from_file: Option<std::path::PathBuf>,
     finding: Vec<String>,
+    mod_key: Vec<String>,
     profile: Option<String>,
     session_id: Option<String>,
     timeout: u32,
@@ -1393,6 +1396,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         message,
         message_from_file,
         finding,
+        mod_key,
         profile,
         session_id,
         timeout,
@@ -1457,22 +1461,33 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
             buf
         }
     };
-    // (#2265) `--finding <key>` (repeatable): each named finding's stored
-    // record is appended to the brief VERBATIM, after the operator's own
-    // message. A key that addresses no stored finding is refused BEFORE any
-    // dispatch setup — dispatching with a silently missing brief would send
-    // the role to work on an observation it never saw.
-    let (message, finding_keys) = darkmux_crew::findings::append_to_brief(
+    // (#2295) `--finding <key>` and `--mod <key>` (both repeatable): each
+    // named record's stored content is appended to the brief VERBATIM, after
+    // the operator's own message. A key that addresses no stored record is
+    // refused BEFORE any dispatch setup — dispatching with a silently missing
+    // block would send the role to work on a record it never saw.
+    //
+    // Findings first, then mods, each in the order given: clap collects the
+    // two flags into two lists, so their interleaving is not recoverable, and
+    // an order that is stated is better than one that looks meaningful and
+    // is not. A caller that needs a different order sets `brief_refs` on the
+    // step config directly — that, not the flags, is the list's home.
+    let brief_refs: Vec<darkmux_crew::brief_refs::BriefRef> = finding
+        .iter()
+        .map(darkmux_crew::brief_refs::BriefRef::finding)
+        .chain(mod_key.iter().map(darkmux_crew::brief_refs::BriefRef::mod_))
+        .collect();
+    let (message, brief_refs) = darkmux_crew::brief_refs::append_to_brief(
         &message,
-        &finding,
-        &darkmux_crew::findings::findings_dir(),
+        &brief_refs,
+        &darkmux_crew::brief_refs::StoreDirs::resolved(),
     )?;
     let opts = crew::dispatch::DispatchOpts {
         workspace_read_only: false,
         record_context: None,
         role_id: role,
         message,
-        findings_in_brief: finding_keys,
+        brief_refs,
         session_id,
         timeout_seconds: timeout,
         skip_preflight,

@@ -1749,6 +1749,7 @@
             container_name: "darkmux-dispatch-test-123".to_string(),
             workspace: PathBuf::from("/host/workspace"),
             host_out: PathBuf::from("/host/out"),
+            mod_attachment_mounts: Vec::new(),
             inject: true,
             runtime_binary: Some(PathBuf::from(
                 "/home/op/.darkmux/runtime/darkmux-runtime",
@@ -1954,6 +1955,7 @@
             container_name: "darkmux-dispatch-min".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
             host_out: PathBuf::from("/tmp/out"),
+            mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
@@ -2086,6 +2088,7 @@
             container_name: "darkmux-dispatch-schema".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
             host_out: PathBuf::from("/tmp/out"),
+            mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
@@ -2139,6 +2142,7 @@
             container_name: "darkmux-edge".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
             host_out: PathBuf::from("/tmp/out"),
+            mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
@@ -2879,6 +2883,7 @@
             container_name: "darkmux-dispatch-reg".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
             host_out: PathBuf::from("/tmp/out"),
+            mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
@@ -4732,23 +4737,68 @@
         restore_env(prev);
     }
 
-    /// (#2265) `dispatch --finding <key>` records WHICH observations the
-    /// dispatch was briefed on. The brief itself is capped on the record, and
-    /// a key is the address the finding store answers to — so the keys are
-    /// their own field, not something a reader has to recover from `prompt`.
+    /// (#2295) `dispatch --finding <key>` / `--mod <key>` records WHICH
+    /// darkmux records the dispatch was briefed on. The brief itself is capped
+    /// on the record, and a key is the address its store answers to — so the
+    /// refs are their own field, not something a reader has to recover from
+    /// `prompt`.
     #[test]
-    fn the_dispatch_start_payload_names_the_findings_that_were_briefed() {
-        let keys = vec!["sess-a/1".to_string(), "sess-b/2".to_string()];
+    fn the_dispatch_start_payload_names_the_records_that_were_briefed() {
+        let refs = vec![
+            crate::brief_refs::BriefRef::finding("sess-a/1"),
+            crate::brief_refs::BriefRef::mod_("mod-1-aaa"),
+        ];
         let with = dispatch_start_payload_json(
-            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, &keys,
+            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, &refs,
         );
-        assert_eq!(with["findings_in_brief"], serde_json::json!(["sess-a/1", "sess-b/2"]));
+        assert_eq!(
+            with["brief_refs"],
+            serde_json::json!([
+                {"kind": "finding", "key": "sess-a/1"},
+                {"kind": "mod", "key": "mod-1-aaa"},
+            ])
+        );
         // Every other dispatch carries the field EMPTY rather than absent — an
         // absent key would be indistinguishable from an older writer's record.
         let without = dispatch_start_payload_json(
             "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, &[],
         );
-        assert_eq!(without["findings_in_brief"], serde_json::json!([]));
+        assert_eq!(without["brief_refs"], serde_json::json!([]));
+    }
+
+    /// (#2295) The full-argv wiring for a briefed mod's attachments: the host
+    /// directory must reach the actual `docker run` argv as a READ-ONLY bind
+    /// at the SAME container path `mods::brief_block` names in the text handed
+    /// to the model. Asserting one without the other is how a block can point
+    /// at a path nothing mounted while both halves stay green (#975).
+    #[test]
+    fn build_docker_run_argv_binds_briefed_mod_attachments_read_only() {
+        let mut config = base_argv_config();
+        let container = crate::mods::attachments_container_dir("mod-7-abc");
+        config.mod_attachment_mounts =
+            vec![(PathBuf::from("/store/mods/mod-7-abc/attachments"), container.clone())];
+        let argv = build_docker_run_argv(&config);
+
+        let bind = format!("/store/mods/mod-7-abc/attachments:{container}:ro");
+        let at = argv.iter().position(|a| a == &bind).unwrap_or_else(|| {
+            panic!("the mod's attachments must be bound read-only: {argv:?}")
+        });
+        assert_eq!(argv[at - 1], "-v", "the bind must be preceded by its -v flag: {argv:?}");
+        let image_at = argv.iter().position(|a| a == &config.image).expect("the image arg");
+        assert!(at < image_at, "docker-run OPTIONS precede the image arg: {argv:?}");
+        // The block the model reads and the argv the container gets must name
+        // the same path — one constant, both sides.
+        assert!(
+            bind.contains("/darkmux-mods/mod-7-abc/attachments"),
+            "the mount path is `mods::attachments_container_dir`: {bind}"
+        );
+
+        // No mod named ⇒ no extra mount at all.
+        let plain = build_docker_run_argv(&base_argv_config());
+        assert!(
+            !plain.iter().any(|a| a.contains("/darkmux-mods")),
+            "a dispatch that names no mod mounts nothing: {plain:?}"
+        );
     }
 
     /// (#2265) The mod channel's host half: an accepted `create_mod` call's

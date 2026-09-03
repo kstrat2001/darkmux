@@ -189,7 +189,7 @@ fn run_mock_dispatch(
 
     let session_id = format!("mock-model-proof-{}-{}", std::process::id(), port);
     let opts = DispatchOpts {
-        findings_in_brief: Vec::new(),
+        brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
         resume_from: None,

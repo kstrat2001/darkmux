@@ -119,6 +119,17 @@ pub(crate) enum Cmd {
         /// replays the flow stream into the store.
         #[arg(long = "finding", value_name = "KEY")]
         finding: Vec<String>,
+        /// (#2295) Append a stored mod's record to the brief — repeatable.
+        /// The mod is the HOW (a change someone already proposed); this hands
+        /// the role the kit BYTE-EXACT, unparsed, plus its attached files,
+        /// which are bind-mounted read-only at
+        /// `/darkmux-mods/<key>/attachments/` and named by that path in the
+        /// block. A key with no stored mod is refused loudly rather than
+        /// dispatched with a silently missing brief — `darkmux mod list`
+        /// shows what is stored. When both flags are given, the finding
+        /// blocks come first, then the mod blocks, each in the order given.
+        #[arg(long = "mod", value_name = "KEY")]
+        mod_key: Vec<String>,
         /// (#1054) Select a named profile from the machine's registry for this
         /// dispatch's model + context-window resolution, instead of the
         /// registry's `default_profile`. When the named profile isn't defined

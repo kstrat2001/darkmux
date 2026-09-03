@@ -237,6 +237,86 @@ pub fn attachments_dir_at(root: &Path, key: &str) -> PathBuf {
     record_dir_at(root, key).join("attachments")
 }
 
+/// (#2295) Where a briefed mod's `attachments/` is bind-mounted inside the
+/// dispatch container, READ-ONLY. Named ONCE, here, and used by both sides
+/// that must agree: `dispatch_internal`'s docker argv builds the `-v` from it,
+/// and [`brief_block`] tells the model the files are at it. A test asserting
+/// the argv is not a test that the mount WORKS (#975) — one constant is what
+/// keeps the two from drifting apart while both stay green.
+pub const CONTAINER_MODS_BASE: &str = "/darkmux-mods";
+
+/// The container path one mod's `attachments/` is mounted at.
+pub fn attachments_container_dir(key: &str) -> String {
+    format!("{CONTAINER_MODS_BASE}/{key}/attachments")
+}
+
+/// Render one stored mod for a dispatch brief (`dispatch --mod <key>`).
+///
+/// **The kit goes in byte-exact and unparsed.** darkmux does not know what is
+/// inside it — a patch, prose, JSON, a shell script — and the model reading
+/// this is the one that does. `attachments_mount` is the container directory
+/// the files are readable at (see [`attachments_container_dir`]); it is a
+/// parameter rather than derived here so the block and the `docker run` argv
+/// can be asserted against the SAME value in one test.
+///
+/// XML-tagged with inline definitions of the two darkmux terms it cannot avoid
+/// using — a model under clean dispatch context has no darkmux history to
+/// ground `mod` or `kit` against (the model-facing prompt doctrine).
+pub fn brief_block(record: &ModRecord, attachments_mount: &str) -> String {
+    let for_line =
+        if record.r#for.is_empty() { "(none named)".to_string() } else { record.r#for.join(", ") };
+    let kit = match &record.kit {
+        Some(text) => format!("<kit>\n{text}\n</kit>"),
+        None => "<kit>(no kit text — the attached files are the whole change)</kit>".to_string(),
+    };
+    let attachments = if record.attachments.is_empty() {
+        "attachments: (none)".to_string()
+    } else {
+        let mut s = String::from(
+            "attachments — these files are already mounted in this container, read-only:\n",
+        );
+        for name in &record.attachments {
+            s.push_str(&format!("- {attachments_mount}/{name}\n"));
+        }
+        s.pop();
+        s
+    };
+    // A mod whose sibling fields partly failed is written ANYWAY (the kit is
+    // the product), so a brief that omitted the warnings would show a partial
+    // mod as if it were whole.
+    let warnings = if record.warnings.is_empty() {
+        String::new()
+    } else {
+        let mut s =
+            String::from("\nThis mod is PARTIAL — these parts of it could not be kept:\n");
+        for w in &record.warnings {
+            s.push_str(&format!("- {w}\n"));
+        }
+        s
+    };
+    format!(
+        "<mod key=\"{key}\">\n\
+         <darkmux-term name=\"mod\">a change someone proposed: instructions and/or data, \
+         enough for whoever applies it later</darkmux-term>\n\
+         <darkmux-term name=\"kit\">the change itself, exactly as its proposer wrote it — \
+         it is handed to you unparsed, in whatever form they chose</darkmux-term>\n\
+         \n\
+         proposed by: {by}\n\
+         addresses findings: {for_line}\n\
+         \n\
+         {kit}\n\
+         \n\
+         {attachments}\n\
+         {warnings}</mod>\n\
+         \n\
+         Read the kit and do what it asks. Nothing in it has been summarized or \
+         interpreted. Read any attached file from the path above; those files are \
+         read-only, so copy from them rather than editing them in place.",
+        key = record.key,
+        by = record.by,
+    )
+}
+
 /// Whether a kit's text parses as JSON. A HINT for readers, computed once at
 /// write time and stored — darkmux does not act on the answer, and the kit is
 /// handed on as bytes whichever way it goes.

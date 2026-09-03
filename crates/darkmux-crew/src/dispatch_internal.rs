@@ -153,6 +153,27 @@ pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host
     args.push(format!("{}:/darkmux-out", host_out.display()));
 }
 
+/// (#2295) Bind-mount each briefed mod's `attachments/` READ-ONLY at
+/// `/darkmux-mods/<key>/attachments`, so a role handed a mod block can read
+/// the files that block names. `mounts` is `(host dir, container dir)` pairs
+/// from `brief_refs::mod_attachment_mounts`, which drops a mod with no
+/// attachments directory entirely — docker would otherwise CREATE an empty one
+/// on the host, inside the operator's mod store.
+///
+/// The container path comes from `mods::attachments_container_dir`, the same
+/// one `mods::brief_block` names in the text handed to the model: one
+/// constant, both sides. `:ro` because a mod is a record of a moment someone
+/// proposed a change — the container reads it and never writes it back.
+///
+/// Extracted from the docker-spawn site for the same reason as
+/// `apply_volume_mounts`: the mount rule is unit-testable without a container.
+pub(crate) fn apply_mod_attachment_mounts(args: &mut Vec<String>, mounts: &[(PathBuf, String)]) {
+    for (host, container) in mounts {
+        args.push("-v".to_string());
+        args.push(format!("{}:{container}:ro", host.display()));
+    }
+}
+
 /// (#386) Filename the host writes the user message into (under `host_out`), and
 /// the matching container path the runtime reads it from via `--prompt-file`.
 /// Keeps a substantial brief off the `docker run` argv (ARG_MAX + `ps`).
@@ -835,6 +856,11 @@ pub struct DockerRunConfig {
     pub workspace: PathBuf,
     /// Host path for out-of-band bookkeeping (mounted at /darkmux-out).
     pub host_out: PathBuf,
+    /// (#2295) `(host attachments dir, container path)` for each briefed mod
+    /// that HAS attachments — bound read-only by
+    /// `apply_mod_attachment_mounts`. Empty on every dispatch that names no
+    /// mod, and on a mod that carries no files.
+    pub mod_attachment_mounts: Vec<(PathBuf, String)>,
     /// Whether to inject the darkmux-runtime binary into a non-default image.
     pub inject: bool,
     /// Path to the cached runtime binary (only used when `inject` is true).
@@ -1020,6 +1046,10 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
 
     // Workspace + out-dir volume mounts
     apply_volume_mounts(&mut args, &config.workspace, &config.host_out, config.workspace_read_only);
+
+    // (#2295) Each briefed mod's attachments, read-only — the files the mod
+    // block in the brief tells the model to read.
+    apply_mod_attachment_mounts(&mut args, &config.mod_attachment_mounts);
 
     // Shared toolchain cache mount (always applied). The host dir is
     // resolved + created at the call site (see DockerRunConfig.cache_dir);
@@ -2290,11 +2320,11 @@ fn dispatch_remote(
                 "endpoint": label,
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
-                // (#2265) Same field, same reason as the container path's
+                // (#2295) Same field, same reason as the container path's
                 // `dispatch_start_payload_json`: the prompt is capped in the
-                // record, so which observations a dispatch was briefed on has
-                // to be its own key on EVERY dispatch path, not just one.
-                "findings_in_brief": opts.findings_in_brief,
+                // record, so which records a dispatch was briefed on has to be
+                // its own key on EVERY dispatch path, not just one.
+                "brief_refs": crate::brief_refs::to_json(&opts.brief_refs),
             }),
         ),
     );
@@ -2588,8 +2618,8 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 "runtime": "direct",
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
-                // (#2265) Same field, same reason — see the hosted path above.
-                "findings_in_brief": opts.findings_in_brief,
+                // (#2295) Same field, same reason — see the hosted path above.
+                "brief_refs": crate::brief_refs::to_json(&opts.brief_refs),
             }),
         ),
     );
@@ -3540,7 +3570,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         agentic_pm.is_some(),
         opts.max_turns_override,
         allowed_tools.as_deref(),
-        &opts.findings_in_brief,
+        &opts.brief_refs,
     );
     // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
@@ -3718,6 +3748,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         container_name: container_name.clone(),
         workspace: workspace.clone(),
         host_out: host_out.clone(),
+        // (#2295) The attachment directories the briefed mods want readable
+        // inside the container. Resolved off the SAME ref list the brief was
+        // rendered from, so the paths the block names are the paths mounted.
+        mod_attachment_mounts: crate::brief_refs::mod_attachment_mounts(
+            &opts.brief_refs,
+            &crate::mods::mods_dir(),
+        ),
         inject,
         runtime_binary: if inject {
             Some(ensure_runtime_binary_cached(&darkmux_image)?)
@@ -4478,7 +4515,7 @@ fn dispatch_start_payload_json(
     is_agentic_remote: bool,
     max_turns_override: Option<u32>,
     tools_requested: Option<&[String]>,
-    findings_in_brief: &[String],
+    brief_refs: &[crate::brief_refs::BriefRef],
 ) -> serde_json::Value {
     serde_json::json!({
         "runtime": "internal",
@@ -4493,12 +4530,13 @@ fn dispatch_start_payload_json(
         // runtime records what it ADVERTISED on its trajectory `dispatch.start`;
         // a gap between the two is the class that hid `create_finding`.
         "tools_requested": tools_requested,
-        // (#2265) The findings whose stored records `dispatch --finding <key>`
-        // appended to the brief. Always present, EMPTY on every other dispatch
-        // — an absent key would be indistinguishable from a record written
-        // before the field existed. `prompt` above is capped; a key is the
-        // address the finding store answers to, so it is its own field.
-        "findings_in_brief": findings_in_brief,
+        // (#2295) The darkmux records `dispatch --finding <key>` / `--mod
+        // <key>` appended to the brief, as `{kind, key}` pairs. Always
+        // present, EMPTY on every other dispatch — an absent key would be
+        // indistinguishable from a record written before the field existed.
+        // `prompt` above is capped; a key is the address its store answers to,
+        // so it is its own field.
+        "brief_refs": crate::brief_refs::to_json(brief_refs),
         "prompt_chars": message.chars().count(),
         // (#1127) The dispatch prompt text (capped) — run context the viewer
         // renders collapsed. prompt_chars carries the full length.

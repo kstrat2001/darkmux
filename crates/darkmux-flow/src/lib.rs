@@ -2986,7 +2986,11 @@ mod tests {
         //           `tool_name: "create_mod"` (riding 1.33.0's `emitted` /
         //           `emit_seq`), and `dispatch start` gains
         //           `findings_in_brief` (#2265).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.35.0");
+        //   1.36.0: `dispatch start`'s `findings_in_brief` becomes
+        //           `brief_refs: [{kind, key}]` — findings AND mods, one
+        //           provenance list. The old key is dropped, not aliased: it
+        //           had zero consumers and was one version old (#2295).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.36.0");
     }
 
     #[test]
