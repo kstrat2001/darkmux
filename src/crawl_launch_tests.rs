@@ -722,6 +722,11 @@ fn message_builder_site_shape_has_scope_and_pattern_prose() {
     assert!(msg.contains("- /workspace/app1/x.ts:3 (read lines 1-6)"), "{msg}");
     assert!(!msg.contains("- x.ts:3"), "sites must be full container paths, not source-relative: {msg}");
     assert!(msg.contains("report_finding"), "{msg}");
+    // (#2267) A site is a pointer into a read window. The prompt has to say the
+    // window comes back numbered, or the model counts lines by hand to find the
+    // cited one — 26% of one measured turn's reasoning was exactly that.
+    assert!(msg.contains("`N: content`"), "the site prompt must name the numbered read form: {msg}");
+    assert!(msg.contains("`<line>: `"), "the site prompt must say where the cited line appears: {msg}");
 }
 
 #[test]

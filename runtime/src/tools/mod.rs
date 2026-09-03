@@ -121,6 +121,15 @@ impl Tool {
                  `limit` (max lines to read; 0 = read entire file \
                  from offset to end).\n\
                  \n\
+                 Every line comes back as `N: content`, where N is that \
+                 line's own line number in the file — the same numbering \
+                 `search` uses. A read at offset=146 starts at `146: `. \
+                 You never have to count lines: the number you need is \
+                 already on the line. When you quote a line as `evidence` \
+                 for `report_finding`, copy only the content AFTER the \
+                 `N: ` prefix, verbatim — the prefix is not part of the \
+                 file.\n\
+                 \n\
                  WHEN TO USE limit > 0 (preferred):\n\
                  - After a `search` match at `path:N:content`, read \
                  around it: offset=N-10, limit=30\n\
@@ -684,15 +693,20 @@ fn execute_read(raw_args: &str, workspace_root: &Path) -> Result<String> {
 /// Slice `content` to lines [offset .. offset+limit). Returns just the
 /// sliced text (no footer). `limit == 0` means "from offset to EOF".
 fn slice_lines(content: &str, offset: u64, limit: u64) -> String {
-    let start = offset.saturating_sub(1) as usize;
-    let lines: Vec<&str> = content.lines().skip(start).collect();
-    let take = if limit == 0 { lines.len() } else { limit as usize };
-    lines.into_iter().take(take).collect::<Vec<_>>().join("\n")
+    slice_lines_with_info(content, offset, limit).0
 }
 
 /// Like `slice_lines` but also returns (lines_returned, end_offset).
 /// end_offset is the 1-indexed line number of the last line returned
 /// (so the next region begins at end_offset+1).
+///
+/// (#2267) Every returned line carries its own 1-indexed FILE line number as
+/// `N: content` — the same `path:line:content` vocabulary `search` already
+/// emits, minus the path this call already named. Unnumbered output made the
+/// model count lines by hand to find the one it had been asked about (26% of
+/// one measured turn's reasoning was retyped source), and that cost lands in
+/// generation, where no tool-call metric sees it. No padding: alignment would
+/// buy nothing and every space is a token.
 fn slice_lines_with_info(content: &str, offset: u64, limit: u64) -> (String, u64, u64) {
     let start = offset.saturating_sub(1) as usize;
     let all_lines: Vec<&str> = content.lines().skip(start).collect();
@@ -700,7 +714,13 @@ fn slice_lines_with_info(content: &str, offset: u64, limit: u64) -> (String, u64
     let kept: Vec<&str> = all_lines.into_iter().take(take).collect();
     let returned = kept.len() as u64;
     let end_offset = offset + returned.saturating_sub(1);
-    (kept.join("\n"), returned, end_offset)
+    let numbered = kept
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("{}: {l}", offset + i as u64))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (numbered, returned, end_offset)
 }
 
 // ─── write ────────────────────────────────────────────────────────────────
@@ -1227,6 +1247,103 @@ mod tests {
 
     // ─── read ─────────────────────────────────────────────────────────────
 
+    // (#2267) `read` hands back `N: content`, N being the line's own number in
+    // the FILE. Measured cost of not doing this: on crawl mission
+    // `crawl-1788339231-148c18` a model spent 26% of one turn's reasoning
+    // retyping source as `NNN: …` to locate a line by hand, because the unit
+    // prompt named `App.tsx:186` and `read` returned 198 unnumbered lines.
+
+    #[test]
+    fn read_numbers_each_line_with_its_own_file_line_number() {
+        let ws = fresh_workspace();
+        let content: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        fs::write(ws.path().join("a.txt"), content).unwrap();
+        let raw =
+            serde_json::json!({"path": "a.txt", "offset": 146, "limit": 3}).to_string();
+        let result = execute_read(&raw, ws.path()).unwrap();
+        assert!(
+            result.starts_with("146: line 146\n147: line 147\n148: line 148"),
+            "a read at offset 146 must start numbering at 146, got: {result}"
+        );
+        assert!(result.contains("returned 3 lines starting at offset 146"), "{result}");
+    }
+
+    #[test]
+    fn read_numbers_an_empty_line_as_number_colon_space() {
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("a.txt"), b"\nsecond\n").unwrap();
+        let raw =
+            serde_json::json!({"path": "a.txt", "offset": 1, "limit": 2}).to_string();
+        let result = execute_read(&raw, ws.path()).unwrap();
+        assert!(
+            result.starts_with("1: \n2: second"),
+            "an empty line renders as number, colon, space and nothing else, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn read_byte_cap_branch_numbers_from_the_offset() {
+        let ws = fresh_workspace();
+        // Each line is 16 bytes, so this comfortably exceeds READ_MAX_BYTES and
+        // the truncating branch is the one that renders.
+        let content: String = (1..=200_000).map(|i| format!("{i:0>14}\n")).collect();
+        assert!(content.len() > READ_MAX_BYTES);
+        fs::write(ws.path().join("big.txt"), content).unwrap();
+        let raw =
+            serde_json::json!({"path": "big.txt", "offset": 10, "limit": 2}).to_string();
+        let result = execute_read(&raw, ws.path()).unwrap();
+        assert!(
+            result.starts_with("10: 00000000000010\n11: 00000000000011"),
+            "the byte-cap branch numbers from the offset too, got: {result}"
+        );
+        assert!(result.contains("byte safety cap fired"), "{result}");
+    }
+
+    #[test]
+    fn report_finding_accepts_evidence_that_kept_its_own_line_prefix() {
+        // The model quotes what `read` handed it, prefix and all. That is the
+        // literal line it examined, so it is accepted rather than rejected as
+        // a mismatch.
+        let ws = finding_workspace(&numbered_src(100, 82, "    let _ = risky();"));
+        let out = fresh_workspace();
+        let msg = report(ws.path(), out.path(), 82, "82:     let _ = risky();");
+        assert!(msg.starts_with("Recorded."), "expected acceptance, got: {msg}");
+        let rec = last_finding(out.path());
+        assert_eq!(rec["evidence"], "    let _ = risky();");
+    }
+
+    #[test]
+    fn report_finding_rejects_a_prefix_naming_a_different_line() {
+        // Only the CITED line's own prefix is strippable. `83: ` on a finding
+        // that cites line 82 is exactly the wrong-line-number error the
+        // mismatch guard exists to catch.
+        let ws = finding_workspace(&numbered_src(100, 82, "    let _ = risky();"));
+        let out = fresh_workspace();
+        let msg = report(ws.path(), out.path(), 82, "83:     let _ = risky();");
+        assert!(
+            msg.starts_with("REJECTED: line 82"),
+            "a prefix naming another line must not be stripped, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn report_finding_still_rejects_a_plain_mismatch() {
+        let ws = finding_workspace(&numbered_src(100, 82, "    let _ = risky();"));
+        let out = fresh_workspace();
+        let msg = report(ws.path(), out.path(), 82, "    let _ = safe();");
+        assert!(msg.starts_with("REJECTED: line 82"), "{msg}");
+    }
+
+    #[test]
+    fn read_tool_description_states_the_numbered_form() {
+        let d = Tool::Read.description();
+        assert!(d.contains("N: content"), "description must name the numbered form: {d}");
+        assert!(
+            d.contains("report_finding"),
+            "description must say what to copy when quoting evidence: {d}"
+        );
+    }
+
     #[test]
     fn read_returns_full_file_when_limit_zero() {
         let ws = fresh_workspace();
@@ -1234,7 +1351,10 @@ mod tests {
         let raw =
             serde_json::json!({"path": "a.txt", "offset": 1, "limit": 0}).to_string();
         let result = execute_read(&raw, ws.path()).unwrap();
-        assert!(result.starts_with("line one\nline two\nline three"));
+        // (#2267) Was `starts_with("line one\nline two\nline three")`. Numbering
+        // applies to the whole-file read too, so this is flipped to the numbered
+        // form rather than relaxed — it still pins the exact rendering.
+        assert!(result.starts_with("1: line one\n2: line two\n3: line three"), "{result}");
         assert!(result.contains("read entire file"));
         assert!(result.contains("3 lines total"));
     }
@@ -1846,6 +1966,10 @@ struct FindingContext {
     start: usize,
     end: usize,
     mismatch: bool,
+    /// (#2267) Whether the model's quote arrived carrying `read`'s own
+    /// `N: ` prefix. Recorded so a later reader can tell which form the
+    /// tier produced without re-deriving it.
+    evidence_had_line_prefix: bool,
 }
 
 /// Resolve the cited file, verify the line exists, and capture the window.
@@ -1883,8 +2007,24 @@ fn capture_finding_context(
         .collect::<Vec<_>>()
         .join("\n");
     let evidence = lines[n - 1].to_string();
-    let mismatch = !claimed.trim().is_empty() && claimed.trim() != evidence.trim();
-    Ok(FindingContext { evidence, context, start, end, mismatch })
+    // (#2267) `read` hands lines back as `N: content`, so a model quoting what
+    // it was shown may quote the prefix too. That is the line it examined, not
+    // a paraphrase, so accept it — but strip ONLY this line's own exact prefix
+    // (`{line}: `). A generic `\d+: ` strip would silently repair a citation
+    // naming the WRONG line, which is the error this guard exists to catch, and
+    // would also mangle source lines that legitimately begin with digits and a
+    // colon.
+    let own_prefix = format!("{n}: ");
+    let quoted = claimed.strip_prefix(own_prefix.as_str()).unwrap_or(claimed);
+    let mismatch = !claimed.trim().is_empty() && quoted.trim() != evidence.trim();
+    Ok(FindingContext {
+        evidence,
+        context,
+        start,
+        end,
+        mismatch,
+        evidence_had_line_prefix: quoted.len() != claimed.len(),
+    })
 }
 
 pub const FINDINGS_FILE: &str = "findings.jsonl";
@@ -2035,6 +2175,7 @@ fn execute_report_finding(
         "context": captured.context,
         "context_start": captured.start,
         "context_end": captured.end,
+        "evidence_had_line_prefix": captured.evidence_had_line_prefix,
         "why": args.why,
         "ts": crate::trajectory::unix_ms(),
     });
