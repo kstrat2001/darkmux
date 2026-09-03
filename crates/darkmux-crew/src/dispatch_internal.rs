@@ -8044,8 +8044,58 @@ pub(crate) fn bare_model_key(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+/// (#2318) Serializes the residency preflight's check-then-load window inside
+/// this process.
+///
+/// The preflight is a classic check-then-act: read `lms ps`, decide the model
+/// is absent, then `lms load` it. A mission phase that runs sibling steps
+/// CONCURRENTLY (the wave scheduler) runs one preflight per sibling on its own
+/// worker thread, so every sibling can read the same "absent" answer before any
+/// of them has finished loading. They then all mint the SAME
+/// `darkmux:<model-key>` identifier and all call `lms load`; LMStudio admits
+/// the first and refuses the rest with "A model with identifier … already
+/// exists", which surfaced as five of six steps failing before dispatch while
+/// the sixth ran fine (mission `crawl-followon-1788459820-486c3d`).
+///
+/// One process-wide lock is the right grain: `lms load` is serialized by
+/// LMStudio anyway, and holding it across check+load means the losers re-read
+/// residency AFTER the winner's load has landed and take the reuse arm. It does
+/// NOT cover two darkmux processes racing each other — that is what the
+/// already-resident recovery below the load is for.
+static RESIDENCY_PREFLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// (#2318) Does this `lms load` failure detail mean the identifier we tried to
+/// mint is ALREADY resident?
+///
+/// The real refusal, verbatim from the failing run:
+/// `Error: A model with identifier darkmux:qwen/qwen3.8-27b already exists.`
+///
+/// A refusal of that shape is not a load failure at all — it is proof that the
+/// thing we wanted resident IS resident. Pure and case-insensitive so the
+/// classification is unit-testable without a live `lms`.
+pub(crate) fn identifier_already_resident(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("identifier") && detail.contains("already exists")
+}
+
 fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     use darkmux_profiles::lms;
+    ensure_model_resident(
+        pm,
+        &|| lms::list_loaded().unwrap_or_default(),
+        &|identifier| lms::unload(identifier),
+        &|model_key, identifier, n_ctx| load_at_ctx_bounded(model_key, identifier, n_ctx),
+    )
+}
+
+/// (#1135/#2318) The residency preflight, pure over its host effects so the
+/// concurrency + recovery contracts are unit-testable without LMStudio.
+fn ensure_model_resident(
+    pm: &darkmux_types::ProfileModel,
+    list: &dyn Fn() -> Vec<darkmux_types::LoadedModel>,
+    unload: &dyn Fn(&str) -> Result<()>,
+    load: &dyn Fn(&str, &str, u32) -> Result<()>,
+) -> Result<()> {
     // (#1282) This is a LOCAL load path (remote-brained dispatches skip it) —
     // a model without a declared `n_ctx` is a resolution error here, with the
     // uniform require_n_ctx message, never a parse-stage failure.
@@ -8067,7 +8117,21 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     // identifier` below is idempotent over the prefix, so the identifier
     // darkmux mints is byte-identical either way.
     let model_key = bare_model_key(&pm.id);
-    let loaded = lms::list_loaded().unwrap_or_default();
+    // (#1617 review) "What it loaded" is the identifier this profile DECLARES,
+    // which is the `darkmux:` form by default and the operator's own string
+    // when they take the documented `identifier` opt-out — see
+    // `is_reloadable_target`.
+    let want_identifier = pm.identifier.as_deref();
+    let identifier = darkmux_gestalt::namespaced_identifier(model_key, want_identifier);
+
+    // (#2318) Held across the read AND the load — concurrent siblings on this
+    // process's wave now serialize here instead of all reading "absent" and all
+    // issuing the same `lms load`. A poisoned lock still admits us: the guarded
+    // state is the host's residency, which the re-read below establishes
+    // afresh, so there is nothing corrupt to inherit.
+    let _serialized = RESIDENCY_PREFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+
+    let loaded = list();
     // (#1609) Consider ONLY darkmux-owned residents. This used to match on the
     // bare model key alone — and `lms ps` reports a darkmux load as
     // `identifier=darkmux:foo, modelKey=foo` and a hand-loaded one as
@@ -8082,12 +8146,6 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     // that structurally through `OwnedTarget`; this legacy path reached past it
     // to the raw `lms::unload`, so the guarantee has to be restated here until
     // the raw call is retired in favor of the `ModelHost` seam.
-    //
-    // (#1617 review) "What it loaded" is the identifier this profile DECLARES,
-    // which is the `darkmux:` form by default and the operator's own string
-    // when they take the documented `identifier` opt-out — see
-    // `is_reloadable_target`.
-    let want_identifier = pm.identifier.as_deref();
     match loaded
         .iter()
         .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
@@ -8100,7 +8158,7 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
                  context. (#1135)",
                 model_key, m.context, n_ctx, n_ctx
             );
-            lms::unload(&m.identifier).with_context(|| {
+            unload(&m.identifier).with_context(|| {
                 format!("unloading `{}` to reload at n_ctx={}", m.identifier, n_ctx)
             })?;
         }
@@ -8127,8 +8185,45 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
             }
         }
     }
-    let identifier = darkmux_gestalt::namespaced_identifier(model_key, want_identifier);
-    load_at_ctx_bounded(model_key, &identifier, n_ctx)
+    match load(model_key, &identifier, n_ctx) {
+        Ok(()) => Ok(()),
+        // (#2318) A refusal naming the identifier as already taken is the
+        // cross-process half of the race the lock above closes in-process
+        // (another darkmux, or an operator, loaded it between our read and our
+        // load). Re-read residency and reuse when the instance now there
+        // satisfies the declared context — the namespace contract says a
+        // resident `darkmux:<id>` at the right context IS the thing to reuse.
+        Err(e) if identifier_already_resident(&format!("{e:#}")) => {
+            match list()
+                .into_iter()
+                .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
+            {
+                Some(m) if m.context >= u64::from(n_ctx) => {
+                    eprintln!(
+                        "darkmux dispatch: `{identifier}` was already resident at context {} \
+                         when this load ran (another dispatch loaded it first); reusing it \
+                         rather than failing. (#2318)",
+                        m.context
+                    );
+                    Ok(())
+                }
+                Some(m) => bail!(
+                    "darkmux: `{identifier}` is already resident at context {} but this \
+                     dispatch declares n_ctx={n_ctx}, and the load that would have fixed \
+                     that was refused because the identifier is taken. Evict it with \
+                     `darkmux machine eject`, then retry. (#2318)",
+                    m.context
+                ),
+                None => bail!(
+                    "darkmux: loading `{model_key}` at n_ctx={n_ctx} was refused because \
+                     `{identifier}` is already taken, yet no resident matching it came back \
+                     from `lms ps` — a `darkmux:<id>` instance is already resident but was \
+                     not recognized — this is #2318. Original error: {e:#}"
+                ),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// (#1139) Load `model_key` under `identifier` at `n_ctx` through the bounded
