@@ -4769,15 +4769,7 @@ body {
   color: var(--warn);
   border-color: var(--warn);
 }
-.missionlens .livepill {
-  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--dim);
-  border: 1px solid var(--border);
-  padding: 3px 8px;
-  border-radius: 3px;
-}
+
 @keyframes ml-pulse {
   0%,
   100% {
@@ -4787,16 +4779,7 @@ body {
     opacity: 0.5;
   }
 }
-.missionlens .livepill.on {
-  color: var(--accent);
-  border-color: var(--accent);
-  animation: ml-pulse 1.6s ease-in-out infinite;
-}
-.missionlens .livepill.off {
-  color: var(--warn);
-  border-color: var(--warn);
-  animation: ml-pulse 1s ease-in-out infinite;
-}
+
 .missionlens .mmeter {
   display: inline-flex;
   align-items: baseline;
