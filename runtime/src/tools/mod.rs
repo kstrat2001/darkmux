@@ -355,7 +355,7 @@ impl Tool {
                     },
                     "attach": {
                         "type": "array",
-                        "description": "Workspace-relative paths of files to copy into the mod, for data the kit needs but cannot inline. Each must be an existing file inside the workspace.",
+                        "description": "Workspace-relative paths of files to copy into the mod, for data the kit needs but cannot inline. Each must be an existing file inside the workspace, and they may total at most 40960 bytes.",
                         "items": { "type": "string" }
                     }
                 },
@@ -1321,8 +1321,17 @@ y = 2
         let run = execute_create_mod(&raw, out.path(), ws.path()).unwrap();
         assert!(run.result.starts_with("Recorded mod 1"), "{}", run.result);
         let emitted = run.emitted.expect("an accepted mod returns its emission");
-        let verbatim: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(emitted, verbatim, "the emission is the model's arguments, untouched");
+        let mut expected: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // Verbatim EXCEPT `attach`, which becomes the resolved list the host
+        // reads — see `the_emission_carries_resolved_attachments_in_the_shape_
+        // the_host_reads` for why the model's path strings cannot ride.
+        expected["attach"] = serde_json::json!([
+            {"path": "src/patch.diff", "bytes": "LS0tIGEKKysrIGIK"}
+        ]);
+        assert_eq!(
+            emitted, expected,
+            "every key but `attach` is the model's own arguments, untouched"
+        );
         assert_eq!(run.emit_seq, Some(1), "first accepted mod in this dispatch");
 
         let rec = last_mod(out.path());
@@ -1412,8 +1421,11 @@ y = 2
     fn an_attachment_over_the_cap_is_refused_with_its_size() {
         let ws = mod_workspace();
         let out = tempfile::tempdir().unwrap();
-        std::fs::write(ws.path().join("big.bin"), vec![7u8; (MAX_ATTACHMENT_BYTES + 1) as usize])
-            .unwrap();
+        std::fs::write(
+            ws.path().join("big.bin"),
+            vec![7u8; (MAX_ATTACHMENT_TOTAL_BYTES + 1) as usize],
+        )
+        .unwrap();
         let run = execute_create_mod(
             &serde_json::json!({"kit": "k", "attach": ["big.bin"]}).to_string(),
             out.path(),
@@ -1421,10 +1433,11 @@ y = 2
         )
         .unwrap();
         assert!(run.result.starts_with("NOT RECORDED"), "{}", run.result);
-        assert!(run.result.contains("big.bin"), "names the file: {}", run.result);
+        assert!(run.result.contains("big.bin"), "names the file that crossed it: {}", run.result);
         assert!(
-            run.result.contains("1048577") || run.result.contains("1 MiB"),
-            "names the size or the cap: {}",
+            run.result.contains(&(MAX_ATTACHMENT_TOTAL_BYTES + 1).to_string())
+                && run.result.contains(&MAX_ATTACHMENT_TOTAL_BYTES.to_string()),
+            "names the size AND the budget: {}",
             run.result
         );
         assert!(!out.path().join(MODS_FILE).exists(), "nothing recorded");
@@ -1464,6 +1477,115 @@ y = 2
             }
         }
         out
+    }
+
+    /// The repo-root fixture both sides of the runtime->host boundary read.
+    /// Loaded at test RUNTIME (never `include_str!`), so the Docker image
+    /// build — which compiles this crate with no test targets and no repo
+    /// checkout above `runtime/` — is unaffected.
+    fn wire_fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/create_mod_wire.json");
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the wire fixture")).unwrap()
+    }
+
+    /// (#2265 review, CRITICAL 1) The emission is the model's arguments with
+    /// `attach` REPLACED by the resolved `[{path, bytes}]` list — the shape
+    /// the HOST reads. The first version emitted the model's path strings,
+    /// so an accepted mod WITH an attachment recorded nothing at all: the
+    /// host read `a["path"]`, found a string, and bailed. Both sides now
+    /// assert against this one fixture.
+    #[test]
+    fn the_emission_carries_resolved_attachments_in_the_shape_the_host_reads() {
+        let fx = wire_fixture();
+        let ws = fresh_workspace();
+        let rel = fx["attachment"]["path"].as_str().unwrap();
+        let path = ws.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, fx["attachment"]["content"].as_str().unwrap()).unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let run = execute_create_mod(&fx["args"].to_string(), out.path(), ws.path()).unwrap();
+        assert!(run.result.starts_with("Recorded mod 1"), "{}", run.result);
+        assert_eq!(
+            run.emitted.expect("an accepted mod emits"),
+            fx["emitted"],
+            "the emission must match the wire fixture the host's own test reads"
+        );
+    }
+
+    /// The two `for`-key predicates must agree, or a key the model is allowed
+    /// to send is a mod the host silently drops. One table, both crates.
+    #[test]
+    fn the_for_key_predicate_agrees_with_the_hosts_on_the_shared_table() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/finding_key_cases.json");
+        let fx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the key fixture")).unwrap();
+        for case in fx["cases"].as_array().unwrap() {
+            let key = case["key"].as_str().unwrap();
+            let valid = case["valid"].as_bool().unwrap();
+            assert_eq!(
+                finding_key_shape_ok(key),
+                valid,
+                "the runtime and the host must agree about {key:?}"
+            );
+        }
+    }
+
+    /// The attachment budget is TOTAL and sized so the emission stays under
+    /// the host's own 64 KiB bound: an emission cut in half loses the kit,
+    /// which is the whole product of the call.
+    #[test]
+    fn attachments_are_bounded_in_total_so_the_emission_never_truncates() {
+        let ws = mod_workspace();
+        let out = tempfile::tempdir().unwrap();
+        // Two files, each under any per-file limit, together over the budget.
+        let half = (MAX_ATTACHMENT_TOTAL_BYTES / 2) + 1024;
+        std::fs::write(ws.path().join("a.bin"), vec![1u8; half as usize]).unwrap();
+        std::fs::write(ws.path().join("b.bin"), vec![2u8; half as usize]).unwrap();
+        let run = execute_create_mod(
+            &serde_json::json!({"kit": "k", "attach": ["a.bin", "b.bin"]}).to_string(),
+            out.path(),
+            ws.path(),
+        )
+        .unwrap();
+        assert!(run.result.starts_with("NOT RECORDED"), "{}", run.result);
+        assert!(
+            run.result.contains(&MAX_ATTACHMENT_TOTAL_BYTES.to_string()),
+            "the refusal names the budget: {}",
+            run.result
+        );
+        assert!(!out.path().join(MODS_FILE).exists(), "nothing recorded");
+
+        // And the whole emission is bounded too, so a huge kit plus a legal
+        // attachment cannot push it past what the host will forward.
+        let big_kit = "x".repeat(MAX_EMISSION_BYTES + 10);
+        let run = execute_create_mod(
+            &serde_json::json!({"kit": big_kit}).to_string(),
+            out.path(),
+            ws.path(),
+        )
+        .unwrap();
+        assert!(run.result.starts_with("NOT RECORDED"), "{}", run.result);
+        assert!(run.result.contains("65536"), "names the bound: {}", run.result);
+    }
+
+    /// (#2265 review, NIT 7) `for` as a bare string is the near-miss a model
+    /// makes when it has exactly one finding. Accept it as a one-element
+    /// list rather than handing back a generic parse failure.
+    #[test]
+    fn a_single_for_key_may_be_a_bare_string() {
+        let ws = mod_workspace();
+        let out = tempfile::tempdir().unwrap();
+        let run = execute_create_mod(
+            &serde_json::json!({"for": "sess-a/1", "kit": "k"}).to_string(),
+            out.path(),
+            ws.path(),
+        )
+        .unwrap();
+        assert!(run.result.starts_with("Recorded mod 1"), "{}", run.result);
+        assert_eq!(last_mod(out.path())["for"], serde_json::json!(["sess-a/1"]));
     }
 
     /// `create_mod` is palette-named, exactly like `create_finding`: a role
@@ -2577,11 +2699,27 @@ fn execute_create_finding(
 /// The per-dispatch mod file, beside `findings.jsonl` in the runtime dir.
 pub const MODS_FILE: &str = "mods.jsonl";
 
-/// Ceiling on ONE attachment, before encoding. A kit is instructions plus the
-/// data needed to apply them; a file over this is a workspace artifact the
-/// applier can fetch itself, and inlining it would push the emission (which
-/// rides a flow record) far past what any reader of the stream expects.
-const MAX_ATTACHMENT_BYTES: u64 = 1024 * 1024;
+/// TOTAL raw bytes of attachments one mod may carry, before encoding.
+///
+/// **Sized against the HOST's emission bound, not against what a file system
+/// would tolerate.** The emission rides a `dispatch.tool` flow record, which
+/// `bound_emitted` cuts at 64 KiB — and a cut emission has no `kit` at all, so
+/// an over-large attachment would silently cost the model the entire product
+/// of its call. Base64 costs 4 bytes per 3, so 40 KiB raw is ~54.6 KiB
+/// encoded and leaves room for the kit and the JSON around it. The first
+/// version's 1 MiB per-file ceiling was ~20x past the point where the record
+/// stopped carrying the kit.
+///
+/// A file bigger than this is `darkmux mod create --attach` territory: that
+/// producer runs on the host, copies from a path, and rides no flow record.
+const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 40 * 1024;
+
+/// Bound on the SERIALIZED emission, mirroring the host's `MAX_EMITTED_BYTES`
+/// (`crates/darkmux-crew/src/dispatch_internal.rs`). Checked here so the
+/// truncation is never reachable from this tool: over the bound the call is
+/// REFUSED with something the model can act on, rather than accepted and then
+/// quietly stripped of its kit somewhere downstream.
+pub const MAX_EMISSION_BYTES: usize = 64 * 1024;
 
 /// The teaching response every refusal ends with — a model that cannot read a
 /// rejection cannot correct it, and a `create_mod` that reads as broken gets
@@ -2591,11 +2729,38 @@ const CREATE_MOD_SHAPE: &str = "\n\n  {\"for\": [\"sess-abc/1\"], \
      \"attach\": [\"path/inside/the/workspace\"]}\n\n\
      Only `kit` is required. Nothing was recorded.";
 
+/// Accept `"for": "sess-a/1"` as well as `"for": ["sess-a/1"]`.
+///
+/// A model with exactly ONE finding writes the bare string; refusing that with
+/// a generic parse error teaches nothing and costs the whole call. Same
+/// liberal-in-what-we-accept reasoning as `CreateFindingArgs`'s aliases.
+fn string_or_list<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateModArgs {
     /// Findings this change addresses. Optional and may be empty: a model that
     /// does not know a finding key still made the change.
-    #[serde(default, rename = "for", alias = "findings", alias = "for_findings")]
+    #[serde(
+        default,
+        rename = "for",
+        alias = "findings",
+        alias = "for_findings",
+        deserialize_with = "string_or_list"
+    )]
     r#for: Vec<String>,
     /// The change itself. Required, stored verbatim, never parsed.
     #[serde(default, alias = "change", alias = "instructions")]
@@ -2623,8 +2788,16 @@ fn finding_key_shape_ok(key: &str) -> bool {
     let Some((dispatch, seq)) = key.rsplit_once('/') else {
         return false;
     };
+    // EXACTLY `findings::is_safe_dispatch_segment` (darkmux-crew), duplicated
+    // rather than shared because this crate cannot depend on the workspace —
+    // and pinned to its twin by `the_for_key_predicate_agrees_with_the_hosts_
+    // on_the_shared_table`, which reads the same checked-in table the host's
+    // own test reads. A rule that drifts here is a mod the host drops: the
+    // first version omitted the `/` check, so `sess/extra/1` passed the model-
+    // facing gate and then failed silently on the far side.
     !dispatch.is_empty()
         && !dispatch.starts_with('.')
+        && !dispatch.contains('/')
         && !dispatch.contains('\\')
         && !dispatch.contains('\0')
         && seq.parse::<u64>().is_ok()
@@ -2686,6 +2859,7 @@ fn execute_create_mod(raw_args: &str, out_dir: &Path, workspace_root: &Path) -> 
     // Attachments are read BEFORE anything is written, so a mod is never
     // recorded naming a file it does not carry.
     let mut attached: Vec<serde_json::Value> = Vec::new();
+    let mut total_bytes: u64 = 0;
     for rel in &args.attach {
         let path = match resolve_read(rel, workspace_root) {
             Ok(p) => p,
@@ -2712,13 +2886,16 @@ fn execute_create_mod(raw_args: &str, out_dir: &Path, workspace_root: &Path) -> 
             }
         };
         // A cap is a REFUSAL, not a truncation: half a file is not the data the
-        // kit needs, and the emission rides a flow record.
-        if meta.len() > MAX_ATTACHMENT_BYTES {
+        // kit needs, and the emission rides a flow record the host bounds.
+        total_bytes += meta.len();
+        if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
             return Ok(ToolRun::text(format!(
-                "NOT RECORDED — `attach` names {rel:?}, which is {} bytes; the limit \
-                 for one attachment is {MAX_ATTACHMENT_BYTES} bytes (1 MiB). Attach a \
-                 smaller file, or describe where the data lives in the `kit` instead.",
-                meta.len()
+                "NOT RECORDED — the attachments total {total_bytes} bytes, over this \
+                 tool's budget of {MAX_ATTACHMENT_TOTAL_BYTES} bytes across ALL \
+                 attachments on one mod ({rel:?} is the one that crossed it). Attach \
+                 less, or name in the `kit` where the data lives instead — the record \
+                 travels on a size-bounded channel, and a mod cut in half would lose \
+                 its kit."
             )));
         }
         let bytes = match std::fs::read(&path) {
@@ -2740,6 +2917,38 @@ fn execute_create_mod(raw_args: &str, out_dir: &Path, workspace_root: &Path) -> 
     // property the findings file has, for the same reason.
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let count = existing.lines().filter(|l| !l.trim().is_empty()).count();
+
+    // (#2265 review, CRITICAL 1) The emission is the model's arguments
+    // VERBATIM, with ONE substitution: `attach` becomes the RESOLVED
+    // `[{path, bytes}]` list. The host has no access to this container's
+    // workspace, so the model's path strings would name files it can never
+    // open — the first version emitted them, and every accepted mod with an
+    // attachment vanished on the far side. Every other key, including ones
+    // darkmux does not know, rides untouched. An alias key the model used
+    // (`files`, `attachments`) stays verbatim beside the canonical `attach`
+    // the host reads.
+    let emitted = verbatim.map(|mut v| {
+        if !attached.is_empty() {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("attach".to_string(), serde_json::Value::Array(attached.clone()));
+            }
+        }
+        v
+    });
+    // The whole emission is bounded HERE so the host's own bound is never
+    // reached: over there, an over-size emission is replaced by a truncation
+    // marker with no `kit` in it at all, and the kit is the product.
+    if let Some(e) = &emitted {
+        let size = e.to_string().len();
+        if size > MAX_EMISSION_BYTES {
+            return Ok(ToolRun::text(format!(
+                "NOT RECORDED — these arguments serialize to {size} bytes, over the \
+                 {MAX_EMISSION_BYTES}-byte limit for one mod. Shorten the `kit`, or \
+                 drop an attachment and say in the `kit` where the data lives. \
+                 Recording it as-is would cut the record and lose the kit."
+            )));
+        }
+    }
 
     let record = serde_json::json!({
         "seq": count + 1,
@@ -2766,7 +2975,7 @@ fn execute_create_mod(raw_args: &str, out_dir: &Path, workspace_root: &Path) -> 
             "Recorded mod {recorded}. It is a record of the change, not the change \
              itself — carry on with the work you were asked to do."
         ),
-        emitted: verbatim,
+        emitted,
         emit_seq: Some(recorded),
     })
 }

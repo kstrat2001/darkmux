@@ -4586,6 +4586,152 @@
         }
     }
 
+
+    /// Point the two record stores (and the flow sink) at tempdirs for a mod
+    /// test, returning what to put back.
+    fn mod_test_env(
+        flows: &std::path::Path,
+        mods: &std::path::Path,
+        findings: &std::path::Path,
+    ) -> Vec<(&'static str, Option<String>)> {
+        let prev: Vec<(&'static str, Option<String>)> = [
+            "DARKMUX_FLOWS_DIR",
+            "DARKMUX_MODS_DIR",
+            "DARKMUX_FINDINGS_DIR",
+            "DARKMUX_REDIS_URL",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows);
+            std::env::set_var("DARKMUX_MODS_DIR", mods);
+            std::env::set_var("DARKMUX_FINDINGS_DIR", findings);
+        }
+        prev
+    }
+
+    fn restore_env(prev: Vec<(&'static str, Option<String>)>) {
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// (#2265 review, CRITICAL 1) The host reads the SAME wire shape the
+    /// runtime writes. The fixture is produced-and-asserted on the runtime
+    /// side (`the_emission_carries_resolved_attachments_in_the_shape_the_host_
+    /// reads`) and consumed here: two hand-written fixtures on either side of
+    /// this boundary is exactly how the attachment break hid — the runtime
+    /// emitted the model's path strings, the host read `{path, bytes}`, and
+    /// each side's own test agreed with it.
+    #[test]
+    #[serial]
+    fn the_host_records_the_wire_shape_the_runtime_actually_emits() {
+        let tmp = TempDir::new().unwrap();
+        let mods_store = tmp.path().join("mods");
+        let prev = mod_test_env(tmp.path(), &mods_store, &tmp.path().join("findings"));
+
+        let fx: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/create_mod_wire.json"),
+            )
+            .expect("the wire fixture"),
+        )
+        .unwrap();
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-wire".into(),
+            "coder".into(),
+            "m".into(),
+        );
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_mod",
+                "args": "{}", "result": "Recorded mod 1.", "ok": true,
+                "emitted": fx["emitted"], "emit_seq": 1,
+            })
+            .to_string(),
+        );
+
+        let all = crate::mods::load_all_at(&mods_store).unwrap();
+        assert_eq!(all.len(), 1, "the runtime's own emission must produce a record: {all:?}");
+        let rec = &all[0];
+        assert_eq!(rec.kit.as_deref(), Some(fx["args"]["kit"].as_str().unwrap()));
+        let name = std::path::Path::new(fx["attachment"]["path"].as_str().unwrap())
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(rec.attachments, vec![name.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(
+                crate::mods::attachments_dir_at(&mods_store, &rec.key).join(&name)
+            )
+            .unwrap(),
+            fx["attachment"]["content"].as_str().unwrap(),
+            "the attachment decodes to the bytes the container read"
+        );
+        assert!(rec.warnings.is_empty(), "a clean emission warns about nothing: {rec:?}");
+        restore_env(prev);
+    }
+
+    /// (#2265 review, CRITICAL 3) A bad PART never costs the kit. The kit is
+    /// the product of the dispatch; a malformed attachment or an unaddressable
+    /// `for` key drops that part, says so in the record, and the mod survives.
+    #[test]
+    #[serial]
+    fn a_malformed_part_is_dropped_with_a_warning_and_the_kit_is_still_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let mods_store = tmp.path().join("mods");
+        let prev = mod_test_env(tmp.path(), &mods_store, &tmp.path().join("findings"));
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-partial".into(),
+            "coder".into(),
+            "m".into(),
+        );
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_mod",
+                "args": "{}", "result": "Recorded mod 1.", "ok": true,
+                "emit_seq": 1,
+                "emitted": {
+                    "for": ["sess-ok/1", "sess/extra/1", 7],
+                    "kit": "the change nobody may lose",
+                    "attach": [
+                        {"path": "good.txt", "bytes": "aGk="},
+                        {"path": "no-bytes.txt"},
+                        {"path": "bad.txt", "bytes": "not base64!"},
+                        {"path": "dir/good.txt", "bytes": "aGk="}
+                    ]
+                },
+            })
+            .to_string(),
+        );
+
+        let all = crate::mods::load_all_at(&mods_store).unwrap();
+        assert_eq!(all.len(), 1, "the mod is written despite the bad parts: {all:?}");
+        let rec = &all[0];
+        assert_eq!(rec.kit.as_deref(), Some("the change nobody may lose"));
+        assert_eq!(rec.r#for, vec!["sess-ok/1".to_string()], "only the addressable key survives");
+        assert_eq!(rec.attachments, vec!["good.txt".to_string()], "only the decodable one");
+        assert_eq!(rec.warnings.len(), 5, "one per dropped part: {:?}", rec.warnings);
+        let joined = rec.warnings.join(" | ");
+        for expected in ["sess/extra/1", "not a string", "no-bytes.txt", "bad.txt", "dir/good.txt"] {
+            assert!(joined.contains(expected), "{expected} must be named: {joined}");
+        }
+        restore_env(prev);
+    }
+
     /// (#2265) `dispatch --finding <key>` records WHICH observations the
     /// dispatch was briefed on. The brief itself is capped on the record, and
     /// a key is the address the finding store answers to — so the keys are

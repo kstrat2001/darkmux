@@ -480,6 +480,30 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
 
 #[cfg(test)]
 mod tests {
+    /// (#2265 review, CRITICAL 2) The host's key predicate and the runtime's
+    /// `finding_key_shape_ok` must agree, or a key the model is allowed to
+    /// send is a mod the host silently drops. ONE table, read by both crates'
+    /// tests — `sess/extra/1` and `a/../b/1` are the two that disagreed.
+    #[test]
+    fn parse_key_agrees_with_the_runtimes_predicate_on_the_shared_table() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/finding_key_cases.json");
+        let fx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the key fixture")).unwrap();
+        for case in fx["cases"].as_array().unwrap() {
+            let key = case["key"].as_str().unwrap();
+            let valid = case["valid"].as_bool().unwrap();
+            assert_eq!(parse_key(key).is_some(), valid, "the host's verdict on {key:?}");
+            // `canonical_finding_key` is what a `for` key is put through, and
+            // it is built on `parse_key` — pinned here so the two cannot part.
+            assert_eq!(
+                crate::mods::canonical_finding_key(key).is_some(),
+                valid,
+                "canonicalization must agree about {key:?}"
+            );
+        }
+    }
+
     /// (#2265) The WIRING: the operator's own message comes first, then one
     /// block per finding, in the order named — and the keys come back so the
     /// dispatch record can say which observations it was briefed on.

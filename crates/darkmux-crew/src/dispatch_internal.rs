@@ -2290,6 +2290,11 @@ fn dispatch_remote(
                 "endpoint": label,
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
+                // (#2265) Same field, same reason as the container path's
+                // `dispatch_start_payload_json`: the prompt is capped in the
+                // record, so which observations a dispatch was briefed on has
+                // to be its own key on EVERY dispatch path, not just one.
+                "findings_in_brief": opts.findings_in_brief,
             }),
         ),
     );
@@ -2583,6 +2588,8 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 "runtime": "direct",
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
+                // (#2265) Same field, same reason — see the hosted path above.
+                "findings_in_brief": opts.findings_in_brief,
             }),
         ),
     );
@@ -6704,6 +6711,20 @@ impl TailerState {
     /// **a failure here never fails the dispatch**, because the record is a
     /// derived convenience over the flow stream, which already carries the
     /// emission and is the audit trail.
+    ///
+    /// **The kit is never discarded over a bad PART** (#2265 review). A
+    /// malformed attachment or a `for` key that addresses no finding drops
+    /// that part, records the reason in the mod's own `warnings`, and writes
+    /// the record anyway. The first version returned early on either, so one
+    /// bad sibling field threw away the entire product of a dispatch — and
+    /// silently, since a warning on a successful unit's stderr is kept only as
+    /// a byte count. A partial mod that says it is partial beats no mod.
+    ///
+    /// The one thing that genuinely cannot be written is an emission with no
+    /// `kit` at all (`bound_emitted` truncated it, or the call came from a
+    /// runtime older than the resolved-attachment wire shape): there is no
+    /// change to record. The runtime bounds the emission itself so that case
+    /// is unreachable from the current tool.
     fn materialize_mod(
         &self,
         event: &serde_json::Value,
@@ -6719,56 +6740,78 @@ impl TailerState {
         if bounded_emission.is_null() {
             return;
         }
-        // An emission over `bound_emitted`'s cap is `{truncated, ...}` and has
-        // no `kit` at all. A mod whose kit is missing is not the change anyone
-        // proposed, so it is refused loudly rather than stored as one — the
-        // flow record still carries what there is.
+        let mut warnings: Vec<String> = Vec::new();
         let Some(kit) = bounded_emission.get("kit").and_then(|v| v.as_str()) else {
             eprintln!(
-                "[darkmux] warning: a create_mod emission carried no `kit` string                  (truncated over the emission cap?); no mod record was written"
+                "[darkmux] warning: a create_mod emission carried no `kit` string \
+                 (truncated over the emission cap?); no mod record was written"
             );
             return;
         };
-        let for_keys: Vec<String> = bounded_emission
+        // A `for` key that can address no finding would be a link nothing
+        // could follow. The runtime refuses one at the tool boundary, where
+        // the model reads the refusal; anything that still arrives here is
+        // dropped from the list rather than taking the mod down with it.
+        let mut for_keys: Vec<String> = Vec::new();
+        for named in bounded_emission
             .get("for")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|k| k.as_str()).map(String::from).collect())
-            .unwrap_or_default();
-        // The runtime refuses an unshaped `for` key at the tool boundary, where
-        // the model can read the refusal and call again; by here every key is
-        // addressable, and this only puts it in its one canonical form.
-        let for_keys = match crate::mods::canonical_for_keys(&for_keys) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("[darkmux] warning: could not write mod: {e:#}");
-                return;
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+        {
+            let Some(key) = named.as_str() else {
+                warnings.push(format!("dropped a `for` entry that was not a string: {named}"));
+                continue;
+            };
+            match crate::mods::canonical_finding_key(key) {
+                Some(k) => for_keys.push(k),
+                None => warnings.push(format!(
+                    "dropped `for` key {key:?}: not `<dispatch>/<seq>`, so it can address \
+                     no finding"
+                )),
             }
-        };
+        }
         // Each attachment rode out of the container as base64 — no host path
         // reaches the container's workspace copy, so the bytes ARE the file.
         let mut attachments: Vec<crate::mods::InlineAttachment> = Vec::new();
-        for a in bounded_emission.get("attach").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+        for a in bounded_emission
+            .get("attach")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+        {
             let (Some(path), Some(b64)) = (
                 a.get("path").and_then(|v| v.as_str()),
                 a.get("bytes").and_then(|v| v.as_str()),
             ) else {
-                eprintln!(
-                    "[darkmux] warning: could not write mod: an attachment carried no                      path/bytes pair"
-                );
-                return;
+                warnings.push(format!(
+                    "dropped an attachment with no path/bytes pair: {a}"
+                ));
+                continue;
             };
             let name = std::path::Path::new(path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
+            if !crate::mods::is_safe_basename(&name) {
+                warnings.push(format!("dropped attachment {path:?}: unusable file name"));
+                continue;
+            }
+            if attachments.iter().any(|x: &crate::mods::InlineAttachment| x.name == name) {
+                warnings.push(format!(
+                    "dropped attachment {path:?}: another attachment already uses the \
+                     name {name:?}"
+                ));
+                continue;
+            }
             match crate::mods::decode_b64(b64) {
                 Ok(bytes) => attachments.push(crate::mods::InlineAttachment { name, bytes }),
-                Err(e) => {
-                    eprintln!("[darkmux] warning: could not write mod: attachment {path:?}: {e:#}");
-                    return;
-                }
+                Err(e) => warnings.push(format!("dropped attachment {path:?}: {e:#}")),
             }
+        }
+        for w in &warnings {
+            eprintln!("[darkmux] warning: create_mod: {w}");
         }
         // The same proposer string the finding record's `proposer` names, in
         // the one free-actor field a mod has: role handle plus the model that
@@ -6786,6 +6829,7 @@ impl TailerState {
                 phase_id: self.phase_id.clone(),
                 step_id: self.step_id.clone(),
             },
+            warnings,
         ) {
             eprintln!("[darkmux] warning: could not write mod: {e:#}");
         }

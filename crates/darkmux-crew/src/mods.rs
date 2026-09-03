@@ -172,6 +172,16 @@ pub struct ModRecord {
     /// Each `for` finding's own provenance, copied at create time.
     #[serde(default)]
     pub context: ModContext,
+    /// What was WRONG with the parts of this mod that could not be kept — an
+    /// attachment that did not decode, a `for` key that addressed no finding.
+    ///
+    /// The record is written ANYWAY when any part fails, because the kit is
+    /// the product: a dispatch that spent its run producing a change must not
+    /// lose it to a malformed sibling field. The problem rides here so the
+    /// mod is honest about being partial instead of silently looking whole.
+    /// Absent (not `[]`) on a mod with nothing wrong.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// The mission / phase / step the DISPATCH that proposed this mod ran
     /// under — `null` for `mod create` (an external actor belongs to no
     /// dispatch) and for a plain `darkmux dispatch`. Top-level for the same
@@ -372,6 +382,7 @@ pub fn create(
         kit_looks_json: kit.is_some_and(kit_looks_json),
         attachments: names.clone(),
         context: finding_context(findings_root, &for_keys)?,
+        warnings: Vec::new(),
         // `mod create` is the EXTERNAL producer: the change was made outside
         // darkmux, so there is no dispatch and no mission to name.
         mission_id: None,
@@ -492,6 +503,10 @@ pub fn decode_b64(s: &str) -> Result<Vec<u8>> {
 /// named findings' provenance — the difference is only where the attachments
 /// come from (a path on the host vs bytes that rode the emission out of the
 /// container, which no host path can reach).
+// One record's worth of parts, each a distinct thing the record must carry;
+// a struct here would only move the same list one line up (`create` above
+// carries the same shape).
+#[allow(clippy::too_many_arguments)]
 pub fn create_from_emission(
     root: &Path,
     findings_root: &Path,
@@ -500,6 +515,7 @@ pub fn create_from_emission(
     kit: &str,
     attachments: &[InlineAttachment],
     scope: crate::findings::Scope,
+    warnings: Vec<String>,
 ) -> Result<ModRecord> {
     anyhow::ensure!(!by.trim().is_empty(), "a mod needs a proposer");
     // The same floor `create` enforces, here too so neither producer can write
@@ -535,6 +551,7 @@ pub fn create_from_emission(
         kit_looks_json: kit_looks_json(kit),
         attachments: names.clone(),
         context: finding_context(findings_root, &for_keys)?,
+        warnings,
         mission_id: scope.mission_id,
         phase_id: scope.phase_id,
         step_id: scope.step_id,
@@ -665,6 +682,7 @@ mod tests {
                 phase_id: Some("p-1".into()),
                 step_id: Some("step-3".into()),
             },
+            vec!["a part the host could not keep".to_string()],
         )
         .unwrap();
 
@@ -675,6 +693,11 @@ mod tests {
         assert_eq!(rec.step_id.as_deref(), Some("step-3"));
         assert_eq!(rec.context.findings[0].mission_id.as_deref(), Some("m-9"));
         assert!(!rec.context.findings[0].missing);
+        assert_eq!(
+            rec.warnings,
+            vec!["a part the host could not keep".to_string()],
+            "what the host could not keep rides ON the record, not only on stderr"
+        );
 
         let stored = load_at(&root, &rec.key).unwrap().expect("the mod is readable");
         assert_eq!(
@@ -714,6 +737,7 @@ mod tests {
                 kit,
                 &attachments,
                 findings::Scope::default(),
+                Vec::new(),
             )
             .expect_err("refused");
             let _ = err;
@@ -1085,6 +1109,7 @@ mod tests {
             kit_looks_json: false,
             attachments: vec![],
             context: ModContext::default(),
+            warnings: Vec::new(),
             mission_id: None,
             phase_id: None,
             step_id: None,
@@ -1118,6 +1143,7 @@ mod tests {
             kit_looks_json: false,
             attachments: vec![],
             context: ModContext::default(),
+            warnings: Vec::new(),
             mission_id: None,
             phase_id: None,
             step_id: None,

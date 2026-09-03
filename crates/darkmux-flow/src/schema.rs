@@ -717,6 +717,18 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.35.0";
 //           `prompt` is capped, and a key is the address the finding store
 //           answers to, so "which observations was this dispatch briefed on"
 //           is answerable from the record without recovering it from prose.
+//           `findings_in_brief` rides EVERY dispatch path's start record (the
+//           container path and both single-shot hosted/local paths), because
+//           `prompt` is capped on all of them. ONE gap, stated rather than
+//           papered over: a CROSS-MACHINE (`--machine`) dispatch carries the
+//           finding's text — it is inside `message` — but not the keys, because
+//           `WorkJob` does not have the field. Adding it there is a real wire
+//           break (`deny_unknown_fields` + a coordinated
+//           `WORK_JOB_SCHEMA_VERSION` bump that would reject EVERY job from a
+//           peer on the old version, for a provenance field), so it is a
+//           deliberate follow-up rather than a rider on this change. A runner's
+//           record therefore reads `[]` for a `--finding` dispatch that was
+//           routed to it; the brief it worked from is unaffected.
 //           Both additive; older readers ignore what they do not recognize.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
