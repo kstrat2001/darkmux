@@ -1509,7 +1509,7 @@ fn build_hooks_check(
             message: format!("enabled ({provenance}) but no rules configured — outbox_dir={}", outbox_dir.display()),
             hint: Some(
                 "Add a rule to config.json's `hooks.rules`, e.g. `darkmux config set hooks.rules \
-                 '[{\"match\":{\"action\":\"dispatch.tool\",\"payload.tool_name\":\"report_finding\",\
+                 '[{\"match\":{\"action\":\"dispatch.tool\",\"payload.tool_name\":\"create_finding\",\
                  \"payload.ok\":true},\"http\":\"http://127.0.0.1:8790/events\"}]'`."
                     .into(),
             ),

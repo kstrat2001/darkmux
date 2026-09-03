@@ -892,8 +892,8 @@ impl HookMatch {
     /// `payload.` prefix stripped — the exact-match predicates
     /// `hooks::hook_match` evaluates against a record's OWN `payload`
     /// field, e.g. `{"action": "dispatch.tool", "payload.tool_name":
-    /// "report_finding", "payload.ok": true}` yields `("tool_name",
-    /// "report_finding")` and `("ok", true)`. A remaining `extras` key that
+    /// "create_finding", "payload.ok": true}` yields `("tool_name",
+    /// "create_finding")` and `("ok", true)`. A remaining `extras` key that
     /// does NOT start with `payload.` is unrelated forward-compat overflow
     /// and is not a predicate — see the struct doc.
     pub fn payload_predicates(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {

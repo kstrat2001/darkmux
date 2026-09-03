@@ -4479,7 +4479,7 @@ fn dispatch_start_payload_json(
         // (`--allowed-tools`, from the role's palette); `null` when the role
         // declares no palette and the runtime's full catalog applies. The
         // runtime records what it ADVERTISED on its trajectory `dispatch.start`;
-        // a gap between the two is the class that hid `report_finding`.
+        // a gap between the two is the class that hid `create_finding`.
         "tools_requested": tools_requested,
         "prompt_chars": message.chars().count(),
         // (#1127) The dispatch prompt text (capped) — run context the viewer
@@ -4718,7 +4718,7 @@ fn enrich_envelope_with_summary(
     //
     // The block is emitted only when the file exists, and its ABSENCE is
     // meaningful rather than merely uninformative: the runtime creates this
-    // file on the first successful `report_finding` call, so no file means the
+    // file on the first successful `create_finding` call, so no file means the
     // channel was never used. For a role holding that tool, that is precisely
     // the #1959 failure — the model mis-called the tool, decided it "is not
     // available in this runtime", and narrated its findings into prose where
@@ -5167,7 +5167,7 @@ const MAX_TRAJ_FIELD_BYTES: usize = 4 * 1024;
 /// truncation here is always visible rather than silent.
 const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
 
-/// (#2272) Bound on the serialized size of an accepted `report_finding`
+/// (#2272) Bound on the serialized size of an accepted `create_finding`
 /// emission forwarded onto the `dispatch.tool` record. The emission is the
 /// crawl's PRODUCT and must arrive whole — nine of nine findings on
 /// 2026-09-02 were lost because the only wire copy was the 512-char `args`
@@ -6257,7 +6257,7 @@ impl TailerState {
                     // here defensively against MAX_TRAJ_FIELD_BYTES for the flow record.
                     "args": cap_json_str(event.get("args"), MAX_TRAJ_FIELD_BYTES),
                     "args_chars": event.get("args_chars"),
-                    // (#2272) An accepted `report_finding`'s emission, whole
+                    // (#2272) An accepted `create_finding`'s emission, whole
                     // (bounded loudly), plus its 1-based ordinal within this
                     // dispatch. A runtime that knows the field sends it on
                     // EVERY tool.completed — `null` for a non-emitting call —
@@ -8035,7 +8035,7 @@ fn probe_loaded_model() -> Result<String> {
 /// runtime gains a new tool or roles gain a new capability token,
 /// add it here AND to the match in `role_to_runtime`.
 const KNOWN_ROLE_VOCAB: &[&str] =
-    &["read", "edit", "write", "exec", "process", "update_plan", "report_finding"];
+    &["read", "edit", "write", "exec", "process", "update_plan", "create_finding"];
 
 /// Single source of truth for role-vocab → runtime-vocab. Add new
 /// mappings here when the runtime gains a new tool or roles gain
@@ -8052,7 +8052,7 @@ fn role_to_runtime(role_name: &str) -> &'static [&'static str] {
         // than folded into `write`, because a role that may RECORD A CLAIM is
         // categorically different from one that may modify the tree — the
         // crawler is read-only and must stay that way.
-        "report_finding" => &["report_finding"],
+        "create_finding" => &["create_finding"],
         // Known role-vocab tokens with no runtime equivalent today.
         // NOT typos — silently dropped is correct behavior.
         "process" | "update_plan" => &[],

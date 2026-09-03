@@ -62,10 +62,10 @@ describe("recordDetail", () => {
     expect(d).toBe("search pattern=let _ = → 4816ch");
   });
 
-  it("surfaces a report_finding's evidence — the finding itself, which is why a crawl's results were invisible", () => {
+  it("surfaces a create_finding's evidence — the finding itself, which is why a crawl's results were invisible", () => {
     const d = recordDetail(
       toolRec({
-        tool_name: "report_finding",
+        tool_name: "create_finding",
         args: JSON.stringify({
           file: "/workspace/crates/darkmux-flow/src/lib.rs",
           line: 147,
@@ -75,7 +75,7 @@ describe("recordDetail", () => {
         ok: true,
       }),
     );
-    expect(d).toContain("report_finding");
+    expect(d).toContain("create_finding");
     expect(d).toContain("lib.rs");
     expect(d).toContain("line=147");
     expect(d).toContain("create_dir_all");

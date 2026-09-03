@@ -804,7 +804,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let full_catalog = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
     let tools = advertised_tools(&full_catalog, allowed_tools.as_deref());
     // (#2268) The advertised set is a FACT about this run and belongs in
-    // the artifact: the crawler's `report_finding` was silently absent from
+    // the artifact: the crawler's `create_finding` was silently absent from
     // every request for two releases, and the first place that was visible
     // was the model's own reasoning ("The tools I have are: search, read,
     // bash"). Recorded on `dispatch.start` so the next such gap is a grep.
@@ -1298,10 +1298,10 @@ fn parse_auth_header_json(contents: &str) -> Result<(String, String), String> {
 /// (#2268) The tools this run ADVERTISES to the model. `full_catalog` is the
 /// general-purpose set every role can draw from; an explicit `--allowed-tools`
 /// list is authoritative and may name a tool that is NOT in the catalog
-/// (`report_finding` — crawler-only, deliberately kept out of the general
+/// (`create_finding` — crawler-only, deliberately kept out of the general
 /// catalog so a role with an empty palette never sees it). Before this, such
 /// a name was filtered against the catalog and vanished: the host passed
-/// `--allowed-tools read,search,bash,report_finding`, the runtime advertised
+/// `--allowed-tools read,search,bash,create_finding`, the runtime advertised
 /// `search,read,bash`, and since #2182 derived the execution allow-list from
 /// the ADVERTISED set, so the crawler could neither see nor call the one
 /// tool its role exists for. It had only ever worked because the pre-#2182
@@ -1372,7 +1372,7 @@ mod tests {
         );
     }
 
-    // (#2268) RED before the fix: `report_finding` is a real tool with a
+    // (#2268) RED before the fix: `create_finding` is a real tool with a
     // `from_name` mapping, is named by the crawler role's palette, and was
     // never advertised because it is not in `full_catalog`.
     #[test]
@@ -1394,31 +1394,31 @@ mod tests {
     fn advertised_tools_keeps_catalog_order_then_appends_extras_in_allow_order() {
         let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
         // the crawler's palette as the host actually emits it (`read` → read,search;
-        // `exec` → bash; then report_finding): catalog members come out in CATALOG
-        // order regardless of allow order, then the extra — so report_finding is LAST.
-        let allow: Vec<String> = ["read", "search", "bash", "report_finding"].iter().map(|s| s.to_string()).collect();
+        // `exec` → bash; then create_finding): catalog members come out in CATALOG
+        // order regardless of allow order, then the extra — so create_finding is LAST.
+        let allow: Vec<String> = ["read", "search", "bash", "create_finding"].iter().map(|s| s.to_string()).collect();
         let names: Vec<&str> = advertised_tools(&full, Some(&allow)).iter().map(|t| t.name()).collect();
-        assert_eq!(names, vec!["search", "read", "bash", "report_finding"]);
+        assert_eq!(names, vec!["search", "read", "bash", "create_finding"]);
         // and allow order does not change that
-        let allow2: Vec<String> = ["report_finding", "bash", "read", "search"].iter().map(|s| s.to_string()).collect();
+        let allow2: Vec<String> = ["create_finding", "bash", "read", "search"].iter().map(|s| s.to_string()).collect();
         let names2: Vec<&str> = advertised_tools(&full, Some(&allow2)).iter().map(|t| t.name()).collect();
         assert_eq!(names2, names);
     }
 
     #[test]
-    fn advertised_tools_none_is_the_full_catalog_and_never_adds_report_finding() {
+    fn advertised_tools_none_is_the_full_catalog_and_never_adds_create_finding() {
         let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
         let out = advertised_tools(&full, None);
         assert_eq!(out.len(), 5);
-        assert!(!out.iter().any(|t| matches!(t, Tool::ReportFinding)), "an empty palette must not expose report_finding");
+        assert!(!out.iter().any(|t| matches!(t, Tool::CreateFinding)), "an empty palette must not expose create_finding");
     }
 
     #[test]
     fn advertised_tools_ignores_an_unknown_name_and_dedupes() {
         let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
-        let allow: Vec<String> = ["read", "not_a_tool", "read", "report_finding", "report_finding"].iter().map(|s| s.to_string()).collect();
+        let allow: Vec<String> = ["read", "not_a_tool", "read", "create_finding", "create_finding"].iter().map(|s| s.to_string()).collect();
         let names: Vec<&str> = advertised_tools(&full, Some(&allow)).iter().map(|t| t.name()).collect();
-        assert_eq!(names, vec!["read", "report_finding"]);
+        assert_eq!(names, vec!["read", "create_finding"]);
     }
 
     #[test]

@@ -2945,7 +2945,7 @@ mod tests {
         //           complete`/`step error` actions with additive payload
         //           keys (`workspace`, `unit`, `source`, `sha`, `rule`,
         //           `est_tokens`, `findings`, …). `crawl.finding` has no
-        //           replacement action: a rejected `report_finding` reply
+        //           replacement action: a rejected `create_finding` reply
         //           now classifies as a FAILED tool call (`payload.ok:
         //           false` on the ordinary `dispatch.tool` record), and
         //           `DispatchOpts::record_context` merges caller-supplied
@@ -2981,7 +2981,8 @@ mod tests {
         //           Additive; same free-form `payload` blob. See schema.rs.
         //   1.32.0: `dispatch start` gains `tools_requested` (#2268).
         //   1.33.0: `dispatch.tool` gains `emitted` + `emit_seq` (#2272).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.33.0");
+        //   1.34.0: `payload.tool_name` `create_finding` → `create_finding` (rename).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.34.0");
     }
 
     #[test]

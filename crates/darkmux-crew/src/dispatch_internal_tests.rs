@@ -1605,7 +1605,7 @@
     /// bind only — the out-dir mount stays read-write regardless, since the
     /// runtime always writes its own bookkeeping (trajectory, findings)
     /// there. The crawl launcher sets `DispatchOpts::workspace_read_only`
-    /// so a role holding only `read`/`exec`/`report_finding` can't write
+    /// so a role holding only `read`/`exec`/`create_finding` can't write
     /// into the corpus tree even via a shell escape.
     #[test]
     fn apply_volume_mounts_appends_ro_to_workspace_bind_when_read_only() {
@@ -4260,7 +4260,7 @@
     /// `DispatchOpts::record_context` (threaded to `TailerState` via
     /// `with_record_context`) merges under `payload.context` on EVERY
     /// record the tailer emits for this dispatch — proven here against a
-    /// `dispatch.tool` record for a `report_finding` call, but the merge
+    /// `dispatch.tool` record for a `create_finding` call, but the merge
     /// itself (`merge_record_context`) is called from `emit`/`emit_telemetry`
     /// unconditionally, not gated on tool name.
     #[test]
@@ -4289,7 +4289,7 @@
             "unit": "u-0001",
         })));
         state.handle_event(
-            r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"report_finding","args":"{\"file\":\"a.rs\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
+            r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"create_finding","args":"{\"file\":\"a.rs\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
         );
 
         unsafe {
@@ -4316,7 +4316,7 @@
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find(|v| v["session_id"] == "sess-context" && v["action"] == "dispatch.tool")
-            .expect("a dispatch.tool record for the report_finding call");
+            .expect("a dispatch.tool record for the create_finding call");
 
         assert_eq!(record["payload"]["context"]["workspace"], "acme");
         assert_eq!(record["payload"]["context"]["source"], "acme-core");
@@ -4324,10 +4324,10 @@
         assert_eq!(record["payload"]["context"]["unit"], "u-0001");
         // The record's OWN fields survive alongside the merged context —
         // the merge adds a key, it never replaces the payload.
-        assert_eq!(record["payload"]["tool_name"], "report_finding");
+        assert_eq!(record["payload"]["tool_name"], "create_finding");
     }
 
-    /// (#2272) A `report_finding` call's arguments ARE the crawl's product, and
+    /// (#2272) A `create_finding` call's arguments ARE the crawl's product, and
     /// the `dispatch.tool` record's `args` is a 512-char viewer preview (the
     /// runtime's `MAX_TOOL_ARGS_CHARS`). Nine of nine findings on 2026-09-02
     /// reached the tracker as a preview cut mid-JSON and were rejected. The
@@ -4360,7 +4360,7 @@
         });
         let preview = "{\"file\":\"/workspace/acme/src/x.ts\",\"line\":82,\"why\":\"yyyyyyyy…";
         let event = serde_json::json!({
-            "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "report_finding",
+            "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_finding",
             "args": preview, "args_chars": 2_150,
             "result": "Recorded. 1 finding(s) so far, 39 remaining in this run's budget.",
             "ok": true, "emitted": emitted, "emit_seq": 1,
@@ -4373,7 +4373,7 @@
         );
         // A runtime that PREDATES the field (a stale local image) sends no key.
         state.handle_event(
-            r#"{"type":"tool.completed","seq":1,"tool_seq":2,"tool_name":"report_finding","args":"{\"file\":\"x\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
+            r#"{"type":"tool.completed","seq":1,"tool_seq":2,"tool_name":"create_finding","args":"{\"file\":\"x\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
         );
 
         unsafe {
@@ -7470,7 +7470,7 @@ fn a_trailing_newline_is_not_a_finding() {
 #[test]
 fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found() {
     // The distinction is load-bearing and is why this is not a zeroed block:
-    // the runtime creates the file on the first successful `report_finding`,
+    // the runtime creates the file on the first successful `create_finding`,
     // so for a role HOLDING that tool an absent file is the #1959 failure —
     // the model decided the tool "is not available in this runtime" and
     // narrated its findings into prose instead. `count: 0` cannot say that.
@@ -8721,7 +8721,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
         );
         assert!(none["tools_requested"].is_null(), "{}", none);
-        let names = vec!["read".to_string(), "search".to_string(), "bash".to_string(), "report_finding".to_string()];
+        let names = vec!["read".to_string(), "search".to_string(), "bash".to_string(), "create_finding".to_string()];
         let some = dispatch_start_payload_json(
             "darkmux-runtime:latest",
             "msg",
@@ -8731,34 +8731,34 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             Some(&names),
         );
-        assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "report_finding"]));
+        assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "create_finding"]));
     }
 
     // (#2268) The host half of the end-to-end claim: the crawler role's
-    // palette must reach the runtime as `read,search,bash,report_finding`.
-    // Pinned here so a palette or mapping change that drops report_finding
+    // palette must reach the runtime as `read,search,bash,create_finding`.
+    // Pinned here so a palette or mapping change that drops create_finding
     // fails a host test, not a crawl.
     #[test]
-    fn allowed_tools_crawler_palette_names_report_finding_last() {
-        let p = palette(&["read", "exec", "report_finding"], &["edit", "write", "process"]);
+    fn allowed_tools_crawler_palette_names_create_finding_last() {
+        let p = palette(&["read", "exec", "create_finding"], &["edit", "write", "process"]);
         let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
-        assert_eq!(result, vec!["read", "search", "bash", "report_finding"]);
+        assert_eq!(result, vec!["read", "search", "bash", "create_finding"]);
     }
 
     // (#2268, review rounds 2-3) The REAL builtin crawler manifest, not a
     // hand-written mirror of it: a change to templates/builtin/roles/
-    // crawler.json that drops report_finding from `allow` (or moves it to
+    // crawler.json that drops create_finding from `allow` (or moves it to
     // `deny`) must fail here, not surface as a crawl with no output channel.
     // Read through `loader::builtin_role`, which parses the EMBEDDED JSON and
     // nothing else — `load_roles()` merges the operator's user tier first,
     // and review proved a local `crawler.json` override flips a test that
     // goes through it, in either direction.
     #[test]
-    fn the_builtin_crawler_manifest_reaches_the_runtime_with_report_finding() {
+    fn the_builtin_crawler_manifest_reaches_the_runtime_with_create_finding() {
         let crawler = crate::loader::builtin_role("crawler")
             .expect("the embedded crawler manifest parses")
             .expect("the crawler role is a builtin");
         let result = compute_runtime_allowed_tools(&crawler.tool_palette).expect("crawler declares a palette");
-        assert_eq!(result, vec!["read", "search", "bash", "report_finding"], "palette: {:?}", crawler.tool_palette);
+        assert_eq!(result, vec!["read", "search", "bash", "create_finding"], "palette: {:?}", crawler.tool_palette);
     }
 

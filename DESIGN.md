@@ -474,6 +474,36 @@ The split is the whole design. A transform is a **pure function** — it needs n
 
 **One limit stated plainly rather than discovered later.** At-least-once is not idempotent, and a create-issue API has no idempotency key, so a lost response can produce a duplicate. The delivery id is stable across retries and an adapter can write it into a searchable field, but a genuine check-then-create needs two requests — which is the `cmd` transport's job, not the transform's.
 
+## Findings and mods: what was observed, and how it could change
+
+Settled with the operator on 2026-09-03, after the first crawl findings reached a tracker and the first PR was made from them by an agent that knew nothing about crawls.
+
+### darkmux is the worker
+
+Imagine the tracker is GitHub. The orchestration layer above darkmux knows its job is to post a PR with every change that came out of crawl X. darkmux does not: it is the worker. It is asked to observe (a crawl, a review, a one-off dispatch with the right tool granted) and it is asked to make a change for a given observation, and it records both. It never reads a tracker, never decides which observations deserve a change, never opens a PR. Those are the orchestrator's, whether the orchestrator is a frontier session, a person, or a scheduled darkmux mission later on. The reason is modularity: every step of the loop has to be staffable independently, so that a local model can do the generation and thinking and a frontier model does only the packaging, or the reverse when a step turns out to need it.
+
+### Two records, both opaque
+
+A **finding** is what was observed. It is an event: it happened at a moment, from a dispatch, and it is never rewritten. Its key is `<dispatch>/<seq>` — the dispatch that produced it and the ordinal of the acceptance within that dispatch — which every finding has, crawl or not. A crawl adds context (mission, unit, rule, source, sha) when it launches the dispatch; nothing about a finding requires a crawl. The runtime tool that produces one is `create_finding` (renamed from `report_finding` on 2026-09-03: the tool *creates* a record; a hook is what *reports* it). darkmux does not interpret the emission: the record is metadata plus the model's arguments verbatim (`emitted`, see the flow schema's 1.33.0 entry), and a hook's transform composes whatever a destination needs from that. A finding's location is domain-specific — a line for text, a page for a PDF, a rect for an image — so no field for it exists on darkmux's side.
+
+A **mod** is how something could change. It is a *kit*: instructions plus data, in whatever form the proposer chose — a diff, a sentence, pixel data, a config value — enough for an AI to make the change correctly later, given the mod's own context. darkmux never types a kit and never opens it. A mod has its own minted key and its own store; it may carry provenance, `for`: zero or more finding references. That is the only stored link between the two records, it lives on the thing created later, and it is a list, because one change can address three observations and one observation can attract three competing changes. The view from a finding to its mods is derived by scanning mods, never stored on the finding.
+
+Two producers write the same mod record: the CLI, for a change made outside darkmux (`darkmux mod create --by <actor> [--for <finding>]... --kit ... [--attach ...]`), and the runtime tool `create_mod`, for a change made inside a dispatch. Whoever made it, the record names the proposer and the time.
+
+### Why the key is minted per mod
+
+Two agents review the same finding at different times. One proposes the code change; the other recommends a comment. Both are valid; they may overlap, conflict, or compose. The record keeps both, judges neither, and leaves the question to whatever integrates them. A key derived from the finding would have made the second overwrite the first.
+
+### Verbs, and what is deliberately absent
+
+`finding list` / `finding show` read the store (the flow stream stays the audit trail; the directory is the queryable copy — JSON on disk is the truth, as with roles). `mod create` / `mod list` likewise. `dispatch <role> --finding <key>` appends the finding's stored record to the brief, verbatim, so a role has the *what*; its palette decides whether it may `create_mod`.
+
+There is no `integrate` verb. If darkmux integrates mods, that is a mission: a shared workspace, one step per mod applying its kit onto the accumulating change and handing the workspace to the next, a failed step failing itself and not the mission. It composes from existing pieces — a worktree step, shell or coder steps — so the concept lives in a mission config, not in the CLI. Each step names its seat, which is what lets the operator decide, per integration, whether a local model or a frontier model does it.
+
+### What this makes measurable
+
+Tokens on the local seat versus the frontier seat per crawl PR. The frontier-only baseline (a Sonnet agent doing both creation and integration for seven findings, PR #2285) is the number every local-seat experiment is compared against.
+
 ## ACP: darkmux inside the editor
 
 `darkmux acp` speaks the [Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol) over stdio, so an editor like Zed can drive darkmux from its own agent panel — you type `/review` in the editor and a local crew works the PR, with progress rendering in the panel rather than a terminal you have to go find.

@@ -461,7 +461,7 @@ fn unit_loop_emits_started_dispatch_findings_completed_in_order_with_mission_id(
 
     // (#1959 merge-gate finding 6, revised) `model` is pinned on the
     // top-level FlowRecord for the `step complete` record that carried a
-    // finding — a plain accepted `report_finding` call has no flow record
+    // finding — a plain accepted `create_finding` call has no flow record
     // of its own anymore (see the module doc), so there is nothing to
     // check there; the model IS still visible on the unit's own
     // completion record.
@@ -721,7 +721,7 @@ fn message_builder_site_shape_has_scope_and_pattern_prose() {
     assert!(msg.contains("/workspace/app1"), "{msg}");
     assert!(msg.contains("- /workspace/app1/x.ts:3 (read lines 1-6)"), "{msg}");
     assert!(!msg.contains("- x.ts:3"), "sites must be full container paths, not source-relative: {msg}");
-    assert!(msg.contains("report_finding"), "{msg}");
+    assert!(msg.contains("create_finding"), "{msg}");
     // (#2267) A site is a pointer into a read window. The prompt has to say the
     // window comes back numbered, or the model counts lines by hand to find the
     // cited one — 26% of one measured turn's reasoning was exactly that.
@@ -2494,7 +2494,7 @@ fn max_turns_ceiling_line_reports_the_bare_formula_for_an_empty_plan() {
 }
 
 /// Build one `tool.completed` trajectory event — the shape
-/// `unit_hit_no_progress_bound` and `count_rejected_report_findings` both
+/// `unit_hit_no_progress_bound` and `count_rejected_create_findings` both
 /// parse (mirrors `runtime::trajectory::append_tool_completed`'s real
 /// field set closely enough for these two readers, which only look at
 /// `type`/`seq`/`tool_name`/`args`).
@@ -2577,7 +2577,7 @@ fn no_progress_bound_ends_a_stalled_unit_as_budget_exhausted_not_errored() {
 
     // Turn 0 reads a NEW path (progress). Turns 1-3 all re-read the SAME
     // path — three consecutive turns with no new file read and no
-    // `report_finding` attempt. With `--param no_progress_turns=3` this
+    // `create_finding` attempt. With `--param no_progress_turns=3` this
     // trailing window trips the bound even though the runtime's own
     // envelope says a clean `"stop"`.
     let mut trajectory = vec![tool_completed_event(0, "read", &json!({"path": "app1/x.ts"}))];

@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn apply_transform_object_becomes_body() {
-        let record = r#"{"action":"dispatch.tool","payload":{"tool_name":"report_finding"}}"#;
+        let record = r#"{"action":"dispatch.tool","payload":{"tool_name":"create_finding"}}"#;
         let out = apply_transform(
             r#"{summary: .payload.tool_name}"#,
             record,
@@ -518,7 +518,7 @@ mod tests {
         match out {
             TransformOutcome::Body(b) => {
                 let v: serde_json::Value = serde_json::from_str(&b).unwrap();
-                assert_eq!(v["summary"], "report_finding");
+                assert_eq!(v["summary"], "create_finding");
             }
             TransformOutcome::Error(e) => panic!("expected a body, got error: {e}"),
             TransformOutcome::Busy => panic!("expected a body, got Busy"),

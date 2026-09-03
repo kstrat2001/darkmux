@@ -87,7 +87,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Every `report_finding` field the runtime's `execute_report_finding`
+/// Every `create_finding` field the runtime's `execute_create_finding`
 /// persists (`runtime/src/tools/mod.rs`) — used to strip the container
 /// path off `file` without disturbing any other field, whatever the
 /// runtime's own record shape carries today or adds later (a finding's
@@ -433,7 +433,7 @@ fn render_files(source: &str, files: &[ReadFileEntry]) -> String {
 /// load-bearing sentences (the tool's exact five keys; the coverage
 /// request), so a model already tuned against that workload sees familiar
 /// phrasing here.
-const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `report_finding` with these five keys exactly: `file`, `line`, `pattern`, `evidence`, `why`. `file` must be the full path exactly as listed above, starting with `/workspace/`. `evidence` must be the source line copied verbatim, and `line` must be where it appears.\n\nWhen you are done, say which files or sites you examined, which you did not get to, and whether you covered the whole scope.\n";
+const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `create_finding` with these five keys exactly: `file`, `line`, `pattern`, `evidence`, `why`. `file` must be the full path exactly as listed above, starting with `/workspace/`. `evidence` must be the source line copied verbatim, and `line` must be where it appears.\n\nWhen you are done, say which files or sites you examined, which you did not get to, and whether you covered the whole scope.\n";
 
 /// Build the dispatch message for one unit. Model-facing (AI-convention
 /// terms; the words `unit`/`ledger`/`corpus`/`packet` never appear —
@@ -613,7 +613,7 @@ fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDispatc
 // wrapping `darkmux_crew::scheduler::step_lifecycle_record_with_payload`)
 // — with the crawl-specific numbers riding in `payload`. There is no
 // `crawl.finding` and no replacement for it: the runtime classifies a
-// REJECTED/NOT-RECORDED `report_finding` reply as a FAILED tool call, so
+// REJECTED/NOT-RECORDED `create_finding` reply as a FAILED tool call, so
 // `payload.ok` on the ordinary `dispatch.tool` record already tells an
 // external tracker whether a finding was accepted — see
 // `crew::dispatch::DispatchOpts::record_context`, set per unit on the
@@ -707,9 +707,9 @@ fn append_file(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// (#1959) Count `report_finding` tool calls THIS unit's dispatch made
+/// (#1959) Count `create_finding` tool calls THIS unit's dispatch made
 /// that the runtime rejected (`tool.completed` events with
-/// `tool_name == "report_finding"` and `ok == false` — see
+/// `tool_name == "create_finding"` and `ok == false` — see
 /// `runtime::failure_rate::classify_outcome`'s REJECTED/NOT-RECORDED
 /// classification). Reads `out_dir/.darkmux-runtime/trajectory.jsonl`,
 /// the same file the host tailer streams live; a missing/unreadable file
@@ -717,7 +717,7 @@ fn append_file(path: &Path, text: &str) -> Result<()> {
 /// best-effort "exclusions" count for the operator-facing payload/table,
 /// never a correctness-bearing value — the ledger and the accepted-
 /// findings count are unaffected by anything this function returns).
-fn count_rejected_report_findings(out_dir: &Path) -> usize {
+fn count_rejected_create_findings(out_dir: &Path) -> usize {
     let traj_path = out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
     let Ok(body) = std::fs::read_to_string(&traj_path) else {
         return 0;
@@ -726,7 +726,7 @@ fn count_rejected_report_findings(out_dir: &Path) -> usize {
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter(|v| {
             v.get("type").and_then(Value::as_str) == Some("tool.completed")
-                && v.get("tool_name").and_then(Value::as_str) == Some("report_finding")
+                && v.get("tool_name").and_then(Value::as_str) == Some("create_finding")
                 && v.get("ok").and_then(Value::as_bool) == Some(false)
         })
         .count()
@@ -735,7 +735,7 @@ fn count_rejected_report_findings(out_dir: &Path) -> usize {
 // ── per-unit bounds (#2193) ─────────────────────────────────────────────
 //
 // Live evidence (crawl-1788144785, unit u-0005, Devstral, 2026-08-31): one
-// unit ran 96+ minutes / 38 turns / 65 tool calls with ZERO `report_finding`
+// unit ran 96+ minutes / 38 turns / 65 tool calls with ZERO `create_finding`
 // attempts and nothing able to stop it — `runtime.max_turns` defaults to
 // `None` (uncapped), and nothing in this launcher supplied a per-unit
 // default. Two independent bounds close that gap: a turn CEILING (this
@@ -747,7 +747,7 @@ fn count_rejected_report_findings(out_dir: &Path) -> usize {
 // detector happened to fire."
 
 /// A rough multiple of turns per site — read the site, maybe grep around
-/// it, decide, call `report_finding` (or not). Deliberately generous (a
+/// it, decide, call `create_finding` (or not). Deliberately generous (a
 /// unit that needs fewer turns just finishes early via `result: "stop"`;
 /// this only bounds the WORST case).
 const TURNS_PER_SITE: u32 = 3;
@@ -792,12 +792,12 @@ fn default_unit_max_turns(unit: &Unit) -> u32 {
 }
 
 /// (#2193) Walk `out_dir/.darkmux-runtime/trajectory.jsonl` (the SAME file
-/// `count_rejected_report_findings` reads, best-effort — a missing/
+/// `count_rejected_create_findings` reads, best-effort — a missing/
 /// unreadable trajectory reports `false`, never escalates a unit this
 /// launcher can't fully inspect) and report whether this unit's LAST `n`
-/// turns collectively made no progress: no `report_finding` attempt
+/// turns collectively made no progress: no `create_finding` attempt
 /// (accepted OR rejected — an ATTEMPT is engagement, unlike `count_
-/// rejected_report_findings`'s rejected-only count) and no path read that
+/// rejected_create_findings`'s rejected-only count) and no path read that
 /// hadn't already been read in an EARLIER turn. Turns are grouped by
 /// `tool.completed`'s own `seq` field — the same turn-numbering `dispatch_
 /// internal`'s live tailer counts by, so this reads the exact same "turn"
@@ -825,7 +825,7 @@ fn unit_hit_no_progress_bound(out_dir: &Path, n: usize) -> bool {
         let tool_name = v.get("tool_name").and_then(Value::as_str).unwrap_or("");
         let entry = by_turn.entry(seq).or_insert(false);
         match tool_name {
-            "report_finding" => *entry = true,
+            "create_finding" => *entry = true,
             "read" => {
                 let args = v.get("args").and_then(Value::as_str).unwrap_or("");
                 if let Some(path) = serde_json::from_str::<Value>(args)
@@ -2122,7 +2122,7 @@ pub(crate) fn run(
         // (#2193) No-progress bound — checked whenever the dispatch
         // actually ran and reported a clean `"stop"`: a unit whose LAST
         // `no_progress_turns` turns show no new file read and no
-        // `report_finding` attempt ends here with the SAME named outcome
+        // `create_finding` attempt ends here with the SAME named outcome
         // `interpret_dispatch_result` gives an envelope `result:
         // "max_turns"` — the operator-facing question is "did this unit
         // run out of room to work in," not "which bound happened to
@@ -2147,7 +2147,7 @@ pub(crate) fn run(
         }
 
         let mut findings_n = 0usize;
-        // (#1959) `exclusions` — rejected `report_finding` calls this unit
+        // (#1959) `exclusions` — rejected `create_finding` calls this unit
         // made, read from the SAME `trajectory.jsonl` the tailer streams
         // live (see runtime::failure_rate::classify_outcome's REJECTED/
         // NOT-RECORDED classification): a cheap sibling scan to the
@@ -2157,7 +2157,7 @@ pub(crate) fn run(
             .as_ref()
             .ok()
             .and_then(|res| res.out_dir.as_deref())
-            .map(count_rejected_report_findings)
+            .map(count_rejected_create_findings)
             .unwrap_or(0);
         // (#2114 follow-up) This unit's host out dir (the `/darkmux-out`
         // mount) — recorded into `per_unit_rows` below so a LATER
@@ -2211,7 +2211,7 @@ pub(crate) fn run(
                         ledger_buf.push('\n');
                         // (#1959, revised) No flow record here — a finding
                         // is never a special record. The runtime already
-                        // classified this `report_finding` call's outcome
+                        // classified this `create_finding` call's outcome
                         // on the `dispatch.tool` record its own tailer
                         // emitted (`payload.ok: true` for an accepted
                         // finding), and `DispatchOpts::record_context`

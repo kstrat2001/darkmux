@@ -96,7 +96,7 @@ tools! {
     Write => "write",
     Edit => "edit",
     Search => "search",
-    ReportFinding => "report_finding",
+    CreateFinding => "create_finding",
 }
 
 impl Tool {
@@ -129,7 +129,7 @@ impl Tool {
                  file: never put it in `edit`'s `old_string` or `new_string`, \
                  never put it in `write`'s `content` (the runtime refuses \
                  content that still carries it), and when you quote a line \
-                 as `evidence` for `report_finding`, copy only the content \
+                 as `evidence` for `create_finding`, copy only the content \
                  AFTER the prefix, verbatim.\n\
                  \n\
                  WHEN TO USE limit > 0 (preferred):\n\
@@ -184,7 +184,7 @@ impl Tool {
                  any edit in the batch fails, no write happens). \
                  Arguments: { path: string, edits: [{ old_string: string, new_string: string, replace_all?: bool }] }."
             }
-            Tool::ReportFinding => {
+            Tool::CreateFinding => {
                 "Records ONE suspected issue you have found, then lets you keep \
                  working. Call it as soon as you find something rather than \
                  saving them up for the end — a run that is cut short keeps \
@@ -295,7 +295,7 @@ impl Tool {
                 },
                 "required": ["path", "content"]
             }),
-            Tool::ReportFinding => serde_json::json!({
+            Tool::CreateFinding => serde_json::json!({
                 "type": "object",
                 "properties": {
                     "file": {
@@ -397,8 +397,8 @@ impl Tool {
             Tool::Write => execute_write(raw_args, ws).map(ToolRun::text),
             Tool::Edit => execute_edit(raw_args, ws).map(ToolRun::text),
             Tool::Search => execute_search(raw_args, ws).map(ToolRun::text),
-            Tool::ReportFinding => {
-                execute_report_finding(raw_args, &crate::trajectory::runtime_dir(), ws)
+            Tool::CreateFinding => {
+                execute_create_finding(raw_args, &crate::trajectory::runtime_dir(), ws)
             }
         }
     }
@@ -433,7 +433,7 @@ pub fn dispatch(name: &str, raw_args: &str) -> ToolRun {
 
 /// What one tool call produced: the text that goes back into the
 /// conversation as the `role: tool` message, plus — for an ACCEPTED
-/// `report_finding` call only — the model's emission (#2272).
+/// `create_finding` call only — the model's emission (#2272).
 ///
 /// `emitted` is the tool's arguments exactly as the model sent them, parsed
 /// and nothing more: darkmux does not know what is inside it and must not,
@@ -1046,7 +1046,7 @@ mod tests {
     #[test]
     fn the_wire_name_set_is_exactly_this() {
         let names: Vec<&str> = super::Tool::ALL.iter().map(|t| t.name()).collect();
-        assert_eq!(names, ["echo", "bash", "read", "write", "edit", "search", "report_finding"]);
+        assert_eq!(names, ["echo", "bash", "read", "write", "edit", "search", "create_finding"]);
         // and no two variants share a wire name (a duplicate would also be an
         // unreachable-pattern error under -D warnings in from_name)
         let mut sorted = names.clone();
@@ -1108,7 +1108,7 @@ mod tests {
         );
     }
 
-    // ─── report_finding: harness-captured context (#1959) ─────────────────
+    // ─── create_finding: harness-captured context (#1959) ─────────────────
 
     // The tier that PRODUCES candidates must not also author what the tier
     // that JUDGES them gets to see. These assert the runtime reads the source
@@ -1140,7 +1140,7 @@ mod tests {
             "evidence": evidence, "why": "w",
         })
         .to_string();
-        execute_report_finding(&raw, out, ws).unwrap().result
+        execute_create_finding(&raw, out, ws).unwrap().result
     }
 
     #[test]
@@ -1160,7 +1160,7 @@ mod tests {
             "extra_the_model_chose_to_add": {"rect": [1, 2, 3, 4]},
         })
         .to_string();
-        let run = execute_report_finding(&raw, out.path(), ws.path()).unwrap();
+        let run = execute_create_finding(&raw, out.path(), ws.path()).unwrap();
         assert!(run.result.starts_with("Recorded."), "{}", run.result);
         let emitted = run.emitted.expect("an accepted report returns its emission");
         let verbatim: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1168,10 +1168,10 @@ mod tests {
         assert_eq!(emitted["why"].as_str().unwrap().len(), 2_000);
         assert_eq!(run.emit_seq, Some(1), "first accepted report in this dispatch");
 
-        let second = execute_report_finding(&raw, out.path(), ws.path()).unwrap();
+        let second = execute_create_finding(&raw, out.path(), ws.path()).unwrap();
         assert_eq!(second.emit_seq, Some(2), "the ordinal is the findings-file count, so it survives a resume");
 
-        let rejected = execute_report_finding(
+        let rejected = execute_create_finding(
             &serde_json::json!({"file": "src/a.rs", "line": 3, "pattern": "p",
                 "evidence": "not what line 3 says", "why": "w"}).to_string(),
             out.path(), ws.path(),
@@ -1246,7 +1246,7 @@ y = 2
     }
 
     #[test]
-    fn read_tool_description_covers_edit_and_write_not_just_report_finding() {
+    fn read_tool_description_covers_edit_and_write_not_just_create_finding() {
         let d = Tool::Read.description();
         assert!(d.contains("old_string") && d.contains("write"), "the prefix rule must name edit/write: {d}");
     }
@@ -1340,7 +1340,7 @@ y = 2
             "evidence": "root", "why": "w",
         })
         .to_string();
-        let resp = execute_report_finding(&raw, out.path(), ws.path()).unwrap().result;
+        let resp = execute_create_finding(&raw, out.path(), ws.path()).unwrap().result;
         assert!(resp.starts_with("REJECTED:"), "context capture must not escape the workspace: {resp}");
     }
 
@@ -1409,7 +1409,7 @@ y = 2
     }
 
     #[test]
-    fn report_finding_accepts_evidence_that_kept_its_own_line_prefix() {
+    fn create_finding_accepts_evidence_that_kept_its_own_line_prefix() {
         // The model quotes what `read` handed it, prefix and all. That is the
         // literal line it examined, so it is accepted rather than rejected as
         // a mismatch.
@@ -1422,7 +1422,7 @@ y = 2
     }
 
     #[test]
-    fn report_finding_rejects_a_prefix_naming_a_different_line() {
+    fn create_finding_rejects_a_prefix_naming_a_different_line() {
         // Only the CITED line's own prefix is strippable. `83: ` on a finding
         // that cites line 82 is exactly the wrong-line-number error the
         // mismatch guard exists to catch.
@@ -1436,7 +1436,7 @@ y = 2
     }
 
     #[test]
-    fn report_finding_still_rejects_a_plain_mismatch() {
+    fn create_finding_still_rejects_a_plain_mismatch() {
         let ws = finding_workspace(&numbered_src(100, 82, "    let _ = risky();"));
         let out = fresh_workspace();
         let msg = report(ws.path(), out.path(), 82, "    let _ = safe();");
@@ -1448,7 +1448,7 @@ y = 2
         let d = Tool::Read.description();
         assert!(d.contains("N: content"), "description must name the numbered form: {d}");
         assert!(
-            d.contains("report_finding"),
+            d.contains("create_finding"),
             "description must say what to copy when quoting evidence: {d}"
         );
     }
@@ -2023,7 +2023,7 @@ y = 2
     }
 }
 
-// ─── report_finding ───────────────────────────────────────────────────────
+// ─── create_finding ───────────────────────────────────────────────────────
 //
 // (#1959) The crawler's output channel, and a DIFFERENT shape from escalation.
 //
@@ -2160,7 +2160,7 @@ pub const FINDINGS_FILE: &str = "findings.jsonl";
 /// entire class of failure. The schema still ADVERTISES `file`/`line`; these
 /// aliases just stop a near-miss from being a total loss.
 #[derive(Debug, Deserialize)]
-struct ReportFindingArgs {
+struct CreateFindingArgs {
     #[serde(alias = "path", alias = "file_path", alias = "filename")]
     file: String,
     #[serde(alias = "offset", alias = "line_number", alias = "lineno")]
@@ -2173,7 +2173,7 @@ struct ReportFindingArgs {
     why: String,
 }
 
-fn execute_report_finding(
+fn execute_create_finding(
     raw_args: &str,
     out_dir: &Path,
     workspace_root: &Path,
@@ -2181,7 +2181,7 @@ fn execute_report_finding(
     // NEVER return Err from a model-facing tool.
     //
     // Measured on the first live crawl: one malformed call returned an error,
-    // and the model concluded "the report_finding tool is not available in
+    // and the model concluded "the create_finding tool is not available in
     // this runtime" and abandoned the channel entirely for the rest of the
     // run — falling back to narrating findings in prose, where nothing could
     // record them. It never retried.
@@ -2194,7 +2194,7 @@ fn execute_report_finding(
     // already does — before the struct below normalizes aliases and drops
     // whatever keys it does not know. This is what rides the event.
     let verbatim: Option<serde_json::Value> = serde_json::from_str(raw_args).ok();
-    let args: ReportFindingArgs = match serde_json::from_str(raw_args) {
+    let args: CreateFindingArgs = match serde_json::from_str(raw_args) {
         Ok(a) => a,
         Err(e) => {
             return Ok(ToolRun::text(format!(
