@@ -476,7 +476,7 @@ The split is the whole design. A transform is a **pure function** — it needs n
 
 ## Crawl as a mission: the shapes and how data flows between them
 
-Ratified 2026-09-04 (#2297) and landing in pieces (#2298 plan step, #2299 `enabled`, #2300 grow seam, #2301 launcher retirement, #2302 follow-on steps, #2303 admission). This section is the map: every record the crawl touches, its shape, who writes it, who reads it. Where a piece is not built yet, it says so, so a reader can tell design from delivery.
+Ratified with the operator in #2297 and landing in pieces (#2298 plan step, #2299 `enabled`, #2300 grow seam, #2301 launcher retirement, #2302 follow-on steps, #2303 admission). This section is the map: every record the crawl touches, its shape, who writes it, who reads it. Where a piece is not built yet, it says so, so a reader can tell design from delivery.
 
 ### The two documents: config is the shape, plan is the instance
 
@@ -542,7 +542,7 @@ crawl.json ──prune(enabled)──▶ minted run: plan phase, one task per LI
                                                         create_mod / mod create ──▶ ~/.darkmux/mods/<key>/ (kit + attachments)
 ```
 
-Two things in that picture are design, not delivery, as of this writing: the arrow from a plan step's output to grown unit tasks (#2300 — today `src/crawl_launch.rs` reads the plan in Rust and drives the units itself, and `mission launch crawl` is routed to it by literal config id), and the follow-on step per finding (#2302). Tracks run in parallel under machine-aware admission (#2303), fail independently, and resume alone; a minted step records the plan it came from and, later, the admission decision that scheduled it, so the operator never wonders where a step came from.
+Two things in that picture are design, not delivery, as of this writing: the arrow from a plan step's output to grown unit tasks (#2300: today `src/crawl_launch.rs` reads the plan in Rust and drives the units itself, and `mission launch crawl` is routed to it by literal config id), and the follow-on step per finding (#2302). Tracks run in parallel under machine-aware admission (#2303), fail independently, and resume alone; a minted step records the plan it came from and, later, the admission decision that scheduled it, so the operator never wonders where a step came from.
 
 ### What each record is for
 

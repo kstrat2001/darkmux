@@ -120,7 +120,8 @@ impl PlanStepConfig {
 /// naming the known ones (the rules module's own message).
 pub fn plan_one_rule(cfg: &PlanStepConfig) -> Result<Plan> {
     let (rules_vec, warnings) = rules::resolve_default(std::slice::from_ref(&cfg.rule))?;
-    for w in &warnings {
+    // Load warnings cover every rule file; this step speaks only for its own.
+    for w in warnings.iter().filter(|w| w.contains(&cfg.rule)) {
         eprintln!("[darkmux] warning: crawl.plan: {w}");
     }
     let (spec, spec_warnings) = WorkspaceSpec::load(&cfg.workspace)
@@ -296,9 +297,59 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
     fn without_plan_out_a_phase_with_no_record_is_a_refusal_not_a_guess() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::set(home.path());
         let err = default_plan_path(&task(), "unnamed-predicate").unwrap_err();
         assert!(format!("{err}").contains("no-such-phase"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn without_plan_out_the_plan_lands_under_the_mission_that_owns_the_phase() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::set(home.path());
+        let phase = darkmux_crew::types::Phase {
+            id: "crawl-77-plan".into(),
+            mission_id: "crawl-77".into(),
+            description: String::new(),
+            display_name: None,
+            status: darkmux_crew::types::PhaseStatus::Planned,
+            created_ts: 1,
+            started_ts: None,
+            completed_ts: None,
+            abandoned_ts: None,
+            task_ids: vec!["plan-unnamed-predicate-task".into()],
+        };
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let mut t = task();
+        t.phase_id = "crawl-77-plan".into();
+        let path = default_plan_path(&t, "unnamed-predicate").unwrap();
+        assert_eq!(
+            path,
+            darkmux_crew::loader::missions_dir().join("crawl-77").join("plan").join("unnamed-predicate.json"),
+            "the MISSION's directory, resolved through the phase record — not the phase id"
+        );
+        assert!(path.starts_with(home.path()), "{}", path.display());
+    }
+
+    /// Scopes `DARKMUX_HOME` for one test and restores the prior value.
+    struct HomeGuard(Option<String>);
+    impl HomeGuard {
+        fn set(p: &Path) -> Self {
+            let prior = std::env::var("DARKMUX_HOME").ok();
+            std::env::set_var("DARKMUX_HOME", p);
+            Self(prior)
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
     }
 
     #[test]

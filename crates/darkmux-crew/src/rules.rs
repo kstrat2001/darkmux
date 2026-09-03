@@ -305,8 +305,17 @@ pub fn resolve(ids: &[String], user_dir: Option<&Path>) -> Result<(Vec<Rule>, Ve
             None => {
                 let mut known: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
                 known.sort();
+                // (#2298 review) A rule that failed to LOAD is "not found" here
+                // too — a reserved `{"command": ...}` prefilter, a malformed
+                // user file. Its load warning is the reason, so it rides the
+                // error instead of being dropped with the warnings vector.
+                let why: String = warnings
+                    .iter()
+                    .filter(|w| w.contains(&format!("'{id}'")) || w.contains(&format!("{id}.json")))
+                    .map(|w| format!("\n  because: {w}"))
+                    .collect();
                 bail!(
-                    "rule '{id}' not found — known rules: {}",
+                    "rule '{id}' not found — known rules: {}{why}",
                     if known.is_empty() {
                         "(none)".to_string()
                     } else {
@@ -412,6 +421,24 @@ mod tests {
         assert!(!map.contains_key("tool-obj.json") && !map.contains_key("tool-mixed.json"), "{map:?}");
         let named: Vec<&String> = warnings.iter().filter(|w| w.contains("#2297") && w.contains("command")).collect();
         assert_eq!(named.len(), 2, "each refusal names the reserved shape and the issue: {warnings:?}");
+    }
+
+    #[test]
+    fn a_rule_refused_at_load_names_the_reason_when_resolved() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("tool-rule.json"),
+            serde_json::json!({
+                "id": "tool-rule", "kind": "site", "applies_to": ["**/*.ts"],
+                "prefilter": {"command": "semgrep --sarif"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = resolve(&["tool-rule".to_string()], Some(dir.path())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains("#2297") && msg.contains("command"), "the load refusal is the reason: {msg}");
     }
 
     #[test]
