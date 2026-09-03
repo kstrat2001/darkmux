@@ -474,6 +474,87 @@ The split is the whole design. A transform is a **pure function** — it needs n
 
 **One limit stated plainly rather than discovered later.** At-least-once is not idempotent, and a create-issue API has no idempotency key, so a lost response can produce a duplicate. The delivery id is stable across retries and an adapter can write it into a searchable field, but a genuine check-then-create needs two requests — which is the `cmd` transport's job, not the transform's.
 
+## Crawl as a mission: the shapes and how data flows between them
+
+Ratified 2026-09-04 (#2297) and landing in pieces (#2298 plan step, #2299 `enabled`, #2300 grow seam, #2301 launcher retirement, #2302 follow-on steps, #2303 admission). This section is the map: every record the crawl touches, its shape, who writes it, who reads it. Where a piece is not built yet, it says so, so a reader can tell design from delivery.
+
+### The two documents: config is the shape, plan is the instance
+
+**Mission config** (`templates/builtin/mission-configs/crawl.json`, schema 3.1) is the shape of the work and is the same file for every crawl of every repo. It declares `inputs` (the workspace spec path, the rule ids, sizing knobs), and phases holding tasks holding steps. The `plan` phase holds **one task per rule**, explicitly, each with a single `crawl.plan` step:
+
+```json
+{ "id": "plan-unnamed-predicate", "enabled": true,
+  "steps": [{ "id": "plan-unnamed-predicate-step", "kind": "crawl.plan",
+              "config": { "rule": "unnamed-predicate", "workspace": "{{workspace}}" } }] }
+```
+
+A task with `"enabled": false` is pruned when the run is minted and never exists in the run (see "Mission configs: a disabled step never exists in the run"). Ten rules are ten tasks; a nightly that wants six disables four; the run shows six. The config is the only place a run's shape comes from: no CLI override, edit the JSON and run, the snapshot records it.
+
+**Plan** (`<missions>/<mission-id>/plan/<rule>.json`, plan schema 1.1) is the instance data for one run of one rule, and it is a **step's output**, never a mission input. Its shape:
+
+```json
+{ "schema_version": "1.1", "workspace": "darkmux-ui", "planned_at": "…",
+  "rules": ["unnamed-predicate"],
+  "params": { "max_sites_per_unit": 40, "max_est_tokens_per_unit": 16000 },
+  "sources": [{ "id": "app", "sha": "20c7750…", "ref": "main", "tree": "…", "files_walked": 412 }],
+  "units": [{ "kind": "site", "id": "u-0001", "rule": "unnamed-predicate", "source": "app",
+              "sites": [{ "file": "src/x.ts", "line": 64, "start": 44, "end": 84, "hits": [64] }],
+              "est_tokens": 3900 }],
+  "totals": { … } }
+```
+
+The test for which document a field belongs to: would you change it without changing what the run is about? Sizing knobs, model, profile, rule ids are config or launch parameters. Units, sites, sha are plan. `rules` and `params` ride the plan so it is self-describing for later comparison, not so anyone edits them there.
+
+### The `crawl.plan` step kind, and why there is exactly one
+
+Control flow: load the workspace spec, materialize it (bare mirror plus checked-out tree, per source, at a recorded sha), run the rule's prefilter over the files its globs admit, cut a window around each hit, pack sites into units under the sizing knobs, write the plan, hand the plan's path downstream as the step's `output`. That flow is new, so by #1352's test it is a kind. It is Tier 3, co-located with the crawl module (`crates/darkmux-lab/src/crawl/plan_step.rs`), because no second mission plans.
+
+Rules vary in **what a site is and who finds it**, not in how planning runs, so there is never a kind per rule. The site producer is a mux keyed by the rule's declared `prefilter` shape:
+
+| shape | today | example |
+|---|---|---|
+| `["<regex>", …]` | implemented; the planner compiles and runs it | `unnamed-predicate`, `swallowed-error` |
+| `{"command": "…"}` | **reserved, refused at rule load by name (#2297)** | semgrep, ast-grep, a linter emitting SARIF/JSON |
+| none | whole files, sized by tokens | `read`-kind rules |
+
+Semantic rules with no cheap prefilter (`doc-contradicts-code`) are the part a linter cannot do and the model is for. When the command shape lands, it is a `procedural.shell` step ahead of the plan step whose output is a site list; the plan step consumes sites in one shape regardless of who produced them.
+
+### How data flows, phase by phase
+
+```
+crawl.json ──prune(enabled)──▶ minted run: plan phase, one task per LIVE rule
+                                  │  config-snapshot.json (declared), graph-report.json (what was left out)
+                                  ▼
+  crawl.plan (per rule) ──▶ plan/<rule>.json ─── output = path ──▶ [#2300] unit tasks grown per plan unit,
+                                                                     each tagged with its rule (a TRACK)
+                                                                             │
+                              crawler role reads the rule's match/no_match/evidence text, one unit per task
+                                                                             ▼
+                                              create_finding ──▶ dispatch.tool record (payload.emitted, emit_seq)
+                                                                             │
+                     ┌───────────────────────────────────────────────────────┼─────────────────────────┐
+                     ▼                                                       ▼                         ▼
+      hook rule → jq transform → external tracker           finding sync → ~/.darkmux/findings/    [#2302] follow-on step per finding
+      (metadata + emitted, destination owned by the hook)   <dispatch>/<seq>/finding.json         (brief_refs: [{finding, key}])
+                                                                             │
+                                                        dispatch --finding / --mod, or a mission step with brief_refs
+                                                                             ▼
+                                                        create_mod / mod create ──▶ ~/.darkmux/mods/<key>/ (kit + attachments)
+```
+
+Two things in that picture are design, not delivery, as of this writing: the arrow from a plan step's output to grown unit tasks (#2300 — today `src/crawl_launch.rs` reads the plan in Rust and drives the units itself, and `mission launch crawl` is routed to it by literal config id), and the follow-on step per finding (#2302). Tracks run in parallel under machine-aware admission (#2303), fail independently, and resume alone; a minted step records the plan it came from and, later, the admission decision that scheduled it, so the operator never wonders where a step came from.
+
+### What each record is for
+
+| record | written by | read by | key |
+|---|---|---|---|
+| `config-snapshot.json` | mint | provenance; `mission status` | mission id |
+| `graph-report.json` | mint (prune) | `mission status`; the `mission start` record carries the same object | mission id |
+| `plan/<rule>.json` | `crawl.plan` step | the grow seam (#2300); `--param plan=` reuse today | mission id + rule |
+| `dispatch.tool` record with `emitted` | the runtime, via `create_finding` | hooks (external trackers); `finding sync` | dispatch session + `emit_seq` |
+| `findings/<dispatch>/<seq>/finding.json` | `finding sync` (the tailer) | `finding list/show`; `dispatch --finding`; brief refs | `<dispatch>/<seq>` |
+| `mods/<key>/mod.json` + `attachments/` | `mod create`; `create_mod` | `mod list/show`; `dispatch --mod`; the integration mission | minted `mod-<secs>-<hex>` |
+
 ## Findings and mods: what was observed, and how it could change
 
 Settled with the operator on 2026-09-03, after the first crawl findings reached a tracker and the first PR was made from them by an agent that knew nothing about crawls.

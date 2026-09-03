@@ -940,6 +940,8 @@ fn synthetic_plan_with_n_units(workspace_name: &str, n: usize, materialized: &[w
         })
         .collect();
     Plan {
+        rules: Vec::new(),
+        params: None,
         schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
         workspace: workspace_name.to_string(),
         planned_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1055,6 +1057,8 @@ fn plan_with_empty_sources_naming_a_real_unit_bails_before_any_mint() {
     let fx = two_source_fixture();
     let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let empty_sources_plan = Plan {
+        rules: Vec::new(),
+        params: None,
         schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
         workspace: manifest.effective_name().to_string(),
         planned_at: "2026-01-01T00:00:00Z".to_string(),
@@ -2014,6 +2018,8 @@ fn plan_source(id: &str, sha: &str, tree: &std::path::Path) -> plan::PlanSource 
 
 fn plan_with_one_source(sha: &str, tree: &std::path::Path) -> Plan {
     Plan {
+        rules: Vec::new(),
+        params: None,
         schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
         workspace: "fixture".to_string(),
         planned_at: "2026-01-01T00:00:00Z".to_string(),

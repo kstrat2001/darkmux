@@ -1,7 +1,7 @@
 {
   "id": "crawl",
   "name": "Crawl",
-  "description": "Documentation-only (#1959) — `crawl` carries NO Task/Step graph. `darkmux mission launch crawl` is routed by literal config id in `mission_launch::launch`, BEFORE this document (or any mission-config document) is ever loaded: its Task/Step graph is computed at RUN TIME from a resolved crawl plan, one Task per (source, rule-set) grouping, built fresh from whatever the `workspace`/`rules`/`source`+`rule` inputs below resolve to on THIS invocation — there is nothing static to declare ahead of time the way `coder-phase`'s fixed worktree->coder->verify chain or `review`'s fixed bundle->probe->dedup->judge->verify->synthesis chain can. This file exists purely so `mission config list`/`mission config show crawl` can enumerate crawl's inputs for a curious operator; editing `phases` here has NO effect on what a real crawl launch does — see `src/crawl_launch.rs`'s own module doc for the real launcher.",
+  "description": "Crawl a workspace with static-analysis rules and record what the crew observes as findings. (#2298) The `plan` phase holds one `crawl.plan` task per rule; each writes the plan for that rule (units of sites at one sha) as its output. Today `darkmux mission launch crawl` is still routed by literal config id to `src/crawl_launch.rs`, which plans every rule together and drives the units itself; #2300 grows the unit track from each plan step's output and #2301 retires the literal launcher, at which point this document IS the crawl. Disable a rule's task with `\"enabled\": false` (#2299); it is pruned at mint and the run shows only the rules that will run.",
   "schema_version": "3.1",
   "inputs": [
     {
@@ -70,5 +70,73 @@
       "required": false
     }
   ],
-  "phases": []
+  "phases": [
+    {
+      "id": "plan",
+      "display_name": "Plan",
+      "description": "One planning task per rule. Each materializes the workspace, runs the rule's prefilter, packs the flagged sites into units under the sizing knobs, and writes plan/<rule>.json beside the run.",
+      "tasks": [
+        {
+          "id": "plan-unnamed-predicate",
+          "display_name": "Plan: Name compound predicates",
+          "description": "Plan the `unnamed-predicate` rule over the workspace.",
+          "steps": [
+            {
+              "id": "plan-unnamed-predicate-step",
+              "kind": "crawl.plan",
+              "config": {
+                "rule": "unnamed-predicate",
+                "workspace": "{{workspace}}"
+              }
+            }
+          ]
+        },
+        {
+          "id": "plan-swallowed-error",
+          "display_name": "Plan: Swallowed errors",
+          "description": "Plan the `swallowed-error` rule over the workspace.",
+          "steps": [
+            {
+              "id": "plan-swallowed-error-step",
+              "kind": "crawl.plan",
+              "config": {
+                "rule": "swallowed-error",
+                "workspace": "{{workspace}}"
+              }
+            }
+          ]
+        },
+        {
+          "id": "plan-doc-contradicts-code",
+          "display_name": "Plan: Doc contradicts code",
+          "description": "Plan the `doc-contradicts-code` rule over the workspace.",
+          "steps": [
+            {
+              "id": "plan-doc-contradicts-code-step",
+              "kind": "crawl.plan",
+              "config": {
+                "rule": "doc-contradicts-code",
+                "workspace": "{{workspace}}"
+              }
+            }
+          ]
+        },
+        {
+          "id": "plan-stale-consumer",
+          "display_name": "Plan: Stale consumers",
+          "description": "Plan the `stale-consumer` rule over the workspace.",
+          "steps": [
+            {
+              "id": "plan-stale-consumer-step",
+              "kind": "crawl.plan",
+              "config": {
+                "rule": "stale-consumer",
+                "workspace": "{{workspace}}"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
 }

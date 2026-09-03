@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-pub const PLAN_SCHEMA_VERSION: &str = "1.0";
+pub const PLAN_SCHEMA_VERSION: &str = "1.1";
 
 /// `ceil(chars / 4)` — the ONE place this project-wide token-estimate
 /// heuristic lives. Deliberately crude: real tokenization is model-specific
@@ -247,6 +247,30 @@ pub struct Plan {
     pub sources: Vec<PlanSource>,
     pub units: Vec<Unit>,
     pub totals: Totals,
+    /// (#2298, plan schema 1.1) The rule ids this plan was cut for — one
+    /// entry when a `crawl.plan` step planned a single rule, the whole set
+    /// when the launcher planned them together. Lenient on read: a 1.0 plan
+    /// has none recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<String>,
+    /// (#2298, plan schema 1.1) The sizing knobs the units were packed
+    /// under, so a plan is self-describing for later comparison. Lenient on
+    /// read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<PlanParamsRecord>,
+}
+
+/// (#2298) The serialized form of [`PlanParams`] a plan records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct PlanParamsRecord {
+    pub max_sites_per_unit: usize,
+    pub max_est_tokens_per_unit: usize,
+}
+
+impl From<PlanParams> for PlanParamsRecord {
+    fn from(p: PlanParams) -> Self {
+        Self { max_sites_per_unit: p.max_sites_per_unit, max_est_tokens_per_unit: p.max_est_tokens_per_unit }
+    }
 }
 
 /// Per-source file cache: the sorted relative-path listing (computed once)
@@ -600,6 +624,8 @@ pub fn plan_with_params(materialized: &Materialized, rules: &[Rule], params: Pla
         sources: plan_sources,
         units,
         totals,
+        rules: rules.iter().map(|r| r.id.clone()).collect(),
+        params: Some(params.into()),
     })
 }
 
