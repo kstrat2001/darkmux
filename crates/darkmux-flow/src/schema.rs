@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.35.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.36.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -730,6 +730,33 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.35.0";
 //           record therefore reads `[]` for a `--finding` dispatch that was
 //           routed to it; the brief it worked from is unaffected.
 //           Both additive; older readers ignore what they do not recognize.
+//   1.36.0 (#2295): `dispatch start`'s payload `findings_in_brief` (added one
+//           version ago, in 1.35.0) is REPLACED by `brief_refs` — a list of
+//           `{"kind": "finding"|"mod", "key": "..."}` rather than a list of
+//           bare finding keys. The reason is that a finding was never the only
+//           record a brief can carry: `dispatch --mod <key>` appends a stored
+//           mod's kit the same way, and two provenance fields for one
+//           operation would drift. `[]` on every dispatch that names no
+//           record, present-and-empty for the same reason as before.
+//           `findings_in_brief` is DROPPED outright rather than kept as an
+//           alias: it had ZERO consumers (nothing in the viewer, the serve
+//           daemon, or any hook rule read it), it shipped one version ago, and
+//           a rename while nothing reads it costs nothing — carrying a second
+//           spelling forever would.
+//           The 1.35.0 cross-machine carve-out CHANGES SHAPE. Resolution moved
+//           from the CLI down to the step kind (the one point every producer
+//           of a `brief_refs` step config goes through — before that move a
+//           mission graph setting the field got the stamp and no block), so a
+//           `--machine` dispatch no longer carries the record's text inside
+//           `message`. `WorkJob` still has no field for the refs — adding one
+//           is a wire break (`deny_unknown_fields` + a coordinated
+//           `WORK_JOB_SCHEMA_VERSION` bump that would reject EVERY job from a
+//           peer on the old version) — so rather than route a brief whose
+//           blocks are silently missing, the CLI now REFUSES
+//           `--finding`/`--mod` together with a remote `--machine`, naming the
+//           gap. No runner record can therefore carry these refs at all, and
+//           none reads `[]` for a routed ref dispatch that silently lost its
+//           blocks.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

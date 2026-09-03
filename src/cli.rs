@@ -119,6 +119,13 @@ pub(crate) enum Cmd {
         /// replays the flow stream into the store.
         #[arg(long = "finding", value_name = "KEY")]
         finding: Vec<String>,
+        /// (#2295) Append a stored mod's record to the brief — repeatable.
+        ///
+        /// The help text is FORMATTED from `mods::CONTAINER_MODS_BASE` rather
+        /// than spelling the mount path by hand (#2295 review, NIT c), so the
+        /// CLI cannot come to advertise a directory the mounts do not use.
+        #[arg(long = "mod", value_name = "KEY", long_help = darkmux_crew::mods::dispatch_mod_flag_help())]
+        mod_key: Vec<String>,
         /// (#1054) Select a named profile from the machine's registry for this
         /// dispatch's model + context-window resolution, instead of the
         /// registry's `default_profile`. When the named profile isn't defined

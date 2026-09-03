@@ -1029,7 +1029,7 @@ fn dispatch_task(
 ) -> Result<(String, String, bool, Option<PathBuf>)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
-        findings_in_brief: Vec::new(),
+        brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
         resume_from: None,

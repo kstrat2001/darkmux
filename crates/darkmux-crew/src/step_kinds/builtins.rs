@@ -387,19 +387,30 @@ impl StepKind for DispatchInternalStepKind {
         // — see that fn's own doc for why the CLI's `DispatchOpts` isn't
         // forwarded wholesale.
         let resume_from = config_str(step, "resume_from").map(std::path::PathBuf::from);
-        // (#2265 review, CRITICAL 8) The finding keys the brief carries, read
-        // back off the step config the crew-of-one graph wrote. Empty for
-        // every other producer of this kind — a mission step's brief is its
-        // own, and names no finding.
-        let findings_in_brief: Vec<String> = step
-            .config
-            .get("findings_in_brief")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|k| k.as_str()).map(String::from).collect())
-            .unwrap_or_default();
+        // (#2295) The finding / mod records the brief carries, read back off
+        // the step config. The step config is this list's HOME: the
+        // crew-of-one graph writes it from the CLI flags, and a mission graph
+        // writes it directly.
+        //
+        // (#2295 review, CRITICAL 1) Resolution and the APPEND happen HERE,
+        // not at the CLI — this is the one point every producer of the field
+        // converges on, and appending at the CLI meant a mission graph that
+        // set `config.brief_refs` got the read-only mount and the provenance
+        // stamp with NO block in its brief and no missing-key refusal. It runs
+        // before `dispatch` is called, so a key that addresses no stored
+        // record still fails the step before the ack gate and before any
+        // container work. The CANONICAL refs (the key as the record spells it)
+        // are what get stamped and mounted.
+        let brief_refs = crate::brief_refs::from_json(step.config.get("brief_refs"));
+        let (message, brief_refs) = crate::brief_refs::append_to_brief(
+            &message,
+            &brief_refs,
+            &crate::brief_refs::StoreDirs::resolved(),
+        )
+        .with_context(|| format!("step `{}`: resolving the brief's records", step.id))?;
 
         let opts = DispatchOpts {
-            findings_in_brief,
+            brief_refs,
             workspace_read_only: false,
             record_context: None,
             role_id,

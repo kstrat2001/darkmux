@@ -751,7 +751,7 @@ fn dispatch_case(
             .to_string(),
     );
     let d = DispatchOpts {
-        findings_in_brief: Vec::new(),
+        brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
         resume_from: None,

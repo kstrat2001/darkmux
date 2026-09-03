@@ -140,6 +140,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             message,
             message_from_file,
             finding,
+            mod_key,
             profile,
             session_id,
             timeout,
@@ -157,6 +158,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             message,
             message_from_file,
             finding,
+            mod_key,
             profile,
             session_id,
             timeout,
@@ -1368,6 +1370,7 @@ struct DispatchInvocation {
     message: Option<String>,
     message_from_file: Option<std::path::PathBuf>,
     finding: Vec<String>,
+    mod_key: Vec<String>,
     profile: Option<String>,
     session_id: Option<String>,
     timeout: u32,
@@ -1393,6 +1396,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         message,
         message_from_file,
         finding,
+        mod_key,
         profile,
         session_id,
         timeout,
@@ -1457,22 +1461,63 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
             buf
         }
     };
-    // (#2265) `--finding <key>` (repeatable): each named finding's stored
-    // record is appended to the brief VERBATIM, after the operator's own
-    // message. A key that addresses no stored finding is refused BEFORE any
-    // dispatch setup — dispatching with a silently missing brief would send
-    // the role to work on an observation it never saw.
-    let (message, finding_keys) = darkmux_crew::findings::append_to_brief(
-        &message,
-        &finding,
-        &darkmux_crew::findings::findings_dir(),
+    // (#2295) `--finding <key>` and `--mod <key>` (both repeatable): each
+    // named record's stored content is appended to the brief VERBATIM, after
+    // the operator's own message. A key that addresses no stored record is
+    // refused BEFORE any dispatch setup — dispatching with a silently missing
+    // block would send the role to work on a record it never saw.
+    //
+    // Findings first, then mods, each in the order given: clap collects the
+    // two flags into two lists, so their interleaving is not recoverable, and
+    // an order that is stated is better than one that looks meaningful and
+    // is not. A caller that needs a different order sets `brief_refs` on the
+    // step config directly — that, not the flags, is the list's home.
+    let brief_refs: Vec<darkmux_crew::brief_refs::BriefRef> = finding
+        .iter()
+        .map(darkmux_crew::brief_refs::BriefRef::finding)
+        .chain(mod_key.iter().map(darkmux_crew::brief_refs::BriefRef::mod_))
+        .collect();
+    //
+    // (#2295 review, CRITICAL 1) The CLI CHECKS but does not append. The block
+    // is rendered once, in `DispatchInternalStepKind` — the point every
+    // producer of a `brief_refs` step config goes through, so a mission graph
+    // that sets the field gets the same brief this verb does. Checking here
+    // anyway is what keeps a typo cheap: it refuses before the ack gate and
+    // before any routing or container work, which the step kind (one layer
+    // down) could not do as early.
+    let brief_refs = darkmux_crew::brief_refs::check_all(
+        &brief_refs,
+        &darkmux_crew::brief_refs::StoreDirs::resolved(),
     )?;
+    // (#2295 review, CRITICAL 1) A cross-machine dispatch is published as a
+    // `WorkJob`, which has no field for these refs, and the peer's store is
+    // its own — so the remote step kind would resolve nothing and dispatch a
+    // brief with no block. Refuse instead: before this change the CLI appended
+    // the text into `message`, which made the gap invisible. Adding the field
+    // to `WorkJob` is a coordinated wire break (see the FLOW 1.36.0 entry) and
+    // is the real fix.
+    if !brief_refs.is_empty() {
+        if let Some(target) = machine.as_deref() {
+            let local = darkmux_flow::resolve_machine_id();
+            if matches!(
+                crew::dispatch::routing_decision(Some(target), local.as_deref()),
+                crew::dispatch::RoutingDecision::Remote { .. }
+            ) {
+                anyhow::bail!(
+                    "--finding / --mod cannot be routed to another machine yet: the work \
+                     queue's job shape carries no record refs, and {target}'s own finding / \
+                     mod stores are its own. Run it on this machine (drop --machine), or \
+                     paste the record's content into the message."
+                );
+            }
+        }
+    }
     let opts = crew::dispatch::DispatchOpts {
         workspace_read_only: false,
         record_context: None,
         role_id: role,
         message,
-        findings_in_brief: finding_keys,
+        brief_refs,
         session_id,
         timeout_seconds: timeout,
         skip_preflight,

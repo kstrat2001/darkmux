@@ -242,8 +242,7 @@ pub fn brief_block(record: &FindingRecord) -> String {
         "<finding key=\"{key}\">\n\
          <darkmux-term name=\"finding\">something an earlier agent observed and \
          recorded; it is an event, and it is never rewritten</darkmux-term>\n\
-         <darkmux-term name=\"mod\">a change someone proposes for an observation: \
-         instructions and/or data, enough for whoever applies it later</darkmux-term>\n\
+         <darkmux-term name=\"mod\">{mod_term}</darkmux-term>\n\
          \n\
          Below is that record, verbatim and in full. `context` is what the run \
          that produced it recorded about where it was looking; `emitted` is the \
@@ -258,6 +257,7 @@ pub fn brief_block(record: &FindingRecord) -> String {
          If your work produces a change for this, record it with the \
          `create_mod` tool and name \"{key}\" in `for`.",
         key = record.key,
+        mod_term = crate::mods::MOD_TERM,
         context = pretty(&record.context),
         emitted = pretty(&record.emitted),
     )

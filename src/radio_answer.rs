@@ -841,7 +841,7 @@ pub fn dispatch_answerer_call_with(user_message: &str, overrides: &AnswererOverr
     let profile_name = resolved_answerer_profile(overrides);
 
     let opts = crate::crew::dispatch::DispatchOpts {
-        findings_in_brief: Vec::new(),
+        brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
         resume_from: None,

@@ -232,6 +232,7 @@ def blob: (.payload.emitted
     <pre><code>darkmux mod create --by &lt;actor&gt; [--for &lt;finding&gt;]... [--kit &lt;file&gt;|-] [--attach &lt;path&gt;]...
 darkmux mod list [--for &lt;finding&gt;] [--mission &lt;id&gt;] [--json]
 darkmux mod show &lt;key&gt;</code></pre>
+    <p><code>darkmux dispatch &lt;role&gt; --finding &lt;key&gt; --mod &lt;key&gt;</code> (both repeatable) appends those stored records to the brief verbatim; a mod's attached files are mounted read-only at <code>/darkmux-mods/&lt;key&gt;/attachments/</code>.</p>
     <p>Both stores relocate with <code>DARKMUX_FINDINGS_DIR</code> / <code>DARKMUX_MODS_DIR</code>; see <a href="https://github.com/kstrat2001/darkmux/blob/main/docs/ENVIRONMENT.md">ENVIRONMENT.md</a>.</p>
   </div>
 </section>

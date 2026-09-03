@@ -144,12 +144,14 @@ pub(crate) fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
 pub struct DispatchOpts {
     pub role_id: String,
     pub message: String,
-    /// (#2265) Finding keys whose stored records were appended to `message`
-    /// by `dispatch --finding <key>`. Recorded on the `dispatch start` flow
-    /// record so a reader can tell WHICH observations a dispatch was briefed
-    /// on — the brief itself is capped in the record, and a key is the address
-    /// the finding store answers to. Empty on every other path.
-    pub findings_in_brief: Vec<String>,
+    /// (#2295) The darkmux records whose stored content was appended to
+    /// `message` by `dispatch --finding <key>` / `dispatch --mod <key>`.
+    /// Recorded on the `dispatch start` flow record so a reader can tell WHICH
+    /// records a dispatch was briefed on — the brief itself is capped in the
+    /// record, and a key is the address its store answers to. A `mod` ref also
+    /// decides which attachment directories the container gets mounted.
+    /// Empty on every other path.
+    pub brief_refs: Vec<crate::brief_refs::BriefRef>,
     pub session_id: Option<String>,
     pub timeout_seconds: u32,
     /// Skip the pre-flight checks. Use only when explicitly debugging.

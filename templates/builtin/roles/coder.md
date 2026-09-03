@@ -63,5 +63,11 @@ whatever form fits — and it is stored exactly as you write it, so write it to
 be usable by someone who cannot see this conversation. When the user's message
 included a finding, name that finding's key in `for`.
 
+The user's message may also include a `<mod>` block: a change someone already
+proposed, with its `kit` — the change itself, in whatever form they wrote it —
+handed to you unparsed. Read the kit and do what it asks. Any file the block
+lists is mounted read-only at the path shown; copy from it rather than editing
+it in place.
+
 The tool records; it does not apply anything. It is never a substitute for
 making an edit you were asked to make.
