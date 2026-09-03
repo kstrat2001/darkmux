@@ -769,8 +769,9 @@ function PanelBody({
     const failed = typeof exitCode !== "number" || exitCode !== 0;
     const hasStdout = ansiText !== "";
     const hasStderr = stderrTail !== "";
+    const isEmptyCleanOutput = !failed && !hasStdout && !hasStderr;
 
-    if (!failed && !hasStdout && !hasStderr) return <div className={`panelout${staleClass}`}>no output</div>;
+    if (isEmptyCleanOutput) return <div className={`panelout${staleClass}`}>no output</div>;
 
     return (
       <>

@@ -365,7 +365,8 @@ export function MissionGraphLens({
   const [ownedBy, setOwnedBy] = useState<string | null>(null);
   useEffect(() => {
     setOwnedBy(null);
-    if (graphQuery.data && !graphQuery.data.ok && graphQuery.data.status === 404) {
+    const isGraphNotFound = graphQuery.data && !graphQuery.data.ok && graphQuery.data.status === 404;
+    if (isGraphNotFound) {
       let cancelled = false;
       void lookupOwningMachine(missionId).then((m) => {
         if (!cancelled) setOwnedBy(m);
