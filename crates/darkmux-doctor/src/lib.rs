@@ -3976,12 +3976,14 @@ fn check_mission_config_registry() -> Check {
                                 // Telling the operator that is harmless would be
                                 // backwards for the one case that prompted the check.
                                 "trailing by one minor is additive by this schema's own \
-                                 versioning rule, so the document still LOADS — but absent \
-                                 is not the same as harmless. Confirm none of the fields \
-                                 this binary's schema added since your document's version \
-                                 apply to it: 1.3 -> 1.4 added `reads` (cross-phase data \
-                                 delivery silently stops), 2.2 -> 2.3 added `cmd` (a \
-                                 config that mutates GitHub state runs ungated)"
+                                 versioning rule, so the document still LOADS — but its \
+                                 fields predate additive fields this binary now reads, and \
+                                 absent is not the same as harmless. Confirm none of the \
+                                 fields this binary's schema added since your document's \
+                                 version apply to it: 1.3 -> 1.4 added `reads` (cross-phase \
+                                 data delivery silently stops), 2.2 -> 2.3 added `cmd` (a \
+                                 config that mutates GitHub state runs ungated), 3.0 -> 3.1 \
+                                 added `enabled` (a step you meant to leave out still runs)"
                                     .to_string()
                             } else {
                                 format!(
