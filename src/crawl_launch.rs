@@ -450,7 +450,7 @@ fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<St
             })?;
             out.push_str(&pattern_block(r));
             out.push_str(&format!(
-                "Your scope is these sites in `/workspace/{source}`. For each, read lines noted below and decide whether the cited line matches the pattern. Sites:\n{}\n",
+                "Your scope is these sites in `/workspace/{source}`. For each, read lines noted below and decide whether the cited line matches the pattern. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: ` — do not count lines. Cite it as `file:line`. Sites:\n{}\n",
                 render_sites(source, sites)
             ));
         }
@@ -488,7 +488,7 @@ fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<St
             })?;
             out.push_str(&pattern_block(r));
             out.push_str(&format!(
-                "Your scope is these import sites in `/workspace/{source}`:\n{}\n\n",
+                "Your scope is these import sites in `/workspace/{source}`. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: `. Cite it as `file:line`.\n{}\n\n",
                 render_sites(source, sites)
             ));
             out.push_str(&format!(

@@ -722,6 +722,11 @@ fn message_builder_site_shape_has_scope_and_pattern_prose() {
     assert!(msg.contains("- /workspace/app1/x.ts:3 (read lines 1-6)"), "{msg}");
     assert!(!msg.contains("- x.ts:3"), "sites must be full container paths, not source-relative: {msg}");
     assert!(msg.contains("report_finding"), "{msg}");
+    // (#2267) A site is a pointer into a read window. The prompt has to say the
+    // window comes back numbered, or the model counts lines by hand to find the
+    // cited one — 26% of one measured turn's reasoning was exactly that.
+    assert!(msg.contains("`N: content`"), "the site prompt must name the numbered read form: {msg}");
+    assert!(msg.contains("`<line>: `"), "the site prompt must say where the cited line appears: {msg}");
 }
 
 #[test]
@@ -776,6 +781,11 @@ fn message_builder_edge_shape_includes_library_surface_and_versions() {
     assert!(msg.contains("CHANGELOG.md"), "{msg}");
     assert!(msg.contains("- /workspace/app1/uses.ts:1"), "{msg}");
     assert!(msg.contains("starting with `/workspace/`"), "{msg}");
+    // (#2267 review) The edge shape renders the same `file:line` pointer
+    // through the same helper; pin the numbered-read clause here too, or a
+    // prompt-tightening pass drops it and edge units resume counting.
+    assert!(msg.contains("numbers every line it returns as `N: content`"), "edge prompt must state the numbered form: {msg}");
+    assert!(msg.contains("beginning `<line>: `"), "edge prompt must tell the model where the cited line is: {msg}");
 }
 
 #[test]
