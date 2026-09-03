@@ -470,8 +470,17 @@ pub fn load_all_at(root: &Path) -> Result<Vec<ModRecord>> {
 
 /// The mods that name one finding — DERIVED by scanning mods, because nothing
 /// about a mod is ever written back onto the finding it addresses.
+///
+/// The QUERY is canonicalized here, not only at the caller, so every reader
+/// gets the same answer for `sess-a/01` and `sess-a/1`. Stored `for` keys are
+/// canonical by construction, so canonicalizing only on write would leave one
+/// finding with two addresses from the reader's side. A query that can address
+/// no finding matches nothing — there is no stored key it could equal.
 pub fn mods_for<'a>(all: &'a [ModRecord], finding_key: &str) -> Vec<&'a ModRecord> {
-    all.iter().filter(|m| m.r#for.iter().any(|k| k == finding_key)).collect()
+    let Some(key) = canonical_finding_key(finding_key) else {
+        return Vec::new();
+    };
+    all.iter().filter(|m| m.r#for.contains(&key)).collect()
 }
 
 /// Whether a mod names any finding recorded under this mission. The mission
@@ -719,8 +728,22 @@ mod tests {
         assert!(!rec.context.findings[0].missing, "it resolved to the real finding");
 
         // The one address is the one every reader uses.
+        // One address, on the READ side too. Stored keys are canonical, so a
+        // reader that compares the caller's raw string finds nothing — the
+        // same mod is attached by one query and invisible to another.
         let all = load_all_at(&mods).unwrap();
         assert_eq!(mods_for(&all, "sess-a/1").len(), 1, "the derived view finds it");
+        assert_eq!(
+            mods_for(&all, "sess-a/01").len(),
+            1,
+            "a non-canonical QUERY finds the mod stored under the canonical key"
+        );
+        assert_eq!(mods_for(&all, "sess-a/2").len(), 0, "a different finding is still different");
+        assert_eq!(
+            mods_for(&all, "no-slash").len(),
+            0,
+            "a query that can address no finding matches nothing"
+        );
 
         // A key that can address no finding is refused LOUDLY at create time,
         // rather than stored as a link that nothing can ever follow.

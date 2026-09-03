@@ -4338,11 +4338,13 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
     let path_j = home.path().join("mods").join(&key_j).join("mod.json");
     assert_eq!(v["path"].as_str().expect("--json carries the path"), path_j.to_str().unwrap());
     assert_eq!(v["record"]["by"], "kain", "the whole record is there: {v}");
-    // `path` sits BESIDE the record, never inside it: the record has to stay
-    // byte-equal to what is on disk.
+    // `path` sits BESIDE the record, never inside it: the printed record has
+    // to carry exactly the stored record's fields and nothing darkmux added.
+    // Compared as VALUES (both parsed) — this pins the field set, not the
+    // formatting, which pretty-printing changes either way.
     let on_disk: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path_j).unwrap()).unwrap();
-    assert_eq!(v["record"], on_disk, "the printed record is exactly the stored one");
+    assert_eq!(v["record"], on_disk, "the printed record has the stored record's fields");
 
     // A non-canonical finding key is CANONICALIZED on create, so one finding
     // has one address: `sess-a/01` must be findable as `sess-a/1` by both the
@@ -4387,6 +4389,23 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
         for_a.contains(&key_pad),
         "the canonicalized `sess-a/01` mod is found under `sess-a/1`: {for_a:?}"
     );
+    // The QUERY is canonicalized too. Canonicalizing only on write left one
+    // finding with two addresses from the reader's side: the mod created with
+    // `--for sess-a/01` was invisible to `--for sess-a/01`.
+    assert_eq!(
+        keys(&["mod", "list", "--for", "sess-a/01", "--json"]),
+        for_a,
+        "a non-canonical query returns exactly what the canonical one does"
+    );
+    // An unaddressable query is refused loudly — an empty result would read
+    // as "no mods for that finding" when the key names no finding at all.
+    let out = dm(&["mod", "list", "--for", "no-slash", "--json"]);
+    assert_ne!(out.status.code(), Some(0), "an unaddressable --for must not exit clean");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("finding key"),
+        "the error names the shape: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(keys(&["mod", "list", "--for", "sess-b/2", "--json"]), vec![key_b.clone()]);
     // `--mission` matches through the `for` finding's OWN recorded mission.
     assert_eq!(keys(&["mod", "list", "--mission", "crawl-2", "--json"]), vec![key_b.clone()]);
@@ -4425,6 +4444,9 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
         stdout.contains("12345678901234567890123"),
         "an integer past f64 survives, because nothing parsed it: {stdout}"
     );
+    // Nothing is appended to the kit. The fixture ends in a newline, so the
+    // output ends in exactly one — a second would be a byte darkmux invented.
+    assert!(stdout.ends_with("}\n"), "the kit's own bytes end the output: {stdout:?}");
     assert!(!stdout.contains(&key_a), "show is ONE record: {stdout}");
 
     let out = dm(&["mod", "show", "mod-nope"]);

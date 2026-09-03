@@ -16,7 +16,7 @@
 //! a change made inside a dispatch; both write the same record through
 //! `darkmux_crew::mods`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use darkmux_crew::mods::{self, ModRecord};
 use darkmux_types::config_access;
 use std::path::PathBuf;
@@ -101,10 +101,21 @@ pub fn create(
 /// `mod list` — every mod in the store, ts-ascending.
 pub fn list(for_key: Option<&str>, mission: Option<&str>, json: bool) -> Result<i32> {
     let root = config_access::mods_dir();
+    // The query is canonicalized to the one form every stored key is in, and
+    // a key that can address no finding is refused rather than returning an
+    // empty list — "no mods for that finding" and "that names no finding" are
+    // different answers.
+    let for_key = for_key
+        .map(|k| {
+            mods::canonical_finding_key(k).with_context(|| {
+                format!("not a finding key: {k:?} (expected <dispatch>/<seq>, e.g. sess-abc/1)")
+            })
+        })
+        .transpose()?;
     let all = mods::load_all_at(&root)?;
     let rows: Vec<&ModRecord> = all
         .iter()
-        .filter(|m| for_key.is_none_or(|k| m.r#for.iter().any(|f| f == k)))
+        .filter(|m| for_key.as_deref().is_none_or(|k| m.r#for.iter().any(|f| f == k)))
         // The mission is matched through the `for` finding's OWN mission,
         // copied onto the mod at create time — so the filter answers from the
         // mod alone, and a mod naming no finding belongs to no mission.
@@ -209,21 +220,21 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
             }
         }
     }
-    // The kit is the proposer's own bytes, printed UNINDENTED and unparsed —
-    // so `darkmux mod show <key> | tail -n +N > kit.txt` yields the kit, and
-    // a JSON kit is still the exact JSON that was written.
+    // The kit is the proposer's own bytes, printed unindented, unparsed, and
+    // with NOTHING appended — a trailing newline this did not receive is a
+    // byte it must not add. This rendering is for reading; the byte-exact
+    // channel a script should use is `mod show --json | jq -j .kit`, named in
+    // the verb's own `--help` rather than only in a comment here.
     println!("\nkit");
     if let Some(kit) = rec.kit.as_deref() {
         print!("{kit}");
-        if !kit.ends_with('\n') {
-            println!();
-        }
     }
     Ok(0)
 }
 
-/// A one-line, TRUNCATED preview of the raw kit as compact JSON. Not an
-/// interpretation: whatever the proposer wrote, clipped to fit a line.
+/// A one-line, TRUNCATED clip of the kit's own text — whitespace runs
+/// collapsed so it fits a line, then cut. Plain text, not JSON: the kit is
+/// never parsed, and this is a glance at it, not an interpretation of it.
 fn preview(kit: Option<&str>) -> String {
     let compact: String = kit.unwrap_or("(attachments only)").split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= PREVIEW_CHARS {
