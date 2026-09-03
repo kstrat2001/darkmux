@@ -695,6 +695,21 @@ pub fn launch(
             eprintln!("{}", style::dim(&format!("mission launch: task persist warning: {e:#}")));
         }
     }
+    // (#2300) The phase record names the tasks it owns. `crawl_launch.rs`
+    // has always written this (it builds `task_ids` per group and saves the
+    // phase); the generic launcher never did, so the field meant different
+    // things depending on which launcher minted the run. It means the same
+    // thing on both now — which is a precondition for #2301 folding crawl
+    // onto this path. Growth appends to it at the phase boundary.
+    for phase in &config.phases {
+        let Some(real_phase_id) = real_phase_ids.get(&phase.id) else { continue };
+        let ids: Vec<String> = tasks
+            .iter()
+            .filter(|t| &t.phase_id == real_phase_id)
+            .map(|t| t.id.clone())
+            .collect();
+        write_phase_task_ids(&mission_id, real_phase_id, ids);
+    }
 
     if tasks.is_empty() {
         // Freeform/manual mission (every phase has zero tasks) — mint + start.
@@ -1129,7 +1144,8 @@ pub fn launch(
                         println!(
                             "  {}",
                             style::dim(&format!(
-                                "graph: `{}` grew nothing from `{}` (0 items) — phase `{}` has no                                  work (grew_nothing)",
+                                "graph: `{}` grew nothing from `{}` (0 items) — phase `{}` has \
+                                 no work (grew_nothing)",
                                 event.task_template, event.from, real_phase_id
                             ))
                         );
@@ -1144,20 +1160,27 @@ pub fn launch(
                             ))
                         );
                     }
+                    // (#2300) `reason` is OMITTED, never `null`, when the
+                    // growth minted something — a key present with a null
+                    // value reads as "there was a reason and it was
+                    // unknown", which is not what happened.
+                    let mut payload = serde_json::json!({
+                        "phase": event.phase,
+                        "task_template": event.task_template,
+                        "from": event.from,
+                        "source_path": event.source_path,
+                        "items": event.items,
+                        "minted": event.minted,
+                    });
+                    if event.minted.is_empty() {
+                        payload["reason"] = serde_json::json!("grew_nothing");
+                    }
                     bookend.emit_now(mission_bookend_record(
                         flow::Level::Info,
                         "mission.grow",
                         config_id,
                         &mission_id,
-                        serde_json::json!({
-                            "phase": event.phase,
-                            "task_template": event.task_template,
-                            "from": event.from,
-                            "source_path": event.source_path,
-                            "items": event.items,
-                            "minted": event.minted,
-                            "reason": if event.minted.is_empty() { Some("grew_nothing") } else { None },
-                        }),
+                        payload,
                     ));
                     for task in &grown_tasks {
                         if let Err(e) = crew::lifecycle::save_task(&mission_id, task) {
@@ -1175,19 +1198,16 @@ pub fn launch(
                             );
                         }
                     }
-                    // (#2300) Deliberately NOT written into the phase
-                    // record's `task_ids`. Nothing populates that field on
-                    // any launcher today (`new_planned_phase` mints it
-                    // empty and no path ever fills it — grep it), so
-                    // writing ONLY the grown subset there would turn a
-                    // uniformly-empty field into one that lies: a reader
-                    // would see a phase listing two of its five tasks and
-                    // have no way to tell that from a phase with two. The
-                    // grown tasks' own records are on disk (`save_task`
-                    // just below, each carrying its phase id), and the
-                    // per-copy provenance is in `graph-report.json` plus
-                    // the `mission.grow` record. Populating `task_ids` for
-                    // every task on every launcher is its own change.
+                    // (#2300) The phase record names the tasks it owns.
+                    // The mint already wrote this phase's declared task ids
+                    // (see `write_phase_task_ids` at the mint), so growth
+                    // APPENDS — the field then reads the same on this
+                    // launcher as it already does on `crawl_launch.rs`,
+                    // which builds `task_ids` per group and saves the phase
+                    // (the one launcher that has always written it). #2301
+                    // folds the two into one path; the field has to mean
+                    // the same thing on both before that can happen.
+                    append_phase_task_ids(&mission_id, &real_phase_id, &event.minted);
                     for task in grown_tasks {
                         tasks_by_id.insert(task.id.clone(), task.clone());
                         tasks.push(task);
@@ -1216,10 +1236,34 @@ pub fn launch(
             tasks_by_id.insert(task.id.clone(), task.clone());
         }
 
-        if !steps.values().any(|s| s.status == crew::types::NodeStatus::Planned) {
-            // Nothing new to run in this phase (every earlier step is
-            // already terminal and this phase minted none) — skip the
-            // scheduler setup rather than spinning an empty wave.
+        let phase_has_work = steps.values().any(|s| {
+            s.status == crew::types::NodeStatus::Planned
+                && tasks_by_id.get(&s.task_id).is_some_and(|t| t.phase_id == real_phase_id)
+        });
+        if !phase_has_work {
+            // (#2300) A phase that declared a `grow` template and grew
+            // NOTHING has no steps at all, and phases only ever open and
+            // close through `lazy_start_phase_for_step`/
+            // `lazy_close_prior_phases`, which are driven BY a step. So
+            // such a phase would sit `Planned` for the whole run and get
+            // swept to `Abandoned` by the #1504 backstop at finalize —
+            // printing a reconcile warning and recording a lie, because
+            // nothing failed: the plan planned nothing. Start and complete
+            // it explicitly here instead. Scoped to phases that actually
+            // declared growth: a freeform phase with no tasks in the
+            // document is a different thing (the operator works it by
+            // hand) and keeps its existing behavior untouched.
+            if phase.tasks.iter().any(|t| t.grow.is_some()) {
+                complete_grown_nothing_phase(
+                    &mission_id,
+                    &real_phase_id,
+                    &phase_order,
+                    &mut started_phases,
+                    &mut closed_phases,
+                );
+            }
+            // Nothing to run in this phase — skip the scheduler setup
+            // rather than spinning an empty wave.
             continue;
         }
 
@@ -1652,6 +1696,85 @@ fn grow_phase(
         ));
     }
     Ok(out)
+}
+
+/// (#2300) Set a phase record's `task_ids` to exactly `ids`.
+///
+/// Warn-and-continue, never fatal: `task_ids` is a rendering convenience
+/// (`mission status`, the graph lens), and every Task record on disk
+/// already carries its own `phase_id`, so a failed write costs a nicety,
+/// not correctness. Mirrors `crawl_launch.rs`'s `phase.task_ids = ...;
+/// save_phase(&phase)` — the one launcher that has always written it.
+fn write_phase_task_ids(mission_id: &str, phase_id: &str, ids: Vec<String>) {
+    let result = load_phase_for_brief(mission_id, phase_id).and_then(|mut phase| {
+        phase.task_ids = ids;
+        crew::lifecycle::save_phase(&phase)
+    });
+    if let Err(e) = result {
+        eprintln!(
+            "{}",
+            style::dim(&format!("mission launch: phase `{phase_id}` task_ids warning: {e:#}"))
+        );
+    }
+}
+
+/// (#2300) Append grown task ids to a phase record's existing `task_ids`.
+/// Growth happens after the mint wrote the declared ids, so this is an
+/// append, and it dedups so a re-entered phase can't double-list a task.
+fn append_phase_task_ids(mission_id: &str, phase_id: &str, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let existing = load_phase_for_brief(mission_id, phase_id).map(|p| p.task_ids).unwrap_or_default();
+    let mut merged = existing;
+    for id in ids {
+        if !merged.iter().any(|e| e == id) {
+            merged.push(id.clone());
+        }
+    }
+    write_phase_task_ids(mission_id, phase_id, merged);
+}
+
+/// (#2300) Explicitly open and close a phase whose `grow` template grew
+/// zero tasks, so its record reads `complete` rather than being swept to
+/// `abandoned` by the #1504 finalize backstop.
+///
+/// A phase with no steps is invisible to `lazy_start_phase_for_step` and
+/// `lazy_close_prior_phases` — both are driven by a step transition — so
+/// without this the phase sits `Planned` all run and finalize reconciles it
+/// to `Abandoned` with a warning. Nothing failed, though: the plan planned
+/// nothing, which is a real and legitimate outcome (the `grew_nothing`
+/// reason on the `mission.grow` record says exactly that). Closing the
+/// prior phases first keeps the strictly-linear phase model (#1341) intact:
+/// reaching this phase is still the evidence that the ones before it are
+/// over, exactly as a first step transition would have been.
+fn complete_grown_nothing_phase(
+    mission_id: &str,
+    real_phase_id: &str,
+    phase_order: &[String],
+    started: &mut std::collections::HashSet<String>,
+    closed: &mut std::collections::HashSet<String>,
+) {
+    if !started.insert(real_phase_id.to_string()) {
+        return;
+    }
+    lazy_close_prior_phases(mission_id, phase_order, real_phase_id, closed);
+    let result = crew::lifecycle::phase_start(real_phase_id)
+        .and_then(|_| crew::lifecycle::phase_complete(real_phase_id));
+    match result {
+        Ok(_) => {
+            closed.insert(real_phase_id.to_string());
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "mission launch: completing empty phase `{real_phase_id}` failed: {e:#} — \
+                     continuing; the whole-mission terminal reconciles phase state."
+                ))
+            );
+        }
+    }
 }
 
 fn bool_param(collected: &BTreeMap<String, serde_json::Value>, key: &str) -> bool {

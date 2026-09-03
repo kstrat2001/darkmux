@@ -5096,6 +5096,14 @@ fn one_mission_dir(home: &TempDir) -> std::path::PathBuf {
     entries.pop().unwrap()
 }
 
+fn phase_record(mission_dir: &std::path::Path, phase_id: &str) -> serde_json::Value {
+    let path = mission_dir.join("phases").join(format!("{phase_id}.json"));
+    serde_json::from_str(
+        &fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display())),
+    )
+    .unwrap()
+}
+
 fn flow_actions(flows: &TempDir) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     for entry in fs::read_dir(flows.path()).unwrap().filter_map(|e| e.ok()) {
@@ -5144,6 +5152,35 @@ fn mission_launch_grows_one_task_per_plan_unit_with_provenance() {
         "the `grow` template must not be minted as a task of its own"
     );
 
+    // (#2300) The phase record names the tasks it owns — the declared ids
+    // at mint, the grown ids appended at the boundary. `crawl_launch.rs`
+    // has always written this field; the generic launcher does now too.
+    let plan_phase = phase_record(&dir, &format!("{mission_id}-plan"));
+    assert_eq!(
+        plan_phase["task_ids"],
+        // The placeholder-prefix rule rewrites `plan-task` (prefixed by the
+        // document phase id `plan`) into `<real phase id>-task`.
+        serde_json::json!([format!("{mission_id}-plan-task")]),
+        "the producing phase lists its declared task: {plan_phase}"
+    );
+    let units_phase = phase_record(&dir, &grown_phase);
+    let listed = units_phase["task_ids"].as_array().expect("task_ids is a list");
+    assert_eq!(
+        listed.len(),
+        2,
+        "the grown phase lists exactly its grown tasks (the template is not one): {units_phase}"
+    );
+    for unit in ["u-1", "u-2"] {
+        assert!(
+            listed.contains(&serde_json::json!(format!("unit-task-{unit}"))),
+            "missing grown id in task_ids: {units_phase}"
+        );
+    }
+    assert!(
+        !listed.contains(&serde_json::json!("unit-task")),
+        "the `grow` template must never be listed as a task: {units_phase}"
+    );
+
     // graph-report.json carries the growth event.
     let report: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.join("graph-report.json")).unwrap()).unwrap();
@@ -5163,6 +5200,10 @@ fn mission_launch_grows_one_task_per_plan_unit_with_provenance() {
     assert_eq!(payload["from"], serde_json::json!("plan-task"));
     assert_eq!(payload["items"], serde_json::json!(2));
     assert_eq!(payload["minted"].as_array().unwrap().len(), 2);
+    assert!(
+        payload.get("reason").is_none(),
+        "`reason` is omitted, never null, when the growth minted something: {payload}"
+    );
 
     // `mission status` names the growth.
     let status = Command::cargo_bin("darkmux")
@@ -5174,7 +5215,7 @@ fn mission_launch_grows_one_task_per_plan_unit_with_provenance() {
         .unwrap();
     let status_out = String::from_utf8_lossy(&status.stdout);
     assert!(
-        status_out.contains("grew 2 task(s) from plan-task"),
+        status_out.contains("grew 2 task(s) from `plan-task`"),
         "mission status must name the growth, got:\n{status_out}"
     );
 }
@@ -5195,6 +5236,21 @@ fn mission_launch_grows_nothing_from_an_empty_plan_and_still_completes() {
     assert!(
         !grown_dir.exists() || fs::read_dir(&grown_dir).unwrap().next().is_none(),
         "zero items must mint zero tasks"
+    );
+    // (#2300) The phase must read `complete`, not `abandoned`. A phase with
+    // no steps is invisible to the step-driven lazy start/close, so without
+    // an explicit completion it sits Planned all run and the #1504 finalize
+    // backstop sweeps it to Abandoned — recording a failure where the plan
+    // simply planned nothing.
+    let units_phase = phase_record(&dir, &format!("{mission_id}-units"));
+    assert_eq!(
+        units_phase["status"],
+        serde_json::json!("complete"),
+        "a phase that grew nothing must COMPLETE: {units_phase}"
+    );
+    assert!(
+        !stdout.contains("reconciled to Abandoned"),
+        "no backstop reconcile warning may print for a phase that legitimately grew nothing:\n{stdout}"
     );
     let records = flow_actions(&flows);
     let grow = records.iter().find(|r| r["action"] == "mission.grow").expect("a grow record");

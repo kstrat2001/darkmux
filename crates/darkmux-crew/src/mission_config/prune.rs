@@ -73,7 +73,7 @@ impl PruneReport {
         Some(
             self.grown
                 .iter()
-                .map(|g| format!("grew {} task(s) from {}", g.minted.len(), g.from))
+                .map(|g| format!("grew {} task(s) from `{}`", g.minted.len(), g.from))
                 .collect::<Vec<_>>()
                 .join("; "),
         )
