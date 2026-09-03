@@ -53,6 +53,10 @@ test.describe("#2280 — collapsed task row keeps the task name readable", () =>
     expect(nameBox!.width, `name box was ${nameBox!.width}px, expected >= ${10 * fontSize * 0.6}px (10 chars)`).toBeGreaterThanOrEqual(10 * fontSize * 0.6);
   });
 
+  // Pinned by the two-row phone layout (part 2), not by `overflow: hidden`:
+  // with the meter on its own row it has ~96px of slack at 390px, so removing
+  // the clip does not red this (review, #2282). It guards the row; it does
+  // not prove the clip.
   test("390x844 (phone): no child of the meter cell paints past its own right edge", async ({ page }) => {
     await gotoCollapsedTaskRow(page, 390, 844);
 
@@ -62,6 +66,7 @@ test.describe("#2280 — collapsed task row keeps the task name readable", () =>
     const childRights = await page
       .locator(".missionlens .tltask .tlt-hd .tlt-meter-cell .mn-step-meter > *")
       .evaluateAll((nodes) => nodes.map((n) => n.getBoundingClientRect().right));
+    expect(childRights.length, "the meter must have children, else this loop proves nothing").toBeGreaterThan(0);
 
     for (const right of childRights) {
       expect(right, `a meter child's right edge (${right}px) exceeded the cell's right edge (${cellBox!.x + cellBox!.width}px)`).toBeLessThanOrEqual(cellBox!.x + cellBox!.width + 0.5);
@@ -74,17 +79,6 @@ test.describe("#2280 — collapsed task row keeps the task name readable", () =>
     // is the real signal).
     const overflow = await page.evaluate(() => document.body.scrollWidth > document.documentElement.clientWidth);
     expect(overflow, "no horizontal document scroll at 390px").toBe(false);
-  });
-
-  test("700x900: the name keeps a readable minimum width", async ({ page }) => {
-    await gotoCollapsedTaskRow(page, 700, 900);
-
-    const nameEl = page.locator(".missionlens .tltask .tlt-hd .tlt-name").first();
-    const nameBox = await nameEl.boundingBox();
-    const fontSize = await nameEl.evaluate((el) => parseFloat(getComputedStyle(el).fontSize));
-
-    expect(nameBox).not.toBeNull();
-    expect(nameBox!.width, `name box was ${nameBox!.width}px, expected >= ${10 * fontSize * 0.6}px (10 chars)`).toBeGreaterThanOrEqual(10 * fontSize * 0.6);
   });
 
   test("390x844 (phone): the meter drops to its own line under the name", async ({ page }) => {

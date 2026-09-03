@@ -5366,11 +5366,17 @@ body {
      tokens + turns) claim whatever it wants from an `auto` grid track,
      because grid track sizing reads an item's max-content width regardless
      of any `flex` property on the item — `flex` only governs sizing inside
-     a FLEX container, and this is a grid one. `minmax(10ch, 1fr)` on the
-     name is the actual floor; `minmax(0, auto)` on the meter is what lets
-     its track shrink below max-content so `.tlt-meter-cell`'s own
-     `min-width: 0` + `overflow: hidden` (below) can take effect. */
-  grid-template-columns: auto minmax(10ch, 1fr) auto minmax(0, auto) auto;
+     a FLEX container, and this is a grid one. The name column's floor is
+     the actual fix. It is written in the NAME's own font terms — `.tlt-name`
+     is `calc(12px * var(--fs-scale))` monospace, ~0.6em per glyph, so ten
+     glyphs ≈ 7.2 × 12px × scale — rather than `10ch`, which would resolve
+     against this header's inherited sans font and stop tracking the font
+     scale (review, #2282). `minmax(0, auto)` on the meter lets its track
+     shrink below max-content; with `.tlt-meter-cell`'s `overflow: hidden`
+     that CLIPS the meter at the cell edge (it does not ellipsize — see the
+     cell's own note). Measured to matter only in a ~860px band; kept as the
+     guard for a longer meter than today's. */
+  grid-template-columns: auto minmax(calc(7.2 * 12px * var(--fs-scale)), 1fr) auto minmax(0, auto) auto;
   grid-template-areas: "dot name count meter chev";
   align-items: center;
   gap: 9px;
@@ -5430,10 +5436,12 @@ body {
   /* (#2280) The cell itself must be allowed to shrink + clip — the grid
      track alone (`minmax(0, auto)` above) only permits the TRACK to
      shrink; without this the cell's own content still forces intrinsic
-     width. The child `.mn-step-meter` (shared rule, #2104/#2281) already
-     ellipsizes from the right once it's actually squeezed, so a tight row
-     loses "turns"/"tools" first and keeps the time + tokens — same
-     precedent as the step rows. */
+     width. Honest about what happens next: the child `.mn-step-meter` is an
+     `inline-flex` box, and `text-overflow: ellipsis` does not apply to flex
+     children, so a squeezed meter is hard-CLIPPED at the cell's right edge,
+     not ellipsized (review, #2282 — measured 3.7px of clipping in a ~860px
+     band and none elsewhere). Below 700px the meter has its own row and
+     never clips; the clip is the wide-viewport backstop only. */
   overflow: hidden;
 }
 /* (#2269) A finished step's (or task's) wall time — the pulse is gone, the
