@@ -52,6 +52,16 @@ pub struct Proposer {
     pub machine_id: Option<String>,
 }
 
+/// The mission scope a dispatch ran under. Every field is `None` for a plain
+/// `darkmux dispatch`, which belongs to no mission — grouped into one struct so
+/// the two producers cannot pass the three ids in different orders.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub mission_id: Option<String>,
+    pub phase_id: Option<String>,
+    pub step_id: Option<String>,
+}
+
 /// One finding, as stored at `<findings dir>/<dispatch>/<seq>/finding.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindingRecord {
@@ -65,9 +75,25 @@ pub struct FindingRecord {
     pub ts: String,
     pub tool_name: String,
     pub proposer: Proposer,
+    /// The mission / phase / step this dispatch ran under, when it ran under
+    /// one — `null` for a plain `darkmux dispatch`, which belongs to no
+    /// mission. These are the dispatch's OWN scope and are top-level fields on
+    /// the flow record, NOT part of `context`; a crawl's context blob carries
+    /// workspace / source / sha / rule / unit and no mission id at all. They
+    /// live here for the same reason: `context` is the launcher's, verbatim,
+    /// and darkmux does not write into it.
+    ///
+    /// Additive (a record written before them simply lacks the keys, and
+    /// `Option` reads that as `None`), so the schema version does not move.
+    #[serde(default)]
+    pub mission_id: Option<String>,
+    #[serde(default)]
+    pub phase_id: Option<String>,
+    #[serde(default)]
+    pub step_id: Option<String>,
     /// The dispatch's `record_context` verbatim when it had one (a crawl's
-    /// mission / unit / rule / source / sha), else `null`. darkmux does not
-    /// read inside it.
+    /// workspace / source / sha / rule / unit), else `null`. darkmux does not
+    /// read inside it, and never adds to it.
     pub context: serde_json::Value,
     /// The model's arguments, verbatim. Opaque: never parsed, never validated,
     /// never reshaped.
@@ -111,6 +137,7 @@ pub fn build_record(
     ts: String,
     tool_name: &str,
     proposer: Proposer,
+    scope: Scope,
     context: Option<serde_json::Value>,
     emitted: serde_json::Value,
 ) -> FindingRecord {
@@ -121,6 +148,9 @@ pub fn build_record(
         ts,
         tool_name: tool_name.to_string(),
         proposer,
+        mission_id: scope.mission_id,
+        phase_id: scope.phase_id,
+        step_id: scope.step_id,
         context: context.unwrap_or(serde_json::Value::Null),
         emitted,
         schema_version: FINDING_SCHEMA_VERSION.to_string(),
@@ -208,6 +238,11 @@ pub fn load_all_at(root: &Path) -> Result<Vec<FindingRecord>> {
     }
     out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.key.cmp(&b.key)));
     Ok(out)
+}
+
+/// A top-level string field off a flow record, when it is present and a string.
+fn str_field(v: &serde_json::Value, field: &str) -> Option<String> {
+    v.get(field).and_then(|x| x.as_str()).map(String::from)
 }
 
 /// What one `finding sync` pass did.
@@ -305,6 +340,15 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
                         .get("machine_id")
                         .and_then(|v| v.as_str())
                         .map(String::from),
+                },
+                Scope {
+                    // TOP-LEVEL on the flow record, never inside `payload.context`
+                    // — the gap #2288's live proof found. `step_id` is the one
+                    // exception: it is stamped into the PAYLOAD (#1483), so it
+                    // is read from there, with the top level as a fallback.
+                    mission_id: str_field(&rec, "mission_id"),
+                    phase_id: str_field(&rec, "phase_id"),
+                    step_id: str_field(payload, "step_id").or_else(|| str_field(&rec, "step_id")),
                 },
                 payload.get("context").cloned(),
                 emitted.cloned().unwrap_or(serde_json::Value::Null),

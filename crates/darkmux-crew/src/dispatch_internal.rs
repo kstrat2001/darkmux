@@ -6641,6 +6641,15 @@ impl TailerState {
                 model: self.model.clone(),
                 machine_id: darkmux_flow::resolve_machine_id(),
             },
+            crate::findings::Scope {
+                // The dispatch's own scope, from the SAME values every record
+                // this tailer emits carries. Top-level on the flow record, and
+                // deliberately not merged into `context` — that blob is the
+                // launcher's, verbatim.
+                mission_id: self.mission_id.clone(),
+                phase_id: self.phase_id.clone(),
+                step_id: self.step_id.clone(),
+            },
             self.record_context.clone(),
             emitted,
         );

@@ -3948,10 +3948,14 @@ fn dry_run_table_marks_shared_read_pass_rows() {
 /// 1.33.0 and therefore carried no `emitted` at all.
 fn write_finding_day_file(flows: &std::path::Path) {
     fs::create_dir_all(flows).unwrap();
-    let rec = |ts: &str, sess: &str, tool: &str, seq: u64, emitted: Option<serde_json::Value>| {
+    // `mission_id` / `phase_id` are TOP-LEVEL on a flow record; the crawl's
+    // `context` is the launcher's blob (workspace / source / sha / rule / unit)
+    // and carries no mission. A fixture that put the mission inside `context`
+    // would test a shape the producer never emits.
+    let rec = |ts: &str, sess: &str, tool: &str, seq: u64, mission: &str, emitted: Option<serde_json::Value>| {
         let mut payload = serde_json::json!({
             "tool_name": tool, "ok": true, "args": "{}",
-            "context": {"mission_id": "crawl-x", "unit": "u1", "rule": "unnamed-predicate"},
+            "context": {"unit": "u1", "rule": "unnamed-predicate", "source": "acme"},
         });
         if let Some(e) = emitted {
             payload["emitted"] = e;
@@ -3961,17 +3965,18 @@ fn write_finding_day_file(flows: &std::path::Path) {
             "ts": ts, "level": "info", "category": "work", "tier": "local",
             "stage": "dispatch", "action": "dispatch.tool", "handle": "crawler",
             "session_id": sess, "model": "darkmux:qwen3.6", "machine_id": "test-machine",
+            "mission_id": mission, "phase_id": format!("{mission}-crawl"),
             "payload": payload,
         })
         .to_string()
     };
     let lines = [
-        rec("2026-09-03T01:00:00Z", "sess-a", "create_finding", 1,
+        rec("2026-09-03T01:00:00Z", "sess-a", "create_finding", 1, "crawl-1",
             Some(serde_json::json!({"file": "a.ts", "line": 4, "why": "unnamed operands"}))),
-        rec("2026-09-03T02:00:00Z", "sess-b", "report_finding", 2,
+        rec("2026-09-03T02:00:00Z", "sess-b", "report_finding", 2, "crawl-2",
             Some(serde_json::json!({"file": "b.ts", "line": 9}))),
         // Pre-FLOW-1.33.0: no `emitted` key at all — in the stream, not a record.
-        rec("2026-09-03T03:00:00Z", "sess-c", "create_finding", 3, None),
+        rec("2026-09-03T03:00:00Z", "sess-c", "create_finding", 3, "crawl-1", None),
     ];
     fs::write(flows.join("2026-09-03.jsonl"), lines.join("\n") + "\n").unwrap();
 }
@@ -4037,7 +4042,49 @@ fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
     assert_eq!(arr.len(), 2, "got: {v}");
     assert_eq!(arr[0]["emitted"]["file"], "a.ts", "the emission rides whole: {v}");
 
-    // Filters read the record's own context — never interpreting the emission.
+    // The record carries the mission the dispatch ran under as its OWN field —
+    // never read out of the launcher's context blob, which has no mission in it.
+    assert_eq!(arr[0]["mission_id"], "crawl-1", "got: {v}");
+    assert_eq!(arr[0]["phase_id"], "crawl-1-crawl", "got: {v}");
+    assert!(
+        arr[0]["context"].get("mission_id").is_none(),
+        "the launcher's context stays verbatim — no mission injected into it: {v}"
+    );
+
+    // `--mission` selects on that field. THE #2288 live-proof gap: sync made
+    // every record, `--rule` matched them all, and `--mission` matched none,
+    // because the filter read a key `context` never holds.
+    let mission_ids = |args: &[&str]| -> Vec<String> {
+        let out = dm(args);
+        let v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        v["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .map(|f| f["key"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        mission_ids(&["finding", "list", "--mission", "crawl-1", "--json"]),
+        vec!["sess-a/1".to_string()],
+        "--mission must return exactly that mission's findings"
+    );
+    assert_eq!(
+        mission_ids(&["finding", "list", "--mission", "crawl-2", "--json"]),
+        vec!["sess-b/2".to_string()],
+    );
+    assert!(
+        mission_ids(&["finding", "list", "--mission", "no-such-mission", "--json"]).is_empty(),
+        "an unknown mission returns none"
+    );
+
+    // The human list names the mission when the finding has one.
+    let out = dm(&["finding", "list", "--mission", "crawl-1"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("crawl-1"), "the mission is shown: {stdout}");
+
+    // Filters otherwise read the record's own context — never the emission.
     let out = dm(&["finding", "list", "--rule", "nope", "--json"]);
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
@@ -4049,6 +4096,7 @@ fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("sess-a/1"), "got:\n{stdout}");
     assert!(stdout.contains("a.ts"), "the emission is shown: {stdout}");
+    assert!(stdout.contains("crawl-1"), "show names the mission: {stdout}");
     assert!(!stdout.contains("sess-b"), "show is ONE record: {stdout}");
 
     // A missing key is an error with a clear message, not an empty success.

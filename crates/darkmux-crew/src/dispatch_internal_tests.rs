@@ -4452,10 +4452,17 @@
             "crawler".into(),
             "darkmux:qwen3.6".into(),
         );
+        // A crawl's `context` is the LAUNCHER's blob: workspace / source / sha /
+        // rule / unit. The mission is NOT in it — on the flow record
+        // `mission_id`, `phase_id` and `step_id` are TOP-LEVEL fields, which is
+        // why the finding record has to capture them separately.
         state.record_context = Some(serde_json::json!({
-            "mission_id": "crawl-x", "unit": "u7", "rule": "unnamed-predicate",
+            "unit": "u7", "rule": "unnamed-predicate",
             "source": "acme", "sha": "deadbeef",
         }));
+        state.mission_id = Some("crawl-1788402801".into());
+        state.phase_id = Some("crawl-1788402801-crawl".into());
+        state.step_id = Some("step-7".into());
 
         let emitted = serde_json::json!({
             "file": "/workspace/acme/src/x.ts", "line": 82,
@@ -4482,6 +4489,16 @@
         assert_eq!(rec["proposer"]["model"], "darkmux:qwen3.6");
         assert_eq!(rec["proposer"]["machine_id"], "test-machine");
         assert_eq!(rec["context"]["unit"], "u7", "the crawl's context rides verbatim");
+        assert!(
+            rec["context"].get("mission_id").is_none(),
+            "the mission is NOT in the launcher's context blob: {rec}"
+        );
+        assert_eq!(
+            rec["mission_id"], "crawl-1788402801",
+            "the mission the dispatch ran under is a TOP-LEVEL field on the record: {rec}"
+        );
+        assert_eq!(rec["phase_id"], "crawl-1788402801-crawl", "got: {rec}");
+        assert_eq!(rec["step_id"], "step-7", "got: {rec}");
         assert_eq!(rec["emitted"], emitted, "the emission is stored untouched");
 
         // WRITE-ONCE. Mutate the file, replay the identical event, and the
@@ -4518,6 +4535,27 @@
         );
         assert!(!store.join("sess-finding").join("6").exists(), "emitted:null → no record");
         assert!(!store.join("sess-finding").join("7").exists(), "a read is not a finding");
+
+        // A plain `darkmux dispatch` runs under no mission at all. The fields
+        // must be explicitly null rather than absent, so "no mission" and "an
+        // older writer that did not know the field" stay distinguishable.
+        let mut solo = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-solo".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        solo.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"create_finding","args":"{}","result":"r","ok":true,"emitted":{"file":"s.ts"},"emit_seq":1}"#,
+        );
+        let solo_rec: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(store.join("sess-solo").join("1").join("finding.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(solo_rec["mission_id"].is_null(), "no mission → explicit null: {solo_rec}");
+        assert!(solo_rec["phase_id"].is_null(), "got: {solo_rec}");
+        assert!(solo_rec["step_id"].is_null(), "got: {solo_rec}");
+        assert!(solo_rec["context"].is_null(), "no launcher context → null: {solo_rec}");
 
         unsafe {
             for (k, v) in [

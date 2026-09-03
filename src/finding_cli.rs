@@ -33,7 +33,11 @@ pub fn list(
     let rows: Vec<&FindingRecord> = all
         .iter()
         .filter(|r| dispatch.is_none_or(|d| r.dispatch == d))
-        .filter(|r| mission.is_none_or(|m| context_str(r, "mission_id").as_deref() == Some(m)))
+        // The mission is the RECORD's own field, not something inside the
+        // launcher's `context` blob (which carries workspace / source / sha /
+        // rule / unit and no mission at all). Reading it from `context` was
+        // #2288's live-proof gap: every filter matched except this one.
+        .filter(|r| mission.is_none_or(|m| r.mission_id.as_deref() == Some(m)))
         .filter(|r| rule.is_none_or(|x| context_str(r, "rule").as_deref() == Some(x)))
         .collect();
 
@@ -53,7 +57,10 @@ pub fn list(
 
     for r in &rows {
         let mut context_bits: Vec<String> = Vec::new();
-        for field in ["mission_id", "unit", "rule"] {
+        if let Some(m) = r.mission_id.as_deref() {
+            context_bits.push(format!("mission={m}"));
+        }
+        for field in ["unit", "rule"] {
             if let Some(v) = context_str(r, field) {
                 context_bits.push(format!("{field}={v}"));
             }
@@ -102,6 +109,17 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     println!("seq       {}", rec.seq);
     println!("recorded  {}", rec.ts);
     println!("tool      {}", rec.tool_name);
+    // The dispatch's scope, printed only when it HAD one — a plain `darkmux
+    // dispatch` belongs to no mission, and a row of "(none)" would be noise.
+    for (label, value) in [
+        ("mission", rec.mission_id.as_deref()),
+        ("phase", rec.phase_id.as_deref()),
+        ("step", rec.step_id.as_deref()),
+    ] {
+        if let Some(v) = value {
+            println!("{label:<10}{v}");
+        }
+    }
     println!(
         "proposer  {} ({}){}",
         rec.proposer.handle,
@@ -162,7 +180,8 @@ they exist in the stream but cannot become records)",
 }
 
 /// A record's `context.<field>` as a string, when the launcher supplied one.
-/// Provenance only — the `emitted` blob is never read.
+/// Provenance only — the `emitted` blob is never read, and the mission scope
+/// is NOT here (it is the record's own field; see the `--mission` filter).
 fn context_str(rec: &FindingRecord, field: &str) -> Option<String> {
     rec.context.get(field).and_then(|v| v.as_str()).map(String::from)
 }
