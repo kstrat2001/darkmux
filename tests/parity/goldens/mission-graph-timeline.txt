@@ -13,12 +13,12 @@ PHASE [s-complete] Investigate (complete)
   TASK [s-complete open] bundle
     STEP [s-complete] Shell
   TASK [s-complete open] probe
-    STEP [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | · tok
+    STEP [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | 0:03
   TASK [s-complete open] dedup
     STEP [s-complete] No-op
 PHASE [s-complete] Adjudicate (complete)
   TASK [s-complete open] judge
-    STEP [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | · tok
+    STEP [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | 0:01
 PHASE [s-complete] Report (complete)
   TASK [s-complete open] synthesis
     STEP [s-complete] No-op
