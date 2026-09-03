@@ -30,7 +30,8 @@ export function activityOf(r: FlowRecord): string {
   if (a === "dispatch.feedback.injected") return "feedback";
   if (a === "tier-decision") return "routing";
   if (a === "dispatch.compaction" || r.source === "compaction") return "compaction";
-  if (a === "flow.note" || a === "note" || r.source === "orchestrator" || r.source === "adjudication") return "note";
+  const isNoteEvent = a === "flow.note" || a === "note" || r.source === "orchestrator" || r.source === "adjudication";
+  if (isNoteEvent) return "note";
   if (a === "machine.online" || a === "machine online") return "machine online";
   if (a === "machine.offline" || a === "machine offline") return "machine offline";
   if (a === "session.end") return "session end";
