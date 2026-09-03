@@ -6243,6 +6243,13 @@ impl TailerState {
                         *lock_deadline(deadline) = new_deadline;
                     }
                 }
+                // (#2265 review) Bound ONCE, then share. The flow record and
+                // the finding record must hold the SAME bytes for an emission
+                // — otherwise an over-cap emission is whole or clipped
+                // depending on which producer wrote it, since `finding sync`
+                // replays the (clipped) flow record while the tailer would
+                // have stored the raw one.
+                let bounded_emission = bound_emitted(event.get("emitted"));
                 let mut payload = serde_json::json!({
                     "tool_seq": event.get("tool_seq"),
                     // (#1483) The AUTHORITATIVE running tool-call count for this
@@ -6267,7 +6274,7 @@ impl TailerState {
                     // so "nothing emitted" and "the image cannot emit" stay
                     // distinguishable downstream. The crawl's product rides
                     // THIS, never the `args` preview above.
-                    "emitted": bound_emitted(event.get("emitted")),
+                    "emitted": bounded_emission.clone(),
                     "emit_seq": event.get("emit_seq"),
                     "result_chars": event.get("result_chars"),
                     // (#2007) The result itself, so a failed tool call can be
@@ -6305,7 +6312,7 @@ impl TailerState {
                 // this missed (an older binary, a killed process); both go
                 // through the same write-once materializer, so the two
                 // producers cannot disagree about what a finding is.
-                self.materialize_finding(&event, tool_ok);
+                self.materialize_finding(&event, tool_ok, &bounded_emission);
             }
             "compaction" => {
                 self.summary.compactions += 1;
@@ -6616,7 +6623,15 @@ impl TailerState {
     ///
     /// Cost: one `create_dir_all` + one small file write per ACCEPTED finding
     /// call, and a bare `exists()` on a replay. Nothing on any other tool call.
-    fn materialize_finding(&self, event: &serde_json::Value, tool_ok: bool) {
+    fn materialize_finding(
+        &self,
+        event: &serde_json::Value,
+        tool_ok: bool,
+        bounded_emission: &serde_json::Value,
+    ) {
+        // A REJECTED citation (a wrong line, an unresolvable path, a spent
+        // budget) is a FAILED tool call, and the store is write-once — a bad
+        // record written here would be permanent.
         if !tool_ok {
             return;
         }
@@ -6624,10 +6639,11 @@ impl TailerState {
         if !crate::findings::is_finding_tool(tool_name) {
             return;
         }
-        let emitted = match event.get("emitted") {
-            Some(v) if !v.is_null() => v.clone(),
-            _ => return,
-        };
+        if bounded_emission.is_null() {
+            return;
+        }
+        // The SAME value the flow record carries, never the raw event field.
+        let emitted = bounded_emission.clone();
         let Some(seq) = event.get("emit_seq").and_then(|v| v.as_u64()) else {
             return;
         };
@@ -6650,7 +6666,10 @@ impl TailerState {
                 phase_id: self.phase_id.clone(),
                 step_id: self.step_id.clone(),
             },
-            self.record_context.clone(),
+            // `merge_record_context` drops a NON-object context, so the flow
+            // record has none and `sync` stores null. Make the same judgment
+            // here, or the two producers disagree about the same dispatch.
+            self.record_context.as_ref().filter(|c| c.is_object()).cloned(),
             emitted,
         );
         let root = crate::findings::findings_dir();

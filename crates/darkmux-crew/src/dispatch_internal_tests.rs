@@ -4526,6 +4526,18 @@
             "report_finding (the old name) must materialize the same record"
         );
 
+        // A REJECTED citation is a FAILED tool call (`ok: false`) and must make
+        // NO record. Rejections are a real runtime path — a wrong line number,
+        // an unresolvable path, a spent budget — and write-once would make a
+        // bad record permanent.
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":8,"tool_name":"create_finding","args":"{}","result":"REJECTED: line 9999 does not exist","ok":false,"emitted":{"file":"r.ts"},"emit_seq":8}"#,
+        );
+        assert!(
+            !store.join("sess-finding").join("8").exists(),
+            "a rejected (ok:false) finding call must NOT become a record"
+        );
+
         // A non-emitting call and a non-finding tool make NO record.
         state.handle_event(
             r#"{"type":"tool.completed","seq":1,"tool_seq":2,"tool_name":"create_finding","args":"{}","result":"r","ok":true,"emitted":null,"emit_seq":6}"#,
@@ -4570,6 +4582,102 @@
                 }
             }
         }
+    }
+
+    /// (#2265 review) The two stores must never hold DIFFERENT bytes for the
+    /// same emission. The flow record gets `bound_emitted`; the finding record
+    /// must get the SAME value, or an over-cap emission is whole-or-clipped
+    /// depending on which producer wrote it (`sync` replays the flow record,
+    /// so it would store the clipped form while the tailer stored the raw one).
+    ///
+    /// Same class, second case: `merge_record_context` no-ops on a NON-object
+    /// `record_context`, so the flow record gets no `context` at all and
+    /// `sync` stores null. The tailer must make the same judgment.
+    #[test]
+    #[serial] // reaches emit() + the findings store
+    fn the_finding_record_stores_exactly_what_the_flow_record_stores() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("findings");
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        let prev_store = std::env::var("DARKMUX_FINDINGS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+            std::env::set_var("DARKMUX_FINDINGS_DIR", &store);
+        }
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-parity".into(),
+            "crawler".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // A non-object context: the flow record's merge drops it entirely.
+        state.record_context = Some(serde_json::json!("just a string"));
+
+        let over_cap = serde_json::json!({"why": "z".repeat(MAX_EMITTED_BYTES + 10)});
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0,
+                "tool_name": "create_finding", "args": "{}", "result": "Recorded.",
+                "ok": true, "emitted": over_cap, "emit_seq": 1,
+            })
+            .to_string(),
+        );
+
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_store {
+                Some(v) => std::env::set_var("DARKMUX_FINDINGS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FINDINGS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let flow: serde_json::Value = std::fs::read_to_string(&day_file)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["action"] == "dispatch.tool")
+            .expect("a dispatch.tool record");
+        let rec: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(store.join("sess-parity").join("1").join("finding.json"))
+                .expect("record written"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            flow["payload"]["emitted"]["emitted_truncated"],
+            serde_json::json!(true),
+            "fixture must actually exceed the bound, or this test proves nothing"
+        );
+        assert_eq!(
+            rec["emitted"], flow["payload"]["emitted"],
+            "the finding record must store EXACTLY the bounded value the flow record stores"
+        );
+        assert!(
+            flow["payload"].get("context").is_none(),
+            "a non-object record_context is dropped from the flow record"
+        );
+        assert!(
+            rec["context"].is_null(),
+            "…so the finding record must drop it too, not store it verbatim: {rec}"
+        );
     }
 
     /// (#2272) The forward is bounded — a runaway emission cannot blow a flow

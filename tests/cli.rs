@@ -4079,6 +4079,49 @@ fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
         "an unknown mission returns none"
     );
 
+    // `--dispatch` narrows to one dispatch. Unpinned, the filter could be
+    // `.filter(|_| true)` and nothing would notice.
+    assert_eq!(
+        mission_ids(&["finding", "list", "--dispatch", "sess-b", "--json"]),
+        vec!["sess-b/2".to_string()],
+        "--dispatch must return exactly that dispatch's findings"
+    );
+    assert!(
+        mission_ids(&["finding", "list", "--dispatch", "sess-nope", "--json"]).is_empty(),
+        "an unknown dispatch returns none"
+    );
+    // …and the three filters compose rather than replacing each other.
+    assert!(
+        mission_ids(&["finding", "list", "--mission", "crawl-1", "--dispatch", "sess-b", "--json"])
+            .is_empty(),
+        "filters compose: sess-b is not in crawl-1"
+    );
+
+    // A filter that matches nothing must not read like an EMPTY STORE — the
+    // remedy for the two is different ("your filter matched nothing" vs "run
+    // sync").
+    let out = dm(&["finding", "list", "--mission", "no-such-mission"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no findings match"), "got:\n{stdout}");
+    assert!(
+        !stdout.contains("finding sync"),
+        "the store is NOT empty — do not tell the operator to sync: {stdout}"
+    );
+
+    // A malformed --since would match no day file and exit clean, which reads
+    // exactly like "there are no findings". It must refuse instead.
+    let out = dm(&["finding", "sync", "--since", "last-tuesday"]);
+    assert_ne!(out.status.code(), Some(0), "a non-date --since must not exit clean");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("YYYY-MM-DD"),
+        "the error names the shape: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A key that would escape the store is refused, not resolved.
+    let out = dm(&["finding", "show", "../sess-a/1"]);
+    assert_eq!(out.status.code(), Some(1), "a traversal key must not resolve");
+
     // The human list names the mission when the finding has one.
     let out = dm(&["finding", "list", "--mission", "crawl-1"]);
     let stdout = String::from_utf8_lossy(&out.stdout);

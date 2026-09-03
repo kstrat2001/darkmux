@@ -50,7 +50,22 @@ pub fn list(
     }
 
     if rows.is_empty() {
-        println!("(no findings){}", if root.exists() { String::new() } else { format!(" — {} does not exist yet", root.display()) });
+        // An empty RESULT and an empty STORE need different remedies, so they
+        // must not print the same line: one means "widen your filter", the
+        // other means "nothing has been recorded here yet".
+        let filtered = mission.is_some() || dispatch.is_some() || rule.is_some();
+        if filtered && !all.is_empty() {
+            println!("(no findings match — {} in the store)", all.len());
+            return Ok(0);
+        }
+        println!(
+            "(no findings){}",
+            if root.exists() {
+                String::new()
+            } else {
+                format!(" — {} does not exist yet", root.display())
+            }
+        );
         println!("  `darkmux finding sync` replays the flow stream into the store.");
         return Ok(0);
     }
