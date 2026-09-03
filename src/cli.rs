@@ -715,23 +715,14 @@ pub(crate) enum MissionCmd {
     /// any produced output (Clean/Degraded/Degenerate alike — CI-facing
     /// pass/fail comes from the rendered payload's `mode` field, not this
     /// code), propagating a hard failure for anything that fails before an
-    /// envelope was ever produced. `crawl` (#1959 packet 2 — the crawl
-    /// LAUNCHER, `src/crawl_launch.rs`) exits `0` on a clean finish
-    /// (every selected unit attempted, or `--param limit=` cut the
-    /// selection short by design — both read as an honest completion);
-    /// `1` an error before or during the per-unit loop (a pre-mint
-    /// validation bail, a mint-window failure — mission/phase/task/step
-    /// persistence or the runs-dir creation, reconciled to a terminal
-    /// mission rather than left stranded Active — or the RAII finalize
-    /// guard catching an early return/panic mid-loop); `3` the operator
-    /// dropped a `STOP` kill file
-    /// in the crawl-state root (`<darkmux root>/crawl/<name>/`, or the
-    /// workspace spec's own explicit `root:` when it sets one) — honored
-    /// BETWEEN units, never mid-dispatch;
-    /// `130` SIGINT (a first Ctrl-C is honored the same between-units way
-    /// as the kill file; a second Ctrl-C restores the default handler; a
-    /// third kills the process outright — `darkmux_types::interrupt`'s own
-    /// doc).
+    /// envelope was ever produced. (#2301) `crawl` has no exit codes of
+    /// its own any more: it is an ordinary generic graph
+    /// (`crawl.plan` → grown `crawl.unit` tasks → `crawl.summary`), so it
+    /// exits `0` when the graph completes Clean/Degraded and `1` otherwise,
+    /// exactly like every other config. The retired launcher's bespoke
+    /// `3` (kill file) and its between-units skip loop are gone with it;
+    /// SIGINT/SIGTERM/SIGHUP still exit `130` through this launcher's own
+    /// shared guard.
     Launch {
         /// Mission config id to launch — a built-in (e.g. `coder-phase`)
         /// or a `darkmux mission propose`-drafted user-tier config.
@@ -756,8 +747,10 @@ pub(crate) enum MissionCmd {
         timeout: Option<u32>,
         /// (#1959) Resolve config + inputs, mint NOTHING, emit NO flow
         /// records, dispatch NOTHING — print what would run and exit.
-        /// `crawl` prints the plan table (writes it to disk only when
-        /// `--param plan_out=<path>` names a destination); `review`
+        /// (#2301) `crawl` prints its task/step graph like any other
+        /// config — including which rule tracks `--param rules=` left out;
+        /// the retired launcher's in-process plan table and
+        /// `--param plan_out=` are gone with it. `review`
         /// prints resolved inputs and, when the source is a local
         /// worktree, the bundle count (a GitHub source says the count
         /// isn't computed in dry-run — that would cost a network fetch
@@ -963,17 +956,15 @@ pub(crate) enum MissionConfigCmd {
     /// of being silently dropped, so one broken user-tier override never
     /// hides every other registered config. Read-only.
     ///
-    /// `crawl` (`darkmux mission launch crawl`, #1959) DOES appear here —
-    /// `templates/builtin/mission-configs/crawl.json` exists purely for
-    /// discoverability (it declares workspace, rules, source, rule, plan, plan_out, units, limit, no_fetch, and dry_run as inputs with zero phases)
-    /// — but its listed 0 phases / 0 tasks are the
-    /// honest count of a document that carries NO real graph: crawl's
-    /// Task/Step graph is computed at RUN TIME from a resolved crawl plan,
-    /// never declared ahead of time (see `src/crawl_launch.rs`'s module
-    /// doc for the full reasoning). `mission launch crawl` is routed by
-    /// literal config id in `mission_launch::launch`, BEFORE this document
-    /// (or any mission-config document) is ever loaded — editing
-    /// `crawl.json`'s `phases` field has no effect on a real crawl launch.
+    /// (#2301) `crawl` lists like any other config, and its counts are
+    /// real: `templates/builtin/mission-configs/crawl.json` declares the
+    /// whole crawl (a `crawl.plan` task per rule, a `crawl.unit` GROW
+    /// template per rule, one `crawl.summary`), and editing it changes what
+    /// a crawl launch does. The literal `config_id == "crawl"` routing to
+    /// a bespoke launcher is gone. The per-unit tasks a real run executes
+    /// are GROWN from each plan's output at the phase boundary (#2300), so
+    /// the listed task count is the document's templates, not the run's
+    /// units.
     List {
         #[command(flatten)]
         json: JsonFlag,

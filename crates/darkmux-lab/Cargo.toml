@@ -35,6 +35,8 @@ blake3 = "1.5"
 # this promotes it to a real dependency of the one crate that needs it at
 # runtime rather than widening the workspace's already-locked version.
 regex = "1"
+# (#2301) Optional, off by default — see the `ts-export` feature below.
+ts-rs = { version = "10", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -53,3 +55,11 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # into normal-dependency builds, so release builds stay off (verified via
 # `cargo tree -e features` in the #1355 review round).
 darkmux-flow = { path = "../darkmux-flow", features = ["test-support"] }
+
+[features]
+# (#2301) TypeScript export for the crawl's typed step-output structs. Turned
+# on by `darkmux-serve`'s DEV-dependency for
+# `cargo test -p darkmux-serve export_bindings --lib`; cargo does not unify a
+# dev-dep's features into a normal dependency, so the release binary never
+# pulls `ts-rs` in.
+ts-export = ["dep:ts-rs", "darkmux-crew/ts-export"]

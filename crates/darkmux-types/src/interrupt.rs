@@ -167,7 +167,7 @@ pub fn is_set() -> bool {
 /// Gated the same way `darkmux-types`'s other test-support hooks are
 /// (`cfg(any(test, feature = "test-support"))`, e.g. `paths.rs`/`config_
 /// access.rs`) — unreachable from any production build. A caller in
-/// ANOTHER crate (e.g. `darkmux`'s own `crawl_launch` tests, which can't
+/// ANOTHER crate (e.g. `darkmux`'s own launcher tests, which can't
 /// see the private `on_sigint` fn directly) enables the `test-support`
 /// feature on its dev-dependency to reach this.
 #[cfg(any(test, feature = "test-support"))]

@@ -134,12 +134,12 @@ fn write_pace_file(host_out: &Path, pause: bool, reason: &'static str, state: &s
 }
 
 /// (#2109) Best-effort derivation of a crawl mission's `STOP` file path
-/// from the dispatch's `record_context` (`src/crawl_launch.rs`'s per-unit
+/// from the dispatch's `record_context` (the crawl's per-unit
 /// `record_context`, carrying `workspace` = the crawl manifest name, plus
 /// `unit`/`rule` as crawl-specific markers). The breaker needs to write the
 /// SAME path the crawl launcher's per-unit loop checks
 /// (`<crawl_root>/STOP`) for "no further unit dispatches" to actually
-/// hold — but this module must not depend on or edit `crawl_launch.rs`
+/// hold — but this module must not depend on or edit the crawl's own module
 /// (another agent owns that file for #2131 concurrently), so the formula
 /// is duplicated here from that launcher's DEFAULT (no `root:` override)
 /// resolution: `<darkmux root>/crawl/<manifest_name>/STOP`.

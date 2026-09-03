@@ -476,11 +476,11 @@ The split is the whole design. A transform is a **pure function** — it needs n
 
 ## Crawl as a mission: the shapes and how data flows between them
 
-Ratified with the operator in #2297 and landing in pieces (#2298 plan step, #2299 `enabled`, #2300 grow seam, #2301 launcher retirement, #2302 follow-on steps, #2303 admission). This section is the map: every record the crawl touches, its shape, who writes it, who reads it. Where a piece is not built yet, it says so, so a reader can tell design from delivery.
+Ratified with the operator in #2297 and landing in pieces (#2298 plan step, #2299 `enabled`, #2300 grow seam, #2301 launcher retirement — **delivered**, #2302 follow-on steps, #2303 admission). This section is the map: every record the crawl touches, its shape, who writes it, who reads it. Where a piece is not built yet, it says so, so a reader can tell design from delivery.
 
 ### The two documents: config is the shape, plan is the instance
 
-**Mission config** (`templates/builtin/mission-configs/crawl.json`, schema 3.1) is the shape of the work and is the same file for every crawl of every repo. It declares `inputs` (the workspace spec path, the rule ids, sizing knobs), and phases holding tasks holding steps. The `plan` phase holds **one task per rule**, explicitly, each with a single `crawl.plan` step:
+**Mission config** (`templates/builtin/mission-configs/crawl.json`, schema 3.2) is the shape of the work and is the same file for every crawl of every repo. It declares `inputs` (the workspace spec path, the rule ids, sizing knobs), and phases holding tasks holding steps. The `plan` phase holds **one task per rule**, explicitly, each with a single `crawl.plan` step:
 
 ```json
 { "id": "plan-unnamed-predicate", "enabled": true,
@@ -519,6 +519,30 @@ Rules vary in **what a site is and who finds it**, not in how planning runs, so 
 
 Semantic rules with no cheap prefilter (`doc-contradicts-code`) are the part a linter cannot do and the model is for. When the command shape lands, it is a `procedural.shell` step ahead of the plan step whose output is a site list; the plan step consumes sites in one shape regardless of who produced them.
 
+### Typed step outputs
+
+**Every value one step kind hands to another is a typed serde struct with a `schema_version`** — required fields plain, optional fields `#[serde(default)]` — never a free-form JSON blob and never a string protocol. The consumer deserializes through that struct, and **the read IS the check**: a producer that drifted fails at the read, by field name, instead of being silently summarized as zeros. Required-versus-optional is expressed in the body struct itself, so there is one place to look. Comparing two schemas at CONFIG time is only worth building when composition can wire two different families' outputs together; until then the read is enough.
+
+The body rides in a thin envelope (`darkmux_crew::step_output::Output<T>`), so a consumer knows what it is holding before it looks:
+
+```json
+{ "schema_version": "1.0", "kind": "crawl.unit-outcome",
+  "producer": { "mission": "crawl-…", "task": "unit-…", "step": "unit-…-step", "machine_id": "laptop" },
+  "produced_at": "2026-09-04T…Z",
+  "hash": "9f2c…",
+  "body": { "schema_version": "1.0", "unit": "u-0001", "result": "stop", "findings": 2, … } }
+```
+
+`kind` is a CONTENT id the reader checks against the value it expects **before** deserializing `body`; a mismatch is a refusal naming both, which turns a mis-wired graph into one clear error instead of a confusing field error deep inside a body struct. A **data port's label is the same string as the `kind` its output carries** — `crawl.plan` provides `crawl.plan`, `crawl.unit` requires `crawl.plan` and provides `crawl.unit-outcome`, `crawl.summary` requires `crawl.unit-outcome` and provides `crawl.summary` — so a graph validator (#2312) can compare a producer's `provides` against a consumer's `requires` directly, with no rename table in between. The two concepts stay distinct (a port says where a value flows, `kind` says what is in it); they just agree on their spelling.
+
+`hash` is blake3 over the body written in a canonical form — every object's keys emitted in sorted order, all the way down, arrays left in their own (meaningful) order — so field order can never change the digest, and `Output::read` recomputes it and refuses a mismatch. The sort is explicit rather than inherited from `serde_json::Map`'s default `BTreeMap`, because serde_json's `preserve_order` feature makes that map insertion-ordered and cargo unifies features across a workspace: in darkmux's own tree `agent-client-protocol` enables it, which made the digest stable under `cargo test -p darkmux-crew` and unstable under `cargo test --workspace` until the canonicalizer sorted keys itself. A hash whose value depends on who else is being compiled is not a hash. The reason is not tampering: a consumer must be able to tell a **complete** file from a partial one, and a **stale** copy from the current one, whatever moved it there. A length check cannot and a timestamp lies. Bodies (and plan files) are written once via tmp + rename and never rewritten, so a body whose hash disagrees is a truncated write or a copy that is not the one this run produced. A synced or shared filesystem (iCloud, a network share) is **never** the transport for a `ref` — those deliver partial files as ordinary reads, which is exactly the case this check names. When `body` lives in a file, the hash is of that file's body bytes.
+
+A step's `output` is a string, so `Output::read` accepts an inline envelope, a `{"ref": {"path": "…"}}` pointer, or a bare path (the shape `crawl.plan` used before the wrapper, still read for the transition). The grow seam's `items_from_artifact` looks inside `body` when it finds an envelope and at the top level when it does not, so a pre-wrapper producer keeps working.
+
+**Crawl is the pilot**, in that order: crawl (`crawl.plan` → `Plan`, `crawl.unit` → `UnitOutcome`, `crawl.summary` → `CrawlSummary`), then the coder phase, then review. Fleet transport comes after the wrapper exists everywhere: once every producer wraps, a `ref` can name a MACHINE as well as a path and be fetched from the producing machine's daemon, with the hash as the completeness check on arrival. No body struct changes when that lands.
+
+**The drift guard is the exported types**, not a second hand-written schema. These structs derive `ts_rs::TS` behind each crate's `ts-export` feature and export into `ui/src/types/generated/` — the same generated file the viewer already consumes and CI already diffs (`bun run types:check`). No `schemars`, no hand-written zod: one definition in Rust, one generated TypeScript file, one `git diff --exit-code`.
+
 ### How data flows, phase by phase
 
 ```
@@ -542,7 +566,7 @@ crawl.json ──prune(enabled)──▶ minted run: plan phase, one task per LI
                                                         create_mod / mod create ──▶ ~/.darkmux/mods/<key>/ (kit + attachments)
 ```
 
-The grow arrow is delivered (#2300): a task in a mission config may declare `grow`, and the generic launcher expands it at the phase boundary — see "Mission configs: a step's output grows the graph" below. What is still design as of this writing: `crawl.json`'s unit phase does not declare `grow` yet, because the unit step kind does not exist (#2301 — today `src/crawl_launch.rs` reads the plan in Rust and drives the units itself, and `mission launch crawl` is routed to it by literal config id), and the follow-on step per finding (#2302). Tracks run in parallel under machine-aware admission (#2303), fail independently, and resume alone; a minted step records the plan it came from and, later, the admission decision that scheduled it, so the operator never wonders where a step came from.
+Every arrow above the finding row is delivered. The grow arrow is #2300 (a task may declare `grow`; the generic launcher expands it at the phase boundary — see "Mission configs: a step's output grows the graph" below), and #2301 finished the picture: **the literal-routed crawl launcher is retired.** `src/crawl_launch.rs` is deleted, the `config_id == "crawl"` branch in `mission_launch::launch` is gone, and `crawl.json` declares the whole crawl — a `crawl.plan` task per rule, a `crawl.unit` GROW template per rule, and one `crawl.summary`. `darkmux mission launch crawl --param workspace=<spec.json>` is an ordinary generic launch. Its inputs are `workspace` (required), `rules` (which rule tracks to mint), `max_sites_per_unit`, `max_est_tokens_per_unit`, `no_fetch` and the generic `dry_run`; the launcher's own `source`/`rule` one-shot pair is gone (a one-shot crawl is a one-source spec file), and so are `plan` (a plan is always written under the run), `plan_out`, `units`, `limit` and `resume` (per-unit reuse becomes the scheduler's step-output reuse, #2303). `--param rules=a,b` prunes the tracks it does not name at mint, with reason `not_selected` in `graph-report.json` — the same mechanism `enabled: false` uses, so a run's graph is always exactly what will execute. Grown unit task ids are unprefixed (`unit-<rule>-<unit-id>`) while declared ids carry the mission-id prefix; that is the shape the phase record's `task_ids` holds. What is still design: the follow-on step per finding (#2302). Tracks run in parallel under machine-aware admission (#2303), fail independently, and resume alone; a minted step records the plan it came from and, later, the admission decision that scheduled it, so the operator never wonders where a step came from.
 
 ### What each record is for
 
@@ -550,7 +574,12 @@ The grow arrow is delivered (#2300): a task in a mission config may declare `gro
 |---|---|---|---|
 | `config-snapshot.json` | mint | provenance; `mission status` | mission id |
 | `graph-report.json` | mint (prune) | `mission status`; the `mission start` record carries the same object | mission id |
-| `plan/<rule>.json` | `crawl.plan` step | the grow seam (`grow.from`, #2300); `--param plan=` reuse today | mission id + rule |
+| `plan/<rule>.json` | `crawl.plan` step | the grow seam (`grow.from`, #2300); `crawl.unit` (via `config.plan`) | mission id + rule |
+| `Output<T>` envelope | every typed producer (#2301) | every typed consumer, through `Output::read` | `kind` + `hash` |
+| `UnitOutcome` (`crawl.unit-outcome`) | `crawl.unit` step | `crawl.summary`; the run-detail lens (step output) | unit id |
+| `CrawlSummary` (`crawl.summary`) | `crawl.summary` step | the `mission close` payload; the viewer's crawl surfaces | mission id |
+
+The close payload is a **generic** rule, not a crawl one: the launcher promotes the LAST phase's last step `output` to the `mission close` payload whenever that output is a JSON object (unwrapping an `Output` envelope's `body` when it is one). Before #2301 the generic path always closed with a `null` payload, so any config whose final step emits a JSON object now has one — read the config id, never infer the crawl shape from a payload's presence.
 | `grown_from` on a grown step's `config` | the grow seam | the on-disk step record; `graph-report.json` carries the same triple per copy | `{task, item, index}` |
 | `graph-report.json`'s `grown[]` | the grow seam (appended post-mint) | `mission status`; the `mission.grow` flow record carries the same facts | mission id |
 | `dispatch.tool` record with `emitted` | the runtime, via `create_finding` | hooks (external trackers); `finding sync` | dispatch session + `emit_seq` |

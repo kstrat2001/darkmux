@@ -11,7 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "types:regen": "(cd .. && cargo test -p darkmux-serve export_bindings --lib)",
+    "types:regen": "(cd .. && cargo test -p darkmux-serve export_bindings --lib && cargo test -p darkmux-crew --features ts-export export_bindings --lib && cargo test -p darkmux-lab --features ts-export export_bindings --lib)",
     "types:check": "bun run types:regen && git diff --exit-code -- src/types/generated"
   },
   "dependencies": {

@@ -70,13 +70,12 @@ mod mission_config_cli;
 mod coder_phase;
 // (#2112) Power-posture pre-flight — battery/Low-Power-Mode warnings + the
 // serious/critical-thermal refusal, called once from each long-mission
-// entry point (`mission_launch::launch`, `crawl_launch::launch`).
+// entry point (`mission_launch::launch`).
 mod preflight;
 // `darkmux mission launch crawl` (#1959 packet 2) — the crawl launcher,
 // a dedicated launcher alongside mission_launch_review for the same
 // reason: it needs execution shape the generic mission_config::interpret
 // + scheduler path has no seam for. See its own module doc.
-mod crawl_launch;
 mod mission_launch;
 mod mission_launch_review;
 // (#2131) The shared SIGINT/SIGTERM/SIGHUP-aware finalize guard + child

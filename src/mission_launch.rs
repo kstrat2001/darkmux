@@ -375,18 +375,14 @@ pub fn launch(
     darkmux_types::dispatch_liveness::liveness("process-start");
     fleet::validate_identifier("config_id", config_id)?;
 
-    // (#1959 packet 2) `crawl` has NO `mission-configs/crawl.json` to load
-    // structurally against — its Task/Step graph is computed at run time
-    // from a resolved crawl plan, not declared ahead of time in a JSON
-    // document (see `crawl_launch`'s module doc). Routed by literal id,
-    // BEFORE `mission_config::load` below (which would otherwise fail —
-    // there is no such config to find), the same way `review` was
-    // literal-id-routed before #1538 made it structural: there is exactly
-    // one crawl entry point today, so there is nothing to route
-    // structurally ON.
-    if config_id == "crawl" {
-        return crate::crawl_launch::launch(input_file, params, timeout_seconds);
-    }
+    // (#2301) `crawl` used to be routed by literal id to a bespoke
+    // launcher, BEFORE the config load below, because its Task/Step graph
+    // was computed at run time and there was no document to execute. There
+    // is one now: `crawl.json` declares a `crawl.plan` task per rule, grows
+    // a `crawl.unit` task per planned unit from each plan's output (#2300),
+    // and closes with a `crawl.summary`. Nothing about a crawl needs a
+    // launcher of its own any more, so it takes this path like every other
+    // config and `src/crawl_launch.rs` is gone.
 
     let loaded = mission_config::load(config_id).with_context(|| {
         format!(
@@ -530,8 +526,18 @@ pub fn launch(
     // plus the `graph-report.json` written beside it; the PRUNED document is
     // what every step below mints from. No CLI override by design — edit the
     // JSON and run.
+    // (#2301) `--param rules=<csv>` is the operator's PER-LAUNCH selection,
+    // pruned by the same mechanism with its own reason (`not_selected`), so
+    // the graph a run shows is exactly the rules that will run — see
+    // [`rule_selection`].
+    let selection = rule_selection(&collected);
     let config_as_declared: &MissionConfig = &config_owned;
-    let (config_pruned, prune_report) = mission_config::prune::prune_disabled(config_as_declared);
+    let (config_pruned, prune_report) = match &selection {
+        Some(wanted) => mission_config::prune::prune_with_selection(config_as_declared, &|task| {
+            task_declares_rule(task).is_none_or(|rule| wanted.contains(rule))
+        }),
+        None => mission_config::prune::prune_disabled(config_as_declared),
+    };
     let config: &MissionConfig = &config_pruned;
 
     // (#1284 review round 1, consider 11) A config whose graph uses the
@@ -573,7 +579,7 @@ pub fn launch(
     // (#2131 review round 4, F2) SIGINT + SIGTERM + SIGHUP — this launcher
     // (generic graphs + coder-phase) previously installed no signal
     // handling at all, the gap #2124 fixed for `mission_launch_review.rs`
-    // and #1959 fixed (SIGINT only) for `crawl_launch.rs`. Installed HERE
+    // and #1959 fixed (SIGINT only) for the retired crawl launcher. Installed HERE
     // — ahead of `mint_run_id` below, matching `mission_launch_review.rs`'s
     // `run_dispatch`, which arms before ITS mint too — not merely ahead of
     // the config-snapshot write / interpret / freeform-mint /
@@ -695,12 +701,11 @@ pub fn launch(
             eprintln!("{}", style::dim(&format!("mission launch: task persist warning: {e:#}")));
         }
     }
-    // (#2300) The phase record names the tasks it owns. `crawl_launch.rs`
-    // has always written this (it builds `task_ids` per group and saves the
-    // phase); the generic launcher never did, so the field meant different
-    // things depending on which launcher minted the run. It means the same
-    // thing on both now — which is a precondition for #2301 folding crawl
-    // onto this path. Growth appends to it at the phase boundary.
+    // (#2300) The phase record names the tasks it owns. The generic
+    // launcher never wrote it, so the field used to mean different things
+    // depending on which launcher minted the run — the precondition #2301
+    // needed before folding crawl onto this path (done; the crawl launcher
+    // is gone). Growth appends to it at the phase boundary.
     for phase in &config.phases {
         let Some(real_phase_id) = real_phase_ids.get(&phase.id) else { continue };
         let ids: Vec<String> = tasks
@@ -1168,7 +1173,7 @@ pub fn launch(
                         "phase": event.phase,
                         "task_template": event.task_template,
                         "from": event.from,
-                        "source_path": event.source_path,
+                        "source": event.source,
                         "items": event.items,
                         "minted": event.minted,
                     });
@@ -1202,7 +1207,7 @@ pub fn launch(
                     // The mint already wrote this phase's declared task ids
                     // (see `write_phase_task_ids` at the mint), so growth
                     // APPENDS — the field then reads the same on this
-                    // launcher as it already does on `crawl_launch.rs`,
+                    // launcher as it did on the retired crawl launcher,
                     // which builds `task_ids` per group and saves the phase
                     // (the one launcher that has always written it). #2301
                     // folds the two into one path; the field has to mean
@@ -1482,8 +1487,12 @@ pub fn launch(
     // phase/mission status (Packet 2's own doctrine for gate-free work).
     let envelope = build_envelope(&mission_id, config, &real_phase_ids, &tasks, &steps);
     let status = envelope.status;
+    // (#2301) A run's own numbers ride the `mission close` payload — the
+    // home the retired crawl launcher used, kept for every generic graph
+    // that ends in a summarizing step. See [`run_summary_payload`].
+    let close_payload = run_summary_payload(config, &real_phase_ids, &tasks, &steps);
     // (#2131) Disarms `guard` — the third and last known terminal point.
-    guard.close(|| crew::envelope::finalize_mission(&envelope));
+    guard.close(|| crew::envelope::finalize_mission_with_payload(&envelope, close_payload));
 
     print_run_summary(&mission_id, &steps);
 
@@ -1628,7 +1637,7 @@ fn grow_phase(
                 last_step.status
             );
         }
-        let source_path = last_step
+        let from_output = last_step
             .output
             .as_deref()
             .map(str::trim)
@@ -1643,24 +1652,23 @@ fn grow_phase(
             })?
             .to_string();
 
-        let raw = std::fs::read_to_string(&source_path).with_context(|| {
+        // (#2301) A producing step's output is inline JSON, a `ref`
+        // naming a file, or a bare path — `resolve_output_doc` reads all
+        // three, and `items_from_artifact` looks inside a typed envelope's
+        // `body` when it finds one.
+        let (doc, whence) = crew::step_output::resolve_output_doc(&from_output).with_context(|| {
             format!(
- "mission launch: task `{}` grows from `{}`, whose output names `{source_path}` — a producing step's \
-  output must be a readable path to a JSON file",
+ "mission launch: task `{}` grows from `{}`, whose output names `{from_output}`",
                 task_cfg.id, spec.from
             )
         })?;
-        let doc: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
-            format!(
- "mission launch: task `{}` grows from `{}`, whose output names `{source_path}`, which is not valid \
-  JSON",
-                task_cfg.id, spec.from
-            )
-        })?;
-        let items = crew::mission_config::items_from_artifact(&doc, &spec.items, &source_path)
+        let items = crew::mission_config::items_from_artifact(&doc, &spec.items, &whence)
             .with_context(|| format!("mission launch: growing task `{}`", task_cfg.id))?;
 
-        let growth = crew::mission_config::grow_task(task_cfg, spec, items)
+        // `{{from.output}}` renders the producer's output VERBATIM — a
+        // consumer reads it through `Output::read`, which takes a `ref`, a
+        // bare path or inline JSON alike.
+        let growth = crew::mission_config::grow_task(task_cfg, spec, items, &from_output)
             .with_context(|| format!("mission launch: growing task `{}`", task_cfg.id))?;
         let (grown_tasks, grown_steps) = mission_config::interpret::interpret_grown(
             &growth.tasks,
@@ -1687,7 +1695,9 @@ fn grow_phase(
                 phase: real_phase_id.to_string(),
                 task_template: task_cfg.id.clone(),
                 from: spec.from.clone(),
-                source_path,
+                // (#2301) The RESOLVED name, not the raw output string —
+                // a wrapped producer's output is a `{"ref": …}` pointer.
+                source: whence,
                 items: items.len(),
                 minted: grown_tasks.iter().map(|t| t.id.clone()).collect(),
             },
@@ -1703,8 +1713,9 @@ fn grow_phase(
 /// Warn-and-continue, never fatal: `task_ids` is a rendering convenience
 /// (`mission status`, the graph lens), and every Task record on disk
 /// already carries its own `phase_id`, so a failed write costs a nicety,
-/// not correctness. Mirrors `crawl_launch.rs`'s `phase.task_ids = ...;
-/// save_phase(&phase)` — the one launcher that has always written it.
+/// not correctness. #2300 added this so the field meant the same thing on
+/// the generic path as on the crawl launcher, which had always written it;
+/// #2301 retired that launcher, so this is now the only writer.
 fn write_phase_task_ids(mission_id: &str, phase_id: &str, ids: Vec<String>) {
     let result = load_phase_for_brief(mission_id, phase_id).and_then(|mut phase| {
         phase.task_ids = ids;
@@ -2128,6 +2139,111 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
 /// even when the operator launched into a non-default location," which the
 /// id gate silently broke for every config not literally named
 /// `coder-phase`. Same treatment review's own id gate got in #1538.
+/// (#2301) The LAST phase's last step output, when it is a JSON OBJECT —
+/// the run's own summary, promoted to the `mission close` record's
+/// payload.
+///
+/// Deliberately positional rather than keyed on a step KIND: the rule a
+/// config author can rely on is "end your graph with a step that outputs
+/// your run's summary", which composes with any kind. A last step that
+/// outputs nothing, or outputs something that is not a JSON object (a
+/// path, a branch name, a shell command's stdout), contributes no payload
+/// — exactly the pre-#2301 behavior for every config that has one.
+fn run_summary_payload(
+    config: &MissionConfig,
+    real_phase_ids: &BTreeMap<String, String>,
+    tasks: &[crew::types::Task],
+    steps: &BTreeMap<String, Step>,
+) -> Option<serde_json::Value> {
+    let last_phase = config.phases.last()?;
+    let real_phase_id = real_phase_ids.get(&last_phase.id)?;
+    let task = tasks.iter().rfind(|t| &t.phase_id == real_phase_id)?;
+    let step = steps.get(task.step_ids.last()?)?;
+    if step.status != crew::types::NodeStatus::Complete {
+        return None;
+    }
+    // (#2301) A typed output rides in a `step_output::Output` envelope;
+    // the payload readers want is the BODY, not the wrapper. An unwrapped
+    // object passes through as-is (the pre-wrapper shape).
+    match serde_json::from_str::<serde_json::Value>(step.output.as_deref()?.trim()) {
+        Ok(serde_json::Value::Object(mut o)) => match (o.contains_key("kind"), o.remove("body")) {
+            (true, Some(body @ serde_json::Value::Object(_))) => Some(body),
+            (true, _) => None,
+            (false, _) => Some(serde_json::Value::Object(o)),
+        },
+        _ => None,
+    }
+}
+
+/// (#2301) The rule id a task is FOR — the `rule` key on any of its step
+/// configs. A task with no such key (the crawl's own `summary`, and every
+/// task in every other config) belongs to no rule and is never deselected.
+fn task_declares_rule(task: &mission_config::TaskConfig) -> Option<&str> {
+    task.steps.iter().find_map(|s| s.config.get("rule").and_then(|v| v.as_str()))
+}
+
+/// (#2301) The set `--param rules=<csv>` names, or `None` when the operator
+/// named none (every enabled task runs). An explicitly EMPTY value selects
+/// nothing — the operator's own honest no-op, the same reading `--param
+/// limit=0` had — rather than silently meaning "all".
+fn rule_selection(
+    collected: &BTreeMap<String, serde_json::Value>,
+) -> Option<std::collections::BTreeSet<String>> {
+    let csv = collected.get("rules").and_then(|v| v.as_str())?;
+    Some(csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+}
+
+/// (#2301) The crawl's plan steps take their workspace + sizing knobs from
+/// `--param`, not from the document (which carries a `{{workspace}}`
+/// placeholder no interpreter substitutes). `step_config_overrides`
+/// REPLACES a step's whole config, so each override is the document's own
+/// config with the resolved values written over it — never a bare fragment
+/// that would drop the step's `rule`.
+fn crawl_plan_step_overrides(
+    config: &MissionConfig,
+    collected: &BTreeMap<String, serde_json::Value>,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut out = BTreeMap::new();
+    let Some(workspace) = collected.get("workspace").and_then(|v| v.as_str()) else {
+        return out;
+    };
+    let mut sizing = serde_json::Map::new();
+    for key in ["max_sites_per_unit", "max_est_tokens_per_unit"] {
+        if let Some(n) = collected.get(key).and_then(param_as_u64) {
+            sizing.insert(key.to_string(), serde_json::json!(n));
+        }
+    }
+    let no_fetch = bool_param(collected, "no_fetch");
+    for step in config
+        .phases
+        .iter()
+        .flat_map(|p| p.tasks.iter())
+        .flat_map(|t| t.steps.iter())
+        .filter(|s| s.kind == darkmux_lab::crawl::plan_step::CRAWL_PLAN_KIND)
+    {
+        let mut cfg = step.config.clone();
+        if !cfg.is_object() {
+            cfg = serde_json::json!({});
+        }
+        let obj = cfg.as_object_mut().expect("just forced to an object");
+        obj.insert("workspace".to_string(), serde_json::json!(workspace));
+        if !sizing.is_empty() {
+            obj.insert("sizing".to_string(), serde_json::Value::Object(sizing.clone()));
+        }
+        if no_fetch {
+            obj.insert("no_fetch".to_string(), serde_json::json!(true));
+        }
+        out.insert(step.id.clone(), cfg);
+    }
+    out
+}
+
+/// A `--param` integer: the CLI collects params as strings, so a number
+/// may arrive either typed or quoted.
+fn param_as_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+}
+
 fn build_launch_params(
     config: &MissionConfig,
     real_phase_ids: &BTreeMap<String, String>,
@@ -2169,7 +2285,7 @@ fn build_launch_params(
     LaunchParams {
         phase_ids: real_phase_ids.clone(),
         task_overrides,
-        step_config_overrides: BTreeMap::new(),
+        step_config_overrides: crawl_plan_step_overrides(config, collected),
     }
 }
 

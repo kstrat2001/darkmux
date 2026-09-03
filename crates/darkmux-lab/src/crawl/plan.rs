@@ -3,7 +3,7 @@
 //! rules) into a deterministic `Plan` of work units with token estimates.
 //! NO model dispatch happens here; this is the mechanical, free-to-compute
 //! half of the crawler (prefilters, globs, the npm range check) that the
-//! launcher's (`src/crawl_launch.rs`) dispatch loop consumes.
+//! `crawl.unit` step kind (`unit_step.rs`) consumes, one unit per step.
 
 use darkmux_crew::workspace_spec::{glob, Materialized, MaterializedSource};
 use darkmux_crew::rules::{Rule, RuleKind};
@@ -37,7 +37,7 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024;
 /// whichever first". These are the DEFAULTS `PlanParams::default()`
 /// resolves to; an operator overrides either via `--param
 /// max_sites_per_unit=`/`--param max_est_tokens_per_unit=` on `mission
-/// launch crawl` (#2190) — see `src/crawl_launch.rs`.
+/// launch crawl` (#2190) — see `crawl.json`'s own `inputs`.
 pub const MAX_SITES_PER_UNIT: usize = 40;
 pub const MAX_SITE_TOKENS_PER_UNIT: usize = 16_000;
 /// Edge units cap at 80 sites (spilling into more units beyond that).
@@ -67,6 +67,8 @@ impl Default for PlanParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Site {
     pub file: String,
     pub line: usize,
@@ -88,6 +90,8 @@ pub struct Site {
 /// contract specifies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(untagged)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub enum ReadFileEntry {
     Whole(String),
     Range { file: String, start: usize, end: usize },
@@ -98,6 +102,8 @@ pub enum ReadFileEntry {
 /// packet-1 plan.json contract exactly.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub enum Unit {
     Site {
         id: String,
@@ -162,6 +168,8 @@ impl Unit {
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct PlanSource {
     pub id: String,
     pub sha: String,
@@ -178,6 +186,8 @@ pub struct PlanSource {
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct SkippedEntry {
     pub reason: String,
     pub file: String,
@@ -189,6 +199,8 @@ pub struct SkippedEntry {
 /// unit — the ledger that shows an edge WAS checked even when its range
 /// admits the library version (or the check was inconclusive).
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct EdgeLedgerEntry {
     pub consumer: String,
     pub library: String,
@@ -205,6 +217,8 @@ pub struct EdgeLedgerEntry {
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, Default)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct RuleTotal {
     pub units: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,6 +238,8 @@ pub struct RuleTotal {
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, Default)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Totals {
     pub units: usize,
     pub est_tokens: usize,
@@ -240,6 +256,8 @@ pub struct Totals {
 /// matches the resolved tree before dispatching anything. No wire-format
 /// change — every field this crate already writes reads back unchanged.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Plan {
     pub schema_version: String,
     pub workspace: String,
@@ -262,6 +280,8 @@ pub struct Plan {
 
 /// (#2298) The serialized form of [`PlanParams`] a plan records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct PlanParamsRecord {
     pub max_sites_per_unit: usize,
     pub max_est_tokens_per_unit: usize,

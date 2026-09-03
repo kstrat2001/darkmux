@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// The host watchdog's structured-timeout marker prefix (#363), prepended
 /// to `stderr` when the inactivity timer fires. A public constant (rather
 /// than a literal duplicated at each detection call site) so any other
-/// consumer of a `DispatchResult` — `src/crawl_launch.rs`'s
+/// consumer of a `DispatchResult` — the crawl's `crawl.unit` step kind's
 /// `interpret_dispatch_result` is the first (#1959 merge-gate finding 9) —
 /// can detect the same event without re-deriving or hand-copying this
 /// string.
@@ -205,7 +205,7 @@ const RESUME_CHECKPOINT_CONTAINER_PATH: &str = "/darkmux-out/checkpoint.json";
 /// under a dispatch's `host_out` (see `RESUME_CHECKPOINT_CONTAINER_PATH`'s
 /// own doc for the container-side mount path). Named once here so
 /// `stage_resume_checkpoint` and its tests don't hand-duplicate the literal.
-/// `pub` (not `pub(crate)`) so `src/crawl_launch.rs`'s `--param resume=`
+/// `pub` (not `pub(crate)`) so the crawl's per-unit resume (#2303)
 /// planner — a different crate — can probe `<out_dir>/checkpoint.json`
 /// without re-typing the literal.
 pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";

@@ -29,6 +29,8 @@ dirs = "5.0"
 blake3 = "1.5"
 # Phase B (#45) — SQLite-backed derived index over crew manifests.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# (#2301) Optional, off by default — see the `ts-export` feature below.
+ts-rs = { version = "10", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -56,3 +58,12 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # other target sees either the crate or the frameworks.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[features]
+# (#2301) TypeScript export for the typed step-output structs — the drift
+# guard the viewer's generated types already are. Dev-only by construction:
+# `darkmux-serve`'s DEV-dependency enables it for `cargo test -p
+# darkmux-serve export_bindings --lib`, and cargo does not unify a dev-dep's
+# features into a normal dependency, so the release binary never pulls
+# `ts-rs` in.
+ts-export = ["dep:ts-rs"]

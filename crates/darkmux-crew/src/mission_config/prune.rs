@@ -10,8 +10,16 @@
 //! 4 minted" without drawing anything dead. There is deliberately no CLI
 //! override: edit the JSON and run.
 //!
-//! Three rules, applied in this order:
+//! Four rules, applied in this order:
 //!
+//! 0. **`not_selected`** (#2301) — a task the LAUNCHER deselected for this
+//!    run. `enabled: false` is the document's standing decision; this is
+//!    the operator's per-launch one (`--param rules=` on a crawl picks
+//!    which rules are planned at all). Both mean the same thing to
+//!    everything downstream — the task never exists in the run — so they
+//!    share one mechanism and differ only in the `reason` the report
+//!    records, which is what tells an operator whether to edit the JSON or
+//!    change the invocation.
 //! 1. **`disabled`** — a phase, task or step with `enabled: false` is pruned,
 //!    and everything under it is pruned with it (`parent_pruned`).
 //! 2. **`all_steps_pruned` / `all_tasks_pruned`** — a task whose steps were
@@ -97,10 +105,22 @@ impl PruneReport {
     }
 }
 
-/// Apply the three rules. Returns the pruned config (the one to mint from)
-/// and the report. A config with no `enabled: false` anywhere comes back
-/// equal to its input with an empty `pruned` list.
+/// Apply the rules with nothing deselected — `enabled: false` only.
 pub fn prune_disabled(config: &MissionConfig) -> (MissionConfig, PruneReport) {
+    prune_with_selection(config, &|_| true)
+}
+
+/// (#2301) Apply the rules, with `selected` deciding which tasks this
+/// LAUNCH wants. A task `selected` returns `false` for is pruned with
+/// reason `not_selected`, exactly as if the document had disabled it.
+///
+/// Returns the pruned config (the one to mint from) and the report. A
+/// config with nothing disabled and nothing deselected comes back equal to
+/// its input with an empty `pruned` list.
+pub fn prune_with_selection(
+    config: &MissionConfig,
+    selected: &dyn Fn(&TaskConfig) -> bool,
+) -> (MissionConfig, PruneReport) {
     let mut report = PruneReport {
         phases_in_config: config.phases.len(),
         tasks_in_config: config.phases.iter().map(|p| p.tasks.len()).sum(),
@@ -123,6 +143,10 @@ pub fn prune_disabled(config: &MissionConfig) -> (MissionConfig, PruneReport) {
         for task in &phase.tasks {
             if !task.is_enabled() {
                 prune_task_with_children(task, "disabled", &mut report, &mut pruned_tasks);
+                continue;
+            }
+            if !selected(task) {
+                prune_task_with_children(task, "not_selected", &mut report, &mut pruned_tasks);
                 continue;
             }
             let mut kept = task.clone();
@@ -388,5 +412,65 @@ mod tests {
         let back = serde_json::to_value(&cfg).unwrap();
         assert_eq!(back["phases"][0]["tasks"][0]["steps"][0]["enabled"], serde_json::json!(false));
         assert!(back["phases"][0]["tasks"][0]["steps"][1].get("enabled").is_none(), "absent stays absent");
+    }
+
+    /// (#2301) A per-launch deselection is the same mechanism as
+    /// `enabled: false`, with its own reason — and it cascades to the
+    /// dependents exactly the same way.
+    #[test]
+    fn a_deselected_task_is_pruned_as_not_selected_and_takes_its_dependents() {
+        let mut ruled = step("plan-a-step", None);
+        ruled.config = serde_json::json!({ "rule": "a" });
+        let mut ruled_b = step("plan-b-step", None);
+        ruled_b.config = serde_json::json!({ "rule": "b" });
+        let d = doc(vec![
+            phase(
+                "plan",
+                None,
+                vec![
+                    task("plan-a", &[], None, vec![ruled]),
+                    task("plan-b", &[], None, vec![ruled_b]),
+                ],
+            ),
+            phase(
+                "run",
+                None,
+                vec![
+                    task("unit-a", &["plan-a"], None, vec![step("unit-a-step", None)]),
+                    task("unit-b", &["plan-b"], None, vec![step("unit-b-step", None)]),
+                ],
+            ),
+        ]);
+        let wanted = |t: &TaskConfig| {
+            t.steps
+                .iter()
+                .find_map(|s| s.config.get("rule").and_then(|v| v.as_str()))
+                .is_none_or(|r| r == "a")
+        };
+        let (pruned, report) = prune_with_selection(&d, &wanted);
+
+        let live: Vec<&str> =
+            pruned.phases.iter().flat_map(|p| p.tasks.iter()).map(|t| t.id.as_str()).collect();
+        assert_eq!(live, vec!["plan-a", "unit-a"], "only the selected rule's track survives");
+        let reason = |id: &str| {
+            report.pruned.iter().find(|p| p.id == id).map(|p| p.reason.clone()).unwrap_or_default()
+        };
+        assert_eq!(reason("plan-b"), "not_selected", "the deselected task names WHY");
+        assert_eq!(reason("unit-b"), "all_dependencies_pruned", "its dependent goes with it");
+        assert_eq!(report.tasks_minted, 2);
+    }
+
+    /// Nothing deselected is byte-identical to `prune_disabled`.
+    #[test]
+    fn selecting_everything_prunes_exactly_what_enabled_false_alone_would() {
+        let d = doc(vec![phase(
+            "p",
+            None,
+            vec![
+                task("t1", &[], None, vec![step("s1", None)]),
+                task("t2", &[], Some(false), vec![step("s2", None)]),
+            ],
+        )]);
+        assert_eq!(prune_with_selection(&d, &|_| true), prune_disabled(&d));
     }
 }
