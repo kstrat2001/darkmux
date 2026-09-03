@@ -108,6 +108,17 @@ pub(crate) enum Cmd {
         /// `docker run` argv either. Conflicts with the positional MESSAGE.
         #[arg(long = "message-from-file", value_name = "PATH", conflicts_with = "message")]
         message_from_file: Option<std::path::PathBuf>,
+        /// (#2265) Append a stored finding's record to the brief — repeatable.
+        /// The finding is the WHAT (something an earlier dispatch observed);
+        /// this hands the role that observation VERBATIM, so it can propose the
+        /// HOW. Its `context` and `emitted` go in whole and unsummarized, and
+        /// the block tells the model to record any change it produces with
+        /// `create_mod`, naming this key in `for` (its palette decides whether
+        /// it may). A key with no stored finding is refused loudly rather than
+        /// dispatched with a silently missing brief — `darkmux finding sync`
+        /// replays the flow stream into the store.
+        #[arg(long = "finding", value_name = "KEY")]
+        finding: Vec<String>,
         /// (#1054) Select a named profile from the machine's registry for this
         /// dispatch's model + context-window resolution, instead of the
         /// registry's `default_profile`. When the named profile isn't defined

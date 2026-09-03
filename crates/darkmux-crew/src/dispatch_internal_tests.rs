@@ -899,6 +899,7 @@
             false,
             None,
             None,
+            &[],
         );
 
         // The wiring itself: this key would be ABSENT entirely if the
@@ -942,6 +943,7 @@
             true,
             None,
             None,
+            &[],
         );
         assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
         assert_eq!(payload["turn_delay_ms"], serde_json::json!(0), "the top-level stamp is also forced");
@@ -4574,6 +4576,305 @@
                 ("DARKMUX_FLOWS_DIR", prev_flows),
                 ("DARKMUX_FINDINGS_DIR", prev_store),
                 ("DARKMUX_MACHINE_ID", prev_machine),
+                ("DARKMUX_REDIS_URL", prev_redis),
+            ] {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+
+    /// Point the two record stores (and the flow sink) at tempdirs for a mod
+    /// test, returning what to put back.
+    fn mod_test_env(
+        flows: &std::path::Path,
+        mods: &std::path::Path,
+        findings: &std::path::Path,
+    ) -> Vec<(&'static str, Option<String>)> {
+        let prev: Vec<(&'static str, Option<String>)> = [
+            "DARKMUX_FLOWS_DIR",
+            "DARKMUX_MODS_DIR",
+            "DARKMUX_FINDINGS_DIR",
+            "DARKMUX_REDIS_URL",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows);
+            std::env::set_var("DARKMUX_MODS_DIR", mods);
+            std::env::set_var("DARKMUX_FINDINGS_DIR", findings);
+        }
+        prev
+    }
+
+    fn restore_env(prev: Vec<(&'static str, Option<String>)>) {
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// (#2265 review, CRITICAL 1) The host reads the SAME wire shape the
+    /// runtime writes. The fixture is produced-and-asserted on the runtime
+    /// side (`the_emission_carries_resolved_attachments_in_the_shape_the_host_
+    /// reads`) and consumed here: two hand-written fixtures on either side of
+    /// this boundary is exactly how the attachment break hid — the runtime
+    /// emitted the model's path strings, the host read `{path, bytes}`, and
+    /// each side's own test agreed with it.
+    #[test]
+    #[serial]
+    fn the_host_records_the_wire_shape_the_runtime_actually_emits() {
+        let tmp = TempDir::new().unwrap();
+        let mods_store = tmp.path().join("mods");
+        let prev = mod_test_env(tmp.path(), &mods_store, &tmp.path().join("findings"));
+
+        let fx: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/create_mod_wire.json"),
+            )
+            .expect("the wire fixture"),
+        )
+        .unwrap();
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-wire".into(),
+            "coder".into(),
+            "m".into(),
+        );
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_mod",
+                "args": "{}", "result": "Recorded mod 1.", "ok": true,
+                "emitted": fx["emitted"], "emit_seq": 1,
+            })
+            .to_string(),
+        );
+
+        let all = crate::mods::load_all_at(&mods_store).unwrap();
+        assert_eq!(all.len(), 1, "the runtime's own emission must produce a record: {all:?}");
+        let rec = &all[0];
+        assert_eq!(rec.kit.as_deref(), Some(fx["args"]["kit"].as_str().unwrap()));
+        let name = std::path::Path::new(fx["attachment"]["path"].as_str().unwrap())
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(rec.attachments, vec![name.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(
+                crate::mods::attachments_dir_at(&mods_store, &rec.key).join(&name)
+            )
+            .unwrap(),
+            fx["attachment"]["content"].as_str().unwrap(),
+            "the attachment decodes to the bytes the container read"
+        );
+        assert!(rec.warnings.is_empty(), "a clean emission warns about nothing: {rec:?}");
+        restore_env(prev);
+    }
+
+    /// (#2265 review, CRITICAL 3) A bad PART never costs the kit. The kit is
+    /// the product of the dispatch; a malformed attachment or an unaddressable
+    /// `for` key drops that part, says so in the record, and the mod survives.
+    #[test]
+    #[serial]
+    fn a_malformed_part_is_dropped_with_a_warning_and_the_kit_is_still_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let mods_store = tmp.path().join("mods");
+        let prev = mod_test_env(tmp.path(), &mods_store, &tmp.path().join("findings"));
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-partial".into(),
+            "coder".into(),
+            "m".into(),
+        );
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_mod",
+                "args": "{}", "result": "Recorded mod 1.", "ok": true,
+                "emit_seq": 1,
+                "emitted": {
+                    "for": ["sess-ok/1", "sess/extra/1", 7],
+                    "kit": "the change nobody may lose",
+                    "attach": [
+                        {"path": "good.txt", "bytes": "aGk="},
+                        {"path": "no-bytes.txt"},
+                        {"path": "bad.txt", "bytes": "not base64!"},
+                        {"path": "dir/good.txt", "bytes": "aGk="}
+                    ]
+                },
+            })
+            .to_string(),
+        );
+
+        let all = crate::mods::load_all_at(&mods_store).unwrap();
+        assert_eq!(all.len(), 1, "the mod is written despite the bad parts: {all:?}");
+        let rec = &all[0];
+        assert_eq!(rec.kit.as_deref(), Some("the change nobody may lose"));
+        assert_eq!(rec.r#for, vec!["sess-ok/1".to_string()], "only the addressable key survives");
+        assert_eq!(rec.attachments, vec!["good.txt".to_string()], "only the decodable one");
+        assert_eq!(rec.warnings.len(), 5, "one per dropped part: {:?}", rec.warnings);
+        let joined = rec.warnings.join(" | ");
+        for expected in ["sess/extra/1", "not a string", "no-bytes.txt", "bad.txt", "dir/good.txt"] {
+            assert!(joined.contains(expected), "{expected} must be named: {joined}");
+        }
+        restore_env(prev);
+    }
+
+    /// (#2265) `dispatch --finding <key>` records WHICH observations the
+    /// dispatch was briefed on. The brief itself is capped on the record, and
+    /// a key is the address the finding store answers to — so the keys are
+    /// their own field, not something a reader has to recover from `prompt`.
+    #[test]
+    fn the_dispatch_start_payload_names_the_findings_that_were_briefed() {
+        let keys = vec!["sess-a/1".to_string(), "sess-b/2".to_string()];
+        let with = dispatch_start_payload_json(
+            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, &keys,
+        );
+        assert_eq!(with["findings_in_brief"], serde_json::json!(["sess-a/1", "sess-b/2"]));
+        // Every other dispatch carries the field EMPTY rather than absent — an
+        // absent key would be indistinguishable from an older writer's record.
+        let without = dispatch_start_payload_json(
+            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, &[],
+        );
+        assert_eq!(without["findings_in_brief"], serde_json::json!([]));
+    }
+
+    /// (#2265) The mod channel's host half: an accepted `create_mod` call's
+    /// emission becomes a stored mod record, with the dispatch as its
+    /// proposer, canonical `for` keys, the kit byte-exact, each attachment
+    /// decoded back to the bytes the container read, and the named finding's
+    /// provenance copied off the store.
+    #[test]
+    #[serial] // reaches emit() + both stores; every env dir is a tempdir
+    fn an_accepted_create_mod_call_materializes_a_mod_record() {
+        let tmp = TempDir::new().unwrap();
+        let mods_store = tmp.path().join("mods");
+        let findings_store = tmp.path().join("findings");
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        let prev_findings = std::env::var("DARKMUX_FINDINGS_DIR").ok();
+        let prev_mods = std::env::var("DARKMUX_MODS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+            std::env::set_var("DARKMUX_FINDINGS_DIR", &findings_store);
+            std::env::set_var("DARKMUX_MODS_DIR", &mods_store);
+        }
+
+        // A finding already in the store, so the mod has real provenance to
+        // copy — the whole reason a reader of a mod never has to go find one.
+        let planted = crate::findings::build_record(
+            "sess-crawl",
+            3,
+            "2026-09-03T00:00:00Z".into(),
+            "create_finding",
+            crate::findings::Proposer {
+                handle: "crawler".into(),
+                model: "darkmux:qwen3.6".into(),
+                machine_id: None,
+            },
+            crate::findings::Scope {
+                mission_id: Some("crawl-1".into()),
+                phase_id: None,
+                step_id: None,
+            },
+            Some(serde_json::json!({"unit": "u7"})),
+            serde_json::json!({"file": "src/x.ts", "line": 82}),
+        );
+        crate::findings::materialize(&findings_store, &planted).unwrap();
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-mod".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.mission_id = Some("crawl-1".into());
+        state.phase_id = Some("crawl-1-fix".into());
+        state.step_id = Some("step-2".into());
+
+        // `-a\n+b\n` — the bytes the container read, base64 as the emission
+        // carries them.
+        let emitted = serde_json::json!({
+            "for": ["sess-crawl/03"],
+            "kit": "{\"n\": 12345678901234567890}",
+            "attach": [{"path": "src/patch.diff", "bytes": "LWEKK2IK"}],
+        });
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_mod",
+                "args": "{}", "result": "Recorded mod 1.", "ok": true,
+                "emitted": emitted, "emit_seq": 1,
+            })
+            .to_string(),
+        );
+
+        let all = crate::mods::load_all_at(&mods_store).unwrap();
+        assert_eq!(all.len(), 1, "one accepted create_mod → one record: {all:?}");
+        let rec = &all[0];
+        assert_eq!(
+            rec.by, "coder (darkmux:qwen3.6)",
+            "the proposer is the dispatch's own role and model"
+        );
+        assert_eq!(rec.r#for, vec!["sess-crawl/3".to_string()], "`for` is canonicalized");
+        assert_eq!(
+            rec.kit.as_deref(),
+            Some("{\"n\": 12345678901234567890}"),
+            "the kit is stored byte-exact, never parsed and re-serialized"
+        );
+        assert_eq!(rec.mission_id.as_deref(), Some("crawl-1"));
+        assert_eq!(rec.phase_id.as_deref(), Some("crawl-1-fix"));
+        assert_eq!(rec.step_id.as_deref(), Some("step-2"));
+        assert_eq!(rec.attachments, vec!["patch.diff".to_string()]);
+        assert_eq!(
+            std::fs::read(
+                crate::mods::attachments_dir_at(&mods_store, &rec.key).join("patch.diff")
+            )
+            .unwrap(),
+            b"-a\n+b\n",
+            "the attachment is decoded byte-identical"
+        );
+        assert_eq!(
+            rec.context.findings[0].emitted,
+            Some(serde_json::json!({"file": "src/x.ts", "line": 82})),
+            "the named finding's own emission is copied onto the mod: {rec:?}"
+        );
+        assert_eq!(rec.context.findings[0].mission_id.as_deref(), Some("crawl-1"));
+
+        // A REFUSED call (`ok: false`), a non-emitting call, and another
+        // tool's accepted call each make no record.
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":1,"tool_name":"create_mod","args":"{}","result":"NOT RECORDED — `kit` is required","ok":false,"emitted":{"kit":"x"},"emit_seq":2}"#,
+        );
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":2,"tool_name":"create_mod","args":"{}","result":"r","ok":true,"emitted":null,"emit_seq":3}"#,
+        );
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":3,"tool_name":"write","args":"{}","result":"r","ok":true,"emitted":{"kit":"x"},"emit_seq":4}"#,
+        );
+        assert_eq!(
+            crate::mods::load_all_at(&mods_store).unwrap().len(),
+            1,
+            "only the accepted create_mod call made a record"
+        );
+
+        unsafe {
+            for (k, v) in [
+                ("DARKMUX_FLOWS_DIR", prev_flows),
+                ("DARKMUX_FINDINGS_DIR", prev_findings),
+                ("DARKMUX_MODS_DIR", prev_mods),
                 ("DARKMUX_REDIS_URL", prev_redis),
             ] {
                 match v {
@@ -8977,6 +9278,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             false,
             None,
             None,
+            &[],
         );
         assert!(none["tools_requested"].is_null(), "{}", none);
         let names = vec!["read".to_string(), "search".to_string(), "bash".to_string(), "create_finding".to_string()];
@@ -8988,6 +9290,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             false,
             None,
             Some(&names),
+            &[],
         );
         assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "create_finding"]));
     }

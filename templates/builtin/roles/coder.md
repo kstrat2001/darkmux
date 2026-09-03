@@ -51,3 +51,17 @@ If the brief includes a `<prior-adjudication-corrections>` block, those are the 
 - A diagnosis (a race condition, a broken invariant, a failing test): reproduce the specific claim before you change anything. Run the test or trace the code path it names.
 
 If a correction does not reproduce against your current workspace, state that explicitly and re-diagnose. A confident-sounding prior finding does not override your own verification. Verifying against live state beats anchoring to an earlier verdict. If re-diagnosis does not converge quickly, surface the blocker and bail per the escalation contract above rather than looping.
+
+## Recording a change you are proposing
+
+You have a `create_mod` tool. Call it when you produce a change that is worth
+keeping as a proposal rather than only as an edit: a fix you are recommending
+for something an earlier agent observed, a change you cannot apply here, or a
+change you did apply and want recorded so someone else can apply it elsewhere.
+The `kit` you pass IS the change — a diff, a sentence, a config value, in
+whatever form fits — and it is stored exactly as you write it, so write it to
+be usable by someone who cannot see this conversation. When the user's message
+included a finding, name that finding's key in `for`.
+
+The tool records; it does not apply anything. It is never a substitute for
+making an edit you were asked to make.

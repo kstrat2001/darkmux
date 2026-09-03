@@ -1680,6 +1680,169 @@ fn dispatch_message_source_contract() {
         );
 }
 
+/// (#2265) `dispatch --finding <key>` refuses a key that addresses no stored
+/// finding, BEFORE any dispatch setup — a silently missing brief would send
+/// the role to work on an observation it never saw. The refusal names the
+/// second producer that can fill the store.
+#[test]
+fn dispatch_finding_refuses_a_key_with_no_stored_record() {
+    let store = TempDir::new().unwrap(); // empty store
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FINDINGS_DIR", store.path())
+        .args(["dispatch", "health-research", "--finding", "sess-x/9", "smoke"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("no finding sess-x/9")
+                .and(predicate::str::contains("darkmux finding sync"))
+                // Refused ahead of the dispatch: the ACK gate never ran, and
+                // nothing reached docker.
+                .and(predicate::str::contains("requires operator acknowledgment").not())
+                .and(predicate::str::contains("docker").not()),
+        );
+
+    // A key of the wrong SHAPE is refused with the form it should have.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FINDINGS_DIR", store.path())
+        .args(["dispatch", "health-research", "--finding", "not-a-key", "smoke"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<dispatch>/<seq>"));
+}
+
+/// (#2265) A key that DOES address a stored finding is loaded and the dispatch
+/// proceeds — proven at the ACK gate, which bails before any Docker work.
+/// `--finding` is repeatable, and both keys resolve.
+#[test]
+fn dispatch_finding_loads_a_stored_record_and_proceeds() {
+    let store = TempDir::new().unwrap();
+    for (dispatch, seq) in [("sess-x", 1u64), ("sess-y", 2)] {
+        let dir = store.path().join(dispatch).join(seq.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            serde_json::json!({
+                "key": format!("{dispatch}/{seq}"),
+                "dispatch": dispatch,
+                "seq": seq,
+                "ts": "2026-09-03T00:00:00Z",
+                "tool_name": "create_finding",
+                "proposer": {"handle": "crawler", "model": "m"},
+                "context": {"unit": "u7"},
+                "emitted": {"file": "src/x.ts", "line": 82, "why": "three unnamed operands"},
+                "schema_version": "1"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let ack_dir = TempDir::new().unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FINDINGS_DIR", store.path())
+        .env("DARKMUX_ACK_DIR", ack_dir.path())
+        .args([
+            "dispatch", "health-research", "--finding", "sess-x/1", "--finding", "sess-y/2",
+            "smoke",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("requires operator acknowledgment")
+                .and(predicate::str::contains("no finding").not()),
+        );
+}
+
+/// (#2265 review, IMPORTANT 4 + CRITICAL 8) The END-TO-END pin for
+/// `--finding`, through the path a real `darkmux dispatch` takes: the CLI ->
+/// the crew-of-one graph (`dispatch_as_crew_of_one::build_graph`) -> the step
+/// kind -> `dispatch_internal`, with the assertions made on the `dispatch
+/// start` FLOW RECORD that dispatch actually wrote.
+///
+/// Both halves matter and neither was covered before. The earlier CLI tests
+/// asserted only that a good key reaches the ACK gate and a bad one is refused
+/// — nothing about the brief or the record — so the append could be deleted
+/// and they stayed green, and the crew-of-one graph could drop the keys (it
+/// did) with nothing to catch it. Here: `prompt_chars` must exceed the
+/// operator's own message, proving the finding block was appended, and
+/// `findings_in_brief` must name the key, proving the hand-off survived every
+/// hop.
+#[test]
+fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
+    let stub = RespondingStubServer::start();
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let findings = TempDir::new().unwrap();
+
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, responding_endpoint_profiles_json(stub.port)).unwrap();
+
+    // A finding in the store, with a distinctive marker the brief must carry.
+    let dir = findings.path().join("sess-pin").join("4");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("finding.json"),
+        serde_json::json!({
+            "key": "sess-pin/4", "dispatch": "sess-pin", "seq": 4,
+            "ts": "2026-09-03T00:00:00Z", "tool_name": "create_finding",
+            "proposer": {"handle": "crawler", "model": "m"},
+            "context": {"unit": "u7"},
+            "emitted": {"file": "src/x.ts", "line": 82, "why": "MARKER-three-unnamed-operands"},
+            "schema_version": "1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let message = "fix it";
+    // `review-judge` is TOOL-LESS, so this takes the light single-shot hosted
+    // path (a host `curl` to the stub) rather than a `darkmux-runtime`
+    // container — no Docker, no image, no model.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_FINDINGS_DIR", findings.path())
+        .env("DARKMUX_REDIS_URL", "")
+        .args(["dispatch", "review-judge", "--finding", "sess-pin/4", "--skip-preflight", message])
+        .assert()
+        .success();
+
+    let mut start: Option<serde_json::Value> = None;
+    for entry in fs::read_dir(flows.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        for line in fs::read_to_string(&path).unwrap().lines() {
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if rec["action"] == "dispatch start" {
+                start = Some(rec);
+            }
+        }
+    }
+    let start = start.expect("a `dispatch start` flow record");
+    let payload = &start["payload"];
+    assert_eq!(
+        payload["findings_in_brief"],
+        serde_json::json!(["sess-pin/4"]),
+        "the keys must survive the CLI -> crew-of-one -> step-kind hand-off: {start}"
+    );
+    let prompt_chars = payload["prompt_chars"].as_u64().expect("prompt_chars");
+    assert!(
+        prompt_chars > message.chars().count() as u64 + 200,
+        "the finding block must be IN the brief (prompt_chars {prompt_chars} is barely \
+         longer than the operator's own {} chars): {start}",
+        message.chars().count()
+    );
+    assert!(
+        payload["prompt"].as_str().unwrap_or_default().contains("MARKER-three-unnamed-operands"),
+        "the record's own prompt carries the finding's emission verbatim: {start}"
+    );
+}
+
 /// (#1426) The POSITIONAL message reaches the dispatch path. `health-research`
 /// is licensed-adjacent, so its ACK gate bails BEFORE any Docker work — a
 /// CI-safe way to prove the positional message was accepted and routed without
@@ -2203,6 +2366,67 @@ impl HangingStubServer {
     fn wait_for_a_connection_to_close(&self, timeout: std::time::Duration) -> bool {
         self.closed_rx.recv_timeout(timeout).is_ok()
     }
+}
+
+/// (#2265 review) A stub endpoint that ANSWERS — the counterpart to
+/// `HangingStubServer`, for tests that need a dispatch to run to completion
+/// and leave its flow records behind rather than to hang mid-probe. Replies
+/// to every request with one minimal chat completion. No model, no Docker: the
+/// role it serves is tool-less, so `dispatch_internal` takes the light
+/// single-shot hosted path (a plain host `curl`).
+struct RespondingStubServer {
+    port: u16,
+}
+
+impl RespondingStubServer {
+    fn start() -> Self {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("binding the stub listener");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    // Read the request head (and whatever body arrives with
+                    // it); curl waits for the response, so a bounded read is
+                    // enough — this is a stub, not an HTTP server.
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf);
+                    let body = serde_json::json!({
+                        "choices": [{ "message": { "content": "ack" } }],
+                        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                    })
+                    .to_string();
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = stream.flush();
+                });
+            }
+        });
+        Self { port }
+    }
+}
+
+fn responding_endpoint_profiles_json(port: u16) -> String {
+    format!(
+        r#"{{
+            "profiles": {{
+                "stub": {{
+                    "models": [
+                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{port}"}}}}
+                    ]
+                }}
+            }},
+            "default_profile": "stub"
+        }}"#
+    )
 }
 
 fn hanging_endpoint_profiles_json(port: u16) -> String {
@@ -4497,4 +4721,35 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
     assert!(stdout.contains(&key_b), "sess-b/2's own mod is listed: {stdout}");
     let out = dm(&["finding", "list", "--json"]);
     assert!(out.status.success(), "the finding verbs still read the store unchanged");
+}
+
+/// (#2265) A mod the host recorded PARTIALLY — a dropped attachment, an
+/// unaddressable `for` key — carries `warnings`. `mod show` must print them:
+/// the field exists so the record is honest about being partial, and a
+/// rendering that hides it makes the record look whole again.
+#[test]
+fn mod_show_prints_the_warnings_of_a_partial_mod() {
+    let home = TempDir::new().unwrap();
+    let dir = home.path().join("mods").join("mod-1788430000-abc123");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mod.json"),
+        r#"{"schema_version":"1","key":"mod-1788430000-abc123","ts":"2026-09-03T10:00:00Z","by":"coder (qwen)",
+            "for":["sess-a/1"],"kit":"apply mod.diff\n","attachments":[],
+            "warnings":["dropped attachment \"mod.diff\": no path/bytes pair"]}"#,
+    )
+    .unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mod", "show", "mod-1788430000-abc123"])
+        .output()
+        .expect("darkmux runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("warnings"), "a partial mod says so: {stdout}");
+    assert!(stdout.contains("dropped attachment \"mod.diff\""), "and names the part: {stdout}");
+    // The kit still ends the output byte-exact — the warnings print ABOVE it.
+    assert!(stdout.ends_with("apply mod.diff\n"), "got: {stdout:?}");
 }

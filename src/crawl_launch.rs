@@ -2026,6 +2026,7 @@ pub(crate) fn run(
 
         let message = build_message(&rules_by_id, unit)?;
         let opts = DispatchOpts {
+            findings_in_brief: Vec::new(),
             role_id: "crawler".to_string(),
             message,
             session_id: Some(session_id.clone()),

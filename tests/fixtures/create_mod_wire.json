@@ -1,0 +1,16 @@
+{
+  "_why": "(#2265 review) The create_mod WIRE SHAPE, checked in once and used by BOTH sides of the runtime->host boundary. The runtime's test asserts the value it PRODUCES equals `emitted` here; the host's test feeds `emitted` here to its reader and asserts the record it writes. Two hand-written fixtures on either side of a boundary is exactly how the first version's attachment-shape break hid: the runtime emitted the model's path STRINGS while the host read `{path, bytes}` objects, and every test agreed with its own side. Change this file and both tests move together, or one of them fails.",
+  "args": {
+    "for": ["sess-crawl/03"],
+    "kit": "{\"n\": 12345678901234567890}",
+    "attach": ["src/patch.diff"],
+    "extra_the_model_chose_to_add": {"confidence": 0.4}
+  },
+  "attachment": { "path": "src/patch.diff", "content": "-a\n+b\n" },
+  "emitted": {
+    "for": ["sess-crawl/03"],
+    "kit": "{\"n\": 12345678901234567890}",
+    "attach": [{"path": "src/patch.diff", "bytes": "LWEKK2IK"}],
+    "extra_the_model_chose_to_add": {"confidence": 0.4}
+  }
+}

@@ -97,6 +97,7 @@ tools! {
     Edit => "edit",
     Search => "search",
     CreateFinding => "create_finding",
+    CreateMod => "create_mod",
 }
 
 impl Tool {
@@ -195,6 +196,25 @@ impl Tool {
                  appears; a report whose evidence does not match that line is \
                  rejected and does not count. The return value tells you how many \
                  you have recorded and how many remain in this run's budget."
+            }
+            Tool::CreateMod => {
+                "Records ONE change you are proposing — a MOD — then lets you \
+                 keep working. A finding says WHAT was observed; a mod says HOW \
+                 it could change. \
+                 Arguments: { for?: [finding keys], kit: string, attach?: [paths] }. \
+                 `kit` is the change itself, as instructions and/or data, in \
+                 whatever form you choose: a diff, a sentence, a JSON value, a \
+                 config line. It is stored exactly as you write it and is never \
+                 parsed, so write it so that someone applying it later — with no \
+                 access to this conversation — has everything they need. When you \
+                 know which finding(s) this change addresses, name their keys in \
+                 `for` (the form `<dispatch>/<seq>`, e.g. `sess-abc/1`); a key of \
+                 any other shape is refused. `attach` copies files from the \
+                 workspace into the mod, for data a kit needs but cannot inline. \
+                 This tool RECORDS the change; it does not apply anything, and \
+                 recording a mod is not a substitute for making an edit you were \
+                 asked to make. The return value tells you how many you have \
+                 recorded."
             }
             Tool::Search => {
                 "FIRST CHOICE for locating text in a file or directory \
@@ -321,6 +341,26 @@ impl Tool {
                 },
                 "required": ["file", "line", "pattern", "evidence", "why"]
             }),
+            Tool::CreateMod => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "for": {
+                        "type": "array",
+                        "description": "Keys of the findings this change addresses, each of the form `<dispatch>/<seq>` (e.g. `sess-abc/1`). Omit or leave empty when you do not know of a finding this addresses.",
+                        "items": { "type": "string" }
+                    },
+                    "kit": {
+                        "type": "string",
+                        "description": "The change itself, as instructions and/or data — a diff, a sentence, a JSON value, a config line. Stored exactly as written and never parsed. Write it to be self-sufficient for whoever applies it later."
+                    },
+                    "attach": {
+                        "type": "array",
+                        "description": "Workspace-relative paths of files to copy into the mod, for data the kit needs but cannot inline. Each must be an existing file inside the workspace, and they may total at most 40960 bytes.",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["kit"]
+            }),
             Tool::Search => serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -399,6 +439,9 @@ impl Tool {
             Tool::Search => execute_search(raw_args, ws).map(ToolRun::text),
             Tool::CreateFinding => {
                 execute_create_finding(raw_args, &crate::trajectory::runtime_dir(), ws)
+            }
+            Tool::CreateMod => {
+                execute_create_mod(raw_args, &crate::trajectory::runtime_dir(), ws)
             }
         }
     }
@@ -1046,7 +1089,7 @@ mod tests {
     #[test]
     fn the_wire_name_set_is_exactly_this() {
         let names: Vec<&str> = super::Tool::ALL.iter().map(|t| t.name()).collect();
-        assert_eq!(names, ["echo", "bash", "read", "write", "edit", "search", "create_finding"]);
+        assert_eq!(names, ["echo", "bash", "read", "write", "edit", "search", "create_finding", "create_mod"]);
         // and no two variants share a wire name (a duplicate would also be an
         // unreachable-pattern error under -D warnings in from_name)
         let mut sorted = names.clone();
@@ -1243,6 +1286,319 @@ y = 2
         let r = execute_edit(&raw, ws.path()).unwrap();
         assert!(r.starts_with("NOT EDITED"), "{r}");
         assert_eq!(fs::read_to_string(ws.path().join("a.py")).unwrap(), "x = 1\ny = 2\nz = 3\n");
+    }
+
+    // ─── create_mod (#2265) ───────────────────────────────────────────────
+
+    fn mod_workspace() -> tempfile::TempDir {
+        let ws = fresh_workspace();
+        std::fs::create_dir_all(ws.path().join("src")).unwrap();
+        std::fs::write(ws.path().join("src/patch.diff"), b"--- a\n+++ b\n").unwrap();
+        ws
+    }
+
+    fn last_mod(out: &Path) -> serde_json::Value {
+        let body = std::fs::read_to_string(out.join(MODS_FILE)).expect("mods file");
+        let line = body.lines().rfind(|l| !l.trim().is_empty()).expect("a record");
+        serde_json::from_str(line).expect("valid json")
+    }
+
+    /// The accepted shape, whole: the emission is the model's arguments
+    /// untouched, the ordinal is the file's own line count (so it survives a
+    /// resume), and the recorded line carries the kit VERBATIM plus each
+    /// attachment's bytes.
+    #[test]
+    fn an_accepted_mod_records_a_line_and_returns_its_emission_verbatim() {
+        let ws = mod_workspace();
+        let out = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({
+            "for": ["sess-a/01", "sess-a/2"],
+            "kit": "replace the `!= null` with `is_some()` on line 82",
+            "attach": ["src/patch.diff"],
+            "extra_the_model_chose_to_add": {"confidence": 0.4},
+        })
+        .to_string();
+        let run = execute_create_mod(&raw, out.path(), ws.path()).unwrap();
+        assert!(run.result.starts_with("Recorded mod 1"), "{}", run.result);
+        let emitted = run.emitted.expect("an accepted mod returns its emission");
+        let mut expected: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // Verbatim EXCEPT `attach`, which becomes the resolved list the host
+        // reads — see `the_emission_carries_resolved_attachments_in_the_shape_
+        // the_host_reads` for why the model's path strings cannot ride.
+        expected["attach"] = serde_json::json!([
+            {"path": "src/patch.diff", "bytes": "LS0tIGEKKysrIGIK"}
+        ]);
+        assert_eq!(
+            emitted, expected,
+            "every key but `attach` is the model's own arguments, untouched"
+        );
+        assert_eq!(run.emit_seq, Some(1), "first accepted mod in this dispatch");
+
+        let rec = last_mod(out.path());
+        assert_eq!(rec["seq"], 1);
+        assert_eq!(rec["kit"], "replace the `!= null` with `is_some()` on line 82");
+        assert_eq!(rec["for"], serde_json::json!(["sess-a/01", "sess-a/2"]));
+        assert_eq!(rec["attach"][0]["path"], "src/patch.diff");
+        assert_eq!(
+            rec["attach"][0]["bytes"].as_str().unwrap(),
+            "LS0tIGEKKysrIGIK",
+            "the attachment's bytes are base64 of the file's content"
+        );
+        assert!(rec["ts"].as_i64().is_some(), "the record carries its own ts: {rec}");
+
+        let second = execute_create_mod(&raw, out.path(), ws.path()).unwrap();
+        assert_eq!(second.emit_seq, Some(2), "the ordinal is the mods-file count");
+    }
+
+    /// A mod with neither `for` nor `attach` is ordinary: the kit alone is a
+    /// complete mod, and a model that does not know the finding key must
+    /// still be able to record the change it made.
+    #[test]
+    fn a_kit_alone_is_a_complete_mod() {
+        let ws = mod_workspace();
+        let out = tempfile::tempdir().unwrap();
+        let run = execute_create_mod(
+            &serde_json::json!({"kit": "bump the timeout to 30s"}).to_string(),
+            out.path(),
+            ws.path(),
+        )
+        .unwrap();
+        assert!(run.result.starts_with("Recorded mod 1"), "{}", run.result);
+        let rec = last_mod(out.path());
+        assert_eq!(rec["for"], serde_json::json!([]));
+        assert_eq!(rec["attach"], serde_json::json!([]));
+    }
+
+    /// Every rejection: names what to fix, records nothing, counts nothing,
+    /// and emits nothing. A `for` key that could address no finding is
+    /// refused HERE — the host must only ever see addressable keys, and a
+    /// rejection the model can read is louder than a host-side stderr line
+    /// it never sees.
+    #[test]
+    fn a_mod_is_refused_for_an_empty_kit_an_unaddressable_for_key_or_a_bad_attachment() {
+        let ws = mod_workspace();
+        let out = tempfile::tempdir().unwrap();
+        let cases = [
+            (serde_json::json!({"kit": "   "}), "kit"),
+            (serde_json::json!({"for": ["not-a-key"], "kit": "k"}), "for"),
+            (serde_json::json!({"for": ["sess-a/x"], "kit": "k"}), "for"),
+            (serde_json::json!({"kit": "k", "attach": ["src/nope.diff"]}), "attach"),
+            (serde_json::json!({"kit": "k", "attach": ["../outside"]}), "attach"),
+            (serde_json::json!({"kit": "k", "attach": ["src"]}), "attach"),
+        ];
+        for (args, names) in cases {
+            let run = execute_create_mod(&args.to_string(), out.path(), ws.path()).unwrap();
+            assert!(
+                run.result.starts_with("NOT RECORDED"),
+                "{args} should be refused, got: {}",
+                run.result
+            );
+            assert!(
+                run.result.contains(names),
+                "the refusal must name what to fix ({names}): {}",
+                run.result
+            );
+            assert!(
+                run.emitted.is_none() && run.emit_seq.is_none(),
+                "a refused mod emits nothing"
+            );
+        }
+        assert!(
+            !out.path().join(MODS_FILE).exists(),
+            "a refused mod writes no line at all"
+        );
+
+        // Malformed arguments get a teaching response, never an Err — a tool
+        // that errors reads to a model as "this tool is broken".
+        let run = execute_create_mod("{not json", out.path(), ws.path()).unwrap();
+        assert!(run.result.starts_with("NOT RECORDED"), "{}", run.result);
+        assert!(run.result.contains("kit"), "the teaching response shows the shape: {}", run.result);
+    }
+
+    /// The attachment cap is a REFUSAL, not a truncation: half a file is not
+    /// the data the kit needs, and the emission rides a flow record.
+    #[test]
+    fn an_attachment_over_the_cap_is_refused_with_its_size() {
+        let ws = mod_workspace();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("big.bin"),
+            vec![7u8; (MAX_ATTACHMENT_TOTAL_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let run = execute_create_mod(
+            &serde_json::json!({"kit": "k", "attach": ["big.bin"]}).to_string(),
+            out.path(),
+            ws.path(),
+        )
+        .unwrap();
+        assert!(run.result.starts_with("NOT RECORDED"), "{}", run.result);
+        assert!(run.result.contains("big.bin"), "names the file that crossed it: {}", run.result);
+        assert!(
+            run.result.contains(&(MAX_ATTACHMENT_TOTAL_BYTES + 1).to_string())
+                && run.result.contains(&MAX_ATTACHMENT_TOTAL_BYTES.to_string()),
+            "names the size AND the budget: {}",
+            run.result
+        );
+        assert!(!out.path().join(MODS_FILE).exists(), "nothing recorded");
+    }
+
+    /// Binary content survives the round trip — an attachment is bytes, not
+    /// text, and a kit's data may be an image or a compiled artifact.
+    #[test]
+    fn an_attachment_is_encoded_as_bytes_not_text() {
+        let ws = mod_workspace();
+        let out = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        std::fs::write(ws.path().join("blob.bin"), &bytes).unwrap();
+        execute_create_mod(
+            &serde_json::json!({"kit": "k", "attach": ["blob.bin"]}).to_string(),
+            out.path(),
+            ws.path(),
+        )
+        .unwrap();
+        let rec = last_mod(out.path());
+        let encoded = rec["attach"][0]["bytes"].as_str().unwrap();
+        assert_eq!(b64_decode_for_test(encoded), bytes, "byte-identical after the round trip");
+    }
+
+    fn b64_decode_for_test(s: &str) -> Vec<u8> {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut acc: u32 = 0;
+        let mut bits = 0;
+        let mut out = Vec::new();
+        for c in s.bytes().filter(|c| *c != b'=') {
+            let v = A.iter().position(|a| *a == c).expect("base64 alphabet") as u32;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        out
+    }
+
+    /// The repo-root fixture both sides of the runtime->host boundary read.
+    /// Loaded at test RUNTIME (never `include_str!`), so the Docker image
+    /// build — which compiles this crate with no test targets and no repo
+    /// checkout above `runtime/` — is unaffected.
+    fn wire_fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/create_mod_wire.json");
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the wire fixture")).unwrap()
+    }
+
+    /// (#2265 review, CRITICAL 1) The emission is the model's arguments with
+    /// `attach` REPLACED by the resolved `[{path, bytes}]` list — the shape
+    /// the HOST reads. The first version emitted the model's path strings,
+    /// so an accepted mod WITH an attachment recorded nothing at all: the
+    /// host read `a["path"]`, found a string, and bailed. Both sides now
+    /// assert against this one fixture.
+    #[test]
+    fn the_emission_carries_resolved_attachments_in_the_shape_the_host_reads() {
+        let fx = wire_fixture();
+        let ws = fresh_workspace();
+        let rel = fx["attachment"]["path"].as_str().unwrap();
+        let path = ws.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, fx["attachment"]["content"].as_str().unwrap()).unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let run = execute_create_mod(&fx["args"].to_string(), out.path(), ws.path()).unwrap();
+        assert!(run.result.starts_with("Recorded mod 1"), "{}", run.result);
+        assert_eq!(
+            run.emitted.expect("an accepted mod emits"),
+            fx["emitted"],
+            "the emission must match the wire fixture the host's own test reads"
+        );
+    }
+
+    /// The two `for`-key predicates must agree, or a key the model is allowed
+    /// to send is a mod the host silently drops. One table, both crates.
+    #[test]
+    fn the_for_key_predicate_agrees_with_the_hosts_on_the_shared_table() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/finding_key_cases.json");
+        let fx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the key fixture")).unwrap();
+        for case in fx["cases"].as_array().unwrap() {
+            let key = case["key"].as_str().unwrap();
+            let valid = case["valid"].as_bool().unwrap();
+            assert_eq!(
+                finding_key_shape_ok(key),
+                valid,
+                "the runtime and the host must agree about {key:?}"
+            );
+        }
+    }
+
+    /// The attachment budget is TOTAL and sized so the emission stays under
+    /// the host's own 64 KiB bound: an emission cut in half loses the kit,
+    /// which is the whole product of the call.
+    #[test]
+    fn attachments_are_bounded_in_total_so_the_emission_never_truncates() {
+        let ws = mod_workspace();
+        let out = tempfile::tempdir().unwrap();
+        // Two files, each under any per-file limit, together over the budget.
+        let half = (MAX_ATTACHMENT_TOTAL_BYTES / 2) + 1024;
+        std::fs::write(ws.path().join("a.bin"), vec![1u8; half as usize]).unwrap();
+        std::fs::write(ws.path().join("b.bin"), vec![2u8; half as usize]).unwrap();
+        let run = execute_create_mod(
+            &serde_json::json!({"kit": "k", "attach": ["a.bin", "b.bin"]}).to_string(),
+            out.path(),
+            ws.path(),
+        )
+        .unwrap();
+        assert!(run.result.starts_with("NOT RECORDED"), "{}", run.result);
+        assert!(
+            run.result.contains(&MAX_ATTACHMENT_TOTAL_BYTES.to_string()),
+            "the refusal names the budget: {}",
+            run.result
+        );
+        assert!(!out.path().join(MODS_FILE).exists(), "nothing recorded");
+
+        // And the whole emission is bounded too, so a huge kit plus a legal
+        // attachment cannot push it past what the host will forward.
+        let big_kit = "x".repeat(MAX_EMISSION_BYTES + 10);
+        let run = execute_create_mod(
+            &serde_json::json!({"kit": big_kit}).to_string(),
+            out.path(),
+            ws.path(),
+        )
+        .unwrap();
+        assert!(run.result.starts_with("NOT RECORDED"), "{}", run.result);
+        assert!(run.result.contains("65536"), "names the bound: {}", run.result);
+    }
+
+    /// (#2265 review, NIT 7) `for` as a bare string is the near-miss a model
+    /// makes when it has exactly one finding. Accept it as a one-element
+    /// list rather than handing back a generic parse failure.
+    #[test]
+    fn a_single_for_key_may_be_a_bare_string() {
+        let ws = mod_workspace();
+        let out = tempfile::tempdir().unwrap();
+        let run = execute_create_mod(
+            &serde_json::json!({"for": "sess-a/1", "kit": "k"}).to_string(),
+            out.path(),
+            ws.path(),
+        )
+        .unwrap();
+        assert!(run.result.starts_with("Recorded mod 1"), "{}", run.result);
+        assert_eq!(last_mod(out.path())["for"], serde_json::json!(["sess-a/1"]));
+    }
+
+    /// `create_mod` is palette-named, exactly like `create_finding`: a role
+    /// that does not name it never sees it.
+    #[test]
+    fn create_mod_is_in_the_tool_list_and_is_not_a_general_catalog_tool() {
+        assert!(matches!(Tool::from_name("create_mod"), Some(Tool::CreateMod)));
+        let d = Tool::CreateMod.description();
+        assert!(d.contains("kit"), "the description names the kit: {d}");
+        let schema = Tool::CreateMod.parameters_schema();
+        assert_eq!(schema["required"], serde_json::json!(["kit"]));
+        assert!(schema["properties"]["for"].is_object());
+        assert!(schema["properties"]["attach"].is_object());
     }
 
     #[test]
@@ -2322,6 +2678,304 @@ fn execute_create_finding(
              Continue examining the scope; report the next one when you find it."
         ),
         emitted: verbatim,
+        emit_seq: Some(recorded),
+    })
+}
+
+// ─── create_mod ───────────────────────────────────────────────────────────
+//
+// (#2265) The MOD channel: how something could change, recorded from inside a
+// dispatch. Its sibling `create_finding` records WHAT was observed; this one
+// records the HOW, as a KIT — instructions and/or data in whatever form the
+// model chose, stored verbatim and never parsed.
+//
+// Same shape as the finding channel for the same reasons: a per-dispatch
+// append-only file beside the trajectory (so a killed run keeps every mod
+// already recorded, and the line count IS the ordinal), a model-facing
+// response that never returns `Err` (a tool that errors reads to a model as
+// "this tool is broken" and gets abandoned), and an `emitted` that rides the
+// `tool.completed` event so the host can materialize the durable record.
+
+/// The per-dispatch mod file, beside `findings.jsonl` in the runtime dir.
+pub const MODS_FILE: &str = "mods.jsonl";
+
+/// TOTAL raw bytes of attachments one mod may carry, before encoding.
+///
+/// **Sized against the HOST's emission bound, not against what a file system
+/// would tolerate.** The emission rides a `dispatch.tool` flow record, which
+/// `bound_emitted` cuts at 64 KiB — and a cut emission has no `kit` at all, so
+/// an over-large attachment would silently cost the model the entire product
+/// of its call. Base64 costs 4 bytes per 3, so 40 KiB raw is ~54.6 KiB
+/// encoded and leaves room for the kit and the JSON around it. The first
+/// version's 1 MiB per-file ceiling was ~20x past the point where the record
+/// stopped carrying the kit.
+///
+/// A file bigger than this is `darkmux mod create --attach` territory: that
+/// producer runs on the host, copies from a path, and rides no flow record.
+const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 40 * 1024;
+
+/// Bound on the SERIALIZED emission, mirroring the host's `MAX_EMITTED_BYTES`
+/// (`crates/darkmux-crew/src/dispatch_internal.rs`). Checked here so the
+/// truncation is never reachable from this tool: over the bound the call is
+/// REFUSED with something the model can act on, rather than accepted and then
+/// quietly stripped of its kit somewhere downstream.
+pub const MAX_EMISSION_BYTES: usize = 64 * 1024;
+
+/// The teaching response every refusal ends with — a model that cannot read a
+/// rejection cannot correct it, and a `create_mod` that reads as broken gets
+/// abandoned the way `create_finding` was on the first live crawl.
+const CREATE_MOD_SHAPE: &str = "\n\n  {\"for\": [\"sess-abc/1\"], \
+     \"kit\": \"<the change, as instructions and/or data>\", \
+     \"attach\": [\"path/inside/the/workspace\"]}\n\n\
+     Only `kit` is required. Nothing was recorded.";
+
+/// Accept `"for": "sess-a/1"` as well as `"for": ["sess-a/1"]`.
+///
+/// A model with exactly ONE finding writes the bare string; refusing that with
+/// a generic parse error teaches nothing and costs the whole call. Same
+/// liberal-in-what-we-accept reasoning as `CreateFindingArgs`'s aliases.
+fn string_or_list<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateModArgs {
+    /// Findings this change addresses. Optional and may be empty: a model that
+    /// does not know a finding key still made the change.
+    #[serde(
+        default,
+        rename = "for",
+        alias = "findings",
+        alias = "for_findings",
+        deserialize_with = "string_or_list"
+    )]
+    r#for: Vec<String>,
+    /// The change itself. Required, stored verbatim, never parsed.
+    #[serde(default, alias = "change", alias = "instructions")]
+    kit: String,
+    /// Workspace-relative paths copied into the mod.
+    #[serde(default, alias = "attachments", alias = "files")]
+    attach: Vec<String>,
+}
+
+/// Whether a string could address a finding: `<dispatch>/<seq>`, split on the
+/// LAST separator, with a dispatch half that is a safe path segment and a seq
+/// that parses.
+///
+/// **Validated HERE rather than host-side**, deliberately. The host cannot
+/// teach the model anything — a stderr line on a successful dispatch is kept
+/// only as a byte count — so a key that can address no finding has to be
+/// refused where the model will read the refusal and can call again with the
+/// right one. It also means the host only ever sees addressable keys, which
+/// is what lets it canonicalize without a second failure mode.
+///
+/// The canonical FORM (`sess-a/01` and `sess-a/1` are one address) is the
+/// host's to compute — `mods::canonical_finding_key` — because the store is
+/// what has to agree with itself. This checks shape only.
+fn finding_key_shape_ok(key: &str) -> bool {
+    let Some((dispatch, seq)) = key.rsplit_once('/') else {
+        return false;
+    };
+    // EXACTLY `findings::is_safe_dispatch_segment` (darkmux-crew), duplicated
+    // rather than shared because this crate cannot depend on the workspace —
+    // and pinned to its twin by `the_for_key_predicate_agrees_with_the_hosts_
+    // on_the_shared_table`, which reads the same checked-in table the host's
+    // own test reads. A rule that drifts here is a mod the host drops: the
+    // first version omitted the `/` check, so `sess/extra/1` passed the model-
+    // facing gate and then failed silently on the far side.
+    !dispatch.is_empty()
+        && !dispatch.starts_with('.')
+        && !dispatch.contains('/')
+        && !dispatch.contains('\\')
+        && !dispatch.contains('\0')
+        && seq.parse::<u64>().is_ok()
+}
+
+/// Standard base64, inline rather than a dependency (the dep set is
+/// deliberately small; this is the whole encoder). An attachment is BYTES —
+/// an image, a compiled artifact — and JSON strings hold only valid UTF-8, so
+/// the bytes are encoded rather than lossily stringified.
+fn b64_encode(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn execute_create_mod(raw_args: &str, out_dir: &Path, workspace_root: &Path) -> Result<ToolRun> {
+    // NEVER return Err from a model-facing tool — see
+    // `execute_create_finding`'s own doc for the measured reason.
+    // (#2265) The emission, verbatim, from the ONE parse the runtime already
+    // does — before the struct below normalizes aliases and drops keys it does
+    // not know. This is what rides the event and becomes the host's record.
+    let verbatim: Option<serde_json::Value> = serde_json::from_str(raw_args).ok();
+    let args: CreateModArgs = match serde_json::from_str(raw_args) {
+        Ok(a) => a,
+        Err(e) => {
+            return Ok(ToolRun::text(format!(
+                "NOT RECORDED — I could not read those arguments ({e}). \
+                 This tool takes:{CREATE_MOD_SHAPE} \
+                 The tool IS available — call it again with that shape."
+            )));
+        }
+    };
+    if args.kit.trim().is_empty() {
+        return Ok(ToolRun::text(format!(
+            "NOT RECORDED — `kit` is required and must not be empty: it IS the \
+             change, as instructions and/or data, and it is stored exactly as \
+             you write it.{CREATE_MOD_SHAPE}"
+        )));
+    }
+    // A key of the wrong shape can address no finding, so it would be stored
+    // as a link nothing could follow. Refused with the form, not repaired.
+    if let Some(bad) = args.r#for.iter().find(|k| !finding_key_shape_ok(k)) {
+        return Ok(ToolRun::text(format!(
+            "NOT RECORDED — {bad:?} in `for` is not a finding key. A key is \
+             `<dispatch>/<seq>`, e.g. `sess-abc/1` — the address the finding \
+             was given when it was recorded. Drop `for` entirely if you do not \
+             know which finding this addresses.{CREATE_MOD_SHAPE}"
+        )));
+    }
+
+    // Attachments are read BEFORE anything is written, so a mod is never
+    // recorded naming a file it does not carry.
+    let mut attached: Vec<serde_json::Value> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for rel in &args.attach {
+        let path = match resolve_read(rel, workspace_root) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolRun::text(format!(
+                    "NOT RECORDED — `attach` names {rel:?}, which did not resolve to a \
+                     readable path inside the workspace ({e}). Attach only files that \
+                     exist in the workspace, by their workspace-relative path."
+                )));
+            }
+        };
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => m,
+            Ok(_) => {
+                return Ok(ToolRun::text(format!(
+                    "NOT RECORDED — `attach` names {rel:?}, which is not a file. \
+                     Attach individual files, not directories."
+                )));
+            }
+            Err(e) => {
+                return Ok(ToolRun::text(format!(
+                    "NOT RECORDED — `attach` names {rel:?}, which could not be read ({e})."
+                )));
+            }
+        };
+        // A cap is a REFUSAL, not a truncation: half a file is not the data the
+        // kit needs, and the emission rides a flow record the host bounds.
+        total_bytes += meta.len();
+        if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
+            return Ok(ToolRun::text(format!(
+                "NOT RECORDED — the attachments total {total_bytes} bytes, over this \
+                 tool's budget of {MAX_ATTACHMENT_TOTAL_BYTES} bytes across ALL \
+                 attachments on one mod ({rel:?} is the one that crossed it). Attach \
+                 less, or name in the `kit` where the data lives instead — the record \
+                 travels on a size-bounded channel, and a mod cut in half would lose \
+                 its kit."
+            )));
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(ToolRun::text(format!(
+                    "NOT RECORDED — `attach` names {rel:?}, which could not be read ({e})."
+                )));
+            }
+        };
+        attached.push(serde_json::json!({ "path": rel, "bytes": b64_encode(&bytes) }));
+    }
+
+    let path = out_dir.join(MODS_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // The line count IS the ordinal, so it survives a resume — the same
+    // property the findings file has, for the same reason.
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let count = existing.lines().filter(|l| !l.trim().is_empty()).count();
+
+    // (#2265 review, CRITICAL 1) The emission is the model's arguments
+    // VERBATIM, with ONE substitution: `attach` becomes the RESOLVED
+    // `[{path, bytes}]` list. The host has no access to this container's
+    // workspace, so the model's path strings would name files it can never
+    // open — the first version emitted them, and every accepted mod with an
+    // attachment vanished on the far side. Every other key, including ones
+    // darkmux does not know, rides untouched. An alias key the model used
+    // (`files`, `attachments`) stays verbatim beside the canonical `attach`
+    // the host reads.
+    let emitted = verbatim.map(|mut v| {
+        if !attached.is_empty() {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("attach".to_string(), serde_json::Value::Array(attached.clone()));
+            }
+        }
+        v
+    });
+    // The whole emission is bounded HERE so the host's own bound is never
+    // reached: over there, an over-size emission is replaced by a truncation
+    // marker with no `kit` in it at all, and the kit is the product.
+    if let Some(e) = &emitted {
+        let size = e.to_string().len();
+        if size > MAX_EMISSION_BYTES {
+            return Ok(ToolRun::text(format!(
+                "NOT RECORDED — these arguments serialize to {size} bytes, over the \
+                 {MAX_EMISSION_BYTES}-byte limit for one mod. Shorten the `kit`, or \
+                 drop an attachment and say in the `kit` where the data lives. \
+                 Recording it as-is would cut the record and lose the kit."
+            )));
+        }
+    }
+
+    let record = serde_json::json!({
+        "seq": count + 1,
+        "for": args.r#for,
+        // Byte-exact. darkmux never types a kit and never opens it.
+        "kit": args.kit,
+        "attach": attached,
+        "ts": crate::trajectory::unix_ms(),
+    });
+    let mut line = serde_json::to_string(&record).context("serializing mod")?;
+    line.push('\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    use std::io::Write as _;
+    f.write_all(line.as_bytes())
+        .with_context(|| format!("appending to {}", path.display()))?;
+
+    let recorded = count + 1;
+    Ok(ToolRun {
+        result: format!(
+            "Recorded mod {recorded}. It is a record of the change, not the change \
+             itself — carry on with the work you were asked to do."
+        ),
+        emitted,
         emit_seq: Some(recorded),
     })
 }

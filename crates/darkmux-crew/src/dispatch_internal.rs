@@ -2290,6 +2290,11 @@ fn dispatch_remote(
                 "endpoint": label,
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
+                // (#2265) Same field, same reason as the container path's
+                // `dispatch_start_payload_json`: the prompt is capped in the
+                // record, so which observations a dispatch was briefed on has
+                // to be its own key on EVERY dispatch path, not just one.
+                "findings_in_brief": opts.findings_in_brief,
             }),
         ),
     );
@@ -2583,6 +2588,8 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 "runtime": "direct",
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
+                // (#2265) Same field, same reason — see the hosted path above.
+                "findings_in_brief": opts.findings_in_brief,
             }),
         ),
     );
@@ -3533,6 +3540,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         agentic_pm.is_some(),
         opts.max_turns_override,
         allowed_tools.as_deref(),
+        &opts.findings_in_brief,
     );
     // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
@@ -4459,6 +4467,9 @@ fn rewrite_container_paths_for_host(stdout: String, host_out: &std::path::Path) 
 /// agentic-remote endpoint label, the crawl launcher's provenance) this fn
 /// deliberately doesn't take, keeping the seam narrow and cheap to
 /// construct in a test.
+// One record's worth of fields, each one a distinct thing the record must
+// carry; grouping them into a struct would only move the same list one line up.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_start_payload_json(
     image: &str,
     message: &str,
@@ -4467,6 +4478,7 @@ fn dispatch_start_payload_json(
     is_agentic_remote: bool,
     max_turns_override: Option<u32>,
     tools_requested: Option<&[String]>,
+    findings_in_brief: &[String],
 ) -> serde_json::Value {
     serde_json::json!({
         "runtime": "internal",
@@ -4481,6 +4493,12 @@ fn dispatch_start_payload_json(
         // runtime records what it ADVERTISED on its trajectory `dispatch.start`;
         // a gap between the two is the class that hid `create_finding`.
         "tools_requested": tools_requested,
+        // (#2265) The findings whose stored records `dispatch --finding <key>`
+        // appended to the brief. Always present, EMPTY on every other dispatch
+        // — an absent key would be indistinguishable from a record written
+        // before the field existed. `prompt` above is capped; a key is the
+        // address the finding store answers to, so it is its own field.
+        "findings_in_brief": findings_in_brief,
         "prompt_chars": message.chars().count(),
         // (#1127) The dispatch prompt text (capped) — run context the viewer
         // renders collapsed. prompt_chars carries the full length.
@@ -6313,6 +6331,11 @@ impl TailerState {
                 // through the same write-once materializer, so the two
                 // producers cannot disagree about what a finding is.
                 self.materialize_finding(&event, tool_ok, &bounded_emission);
+                // (#2265) The mod channel's live producer, the same shape for
+                // the same reasons. The two are separate calls rather than one
+                // dispatcher because they build different records from
+                // different stores, and neither may fail the dispatch.
+                self.materialize_mod(&event, tool_ok, &bounded_emission);
             }
             "compaction" => {
                 self.summary.compactions += 1;
@@ -6678,6 +6701,137 @@ impl TailerState {
                 "[darkmux] warning: could not write finding {}: {e:#}",
                 record.key
             );
+        }
+    }
+
+    /// (#2265) Materialize the MOD record for an accepted `create_mod` call.
+    ///
+    /// Same three conditions as its finding sibling — the right tool, a call
+    /// that SUCCEEDED, a non-null emission — and the same contract on failure:
+    /// **a failure here never fails the dispatch**, because the record is a
+    /// derived convenience over the flow stream, which already carries the
+    /// emission and is the audit trail.
+    ///
+    /// **The kit is never discarded over a bad PART** (#2265 review). A
+    /// malformed attachment or a `for` key that addresses no finding drops
+    /// that part, records the reason in the mod's own `warnings`, and writes
+    /// the record anyway. The first version returned early on either, so one
+    /// bad sibling field threw away the entire product of a dispatch — and
+    /// silently, since a warning on a successful unit's stderr is kept only as
+    /// a byte count. A partial mod that says it is partial beats no mod.
+    ///
+    /// The one thing that genuinely cannot be written is an emission with no
+    /// `kit` at all (`bound_emitted` truncated it, or the call came from a
+    /// runtime older than the resolved-attachment wire shape): there is no
+    /// change to record. The runtime bounds the emission itself so that case
+    /// is unreachable from the current tool.
+    fn materialize_mod(
+        &self,
+        event: &serde_json::Value,
+        tool_ok: bool,
+        bounded_emission: &serde_json::Value,
+    ) {
+        if !tool_ok {
+            return;
+        }
+        if event.get("tool_name").and_then(|v| v.as_str()) != Some(crate::mods::MOD_TOOL_NAME) {
+            return;
+        }
+        if bounded_emission.is_null() {
+            return;
+        }
+        let mut warnings: Vec<String> = Vec::new();
+        let Some(kit) = bounded_emission.get("kit").and_then(|v| v.as_str()) else {
+            eprintln!(
+                "[darkmux] warning: a create_mod emission carried no `kit` string \
+                 (truncated over the emission cap?); no mod record was written"
+            );
+            return;
+        };
+        // A `for` key that can address no finding would be a link nothing
+        // could follow. The runtime refuses one at the tool boundary, where
+        // the model reads the refusal; anything that still arrives here is
+        // dropped from the list rather than taking the mod down with it.
+        let mut for_keys: Vec<String> = Vec::new();
+        for named in bounded_emission
+            .get("for")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+        {
+            let Some(key) = named.as_str() else {
+                warnings.push(format!("dropped a `for` entry that was not a string: {named}"));
+                continue;
+            };
+            match crate::mods::canonical_finding_key(key) {
+                Some(k) => for_keys.push(k),
+                None => warnings.push(format!(
+                    "dropped `for` key {key:?}: not `<dispatch>/<seq>`, so it can address \
+                     no finding"
+                )),
+            }
+        }
+        // Each attachment rode out of the container as base64 — no host path
+        // reaches the container's workspace copy, so the bytes ARE the file.
+        let mut attachments: Vec<crate::mods::InlineAttachment> = Vec::new();
+        for a in bounded_emission
+            .get("attach")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+        {
+            let (Some(path), Some(b64)) = (
+                a.get("path").and_then(|v| v.as_str()),
+                a.get("bytes").and_then(|v| v.as_str()),
+            ) else {
+                warnings.push(format!(
+                    "dropped an attachment with no path/bytes pair: {a}"
+                ));
+                continue;
+            };
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            if !crate::mods::is_safe_basename(&name) {
+                warnings.push(format!("dropped attachment {path:?}: unusable file name"));
+                continue;
+            }
+            if attachments.iter().any(|x: &crate::mods::InlineAttachment| x.name == name) {
+                warnings.push(format!(
+                    "dropped attachment {path:?}: another attachment already uses the \
+                     name {name:?}"
+                ));
+                continue;
+            }
+            match crate::mods::decode_b64(b64) {
+                Ok(bytes) => attachments.push(crate::mods::InlineAttachment { name, bytes }),
+                Err(e) => warnings.push(format!("dropped attachment {path:?}: {e:#}")),
+            }
+        }
+        for w in &warnings {
+            eprintln!("[darkmux] warning: create_mod: {w}");
+        }
+        // The same proposer string the finding record's `proposer` names, in
+        // the one free-actor field a mod has: role handle plus the model that
+        // ran it.
+        let by = format!("{} ({})", self.role_id, self.model);
+        if let Err(e) = crate::mods::create_from_emission(
+            &crate::mods::mods_dir(),
+            &crate::findings::findings_dir(),
+            &by,
+            &for_keys,
+            kit,
+            &attachments,
+            crate::findings::Scope {
+                mission_id: self.mission_id.clone(),
+                phase_id: self.phase_id.clone(),
+                step_id: self.step_id.clone(),
+            },
+            warnings,
+        ) {
+            eprintln!("[darkmux] warning: could not write mod: {e:#}");
         }
     }
 
@@ -8123,7 +8277,7 @@ fn probe_loaded_model() -> Result<String> {
 /// runtime gains a new tool or roles gain a new capability token,
 /// add it here AND to the match in `role_to_runtime`.
 const KNOWN_ROLE_VOCAB: &[&str] =
-    &["read", "edit", "write", "exec", "process", "update_plan", "create_finding"];
+    &["read", "edit", "write", "exec", "process", "update_plan", "create_finding", "create_mod"];
 
 /// Single source of truth for role-vocab → runtime-vocab. Add new
 /// mappings here when the runtime gains a new tool or roles gain
@@ -8141,6 +8295,11 @@ fn role_to_runtime(role_name: &str) -> &'static [&'static str] {
         // categorically different from one that may modify the tree — the
         // crawler is read-only and must stay that way.
         "create_finding" => &["create_finding"],
+        // (#2265) The mod channel, granted on its own token for the same
+        // reason: a role that may RECORD A PROPOSED CHANGE is categorically
+        // different from one that may make it, and the two grants are
+        // independent — a read-only reviewer can propose without editing.
+        "create_mod" => &["create_mod"],
         // Known role-vocab tokens with no runtime equivalent today.
         // NOT typos — silently dropped is correct behavior.
         "process" | "update_plan" => &[],

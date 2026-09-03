@@ -307,6 +307,12 @@ impl WorkJob {
     pub fn into_dispatch_opts(self) -> darkmux_crew::dispatch::DispatchOpts {
         use darkmux_crew::dispatch::DispatchOpts;
         DispatchOpts {
+            // (#2265) A cross-machine job carries its brief as TEXT, so a
+            // `--finding`-briefed dispatch still reaches the runner with the
+            // finding's record inside `message`; only the keys field — this
+            // machine's provenance note about where that text came from — does
+            // not cross the queue, because `WorkJob` does not carry it.
+            findings_in_brief: Vec::new(),
             workspace_read_only: false,
             record_context: None,
             resume_from: None,

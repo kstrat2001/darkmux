@@ -220,6 +220,15 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
             }
         }
     }
+    // A mod the host wrote PARTIALLY says so here, above the kit: the
+    // `warnings` field exists so the record is honest about what was dropped,
+    // and a rendering that hid it would make the record look whole again.
+    if !rec.warnings.is_empty() {
+        println!("\nwarnings");
+        for w in &rec.warnings {
+            println!("  {w}");
+        }
+    }
     // The kit is the proposer's own bytes, printed unindented, unparsed, and
     // with NOTHING appended — a trailing newline this did not receive is a
     // byte it must not add. This rendering is for reading; the byte-exact
