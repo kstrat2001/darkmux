@@ -99,6 +99,10 @@ pub mod scheduler;
 pub mod single_shot;
 // (#1230 Packet 2) Step-kind registry — the execution contract
 // `scheduler::run_step_graph` dispatches through.
+/// (#2301) `Output<T>` — the typed envelope every step output rides in.
+/// One consumer reads another's value THROUGH a struct; the deserialize is
+/// the validation.
+pub mod step_output;
 pub mod step_kinds;
 pub mod telemetry_sampler;
 // (#2110/#2109) Host-side thermal governor + breaker — see the module doc.

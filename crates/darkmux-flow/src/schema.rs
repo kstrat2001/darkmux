@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.38.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.39.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -485,7 +485,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.38.0";
 //           null-host-on-crawl-units gap named in the same issue: the
 //           sampler always populated `host` on the raw envelope
 //           per-dispatch, but the crawl launcher's own readback
-//           (`interpret_dispatch_result` in `src/crawl_launch.rs`) never
+//           (`interpret_dispatch_result`, now in the crawl's `crawl.unit`) never
 //           extracted it, so it never reached the unit's own `step
 //           complete`/`step error` payload or the mission's `envelope.json`
 //           — a launcher-side readback gap, not a flow-schema change (no
@@ -786,6 +786,37 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.38.0";
 //           nothing — never an error) and `null` otherwise. Additive: a
 //           reader that does not know the action already treats `action` as
 //           a free-form string.
+//
+//   1.39.0 (#2301): the CRAWL's payloads move, because the literal crawl
+//           launcher is retired and `crawl.json` is now an ordinary generic
+//           graph. Three changes a reader must hear about:
+//           (a) `mission start` for a crawl NO LONGER carries `workspace`,
+//               `units_in_plan`, `units_selected`, `est_tokens` or
+//               `sources`. It could not: a crawl's units do not exist until
+//               its plan steps run, which is after the mint. It carries the
+//               generic `graph` (1.37.0) like every other config.
+//           (b) Those keys, and every key the retired launcher's `mission
+//               close` payload carried (`units_completed`/`units_errored`/
+//               `units_interrupted`/`units_budget_exhausted`/
+//               `units_skipped`/`units_not_run`, `findings`,
+//               `prompt_tokens`, `completion_tokens`, `wall_ms`,
+//               `tokens_per_hour`, `stopped_by`, `model`, `profile`), are
+//               still on `mission close` — produced by the run's own
+//               `crawl.summary` step, which the generic launcher promotes
+//               to the close payload. Same names, same meanings; only the
+//               producer changed. `units_skipped` is now always 0 (there is
+//               no between-units skip loop left to stop early).
+//           (c) The bespoke per-unit `step start`/`step complete` PAYLOADS
+//               the launcher wrote (`workspace`/`unit`/`source`/`sha`/
+//               `rule`/`rules`/`kind`/`est_tokens`/`findings`/`exclusions`/
+//               `detections`/`host`) are gone. A unit's step records are
+//               the scheduler's generic ones now; the same facts ride
+//               `payload.context` on every record that unit's dispatch
+//               emits (`record_context`, unchanged) and its own typed step
+//               `output` (`crawl.unit-outcome`). The only reader of the old
+//               keys was documentation (`docs/guide/crawl-and-hooks.html`),
+//               audited and updated in the same change — no viewer, serve
+//               or doctor code read them.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

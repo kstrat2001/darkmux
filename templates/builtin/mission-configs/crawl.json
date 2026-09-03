@@ -1,72 +1,37 @@
 {
   "id": "crawl",
   "name": "Crawl",
-  "description": "Crawl a workspace with static-analysis rules and record what the crew observes as findings. (#2298) The `plan` phase holds one `crawl.plan` task per rule; each writes the plan for that rule (units of sites at one sha) as its output. Today `darkmux mission launch crawl` is still routed by literal config id to `src/crawl_launch.rs`, which plans every rule together and drives the units itself; #2300 grows the unit track from each plan step's output and #2301 retires the literal launcher, at which point this document IS the crawl. Disable a rule's task with `\"enabled\": false` (#2299); it is pruned at mint and the run shows only the rules that will run.",
+  "description": "Crawl a workspace with static-analysis rules and record what the crew observes as findings. (#2301) THIS DOCUMENT IS THE CRAWL \u2014 `darkmux mission launch crawl` runs it through the generic launcher; there is no literal routing and no bespoke launcher behind it any more. The `plan` phase holds one `crawl.plan` task per rule, each writing that rule's plan (units of sites at one sha) as its output; the `crawl` phase GROWS one `crawl.unit` task per planned unit from those outputs (#2300) and dispatches each to the `crawler` role against the materialized tree, mounted read-only; the `summarize` phase totals the run and its output becomes the mission's close payload. Disable a rule's task with `\"enabled\": false` (#2299), or deselect it for one launch with `--param rules=a,b` \u2014 either way it is pruned at mint (reason `disabled` / `not_selected`, recorded in `graph-report.json`) and the run's graph shows only the rules that will run.",
   "schema_version": "3.2",
   "inputs": [
     {
       "name": "workspace",
-      "description": "Path to a workspace spec JSON (darkmux_crew::workspace_spec::WorkspaceSpec) — named sources + include/exclude filters + optional rule-id defaults. Required unless `source` is given for a one-shot crawl. The spec's own `rules` array is the default rule binding when `--param rules=` is absent.",
-      "required": false
+      "description": "Path to a workspace spec JSON (darkmux_crew::workspace_spec::WorkspaceSpec) \u2014 named sources + include/exclude filters + optional rule-id defaults. REQUIRED: every `crawl.plan` step reads it. A one-shot crawl is a one-SOURCE spec file \u2014 write the spec once and pass it here.",
+      "required": true
     },
     {
       "name": "rules",
-      "description": "Comma-separated rule ids to crawl with. Wins over the workspace spec's own `rules` array when given; wins over a one-shot `--param rule=` too.",
-      "required": false
-    },
-    {
-      "name": "source",
-      "description": "One-shot crawl: a single path or git URL, synthesizing a one-source workspace spec in memory (no spec file needed). Requires `--param rule=` (a one-shot crawl runs exactly one rule). Mutually exclusive with `workspace` in practice — when both are given, `workspace` wins.",
-      "required": false
-    },
-    {
-      "name": "rule",
-      "description": "The single rule id to run against `--param source=` in the one-shot path. Ignored when `--param rules=` or a workspace spec's own `rules` array supplies a binding instead.",
-      "required": false
-    },
-    {
-      "name": "plan",
-      "description": "Path to a previously-written plan JSON (`--param plan_out=` from an earlier `--dry-run`, or a plan a prior run left behind) — skips re-planning and dispatches straight from it. Bails loudly if the plan's `workspace` name or any resolved source's sha/tree has drifted since it was written.",
-      "required": false
-    },
-    {
-      "name": "units",
-      "description": "Comma-separated unit ids to run, filtering the resolved plan down to exactly those. Bails on an unknown id.",
-      "required": false
-    },
-    {
-      "name": "limit",
-      "description": "Cap the number of units dispatched this run (after any `--param units=` filter). `0` selects nothing and completes cleanly — the run's own honest no-op.",
+      "description": "Comma-separated rule ids to crawl with, selecting which of this document's plan tasks are minted. A task whose `config.rule` is not named is pruned at mint with reason `not_selected` and reported in `graph-report.json`, so the run's graph is exactly the rules that will run. Absent means every enabled plan task the document declares.",
       "required": false
     },
     {
       "name": "max_sites_per_unit",
-      "description": "(#2190) Cap on how many sites a `site`-kind unit may hold before the planner starts a new one — the planner already caps on `max_est_tokens_per_unit` too, whichever binds first. Absent means the built-in default (40), so a launch with no override plans byte-identically to before this knob existed. A model whose per-turn tool loop stalls on a large unit's read batch (empty `finish_reason=tool_calls`, e.g. #2190) is a signal to shrink this — smaller units mean a smaller first-turn prompt. Must be a positive integer; `0` or a non-numeric value is refused at param-parse time.",
+      "description": "(#2190) Cap on how many sites a `site`-kind unit may hold before the planner starts a new one \u2014 the planner also caps on `max_est_tokens_per_unit`, whichever binds first. Absent means the built-in default (40), so a launch with no override plans byte-identically to before this knob existed. A model whose per-turn tool loop stalls on a large unit's read batch (#2190) is a signal to shrink this. Must be a positive integer; `0` or a non-numeric value is refused at param-parse time.",
       "required": false
     },
     {
       "name": "max_est_tokens_per_unit",
-      "description": "(#2190) Companion to `max_sites_per_unit`: cap on a `site`-kind unit's estimated token total (the same `est_tokens` heuristic the plan table already reports), whichever of the two caps binds first. Absent means the built-in default (16,000). Must be a positive integer; `0` or a non-numeric value is refused at param-parse time.",
+      "description": "(#2190) Companion to `max_sites_per_unit`: cap on a `site`-kind unit's estimated token total (the same `est_tokens` heuristic the plan table reports), whichever of the two binds first. Absent means the built-in default (16,000). Must be a positive integer; `0` or a non-numeric value is refused at param-parse time.",
       "required": false
     },
     {
       "name": "no_fetch",
-      "description": "Resolve sources against the mirror as-is, without `git fetch`ing first — fully offline against whatever's already mirrored. A `git` source with no mirror yet REFUSES instead of cloning; a `path` source's first clone is local-filesystem-only and is exempt.",
+      "description": "Resolve sources against the mirror as-is, without `git fetch`ing first \u2014 fully offline against whatever's already mirrored. A `git` source with no mirror yet REFUSES instead of cloning; a `path` source's first clone is local-filesystem-only and is exempt.",
       "required": false
     },
     {
       "name": "dry_run",
-      "description": "(#1959) The generic `mission launch --dry-run` flag, injected as `dry_run=true` by the CLI layer — never set by hand. Resolves + plans (everything a real launch does, so a missing/invalid input still bails the same way), then prints the plan table and mints NOTHING: no mission, no flow records, no dispatch. Writes nothing to disk unless `plan_out` is also given.",
-      "required": false
-    },
-    {
-      "name": "plan_out",
-      "description": "(#1959) Path to write the full plan JSON to, on a `--dry-run` invocation. Absent means a dry run writes nothing — read-only by default.",
-      "required": false
-    },
-    {
-      "name": "resume",
-      "description": "(#2114 follow-up) A PRIOR crawl mission id to resume. Pass the EXACT SAME `workspace`/`rules`/`source`/`rule`/`plan`/`units`/`limit`/`no_fetch` inputs as the original launch (minus this key itself) — the launch REFUSES OUTRIGHT, before minting anything, if this run's inputs fingerprint differs from the prior mission's own recorded one, since crawl re-plans and re-fetches on every launch and different inputs can shift which unit id means what. NOTE: `units`/`limit` are applied to THIS run's own selection BEFORE the resume filter runs (select first, then skip/resume/fresh each selected unit) — a resume with a narrower `limit` than the original never revisits units outside the first N of THIS run's selection, even if they were part of the original plan. With matching inputs, each of THIS run's selected units is looked up in the prior mission's `envelope.json` by unit id AND matching source/rule (a shifted positional id with a different source/rule is treated as never having run): completed (`result: \"stop\"`) is skipped entirely; aborted with a checkpoint at its recorded `out_dir` resumes from it (`--resume`, at most one re-executed tool call); anything else (no usable checkpoint, or no record at all — the launcher process itself died before recording one) is re-run fresh. Bails loudly if the named mission or its `envelope.json` can't be found/read.",
+      "description": "(#1959) The generic `mission launch --dry-run` flag, injected as `dry_run=true` by the CLI layer \u2014 never set by hand. Resolves the inputs and prints the task/step graph this launch would mint (including which rules `--param rules=` left out), then mints NOTHING: no mission, no flow records, no planning, no dispatch.",
       "required": false
     }
   ],
@@ -133,6 +98,136 @@
                 "rule": "stale-consumer",
                 "workspace": "{{workspace}}"
               }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "crawl",
+      "display_name": "Crawl",
+      "description": "One dispatch per planned unit. Every task here is GROWN (#2300) from its rule's plan at the phase boundary \u2014 the units do not exist until the plan step writes them \u2014 so what this phase declares is one TEMPLATE per rule, not one task per unit.",
+      "tasks": [
+        {
+          "id": "unit-unnamed-predicate",
+          "display_name": "Crawl: Name compound predicates",
+          "description": "Dispatch one `unnamed-predicate` unit \u2014 one task per unit the plan above produced.",
+          "role_id": "crawler",
+          "depends_on": [
+            "plan-unnamed-predicate"
+          ],
+          "grow": {
+            "from": "plan-unnamed-predicate",
+            "items": "units",
+            "id": "{{item.id}}",
+            "config": {
+              "plan": "{{from.output}}",
+              "unit": "{{item.id}}",
+              "rule": "unnamed-predicate"
+            }
+          },
+          "steps": [
+            {
+              "id": "unit-unnamed-predicate-step",
+              "kind": "crawl.unit",
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "unit-swallowed-error",
+          "display_name": "Crawl: Swallowed errors",
+          "description": "Dispatch one `swallowed-error` unit \u2014 one task per unit the plan above produced.",
+          "role_id": "crawler",
+          "depends_on": [
+            "plan-swallowed-error"
+          ],
+          "grow": {
+            "from": "plan-swallowed-error",
+            "items": "units",
+            "id": "{{item.id}}",
+            "config": {
+              "plan": "{{from.output}}",
+              "unit": "{{item.id}}",
+              "rule": "swallowed-error"
+            }
+          },
+          "steps": [
+            {
+              "id": "unit-swallowed-error-step",
+              "kind": "crawl.unit",
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "unit-doc-contradicts-code",
+          "display_name": "Crawl: Doc contradicts code",
+          "description": "Dispatch one `doc-contradicts-code` unit \u2014 one task per unit the plan above produced.",
+          "role_id": "crawler",
+          "depends_on": [
+            "plan-doc-contradicts-code"
+          ],
+          "grow": {
+            "from": "plan-doc-contradicts-code",
+            "items": "units",
+            "id": "{{item.id}}",
+            "config": {
+              "plan": "{{from.output}}",
+              "unit": "{{item.id}}",
+              "rule": "doc-contradicts-code"
+            }
+          },
+          "steps": [
+            {
+              "id": "unit-doc-contradicts-code-step",
+              "kind": "crawl.unit",
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "unit-stale-consumer",
+          "display_name": "Crawl: Stale consumers",
+          "description": "Dispatch one `stale-consumer` unit \u2014 one task per unit the plan above produced.",
+          "role_id": "crawler",
+          "depends_on": [
+            "plan-stale-consumer"
+          ],
+          "grow": {
+            "from": "plan-stale-consumer",
+            "items": "units",
+            "id": "{{item.id}}",
+            "config": {
+              "plan": "{{from.output}}",
+              "unit": "{{item.id}}",
+              "rule": "stale-consumer"
+            }
+          },
+          "steps": [
+            {
+              "id": "unit-stale-consumer-step",
+              "kind": "crawl.unit",
+              "config": {}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "summarize",
+      "display_name": "Summarize",
+      "description": "The run's totals, read back through the typed per-unit outcome every `crawl.unit` step recorded. This phase's output becomes the mission's `mission close` payload.",
+      "tasks": [
+        {
+          "id": "summary",
+          "display_name": "Summary",
+          "description": "Total this crawl's units, findings and tokens.",
+          "steps": [
+            {
+              "id": "summary-step",
+              "kind": "crawl.summary",
+              "config": {}
             }
           ]
         }

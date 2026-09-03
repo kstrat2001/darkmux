@@ -1606,10 +1606,11 @@ mod tests {
         }
     }
 
-    // (#1959) `crawl` is the ONE embedded config with NO graph by design
-    // (see `templates/builtin/mission-configs/crawl.json`'s own
-    // `description`) — a separate, deliberately inverted assertion from
-    // the graph-bearing pair above, not folded into their loop.
+    // (#2301) `crawl` is an ordinary graph-bearing config now — plan,
+    // crawl, summarize — so this asserts its whole shape rather than the
+    // "no graph by design" inversion #1959 needed. Kept separate from the
+    // pair above because it checks the per-rule track structure, not just
+    // that the document builds.
     #[test]
     fn crawl_loads_and_builds_a_plan_phase_with_one_constructible_task_per_rule() {
         let registry = crate::mission_launch::all_step_kinds().unwrap();
@@ -1624,15 +1625,22 @@ mod tests {
             &[],
         );
         assert_eq!(show.id, "crawl");
-        // (#2298) One plan phase, one `crawl.plan` task per built-in rule,
-        // every step constructible by the launcher's own registry.
-        assert_eq!(show.phases.len(), 1, "{:?}", show.phases.iter().map(|p| &p.id).collect::<Vec<_>>());
-        let plan = &show.phases[0];
-        assert_eq!(plan.tasks.len(), 4);
-        for task in &plan.tasks {
-            for step in &task.steps {
-                assert_eq!(step.kind, "crawl.plan");
-                assert!(step.constructible, "`crawl.plan` must be registered: step {}", step.id);
+        // (#2298 + #2301) Three phases: one `crawl.plan` task per built-in
+        // rule, one `crawl.unit` GROW template per rule, one
+        // `crawl.summary`. Every step constructible by the launcher's own
+        // registry — a crawl kind that failed to register would leave a
+        // config that cannot execute.
+        let ids: Vec<&str> = show.phases.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["plan", "crawl", "summarize"], "{ids:?}");
+        let kinds_of = |i: usize| -> Vec<&str> {
+            show.phases[i].tasks.iter().flat_map(|t| t.steps.iter()).map(|s| s.kind.as_str()).collect()
+        };
+        assert_eq!(kinds_of(0), vec!["crawl.plan"; 4]);
+        assert_eq!(kinds_of(1), vec!["crawl.unit"; 4]);
+        assert_eq!(kinds_of(2), vec!["crawl.summary"]);
+        for phase in &show.phases {
+            for step in phase.tasks.iter().flat_map(|t| t.steps.iter()) {
+                assert!(step.constructible, "`{}` must be registered: step {}", step.kind, step.id);
             }
         }
     }

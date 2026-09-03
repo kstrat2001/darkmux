@@ -2997,7 +2997,13 @@ mod tests {
         //           event, naming the template, the producing task, the
         //           artifact path, the item count and the real task ids
         //           minted from it (#2300).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.38.0");
+        //   1.39.0: the crawl's payloads move — `mission start` drops the
+        //           launcher's crawl keys (a crawl's units do not exist
+        //           until its plan steps run), `mission close` carries the
+        //           SAME keys produced by the run's own `crawl.summary`
+        //           step, and the bespoke per-unit step payloads are gone
+        //           (#2301).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.39.0");
     }
 
     #[test]

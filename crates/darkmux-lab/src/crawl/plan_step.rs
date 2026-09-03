@@ -42,6 +42,12 @@ use std::sync::Arc;
 
 pub const CRAWL_PLAN_KIND: &str = "crawl.plan";
 
+/// (#2301) The CONTENT id of what this kind produces — the value a
+/// consumer checks before deserializing the body as a [`Plan`]. Same
+/// string as the step kind here because the kind produces exactly one
+/// thing; they are separate concepts and are allowed to diverge.
+pub const CRAWL_PLAN_OUTPUT_KIND: &str = "crawl.plan";
+
 pub struct CrawlPlanStepKind;
 
 impl StepKind for CrawlPlanStepKind {
@@ -53,8 +59,12 @@ impl StepKind for CrawlPlanStepKind {
         "Plan"
     }
 
+    /// (#2301) A data port's LABEL is the same string as the wrapper
+    /// `kind` the output carries, so a graph validator can compare a
+    /// producer's `provides` against a consumer's `requires` without a
+    /// rename table in between.
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data("plan")];
+        const PORTS: [Port; 1] = [Port::data(CRAWL_PLAN_OUTPUT_KIND)];
         &PORTS
     }
 
@@ -65,8 +75,21 @@ impl StepKind for CrawlPlanStepKind {
             None => default_plan_path(task, &cfg.rule)?,
         };
         let the_plan = plan_one_rule(&cfg)?;
-        write_plan(&out_path, &the_plan)?;
-        Ok(StepOutcome { output: out_path.display().to_string(), flow_records: Vec::new() })
+        // (#2301) The plan is WRAPPED on disk: `Output<Plan>` carries the
+        // content id + producer beside the body, so a consumer checks what
+        // it is holding before reading it. The step's own `output` is a
+        // `ref` to that file rather than the file's bytes — a plan is
+        // large, and every consumer wants the path anyway.
+        let wrapped = darkmux_crew::step_output::Output::wrap(
+            CRAWL_PLAN_OUTPUT_KIND,
+            the_plan,
+            darkmux_crew::step_output::Producer::of(&mission_id_of(task), &task.id, &step.id),
+        );
+        write_plan(&out_path, &wrapped)?;
+        Ok(StepOutcome {
+            output: darkmux_crew::step_output::ref_output_string(&out_path),
+            flow_records: Vec::new(),
+        })
     }
 }
 
@@ -154,7 +177,16 @@ pub fn default_plan_path(task: &Task, rule: &str) -> Result<PathBuf> {
     Ok(darkmux_crew::loader::missions_dir().join(&phase.mission_id).join("plan").join(format!("{rule}.json")))
 }
 
-fn write_plan(path: &Path, the_plan: &Plan) -> Result<()> {
+/// The mission a task belongs to, or an empty string — provenance never
+/// fails a step that is otherwise fine.
+fn mission_id_of(task: &Task) -> String {
+    darkmux_crew::loader::load_phases()
+        .ok()
+        .and_then(|ps| ps.iter().find(|p| p.id == task.phase_id).map(|p| p.mission_id.clone()))
+        .unwrap_or_default()
+}
+
+fn write_plan(path: &Path, the_plan: &darkmux_crew::step_output::Output<Plan>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -166,9 +198,12 @@ fn write_plan(path: &Path, the_plan: &Plan) -> Result<()> {
 }
 
 /// Register the crawl's step kinds. Called from the launcher's registry
-/// builder beside the review and coder-phase kinds.
+/// builder beside the review and coder-phase kinds. (#2301) The dispatch
+/// half — `crawl.unit` + `crawl.summary` — registers here too, so one call
+/// still gives a launcher every kind `crawl.json` declares.
 pub fn register_crawl_kinds(registry: &StepKindRegistry) -> Result<()> {
     registry.register(Arc::new(CrawlPlanStepKind)).context("registering crawl.plan")?;
+    crate::crawl::unit_step::register(registry)?;
     Ok(())
 }
 
@@ -256,14 +291,39 @@ mod tests {
             "sizing": {"max_sites_per_unit": 7}
         }));
         let outcome = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new()).unwrap();
-        assert_eq!(outcome.output, out.display().to_string(), "the output IS the plan's path");
-        let written: Plan = serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            outcome.output,
+            darkmux_crew::step_output::ref_output_string(&out),
+            "(#2301) the output is a `ref` NAMING the plan file, not the file's bytes"
+        );
+        let envelope = darkmux_crew::step_output::Output::<Plan>::read(&outcome.output, CRAWL_PLAN_OUTPUT_KIND)
+            .expect("the ref resolves and the content id checks out");
+        assert_eq!(envelope.kind, CRAWL_PLAN_OUTPUT_KIND);
+        let written: Plan = envelope.body;
         assert_eq!(written.rules, vec!["unnamed-predicate".to_string()]);
         assert_eq!(written.params.unwrap().max_sites_per_unit, 7, "the sizing knob the plan was cut with");
         assert_eq!(written.sources.len(), 1);
         assert_eq!(written.sources[0].sha.len(), 40, "the sha the plan was cut at: {:?}", written.sources[0].sha);
         assert!(!written.units.is_empty(), "the prefilter hit the unnamed predicate: {written:?}");
         assert_eq!(written.schema_version, plan::PLAN_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_written_plan_is_refused_when_read_as_the_wrong_content_id() {
+        // (#2301) Mutation-kill for the kind check: the same file read
+        // under a different expectation stops, naming both.
+        let source = git_repo_with(&[("src/a.ts", UNNAMED)]);
+        let root = TempDir::new().unwrap();
+        let spec = spec_file(root.path(), source.path());
+        let out = root.path().join("plan.json");
+        let step = step_with(serde_json::json!({
+            "rule": "unnamed-predicate", "workspace": spec.to_string_lossy(), "plan_out": out.to_string_lossy()
+        }));
+        let outcome = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new()).unwrap();
+        let err = darkmux_crew::step_output::Output::<Plan>::read(&outcome.output, "crawl.unit-outcome")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("crawl.plan") && err.contains("crawl.unit-outcome"), "{err}");
     }
 
     #[test]

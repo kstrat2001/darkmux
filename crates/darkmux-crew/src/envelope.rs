@@ -484,6 +484,20 @@ fn classify_mission_close_refusal(current: Option<MissionStatus>) -> FinalizeRef
 }
 
 pub fn finalize_mission(envelope: &MissionEnvelope) {
+    finalize_mission_with_payload(envelope, None)
+}
+
+/// (#2301) [`finalize_mission`] with a `mission close` PAYLOAD.
+///
+/// A generic graph's last phase can produce a run summary (the crawl's
+/// `crawl.summary` step is the first one that does), and the operator-
+/// facing home for a run's own numbers has always been the `mission close`
+/// record's payload — that is where the retired crawl launcher wrote them.
+/// Rather than give one mission kind a private close path, the generic
+/// launcher promotes its LAST phase's last step output to this payload
+/// when that output is a JSON object; everything else about finalization
+/// is unchanged, and a `None` payload is byte-identical to before.
+pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option<serde_json::Value>) {
     for phase in &envelope.phases {
         let result = match phase.outcome {
             PhaseOutcomeKind::Complete => lifecycle::phase_complete(&phase.phase_id),
@@ -504,7 +518,12 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
         .reason
         .clone()
         .unwrap_or_else(|| envelope.status.default_reason().to_string());
-    if let Err(e) = lifecycle::mission_close_with_reasoning(&envelope.mission_id, Some(&reason)) {
+    if let Err(e) = lifecycle::mission_terminal_with_reasoning_and_payload(
+        &envelope.mission_id,
+        crate::types::MissionStatus::Finalized,
+        Some(&reason),
+        payload,
+    ) {
         // (#1433 follow-up) Was `let _`-swallowed — a mission that couldn't be
         // closed left its envelope.json disagreeing with an Active mission on
         // disk, silently. Classify like the phase refusals: quiet only when the

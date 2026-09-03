@@ -1897,11 +1897,10 @@ mod tests {
         }
     }
 
-    // ─── crawl (#1959): documentation-only, zero-graph builtin ─────────
-    // Deliberately NOT folded into `both_builtins_*` above — those loops
-    // assert graph-shaped invariants (Tier 3 step-kind warnings, a real
-    // phase/task/step shape) that are meaningless for a document with zero
-    // phases by design. `crawl` gets its own goldens instead.
+    // ─── crawl (#2301): the document IS the crawl ──────────────────────
+    // Kept out of `both_builtins_*` above because those loops assert the
+    // TWO dedicated-launcher configs' invariants; crawl's own goldens
+    // assert its per-rule track structure, which neither of those has.
 
     #[test]
     fn crawl_builtin_validates_with_zero_error_findings_and_plans_one_task_per_rule() {
@@ -1910,19 +1909,42 @@ mod tests {
         let cfg = embedded_config("crawl");
         assert_eq!(cfg.id, "crawl");
         assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
-        // (#2298) The plan phase: one `crawl.plan` task per built-in rule,
-        // each step naming its rule. The unit track is still the literal
-        // launcher's until #2300/#2301.
-        assert_eq!(cfg.phases.len(), 1, "one plan phase: {:?}", cfg.phases);
+        // (#2298 + #2301) Three phases: a `crawl.plan` task per built-in
+        // rule, a `crawl.unit` GROW template per rule growing from that
+        // rule's own plan task, and one `crawl.summary`.
+        let phase_ids: Vec<&str> = cfg.phases.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(phase_ids, vec!["plan", "crawl", "summarize"], "{phase_ids:?}");
+        const RULES: [&str; 4] =
+            ["unnamed-predicate", "swallowed-error", "doc-contradicts-code", "stale-consumer"];
+
         let plan = &cfg.phases[0];
-        assert_eq!(plan.id, "plan");
         let rules: Vec<&str> = plan
             .tasks
             .iter()
             .map(|t| t.steps[0].config["rule"].as_str().expect("each plan step names its rule"))
             .collect();
-        assert_eq!(rules, vec!["unnamed-predicate", "swallowed-error", "doc-contradicts-code", "stale-consumer"]);
+        assert_eq!(rules, RULES.to_vec());
         assert!(plan.tasks.iter().all(|t| t.steps.len() == 1 && t.steps[0].kind == "crawl.plan"));
+
+        let crawl = &cfg.phases[1];
+        assert_eq!(crawl.tasks.len(), RULES.len());
+        for (task, rule) in crawl.tasks.iter().zip(RULES) {
+            assert_eq!(task.role_id.as_deref(), Some("crawler"));
+            assert_eq!(task.depends_on, vec![format!("plan-{rule}")]);
+            let grow = task.grow.as_ref().unwrap_or_else(|| panic!("`{}` must be a grow template", task.id));
+            assert_eq!(grow.from, format!("plan-{rule}"), "each track grows from its OWN plan");
+            assert_eq!(grow.items, "units");
+            // `{{from.output}}` is what hands the grown unit the plan it
+            // came from without every plan item repeating the path.
+            assert_eq!(grow.config["plan"], serde_json::json!("{{from.output}}"));
+            assert_eq!(grow.config["unit"], serde_json::json!("{{item.id}}"));
+            assert_eq!(grow.config["rule"], serde_json::json!(rule));
+            assert_eq!(task.steps[0].kind, "crawl.unit");
+        }
+
+        let summarize = &cfg.phases[2];
+        assert_eq!(summarize.tasks.len(), 1);
+        assert_eq!(summarize.tasks[0].steps[0].kind, "crawl.summary");
         let findings = cfg.validate(&known_refs);
         let errors: Vec<&ValidationFinding> =
             findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();
@@ -1934,11 +1956,21 @@ mod tests {
     fn crawl_builtin_declares_every_launcher_input() {
         let cfg = embedded_config("crawl");
         let names: Vec<&str> = cfg.inputs.iter().map(|i| i.name.as_str()).collect();
-        for expected in [
-            "workspace", "rules", "source", "rule", "plan", "units", "limit", "no_fetch", "dry_run", "plan_out",
-        ] {
-            assert!(names.contains(&expected), "crawl.json must declare input `{expected}`: {names:?}");
-        }
+        // (#2301) The generic path's inputs, exactly. `source`/`rule` (the
+        // one-shot pair — a one-shot is a one-source spec file now),
+        // `plan`/`plan_out` (a plan is always written under the run) and
+        // `units`/`limit`/`resume` were the retired launcher's, and are
+        // asserted ABSENT so a copy-paste never quietly reintroduces an
+        // input nothing reads.
+        assert_eq!(
+            names,
+            vec!["workspace", "rules", "max_sites_per_unit", "max_est_tokens_per_unit", "no_fetch", "dry_run"],
+            "{names:?}"
+        );
+        assert!(
+            cfg.inputs.iter().find(|i| i.name == "workspace").is_some_and(|i| i.required == Some(true)),
+            "every `crawl.plan` step reads `workspace`, so it is required"
+        );
     }
 
     #[test]

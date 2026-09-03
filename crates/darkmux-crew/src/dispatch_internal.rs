@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// The host watchdog's structured-timeout marker prefix (#363), prepended
 /// to `stderr` when the inactivity timer fires. A public constant (rather
 /// than a literal duplicated at each detection call site) so any other
-/// consumer of a `DispatchResult` — `src/crawl_launch.rs`'s
+/// consumer of a `DispatchResult` — the crawl's `crawl.unit` step kind's
 /// `interpret_dispatch_result` is the first (#1959 merge-gate finding 9) —
 /// can detect the same event without re-deriving or hand-copying this
 /// string.

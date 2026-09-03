@@ -1,13 +1,13 @@
 //! Shared RAII finalize guard for every `darkmux mission launch` launcher
 //! (#2131), extracted from `review_finalize_guard.rs` (#2124/#2130) once a
-//! second launcher (`crawl_launch.rs`, SIGINT-only) and a third with NO
+//! second launcher (the retired `crawl_launch.rs`, SIGINT-only) and a third with NO
 //! guard at all (`mission_launch.rs` — generic graphs + coder-phase) proved
 //! the shape needed to be shared rather than reinvented per launcher.
 //!
 //! **Why a closure-parameterized guard, not one hardcoded to a Mission
 //! envelope type.** The three launchers finalize completely differently —
 //! `mission_launch_review.rs` writes a `ReviewEnvelope`-derived
-//! `MissionEnvelope`, `crawl_launch.rs` writes a crawl summary + its own
+//! `MissionEnvelope`, `crawl_launch.rs` wrote a crawl summary + its own
 //! `mission_terminal_with_reasoning_and_payload` call, `mission_launch.rs`
 //! writes either a gate banner (coder-phase, no finalize at all on the
 //! happy path) or a generic `build_envelope`/`finalize_mission`. Rather
@@ -41,7 +41,7 @@
 //! durable — see that function's own doc for why this is a launcher
 //! decision, not something the guard forces unconditionally in `close`. A
 //! launcher whose dispatch is a plain synchronous loop with its own
-//! between-units polling seam (`crawl_launch.rs`) never needs to call it at
+//! between-units polling seam (`crawl_launch.rs`, retired in #2301) never needed to call it at
 //! all — its own loop already stops cleanly once `close` runs.
 
 use std::any::Any;
@@ -89,7 +89,7 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// A no-op when no signal was observed (checks `darkmux_types::interrupt::
 /// is_set()` itself) — safe to call unconditionally after a normal
 /// completion; only a launcher that actually abandoned a worker thread
-/// needs to call it at all (`crawl_launch.rs`'s synchronous, self-polling
+/// needed to call it at all (`crawl_launch.rs`'s synchronous, self-polling
 /// loop never does).
 pub(crate) fn reap_and_exit_on_signal() {
     if !darkmux_types::interrupt::is_set() {
