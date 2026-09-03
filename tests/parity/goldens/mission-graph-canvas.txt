@@ -26,10 +26,10 @@ abandoned
     [s-complete] No-op
 
 [k-task s-complete] probe (title="probe")
-    [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | · tok
+    [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | 0:03
 
 [k-task s-complete] judge (title="judge")
-    [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | · tok
+    [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | 0:01
 
 [k-task s-complete] synthesis (title="synthesis")
     [s-complete] No-op

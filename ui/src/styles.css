@@ -5454,6 +5454,12 @@ body {
   display: inline-flex;
   min-width: 0;
 }
+/* (#2269) A finished step's (or task's) wall time — the pulse is gone, the
+   number stays, muted so the live pulse still reads as the loud one. */
+.missionlens .mn-step-meter .wall {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
 .missionlens .tltask .tlt-hd .tlt-meter-cell .mn-step-meter {
   margin-left: 0;
 }

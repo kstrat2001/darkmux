@@ -6,7 +6,7 @@
  * this module owns none of the DOM.
  */
 import type { GraphEdge, GraphNode, MetricsMap, StepMeter } from "./graph";
-import { isAiKind, stepDisplayMetrics, stepMeterFor, stepStartMs } from "./graph";
+import { isAiKind, stepDisplayMetrics, stepEndMs, stepMeterFor, stepStartMs } from "./graph";
 
 /** (#1404) The renderer breakpoint — kept `<= 700` to match the CSS
  * `@media (max-width:700px)` (inclusive at exactly 700px). */
@@ -57,7 +57,20 @@ export interface TaskAggMetrics {
   turns: number;
   cloud: boolean;
   generating: boolean;
+  /** (#2269) While any step runs: the task SPAN (earliest step start → now),
+   * so the row's pulsing timer is the task's, not the running step's. `0`
+   * when nothing runs — the meter's pulse is a liveness signal. */
   elapsedMs: number;
+  /** (#2269) Earliest step start → latest step end (or now while any step
+   * runs). Meaningful in either state; `0` when no step ever started. */
+  spanMs: number;
+  /** (#2269) Sum of each step's own wall time (running steps count to now).
+   * Equals `spanMs` for a strictly sequential task; less when steps idle
+   * between each other; more when they overlap. */
+  sumMs: number;
+  /** (#2269) What the shared meter renders once nothing runs: the task
+   * span. Same field the per-step meter uses, so one renderer serves both. */
+  wallMs: number;
 }
 
 /** `taskAggMetrics` — mission-graph.html. Aggregate a task's step metrics
@@ -67,22 +80,33 @@ export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number
     turns = 0,
     cloud = false,
     generating = false,
-    startMs = 0;
+    firstStartMs = 0,
+    lastEndMs = 0,
+    sumMs = 0;
   for (const s of task.steps || []) {
     const m = metrics[s.id];
     const d = stepDisplayMetrics(m);
     tokens += d.tokens;
     turns += d.turns;
     if (d.cloud) cloud = true;
-    if (s.status === "running") {
-      generating = true;
-      const st = stepStartMs(s, m);
-      if (st) startMs = startMs ? Math.min(startMs, st) : st;
+    const running = s.status === "running";
+    if (running) generating = true;
+    // (#2269) EVERY started step contributes to the task's duration — the
+    // old code read the start only off RUNNING steps, so a sequential
+    // task's timer restarted with each step and disappeared at the end.
+    const st = stepStartMs(s, m);
+    if (!st) continue;
+    firstStartMs = firstStartMs ? Math.min(firstStartMs, st) : st;
+    const en = stepEndMs(s, m) || (running && now ? now : 0);
+    if (en) {
+      lastEndMs = Math.max(lastEndMs, en);
+      sumMs += Math.max(0, en - st);
     }
   }
   const ai = (task.steps || []).some((s) => isAiKind(s.kind));
-  const elapsedMs = generating && startMs && now ? Math.max(0, now - startMs) : 0;
-  return { show: ai || tokens > 0 || turns > 0 || generating, tokens, turns, cloud, generating, elapsedMs };
+  const spanMs = firstStartMs && lastEndMs ? Math.max(0, lastEndMs - firstStartMs) : 0;
+  const elapsedMs = generating ? spanMs : 0;
+  return { show: ai || tokens > 0 || turns > 0 || generating, tokens, turns, cloud, generating, elapsedMs, spanMs, sumMs, wallMs: spanMs };
 }
 
 export interface TimelineStep {
