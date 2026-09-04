@@ -1704,9 +1704,12 @@ mod tests {
         let investigate = &cfg.phases[0];
         let investigate_task_ids: Vec<&str> =
             investigate.tasks.iter().map(|t| t.id.as_str()).collect();
+        // (#2310 P1) The context step is the pipeline's first task; every
+        // review task reads its typed output.
         assert_eq!(
             investigate_task_ids,
             vec![
+                "review-context-task",
                 "review-bundle-task",
                 "review-probe-high-task",
                 "review-probe-mid-task",
@@ -1757,7 +1760,7 @@ mod tests {
         // cannot start before dedup completes, but the graph no longer draws
         // an investigate→adjudicate task connector that read as a bypass.
         assert_eq!(adjudicate.tasks[0].depends_on, Vec::<String>::new());
-        assert_eq!(adjudicate.tasks[0].reads, vec!["review-dedup-task"]);
+        assert_eq!(adjudicate.tasks[0].reads, vec!["review-dedup-task", "review-context-task"]);
         assert_eq!(adjudicate.tasks[0].steps[0].kind, "review.judge");
         // (#1475 packet 2) The judge task assigns the `review-judge` role — the
         // role→profile flip's model source (the crew is the task→role→profile
@@ -1788,7 +1791,7 @@ mod tests {
         // synthesis... looks like the design includes short circuits":
         // same data, no more phantom bypass arrows.
         assert_eq!(report.tasks[1].depends_on, vec!["review-verify-task"]);
-        assert_eq!(report.tasks[1].reads, vec!["review-dedup-task", "review-judge-task"]);
+        assert_eq!(report.tasks[1].reads, vec!["review-dedup-task", "review-judge-task", "review-context-task"]);
     }
 
     #[test]
