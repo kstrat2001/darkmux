@@ -262,6 +262,7 @@ mod tests {
 
     fn task() -> Task {
         Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "plan-unnamed-predicate-task".into(),
             phase_id: "no-such-phase".into(),
             description: String::new(),

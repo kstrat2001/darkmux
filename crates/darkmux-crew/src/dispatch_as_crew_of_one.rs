@@ -319,6 +319,7 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Miss
     };
 
     let task = Task {
+        run_on: crate::types::default_run_on(),
         id: task_id.clone(),
         phase_id: phase_id.clone(),
         description: format!("dispatch `{}`", opts.role_id),

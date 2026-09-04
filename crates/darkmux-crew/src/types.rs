@@ -603,6 +603,16 @@ pub struct Step {
     pub output: Option<String>,
 }
 
+/// (#2310 P4) The default `Task::run_on` / `mission_config::TaskConfig::run_on`
+/// value — a Task is ready only once every dependency reaches
+/// `NodeStatus::Complete`, the behavior every config predating this field
+/// already had. Exposed so every `Task { .. }` struct-literal call site
+/// (interpret, step kinds, tests) can name the same default explicitly
+/// rather than re-typing the string literal.
+pub fn default_run_on() -> Vec<String> {
+    vec!["complete".to_string()]
+}
+
 /// (#1230 Packet 2, revised #1341) A real (not synthesized) grouping of
 /// Steps within a Phase — operators reference a Task directly (e.g. "the
 /// coder task"), so it's a first-class schema level, not just a derived
@@ -665,6 +675,35 @@ pub struct Task {
     /// read cleanly (contract 5).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reads: Vec<String>,
+    /// (#2310 P4/P4a) Which TERMINAL statuses of this Task's
+    /// `depends_on`/`reads` dependencies satisfy readiness. Defaults to
+    /// `["complete"]` (`default_run_on()`) — the pre-#2310 behavior:
+    /// every dependency must be `NodeStatus::Complete`. A Task that also
+    /// declares `"error"` becomes ready once every dependency reaches ANY
+    /// terminal status: `Complete`, `Error`, OR `Abandoned` (P4a folds
+    /// `Abandoned` into the same `"error"` acceptance — see
+    /// `scheduler::dependency_satisfies_run_on`) — this is what lets a
+    /// report/close task render a degraded result instead of wedging
+    /// `Planned` forever behind a failed upstream. `Abandoned` itself is
+    /// never something a document names directly; it is the scheduler's
+    /// own doing (`scheduler::cascade_abandon`): the moment ANY task
+    /// reaches `Error`, every task that transitively depends on it and
+    /// does NOT accept `"error"` is rolled to `Abandoned` eagerly, in the
+    /// same pass — so a task several hops downstream of a failure, with
+    /// `run_on: ["complete", "error"]`, sees a resolved dependency this
+    /// same pass rather than waiting on an ancestor that will never
+    /// reach `Complete`. The cascade's domain is OTHER tasks only — an
+    /// errored Task's own later, still-`Planned` steps (a multi-step
+    /// Task whose first step failed) are never touched by it; they stay
+    /// wedged `Planned` until the ordinary close-time reconcile
+    /// (`lifecycle::reconcile_phase_steps_terminal`) sweeps them, same as
+    /// any other stranded step on a stopped run. Never emptied by a
+    /// document — `mission_config::TaskConfig::run_on` is `None` on
+    /// every pre-#2310 config, which resolves to this same default at
+    /// interpret time (contract 5: read-compat, no field ever forces a
+    /// migration).
+    #[serde(default = "default_run_on")]
+    pub run_on: Vec<String>,
     /// (#1230/#1341) A Task is the ASSIGNABLE unit — like a Jira ticket
     /// assigned to one crew member, the assignee/environment/profile are
     /// properties of the whole job, fixed for its duration, not

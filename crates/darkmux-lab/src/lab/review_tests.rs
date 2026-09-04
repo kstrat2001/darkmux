@@ -5730,6 +5730,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "judge-task".to_string(),
             phase_id: "adjudicate".to_string(),
             description: "judge".to_string(),
@@ -5826,6 +5827,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "judge-task".to_string(),
             phase_id: "adjudicate".to_string(),
             description: "judge".to_string(),
@@ -5919,6 +5921,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "judge-task".to_string(),
             phase_id: "adjudicate".to_string(),
             description: "judge".to_string(),
@@ -8000,6 +8003,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-verify-task".to_string(),
             phase_id: "report".to_string(),
             description: "verify".to_string(),
@@ -8121,6 +8125,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-probe-high-task".to_string(),
             phase_id: "investigate".to_string(),
             description: "probe high".to_string(),
@@ -8195,6 +8200,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-probe-high-task".to_string(),
             phase_id: "investigate".to_string(),
             description: "probe high".to_string(),
@@ -8418,6 +8424,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-probe-high-task".to_string(),
             phase_id: "investigate".to_string(),
             description: "probe high".to_string(),
@@ -8528,6 +8535,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-probe-high-task".to_string(),
             phase_id: "investigate".to_string(),
             description: "probe high".to_string(),
@@ -8590,6 +8598,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-verify-task".to_string(),
             phase_id: "report".to_string(),
             description: "verify".to_string(),
@@ -8765,6 +8774,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-bundle-task".to_string(),
             phase_id: "investigate".to_string(),
             description: "bundle".to_string(),
@@ -8875,6 +8885,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-bundle-task".to_string(),
             phase_id: "investigate".to_string(),
             description: "bundle".to_string(),
@@ -8927,6 +8938,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let judge_task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-judge-task".to_string(),
             phase_id: "adjudicate".to_string(),
             description: "judge".to_string(),
@@ -9070,6 +9082,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-bundle-task".to_string(),
             phase_id: "investigate".to_string(),
             description: "bundle".to_string(),
@@ -9188,6 +9201,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             output: None,
         };
         let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "review-bundle-task".to_string(),
             phase_id: "investigate".to_string(),
             description: "bundle".to_string(),

@@ -162,6 +162,7 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
                 step_ids,
                 override_,
                 task_cfg.role_id.as_deref(),
+                task_cfg.run_on.as_deref(),
             )?;
             expansion_of.insert(task_cfg.id.clone(), vec![real_task_id]);
         }
@@ -292,6 +293,7 @@ pub fn interpret_grown(
             step_ids,
             None,
             task_cfg.role_id.as_deref(),
+            task_cfg.run_on.as_deref(),
         )?;
         let resolve = |relation: &str, entries: &[String]| -> Result<Vec<String>> {
             let mut resolved: Vec<String> = Vec::new();
@@ -417,6 +419,7 @@ fn push_task(
     step_ids: Vec<String>,
     override_: Option<&TaskOverride>,
     doc_role_id: Option<&str>,
+    doc_run_on: Option<&[String]>,
 ) -> Result<()> {
     // (#1284 review round 2, consider 5) Post-substitution FINAL ids must be
     // unique — a phase-id substitution collision (two documents composed
@@ -446,6 +449,7 @@ fn push_task(
         profile_name,
         workdir,
         image,
+        run_on: doc_run_on.map(|v| v.to_vec()).unwrap_or_else(crate::types::default_run_on),
     });
     Ok(())
 }
@@ -505,6 +509,7 @@ mod tests {
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             reads: Vec::new(),
             role_id: role_id.map(String::from),
+            run_on: None,
             steps,
             grow: None,
             extras: Map::new(),

@@ -1243,6 +1243,7 @@ mod tests {
 
     fn task(id: &str, deps: &[&str], step_ids: &[&str]) -> Task {
         Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: id.to_string(),
             phase_id: "p1".to_string(),
             description: format!("task {id}"),

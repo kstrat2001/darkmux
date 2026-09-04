@@ -324,6 +324,9 @@
       "display_name": "Context",
       "id": "review-context-task",
       "phase_id": "pr-review-golden-investigate",
+      "run_on": [
+        "complete"
+      ],
       "step_ids": [
         "review-context-step"
       ]
@@ -336,6 +339,9 @@
       "display_name": "Bundle",
       "id": "review-bundle-task",
       "phase_id": "pr-review-golden-investigate",
+      "run_on": [
+        "complete"
+      ],
       "step_ids": [
         "review-bundle-step"
       ]
@@ -352,6 +358,9 @@
         "review-context-task"
       ],
       "role_id": "review-probe-high",
+      "run_on": [
+        "complete"
+      ],
       "step_ids": [
         "review-probe-high-render-step",
         "review-probe-high-step",
@@ -370,6 +379,9 @@
         "review-context-task"
       ],
       "role_id": "review-probe-mid",
+      "run_on": [
+        "complete"
+      ],
       "step_ids": [
         "review-probe-mid-render-step",
         "review-probe-mid-step",
@@ -388,6 +400,9 @@
         "review-context-task"
       ],
       "role_id": "review-probe-low",
+      "run_on": [
+        "complete"
+      ],
       "step_ids": [
         "review-probe-low-render-step",
         "review-probe-low-step",
@@ -407,6 +422,9 @@
       "reads": [
         "review-context-task"
       ],
+      "run_on": [
+        "complete"
+      ],
       "step_ids": [
         "review-dedup-step"
       ]
@@ -423,6 +441,9 @@
         "review-bundle-task"
       ],
       "role_id": "review-judge",
+      "run_on": [
+        "complete"
+      ],
       "step_ids": [
         "review-judge-step"
       ]
@@ -439,6 +460,9 @@
         "review-bundle-task"
       ],
       "role_id": "review-verify",
+      "run_on": [
+        "complete"
+      ],
       "step_ids": [
         "review-verify-render-step",
         "review-verify-step",
@@ -459,6 +483,9 @@
         "review-context-task",
         "review-bundle-task"
       ],
+      "run_on": [
+        "complete"
+      ],
       "step_ids": [
         "review-synthesis-step"
       ]
@@ -473,7 +500,15 @@
       "phase_id": "pr-review-golden-report",
       "reads": [
         "review-synthesis-task",
-        "review-context-task"
+        "review-context-task",
+        "review-bundle-task",
+        "review-dedup-task",
+        "review-judge-task",
+        "review-verify-task"
+      ],
+      "run_on": [
+        "complete",
+        "error"
       ],
       "step_ids": [
         "review-report-step"

@@ -4367,6 +4367,7 @@
         save_test_phase(&minimal_phase("p1", mission_id));
 
         let task_a = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "task-a".to_string(),
             phase_id: "p1".to_string(),
             description: "task a".to_string(),
@@ -4380,6 +4381,7 @@
             image: None,
         };
         let task_b = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "task-b".to_string(),
             phase_id: "p1".to_string(),
             description: "task b".to_string(),
@@ -4393,6 +4395,7 @@
             image: None,
         };
         let task_c = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "task-c".to_string(),
             phase_id: "p1".to_string(),
             description: "task c (dedup-like)".to_string(),
@@ -4553,6 +4556,7 @@
         save_test_phase(&minimal_phase("p1", mission_id));
 
         let task_a = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "task-a".to_string(),
             phase_id: "p1".to_string(),
             description: "task a".to_string(),
@@ -4566,6 +4570,7 @@
             image: None,
         };
         let task_b = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "task-b".to_string(),
             phase_id: "p1".to_string(),
             description: "task b".to_string(),
@@ -4880,6 +4885,7 @@
 
         // Two steps: one that ran (has a flow record), one that never did.
         let mk_task = |id: &str, step: &str| Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: id.to_string(),
             phase_id: phase_id.to_string(),
             description: format!("task {id}"),
@@ -4968,6 +4974,7 @@
         save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
         save_test_phase(&minimal_phase(phase_id, mission_id));
         let task = Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "t1".to_string(),
             phase_id: phase_id.to_string(),
             description: "t1".to_string(),
@@ -5046,6 +5053,7 @@
         save_test_phase(&minimal_phase(phase_id, mission_id));
 
         let task = Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "verify-task".to_string(),
             phase_id: phase_id.to_string(),
             description: "verify-task".to_string(),

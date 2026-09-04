@@ -267,6 +267,7 @@ mod tests {
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             reads: Vec::new(),
             role_id: None,
+            run_on: None,
             steps,
             enabled,
             grow: None,
