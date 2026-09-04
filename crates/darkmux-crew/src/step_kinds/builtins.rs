@@ -353,7 +353,16 @@ impl StepKind for DispatchInternalStepKind {
             .workdir
             .clone()
             .or_else(|| config_str(step, "workdir").map(std::path::PathBuf::from));
-        let phase_id = config_str(step, "phase_id").map(str::to_string);
+        // The owning Task names the phase for every step minted from a mission
+        // config; the step config's own `phase_id` (the crew-of-one's way of
+        // passing the CLI's `--phase`) wins when present. Without the task
+        // fallback a config-launched dispatch left with no phase and so no
+        // mission on its records: no drill link from the mission view, no
+        // events in the sheet, no token attribution (2026-09-04, the grown
+        // follow-on steps of a crawl).
+        let phase_id = config_str(step, "phase_id")
+            .map(str::to_string)
+            .or_else(|| (!task.phase_id.is_empty()).then(|| task.phase_id.clone()));
         let session_id = config_str(step, "session_id")
             .map(str::to_string)
             .unwrap_or_else(|| darkmux_types::session_id::step(&step.id));
