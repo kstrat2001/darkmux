@@ -1168,9 +1168,12 @@ fn run_funnel_case(
         // no Mission is ever minted for it, so `None` here matches the
         // `--charges-file` path's own honest `None`.
         mission_id: None,
+        // (#2310 P1 fix) Bench never overrides `review.context`'s
+        // resolution — it resolves for real, the same as production.
+        context_test_overrides: Default::default(),
     });
 
-    let graph = review::build_review_graph(
+    let mut graph = review::build_review_graph(
         step_ctx.clone(),
         &bundle_spec,
         judge.clone(),
@@ -1182,6 +1185,24 @@ fn run_funnel_case(
         darkmux_types::config_access::review_judge_concurrency(),
     )
     .with_context(|| format!("building review graph for case {}", c.id))?;
+    // (#2310 P1) `review.context`'s production default (`default_context_
+    // path`) resolves the mission that owns the step's phase — but a bench
+    // run mints no real Mission (lab-vs-fleet boundary, same reasoning as
+    // `mission_id: None` a few lines above), so that lookup has nothing to
+    // find here. Stamp an explicit `context_out` under the OS temp dir
+    // instead — the same "harmless scratch, not user state" scoping
+    // `write_temp_diff` already uses for this bench harness's diff file.
+    if let Some(context_step) = graph.steps.get_mut("review-context-step") {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let context_out = std::env::temp_dir().join(format!(
+            "darkmux-review-bench-{}-{}-{ts}-context.json",
+            c.id,
+            std::process::id()
+        ));
+        let mut cfg = context_step.config.clone();
+        cfg["context_out"] = serde_json::json!(context_out.display().to_string());
+        context_step.config = cfg;
+    }
     let fingerprint_val = review::fingerprint(&judge_identifier, &step_ctx.judge_system);
     let staffing_snapshot =
         review::staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);

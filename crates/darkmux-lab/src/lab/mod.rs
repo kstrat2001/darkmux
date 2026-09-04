@@ -27,6 +27,7 @@ pub mod registry;
 // → dedup → double-confirm judge → envelope.
 pub mod review;
 pub mod review_bench;
+pub mod review_context;
 pub mod run;
 pub mod sandbox_hash;
 // (#1198) scores.json — the bench suite's persisted score artifact (#1197).

@@ -47,9 +47,11 @@ use anyhow::Result;
 use darkmux_crew::resourcing::{ResolvedReviewRoles, ResolvedSeatStaffing};
 use darkmux_lab::lab::review::{
     build_review_graph, fingerprint, run_review_graph, seat_identifier, staffing_snapshot, BundleBuildSpec,
-    BundleInput, BundleSourceSpec, ChatCall, ExecMode, NullEmitter, ReviewStepContext,
+    BundleInput, BundleSourceSpec, ChatCall, ExecMode, NullEmitter, ReviewContextStepKind, ReviewContextTestOverrides,
+    ReviewStepContext,
 };
 use darkmux_crew::single_shot::SingleShotReply;
+use darkmux_crew::step_kinds::StepKind as _;
 use darkmux_types::ProfileModel;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -390,6 +392,17 @@ fn step_ctx(
             Ok(vec![billing_bundle(), auth_bundle(), docs_bundle(), config_bundle()])
         })),
         mission_id: None,
+        // (#2310 P1 fix) `review-context-step` now reads its test overrides
+        // off this bus seam, not step config — mirror the three fixture
+        // prompts + two budget knobs above so a full `run_review_graph` run
+        // resolves the SAME text `chat_fn` discriminates on.
+        context_test_overrides: ReviewContextTestOverrides {
+            probe_system: Some("You are the review-conformance PROBE seat.".to_string()),
+            judge_system: Some("You are the review-conformance JUDGE seat.".to_string()),
+            verify_system: Some("You are the review-conformance VERIFY seat.".to_string()),
+            remote_max_tokens_per_execution: Some(500_000),
+            judge_exhaustion_strict: Some(false),
+        },
     })
 }
 
@@ -646,6 +659,18 @@ fn review_bundle_step_runs_the_real_bundler_over_a_worktree() {
         // run_streaming`'s real `else` branch runs.
         bundle_override: None,
         mission_id: None,
+        // (#2310 P1 fix) `review-context-step` now reads its test overrides
+        // off this bus seam, not step config — mirror the three fixture
+        // prompts above so this hermetic scenario's `chat_fn` (which
+        // discriminates by system-prompt/bundle-content substring) still
+        // sees the fixture text it was written against.
+        context_test_overrides: ReviewContextTestOverrides {
+            probe_system: Some("You are the review-conformance PROBE seat.".to_string()),
+            judge_system: Some("You are the review-conformance JUDGE seat.".to_string()),
+            verify_system: Some("You are the review-conformance VERIFY seat.".to_string()),
+            remote_max_tokens_per_execution: Some(500_000),
+            judge_exhaustion_strict: Some(false),
+        },
     });
 
     let bundle_spec = BundleBuildSpec {
@@ -661,7 +686,7 @@ fn review_bundle_step_runs_the_real_bundler_over_a_worktree() {
     let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
     let crew_name = ctx.roles.distinct_profile_names();
 
-    let graph = build_review_graph(
+    let mut graph = build_review_graph(
         ctx.clone(),
         &bundle_spec,
         judge,
@@ -673,6 +698,25 @@ fn review_bundle_step_runs_the_real_bundler_over_a_worktree() {
         1,
     )
     .expect("the shipped review.json builds cleanly over a real worktree bundle spec");
+    // (#2310 P1) `review.context` resolves its OWN mission dir from the
+    // task's phase record (`default_context_path`) — a real
+    // `mission launch review` mints one; this hermetic test builds the
+    // graph directly with no Mission/Phase ever written to disk, so it
+    // uses the same `context_out` escape hatch `crawl.plan`'s tests use
+    // (`plan_out`) instead of minting one just to satisfy the lookup.
+    {
+        let context_step = graph
+            .steps
+            .get_mut("review-context-step")
+            .expect("the shipped review.json declares a review-context-step");
+        let mut cfg = context_step.config.clone();
+        cfg["context_out"] = serde_json::json!(home.path().join("review-context.json").display().to_string());
+        // (#2310 P1 fix) The three fixture prompts + two budget knobs are
+        // now carried on `ctx.context_test_overrides` (set at construction
+        // above) — the bus seam `run_review_graph` seeds from `ctx`, not a
+        // step-config key.
+        context_step.config = cfg;
+    }
 
     let (env, steps) = run_review_graph(
         &ctx,
@@ -831,7 +875,7 @@ fn review_pipeline_matches_the_committed_golden() {
     let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
     let crew_name = ctx.roles.distinct_profile_names();
 
-    let graph = build_review_graph(
+    let mut graph = build_review_graph(
         ctx.clone(),
         &dummy_bundle_spec(),
         judge,
@@ -849,6 +893,23 @@ fn review_pipeline_matches_the_committed_golden() {
         1,
     )
     .expect("the shipped review.json builds cleanly");
+    // (#2310 P1) See the identical comment in
+    // `review_bundle_step_runs_the_real_bundler_over_a_worktree` — this
+    // hermetic test mints no Mission/Phase, so `review.context`'s config
+    // needs the `context_out` escape hatch.
+    {
+        let context_step = graph
+            .steps
+            .get_mut("review-context-step")
+            .expect("the shipped review.json declares a review-context-step");
+        let mut cfg = context_step.config.clone();
+        cfg["context_out"] = serde_json::json!(home.path().join("review-context.json").display().to_string());
+        // (#2310 P1 fix) The three fixture prompts + two budget knobs are
+        // now carried on `ctx.context_test_overrides` (set at construction
+        // above) — the bus seam `run_review_graph` seeds from `ctx`, not a
+        // step-config key.
+        context_step.config = cfg;
+    }
 
     let (env, steps) = run_review_graph(
         &ctx,
@@ -968,5 +1029,268 @@ fn review_pipeline_matches_the_committed_golden() {
          DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN=1 cargo test -p darkmux-lab --test review_conformance\n\
          then review the diff before committing.",
         golden_path().display()
+    );
+}
+
+// ─── #2310 P1: `review.context` step kind, standalone ─────────────────────
+
+fn context_step_golden_path() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/review-conformance/context.json"))
+}
+
+fn context_fixture_staffing() -> ResolvedReviewRoles {
+    ResolvedReviewRoles {
+        probes: vec![ResolvedSeatStaffing {
+            name: "fast".to_string(),
+            role_id: Some("review-probe-only".to_string()),
+            pm: ProfileModel { id: "probe-model".to_string(), n_ctx: Some(32_000), ..Default::default() },
+            k: 1,
+            passes: 1,
+            max_tokens: None,
+            selector: None,
+            provenance: None,
+        }],
+        judge: ResolvedSeatStaffing {
+            name: "fast".to_string(),
+            role_id: None,
+            pm: ProfileModel { id: "judge-model".to_string(), n_ctx: Some(32_000), ..Default::default() },
+            k: 1,
+            passes: 2,
+            max_tokens: None,
+            selector: None,
+            provenance: None,
+        },
+        verify: None,
+        request_changes: false,
+        warnings: vec![],
+    }
+}
+
+/// (#2310 P1) `review.context` in isolation — no graph, no launcher: a
+/// fixture `Step`/`Task` in, an `Output<ReviewContext>` out, compared
+/// key-for-key (sorted) against a committed golden. `context_out` names an
+/// explicit tempdir path (the `plan_out`-style escape hatch — see
+/// `ReviewContextStepConfig`'s own doc), so this needs no `DARKMUX_HOME`
+/// scoping to stay off the operator's real `~/.darkmux`.
+#[test]
+fn review_context_step_matches_the_committed_golden() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let diff_file = dir.path().join("pr.diff");
+    std::fs::write(&diff_file, "--- a/x.ts\n+++ b/x.ts\n@@ -1 +1 @@\n-old\n+new\n").expect("write diff");
+    let out_path = dir.path().join("context.json");
+
+    let step = darkmux_crew::types::Step {
+        id: "review-context-step".to_string(),
+        task_id: "review-context-task".to_string(),
+        gate: None,
+        kind: "review.context".to_string(),
+        status: darkmux_crew::types::NodeStatus::default(),
+        config: serde_json::json!({
+            "diff_file": diff_file.display().to_string(),
+            "intent_title": "Fix the thing",
+            "intent_body": "A short description.",
+            "case_id": "context-golden-case",
+            "timeout_seconds": 45,
+            "staffing": serde_json::to_value(context_fixture_staffing()).expect("staffing serializes"),
+            "context_out": out_path.display().to_string(),
+        }),
+        started_ts: None,
+        completed_ts: None,
+        output: None,
+    };
+    let task = darkmux_crew::types::Task {
+        id: "review-context-task".to_string(),
+        phase_id: "investigate".to_string(),
+        description: "context".to_string(),
+        display_name: None,
+        step_ids: vec!["review-context-step".to_string()],
+        depends_on: Vec::new(),
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    let input = std::collections::BTreeMap::new();
+
+    let kind = ReviewContextStepKind;
+    let outcome = kind.run(&step, &task, &input).expect("review.context step completes on a valid fixture");
+
+    // The step's own output is a `ref` pointer — read the file it names.
+    let written = std::fs::read_to_string(&out_path).expect("reading the written context file");
+    assert!(outcome.output.contains(&out_path.display().to_string()), "Step.output must ref the written path");
+    let envelope: serde_json::Value = serde_json::from_str(&written).expect("context.json parses");
+    assert_eq!(envelope["kind"], serde_json::json!("review.context"));
+    let body = envelope.get("body").expect("envelope carries a body").clone();
+    let body_sorted = sort_keys(body);
+
+    let pretty = serde_json::to_string_pretty(&body_sorted).expect("pretty-print");
+    if std::env::var("DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN").is_ok() {
+        std::fs::write(context_step_golden_path(), format!("{pretty}\n")).expect("write golden");
+        return;
+    }
+    let expected = std::fs::read_to_string(context_step_golden_path()).unwrap_or_else(|_| {
+        panic!(
+            "missing golden at {} — run with DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN=1 to generate it",
+            context_step_golden_path().display()
+        )
+    });
+    assert_eq!(
+        pretty.trim_end(),
+        expected.trim_end(),
+        "`review.context`'s output body drifted from the committed golden at {}",
+        context_step_golden_path().display()
+    );
+}
+
+/// (#2310 P1 fix, mutation/red-proof) A `judge_system_override` (or any of
+/// its four siblings) named in `Step.config` — the shape an operator-tier
+/// `~/.darkmux/mission-configs/review.json` could set — must have NO
+/// effect. Before this fix these five keys were read straight off
+/// `Step.config` and applied over the real `role_prompt("review-judge")`
+/// text, so a user-tier config could silently replace the FROZEN judge
+/// prompt (#1256). They now live ONLY on the bus-only
+/// `ReviewContextTestOverrides` seam (`ReviewStepContext::
+/// context_test_overrides`), reachable exclusively by in-process test code
+/// that seeds the `ArtifactBus` directly — never by a config file. This
+/// test calls `ReviewContextStepKind::run` (the ctx-free path with no bus
+/// at all, so it can carry NO override regardless of what's stamped on
+/// config) with all five `*_override` keys present in `Step.config`, and
+/// asserts the resolved prompts/budget/policy are the REAL values
+/// `resolve_review_context` computes — proving the config keys are dead.
+#[test]
+fn review_context_step_config_level_overrides_have_no_effect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let diff_file = dir.path().join("pr.diff");
+    std::fs::write(&diff_file, "--- a/x.ts\n+++ b/x.ts\n@@ -1 +1 @@\n-old\n+new\n").expect("write diff");
+    let out_path = dir.path().join("context.json");
+
+    let step = darkmux_crew::types::Step {
+        id: "review-context-step".to_string(),
+        task_id: "review-context-task".to_string(),
+        gate: None,
+        kind: "review.context".to_string(),
+        status: darkmux_crew::types::NodeStatus::default(),
+        config: serde_json::json!({
+            "diff_file": diff_file.display().to_string(),
+            "intent_title": "Fix the thing",
+            "intent_body": "A short description.",
+            "case_id": "context-override-red-proof-case",
+            "timeout_seconds": 45,
+            "staffing": serde_json::to_value(context_fixture_staffing()).expect("staffing serializes"),
+            "context_out": out_path.display().to_string(),
+            // THE ATTACK: a hand-authored `review.json` (or a user-tier
+            // variant) trying to hijack the frozen prompts / budget /
+            // policy through step config.
+            "probe_system_override": "HIJACKED PROBE PROMPT",
+            "judge_system_override": "HIJACKED JUDGE PROMPT",
+            "verify_system_override": "HIJACKED VERIFY PROMPT",
+            "remote_max_tokens_per_execution_override": 1,
+            "judge_exhaustion_strict_override": true,
+        }),
+        started_ts: None,
+        completed_ts: None,
+        output: None,
+    };
+    let task = darkmux_crew::types::Task {
+        id: "review-context-task".to_string(),
+        phase_id: "investigate".to_string(),
+        description: "context".to_string(),
+        display_name: None,
+        step_ids: vec!["review-context-step".to_string()],
+        depends_on: Vec::new(),
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    let input = std::collections::BTreeMap::new();
+
+    let kind = ReviewContextStepKind;
+    let outcome = kind.run(&step, &task, &input).expect("review.context step completes despite the config attack");
+
+    let written = std::fs::read_to_string(&out_path).expect("reading the written context file");
+    assert!(outcome.output.contains(&out_path.display().to_string()), "Step.output must ref the written path");
+    let envelope: serde_json::Value = serde_json::from_str(&written).expect("context.json parses");
+    let body = envelope.get("body").expect("envelope carries a body");
+
+    let real_judge_system = darkmux_crew::loader::role_prompt("review-judge")
+        .expect("the shipped review-judge role always has a system prompt");
+    let real_verify_system = darkmux_crew::loader::role_prompt("review-verify")
+        .expect("the shipped review-verify role always has a system prompt");
+    assert_eq!(
+        body["judge_system"].as_str(),
+        Some(real_judge_system.as_str()),
+        "a config-level `judge_system_override` must not reach the resolved context — the frozen \
+         judge prompt must survive unhijacked"
+    );
+    assert_ne!(body["judge_system"].as_str(), Some("HIJACKED JUDGE PROMPT"), "the attack must not land");
+    assert_eq!(
+        body["verify_system"].as_str(),
+        Some(real_verify_system.as_str()),
+        "a config-level `verify_system_override` must not reach the resolved context"
+    );
+    assert_ne!(body["verify_system"].as_str(), Some("HIJACKED VERIFY PROMPT"), "the attack must not land");
+    assert_ne!(
+        body["probe_system"].as_str(),
+        Some("HIJACKED PROBE PROMPT"),
+        "a config-level `probe_system_override` must not reach the resolved context"
+    );
+    assert_ne!(
+        body["remote_max_tokens_per_execution"].as_u64(),
+        Some(1),
+        "a config-level `remote_max_tokens_per_execution_override` must not reach the resolved context — \
+         the real `config_access` value must survive"
+    );
+    // `judge_exhaustion_strict_override: true` is a WEAKER red-proof (the
+    // real default happens to also be resolvable as `true` in some
+    // environments), so this only asserts the field type/shape round-trips
+    // — the budget + prompt assertions above are what actually pin the fix.
+    assert!(body["judge_exhaustion_strict"].is_boolean(), "the field must still be a real boolean, not hijacked");
+}
+
+/// (#2310 P1 mutation/red-proof) A step config missing BOTH `diff_file` and
+/// `diff` must refuse by NAME — the #1269 "loud at consumption" contract —
+/// never silently default to an empty diff.
+#[test]
+fn review_context_step_missing_diff_is_a_named_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let step = darkmux_crew::types::Step {
+        id: "review-context-step".to_string(),
+        task_id: "review-context-task".to_string(),
+        gate: None,
+        kind: "review.context".to_string(),
+        status: darkmux_crew::types::NodeStatus::default(),
+        config: serde_json::json!({
+            "case_id": "context-missing-diff-case",
+            "staffing": serde_json::to_value(context_fixture_staffing()).expect("staffing serializes"),
+            "context_out": dir.path().join("context.json").display().to_string(),
+        }),
+        started_ts: None,
+        completed_ts: None,
+        output: None,
+    };
+    let task = darkmux_crew::types::Task {
+        id: "review-context-task".to_string(),
+        phase_id: "investigate".to_string(),
+        description: "context".to_string(),
+        display_name: None,
+        step_ids: vec!["review-context-step".to_string()],
+        depends_on: Vec::new(),
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    let input = std::collections::BTreeMap::new();
+
+    let kind = ReviewContextStepKind;
+    let err = kind.run(&step, &task, &input).expect_err("a config with neither diff_file nor diff must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("diff_file") && msg.contains("config.diff"),
+        "the error must name BOTH accepted config keys so the fix is obvious, got: {msg}"
     );
 }

@@ -78,7 +78,15 @@ pub enum Capability {
 /// capped by the `Capability` variant count).
 pub type CapabilityProfile = BTreeMap<Capability, f32>;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// (#2310 P1) `PartialEq` added so `ProfileModel` can compose into
+// `ResolvedSeatStaffing`/`ResolvedReviewRoles` (darkmux-crew's
+// resourcing.rs) and, through those, into `darkmux-lab`'s `ReviewContext`
+// step-output body — see that struct's own doc. Every field already
+// supports it (`CapabilityProfile` is a `BTreeMap<Capability, f32>`,
+// `Capability`/`ModelEndpoint` both derive `PartialEq`, and
+// `serde_json::Map`'s does too), so this is additive, not a new
+// obligation on existing fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProfileModel {
     pub id: String,
     /// Context window. For a LOCAL model this is the load parameter (a
@@ -572,7 +580,10 @@ pub const PROFILES_SCHEMA_VERSION: &str = "1.5";
 /// [`crate`]-external `ResolvedSeatStaffing` (the resourcing resolver's
 /// per-seat output); the declared `crews` map that once held it retired in
 /// the 2.0 crew-registry dissolution (#1426 ship-2).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// (#2310 P1) `PartialEq` added — same reason as `ProfileModel`'s own note:
+// this is a field of `ResolvedSeatStaffing`, which needs it to compose into
+// `ReviewContext`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BundleSelector {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fact_families: Vec<String>,

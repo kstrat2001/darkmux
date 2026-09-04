@@ -83,7 +83,15 @@ impl StaffingProvenance {
 /// `run_review_graph`'s caller-seed before any step reads it (see
 /// `Port::artifact`'s doc on why a factory can only build a context-free
 /// default). Never constructed as a real staffing anywhere else.
-#[derive(Debug, Clone, Default)]
+///
+/// (#2310 P1) `Serialize`/`Deserialize`/`PartialEq` added so this can ride
+/// as DATA on `darkmux-lab`'s `ReviewContext` step-output body — the
+/// `review.context` step kind's config carries the resolved staffing as
+/// JSON and needs a round-trip, and the mutation test (drop a field, the
+/// typed read fails by name) needs `PartialEq` for the golden comparison.
+/// Every field is itself `Serialize`/`Deserialize`/`PartialEq` already
+/// (`ProfileModel` gained `PartialEq` in the same packet).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedSeatStaffing {
     /// The [`Profile`](darkmux_types::Profile) name this seat's role resolved to
     /// (via the role→profile flip) and dispatches through.
@@ -125,7 +133,11 @@ pub struct ResolvedSeatStaffing {
 /// (#1530 Packet 3a) `Default` derives cleanly — see
 /// [`ResolvedSeatStaffing`]'s own doc on why and its one consumer
 /// (`ReviewStepContext`'s context-free `ArtifactBus` factory default).
-#[derive(Debug, Clone, Default)]
+///
+/// (#2310 P1) `Serialize`/`Deserialize`/`PartialEq` added for the same
+/// reason as `ResolvedSeatStaffing`'s own doc note — this is the `roles`
+/// field's type on `ReviewContext`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedReviewRoles {
     pub probes: Vec<ResolvedSeatStaffing>,
     pub judge: ResolvedSeatStaffing,
