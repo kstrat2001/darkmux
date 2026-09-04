@@ -67,7 +67,7 @@ test('tokens with no endpoint evidence are not credited to local', async ({ page
   // split lives in the meter's tooltip. The #1607 guard is unchanged in
   // spirit: cloud tokens must never be counted as local.
   const split = await page.locator('.missionlens .mmeter').getAttribute('title');
-  expect(meter, `meter read: ${meter}`).toContain('15.0k tok');
+  expect(meter, `meter read: ${meter}`).toContain('15k tok');
   expect(meter).toContain('cloud');
   expect(split, `split read: ${split}`).toContain('3.0k local');
   expect(split).toContain('unattributed');
@@ -104,8 +104,9 @@ test('a page opened AFTER the run agrees with one watched live', async ({ page }
   await expect(page.locator('.missionlens .mmeter')).toBeVisible();
 
   const meter = (await page.locator('.missionlens .mmeter').innerText()).replace(/\s+/g, ' ');
-  expect(meter, `meter read: ${meter}`).toContain('3.0k local');
-  expect(meter).toContain('5.0k cloud');
-  expect(meter, 'the errored hosted seat stays unattributed').toContain('unattributed');
+  const split = await page.locator('.missionlens .mmeter').getAttribute('title');
+  expect(meter, `meter read: ${meter}`).toContain('5.0k cloud');
+  expect(split, `split read: ${split}`).toContain('3.0k local');
+  expect(split, 'the errored hosted seat stays unattributed').toContain('unattributed');
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });

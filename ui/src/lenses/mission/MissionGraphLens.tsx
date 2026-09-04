@@ -674,7 +674,7 @@ export function MissionGraphLens({
           numbers and controls never move. */}
       <div className="top missionlens__top">
         <div className="mhead-id">
-          <span className="midname" title={graph.mission_id + " — tap to copy"} onClick={copyId}>
+          <span className="midname" title={graph.mission_id} data-mission-id={graph.mission_id} onClick={copyId}>
             {idParts.name}
           </span>
           <WorkStatus status={status} className="mstatus" />

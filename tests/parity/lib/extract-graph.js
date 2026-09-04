@@ -248,7 +248,13 @@ async function extractTimelineGolden(page) {
  * legend button labels, the live pill) — that's real, DIFFERENT chrome (a
  * real app-shell masthead sits above this lens too), not a parity target. */
 async function extractPortHeaderText(page) {
-  const missionId = (await page.locator(".missionlens .midname").textContent().catch(() => "")) || "";
+  // (#2332) The header SHOWS the id's name (epoch stripped, hash in the
+  // sub-line) and carries the full id on `data-mission-id` (and `title`);
+  // the parity fact is the full id, so read the attribute, falling back to
+  // the text for an id the name-split leaves whole.
+  const nameEl = page.locator(".missionlens .midname");
+  const missionId =
+    (await nameEl.getAttribute("data-mission-id").catch(() => null)) || (await nameEl.textContent().catch(() => "")) || "";
   const status = (await page.locator(".missionlens .mstatus").textContent().catch(() => "")) || "";
   return normalize(`${missionId.trim()} | ${status.trim()}`);
 }
