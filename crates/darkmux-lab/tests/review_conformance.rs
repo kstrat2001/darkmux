@@ -1616,6 +1616,146 @@ fn review_pipeline_errored_scenario_matches_the_committed_golden() {
     );
 }
 
+/// (#2310 P4a review fix M1/M2) The OPERATOR-FACING artifact test: reads
+/// the EMITTED payload `review-report-step` itself writes (the comment
+/// file + the envelope_out JSON), never `run_review_graph`'s in-memory
+/// return value directly — that's what an operator/CI actually sees.
+/// Before this fix, `report_ran` flipping `true` (the step now runs on
+/// this errored graph, #2310 P4a) silently regressed the emitted
+/// artifact: the step's own hard-fail-on-missing-synthesis-output path
+/// produced a payload naming a "missing depends_on edge" config excuse
+/// instead of the judge panic that actually happened, and the launcher's
+/// `report_ran` fallback (which USED to render the rich envelope) never
+/// fired because the step had already (wrongly) "succeeded".
+#[test]
+#[serial_test::serial]
+fn errored_scenario_emitted_payload_carries_the_real_failure_not_a_config_excuse() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _guard = HomeGuard::set(home.path());
+
+    let ctx = errored_step_ctx();
+    let judge = ctx.roles.judge.clone();
+    let verify = ctx.roles.verify.clone();
+    let probes = ctx.roles.probes.clone();
+
+    let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+    let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+    let crew_name = ctx.roles.distinct_profile_names();
+
+    let mut graph = build_review_graph(
+        ctx.clone(),
+        &dummy_bundle_spec(),
+        judge,
+        verify,
+        &probes,
+        "investigate",
+        "adjudicate",
+        "report",
+        1,
+    )
+    .expect("the shipped review.json builds cleanly");
+    {
+        let context_step = graph
+            .steps
+            .get_mut("review-context-step")
+            .expect("the shipped review.json declares a review-context-step");
+        let mut cfg = context_step.config.clone();
+        cfg["context_out"] = serde_json::json!(home.path().join("review-context.json").display().to_string());
+        context_step.config = cfg;
+    }
+
+    let emit_path = home.path().join("comment.json");
+    let envelope_out_path = home.path().join("envelope.json");
+    {
+        let report_step = graph
+            .steps
+            .get_mut("review-report-step")
+            .expect("the shipped review.json declares a review-report-step");
+        report_step.config = serde_json::json!({
+            "emit": emit_path.display().to_string(),
+            "envelope_out": envelope_out_path.display().to_string(),
+        });
+    }
+
+    let (driver_env, steps) = run_review_graph(
+        &ctx,
+        &crew_name,
+        ExecMode::Sequential,
+        fingerprint_val,
+        staffing_snap,
+        graph,
+        &mut NullEmitter,
+        &mut |_step| {},
+    )
+    .expect("run_review_graph itself must still return Ok — a step ERROR is not a hard Err out of this call");
+
+    // The step itself must have RUN (this is #2310 P4a's whole point) and
+    // COMPLETED — not stayed Planned, not itself errored.
+    let report_step = steps.get("review-report-step").expect("review.json declares review-report-step");
+    assert_eq!(report_step.status, darkmux_crew::types::NodeStatus::Complete);
+
+    // (a) The EMITTED comment names the judge's real failure text, never
+    // a "must depends_on/reads review-synthesis-task" config excuse.
+    let comment_json = std::fs::read_to_string(&emit_path).expect("the step must have written the emit file");
+    let comment_payload: serde_json::Value =
+        serde_json::from_str(&comment_json).expect("emitted payload must be valid JSON");
+    let comment_text = comment_payload["comment"].as_str().expect("payload has a comment field");
+    // The judge step PANICS inside a spawned thread (`errored_chat_fn`'s
+    // own doc) — `run_bounded` reconciles a panicking job to a terminal
+    // `NodeStatus::Error` whose recorded `output` is its OWN wrapping
+    // message (the raw panic payload goes to stderr, per #1452 — see
+    // `run_step_graph_panicking_step_persists_terminal_error_never_
+    // running`, darkmux-crew). THIS is the real failure text that must
+    // travel all the way from the judge step, through `cascade_abandon`'s
+    // origin-propagation and `gather_inputs`'s run_on-aware forwarding,
+    // into the report step's own rendered comment — the SAME text the
+    // committed golden's `degenerate` field already names.
+    assert!(
+        comment_text.contains("review-judge-step:")
+            && comment_text.contains("a dispatch job panicked mid-wave")
+            && comment_text.contains("#1452"),
+        "the emitted comment must name the judge step's REAL recorded failure text, got: {comment_text}"
+    );
+    assert!(
+        !comment_text.contains("depends_on") && !comment_text.contains("no `review.envelope` output"),
+        "the emitted comment must never fall back to naming a config-shaped excuse: {comment_text}"
+    );
+
+    // (b) mode == "degraded".
+    assert_eq!(comment_payload["mode"], "degraded");
+
+    // (c) crew/staffing/bundle count present in the emitted envelope_out.
+    let envelope_json =
+        std::fs::read_to_string(&envelope_out_path).expect("the step must have written envelope_out");
+    let emitted_env: serde_json::Value =
+        serde_json::from_str(&envelope_json).expect("envelope_out must be valid JSON");
+    assert_eq!(emitted_env["crew"], serde_json::json!(crew_name), "crew must survive into the emitted envelope");
+    assert!(emitted_env["staffing"].is_object(), "staffing must survive into the emitted envelope");
+    assert_eq!(emitted_env["bundles"], serde_json::json!(4), "the bundle count must survive into the emitted envelope");
+    // (M2) case_id is pinned, not left at a hardcoded/default placeholder.
+    assert_eq!(emitted_env["case_id"], serde_json::json!("review-conformance-errored-case"));
+
+    // The emitted envelope equals the driver's OWN `run_review_graph`
+    // return value (`driver_env`) BYTE-FOR-BYTE, including `degenerate`
+    // — the step's independent, input-scoped reconstruction and the
+    // driver's full-`steps`-map reconstruction agree exactly, because
+    // `ReviewReportStepKind::run_streaming` wraps its propagated origin
+    // reason in the SAME "review graph: N step(s) errored, zero usable
+    // signal --" framing `errored_steps_degenerate_reason` (the driver's
+    // own source) uses, rather than leaving it bare.
+    let driver_value = canonicalize(serde_json::to_value(&driver_env).expect("driver env serializes"));
+    let emitted_value = canonicalize(emitted_env);
+    assert_eq!(
+        driver_value, emitted_value,
+        "the step's independently-reconstructed envelope must match the driver's own envelope byte-for-byte"
+    );
+    let degenerate = driver_value["degenerate"].as_str().unwrap_or_default();
+    assert!(
+        degenerate.contains("review-judge-step:") && degenerate.contains("a dispatch job panicked mid-wave") && degenerate.contains("#1452"),
+        "degenerate text must name the judge step's real recorded failure, got: {degenerate}"
+    );
+}
+
 /// (#2310 P4a, supersedes #2345 C1's premise) `review-report-task`
 /// declares `run_on: ["complete", "error"]` (review.json) and the
 /// scheduler's `cascade_abandon` (darkmux-crew) rolls

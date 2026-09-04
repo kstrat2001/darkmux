@@ -7194,55 +7194,94 @@ impl StepKind for ReviewSynthesisStepKind {
 
 // ─── report: report (terminal step, #2310 P3) ───────────────────────────
 
-/// (#2310 P4a) `envelope_from_input` found no `review-synthesis-task`
-/// output — build a minimal, self-describing DEGRADED [`ReviewEnvelope`]
-/// so [`ReviewReportStepKind::run`] can still render+emit through
-/// `render_and_emit_review` instead of hard-failing (#1486: blocked work
-/// must be as reasoned as running work). Deliberately NARROWER than
-/// `run_review_graph`'s own fallback (`fallback_env`/the
-/// `report.errored`-non-empty branch, both in this file): `StepKind::run`
-/// sees only THIS task's own gathered `input` (`review-synthesis-task`/
-/// `review-context-task`, per `review-report-task`'s `reads`), never the
-/// whole graph's `steps` map, so it cannot fold bundle/dedup/judge/verify
-/// outputs the way that richer reconstruction does — it degrades honestly
-/// with the identity it can actually recover (the context task's
-/// `case_id`, when that task ran) plus the one thing it always has: WHY.
-fn degraded_report_envelope(
-    input: &std::collections::BTreeMap<String, String>,
+/// (#2310 P4a review fix M1) The ONE degraded-[`ReviewEnvelope`]
+/// builder — used by BOTH `run_review_graph`'s errored branch (walks the
+/// whole run's `steps` map for whichever typed output completed) AND
+/// [`ReviewReportStepKind::run_streaming`] (reads only its own gathered
+/// `input` — `review.json`'s `review-report-task` now `reads` bundle/
+/// dedup/judge/verify directly, the same four `review-synthesis-task`
+/// already reads, so both callers can hand it the SAME shape of typed
+/// data). One builder, not two hand-rolled copies that can silently
+/// drift apart.
+///
+/// Identity (`case_id`/`crew`/`mode`/`fingerprint`/`staffing`/
+/// `interpret_warnings`) is taken as discrete fields rather than a
+/// `&ReviewStepContext` on purpose: `run_review_graph` MOVES its own
+/// `ReviewStepContext` (`run_ctx_artifact`) into `seed_artifacts` before
+/// the graph ever runs, so by the time its errored branch executes that
+/// value is gone — the caller there already holds these same facts as
+/// separate locals (`ctx.case_id`/`crew_name`/`mode_label(mode)`/
+/// `fingerprint_val`/`staffing`/`interpret_warnings`) and can pass them
+/// straight through; the step-side caller reads them off the SAME
+/// `ReviewStepContext` shape via the bus artifact instead.
+///
+/// `fold_review_outputs_into_envelope` (this file) folds whichever of
+/// `bundle`/`dedup`/`judge`/`verify` are `Some` — `None` for a stage
+/// that never completed, exactly like a clean run's
+/// `ReviewSynthesisStepKind::run_streaming` folds `Some` for every one
+/// of them. `reason` becomes `env.degenerate` ONLY if the fold left it
+/// unset — a dedup/judge stage's OWN, more specific degenerate reason
+/// (e.g. "zero flags from all probe draws") always wins over the
+/// generic "N step(s) errored" framing `reason` usually carries.
+#[allow(clippy::too_many_arguments)]
+fn degraded_review_envelope(
+    case_id: &str,
+    crew: &str,
+    mode: &str,
+    fingerprint: serde_json::Value,
+    staffing: Option<StaffingSnapshot>,
+    interpret_warnings: &[String],
+    bundle: Option<&BundleSetOutput>,
+    dedup: Option<&DedupOutput>,
+    judge: Option<&JudgeOutput>,
+    verify: Option<&VerifyOutput>,
     reason: String,
 ) -> ReviewEnvelope {
-    let case_id = find_by_kind::<ReviewContext>(
-        "review.report",
-        "review-report-step",
-        input,
-        review_context::REVIEW_CONTEXT_OUTPUT_KIND,
-    )
-    .ok()
-    .flatten()
-    .map(|o| o.body.case_id)
-    .unwrap_or_else(|| "unknown".to_string());
-    ReviewEnvelope {
-        case_id,
-        degenerate: Some(reason),
-        degenerate_kind: Some(DegenerateKind::Error),
+    let mut env = ReviewEnvelope {
+        case_id: case_id.to_string(),
+        crew: crew.to_string(),
+        mode: mode.to_string(),
+        fingerprint,
+        staffing,
         ..ReviewEnvelope::default()
+    };
+    env.warnings.extend(interpret_warnings.iter().cloned());
+    fold_review_outputs_into_envelope(&mut env, bundle, dedup, judge, verify);
+    if env.degenerate.is_none() {
+        env.degenerate = Some(reason);
+        env.degenerate_kind = Some(DegenerateKind::Error);
     }
+    env
 }
 
+/// (#2310 P4a review fix M1) `Ok` on a clean run (synthesis's typed
+/// output parses). `Err` carries the RAW forwarded text of whichever
+/// input this task read that did NOT parse as the expected envelope —
+/// on the degraded path this is `review-synthesis-task`'s forwarded
+/// output, which (thanks to `gather_inputs`'s `run_on`-aware forwarding
+/// and `cascade_abandon`'s origin-propagation, both `darkmux-crew`,
+/// `scheduler.rs`) is the ORIGINATING failed step's own id + reason
+/// text, verbatim — not a generic "missing edge" message. Absent
+/// entirely (the pre-#2310-P4a shape, before `gather_inputs` forwarded
+/// non-`Complete` dependencies at all) falls back to naming the missing
+/// edge, same as before.
 fn envelope_from_input(
     kind_id: &str,
     step_id: &str,
     input: &std::collections::BTreeMap<String, String>,
-) -> Result<ReviewEnvelope> {
-    find_by_kind::<ReviewEnvelope>(kind_id, step_id, input, review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND)?
-        .map(|o| o.body)
-        .ok_or_else(|| {
-            anyhow!(
+) -> std::result::Result<ReviewEnvelope, String> {
+    match find_by_kind::<ReviewEnvelope>(kind_id, step_id, input, review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND) {
+        Ok(Some(o)) => Ok(o.body),
+        Ok(None) => match input.get("review-synthesis-task").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(reason) => Err(reason.to_string()),
+            None => Err(format!(
                 "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-synthesis-task` \
                  — no `{}` output was found among its inputs (#2310)",
                 review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND
-            )
-        })
+            )),
+        },
+        Err(e) => Err(format!("{e:#}")),
+    }
 }
 
 /// The diff TEXT this run reviewed — `synthesize_review`'s `diff` parameter,
@@ -7338,26 +7377,109 @@ impl StepKind for ReviewReportStepKind {
         "Report"
     }
 
+    /// (#2310 P4a review fix M1) `Port::artifact(REVIEW_CONTEXT_ARTIFACT,
+    /// ..)` joins the two data ports — this step now needs the bus-seeded
+    /// `ReviewStepContext` (crew/mode/fingerprint/staffing/
+    /// interpret_warnings) for `degraded_review_envelope`'s identity
+    /// fields on the degraded path, the SAME artifact every other review
+    /// kind already reads. The four EXTRA data ports (bundle/dedup/judge/
+    /// verify) are `review.json`'s widened `review-report-task.reads` —
+    /// `Port::data` entries are documentation of the shape this step
+    /// consumes, not a bus gate (only `PortKind::Artifact` ports are
+    /// checked at graph-build time).
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 2] = [
+        const PORTS: [Port; 7] = [
             Port::data(review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND),
             Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
+            Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
+            Port::data(review_outputs::BUNDLE_SET_OUTPUT_KIND),
+            Port::data(review_outputs::DEDUP_OUTPUT_KIND),
+            Port::data(review_outputs::JUDGE_OUTPUT_KIND),
+            Port::data(review_outputs::VERIFY_OUTPUT_KIND),
         ];
         &PORTS
     }
 
-    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, _s: &Step, _t: &Task, _i: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        panic!(
+            "ReviewReportStepKind only runs through `run_streaming` — it reads the run-scoped \
+             ArtifactBus (#2310 P4a review fix M1)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        step: &Step,
+        _task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let seam_ctx = run_ctx
+            .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
+            .expect("run_review_graph seeds the context artifact before the graph runs");
+
         // (#2310 P4a) `run_on: ["complete", "error"]` (review.json's
         // `review-report-task`) plus the scheduler's cascade-abandon can
         // now dispatch this step even when `review-synthesis-task` never
         // ran (cascade-abandoned behind an earlier upstream error, see
         // `darkmux_crew::scheduler::cascade_abandon`). Degrade honestly
-        // through THIS step instead of hard-failing it — see
-        // `degraded_report_envelope`'s own doc for why this reconstruction
-        // is deliberately narrower than `run_review_graph`'s fallback.
+        // through THIS step instead of hard-failing it, using the SAME
+        // builder `run_review_graph`'s own errored branch uses
+        // (`degraded_review_envelope`, above) — never a config-shaped
+        // excuse ("this task must depends_on/reads …") standing in for
+        // the actual reason work stopped.
         let env = match envelope_from_input(self.id(), &step.id, input) {
             Ok(env) => env,
-            Err(e) => degraded_report_envelope(input, e.to_string()),
+            Err(reason) => {
+                // (#2310 P4a review fix M1) Match `errored_steps_
+                // degenerate_reason`'s (this file, `run_review_graph`'s
+                // errored branch) exact "review graph: N step(s) errored,
+                // zero usable signal — <reason>" framing whenever `reason`
+                // is a genuinely propagated origin reason (cascade's
+                // `"{step_id}: {msg}"` shape, forwarded via `input`) — the
+                // fallback "no output was found among its inputs" message
+                // (this file's `envelope_from_input`, starts with a
+                // backtick-quoted kind id) is a CONFIG problem, not a step
+                // failure, and is left unwrapped. `N` is always `1` here:
+                // this reconstruction only ever sees ONE propagated origin
+                // (`gather_inputs`/`cascade_abandon` carry a single origin
+                // per abandonment chain — see those functions' own docs
+                // for the known, documented limit).
+                let reason = if reason.starts_with('`') {
+                    reason
+                } else {
+                    format!("review graph: 1 step(s) errored, zero usable signal — {reason}")
+                };
+                let bundle = find_by_kind::<BundleSetOutput>(self.id(), &step.id, input, review_outputs::BUNDLE_SET_OUTPUT_KIND)
+                    .ok()
+                    .flatten()
+                    .map(|o| o.body);
+                let dedup = find_by_kind::<DedupOutput>(self.id(), &step.id, input, review_outputs::DEDUP_OUTPUT_KIND)
+                    .ok()
+                    .flatten()
+                    .map(|o| o.body);
+                let judge = find_by_kind::<JudgeOutput>(self.id(), &step.id, input, review_outputs::JUDGE_OUTPUT_KIND)
+                    .ok()
+                    .flatten()
+                    .map(|o| o.body);
+                let verify = find_by_kind::<VerifyOutput>(self.id(), &step.id, input, review_outputs::VERIFY_OUTPUT_KIND)
+                    .ok()
+                    .flatten()
+                    .map(|o| o.body);
+                degraded_review_envelope(
+                    &seam_ctx.case_id,
+                    seam_ctx.crew_name.as_deref().unwrap_or_default(),
+                    seam_ctx.mode_label.as_deref().unwrap_or_default(),
+                    seam_ctx.fingerprint.clone().unwrap_or_default(),
+                    seam_ctx.staffing.clone(),
+                    &seam_ctx.interpret_warnings,
+                    bundle.as_ref(),
+                    dedup.as_ref(),
+                    judge.as_ref(),
+                    verify.as_ref(),
+                    reason,
+                )
+            }
         };
         // Same honest-degradation posture for the diff: a missing
         // `review-context-task` output (only reachable if the very FIRST
@@ -8656,23 +8778,18 @@ pub fn run_review_graph(
         // envelope used to keep `bundles`/`bundle_skip`/`bundler_fallback`,
         // probe `members`/`warnings`/`remote_budgets`, `raw_flags`,
         // `probe_retries`, and a pre-set `degenerate` across a step error;
-        // `fallback_env` alone (identity + the errored reason, nothing
-        // else) silently dropped every one of them. Rebuild from whichever
-        // typed outputs actually completed, via the SAME fold
-        // `ReviewSynthesisStepKind` applies on a clean run (see
-        // `fold_review_outputs_into_envelope`'s own doc) — `reason` is used
-        // only if that fold left `degenerate` unset (a dedup/judge stage's
-        // own, more specific reason wins).
-        let mut env = ReviewEnvelope {
-            case_id: ctx.case_id.clone(),
-            crew: crew_name.to_string(),
-            mode: mode_label(mode).to_string(),
-            fingerprint: fingerprint_val.clone(),
-            staffing: Some(staffing.clone()),
-            ..ReviewEnvelope::default()
-        };
-        env.warnings.extend(interpret_warnings.clone());
-
+        // building identity alone (the reason, nothing else) silently
+        // dropped every one of them. Rebuild from whichever typed outputs
+        // actually completed, via the SAME fold `ReviewSynthesisStepKind`
+        // applies on a clean run (see `fold_review_outputs_into_envelope`'s
+        // own doc) — `reason` is used only if that fold left `degenerate`
+        // unset (a dedup/judge stage's own, more specific reason wins).
+        // (#2310 P4a review fix M1) Discovery of bundle/dedup/judge stays
+        // HERE (this driver has the full `steps` map `find_completed_
+        // output_by_kind` needs); ASSEMBLY (identity + fold + degenerate
+        // fallback) moves to `degraded_review_envelope`, the SAME builder
+        // `ReviewReportStepKind::run_streaming` now calls on its own,
+        // input-scoped discovery — one builder, not two.
         let bundle_output =
             find_completed_output_by_kind::<BundleSetOutput>(&steps, review_outputs::BUNDLE_SET_OUTPUT_KIND);
         let mut dedup_output =
@@ -8713,17 +8830,19 @@ pub fn run_review_graph(
         // other three kinds.
         let verify_output =
             find_completed_output_by_kind::<VerifyOutput>(&steps, review_outputs::VERIFY_OUTPUT_KIND);
-        fold_review_outputs_into_envelope(
-            &mut env,
+        let env = degraded_review_envelope(
+            &ctx.case_id,
+            crew_name,
+            mode_label(mode),
+            fingerprint_val.clone(),
+            Some(staffing.clone()),
+            &interpret_warnings,
             bundle_output.as_ref(),
             dedup_output.as_ref(),
             judge_output.as_ref(),
             verify_output.as_ref(),
+            reason,
         );
-        if env.degenerate.is_none() {
-            env.degenerate = Some(reason);
-            env.degenerate_kind = Some(DegenerateKind::Error);
-        }
         // (#1530) Say it on STDERR too, not only in the envelope. Since
         // bundling moved into the graph, a launch MISCONFIGURATION (a typo'd
         // `--bundler`, a `source.path` that doesn't exist) is no longer an

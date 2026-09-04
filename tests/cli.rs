@@ -3564,6 +3564,47 @@ fn mission_launch_outcome_from_unknown_task_refused_before_minting() {
     );
 }
 
+#[test]
+fn mission_launch_run_on_unknown_value_refused_before_minting() {
+    // (#2310 P4a review M3) The CLI-refuse-before-mint twin of
+    // `mission_launch_outcome_from_unknown_task_refused_before_minting`
+    // above — a `run_on` validate Error (unknown value) must refuse the
+    // SAME way, before anything is minted.
+    let home = TempDir::new().unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "run-on-typo-test",
+        "name": "Run On Typo Test",
+        "schema_version": "3.4",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "run_on": ["complete", "maybe"],
+                "steps": [{ "id": "s1", "kind": "procedural.noop" }]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("run-on-typo-test.json"), config_json).unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .args(["mission", "launch", "run-on-typo-test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("run_on"))
+        .stderr(predicate::str::contains("maybe"));
+
+    let missions_dir = home.path().join("missions");
+    assert!(
+        !missions_dir.is_dir() || fs::read_dir(&missions_dir).unwrap().next().is_none(),
+        "a refused run_on must never mint a mission — no missions/ entry may exist"
+    );
+}
+
 // ─── review-bench --funnel flag plumbing (#1222 Phase B packet 7) ─────────
 //
 // The funnel condition's real dispatch path needs a live LMStudio + a real

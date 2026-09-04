@@ -943,6 +943,29 @@ impl MissionConfig {
                             });
                         }
                     }
+                    // (C1, #2310 P4a review) `run_on: ["error"]` alone
+                    // validates structurally clean but is a likely
+                    // authoring mistake: on an ORDINARY clean run, every
+                    // dependency reaches `Complete`, never `Error` — a
+                    // task whose `run_on` doesn't accept `"complete"`
+                    // then NEVER becomes ready on that (the overwhelming
+                    // majority) path, and sits `Planned` until the
+                    // mission-level close reconcile rolls it to
+                    // `Abandoned` as "not started". Warning, not Error —
+                    // "runs only after a failure" is occasionally exactly
+                    // what an operator wants (a cleanup/notify task), so
+                    // this is surfaced, never refused.
+                    if !run_on.is_empty() && !run_on.iter().any(|v| v == "complete") {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Warning,
+                            path: format!("{task_path}.run_on"),
+                            message: format!(
+                                "task \"{}\" run_on omits \"complete\"; this task runs only \
+                                 after an upstream failure",
+                                task.id
+                            ),
+                        });
+                    }
                 }
 
                 // (#1619) `reads` gets the SAME structural checks as
@@ -1730,6 +1753,82 @@ mod tests {
         );
     }
 
+    // ── (#2310 P4a review M3/C1) `run_on` validation ─────────────────────
+
+    #[test]
+    fn run_on_unknown_value_is_an_error() {
+        let mut t = task("t", &[], vec![step("s1", "dispatch.internal")]);
+        t.run_on = Some(vec!["complete".to_string(), "maybe".to_string()]);
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let findings = cfg.validate(&[]);
+        let f = findings
+            .iter()
+            .find(|f| f.path.ends_with(".run_on") && f.message.contains("maybe"))
+            .unwrap_or_else(|| panic!("expected a run_on unknown-value finding, got {findings:?}"));
+        assert_eq!(f.severity, FindingSeverity::Error);
+    }
+
+    #[test]
+    fn run_on_empty_list_is_an_error() {
+        let mut t = task("t", &[], vec![step("s1", "dispatch.internal")]);
+        t.run_on = Some(Vec::new());
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let findings = cfg.validate(&[]);
+        let f = findings
+            .iter()
+            .find(|f| f.path.ends_with(".run_on") && f.severity == FindingSeverity::Error)
+            .unwrap_or_else(|| panic!("expected an empty-run_on error finding, got {findings:?}"));
+        assert!(f.message.contains("wedge") || f.message.contains("empty"), "{}", f.message);
+    }
+
+    #[test]
+    fn run_on_absent_or_default_validates_with_no_run_on_finding() {
+        let no_field = task("t1", &[], vec![step("s1", "dispatch.internal")]);
+        let mut explicit_default = task("t2", &[], vec![step("s2", "dispatch.internal")]);
+        explicit_default.run_on = Some(vec!["complete".to_string()]);
+        let cfg = doc(vec![phase("p1", vec![no_field, explicit_default])]);
+        let findings = cfg.validate(&[]);
+        assert!(
+            !findings.iter().any(|f| f.path.ends_with(".run_on")),
+            "neither an absent run_on nor an explicit [\"complete\"] should produce a finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn run_on_omitting_complete_is_a_warning_not_an_error() {
+        // (C1) `run_on: ["error"]` alone is a legal but likely-mistaken
+        // declaration — the task never becomes ready on an ordinary clean
+        // run (every dependency reaches Complete, which this run_on
+        // doesn't accept). Warning, never Error — a cleanup/notify task
+        // that intentionally runs ONLY after a failure is a real,
+        // legitimate shape.
+        let mut t = task("t", &[], vec![step("s1", "dispatch.internal")]);
+        t.run_on = Some(vec!["error".to_string()]);
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let findings = cfg.validate(&[]);
+        let f = findings
+            .iter()
+            .find(|f| f.path.ends_with(".run_on"))
+            .unwrap_or_else(|| panic!("expected a run_on omits-complete finding, got {findings:?}"));
+        assert_eq!(f.severity, FindingSeverity::Warning, "{f:?}");
+        assert!(f.message.contains("complete"), "{}", f.message);
+        // is_valid (Errors only) stays true — a Warning never blocks usability.
+        assert!(cfg.is_valid(&[]));
+    }
+
+    #[test]
+    fn run_on_including_complete_alongside_error_is_not_a_warning() {
+        let mut t = task("t", &[], vec![step("s1", "dispatch.internal")]);
+        t.run_on = Some(vec!["complete".to_string(), "error".to_string()]);
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let findings = cfg.validate(&[]);
+        assert!(
+            !findings.iter().any(|f| f.path.ends_with(".run_on")),
+            "run_on: [\"complete\", \"error\"] must not trip the omits-complete warning: {findings:?}"
+        );
+    }
+
+
     // (#1550 cluster item 2) The `ExpansionSpec` validation tests
     // (`expanding_task_with`, `expand_with_empty_over_is_an_error`,
     // `expand_patterns_without_index_or_name_are_errors`,
@@ -1990,14 +2089,31 @@ mod tests {
             report.tasks[1].reads,
             vec!["review-dedup-task", "review-judge-task", "review-context-task", "review-bundle-task"]
         );
-        // (#2310 P3) The report task: depends on synthesis (its envelope),
-        // reads synthesis + context (the diff text) — a single
-        // `review.report` step, config `null` in the document (stamped at
-        // launch time from `emit`/`envelope_out`/`attribution`, never from
-        // the document itself — see `ReviewReportStepKind`'s own doc).
+        // (#2310 P3) The report task: depends on synthesis (its envelope)
+        // — a single `review.report` step, config `null` in the document
+        // (stamped at launch time from `emit`/`envelope_out`/
+        // `attribution`, never from the document itself — see
+        // `ReviewReportStepKind`'s own doc). (#2310 P4a review fix M1)
+        // `reads` widened to the SAME four typed outputs
+        // `review-synthesis-task` itself reads (bundle/dedup/judge/
+        // verify), so `ReviewReportStepKind::run_streaming`'s own
+        // degraded-envelope fallback can fold whichever of them actually
+        // completed — the same shape `run_review_graph`'s errored branch
+        // already builds from the full `steps` map, now buildable from
+        // this task's own gathered `input` alone.
         assert_eq!(report.tasks[2].id, "review-report-task");
         assert_eq!(report.tasks[2].depends_on, vec!["review-synthesis-task"]);
-        assert_eq!(report.tasks[2].reads, vec!["review-synthesis-task", "review-context-task"]);
+        assert_eq!(
+            report.tasks[2].reads,
+            vec![
+                "review-synthesis-task",
+                "review-context-task",
+                "review-bundle-task",
+                "review-dedup-task",
+                "review-judge-task",
+                "review-verify-task",
+            ]
+        );
         assert_eq!(report.tasks[2].steps.len(), 1);
         assert_eq!(report.tasks[2].steps[0].kind, "review.report");
 

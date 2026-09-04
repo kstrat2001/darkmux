@@ -500,7 +500,11 @@
       "phase_id": "pr-review-golden-report",
       "reads": [
         "review-synthesis-task",
-        "review-context-task"
+        "review-context-task",
+        "review-bundle-task",
+        "review-dedup-task",
+        "review-judge-task",
+        "review-verify-task"
       ],
       "run_on": [
         "complete",

@@ -310,6 +310,17 @@ pub fn gather_inputs(
     // BTreeMap collect dedups a task named in both relations (legal during
     // config migration) to one entry. (#2310 P2a) This now feeds EVERY step
     // of `task`, not just the first — see the fn doc.
+    // (#2310 P4a review fix M1) A dependency's output forwards when its
+    // TERMINAL status satisfies THIS task's own `run_on` — not only when
+    // it is literally `Complete`. Default `run_on` (`["complete"]`) keeps
+    // the pre-#2310 behavior byte-for-byte (only `Complete` ever
+    // satisfied it). A task declaring `"error"` also receives an `Error`
+    // or cascade-`Abandoned` dependency's `output` — which is exactly how
+    // the ORIGINATING failure's reason text (see `cascade_abandon`'s own
+    // doc) reaches a downstream report/summary task: without this, a
+    // task whose readiness `run_on` cascade-abandonment satisfies could
+    // still run with an EMPTY view of why, forced back to guessing from
+    // its own config wiring instead of the graph's own recorded reason.
     let mut inputs: BTreeMap<String, String> = task
         .depends_on
         .iter()
@@ -318,7 +329,7 @@ pub fn gather_inputs(
             let dep_task = tasks.get(dep_task_id)?;
             let last_step_id = dep_task.step_ids.last()?;
             let last_step = steps.get(last_step_id)?;
-            if last_step.status != NodeStatus::Complete {
+            if !dependency_satisfies_run_on(last_step.status, &task.run_on) {
                 return None;
             }
             last_step.output.clone().map(|output| (dep_task_id.clone(), output))
@@ -1092,7 +1103,17 @@ fn apply_step_terminal(
         emit(step_timing_record(step, &rec));
         report.step_records.push(rec);
     }
-    let mut errored_task_id: Option<String> = None;
+    // (#2310 P4a review fix M1) Captured alongside `errored_task_id` so
+    // `cascade_abandon` can propagate the ORIGINATING step's own id and
+    // reason text — not just "some ancestor errored" — down through
+    // every task it makes unreachable. `id` here is a STEP id (this
+    // function's own parameter), matching the `"{step_id}: {reason}"`
+    // shape `errored_steps_degenerate_reason` (darkmux-lab) already uses
+    // when a caller with full graph visibility builds the same kind of
+    // reason from `report.errored` — a task with only its own gathered
+    // `input` (no `report`/`steps` access) can still recover an
+    // IDENTICALLY SHAPED reason once `gather_inputs` forwards this text.
+    let mut errored: Option<(String, String)> = None;
     match result {
         Ok(output) => {
             step.status = NodeStatus::Complete;
@@ -1105,11 +1126,11 @@ fn apply_step_terminal(
         Err(message) => {
             step.status = NodeStatus::Error;
             step.completed_ts = Some(at);
-            step.output = Some(message);
+            step.output = Some(message.clone());
             emit(step_lifecycle_record(step, "step error"));
             persist(step);
             report.errored.push(id.to_string());
-            errored_task_id = Some(step.task_id.clone());
+            errored = Some((id.to_string(), message));
         }
     }
     // (#2310 P4a) "At the moment the error lands, in the same scheduler
@@ -1122,10 +1143,11 @@ fn apply_step_terminal(
     // to `Error` (a task with other still-`Planned`/`Running` steps
     // hasn't reached a terminal task status yet — nothing to cascade
     // from until it does).
-    if let Some(task_id) = errored_task_id {
+    if let Some((origin_step_id, origin_reason)) = errored {
+        let task_id = steps.get(&origin_step_id).expect("just written above").task_id.clone();
         if let Some(task) = tasks.get(&task_id) {
             if task_status(task, steps) == NodeStatus::Error {
-                cascade_abandon(&task_id, tasks, steps, persist);
+                cascade_abandon(&task_id, &origin_step_id, &origin_reason, tasks, steps, persist);
             }
         }
     }
@@ -1167,11 +1189,28 @@ fn apply_step_terminal(
 /// defensive, not load-bearing).
 fn cascade_abandon(
     errored_task_id: &str,
+    origin_step_id: &str,
+    origin_reason: &str,
     tasks: &BTreeMap<String, Task>,
     steps: &mut BTreeMap<String, Step>,
     persist: &mut dyn FnMut(&Step),
 ) {
     let at = now_unix();
+    // (#2310 P4a review fix M1) Every step this cascade abandons — no
+    // matter how many hops from `errored_task_id` — gets the SAME output
+    // text: `"{origin_step_id}: {origin_reason}"`, the ORIGINATING
+    // step's own id and failure message, verbatim. This is what "the
+    // reason travels down the graph" means concretely: a task several
+    // hops downstream that only ever sees ONE of its dependencies
+    // (`gather_inputs`, now `run_on`-aware) still reads the TRUE root
+    // cause, not a chain of "depends on X which depends on Y" links that
+    // lose the actual failure text after the first hop. The shape
+    // matches `errored_steps_degenerate_reason`'s own per-entry format
+    // (`darkmux-lab`, `run_review_graph`'s errored branch) on purpose —
+    // a caller with only a gathered `input` map (no `report`/`steps`
+    // access) can recover an IDENTICALLY SHAPED reason from this text
+    // alone.
+    let reason = format!("{origin_step_id}: {origin_reason}");
     let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     queue.push_back(errored_task_id.to_string());
     while let Some(tid) = queue.pop_front() {
@@ -1201,10 +1240,7 @@ fn cascade_abandon(
                     if s.status == NodeStatus::Planned {
                         s.status = NodeStatus::Abandoned;
                         s.completed_ts = Some(at);
-                        s.output = Some(format!(
-                            "abandoned: task `{dep_id}` depends on task `{tid}`, which reached \
-                             Error, and `{dep_id}`'s run_on does not accept \"error\" (#2310 P4a)"
-                        ));
+                        s.output = Some(reason.clone());
                         persist(s);
                     }
                 }
@@ -2439,7 +2475,13 @@ mod tests {
             NodeStatus::Abandoned,
             "a default-run_on downstream of an errored task dependency is cascade-abandoned, not left wedged Planned"
         );
-        assert!(steps["downstream-step"].output.as_deref().unwrap_or_default().contains("abandoned"));
+        // (#2310 P4a review fix M1) The abandoned step's output carries
+        // the ORIGINATING step's id + its own failure text VERBATIM —
+        // "the reason travels down the graph" — not a generic "depends
+        // on X" placeholder that would lose the actual reason a single
+        // hop downstream.
+        let origin_reason = steps["fails-step"].output.clone().expect("fails-step recorded its own error");
+        assert_eq!(steps["downstream-step"].output.as_deref(), Some(format!("fails-step: {origin_reason}").as_str()));
         assert!(!report.completed.contains(&"downstream-step".to_string()));
         assert!(!report.errored.contains(&"downstream-step".to_string()));
     }
@@ -2540,6 +2582,43 @@ mod tests {
         );
         assert!(report.completed.contains(&"unrelated-step".to_string()));
     }
+
+    #[test]
+    fn cascade_abandon_test_e_accepting_intermediate_shields_its_default_dependents() {
+        // A errors. B (run_on: ["complete", "error"]) depends on A — B is
+        // NOT abandoned; the cascade stops there and B gets a real chance
+        // to run. C (default run_on) depends on B — since B actually
+        // RUNS and COMPLETES (procedural.noop, unconditional success),
+        // C's dependency is genuinely Complete, so C runs too — no
+        // cascade ever reaches C at all, it was never in danger. This is
+        // the branch no shipped config exercises today (review.json's
+        // report-task is a leaf, not an intermediate an ordinary task
+        // depends on).
+        let (task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.kind = "procedural.shell".to_string();
+        step_a.config = json!({"command": "exit 1"});
+        let (mut task_b, step_b) = task_and_step("b", &["a"]);
+        task_b.run_on = vec!["complete".to_string(), "error".to_string()];
+        let (task_c, step_c) = task_and_step("c", &["b"]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a), (task_b, step_b), (task_c, step_c)]);
+
+        let report = run_test_graph(&tasks, &mut steps);
+
+        assert_eq!(steps["a-step"].status, NodeStatus::Error);
+        assert_eq!(
+            steps["b-step"].status,
+            NodeStatus::Complete,
+            "B accepts error — the cascade leaves it alone and it runs to completion"
+        );
+        assert_eq!(
+            steps["c-step"].status,
+            NodeStatus::Complete,
+            "C depends on B, which genuinely completed — C was never a cascade target at all"
+        );
+        assert!(report.completed.contains(&"b-step".to_string()));
+        assert!(report.completed.contains(&"c-step".to_string()));
+    }
+
 
 
     #[test]

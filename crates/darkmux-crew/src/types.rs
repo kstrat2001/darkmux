@@ -692,10 +692,16 @@ pub struct Task {
     /// same pass — so a task several hops downstream of a failure, with
     /// `run_on: ["complete", "error"]`, sees a resolved dependency this
     /// same pass rather than waiting on an ancestor that will never
-    /// reach `Complete`. Never emptied by a document —
-    /// `mission_config::TaskConfig::run_on` is `None` on every pre-#2310
-    /// config, which resolves to this same default at interpret time
-    /// (contract 5: read-compat, no field ever forces a migration).
+    /// reach `Complete`. The cascade's domain is OTHER tasks only — an
+    /// errored Task's own later, still-`Planned` steps (a multi-step
+    /// Task whose first step failed) are never touched by it; they stay
+    /// wedged `Planned` until the ordinary close-time reconcile
+    /// (`lifecycle::reconcile_phase_steps_terminal`) sweeps them, same as
+    /// any other stranded step on a stopped run. Never emptied by a
+    /// document — `mission_config::TaskConfig::run_on` is `None` on
+    /// every pre-#2310 config, which resolves to this same default at
+    /// interpret time (contract 5: read-compat, no field ever forces a
+    /// migration).
     #[serde(default = "default_run_on")]
     pub run_on: Vec<String>,
     /// (#1230/#1341) A Task is the ASSIGNABLE unit — like a Jira ticket
