@@ -3987,8 +3987,10 @@ pub struct ReviewStepContext {
     /// calling the real `build_bundles`/`external_bundles` — the whole point
     /// of this packet (#1530: "no data-producing work before graph
     /// execution"). When `Some`, the bundle step publishes this closure's
-    /// result onto [`REVIEW_BUNDLES_ARTIFACT`] directly instead of touching
-    /// the filesystem/network/an external command — the same "no seam for
+    /// result as this step's typed `review.bundles` output
+    /// ([`BundleSetOutput`], `review_outputs::BUNDLE_SET_OUTPUT_KIND`)
+    /// directly instead of touching the filesystem/network/an external
+    /// command — the same "no seam for
     /// real I/O" problem [`chat_override`]'s own doc names for dispatch,
     /// applied to bundling.
     ///
@@ -4005,9 +4007,10 @@ pub struct ReviewStepContext {
     /// decision, not an oversight.
     ///
     /// Every downstream reader (probe-render/judge/verify-render) still
-    /// reads ONLY [`REVIEW_BUNDLES_ARTIFACT`] off the bus, never this field
-    /// directly — the override only changes how the bundle STEP fills that
-    /// artifact, not who reads it.
+    /// reads ONLY the typed `review.bundles` step output (via
+    /// `bundles_from_input`), never this field directly — the override
+    /// only changes how the bundle STEP produces that output, not who
+    /// reads it.
     #[allow(clippy::type_complexity)]
     pub bundle_override: Option<Arc<dyn Fn() -> Result<Vec<BundleInput>> + Send + Sync>>,
     /// (#1641) The run's own Mission identity, carried as an OPAQUE tag
@@ -4364,7 +4367,9 @@ impl StepKind for ReviewContextStepKind {
     /// run-scoped `ArtifactBus` (`REVIEW_CONTEXT_ARTIFACT`), not on
     /// `Step.config` — see [`ReviewContextTestOverrides`]'s doc. Declared
     /// here (a consumer, mirroring `ReviewBundleStepKind::requires()`'s own
-    /// reasoning for `REVIEW_ENVELOPE_ARTIFACT`) even though some other
+    /// reasoning for `REVIEW_CONTEXT_ARTIFACT` — the ONE artifact that
+    /// survived #2310 P2's retirement of the other four, see this file's
+    /// module-level doc note above that constant) even though some other
     /// kind present in every shipped graph already `provides()` the same
     /// artifact for the scheduler's pre-scan — this keeps the declaration
     /// honest for a hand-built graph that names only this kind.
@@ -4813,11 +4818,54 @@ fn review_context_from_input(
 /// A single, best-effort attempt to read `input`'s ONE `expected_kind`
 /// output. `None` when nothing in `input` carries that kind — the caller
 /// turns that into a by-name refusal.
+/// (#2310 P2 review finding I3) The old `Output::<T>::read(raw, kind).ok()`
+/// folded TWO different failure shapes into the same `None` — "this input
+/// isn't the one we're looking for" and "this IS the right output, but its
+/// body is malformed" — so a real producer bug (a body missing a required
+/// field) read identically to a perfectly normal missing edge, surfacing to
+/// the operator as the generic "no `review.deduped-flags` output was found
+/// among its inputs" instead of naming the actual broken field. Peeks the
+/// envelope's own declared `kind` BEFORE attempting the full typed
+/// deserialize: once that peek says `expected_kind`, a body failure is
+/// propagated BY NAME (field + step) rather than silently read as absent.
+/// Every other shape — a `{"ref": …}` pointer, a bare path string, a
+/// pre-wrapper unwrapped body, or a genuine kind mismatch — has no `kind`
+/// to peek and falls through to the old best-effort read, unchanged.
 fn find_by_kind<T: serde::de::DeserializeOwned>(
+    kind_id: &str,
+    step_id: &str,
     input: &std::collections::BTreeMap<String, String>,
     expected_kind: &str,
-) -> Option<darkmux_crew::step_output::Output<T>> {
-    input.values().find_map(|raw| darkmux_crew::step_output::Output::<T>::read(raw, expected_kind).ok())
+) -> Result<Option<darkmux_crew::step_output::Output<T>>> {
+    for raw in input.values() {
+        let trimmed = raw.trim();
+        let declared_kind = if trimmed.starts_with('{') {
+            serde_json::from_str::<serde_json::Value>(trimmed)
+                .ok()
+                .and_then(|doc| doc.get("kind").and_then(|k| k.as_str()).map(str::to_string))
+        } else {
+            None
+        };
+        if declared_kind.as_deref() == Some(expected_kind) {
+            // The underlying error is embedded via `{e:#}` (the full anyhow
+            // chain, e.g. "missing field `stats`") directly into THIS
+            // message rather than left as a `.with_context` wrapper — an
+            // anyhow chain's plain `Display`/`to_string()` shows only the
+            // OUTERMOST context, and the whole point of this fix is that
+            // the FIELD name reaches the operator, not just a generic
+            // "failed to deserialize".
+            return darkmux_crew::step_output::Output::<T>::read(raw, expected_kind).map(Some).map_err(|e| {
+                anyhow!(
+                    "`{kind_id}`: step `{step_id}`'s input declares a `{expected_kind}` output \
+                     whose body failed to deserialize: {e:#}"
+                )
+            });
+        }
+        if let Ok(out) = darkmux_crew::step_output::Output::<T>::read(raw, expected_kind) {
+            return Ok(Some(out));
+        }
+    }
+    Ok(None)
 }
 
 fn bundles_from_input(
@@ -4825,7 +4873,7 @@ fn bundles_from_input(
     step_id: &str,
     input: &std::collections::BTreeMap<String, String>,
 ) -> Result<BundleSetOutput> {
-    find_by_kind::<BundleSetOutput>(input, review_outputs::BUNDLE_SET_OUTPUT_KIND)
+    find_by_kind::<BundleSetOutput>(kind_id, step_id, input, review_outputs::BUNDLE_SET_OUTPUT_KIND)?
         .map(|o| o.body)
         .ok_or_else(|| {
             anyhow!(
@@ -4841,13 +4889,15 @@ fn deduped_from_input(
     step_id: &str,
     input: &std::collections::BTreeMap<String, String>,
 ) -> Result<DedupOutput> {
-    find_by_kind::<DedupOutput>(input, review_outputs::DEDUP_OUTPUT_KIND).map(|o| o.body).ok_or_else(|| {
-        anyhow!(
-            "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-dedup-task` \
-             — no `{}` output was found among its inputs (#2310)",
-            review_outputs::DEDUP_OUTPUT_KIND
-        )
-    })
+    find_by_kind::<DedupOutput>(kind_id, step_id, input, review_outputs::DEDUP_OUTPUT_KIND)?
+        .map(|o| o.body)
+        .ok_or_else(|| {
+            anyhow!(
+                "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-dedup-task` \
+                 — no `{}` output was found among its inputs (#2310)",
+                review_outputs::DEDUP_OUTPUT_KIND
+            )
+        })
 }
 
 fn judged_from_input(
@@ -4855,13 +4905,15 @@ fn judged_from_input(
     step_id: &str,
     input: &std::collections::BTreeMap<String, String>,
 ) -> Result<JudgeOutput> {
-    find_by_kind::<JudgeOutput>(input, review_outputs::JUDGE_OUTPUT_KIND).map(|o| o.body).ok_or_else(|| {
-        anyhow!(
-            "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-judge-task` \
-             — no `{}` output was found among its inputs (#2310)",
-            review_outputs::JUDGE_OUTPUT_KIND
-        )
-    })
+    find_by_kind::<JudgeOutput>(kind_id, step_id, input, review_outputs::JUDGE_OUTPUT_KIND)?
+        .map(|o| o.body)
+        .ok_or_else(|| {
+            anyhow!(
+                "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-judge-task` \
+                 — no `{}` output was found among its inputs (#2310)",
+                review_outputs::JUDGE_OUTPUT_KIND
+            )
+        })
 }
 
 fn verify_from_input(
@@ -4869,13 +4921,15 @@ fn verify_from_input(
     step_id: &str,
     input: &std::collections::BTreeMap<String, String>,
 ) -> Result<VerifyOutput> {
-    find_by_kind::<VerifyOutput>(input, review_outputs::VERIFY_OUTPUT_KIND).map(|o| o.body).ok_or_else(|| {
-        anyhow!(
-            "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-verify-task` \
-             — no `{}` output was found among its inputs (#2310)",
-            review_outputs::VERIFY_OUTPUT_KIND
-        )
-    })
+    find_by_kind::<VerifyOutput>(kind_id, step_id, input, review_outputs::VERIFY_OUTPUT_KIND)?
+        .map(|o| o.body)
+        .ok_or_else(|| {
+            anyhow!(
+                "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-verify-task` \
+                 — no `{}` output was found among its inputs (#2310)",
+                review_outputs::VERIFY_OUTPUT_KIND
+            )
+        })
 }
 
 /// (#2310 P2) Fan-in: every probe TASK's typed output, in the SAME order
@@ -4939,8 +4993,9 @@ fn probe_flags_from_inputs(
 /// [`FileSource`] from `Step.config` (stamped by
 /// [`build_review_graph_from_config`] from a [`BundleBuildSpec`] — see that
 /// type's doc for why everything it needs is build-time-known data) and
-/// publishing the result onto [`REVIEW_BUNDLES_ARTIFACT`] for every
-/// downstream step.
+/// publishing the result as this step's typed `review.bundles` output
+/// (`review_outputs::BUNDLE_SET_OUTPUT_KIND`) for every downstream step to
+/// read via `bundles_from_input`.
 ///
 /// **Tier 3 (#1352), on purpose.** Diff-parsing/bundle-resolution is
 /// genuinely specific to the review pipeline — no second consumer is
@@ -5268,19 +5323,21 @@ impl StepKind for ReviewProbeRenderStepKind {
 /// existing per-draw iteration shape, not because more than one entry is
 /// ever produced.
 ///
-/// (#1541) NO LONGER carries a `bundles` field. It used to hold a
-/// build-time snapshot of `(bundle_id, fact_family)` pairs
+/// (#1541, superseded by #2310 P2 — see [`reconstruct_probe_seat`]'s own
+/// doc for the CURRENT mechanism) NO LONGER carries a `bundles` field. It
+/// used to hold a build-time snapshot of `(bundle_id, fact_family)` pairs
 /// (`select_bundles_for_staffing(&ctx.bundles, ...)`, computed once in
-/// `build_review_graph_from_config`) that [`reconstruct_probe_stage`] used
-/// to attribute each `dispatch.map` result back to its bundle POSITIONALLY.
-/// That snapshot only agreed with the run-time render step's own selection
-/// because both called the identical pure function over the identical
-/// bundles — a coincidence that would silently break once bundling itself
-/// becomes run-time work (#1541's own filing). Attribution now travels
-/// through the graph instead, via [`REVIEW_PROBE_SELECTION_ARTIFACT`],
-/// published by the render step and read back by
-/// [`reconstruct_probe_stage`] keyed on `draw_task_ids` below — so this
-/// struct no longer needs its own copy.
+/// `build_review_graph_from_config`) that the retired `reconstruct_probe_
+/// stage` used to attribute each `dispatch.map` result back to its bundle
+/// POSITIONALLY. That snapshot only agreed with the run-time render step's
+/// own selection because both called the identical pure function over the
+/// identical bundles — a coincidence that would silently break once
+/// bundling itself becomes run-time work (#1541's own filing). #1541 fixed
+/// this by publishing the selection onto a now-ALSO-retired bus artifact;
+/// #2310 P2 replaced that in turn with each probe seat's `review.probe-
+/// collect` step simply recomputing the SAME selection itself (a pure call
+/// over identical inputs, never published anywhere) — so this struct no
+/// longer needs its own copy either way.
 ///
 /// (#1530 Packet 3a follow-on) `Serialize`/`Deserialize` are new derives —
 /// every field is a plain `String`/`bool`/`Option<String>`/`Vec<String>`, so
@@ -5300,10 +5357,7 @@ pub(crate) struct ProbeSeatSpec {
     /// This seat's claimed probe task id, wrapped in a `Vec` for the dedup
     /// step's `input`-key iteration (`gather_inputs` keys a first-step
     /// input by dependency TASK id, #1341) — always exactly one entry as of
-    /// #1512 (one role, one task). Also the key
-    /// [`REVIEW_PROBE_SELECTION_ARTIFACT`] uses per draw (#1541) — the same
-    /// task id names both this seat's `dispatch.map` results (`input`) and
-    /// its render step's published selection.
+    /// #1512 (one role, one task).
     pub(crate) draw_task_ids: Vec<String>,
 }
 
@@ -5640,7 +5694,24 @@ impl StepKind for ReviewProbeCollectStepKind {
             .ok_or_else(|| {
                 anyhow!("`{}`: step `{}` must be the third step of a probe task", self.id(), step.id)
             })?;
-        let raw = input.get(map_step_id).map(String::as_str).unwrap_or("[]");
+        // (#2310 P2 review, minor finding) A MISSING predecessor entry
+        // (`gather_inputs` never chained `map_step_id`'s output here — a
+        // graph-wiring gap) must be loud, by name — never silently read as
+        // "zero items dispatched" (the P1/P2 posture this pipeline already
+        // holds elsewhere, e.g. `review_context_from_input`'s own by-name
+        // refusal). A LEGITIMATE zero-item `dispatch.map` run still writes
+        // the literal `"[]"` as its output — `Some("[]")` — so that case is
+        // unaffected; only a genuinely ABSENT entry (`None`) is refused.
+        let raw = input.get(map_step_id).map(String::as_str).ok_or_else(|| {
+            anyhow!(
+                "`{}`: step `{}` found no input from its own predecessor `{map_step_id}` — this \
+                 step must be the third step of a probe task, reading that `dispatch.map` step's \
+                 raw results; a missing entry means the chaining is broken, not that zero draws \
+                 fired (#2310)",
+                self.id(),
+                step.id
+            )
+        })?;
         let results: Vec<MapItemResult> = serde_json::from_str(raw)
             .with_context(|| format!("deserializing probe map results from step `{map_step_id}`"))?;
 
@@ -6219,16 +6290,17 @@ impl StepKind for ReviewJudgeStepKind {
     /// early-outs, same order, same `Placement` fields — see this method's
     /// original doc (preserved below) for the empty-bundle-set reasoning.
     ///
-    /// (#1530 bundling-becomes-runtime-work follow-on) The empty-bundle-set
-    /// check now reads [`REVIEW_BUNDLES_ARTIFACT`] directly instead of
+    /// (#1530 bundling-becomes-runtime-work follow-on, superseded by
+    /// #2310 P2 below) The empty-bundle-set check no longer reads
     /// `ctx.bundles` (retired — see that field's removal note on
     /// `ReviewStepContext`), so the `ReviewStepContext` fetch this method
     /// used to need is gone too. Safe by construction, not by luck:
     /// `review-judge-task` depends (transitively, via dedup + the probe
     /// tasks) on `review-bundle-task`, so by the time THIS step's wave
     /// runs — the only time `residency()` is ever called for it — the
-    /// bundle step has already run and populated the artifact for real (see
-    /// `REVIEW_BUNDLES_ARTIFACT`'s own doc for why this ordering is
+    /// bundle step has already run and produced its typed output for real
+    /// (see the #2310 P2 comment just below for the CURRENT mechanism —
+    /// `input`, never a bus artifact — and why this ordering is
     /// guaranteed, not assumed).
     ///
     /// (#1360 follow-up, preserved) Unlike probe, judge can't know upfront
@@ -6256,7 +6328,24 @@ impl StepKind for ReviewJudgeStepKind {
         // main thread BEFORE this step's wave, once `review-bundle-task`
         // has already completed (an earlier wave), so `gather_inputs` has
         // already populated this entry by the time this runs.
-        let bundles = find_by_kind::<BundleSetOutput>(input, review_outputs::BUNDLE_SET_OUTPUT_KIND)?.body.bundles;
+        // (#2310 P2 review finding I3) `find_by_kind` now returns
+        // `Result<Option<_>>` — this residency planner has no `Result` to
+        // propagate (its own contract is `Option<Placement>`, a best-effort
+        // hint), so a genuine body-deserialize failure here is silently
+        // treated the same as "not found yet" via `.ok()`. That is safe
+        // ONLY because this function only ever SKIPS a preload on `None`
+        // (falling through to the ordinary on-demand load path below) —
+        // never trusts a malformed body's contents.
+        let bundles = find_by_kind::<BundleSetOutput>(
+            self.id(),
+            &step.id,
+            input,
+            review_outputs::BUNDLE_SET_OUTPUT_KIND,
+        )
+        .ok()
+        .flatten()?
+        .body
+        .bundles;
         if bundles.is_empty() {
             return None;
         }
@@ -6675,7 +6764,25 @@ impl StepKind for ReviewVerifyCollectStepKind {
             .ok_or_else(|| {
                 anyhow!("`{}`: step `{}` must be the third step of the verify task", self.id(), step.id)
             })?;
-        let raw = input.get(map_step_id).map(String::as_str).unwrap_or("[]");
+        // (#2310 P2 review, minor finding) Same posture as the probe
+        // collect step's identical fix — a MISSING predecessor entry (a
+        // graph-wiring gap) must be loud, by name, never silently read as
+        // "zero items". An EMPTY (but PRESENT) string is left alone below:
+        // `review.verify-render`'s own no-op short-circuit (no verify seat
+        // staffed / a doomed run / zero confirmed findings — see this
+        // task's module doc note) legitimately writes an empty output, and
+        // that's a real, expected shape here — only a genuinely ABSENT
+        // entry (`None`) is refused.
+        let raw = input.get(map_step_id).map(String::as_str).ok_or_else(|| {
+            anyhow!(
+                "`{}`: step `{}` found no input from its own predecessor `{map_step_id}` — this \
+                 step must be the third step of the verify task, reading that `dispatch.map` \
+                 step's raw results; a missing entry means the chaining is broken, not that zero \
+                 items were adjudicated (#2310)",
+                self.id(),
+                step.id
+            )
+        })?;
         let raw = raw.trim();
         let results: Vec<MapItemResult> =
             if raw.is_empty() { Vec::new() } else { serde_json::from_str(raw).with_context(|| {
@@ -6734,6 +6841,79 @@ impl StepKind for ReviewVerifyCollectStepKind {
             .to_output_string()
             .context("serializing verify results")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
+}
+
+/// (#2310 P2 review finding C2) The cross-cutting fold every producer's
+/// typed output contributes to a [`ReviewEnvelope`] — factored out so
+/// [`ReviewSynthesisStepKind::run_streaming`] (the ordinary successful-run
+/// path, every argument always `Some`) and [`run_review_graph`]'s
+/// errored-run fallback (only whatever completed BEFORE the failure, any
+/// subset `None`) share ONE fold instead of two copies drifting apart.
+/// Takes references — the synthesis caller still needs to move `flags`/
+/// `judged` out of `dedup`/`judge` afterward (this only reads the OTHER
+/// fields), and the fallback caller only ever has borrowed locals to begin
+/// with.
+///
+/// Pins the SAME warnings order [`ReviewSynthesisStepKind`]'s own doc
+/// establishes: the CALLER folds `interpret_warnings` first (before calling
+/// this), then this folds judge -> verify -> probe (`dedup.warnings` last,
+/// mirroring the pre-P2 shared envelope's post-run probe merge).
+fn fold_review_outputs_into_envelope(
+    env: &mut ReviewEnvelope,
+    bundle: Option<&BundleSetOutput>,
+    dedup: Option<&DedupOutput>,
+    judge: Option<&JudgeOutput>,
+    verify: Option<&VerifyOutput>,
+) {
+    if let Some(bundle) = bundle {
+        env.bundles = bundle.bundles.len();
+        env.bundle_skip = bundle.skip.clone();
+        env.bundler_fallback = bundle.bundler_fallback.clone();
+    }
+    if let Some(dedup) = dedup {
+        env.raw_flags = dedup.raw_flags;
+        env.probe_retries = dedup.probe_retries;
+        env.members.extend(dedup.members.iter().cloned());
+        if let Some(row) = &dedup.remote_budget {
+            env.remote_budgets.push(row.clone());
+        }
+        env.degenerate = dedup.degenerate.clone();
+        if env.degenerate.is_some() {
+            env.degenerate_kind = Some(DegenerateKind::Error);
+        }
+    }
+    if let Some(judge) = judge {
+        if let Some(member) = &judge.member {
+            env.members.push(member.clone());
+        }
+        env.remote_budgets.extend(judge.remote_budget_rows.iter().cloned());
+        env.warnings.extend(judge.warnings.iter().cloned());
+        // (#2310 P2) `ReviewJudgeStepKind` already folds the dedup stage's
+        // own degenerate reason FORWARD into its own `degenerate` field
+        // when it had none of its own (see that kind's doc) — so reading
+        // `judge.degenerate` here covers BOTH stages without this helper
+        // needing to compare the two.
+        if env.degenerate.is_none() && judge.degenerate.is_some() {
+            env.degenerate = judge.degenerate.clone();
+            env.degenerate_kind = Some(DegenerateKind::Error);
+        }
+    }
+    if let Some(verify) = verify {
+        if let Some(member) = &verify.member {
+            env.members.push(member.clone());
+        }
+        if let Some(w) = &verify.warning {
+            env.warnings.push(w.clone());
+        }
+        if let Some(rec) = &verify.budget_row {
+            env.remote_budgets.push(rec.clone());
+        }
+    }
+    // (#2310 P2 review finding C1) The probe stage's own warnings — folded
+    // LAST, pinning interpret -> judge -> verify -> probe.
+    if let Some(dedup) = dedup {
+        env.warnings.extend(dedup.warnings.iter().cloned());
     }
 }
 
@@ -6839,16 +7019,6 @@ impl StepKind for ReviewSynthesisStepKind {
         let verify_output = verify_from_input(self.id(), &step.id, input)?;
         let bundle_output = bundles_from_input(self.id(), &step.id, input)?;
 
-        let flags = dedup_output.flags;
-        let mut judged = judge_output.judged;
-
-        // (#2310 P2) Verify-APPLY boundary: fold `review.verify-collect`'s
-        // typed `results` back onto the confirmed docket. An empty result
-        // set covers every no-dispatch path in one shape (no seat staffed /
-        // doomed run / zero confirmed): the docket passes through
-        // untouched, byte-identical to a crew with no verify seat.
-        apply_verify_records(&mut judged, &verify_output.results);
-
         // (#2310 P2) Build the envelope FRESH — `case_id`/`crew`/`mode`/
         // `fingerprint`/`staffing` come off the bus seam beside
         // `mission_id` (`run_review_graph` seeds them there now instead of
@@ -6863,45 +7033,43 @@ impl StepKind for ReviewSynthesisStepKind {
             staffing: ctx.staffing.clone(),
             ..ReviewEnvelope::default()
         };
-        env.bundles = bundle_output.bundles.len();
-        env.bundle_skip = bundle_output.skip;
-        env.bundler_fallback = bundle_output.bundler_fallback;
-        env.raw_flags = dedup_output.raw_flags;
-        env.probe_retries = dedup_output.probe_retries;
-        env.members.extend(dedup_output.members);
-        env.warnings.extend(dedup_output.warnings);
-        if let Some(row) = dedup_output.remote_budget {
-            env.remote_budgets.push(row);
-        }
-        env.degenerate = dedup_output.degenerate;
-        if env.degenerate.is_some() {
-            env.degenerate_kind = Some(DegenerateKind::Error);
-        }
+        // (#2310 P2 review finding C1) `build_review_graph`'s own
+        // interpret-time warnings (e.g. "pruned an unclaimed probe task")
+        // never reached ANY successful envelope pre-fix — this step folded
+        // dedup/judge/verify warnings but never `ctx.interpret_warnings`
+        // (they arrived pre-P2 via a pre-seeded shared envelope; this step
+        // now builds `env` fresh and nothing else folds them in). Folded
+        // FIRST, pinning the order interpret -> judge -> verify -> probe:
+        // pre-P2, interpret-time warnings were seeded into the shared
+        // envelope before the run started, and the probe stage's own
+        // warnings (now `dedup_output.warnings` — dedup fans in every probe
+        // seat, see `DedupOutput::warnings`'s own doc) were folded in LAST,
+        // via a post-run merge that ran after every other stage's in-run
+        // push. This order is pinned by `synthesis_folds_warnings_in_pinned_order`.
+        env.warnings.extend(ctx.interpret_warnings.clone());
 
-        if let Some(member) = judge_output.member {
-            env.members.push(member);
-        }
-        env.remote_budgets.extend(judge_output.remote_budget_rows);
-        env.warnings.extend(judge_output.warnings);
-        // (#2310 P2) `ReviewJudgeStepKind` already folds the dedup stage's
-        // own degenerate reason FORWARD into its own `degenerate` field
-        // when it had none of its own (see that kind's doc) — so reading
-        // `judge_output.degenerate` here covers BOTH stages without this
-        // step needing to compare the two.
-        if env.degenerate.is_none() && judge_output.degenerate.is_some() {
-            env.degenerate = judge_output.degenerate;
-            env.degenerate_kind = Some(DegenerateKind::Error);
-        }
+        // (#2310 P2 review finding C2) Shared with `run_review_graph`'s
+        // errored-run fallback — see that helper's own doc.
+        fold_review_outputs_into_envelope(
+            &mut env,
+            Some(&bundle_output),
+            Some(&dedup_output),
+            Some(&judge_output),
+            Some(&verify_output),
+        );
 
-        if let Some(member) = verify_output.member {
-            env.members.push(member);
-        }
-        if let Some(w) = verify_output.warning {
-            env.warnings.push(w);
-        }
-        if let Some(rec) = verify_output.budget_row {
-            env.remote_budgets.push(rec);
-        }
+        // Every field the shared fold above didn't touch: the flag/judged
+        // DATA itself, moved out now that the fold's read-only borrows have
+        // ended.
+        let flags = dedup_output.flags;
+        let mut judged = judge_output.judged;
+
+        // (#2310 P2) Verify-APPLY boundary: fold `review.verify-collect`'s
+        // typed `results` back onto the confirmed docket. An empty result
+        // set covers every no-dispatch path in one shape (no seat staffed /
+        // doomed run / zero confirmed): the docket passes through
+        // untouched, byte-identical to a crew with no verify seat.
+        apply_verify_records(&mut judged, &verify_output.results);
 
         env.deduped_flags = flags.len();
         env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
@@ -7037,24 +7205,27 @@ pub type SharedReviewEnvelope = Arc<StdMutex<ReviewEnvelope>>;
 /// can persist each Step under the SAME Phase its owning Task belongs to
 /// without re-deriving the lookup).
 ///
-/// (#1530 Packet 1) `initial_env` replaces the pre-Packet-1
-/// `shared_env: SharedReviewEnvelope` field — this pipeline's cross-cutting
-/// accumulators (the envelope, the run-wide member/warning accumulators) now
-/// live on the run-scoped `ArtifactBus` instead of a bespoke `Arc<Mutex<_>>`
-/// threaded by hand from `build_review_graph` into `run_review_graph` (see
-/// the module-level doc note above `REVIEW_ENVELOPE_ARTIFACT`). `initial_env`
-/// is the PLAIN, unwrapped envelope value this function assembles at build
-/// time (case_id/bundle count/interpret-time warnings, e.g. the "pruned an
-/// unclaimed probe task" warning) — `run_review_graph` pre-stamps it further
-/// (case_id/crew/mode/fingerprint/staffing) and SEEDS the wrapped
-/// `Arc<StdMutex<_>>` result onto the bus via `run_step_graph`'s caller-seed
-/// path, exactly where the Arc gets minted now (previously minted here,
-/// before the run even started).
+/// (#1530 Packet 1, narrowed by #2310 P2 review finding "minor") This field
+/// used to be `initial_env: ReviewEnvelope` — a plain unwrapped envelope
+/// carrying `case_id`/bundle count/interpret-time warnings, seeded onto the
+/// run-scoped `ArtifactBus` before #2310 P2 retired the shared-envelope
+/// mechanism entirely (see the module-level doc note above
+/// `REVIEW_CONTEXT_ARTIFACT`, the ONE artifact that survived). Every OTHER
+/// field that struct carried (`case_id`, the zero-valued `bundles` count,
+/// etc.) went unread by every caller — `run_review_graph` always uses
+/// `ctx.case_id` directly and re-derives `bundles` from the bundle step's
+/// own typed output — so keeping the whole `ReviewEnvelope` shape here was
+/// stale weight around the ONE thing any caller actually reads: `build_
+/// review_graph`'s own interpret-time warnings (e.g. the "pruned an
+/// unclaimed probe task" warning), which `run_review_graph` folds into
+/// `ReviewStepContext::interpret_warnings` for `ReviewSynthesisStepKind`
+/// (the ordinary path) or directly into the fallback envelope's `warnings`
+/// (the errored path) to read.
 pub struct BuiltReviewGraph {
     pub tasks: Vec<Task>,
     pub steps: std::collections::BTreeMap<String, Step>,
     pub registry: StepKindRegistry,
-    pub initial_env: ReviewEnvelope,
+    pub interpret_warnings: Vec<String>,
     pub synthesis_step_id: String,
     pub phase_id_of_step: std::collections::BTreeMap<String, String>,
 }
@@ -7460,23 +7631,14 @@ pub fn build_review_graph_from_config(
         }
     }
 
-    // (#1373; #1530 Packet 1 — this became `initial_env`, no longer
-    // wrapped in `Arc<Mutex<_>>` here) Built EARLY (moved up from its
-    // former place right before `ReviewSynthesisStepKind`'s construction)
-    // so it's ready alongside every other build-time value this function
-    // hands back. `run_review_graph` pre-stamps it further (case_id is
-    // re-stamped there too — this run-launch's `ctx.case_id`, not a stale
-    // build-time snapshot — plus crew/mode/fingerprint/staffing) and SEEDS
-    // the wrapped `Arc<StdMutex<_>>` result onto the run's `ArtifactBus` —
-    // see `BuiltReviewGraph::initial_env`'s own doc for the full handoff.
-    //
-    // (#1530) `bundles` starts at 0 now, not `ctx.bundles.len()` — the real
-    // bundle set isn't resolved until `review-bundle-step` runs (the whole
-    // point of this packet). `ReviewBundleStepKind::run_streaming` writes
-    // the real count onto the shared envelope artifact once it knows it,
-    // well before `ReviewSynthesisStepKind` (the only other reader) runs.
-    let initial_env =
-        ReviewEnvelope { case_id: ctx.case_id.clone(), warnings: interpret_warnings, ..Default::default() };
+    // (#1373; #1530 Packet 1; narrowed to a plain `Vec<String>` by #2310 P2
+    // review — see `BuiltReviewGraph::interpret_warnings`'s own doc) Built
+    // EARLY (moved up from its former place right before
+    // `ReviewSynthesisStepKind`'s construction) so it's ready alongside
+    // every other build-time value this function hands back.
+    // `run_review_graph` folds it into `ReviewStepContext::
+    // interpret_warnings` for the ordinary synthesis path, or directly into
+    // the fallback envelope's `warnings` on the errored path.
 
     // (#1442 ship-2b) The probe/verify stages ride the GENERIC
     // `dispatch.map` builtin, so the registry starts from the Tier-1
@@ -7609,16 +7771,19 @@ pub fn build_review_graph_from_config(
     // recall breadth is a config edit (add another probe role/task to
     // review.json), never a per-run draw multiplier.
     //
-    // (#1541) `ProbeSeatSpec` no longer computes or carries a build-time
-    // `bundles` snapshot — the OLD `select_bundles_for_staffing(&ctx.bundles,
-    // ...)` call that used to live here duplicated the render step's own
-    // run-time call, and the two were only guaranteed to agree because both
-    // were the identical pure function over the identical `ctx.bundles`. The
-    // dedup boundary now reads the render step's PUBLISHED selection off
-    // `REVIEW_PROBE_SELECTION_ARTIFACT` instead (see that constant's doc and
-    // `reconstruct_probe_stage`'s), so `ProbeSeatSpec` only needs this seat's
-    // TOPOLOGY (identity, remote-ness, its one claimed task id) — never a
-    // second copy of WHICH bundles it covers.
+    // (#1541, superseded by #2310 P2) `ProbeSeatSpec` no longer computes or
+    // carries a build-time `bundles` snapshot — the OLD
+    // `select_bundles_for_staffing(&ctx.bundles, ...)` call that used to
+    // live here duplicated the render step's own run-time call, and the two
+    // were only guaranteed to agree because both were the identical pure
+    // function over the identical `ctx.bundles`. #1541 fixed this by
+    // publishing the render step's selection onto a (now ALSO retired) bus
+    // artifact; #2310 P2 replaced that in turn with each probe seat's
+    // `review.probe-collect` step simply recomputing the SAME selection
+    // itself (see [`ReviewProbeCollectStepKind`]'s own doc) — either way,
+    // `ProbeSeatSpec` only needs this seat's TOPOLOGY (identity,
+    // remote-ness, its one claimed task id), never a second copy of WHICH
+    // bundles it covers.
     let remote_budget = ctx.remote_max_tokens_per_execution;
     let mut probe_specs: Vec<ProbeSeatSpec> = Vec::new();
     for (staffing, task_id) in probes.iter().zip(claims.iter()) {
@@ -7948,7 +8113,7 @@ pub fn build_review_graph_from_config(
         tasks,
         steps,
         registry,
-        initial_env,
+        interpret_warnings,
         synthesis_step_id,
         phase_id_of_step,
     })
@@ -8055,6 +8220,45 @@ fn errored_steps_degenerate_reason(
     )
 }
 
+/// (#2310 P2 review finding C2) The FIRST completed step whose `output`
+/// reads as `expected_kind` — scans every `Step` in the run's post-graph
+/// state (not `gather_inputs`'s edge-scoped `input` map `find_by_kind`
+/// reads; this runs AFTER the graph, over EVERY step, since the errored
+/// fallback below has no single step's own `input` to read from). Only
+/// `NodeStatus::Complete` steps are considered — a `Running`/`Planned`
+/// step's stale `output` (if any) from a PRIOR run is never mistaken for
+/// this run's real data, and an `Error` step's `output` is a failure
+/// message, not a typed body.
+fn find_completed_output_by_kind<T: serde::de::DeserializeOwned>(
+    steps: &std::collections::BTreeMap<String, Step>,
+    expected_kind: &str,
+) -> Option<T> {
+    steps
+        .values()
+        .filter(|s| matches!(s.status, darkmux_crew::types::NodeStatus::Complete))
+        .find_map(|s| {
+            let raw = s.output.as_deref()?;
+            darkmux_crew::step_output::Output::<T>::read(raw, expected_kind).ok().map(|o| o.body)
+        })
+}
+
+/// Same scope as [`find_completed_output_by_kind`], but every match —
+/// there can be one completed step PER PROBE TASK, unlike the other three
+/// kinds this module reads (one producer apiece).
+fn find_all_completed_outputs_by_kind<T: serde::de::DeserializeOwned>(
+    steps: &std::collections::BTreeMap<String, Step>,
+    expected_kind: &str,
+) -> Vec<T> {
+    steps
+        .values()
+        .filter(|s| matches!(s.status, darkmux_crew::types::NodeStatus::Complete))
+        .filter_map(|s| {
+            let raw = s.output.as_deref()?;
+            darkmux_crew::step_output::Output::<T>::read(raw, expected_kind).ok().map(|o| o.body)
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_review_graph(
     ctx: &ReviewStepContext,
@@ -8066,7 +8270,7 @@ pub fn run_review_graph(
     emitter: &mut dyn ReviewEmitter,
     persist: &mut dyn FnMut(&Step),
 ) -> Result<(ReviewEnvelope, std::collections::BTreeMap<String, Step>)> {
-    let BuiltReviewGraph { tasks, mut steps, registry, initial_env, synthesis_step_id, .. } = graph;
+    let BuiltReviewGraph { tasks, mut steps, registry, interpret_warnings, synthesis_step_id, .. } = graph;
     let tasks_by_id: std::collections::BTreeMap<String, Task> =
         tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
 
@@ -8080,32 +8284,35 @@ pub fn run_review_graph(
     // `bundle_override`), `mission_id`, and (new this packet) the run's own
     // identity/knob-config `ReviewSynthesisStepKind` needs to assemble the
     // envelope (`crew_name`/`mode_label`/`fingerprint`/`staffing`) plus
-    // `build_review_graph`'s own interpret-time warnings (`initial_env.
-    // warnings` — see `ReviewStepContext::interpret_warnings`'s own doc).
-    // Overlaid onto `ctx.clone()` via struct-update syntax — the SAME
-    // pre-stamp this function used to apply to a separate shared envelope,
-    // now applied to the context every kind already reads.
+    // `build_review_graph`'s own interpret-time warnings
+    // (`interpret_warnings` — see `ReviewStepContext::interpret_warnings`'s
+    // own doc). Overlaid onto `ctx.clone()` via struct-update syntax — the
+    // SAME pre-stamp this function used to apply to a separate shared
+    // envelope, now applied to the context every kind already reads.
     let run_ctx_artifact: Arc<ReviewStepContext> = Arc::new(ReviewStepContext {
         crew_name: Some(crew_name.to_string()),
         mode_label: Some(mode_label(mode).to_string()),
         fingerprint: Some(fingerprint_val.clone()),
         staffing: Some(staffing.clone()),
-        interpret_warnings: initial_env.warnings.clone(),
+        interpret_warnings: interpret_warnings.clone(),
         ..ctx.clone()
     });
-    // (#2310 P2) A fallback envelope, used only on the three paths that
-    // never reach `ReviewSynthesisStepKind`'s own typed output: a
-    // scheduling failure, a step error, or (defensively) a synthesis
-    // output that fails to parse. Carries the same case_id/crew/mode/
-    // fingerprint/staffing/interpret-warnings identity a successful run's
-    // envelope would, so even a degenerate run is self-describing.
+    // (#2310 P2) A fallback envelope, used only on the two paths that never
+    // reach `ReviewSynthesisStepKind`'s own typed output: a scheduling
+    // failure, or (defensively) a synthesis output that fails to parse. The
+    // THIRD such path — an errored step — no longer uses this closure (see
+    // #2310 P2 review finding C2: it rebuilds from whichever typed outputs
+    // actually completed instead, only falling back to `reason` alone when
+    // nothing did). Carries the same case_id/crew/mode/fingerprint/
+    // staffing/interpret-warnings identity a successful run's envelope
+    // would, so even a degenerate run is self-describing.
     let fallback_env = |reason: String| ReviewEnvelope {
         case_id: ctx.case_id.clone(),
         crew: crew_name.to_string(),
         mode: mode_label(mode).to_string(),
         fingerprint: fingerprint_val.clone(),
         staffing: Some(staffing.clone()),
-        warnings: initial_env.warnings.clone(),
+        warnings: interpret_warnings.clone(),
         degenerate: Some(reason),
         degenerate_kind: Some(DegenerateKind::Error),
         ..ReviewEnvelope::default()
@@ -8226,7 +8433,79 @@ pub fn run_review_graph(
         // That is the dispatch-liveness contract's converse (#857/#1272):
         // blocked/failed work must be as visible — and as REASONED — as
         // running work, never a silent Clean.
-        let env = fallback_env(errored_steps_degenerate_reason(&report.errored, &steps));
+        let reason = errored_steps_degenerate_reason(&report.errored, &steps);
+        // (#2310 P2 review finding C2) An errored run must not lose what
+        // completed BEFORE the failure — the pre-typed-output shared
+        // envelope used to keep `bundles`/`bundle_skip`/`bundler_fallback`,
+        // probe `members`/`warnings`/`remote_budgets`, `raw_flags`,
+        // `probe_retries`, and a pre-set `degenerate` across a step error;
+        // `fallback_env` alone (identity + the errored reason, nothing
+        // else) silently dropped every one of them. Rebuild from whichever
+        // typed outputs actually completed, via the SAME fold
+        // `ReviewSynthesisStepKind` applies on a clean run (see
+        // `fold_review_outputs_into_envelope`'s own doc) — `reason` is used
+        // only if that fold left `degenerate` unset (a dedup/judge stage's
+        // own, more specific reason wins).
+        let mut env = ReviewEnvelope {
+            case_id: ctx.case_id.clone(),
+            crew: crew_name.to_string(),
+            mode: mode_label(mode).to_string(),
+            fingerprint: fingerprint_val.clone(),
+            staffing: Some(staffing.clone()),
+            ..ReviewEnvelope::default()
+        };
+        env.warnings.extend(interpret_warnings.clone());
+
+        let bundle_output =
+            find_completed_output_by_kind::<BundleSetOutput>(&steps, review_outputs::BUNDLE_SET_OUTPUT_KIND);
+        let mut dedup_output =
+            find_completed_output_by_kind::<DedupOutput>(&steps, review_outputs::DEDUP_OUTPUT_KIND);
+        let judge_output =
+            find_completed_output_by_kind::<JudgeOutput>(&steps, review_outputs::JUDGE_OUTPUT_KIND);
+        if dedup_output.is_none() {
+            // The dedup step itself never completed — fall back to folding
+            // each completed PROBE SEAT's own typed output directly, the
+            // SAME `fold_probe_seats` aggregation `ReviewDedupStepKind`
+            // itself applies, so this still carries the members/warnings/
+            // budget-row/degenerate facts dedup would have produced.
+            let seats = find_all_completed_outputs_by_kind::<ProbeSeatOutput>(
+                &steps,
+                review_outputs::PROBE_SEAT_OUTPUT_KIND,
+            );
+            if !seats.is_empty() {
+                let (raw, members, warnings, remote_budget, degenerate, probe_retries) =
+                    fold_probe_seats(&seats, ctx.remote_max_tokens_per_execution);
+                dedup_output = Some(DedupOutput {
+                    schema_version: review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+                    stats: DedupStats { raw: raw.len(), deduped: raw.len() },
+                    raw_flags: raw.len(),
+                    flags: raw,
+                    members,
+                    warnings,
+                    remote_budget,
+                    degenerate,
+                    probe_retries: probe_retries as usize,
+                });
+            }
+        }
+        // (#2310 P2 review finding C2) Verify never contributes here — the
+        // four kinds this fallback reconstructs from
+        // (bundles/probe-flags/deduped-flags/judged-flags) are exactly the
+        // stages that can complete BEFORE a later stage errors; a verify
+        // stage that itself produced real output would have let the graph
+        // reach `review-synthesis-step` normally (the `if` branch above),
+        // never landing here.
+        fold_review_outputs_into_envelope(
+            &mut env,
+            bundle_output.as_ref(),
+            dedup_output.as_ref(),
+            judge_output.as_ref(),
+            None,
+        );
+        if env.degenerate.is_none() {
+            env.degenerate = Some(reason);
+            env.degenerate_kind = Some(DegenerateKind::Error);
+        }
         // (#1530) Say it on STDERR too, not only in the envelope. Since
         // bundling moved into the graph, a launch MISCONFIGURATION (a typo'd
         // `--bundler`, a `source.path` that doesn't exist) is no longer an

@@ -4268,11 +4268,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // unclaimed declared probe task — that pruning must be LOUD, not
         // silent, since a production run pruning a declared task is exactly
         // the reduced-coverage failure mode a Studio hand-edit can trigger.
-        // (#1530 Packet 1) `BuiltReviewGraph` now carries the envelope's
-        // build-time contents as a plain value (`initial_env`), not an
-        // `Arc<Mutex<_>>` — the Arc is minted inside `run_review_graph`,
-        // not here (see `BuiltReviewGraph::initial_env`'s doc).
-        let warnings = graph.initial_env.warnings.clone();
+        // (#1530 Packet 1; narrowed to a plain `Vec<String>` by #2310 P2
+        // review — see `BuiltReviewGraph::interpret_warnings`'s doc)
+        // `BuiltReviewGraph` carries the build-time interpret warnings as a
+        // plain value, not an `Arc<Mutex<_>>` — the Arc is minted inside
+        // `run_review_graph`, not here.
+        let warnings = graph.interpret_warnings.clone();
         assert!(
             warnings.iter().any(|w| w.contains("pruned")),
             "pruning an unclaimed declared probe task must warn: {warnings:?}"
@@ -6970,6 +6971,120 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         );
     }
 
+    /// (#2310 P2 review finding C2) An errored run's fallback envelope used
+    /// to be built from `fallback_env` ALONE — identity fields plus the
+    /// errored reason, nothing else — which silently discarded whatever
+    /// completed BEFORE the failure. Pre-P2, the shared envelope's
+    /// accumulated `bundles`/probe `members`/`remote_budgets` survived a
+    /// later step's error (they had already been written into the shared,
+    /// mutex-guarded envelope); the typed-output graph has no such shared
+    /// state, so `run_review_graph`'s errored branch must rebuild those
+    /// same facts from whichever producer typed outputs actually completed.
+    ///
+    /// Scenario: three REMOTE probe seats all complete (their own
+    /// `review.probe-flags` outputs, then `review.dedup`'s own
+    /// `review.deduped-flags` fold of them — dedup has no dependency on
+    /// judge, so it always completes here), then the JUDGE step itself
+    /// fails LOUDLY (same `reads`-edge-severed mechanism the sibling test
+    /// above uses, for the same reliability reason — a chat-level judge
+    /// dispatch failure is handled gracefully per-flag by `judge_gate_
+    /// outcome` and would reach synthesis normally, never landing in
+    /// `report.errored` at all). Red before the fix: `env.members` was
+    /// `[]` and `env.bundles` was `0`, even though three real probe
+    /// dispatches and a real bundle set both completed before the judge
+    /// step ever ran.
+    #[test]
+    fn errored_run_fallback_envelope_carries_what_completed_before_the_failure() {
+        let crew = crew_with(vec![
+            (
+                "review-probe",
+                vec![
+                    remote_staffing("cloud", "gpt-probe-1", 1),
+                    remote_staffing("cloud", "gpt-probe-2", 1),
+                    remote_staffing("cloud", "gpt-probe-3", 1),
+                ],
+            ),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let ctx = step_ctx_with_chat(&crew, vec![bundle_input("a.ts")], |call: &ChatCall| {
+            assert_ne!(
+                call.model, "darkmux:judge-model",
+                "the judge step must fail before ever reaching a model call"
+            );
+            Ok(SingleShotReply {
+                content: "a real defect `const end = start.plus(30)`".to_string(),
+                total_tokens: Some(600),
+                prompt_tokens: None,
+                completion_tokens: None,
+                model: None,
+            })
+        });
+        let judge = ctx.roles.judge.clone();
+        let probes = ctx.roles.probes.clone();
+        let mut graph = build_review_graph(
+            ctx.clone(),
+            &dummy_bundle_spec(),
+            judge.clone(),
+            None,
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        graph
+            .tasks
+            .iter_mut()
+            .find(|t| t.id == "review-judge-task")
+            .expect("review-judge-task exists")
+            .reads
+            .retain(|id| id != "review-dedup-task");
+        let context_out_dir = tempfile::tempdir().expect("tempdir for review-context-step's output");
+        stamp_context_step_for_test(&mut graph.steps, &ctx, context_out_dir.path());
+
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, None, ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
+        let (env, steps) = run_review_graph(
+            &ctx,
+            &crew_name,
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut NullEmitter,
+            &mut |_step| {},
+        )
+        .expect("graph run completes (a loud PER-STEP error, not a hard Err)");
+
+        assert_eq!(
+            steps["review-judge-step"].status,
+            NodeStatus::Error,
+            "sanity: the judge step must have actually errored (the fallback path this test pins)"
+        );
+        assert_eq!(env.bundles, 1, "the bundle step completed before judge ever ran: {:?}", env);
+        assert_eq!(
+            env.members.len(),
+            3,
+            "all three probe seats' own members must survive the judge step's failure: {:?}",
+            env.members
+        );
+        for m in &env.members {
+            assert!(m.total_tokens > 0, "each surviving member must keep its real token count: {m:?}");
+        }
+        assert!(
+            env.remote_budgets.iter().any(|r| r.stage == "probe"),
+            "the probe stage's own remote-budget row must survive too: {:?}",
+            env.remote_budgets
+        );
+        assert!(
+            env.degenerate.is_some(),
+            "an errored run is still named as degenerate: {:?}",
+            env.degenerate
+        );
+    }
+
     /// (#2310 P1 review finding I2, mutation/red-proof) The verify-render
     /// sibling of the judge test above — a `review-verify-task` whose
     /// `reads` no longer names `review-judge-task` must fail loudly rather
@@ -7454,6 +7569,203 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             env.warnings.iter().any(|w| w.contains("remote judge dispatch failed on 1 of 3 flag")),
             "a minority judge dispatch error must be named in env.warnings: {:?}",
             env.warnings
+        );
+    }
+
+    /// (#2310 P2 review finding C1) `ReviewSynthesisStepKind` folded
+    /// dedup/judge/verify warnings into the final envelope but never
+    /// `ctx.interpret_warnings` — `build_review_graph`'s own interpret-time
+    /// warnings (e.g. "pruned an unclaimed probe task") silently vanished
+    /// from every SUCCESSFUL run's envelope; pre-P2 they always arrived via
+    /// the pre-seeded shared envelope. This combines all four warning
+    /// sources in ONE run and pins the fold order the fix restores:
+    /// interpret -> judge -> verify -> probe (see `ReviewSynthesisStepKind::
+    /// run_streaming`'s own comment on that order). Seeds the interpret
+    /// warning at the REAL site (`BuiltReviewGraph.initial_env.warnings`,
+    /// what `run_review_graph` actually reads — not `ctx.interpret_warnings`
+    /// directly, which `run_review_graph`'s own overlay would clobber
+    /// anyway). Red before the fix (index 0 is the judge warning, not the
+    /// interpret one — or a panic if `env.warnings` was shorter);
+    /// also red under a reversed fold (wrong warning at each index).
+    #[test]
+    fn synthesis_folds_warnings_in_pinned_order() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-a", 1), graph_staffing("fast", "probe-b", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+            ("review-verify", vec![remote_staffing("frontier", "gpt-verify", 1)]),
+        ]);
+        let bundles = vec![bundle_input("a.ts"), bundle_input("b.ts"), bundle_input("c.ts")];
+        let judge_call_index = std::sync::atomic::AtomicU32::new(0);
+        // The DEFAULT (500_000) per-execution allowance — NOT tightened —
+        // so the judge stage's own bucket (a SEPARATE bucket from verify's,
+        // per `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`'s "one execution =
+        // one pipeline stage" contract) has room for 6 ordinary 10-token
+        // calls without tripping its own exhaustion path; only the verify
+        // reply below is scaled to exceed it deliberately.
+        let ctx = step_ctx_with_chat(&crew, bundles, move |call: &ChatCall| {
+            if call.model == "darkmux:probe-b" {
+                // Every probe-b draw errors — this seat's own per-seat
+                // "dispatch failed on N draw(s)" warning, the probe stage's
+                // contribution to `DedupOutput::warnings` (folded LAST).
+                Err(anyhow!("probe-b endpoint down"))
+            } else if call.model == "darkmux:probe-a" {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else if call.model == "gpt-judge" {
+                // Same flag-major call order as `graph_remote_judge_
+                // dispatch_error_on_minority_of_flags_does_not_degrade_
+                // the_run`: f1.p1, f1.p2, f2.p1, f2.p2, f3.p1, f3.p2 — fail
+                // only f2's pass-2 (call index 3), demoting f2 alone and
+                // leaving f1/f3 confirmed (2 confirmed flags for the
+                // verify stage below to adjudicate).
+                let idx = judge_call_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx == 3 { Err(anyhow!("judge endpoint 503")) } else { Ok(reply(CONFIRM_JSON)) }
+            } else if call.model == "gpt-verify" {
+                // Each adjudication reports 600_000 tokens against the
+                // 500_000-token default allowance — the first call exceeds
+                // it, the second is skipped, producing the verify stage's
+                // own budget warning (same mechanism as
+                // `graph_remote_verify_budget_exhaustion_degrades_the_
+                // stage_not_the_run`, scaled up so it doesn't also starve
+                // the judge stage's own SEPARATE bucket above).
+                Ok(SingleShotReply {
+                    content: VERIFIED_JSON.to_string(),
+                    total_tokens: Some(600_000),
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: None,
+                })
+            } else {
+                panic!("unexpected dispatch: model={}", call.model);
+            }
+        });
+
+        let judge = ctx.roles.judge.clone();
+        let verify = ctx.roles.verify.clone();
+        let probes = ctx.roles.probes.clone();
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
+        let mut graph = build_review_graph(
+            ctx.clone(),
+            &dummy_bundle_spec(),
+            judge,
+            verify,
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("built-in review config builds cleanly");
+        let context_out_dir = tempfile::tempdir().expect("tempdir for review-context-step's output");
+        stamp_context_step_for_test(&mut graph.steps, &ctx, context_out_dir.path());
+        // The real seed site: `run_review_graph` reads `graph.
+        // interpret_warnings` (never `ctx.interpret_warnings` directly —
+        // its own overlay clobbers that field with THIS one) to build the
+        // bus context's `interpret_warnings`. Pushing here is exactly what
+        // a real `mission_config::interpret` prune would have populated.
+        graph.interpret_warnings.push("pruned an unclaimed probe task".to_string());
+
+        let (env, _steps) = run_review_graph(
+            &ctx,
+            &crew_name,
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut NullEmitter,
+            &mut |_step| {},
+        )
+        .expect("graph run completes");
+
+        assert_eq!(env.confirmed, 2, "sanity: f1/f3 confirmed, f2 demoted by the judge dispatch error");
+
+        // (position-based, not a fixed index) The built-in `review` config
+        // declares MORE probe tasks (review-probe-high/-mid/-low) than this
+        // fixture staffs (two, unclaimed role_id `None`), so the interpreter
+        // ALSO contributes its OWN "no resolved probe staffing claimed"
+        // prune warning ahead of the one this test injects — both are
+        // genuine interpret-time warnings, and their relative order between
+        // each other is not this test's concern (`build_review_graph`'s own
+        // internal ordering, not `ReviewSynthesisStepKind`'s pinned fold).
+        // What this test pins is that EVERY interpret-time warning —
+        // including the one this test injects — lands strictly BEFORE
+        // every judge/verify/probe warning.
+        let mine_pos = env
+            .warnings
+            .iter()
+            .position(|w| w == "pruned an unclaimed probe task")
+            .expect("the injected interpret-time warning must reach the envelope — this is C1 itself");
+        let judge_pos = env
+            .warnings
+            .iter()
+            .position(|w| w.contains("remote judge dispatch failed on 1 of 3 flag"))
+            .expect("the judge warning must reach the envelope");
+        let verify_pos = env
+            .warnings
+            .iter()
+            .position(|w| w.contains("verify budget exhausted after 1 of 2 adjudications"))
+            .expect("the verify warning must reach the envelope");
+        let probe_pos = env
+            .warnings
+            .iter()
+            .position(|w| w.contains("dispatch failed on") && w.contains("draw(s)"))
+            .expect("the probe stage's own warning must reach the envelope");
+
+        assert!(mine_pos < judge_pos, "interpret must fold before judge: {:?}", env.warnings);
+        assert!(judge_pos < verify_pos, "judge must fold before verify: {:?}", env.warnings);
+        assert!(verify_pos < probe_pos, "verify must fold before probe (probe folds LAST): {:?}", env.warnings);
+    }
+
+    /// (#2310 P2 review finding I3) `find_by_kind`'s old `Output::read(raw,
+    /// kind).ok()` folded TWO different failure shapes into the same
+    /// `None`: a genuinely absent edge, and a `review.deduped-flags` body
+    /// that IS the right output but fails to deserialize (a missing
+    /// required field). Both used to surface as the same generic "no
+    /// `review.deduped-flags` output was found among its inputs" — a real
+    /// producer bug read identically to a perfectly ordinary missing
+    /// `reads` edge. Red before the fix: the assertion on `stats` fails
+    /// (the error names the EDGE, never the field) and the "must not read
+    /// as a missing edge" assertion fails too (it DOES).
+    #[test]
+    fn find_by_kind_propagates_a_body_deserialize_failure_by_field_name() {
+        // Hand-built envelope, hash deliberately empty (an unstamped/
+        // unverified body — `Output::from_value`'s own documented escape
+        // hatch) so this test can drop a required field from `body` without
+        // also having to keep a real blake3 hash in sync with it; the
+        // MISSING-FIELD deserialize failure is what this test is pinning,
+        // not the separate hash-integrity check.
+        let raw = serde_json::json!({
+            "schema_version": "1.0",
+            "kind": review_outputs::DEDUP_OUTPUT_KIND,
+            "producer": {},
+            "produced_at": "",
+            "hash": "",
+            "body": {
+                "schema_version": review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION,
+                "flags": [],
+                // "stats" deliberately omitted — DedupOutput::stats has no
+                // #[serde(default)], so this must fail the deserialize.
+                "members": [],
+                "warnings": [],
+                "remote_budget": null,
+                "degenerate": null,
+                "probe_retries": 0,
+                "raw_flags": 0,
+            },
+        })
+        .to_string();
+
+        let mut input = BTreeMap::new();
+        input.insert("review-dedup-task".to_string(), raw);
+
+        let err = deduped_from_input("review.synthesis", "review-synthesis-step", &input)
+            .expect_err("a malformed body of the RIGHT kind must fail loudly, not read as absent");
+        let msg = err.to_string();
+        assert!(msg.contains("stats"), "must name the broken FIELD: {msg}");
+        assert!(
+            !msg.contains("no `review.deduped-flags` output was found among its inputs"),
+            "must NOT read as a missing EDGE: {msg}"
         );
     }
 
@@ -8106,6 +8418,138 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             expected_pairs.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             "the collect step's recomputed selection is byte-identical (same bundles, same \
              order) to the render step's own selection for the same inputs"
+        );
+    }
+
+    /// (#2310 P2 review, minor finding) A MISSING predecessor entry (this
+    /// step's own `dispatch.map` output absent from `input` — a graph
+    /// wiring gap, `gather_inputs` never chained it) used to silently read
+    /// as `"[]"` (zero draws), indistinguishable from a genuine no-op
+    /// short-circuit. Red before the fix: this would have completed with
+    /// zero flags and zero warnings instead of failing loudly by name.
+    #[test]
+    fn probe_collect_step_missing_predecessor_input_fails_loudly_not_as_empty() {
+        let bundles = vec![bundle_input("a.ts")];
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let ctx = step_ctx(&crew, bundles.clone());
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
+        let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
+        let step = darkmux_crew::types::Step {
+            id: "review-probe-high-collect-step".to_string(),
+            task_id: "review-probe-high-task".to_string(),
+            gate: None,
+            kind: "review.probe-collect".to_string(),
+            status: NodeStatus::default(),
+            config: serde_json::json!({
+                "selector": null,
+                "name": "fast",
+                "identifier": "darkmux:probe-model",
+                "remote": false,
+                "endpoint_host": null,
+            }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "review-probe-high-task".to_string(),
+            phase_id: "investigate".to_string(),
+            description: "probe high".to_string(),
+            display_name: None,
+            step_ids: vec![
+                "review-probe-high-render-step".to_string(),
+                "review-probe-high-step".to_string(),
+                "review-probe-high-collect-step".to_string(),
+            ],
+            depends_on: vec!["review-bundle-task".to_string()],
+            reads: vec!["review-context-task".to_string()],
+            role_id: Some("review-probe-high".to_string()),
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mut input = BTreeMap::new();
+        input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-bundle-task".to_string(), bundle_task_output(&bundles));
+        // Deliberately NO "review-probe-high-step" entry — the map step's
+        // own output is absent, not empty.
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let kind = ReviewProbeCollectStepKind;
+        let err = kind
+            .run_streaming(&step, &task, &input, &run_ctx)
+            .expect_err("a missing predecessor entry must fail loudly, never read as zero draws");
+        let msg = err.to_string();
+        assert!(msg.contains("review-probe-high-step"), "must name the missing predecessor: {msg}");
+        assert!(
+            msg.contains("no input") || msg.contains("missing"),
+            "must say the entry is ABSENT, not merely empty: {msg}"
+        );
+    }
+
+    /// (#2310 P2 review, minor finding) The verify-collect sibling of the
+    /// probe-collect test above — same fix, same shape: a MISSING
+    /// predecessor entry must fail loudly, never silently read as zero
+    /// adjudications. Red before the fix.
+    #[test]
+    fn verify_collect_step_missing_predecessor_input_fails_loudly_not_as_empty() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![graph_staffing("frontier", "verify-model", 1)]),
+        ]);
+        let ctx = step_ctx(&crew, vec![bundle_input("a.ts")]);
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
+        let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
+        let step = darkmux_crew::types::Step {
+            id: "review-verify-collect-step".to_string(),
+            task_id: "review-verify-task".to_string(),
+            gate: None,
+            kind: "review.verify-collect".to_string(),
+            status: NodeStatus::default(),
+            config: serde_json::json!({}),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "review-verify-task".to_string(),
+            phase_id: "report".to_string(),
+            description: "verify".to_string(),
+            display_name: None,
+            step_ids: vec![
+                "review-verify-render-step".to_string(),
+                "review-verify-step".to_string(),
+                "review-verify-collect-step".to_string(),
+            ],
+            depends_on: vec!["review-judge-task".to_string()],
+            reads: vec!["review-context-task".to_string()],
+            role_id: Some("review-verify".to_string()),
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mut input = BTreeMap::new();
+        input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-judge-task".to_string(), judge_task_output(vec![]));
+        // Deliberately NO "review-verify-step" entry — the map step's own
+        // output is absent, not empty.
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let kind = ReviewVerifyCollectStepKind;
+        let err = kind
+            .run_streaming(&step, &task, &input, &run_ctx)
+            .expect_err("a missing predecessor entry must fail loudly, never read as zero items");
+        let msg = err.to_string();
+        assert!(msg.contains("review-verify-step"), "must name the missing predecessor: {msg}");
+        assert!(
+            msg.contains("no input") || msg.contains("missing"),
+            "must say the entry is ABSENT, not merely empty: {msg}"
         );
     }
 

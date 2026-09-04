@@ -1796,6 +1796,17 @@ mod tests {
         let verify_step_kinds: Vec<&str> =
             report.tasks[0].steps.iter().map(|s| s.kind.as_str()).collect();
         assert_eq!(verify_step_kinds, vec!["review.verify-render", "dispatch.map", "review.verify-collect"]);
+        // (#2310 P2 review, minor finding) The verify task's own `reads`
+        // was asserted nowhere in this test even though judge's and
+        // synthesis's siblings both are (just above/below) — `review-bundle
+        // -task` is new here too, for the SAME reason `ReviewJudgeStepKind`
+        // and `ReviewSynthesisStepKind` need it: `ReviewVerifyRenderStepKind
+        // ::requires()` reads the typed bundle set directly (see that
+        // kind's own doc).
+        assert_eq!(
+            report.tasks[0].reads,
+            vec!["review-judge-task", "review-context-task", "review-bundle-task"]
+        );
         // (#1619) synthesis still receives all three upstream outputs (#1442 —
         // the judged docket flows directly from the judge; verify's own
         // output is the map's result array), but the CROSS-PHASE pair now

@@ -262,6 +262,23 @@ mod tests {
         let err = serde_json::from_value::<DedupOutput>(v).unwrap_err().to_string();
         assert!(err.contains("stats"), "{err}");
 
+        // (#2310 P2 review finding I3) `JudgeOutput` was missing from this
+        // otherwise-exhaustive "every body" test — added so a regression on
+        // its own required field (`judged`) fails here rather than only
+        // being caught (or missed) downstream at `find_by_kind`'s peek.
+        let judge = JudgeOutput {
+            schema_version: REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+            judged: vec![],
+            member: None,
+            remote_budget_rows: vec![],
+            warnings: vec![],
+            degenerate: None,
+        };
+        let mut v = serde_json::to_value(&judge).unwrap();
+        v.as_object_mut().unwrap().remove("judged");
+        let err = serde_json::from_value::<JudgeOutput>(v).unwrap_err().to_string();
+        assert!(err.contains("judged"), "{err}");
+
         let verify = VerifyOutput {
             schema_version: REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
             results: vec![],

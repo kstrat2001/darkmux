@@ -278,9 +278,15 @@ export function indexGraph(g: { nodes: GraphNode[] }): GraphIndex {
 
 export function isAiKind(kind: string | undefined): boolean {
   if (!kind) return false;
-  // `-render` kinds are prompt builders, never dispatchers — excluded
-  // BEFORE the prefix tests below (see mission-graph.html's own #1530 note).
-  if (kind.endsWith("-render")) return false;
+  // `-render` kinds are prompt builders, never dispatchers, and `-collect`
+  // kinds are the procedural fan-in step AFTER a `dispatch.map` (they read
+  // that step's already-completed results, never dispatch themselves) —
+  // both excluded BEFORE the prefix tests below (see mission-graph.html's
+  // own #1530 note; `-collect` added per #2310 P2 review finding I4 — a
+  // `review.probe-collect`/`review.verify-collect` step was getting a
+  // token/turn meter it never earned, having placed zero dispatches of its
+  // own).
+  if (kind.endsWith("-render") || kind.endsWith("-collect")) return false;
   if (kind.indexOf("dispatch.") === 0) return true;
   if (kind === "mission.coder" || kind === "mission.verify") return true;
   if (kind.indexOf("review.probe") === 0 || kind.indexOf("review.judge") === 0 || kind.indexOf("review.verify") === 0)
