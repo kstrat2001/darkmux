@@ -1,0 +1,20 @@
+{
+  "_comment": "(#2310 P4c) DESIGN.md \"Rule seed: existing solutions\" — the classic catch: the author re-implemented something that already exists. `detect` is a concrete shape (a new fn/type whose name or body matches a utility class); `search` is the mechanical recipe the unit runs verbatim over the whole tree; `compare` is the one bounded inference; delivered as a QUESTION with candidates attached, never a claim. Per-repo tribal knowledge (a curated known-solutions list, operator-maintained) is the future data source for the well-known-package half of this rule; today the model's own training knowledge stands in for it, named explicitly as unconfirmed in the question.",
+  "id": "existing-solution",
+  "kind": "site",
+  "title": "A new routine looks re-implemented rather than reused",
+  "scope": ["diff"],
+  "confirm": "question",
+  "applies_to": [],
+  "exclude": ["**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/tests/**"],
+  "window": 25,
+  "match": "This hunk introduces a new function or type whose name or body matches a utility class already common in software: parsing, formatting, validating, retrying, debouncing, path manipulation, date arithmetic, or an enum-like set of string literals — written from scratch rather than calling something that already exists.",
+  "no_match": "The new routine is genuinely specific to this codebase's own domain (no general-purpose library or internal helper could plausibly cover it). It already calls an existing helper or well-known library. Test code, fixtures, or generated code.",
+  "evidence": "The new function or type's signature line, copied verbatim. `line` is where it appears.",
+  "why_hint": "Name the utility class this routine belongs to, then name every candidate your search and your own knowledge turned up, with a one-line yes/no/partly for each on whether it does the same job.",
+  "search": {
+    "patterns": [],
+    "note": "Search the tree for an existing helper doing the same job — the same verbs/nouns as the new routine's name, and any file whose name suggests the same utility class (a `utils`/`helpers`/`lib` directory is a good place to start). Also check the package manifest (package.json/Cargo.toml/pyproject.toml/go.mod) for a well-known library already installed that covers this."
+  },
+  "compare": "Does an existing helper in this tree, or a well-known library already in the manifest, do the same job as this new routine? Name every candidate found (from the search, or from your own training knowledge for a well-known package) with yes/no/partly and one line why."
+}

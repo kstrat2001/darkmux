@@ -14,6 +14,20 @@
 //! module rather than in `darkmux-crew`'s shared `step_kinds/` because no
 //! second mission plans. Promote when one does.
 //!
+//! (#2310 P4c) A second mission plans now — `review-v2.json` uses
+//! `plan_sites_step::PLAN_SITES_KIND` (`"plan.sites"`, this file's
+//! sibling), whose `"source": "tree"` config literally calls this
+//! module's own [`plan_one_rule`], so `crawl.plan`'s tree-source behavior
+//! stays byte-identical (the crawl-plan golden is untouched by this
+//! packet). This kind is deliberately NOT retired or renamed here — the
+//! brief this packet implements says so explicitly, and P4d is where
+//! `crawl.plan` becomes `plan.sites`'s tree-source alias for real (or
+//! retires) once the crawl side of the consolidation is decided. Until
+//! then, `crawl.plan` is the kind `crawl.json` names; `plan.sites` is the
+//! kind `review-v2.json` names; both produce the same `Plan` content
+//! (`CRAWL_PLAN_OUTPUT_KIND`), so `crawl.unit` reads either without
+//! modification.
+//!
 //! Step config:
 //!
 //! ```json
@@ -179,14 +193,22 @@ pub fn default_plan_path(task: &Task, rule: &str) -> Result<PathBuf> {
 
 /// The mission a task belongs to, or an empty string — provenance never
 /// fails a step that is otherwise fine.
-fn mission_id_of(task: &Task) -> String {
+///
+/// `pub(crate)` (#2310 P4c, was module-private): `plan_sites_step`'s
+/// `"plan.sites"` diff-source path writes the SAME `Output<Plan>` wrapper
+/// shape this module's `crawl.plan` writes, and reuses this helper rather
+/// than re-deriving it — one place "which mission does this task belong
+/// to" is answered, not two.
+pub(crate) fn mission_id_of(task: &Task) -> String {
     darkmux_crew::loader::load_phases()
         .ok()
         .and_then(|ps| ps.iter().find(|p| p.id == task.phase_id).map(|p| p.mission_id.clone()))
         .unwrap_or_default()
 }
 
-fn write_plan(path: &Path, the_plan: &darkmux_crew::step_output::Output<Plan>) -> Result<()> {
+/// `pub(crate)` (#2310 P4c, was module-private) — same reasoning as
+/// `mission_id_of` above.
+pub(crate) fn write_plan(path: &Path, the_plan: &darkmux_crew::step_output::Output<Plan>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -204,6 +226,13 @@ fn write_plan(path: &Path, the_plan: &darkmux_crew::step_output::Output<Plan>) -
 pub fn register_crawl_kinds(registry: &StepKindRegistry) -> Result<()> {
     registry.register(Arc::new(CrawlPlanStepKind)).context("registering crawl.plan")?;
     crate::crawl::unit_step::register(registry)?;
+    // (#2310 P4c) `plan.sites` — review-v2.json's planner. Registered
+    // alongside the crawl kinds (not a separate top-level call in
+    // `all_step_kinds`) so one call still gives a launcher every kind
+    // either config declares, matching this function's own existing
+    // reasoning ("Registered here so `mission config show crawl`
+    // validates its graph...").
+    crate::crawl::plan_sites_step::register(registry)?;
     Ok(())
 }
 

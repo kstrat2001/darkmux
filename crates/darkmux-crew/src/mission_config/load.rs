@@ -49,6 +49,18 @@ const EMBEDDED_MISSION_CONFIGS: &[(&str, &str)] = &[
             "/../../templates/builtin/mission-configs/crawl.json"
         )),
     ),
+    // (#2310 P4c) The rebuilt review, as a second config on the crawl's
+    // building blocks. `id: "review-v2"` — deliberately NOT `"review"`,
+    // which stays the frozen, byte-identical CLI surface until P4d swaps
+    // them. Runs through the generic launcher exactly like `crawl` (no
+    // bespoke launcher, no literal routing).
+    (
+        "review-v2",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../templates/builtin/mission-configs/review-v2.json"
+        )),
+    ),
 ];
 
 /// The raw embedded JSON for a built-in id. `pub(crate)` (#1284 review

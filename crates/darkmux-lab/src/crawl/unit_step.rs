@@ -196,16 +196,93 @@ pub struct UnitOutcome {
 /// why_hint fields, wrapped so a Read unit binding several rules can carry
 /// more than one without ambiguity about which sentence belongs to which
 /// pattern.
+///
+/// (#2310 P4c) A `confirm: "search"`/`"question"` rule gets ONE more
+/// instruction appended, naming the confirmation step DESIGN.md's "a rule
+/// is a procedure" section describes: `detect` (the `match`/`no_match`
+/// prose above) is unchanged for either form — only what happens AFTER a
+/// candidate is spotted differs. `create_finding`'s wire schema carries no
+/// `context`/`form` argument the model can set (see `runtime/src/tools/
+/// mod.rs`'s `CreateFinding` schema — deliberately not extended by this
+/// packet, see this crate's #2310 P4c doc notes), so the confirmation step
+/// is instead told to run BEFORE `create_finding` is called and to fold
+/// its result into `why` — the finding's `context` (which mission/rule/
+/// unit produced it, stamped by the host, never the model) is what a
+/// downstream reader keys on to know a rule ran the search/question form
+/// at all; `why`'s text is where the search's own results or the
+/// question's own answer actually live.
 fn pattern_block(rule: &Rule) -> String {
-    format!(
-        "<pattern name=\"{id}\">\nTitle: {title}\n\nReport a match when: {matches}\n\nDo NOT report when: {no_match}\n\nWhat evidence to cite: {evidence}\n\nHow to explain why: {why_hint}\n</pattern>\n\n",
+    let mut out = format!(
+        "<pattern name=\"{id}\">\nTitle: {title}\n\nReport a match when: {matches}\n\nDo NOT report when: {no_match}\n\nWhat evidence to cite: {evidence}\n\nHow to explain why: {why_hint}\n",
         id = rule.id,
         title = rule.title.as_deref().unwrap_or(&rule.id),
         matches = rule.matches.as_deref().unwrap_or(""),
         no_match = rule.no_match.as_deref().unwrap_or(""),
         evidence = rule.evidence.as_deref().unwrap_or(""),
         why_hint = rule.why_hint.as_deref().unwrap_or(""),
-    )
+    );
+    match rule.confirm {
+        darkmux_crew::rules::ConfirmForm::Mod => {}
+        darkmux_crew::rules::ConfirmForm::Search => {
+            if let Some(recipe) = &rule.search {
+                out.push_str(&format!(
+                    "\nBefore you call create_finding for this pattern: this pattern is confirmed by SEARCHING, \
+                     not by reasoning alone. {}Then, in `why`, list every instance the search returned \
+                     (file:line for each) before explaining the match — a finding for this pattern with no \
+                     search results named in `why` is incomplete.\n",
+                    search_instruction(recipe),
+                ));
+            }
+        }
+        darkmux_crew::rules::ConfirmForm::Question => {
+            // (#2310 P4c) DESIGN.md's rule shape is detect -> search ->
+            // compare -> deliver as four steps regardless of the final
+            // delivery form (`existing-solution`'s "search the tree
+            // mechanically, THEN ask the question" is exactly this): a
+            // `confirm: "question"` rule may ALSO declare a `search`
+            // recipe, run first, whose results feed the question's own
+            // answer.
+            if let Some(recipe) = &rule.search {
+                out.push_str(&format!(
+                    "\nBefore you answer the question below: {}List what you find in `why` before your \
+                     answer — the question is answered FROM the search, not guessed.\n",
+                    search_instruction(recipe),
+                ));
+            }
+            if let Some(compare) = &rule.compare {
+                out.push_str(&format!(
+                    "\nBefore you call create_finding for this pattern: answer this question in one line, then \
+                     put your answer AND its reasoning at the start of `why` — this pattern's finding is a \
+                     QUESTION for the author, not a claim, so be honest that it is unconfirmed: {compare}\n",
+                ));
+            }
+        }
+    }
+    out.push_str("</pattern>\n\n");
+    out
+}
+
+/// (#2310 P4c) One sentence telling the model to run the `search` tool,
+/// over the tree (not just its window). Some rules fix the search terms
+/// up front (`shared-symbol-callers`: "search for THIS symbol's name",
+/// known from the rule's own detect step); others cannot — the term IS
+/// the thing the model just observed in the hunk (`existing-solution`:
+/// the new routine's own name), so `patterns` is deliberately empty and
+/// `note` alone carries the instruction. Rendering "run the tool for each
+/// of these patterns: " with an empty list would read as broken
+/// instructions, so the two cases get different sentences rather than one
+/// template papering over the difference.
+fn search_instruction(recipe: &darkmux_crew::rules::SearchRecipe) -> String {
+    let note = recipe.note.as_deref().unwrap_or("");
+    if recipe.patterns.is_empty() {
+        format!("Run the `search` tool over the tree (not just the window you were given). {note} ")
+    } else {
+        format!(
+            "Run the `search` tool once for each of these patterns over the tree (not just the window you were \
+             given): {}. {note} ",
+            recipe.patterns.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", "),
+        )
+    }
 }
 
 fn render_sites(source: &str, sites: &[Site]) -> String {
@@ -453,25 +530,34 @@ pub fn count_rejected_create_findings(out_dir: &Path) -> usize {
 
 // ── crawler seat (#2188) ─────────────────────────────────────────────────
 
-/// The crawler role's resolved model + locality + profile. Resolved
+/// A dispatched role's resolved model + locality + profile. Resolved
 /// per-unit here (the binding does not change mid-run, so this is a cheap
 /// repeat of the same registry read the retired launcher did once) purely
 /// to STAMP provenance onto this dispatch's records: `DispatchOpts::
 /// profile_name` stays `None`, i.e. "use the role's own `role_profiles.
-/// crawler` binding". An unresolvable registry leaves every field
-/// `None`/`"unknown"` rather than failing the unit.
+/// <role>` binding". An unresolvable registry leaves every field
+/// `None`/`"unknown"` rather than failing the unit. Named `CrawlerSeat`
+/// from when it only ever resolved the `crawler` role (#1959); kept the
+/// name across #2310 P4c's generalization to any role since the type
+/// itself is role-agnostic and a rename here would touch every call site
+/// for no behavior change.
 pub struct CrawlerSeat {
     pub model: Option<String>,
     pub locality: &'static str,
     pub profile_name: Option<String>,
 }
 
-pub fn resolve_crawler_seat() -> CrawlerSeat {
+/// (#2310 P4c) `role` is the Task's own `role_id` — see `CrawlUnitStepKind::
+/// run`'s doc for why the dispatch itself now reads `task.role_id` rather
+/// than a hardcoded `"crawler"`; this resolver generalizes the same way so
+/// a reviewer-role unit's provenance stamp names `role_profiles.reviewer`,
+/// not a crawler binding that was never actually dispatched.
+pub fn resolve_crawler_seat(role: &str) -> CrawlerSeat {
     let unresolved = || CrawlerSeat { model: None, locality: "unknown", profile_name: None };
     let Ok(loaded) = darkmux_profiles::profiles::load_registry(None) else {
         return unresolved();
     };
-    let Ok(resolved) = darkmux_profiles::profiles::resolve_role_profile("crawler", &loaded.registry) else {
+    let Ok(resolved) = darkmux_profiles::profiles::resolve_role_profile(role, &loaded.registry) else {
         return unresolved();
     };
     let Some(model_id) = resolved.profile.default_model_id() else {
@@ -773,6 +859,28 @@ fn single_rule_id(rule_ids: &[String]) -> Option<String> {
     }
 }
 
+/// (#2310 P4c) Same "one id or null" shape as [`single_rule`], but the
+/// resolved rule's `confirm` form (`"mod"`/`"search"`/`"question"`) rather
+/// than its id — stamped into `record_context` (host-known, never
+/// model-supplied) so a downstream reader of a finding this unit produced
+/// knows which of the three ways it was meant to be confirmed WITHOUT
+/// re-resolving the rule registry itself. `null` for a multi-rule read
+/// unit (ambiguous which rule a given finding answers to without the
+/// finding's own `pattern`, same reasoning `single_rule` already carries)
+/// or when the single rule id names nothing in `rules_by_id` (the
+/// `missing` rule case `build_message` already refuses loudly before this
+/// is ever reached in practice).
+fn single_confirm(rules_by_id: &BTreeMap<String, Rule>, rule_ids: &[String]) -> Value {
+    match single_rule_id(rule_ids).and_then(|id| rules_by_id.get(&id)) {
+        Some(rule) => json!(match rule.confirm {
+            darkmux_crew::rules::ConfirmForm::Mod => "mod",
+            darkmux_crew::rules::ConfirmForm::Search => "search",
+            darkmux_crew::rules::ConfirmForm::Question => "question",
+        }),
+        None => Value::Null,
+    }
+}
+
 impl StepKind for CrawlUnitStepKind {
     fn id(&self) -> &'static str {
         CRAWL_UNIT_KIND
@@ -799,9 +907,10 @@ impl StepKind for CrawlUnitStepKind {
     /// job under `remote_cap` (1 on the launch path), which is how sibling
     /// units of one plan ran strictly one at a time on an already-resident
     /// model — 3× the wall-clock of the same three units wave-packed. The
-    /// dispatch below always runs the `crawler` role with no explicit profile
+    /// dispatch below runs the Task's OWN `role_id` (#2310 P4c — see `run`'s
+    /// own doc on the same generalization) with no explicit profile
     /// (`profile_name: None`), which the dispatch resolves as `role_profiles.
-    /// crawler` first, `default_profile` second — and `resolve_local_placement`
+    /// <role>` first, `default_profile` second — and `resolve_local_placement`
     /// now resolves the very same way (#2329 review), so the wave leases the
     /// model the dispatch will actually use. A registry that cannot resolve
     /// yields `None` (one stderr warning per unit) and the units fall back to
@@ -809,11 +918,16 @@ impl StepKind for CrawlUnitStepKind {
     fn residency(
         &self,
         step: &Step,
-        _task: &Task,
+        task: &Task,
         _input: &BTreeMap<String, String>,
         _ctx: &StepRunCtx,
     ) -> Option<darkmux_crew::step_kinds::Placement> {
-        darkmux_crew::step_kinds::resolve_local_placement("crawler", None, None, &format!("step:{}", step.id))
+        darkmux_crew::step_kinds::resolve_local_placement(
+            task.role_id.as_deref().unwrap_or("crawler"),
+            None,
+            None,
+            &format!("step:{}", step.id),
+        )
     }
     fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let cfg = UnitStepConfig::from_step(step)?;
@@ -865,11 +979,19 @@ impl StepKind for CrawlUnitStepKind {
         std::fs::create_dir_all(&unit_dir).with_context(|| format!("creating {}", unit_dir.display()))?;
         let host_out = unit_dir.join("out");
 
-        let seat = resolve_crawler_seat();
+        // (#2310 P4c) The Task's OWN `role_id` — `"crawler"` for every
+        // crawl.json task, unchanged from before this generalization; a
+        // review-v2.json task instead declares `"role_id": "reviewer"`,
+        // which is what makes this ONE step kind ("Units. Already
+        // generic: a map step over units with a role that carries the
+        // finding tool" — DESIGN.md) actually reusable rather than only
+        // described as reusable.
+        let role_id = task.role_id.clone().unwrap_or_else(|| "crawler".to_string());
+        let seat = resolve_crawler_seat(&role_id);
         let started = std::time::Instant::now();
         let opts = DispatchOpts {
             brief_refs: Vec::new(),
-            role_id: "crawler".to_string(),
+            role_id: role_id.clone(),
             message,
             session_id: Some(ctx.session_id.clone()),
             timeout_seconds: cfg.timeout_seconds.unwrap_or(600),
@@ -903,6 +1025,11 @@ impl StepKind for CrawlUnitStepKind {
                 "sha": ctx.sha,
                 "rule": single_rule(&ctx.rule_ids),
                 "rules": ctx.rule_ids,
+                // (#2310 P4c) Host-stamped, never model-supplied — see
+                // `pattern_block`'s doc for why the confirmation form
+                // rides here (`context.confirm`) instead of a
+                // `create_finding` tool argument.
+                "confirm": single_confirm(&rules_by_id, &ctx.rule_ids),
                 "unit": ctx.unit_id,
                 "model": seat.model.clone(),
                 "locality": seat.locality,
@@ -1204,7 +1331,10 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         stopped_by: if units_errored > 0 { "error".into() } else { "done".into() },
         est_tokens,
         model: rows.iter().find_map(|r| r.model.clone()),
-        profile: resolve_crawler_seat().profile_name,
+        // (#2310 P4c) `crawl.summary` is not reused by review-v2 (its own
+        // phase declares no summary task) — hardcoded "crawler" here is
+        // unchanged behavior, not a gap.
+        profile: resolve_crawler_seat("crawler").profile_name,
         sources,
         finding_refs: rows.iter().flat_map(|r| r.finding_refs.iter().cloned()).collect(),
         units: rows,

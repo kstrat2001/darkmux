@@ -222,6 +222,49 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     assert_eq!(first["rule"], serde_json::json!("unnamed-predicate"));
 }
 
+/// (#2310 P4c mutation-kill) `CrawlUnitStepKind` used to hardcode
+/// `role_id: "crawler".to_string()` regardless of what the owning Task
+/// declared — DESIGN.md's "Units. Already generic" claim was true in
+/// prose only. A Task whose `role_id` is `"reviewer"` must now dispatch
+/// AS `"reviewer"`, and the finding's `context.confirm` (host-stamped,
+/// not model-supplied — see `pattern_block`'s doc) must name the rule's
+/// own `confirm` form so a downstream reader can tell a search-confirmed
+/// finding from a mod-confirmed one without re-resolving the registry.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_task_naming_a_different_role_dispatches_as_that_role_and_stamps_its_confirm_form() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "swallowed-error", "u-0001", &"b".repeat(40));
+    let out = seeded_out_dir(ws.path(), 1, 0);
+
+    let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let out_for_dispatch = out.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+        *captured.lock().unwrap() = Some(opts);
+        ok_result(envelope("stop", 50, 10, 2_000), out_for_dispatch.clone())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "swallowed-error"
+    }));
+    let mut task = unit_task();
+    task.role_id = Some("reviewer".to_string());
+    kind.run(&step, &task, &BTreeMap::new()).unwrap();
+
+    let opts = seen.lock().unwrap().take().unwrap();
+    assert_eq!(opts.role_id, "reviewer", "the Task's own role_id, not the hardcoded default");
+    let ctx = opts.record_context.expect("provenance the runtime cannot know");
+    assert_eq!(
+        ctx["confirm"],
+        serde_json::json!("mod"),
+        "swallowed-error's built-in confirm form, stamped from the resolved rule: {ctx}"
+    );
+}
+
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
 fn max_turns_is_a_bound_not_a_failure_and_the_step_still_completes() {
@@ -1131,4 +1174,91 @@ fn a_unit_declares_the_crawler_seats_residency_so_siblings_wave_pack() {
     assert_eq!(placement.model_key, "m-local");
     assert_eq!(placement.min_ctx, 8192);
     assert_eq!(placement.seat, "step:unit-step");
+}
+
+/// (#2310 P4c) `pattern_block`'s confirm-form appendix, all three shapes.
+fn base_rule(id: &str, confirm: darkmux_crew::rules::ConfirmForm) -> darkmux_crew::rules::Rule {
+    darkmux_crew::rules::Rule {
+        id: id.to_string(),
+        kind: darkmux_crew::rules::RuleKind::Site,
+        title: None,
+        applies_to: vec![],
+        exclude: vec![],
+        prefilter: vec![],
+        window: None,
+        chunk_tokens: None,
+        edge: None,
+        matches: None,
+        no_match: None,
+        evidence: None,
+        why_hint: None,
+        scope: vec![],
+        confirm,
+        search: None,
+        compare: None,
+        extras: Default::default(),
+    }
+}
+
+#[test]
+fn pattern_block_mod_confirm_appends_nothing() {
+    let rule = base_rule("r", darkmux_crew::rules::ConfirmForm::Mod);
+    let block = pattern_block(&rule);
+    assert!(!block.contains("search"), "{block}");
+    assert!(!block.contains("QUESTION"), "{block}");
+}
+
+#[test]
+fn pattern_block_search_confirm_with_fixed_patterns_names_them() {
+    let mut rule = base_rule("r", darkmux_crew::rules::ConfirmForm::Search);
+    rule.search = Some(darkmux_crew::rules::SearchRecipe {
+        patterns: vec!["fooBar(".to_string()],
+        path: None,
+        note: Some("every caller".to_string()),
+        extras: Default::default(),
+    });
+    let block = pattern_block(&rule);
+    assert!(block.contains("\"fooBar(\""), "{block}");
+    assert!(block.contains("every caller"), "{block}");
+    assert!(block.contains("SEARCHING"), "{block}");
+}
+
+#[test]
+fn pattern_block_search_confirm_with_no_fixed_patterns_still_reads_as_one_instruction() {
+    let mut rule = base_rule("r", darkmux_crew::rules::ConfirmForm::Search);
+    rule.search = Some(darkmux_crew::rules::SearchRecipe {
+        patterns: vec![],
+        path: None,
+        note: Some("search for the same verbs/nouns as the new routine's name".to_string()),
+        extras: Default::default(),
+    });
+    let block = pattern_block(&rule);
+    assert!(
+        !block.contains("patterns over the tree (not just the window you were given): ."),
+        "an empty pattern list must not render as a dangling, punctuated empty list: {block}"
+    );
+    assert!(block.contains("same verbs/nouns"), "{block}");
+}
+
+#[test]
+fn pattern_block_question_confirm_renders_the_compare_question_and_an_optional_search_first() {
+    let mut rule = base_rule("r", darkmux_crew::rules::ConfirmForm::Question);
+    rule.compare = Some("does an existing helper do this already?".to_string());
+    let block = pattern_block(&rule);
+    assert!(block.contains("QUESTION"), "{block}");
+    assert!(block.contains("does an existing helper do this already?"), "{block}");
+    assert!(!block.contains("SEARCHING"), "a question-only rule with no search block gets no search instruction: {block}");
+
+    rule.search = Some(darkmux_crew::rules::SearchRecipe {
+        patterns: vec![],
+        path: None,
+        note: Some("look for a similar helper".to_string()),
+        extras: Default::default(),
+    });
+    let block = pattern_block(&rule);
+    assert!(block.contains("look for a similar helper"), "{block}");
+    assert!(
+        block.find("look for a similar helper").unwrap() < block.find("QUESTION").unwrap(),
+        "the search instruction must precede the question instruction: {block}"
+    );
 }

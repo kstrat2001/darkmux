@@ -1,0 +1,16 @@
+{
+  "_comment": "(#2310 P4c) Cheapest, most common review comment: new or changed behavior with no accompanying test. Delivered as a question rather than a claim — the reviewer cannot see the whole diff's file list from inside one hunk's window, so it asks rather than asserts.",
+  "id": "test-gap",
+  "kind": "site",
+  "title": "New or changed behavior with no visible accompanying test",
+  "scope": ["diff"],
+  "confirm": "question",
+  "applies_to": [],
+  "exclude": ["**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/tests/**"],
+  "window": 15,
+  "match": "This hunk adds a new branch, a new function, or changes an existing function's behavior in a way that a reader would expect a test to cover (a new condition, a new error path, a changed default) — but no test file or test case for it is visible anywhere in the window or files you were given for this dispatch.",
+  "no_match": "The hunk IS test code, or a test file for this exact change is visible elsewhere in what you were given. The change is a comment, formatting, or a rename with no behavior change. The change is inside code your dispatch's rules or instructions say is exempt from test coverage.",
+  "evidence": "The new or changed line most representative of the untested behavior, copied verbatim. `line` is where it appears.",
+  "why_hint": "Say specifically what behavior looks untested and what a test for it would need to exercise (the new branch, the new error path). Be honest that you cannot see the diff's full file list from inside this window — this is a question, not a claim that no test exists anywhere in the change.",
+  "compare": "Based only on what you were given, does a test appear to cover this new or changed behavior? Answer yes, no, or can't tell, and say what a test for it would need to exercise."
+}

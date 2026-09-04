@@ -166,21 +166,26 @@ pub struct ModRecord {
     /// bytes either way.
     #[serde(default)]
     pub kit_looks_json: bool,
-    /// (#2310 P4b review, M-B) An OPTIONAL, PROPOSER-DECLARED hint at the
-    /// kit's shape — `"unified-diff"` today, nothing else recognized yet.
-    /// Still opaque by contract (darkmux never opens a kit): this is not a
-    /// parse, and `mods::create`/`create_mod` write it verbatim from
-    /// whatever the proposer names, unvalidated. It exists so a CONSUMER
-    /// that DOES choose to interpret a kit (`deliver_github_review`'s
-    /// suggestion-block rendering) has an explicit, proposer-opted-in
-    /// signal to key on, rather than sniffing the kit text itself — an
-    /// opaque kit pasted verbatim into a GitHub suggestion block corrupts
-    /// the PR the moment its shape isn't literally "the replacement text
-    /// for one anchored line" (a unified diff's `+++`/`@@` lines are not
-    /// that, and a multi-line kit silently duplicates the lines below the
-    /// anchor). `None` (the default — every kit before this field existed,
-    /// and any kit whose proposer didn't opt in) means "render as an
-    /// opaque fenced patch, never a suggestion." Additive.
+    /// (#2310 P4b review, M-B; producer wiring in P4c) An OPTIONAL hint at
+    /// the kit's shape — `"unified-diff"` today, nothing else recognized
+    /// yet. Still opaque by contract (darkmux never opens a kit): this is
+    /// not a parse, and it is never re-derived once written. Two producers,
+    /// two ways it gets set: `mods::create` (the CLI path) writes it
+    /// VERBATIM from whatever `--kit-kind` names, proposer-declared and
+    /// unvalidated; `create_from_emission` (the runtime `create_mod`
+    /// path) has no such argument to receive — the tool's wire schema is
+    /// `for`/`kit`/`attach` only — so it sets it mechanically via
+    /// `looks_like_unified_diff` instead. Either way it exists so a
+    /// CONSUMER that DOES choose to interpret a kit
+    /// (`deliver_github_review`'s suggestion-block rendering) has an
+    /// explicit signal to key on, rather than sniffing the kit text itself
+    /// — an opaque kit pasted verbatim into a GitHub suggestion block
+    /// corrupts the PR the moment its shape isn't literally "the
+    /// replacement text for one anchored line" (a unified diff's
+    /// `+++`/`@@` lines are not that, and a multi-line kit silently
+    /// duplicates the lines below the anchor). `None` (a kit that matches
+    /// neither producer's detection) means "render as an opaque fenced
+    /// patch, never a suggestion." Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kit_kind: Option<String>,
     /// Basenames of the files under this mod's `attachments/`.
@@ -403,6 +408,26 @@ pub fn brief_block(record: &ModRecord, attachments_mount: &str) -> String {
 /// handed on as bytes whichever way it goes.
 pub fn kit_looks_json(text: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(text).is_ok()
+}
+
+/// (#2310 P4c) A mechanical, unvalidated hint at whether `kit` is a unified
+/// diff — the standard three-marker shape (`--- `/`+++ ` file headers plus
+/// at least one `@@ ` hunk header). Neither `create` (the CLI producer,
+/// whose `--kit-kind` is the proposer's own explicit word) nor
+/// `create_from_emission` before this packet had any way to tell a
+/// runtime-produced kit apart from an opaque instruction string —
+/// `ModRecord::kit_kind`'s own doc names the consequence: a suggestion
+/// block requires `kit_kind == "unified-diff"`, so an unset kit never
+/// renders as one no matter how diff-shaped its text is. Deliberately loose
+/// (a false positive just means a malformed diff renders as a fenced patch
+/// once its `@@ ` line fails to parse) — a false negative is the only
+/// failure mode worth avoiding, hence three independent markers rather than
+/// a strict parse.
+pub fn looks_like_unified_diff(kit: &str) -> bool {
+    let has_old_header = kit.lines().any(|l| l.starts_with("--- "));
+    let has_new_header = kit.lines().any(|l| l.starts_with("+++ "));
+    let has_hunk_header = kit.lines().any(|l| l.starts_with("@@ "));
+    has_old_header && has_new_header && has_hunk_header
 }
 
 /// One finding, one address. `sess-a/01` and `sess-a/1` name the same finding,
@@ -717,10 +742,14 @@ pub fn create_from_emission(
         // The bytes that came in, unchanged. No parse, no re-serialize.
         kit: Some(kit.to_string()),
         kit_looks_json: kit_looks_json(kit),
-        // (#2310 P4b review) `create_mod` (the runtime producer) is left
-        // unchanged by this packet — no kit-kind signal from a dispatch
-        // yet, so this producer always writes `None`.
-        kit_kind: None,
+        // (#2310 P4c) The runtime producer has no `kit_kind` argument the
+        // model can set (the `create_mod` tool takes `for`/`kit`/`attach`
+        // only — see `runtime/src/tools/mod.rs`), so this is detected
+        // mechanically from the kit's own text rather than left `None`
+        // forever, per `mods.rs`'s own #2310 P4b review note this replaces:
+        // a review finding's mod never becomes a GitHub suggestion block
+        // without this, no matter how diff-shaped the kit actually is.
+        kit_kind: looks_like_unified_diff(kit).then(|| "unified-diff".to_string()),
         attachments: names.clone(),
         context: finding_context(findings_root, &for_keys)?,
         warnings,
@@ -884,6 +913,67 @@ mod tests {
             "the attachment's bytes survive the round trip"
         );
         assert!(!root.join(STAGING_DIR).exists(), "nothing is left staged");
+    }
+
+    /// (#2310 P4c) Mutation-kill for `looks_like_unified_diff`: all three
+    /// markers must be present, in any order, on their own lines — two
+    /// markers alone (a common false-shape: a real diff with its `@@ `
+    /// header truncated by a token cap) must NOT read as a diff.
+    #[test]
+    fn looks_like_unified_diff_requires_all_three_markers() {
+        let real = "--- a/f.rs\n+++ b/f.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n";
+        assert!(looks_like_unified_diff(real), "{real:?}");
+
+        for missing in [
+            "+++ b/f.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n",   // no `--- `
+            "--- a/f.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n",   // no `+++ `
+            "--- a/f.rs\n+++ b/f.rs\n-old\n+new\n",         // no `@@ `
+            "just replace this one line with that one line", // a plain instruction
+            "{\"n\": 1}",                                    // JSON, kit_looks_json's own case
+        ] {
+            assert!(!looks_like_unified_diff(missing), "{missing:?}");
+        }
+    }
+
+    /// (#2310 P4c) `create_from_emission` — the runtime `create_mod` path,
+    /// which has no `kit_kind` argument the model can set — now detects the
+    /// unified-diff shape mechanically rather than writing `kit_kind: None`
+    /// forever (the #2310 P4b review note this test guards against
+    /// regressing): a review finding's mod would otherwise never become a
+    /// GitHub suggestion block no matter how diff-shaped its kit was.
+    #[test]
+    fn an_emission_diff_shaped_kit_is_detected_as_unified_diff() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("mods");
+        let findings_root = tmp.path().join("findings");
+        store_finding(&findings_root, "sess-b", 1, None);
+
+        let diff_kit = "--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let rec = create_from_emission(
+            &root,
+            &findings_root,
+            "reviewer (darkmux:qwen3.6)",
+            &["sess-b/1".to_string()],
+            diff_kit,
+            &[],
+            findings::Scope::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(rec.kit_kind.as_deref(), Some("unified-diff"), "{rec:?}");
+
+        let plain = create_from_emission(
+            &root,
+            &findings_root,
+            "reviewer (darkmux:qwen3.6)",
+            &["sess-b/1".to_string()],
+            "did you consider using the existing helper at src/util.rs instead?",
+            &[],
+            findings::Scope::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(plain.kit_kind, None, "{plain:?}");
     }
 
     /// A kit that is empty, or two attachments that would collide, are refused
