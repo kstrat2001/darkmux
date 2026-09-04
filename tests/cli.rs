@@ -5093,7 +5093,14 @@ fn a_static_placeholder_typo_is_refused_on_dry_run() {
     let out = Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_HOME", home.path())
-        .args(["mission", "launch", "synthetic-static-typo", "--dry-run"])
+        .args([
+            "mission",
+            "launch",
+            "synthetic-static-typo",
+            "--dry-run",
+            "--param",
+            "workspace=/tmp/ws.json",
+        ])
         .output()
         .expect("mission launch synthetic-static-typo --dry-run runs");
     assert!(!out.status.success(), "a typo'd placeholder must refuse the dry run");
@@ -5114,7 +5121,7 @@ fn a_static_placeholder_typo_is_refused_before_any_mint_on_a_real_launch() {
         .unwrap()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
-        .args(["mission", "launch", "synthetic-static-typo"])
+        .args(["mission", "launch", "synthetic-static-typo", "--param", "workspace=/tmp/ws.json"])
         .output()
         .expect("mission launch synthetic-static-typo runs");
     assert!(!out.status.success(), "a typo'd placeholder must refuse the real launch");
@@ -5165,6 +5172,85 @@ fn a_grow_config_placeholder_typo_is_refused_before_any_mint_on_a_real_launch() 
     assert!(!out.status.success(), "a typo'd grow.config placeholder must refuse the real launch");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("intent_fle") && stderr.contains("grow.config"), "{stderr}");
+    assert_nothing_minted(&home);
+}
+
+/// (#2310 P4c-2 review round 2, item a) An EMBEDDED placeholder naming a
+/// DECLARED but UNCOLLECTED OPTIONAL input — `"label": "run-{{tag}}"` where
+/// `tag` is optional and the operator never set it. `interpret`'s own
+/// `substitute_step_config` already refuses this (round-1's item 2), but
+/// only from `interpret`, which runs AFTER `--dry-run`'s short-circuit and
+/// AFTER minting — the exact "caught too late" shape the MUST FIX closed
+/// for an undeclared name. This config declares `tag` and never sets it.
+fn write_synthetic_embedded_optional_config(home: &TempDir) {
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("synthetic-embedded-optional.json"),
+        serde_json::json!({
+            "id": "synthetic-embedded-optional",
+            "name": "Synthetic embedded-optional test",
+            "schema_version": "3.4",
+            "inputs": [
+                {"name": "workspace", "required": true},
+                {"name": "tag", "required": false}
+            ],
+            "phases": [{"id": "p", "tasks": [{
+                "id": "t",
+                "steps": [{"id": "t-step", "kind": "procedural.noop",
+                           "config": {"workspace": "{{workspace}}", "label": "run-{{tag}}"}}]
+            }]}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// `--dry-run`. Before this fix: `--dry-run` never called `interpret` at
+/// all, so an embedded reference to an unset optional input exited 0,
+/// silent — the same gap `--dry-run` had for an undeclared name before the
+/// MUST FIX.
+#[test]
+fn an_embedded_placeholder_naming_an_unset_optional_input_is_refused_on_dry_run() {
+    let home = TempDir::new().unwrap();
+    write_synthetic_embedded_optional_config(&home);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .args([
+            "mission",
+            "launch",
+            "synthetic-embedded-optional",
+            "--dry-run",
+            "--param",
+            "workspace=/tmp/ws.json",
+        ])
+        .output()
+        .expect("mission launch synthetic-embedded-optional --dry-run runs");
+    assert!(!out.status.success(), "an embedded reference to an unset optional input must refuse the dry run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("tag") && stderr.contains("t-step"), "{stderr}");
+    assert_nothing_minted(&home);
+}
+
+/// The SAME config, a REAL launch. Before this fix: `interpret` refused
+/// this — but only AFTER the mission directory (mission.json, phase
+/// records) was already minted, exactly the shape the MUST FIX closed for
+/// an undeclared name.
+#[test]
+fn an_embedded_placeholder_naming_an_unset_optional_input_is_refused_before_any_mint_on_a_real_launch() {
+    let home = TempDir::new().unwrap();
+    write_synthetic_embedded_optional_config(&home);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "synthetic-embedded-optional", "--param", "workspace=/tmp/ws.json"])
+        .output()
+        .expect("mission launch synthetic-embedded-optional runs");
+    assert!(!out.status.success(), "an embedded reference to an unset optional input must refuse the real launch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("tag") && stderr.contains("t-step"), "{stderr}");
     assert_nothing_minted(&home);
 }
 

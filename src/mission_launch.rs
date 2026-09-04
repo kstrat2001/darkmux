@@ -594,6 +594,18 @@ pub fn launch(
     // become a silent way to skip this specific refusal for a real launch.
     mission_config::check_placeholders_declared(config)?;
 
+    // (#2310 P4c-2 review round 2, item a) A DECLARED input referenced
+    // EMBEDDED (part of a larger string, e.g. `"label": "run-{{tag}}"`)
+    // that this specific launch never collected — `check_placeholders_
+    // declared` above only catches an UNDECLARED name; `tag` here is
+    // declared, just optional and unset. Before this check, only
+    // `interpret`'s own `substitute_step_config` (round-1 item 2) refused
+    // this, which runs AFTER `--dry-run`'s short-circuit and AFTER
+    // minting — proven: a real launch minted a mission directory, then
+    // failed and abandoned it; `--dry-run` exited 0, silent. Same
+    // placement as the check above: before `--dry-run`, before any mint.
+    mission_config::check_embedded_inputs_collected(config, &collected)?;
+
     // (#1959) `--dry-run`: everything above this point (config load,
     // command-allowlist gate, semantic validation, panel-args injection,
     // coder-phase input precheck, the placeholder check just above) has

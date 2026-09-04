@@ -42,7 +42,7 @@ pub mod prune;
 pub mod load;
 
 pub use grow::{grow_task, items_from_artifact, GrownFrom};
-pub use inputs::{check_placeholders_declared, find_unsubstituted_braces, substitute_step_config, undeclared_placeholders};
+pub use inputs::{check_embedded_inputs_collected, check_placeholders_declared, find_unsubstituted_braces, substitute_step_config, undeclared_placeholders};
 pub use interpret::{interpret, LaunchParams, TaskOverride};
 pub use load::{has_non_user_fallback, list_ids, load, LoadedMissionConfig, MissionConfigSource};
 
@@ -1311,6 +1311,32 @@ impl MissionConfig {
                     inputs::grow_namespace_hint(&name)
                 ),
             });
+        }
+
+        // (#2310 P4c-2 review round 2, item a) An EMBEDDED placeholder
+        // (part of a larger string, e.g. `"label": "run-{{tag}}"`) naming
+        // a DECLARED but OPTIONAL input is a design smell independent of
+        // any particular launch: whenever the operator leaves that input
+        // unset, `check_embedded_inputs_collected` refuses the launch
+        // outright (an embedded placeholder has no key to omit the way a
+        // whole-value one does) — so an optional input embedded this way
+        // is, in practice, required. Warning, not Error: a document is
+        // still USABLE (the launcher enforces the real constraint at
+        // launch time), this just flags that the document's own
+        // `required: false` is misleading.
+        for (where_, name) in inputs::embedded_placeholders(self) {
+            if let Some(input) = self.inputs.iter().find(|i| i.name == name) {
+                if input.required != Some(true) {
+                    findings.push(ValidationFinding {
+                        severity: FindingSeverity::Warning,
+                        path: "inputs".to_string(),
+                        message: format!(
+                            "{where_} names embedded placeholder `{{{{{name}}}}}`, which is an \
+                             optional input; use a whole-value placeholder or make it required"
+                        ),
+                    });
+                }
+            }
         }
 
         // (#2310 P4c-2 review item 4) `ignored: true` combined with
@@ -2663,6 +2689,45 @@ mod tests {
         let cfg = doc(vec![phase("p1", vec![t])]);
         let errs = grow_errors(&cfg);
         assert!(errs.iter().any(|e| e.contains("from.output")), "{errs:?}");
+    }
+
+    // ── (#2310 P4c-2 review round 2, item a) embedded + optional ───────
+
+    #[test]
+    fn an_embedded_placeholder_naming_an_optional_input_is_a_validate_warning() {
+        let mut s = step("s", "procedural.noop");
+        s.config = serde_json::json!({"label": "run-{{tag}}"});
+        let cfg = MissionConfig {
+            inputs: vec![input_named("workspace"), MissionInput { required: Some(false), ..input_named("tag") }],
+            ..doc(vec![phase("p1", vec![task("t", &[], vec![s])])])
+        };
+        assert!(grow_errors(&cfg).is_empty(), "a document is still USABLE, just flagged");
+        let warns = grow_warnings(&cfg);
+        assert!(warns.iter().any(|w| w.contains("tag") && w.contains("optional")), "{warns:?}");
+    }
+
+    #[test]
+    fn an_embedded_placeholder_naming_a_required_input_is_never_flagged() {
+        let mut s = step("s", "procedural.noop");
+        s.config = serde_json::json!({"label": "run-{{tag}}"});
+        let cfg = MissionConfig {
+            inputs: vec![MissionInput { required: Some(true), ..input_named("tag") }],
+            ..doc(vec![phase("p1", vec![task("t", &[], vec![s])])])
+        };
+        let warns = grow_warnings(&cfg);
+        assert!(!warns.iter().any(|w| w.contains("tag")), "{warns:?}");
+    }
+
+    #[test]
+    fn a_whole_value_placeholder_for_an_optional_input_is_never_flagged() {
+        let mut s = step("s", "procedural.noop");
+        s.config = serde_json::json!({"tag": "{{tag}}"});
+        let cfg = MissionConfig {
+            inputs: vec![MissionInput { required: Some(false), ..input_named("tag") }],
+            ..doc(vec![phase("p1", vec![task("t", &[], vec![s])])])
+        };
+        let warns = grow_warnings(&cfg);
+        assert!(!warns.iter().any(|w| w.contains("tag")), "{warns:?}");
     }
 
     // ── (#2310 P4c-2 review item 4) ignored + required interaction ─────

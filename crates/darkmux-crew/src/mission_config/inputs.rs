@@ -342,6 +342,101 @@ pub fn check_placeholders_declared(config: &MissionConfig) -> Result<()> {
     );
 }
 
+/// (#2310 P4c-2 review round 2, item a) Every EMBEDDED (not whole-value)
+/// placeholder occurrence in the document's static graph — `(location,
+/// placeholder_name)` pairs, skipping `item.*`/`from.output`, UNFILTERED
+/// by declared-ness (the caller decides what to do with a name). Shared by
+/// [`check_embedded_inputs_collected`] (filters to declared-but-
+/// uncollected, at launch time, against one launch's `collected`) and
+/// `MissionConfig::validate`'s own Warning (filters to declared-and-
+/// optional, independent of any particular launch).
+pub(crate) fn embedded_placeholders(config: &MissionConfig) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for phase in &config.phases {
+        for task in &phase.tasks {
+            for step in &task.steps {
+                collect_embedded(&step.config, &format!("step `{}`", step.id), &mut out);
+            }
+            if let Some(grow) = &task.grow {
+                collect_embedded(&grow.config, &format!("task `{}`'s grow.config", task.id), &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn collect_embedded(value: &Value, where_: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(s) => {
+            // A WHOLE-value placeholder for an uncollected input is the
+            // documented "omit the key" case, never this function's
+            // concern — only an EMBEDDED occurrence (part of a larger
+            // string) is at risk of silently shortening that string.
+            if whole_placeholder(s).is_some() {
+                return;
+            }
+            for name in placeholder_names(s) {
+                if name.starts_with("item.") || name == "from.output" {
+                    continue;
+                }
+                out.push((where_.to_string(), name));
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_embedded(v, where_, out);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                collect_embedded(v, where_, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// (#2310 P4c-2 review round 2, item a) Refuses (loud `Err`) if any
+/// EMBEDDED placeholder in the document's static graph names a DECLARED
+/// input this launch's `collected` does not carry. Companion to
+/// [`check_placeholders_declared`] — same call site in
+/// `mission_launch.rs::launch` (before `--dry-run`, before any mint),
+/// closing the SAME "caught too late" shape for an input that IS declared
+/// but happens to be optional-and-unset: before this, only `interpret`'s
+/// own `substitute_step_config` refused it (round-1 item 2), which runs
+/// AFTER `--dry-run`'s short-circuit and AFTER minting — a real launch
+/// minted a mission directory, then failed and abandoned it; `--dry-run`
+/// exited 0, silent.
+pub fn check_embedded_inputs_collected(
+    config: &MissionConfig,
+    collected: &BTreeMap<String, Value>,
+) -> Result<()> {
+    let declared: BTreeSet<String> = config.inputs.iter().map(|i| i.name.clone()).collect();
+    let bad: Vec<(String, String)> = embedded_placeholders(config)
+        .into_iter()
+        .filter(|(_, name)| declared.contains(name) && !collected.contains_key(name))
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = bad
+        .iter()
+        .map(|(where_, name)| {
+            format!(
+                "  {where_} names embedded placeholder `{{{{{name}}}}}`, but input `{name}` is not \
+                 set for this launch (declared optional, never supplied) — an embedded placeholder \
+                 cannot omit part of a string the way a whole-value placeholder can"
+            )
+        })
+        .collect();
+    bail!(
+        "mission config \"{}\" has {} embedded placeholder(s) naming an unset input, refused before minting:\n{}",
+        config.id,
+        bad.len(),
+        lines.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +681,99 @@ mod tests {
             extras: BTreeMap::new(),
         }]);
         assert!(check_placeholders_declared(&cfg).is_ok());
+    }
+
+    // ─── check_embedded_inputs_collected (review round 2, item a) ─────
+
+    fn config_with_optional_tag(phases: Vec<PhaseConfig>) -> MissionConfig {
+        let mut cfg = minimal_config(phases);
+        cfg.inputs.push(crate::mission_config::MissionInput {
+            name: "tag".to_string(),
+            description: None,
+            required: Some(false),
+            ignored: None,
+            ignored_reason: None,
+            extras: BTreeMap::new(),
+        });
+        cfg
+    }
+
+    #[test]
+    fn an_embedded_placeholder_naming_an_uncollected_optional_input_is_refused() {
+        let cfg = config_with_optional_tag(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![task("t", vec![step("t-step", "k", json!({"label": "run-{{tag}}"}))])],
+            extras: BTreeMap::new(),
+        }]);
+        let collected: BTreeMap<String, Value> =
+            [("workspace".to_string(), json!("/tmp/ws.json"))].into_iter().collect();
+        let err = check_embedded_inputs_collected(&cfg, &collected).unwrap_err().to_string();
+        assert!(err.contains("t-step"), "{err}");
+        assert!(err.contains("tag"), "{err}");
+    }
+
+    #[test]
+    fn an_embedded_placeholder_naming_a_collected_optional_input_is_fine() {
+        let cfg = config_with_optional_tag(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![task("t", vec![step("t-step", "k", json!({"label": "run-{{tag}}"}))])],
+            extras: BTreeMap::new(),
+        }]);
+        let collected: BTreeMap<String, Value> = [
+            ("workspace".to_string(), json!("/tmp/ws.json")),
+            ("tag".to_string(), json!("nightly")),
+        ]
+        .into_iter()
+        .collect();
+        assert!(check_embedded_inputs_collected(&cfg, &collected).is_ok());
+    }
+
+    #[test]
+    fn a_whole_value_placeholder_for_an_uncollected_optional_input_is_never_flagged_here() {
+        // `check_embedded_inputs_collected` is specifically about EMBEDDED
+        // occurrences — the whole-value case is the documented "omit the
+        // key" outcome `substitute_step_config` itself already handles.
+        let cfg = config_with_optional_tag(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![task("t", vec![step("t-step", "k", json!({"tag": "{{tag}}"}))])],
+            extras: BTreeMap::new(),
+        }]);
+        let collected: BTreeMap<String, Value> =
+            [("workspace".to_string(), json!("/tmp/ws.json"))].into_iter().collect();
+        assert!(check_embedded_inputs_collected(&cfg, &collected).is_ok());
+    }
+
+    #[test]
+    fn an_embedded_placeholder_naming_an_uncollected_optional_input_in_grow_config_is_refused() {
+        let mut t = task("t", vec![step("t-step", "k", json!({}))]);
+        t.grow = Some(GrowSpec {
+            from: "other".to_string(),
+            items: "units".to_string(),
+            id: "{{item.id}}".to_string(),
+            config: json!({"label": "run-{{tag}}"}),
+            extras: BTreeMap::new(),
+        });
+        let cfg = config_with_optional_tag(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![t],
+            extras: BTreeMap::new(),
+        }]);
+        let collected: BTreeMap<String, Value> =
+            [("workspace".to_string(), json!("/tmp/ws.json"))].into_iter().collect();
+        let err = check_embedded_inputs_collected(&cfg, &collected).unwrap_err().to_string();
+        assert!(err.contains("grow.config"), "{err}");
+        assert!(err.contains("tag"), "{err}");
     }
 }
