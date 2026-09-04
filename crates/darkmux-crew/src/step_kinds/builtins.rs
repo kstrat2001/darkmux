@@ -915,8 +915,27 @@ fn item_system_and_payload(item: &serde_json::Value) -> (Option<&str>, &serde_js
 
 /// Resolve a `dispatch.map` step's collection. Precedence: an explicit
 /// `config.collection` JSON array wins; otherwise the collection is a RUNTIME
-/// INPUT — the dependency output named by `config.collection_input`, or (when
-/// the step has exactly one dependency) that one input.
+/// INPUT — the dependency output named by `config.collection_input`, or
+/// (#2310 P2a) when `step` is NOT the first step of `task`, its
+/// immediately-previous same-task step's output (the one thing a later
+/// step's collection can sensibly default to — see below), or (when neither
+/// of those apply and the step has exactly one dependency input) that one
+/// input.
+///
+/// **Why the predecessor gets priority over the single-input rule (#2310
+/// P2a).** Before #2310 P2a, a non-first step in a multi-step Task received
+/// ONLY its predecessor's output — one entry, so the old single-input
+/// fallback always resolved it. `scheduler::gather_inputs` now ALSO chains
+/// in the Task's own `depends_on`/`reads` outputs for every step (see that
+/// fn's doc), so a non-first map step whose Task also declares a `reads`
+/// can legitimately see two or more inputs even though there is still only
+/// one sensible collection source: its predecessor. Falling straight
+/// through to the old "two-or-more-without-`collection_input`-is-a-loud-
+/// error" rule here would break exactly this shape (`review.json`'s four
+/// probe/verify tasks, none of which stamp `collection_input`) — so a
+/// non-first step tries its predecessor's key FIRST, before the ambiguity
+/// check. A first step has no predecessor to prefer, so its two-or-more
+/// case stays exactly as loud as before.
 ///
 /// **Loud on every typo-shaped source (#1442 gate — the #1418 class: a
 /// silent empty masks a config typo as a clean no-op run):**
@@ -924,18 +943,23 @@ fn item_system_and_payload(item: &serde_json::Value) -> (Option<&str>, &serde_js
 ///   silent fall-through to input resolution;
 /// - a `collection_input` naming a key ABSENT from `input` is a loud `Err`
 ///   naming the missing key AND the inputs actually present;
-/// - two or more dependency inputs with NO `collection_input` is a loud
-///   `Err` ("name one") — returning empty there would not be a refusal to
-///   guess, it would BE a guess ("there is no collection");
+/// - (a non-first step whose predecessor produced no `input` entry falls
+///   through to the rules below, same as a first step — it does NOT error
+///   just because a preferred key was absent);
+/// - two or more dependency inputs with NO `collection_input` AND no usable
+///   predecessor entry is a loud `Err` ("name one") — returning empty there
+///   would not be a refusal to guess, it would BE a guess ("there is no
+///   collection");
 /// - a present-but-non-array INPUT source is a loud `Err` too.
 ///
 /// What stays a REAL empty (and short-circuits cleanly): a genuinely absent
-/// source (no `collection` key, no `collection_input`, zero dependency
-/// inputs) and a present-but-blank source string (the upstream truly
-/// produced nothing). `run` surfaces every `Err` here; `residency` stays
-/// best-effort and swallows them (see its doc).
+/// source (no `collection` key, no `collection_input`, no predecessor entry,
+/// zero dependency inputs) and a present-but-blank source string (the
+/// upstream truly produced nothing). `run` surfaces every `Err` here;
+/// `residency` stays best-effort and swallows them (see its doc).
 fn resolve_map_collection(
     step: &Step,
+    task: &Task,
     input: &BTreeMap<String, String>,
 ) -> Result<Vec<serde_json::Value>> {
     if let Some(v) = step.config.get("collection") {
@@ -954,6 +978,17 @@ fn resolve_map_collection(
             input.keys().cloned().collect::<Vec<_>>().join(", ")
         }
     };
+    // (#2310 P2a) The predecessor step's output, when `step` is NOT the
+    // first step of `task` and that predecessor actually produced an
+    // `input` entry (it may not have, e.g. no recorded output) — preferred
+    // over the single-input/ambiguity rules below.
+    let predecessor_source: Option<&String> = task
+        .step_ids
+        .iter()
+        .position(|id| id == &step.id)
+        .filter(|&i| i > 0)
+        .and_then(|i| task.step_ids.get(i - 1))
+        .and_then(|prev_id| input.get(prev_id));
     let source: Option<&String> = match config_str(step, "collection_input") {
         Some(key) => match input.get(key) {
             Some(s) => Some(s),
@@ -964,6 +999,7 @@ fn resolve_map_collection(
                 present_keys()
             ),
         },
+        None if predecessor_source.is_some() => predecessor_source,
         None if input.len() == 1 => input.values().next(),
         None if input.len() > 1 => bail!(
             "step `{}`: `dispatch.map` has two or more dependency inputs ({}) and no \
@@ -1314,10 +1350,11 @@ impl DispatchMapStepKind {
     fn run_map(
         &self,
         step: &Step,
+        task: &Task,
         input: &BTreeMap<String, String>,
         ctx: Option<&StepRunCtx>,
     ) -> Result<StepOutcome> {
-        let items = resolve_map_collection(step, input)?;
+        let items = resolve_map_collection(step, task, input)?;
         let mut batched: Vec<darkmux_flow::FlowRecord> = Vec::new();
         // Emit LIVE through the scheduler's seam when a ctx is present
         // (#1442 gate C3, streaming); otherwise batch for return. `ctx` is
@@ -2076,12 +2113,12 @@ impl StepKind for DispatchMapStepKind {
     }
 
 
-    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         // Ctx-free path (unit tests / callers with no scheduler seam): every
         // record batches into `StepOutcome.flow_records`, and the remote
         // bucket is step-scoped (no `bucket_group` sharing without a
         // scheduler to own the group map).
-        self.run_map(step, input, None)
+        self.run_map(step, task, input, None)
     }
 
     /// (#1442 gate C3) The scheduler entry point — LIVE per-item emission
@@ -2093,11 +2130,11 @@ impl StepKind for DispatchMapStepKind {
     fn run_streaming(
         &self,
         step: &Step,
-        _task: &Task,
+        task: &Task,
         input: &BTreeMap<String, String>,
         ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        self.run_map(step, input, Some(ctx))
+        self.run_map(step, task, input, Some(ctx))
     }
 
     /// (#1442) LOCAL residency hint. Returns `None` — no wave load — when:
@@ -2112,14 +2149,14 @@ impl StepKind for DispatchMapStepKind {
     fn residency(
         &self,
         step: &Step,
-        _task: &Task,
+        task: &Task,
         input: &BTreeMap<String, String>,
         _ctx: &StepRunCtx,
     ) -> Option<darkmux_gestalt::Placement> {
         if step.config.get("endpoint").is_some() {
             return None;
         }
-        match resolve_map_collection(step, input) {
+        match resolve_map_collection(step, task, input) {
             Ok(items) if items.is_empty() => return None,
             Ok(_) => {}
             // `run` owns surfacing a malformed collection; residency stays a
@@ -2539,7 +2576,7 @@ mod tests {
     #[test]
     fn resolve_map_collection_prefers_config_collection() {
         let s = map_step(json!({ "collection": ["a", "b", "c"] }));
-        let out = resolve_map_collection(&s, &BTreeMap::new()).unwrap();
+        let out = resolve_map_collection(&s, &empty_task(), &BTreeMap::new()).unwrap();
         assert_eq!(out.len(), 3);
     }
 
@@ -2548,7 +2585,7 @@ mod tests {
         let s = map_step(json!({}));
         let mut input = BTreeMap::new();
         input.insert("upstream".to_string(), r#"["x","y"]"#.to_string());
-        let out = resolve_map_collection(&s, &input).unwrap();
+        let out = resolve_map_collection(&s, &empty_task(), &input).unwrap();
         assert_eq!(out, vec![json!("x"), json!("y")]);
     }
 
@@ -2558,7 +2595,7 @@ mod tests {
         let mut input = BTreeMap::new();
         input.insert("bundles".to_string(), r#"["only-this"]"#.to_string());
         input.insert("other".to_string(), r#"["ignored"]"#.to_string());
-        let out = resolve_map_collection(&s, &input).unwrap();
+        let out = resolve_map_collection(&s, &empty_task(), &input).unwrap();
         assert_eq!(out, vec![json!("only-this")]);
     }
 
@@ -2567,12 +2604,65 @@ mod tests {
         // No config.collection, no collection_input, ZERO inputs — the one
         // genuinely collection-less shape that stays a real, silent zero.
         let s = map_step(json!({}));
-        assert!(resolve_map_collection(&s, &BTreeMap::new()).unwrap().is_empty());
+        assert!(resolve_map_collection(&s, &empty_task(), &BTreeMap::new()).unwrap().is_empty());
         // A present-but-blank input string is a real zero too (the upstream
         // truly produced nothing), not an error.
         let mut input = BTreeMap::new();
         input.insert("u".to_string(), "   ".to_string());
-        assert!(resolve_map_collection(&s, &input).unwrap().is_empty());
+        assert!(resolve_map_collection(&s, &empty_task(), &input).unwrap().is_empty());
+    }
+
+    /// A `Task` whose step ids are exactly `ids`, for the position-aware
+    /// `resolve_map_collection` tests below — unlike `empty_task()` (whose
+    /// single `step_ids` entry never matches a `map_step`'s `"m1"` id), this
+    /// lets a test control whether the map step is the task's FIRST step or
+    /// a later one.
+    fn task_with_step_ids(ids: &[&str]) -> Task {
+        let mut t = empty_task();
+        t.step_ids = ids.iter().map(|s| s.to_string()).collect();
+        t
+    }
+
+    #[test]
+    fn resolve_map_collection_non_first_step_prefers_predecessor_over_ambiguity() {
+        // (#2310 P2a) `gather_inputs` now chains a Task's `depends_on`/
+        // `reads` outputs onto EVERY step's input, so a non-first
+        // `dispatch.map` step (like `review.json`'s four probe/verify map
+        // steps, which stamp no `collection_input`) can legitimately see
+        // two or more inputs now, even though there is still only one
+        // sensible collection source: its predecessor. Before #2310 P2a
+        // this same input shape would hit the "two or more dependency
+        // inputs... name which input carries the collection" bail — RED
+        // without the predecessor-preference fix.
+        let task = task_with_step_ids(&["render-step", "m1"]);
+        let s = map_step(json!({}));
+        let mut input = BTreeMap::new();
+        input.insert("render-step".to_string(), r#"["from-predecessor"]"#.to_string());
+        input.insert("some-read-task".to_string(), r#"["from-a-task-level-read"]"#.to_string());
+        let out = resolve_map_collection(&s, &task, &input).unwrap();
+        assert_eq!(
+            out,
+            vec![json!("from-predecessor")],
+            "a non-first map step must resolve its collection from its predecessor, \
+             not bail on the extra `reads`-sourced input"
+        );
+    }
+
+    #[test]
+    fn resolve_map_collection_first_step_two_inputs_still_bails_loud() {
+        // (#2310 P2a) The predecessor preference applies ONLY to a non-first
+        // step — a first step has no predecessor to prefer, so two
+        // dependency inputs with no `collection_input` must still bail
+        // exactly as loudly as before this change.
+        let task = task_with_step_ids(&["m1", "later-step"]);
+        let s = map_step(json!({}));
+        let mut two = BTreeMap::new();
+        two.insert("a".to_string(), r#"["x"]"#.to_string());
+        two.insert("b".to_string(), r#"["y"]"#.to_string());
+        let err = resolve_map_collection(&s, &task, &two).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("two or more dependency inputs"), "{msg}");
+        assert!(msg.contains("collection_input"), "the fix is named: {msg}");
     }
 
     #[test]
@@ -2584,7 +2674,7 @@ mod tests {
         let mut two = BTreeMap::new();
         two.insert("a".to_string(), r#"["x"]"#.to_string());
         two.insert("b".to_string(), r#"["y"]"#.to_string());
-        let err = resolve_map_collection(&s, &two).unwrap_err();
+        let err = resolve_map_collection(&s, &empty_task(), &two).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("two or more dependency inputs"), "{msg}");
         assert!(msg.contains("collection_input"), "the fix is named: {msg}");
@@ -2599,13 +2689,13 @@ mod tests {
         let s = map_step(json!({ "collection_input": "bundles" }));
         let mut input = BTreeMap::new();
         input.insert("upstream".to_string(), r#"["x"]"#.to_string());
-        let err = resolve_map_collection(&s, &input).unwrap_err();
+        let err = resolve_map_collection(&s, &empty_task(), &input).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("`bundles`"), "the missing key is named: {msg}");
         assert!(msg.contains("upstream"), "the present inputs are named: {msg}");
 
         // Zero inputs at all: same loud error, with "none" as the roster.
-        let err = resolve_map_collection(&s, &BTreeMap::new()).unwrap_err();
+        let err = resolve_map_collection(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("none"), "{err}");
     }
 
@@ -2617,7 +2707,7 @@ mod tests {
         let s = map_step(json!({ "collection": "not-an-array" }));
         let mut input = BTreeMap::new();
         input.insert("u".to_string(), r#"["would-be-used-on-fallthrough"]"#.to_string());
-        let err = resolve_map_collection(&s, &input).unwrap_err();
+        let err = resolve_map_collection(&s, &empty_task(), &input).unwrap_err();
         assert!(
             err.to_string().contains("config.collection must be a JSON array"),
             "{err}"
@@ -2629,7 +2719,7 @@ mod tests {
         let s = map_step(json!({}));
         let mut input = BTreeMap::new();
         input.insert("u".to_string(), r#"{"not":"an array"}"#.to_string());
-        let err = resolve_map_collection(&s, &input).unwrap_err();
+        let err = resolve_map_collection(&s, &empty_task(), &input).unwrap_err();
         assert!(err.to_string().contains("must be a JSON array"), "{err}");
     }
 

@@ -233,54 +233,80 @@ fn step_is_ready(
 // ─── Input gathering (#1341 — Task-aware) ──────────────────────────────
 
 /// The `input` map `step`'s job should receive:
-/// - If `step` is the FIRST step of `task`: one entry per `task.depends_on`
-///   OR `task.reads` (#1619 — deduped when both name the same task) Task id
-///   whose LAST step is `Complete` and has recorded `output`,
-///   keyed by that dependency TASK's id (#1341 — Task is the
-///   dependency-declaring unit now; see `Task::depends_on`'s doc for the
-///   "only the first step receives upstream Task output" design choice).
-/// - Otherwise (a later step in a multi-step Task): exactly one entry —
-///   the immediately-previous SAME-TASK step's `output` (if `Complete`),
-///   keyed by that step's id.
+/// - One entry per `task.depends_on` OR `task.reads` (#1619 — deduped when
+///   both name the same task) Task id whose LAST step is `Complete` and has
+///   recorded `output`, keyed by that dependency TASK's id (#1341 — Task is
+///   the dependency-declaring unit; see `Task::depends_on`'s doc). **Every**
+///   step of `task` receives these entries, not just the first — a Task's
+///   declared `depends_on`/`reads` describe what the Task as a whole reads,
+///   and that's visible to whichever step is running (#2310 P2a; see this
+///   change's note below).
+/// - If `step` is NOT the first step of `task`: one MORE entry — the
+///   immediately-previous SAME-TASK step's `output` (if `Complete`), keyed
+///   by that step's id. This is ADDITIVE to the `depends_on`/`reads` entries
+///   above, never a replacement for them.
 ///
 /// A dependency that's `Complete` but has no recorded `output` (a step
 /// kind that legitimately produces none) is omitted, not stubbed with an
 /// empty string.
+///
+/// (#2310 P2a) Before this change, a later step in a multi-step Task saw
+/// ONLY its same-task predecessor's output — the Task's own
+/// `depends_on`/`reads` reached exclusively the Task's FIRST step, so a
+/// second (or third) step had no way to see what the Task declares it
+/// reads. That forced awkward workarounds (carrying an upstream value
+/// forward through every same-task step's own `output` just so a later
+/// step could see it again). The rule now: a later step gets the SAME
+/// `depends_on`/`reads` entries the first step would, PLUS its own
+/// predecessor's output. First steps are unchanged (they had no
+/// predecessor to chain from). A consumer keyed on `input.len() == 1` to
+/// infer "there is exactly one predecessor" (e.g. `dispatch.map`'s
+/// implicit single-dependency collection fallback) must instead prefer a
+/// known predecessor-step key when present — see
+/// `step_kinds::builtins::resolve_map_collection`.
 pub fn gather_inputs(
     step: &Step,
     task: &Task,
     tasks: &BTreeMap<String, Task>,
     steps: &BTreeMap<String, Step>,
 ) -> BTreeMap<String, String> {
-    match task.step_ids.iter().position(|id| id == &step.id) {
-        Some(i) if i > 0 => {
+    // (#1619) `reads` entries deliver exactly like `depends_on` entries —
+    // the dependency task's LAST step output, keyed by that task's id. The
+    // BTreeMap collect dedups a task named in both relations (legal during
+    // config migration) to one entry. (#2310 P2a) This now feeds EVERY step
+    // of `task`, not just the first — see the fn doc.
+    let mut inputs: BTreeMap<String, String> = task
+        .depends_on
+        .iter()
+        .chain(task.reads.iter())
+        .filter_map(|dep_task_id| {
+            let dep_task = tasks.get(dep_task_id)?;
+            let last_step_id = dep_task.step_ids.last()?;
+            let last_step = steps.get(last_step_id)?;
+            if last_step.status != NodeStatus::Complete {
+                return None;
+            }
+            last_step.output.clone().map(|output| (dep_task_id.clone(), output))
+        })
+        .collect();
+
+    // (#2310 P2a) A later step in a multi-step Task ALSO gets its
+    // immediately-previous same-task step's output, chained onto (never
+    // replacing) the `depends_on`/`reads` entries above.
+    if let Some(i) = task.step_ids.iter().position(|id| id == &step.id) {
+        if i > 0 {
             let prev_id = &task.step_ids[i - 1];
-            steps
+            if let Some(output) = steps
                 .get(prev_id)
                 .filter(|s| s.status == NodeStatus::Complete)
                 .and_then(|s| s.output.clone())
-                .map(|output| [(prev_id.clone(), output)].into_iter().collect())
-                .unwrap_or_default()
+            {
+                inputs.insert(prev_id.clone(), output);
+            }
         }
-        // (#1619) `reads` entries deliver exactly like `depends_on` entries —
-        // the dependency task's LAST step output, keyed by that task's id.
-        // The BTreeMap collect dedups a task named in both relations (legal
-        // during config migration) to one entry.
-        _ => task
-            .depends_on
-            .iter()
-            .chain(task.reads.iter())
-            .filter_map(|dep_task_id| {
-                let dep_task = tasks.get(dep_task_id)?;
-                let last_step_id = dep_task.step_ids.last()?;
-                let last_step = steps.get(last_step_id)?;
-                if last_step.status != NodeStatus::Complete {
-                    return None;
-                }
-                last_step.output.clone().map(|output| (dep_task_id.clone(), output))
-            })
-            .collect(),
     }
+
+    inputs
 }
 
 // ─── The scheduler loop ─────────────────────────────────────────────────
@@ -1641,6 +1667,79 @@ mod tests {
             [("multi-0".to_string(), step0), ("multi-1".to_string(), step1.clone())].into_iter().collect();
         let input = gather_inputs(&step1, &task, &tasks, &steps);
         assert_eq!(input.get("multi-0").map(String::as_str), Some("step0 out"));
+    }
+
+    #[test]
+    fn gather_inputs_later_step_also_sees_its_task_s_reads_output() {
+        // (#2310 P2a) Before this change, a later step in a multi-step Task
+        // received ONLY its same-task predecessor's output — the Task's own
+        // `reads` (or `depends_on`) reached exclusively the Task's FIRST
+        // step. This asserts the chain: `multi-1` (the SECOND step of a
+        // two-step task) must see BOTH its predecessor `multi-0`'s output
+        // AND the task-level `reads` target's output, keyed the same way
+        // each already is for a first step / a same-task successor.
+        let (task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.status = NodeStatus::Complete;
+        step_a.output = Some("a's output".to_string());
+
+        let task = Task {
+            id: "multi".to_string(),
+            phase_id: "p1".to_string(),
+            description: "d".to_string(),
+            display_name: None,
+            step_ids: vec!["multi-0".to_string(), "multi-1".to_string()],
+            depends_on: Vec::new(),
+            reads: vec!["a".to_string()],
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let step0 = Step {
+            id: "multi-0".to_string(),
+            task_id: "multi".to_string(),
+            gate: None,
+            kind: "procedural.noop".to_string(),
+            status: NodeStatus::Complete,
+            config: json!(null),
+            started_ts: None,
+            completed_ts: None,
+            output: Some("step0 out".to_string()),
+        };
+        let step1 = Step {
+            id: "multi-1".to_string(),
+            task_id: "multi".to_string(),
+            gate: None,
+            kind: "procedural.noop".to_string(),
+            status: NodeStatus::Planned,
+            config: json!(null),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let tasks: BTreeMap<String, Task> =
+            [("a".to_string(), task_a), ("multi".to_string(), task.clone())].into_iter().collect();
+        let steps: BTreeMap<String, Step> = [
+            ("a-step".to_string(), step_a),
+            ("multi-0".to_string(), step0),
+            ("multi-1".to_string(), step1.clone()),
+        ]
+        .into_iter()
+        .collect();
+
+        let input = gather_inputs(&step1, &task, &tasks, &steps);
+        assert_eq!(
+            input.get("multi-0").map(String::as_str),
+            Some("step0 out"),
+            "the same-task predecessor entry must still arrive (unchanged mechanism)"
+        );
+        assert_eq!(
+            input.get("a").map(String::as_str),
+            Some("a's output"),
+            "the task's own `reads` output must ALSO arrive — chained onto, not \
+             replaced by, the predecessor entry"
+        );
+        assert_eq!(input.len(), 2, "exactly the predecessor entry plus the reads entry, nothing dropped");
     }
 
     // ─── detect_cycles (Task-level, #1341) ──────────────────────────
