@@ -1489,8 +1489,12 @@ pub fn launch(
     let status = envelope.status;
     // (#2301) A run's own numbers ride the `mission close` payload — the
     // home the retired crawl launcher used, kept for every generic graph
-    // that ends in a summarizing step. See [`run_summary_payload`].
-    let close_payload = run_summary_payload(config, &real_phase_ids, &tasks, &steps);
+    // that ends in a summarizing step. See [`run_summary_payload`]. (#2310
+    // P3) `?` — a config-authoring mistake in `outcome_from` (an unknown
+    // task id) is a loud launch failure, not a silently-null close payload;
+    // `guard`'s own Drop-based abort path records the mission as aborted,
+    // same as any other pre-close `?` failure in this function.
+    let close_payload = run_summary_payload(config, &real_phase_ids, &tasks, &steps)?;
     // (#2131) Disarms `guard` — the third and last known terminal point.
     guard.close(|| crew::envelope::finalize_mission_with_payload(&envelope, close_payload));
 
@@ -2141,32 +2145,158 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
 /// `coder-phase`. Same treatment review's own id gate got in #1538.
 /// (#2301) The LAST phase's last step output, when it is a JSON OBJECT —
 /// the run's own summary, promoted to the `mission close` record's
-/// payload.
+/// payload. (#2310 P3) `config.outcome_from`, when set, OVERRIDES the
+/// positional rule: it names a document task id directly, and THAT task's
+/// last step becomes the promoted candidate instead of "the last phase's
+/// last task" — `review.json` names `review-synthesis-task` so the review
+/// mission's close payload is the final envelope (`review.rs`'s
+/// `ReviewEnvelope`), not whatever task happens to be graph-positionally
+/// last (the `report` task's own render step, once #2310 P3's `review.report`
+/// step lands after synthesis).
 ///
-/// Deliberately positional rather than keyed on a step KIND: the rule a
-/// config author can rely on is "end your graph with a step that outputs
-/// your run's summary", which composes with any kind. A last step that
-/// outputs nothing, or outputs something that is not a JSON object (a
-/// path, a branch name, a shell command's stdout), contributes no payload
-/// — exactly the pre-#2301 behavior for every config that has one.
+/// Deliberately positional-by-DEFAULT rather than keyed on a step KIND: the
+/// rule a config author can rely on absent `outcome_from` is "end your graph
+/// with a step that outputs your run's summary", which composes with any
+/// kind. A last step that outputs nothing, or outputs something that is not
+/// a JSON object (a path, a branch name, a shell command's stdout),
+/// contributes no payload — exactly the pre-#2301 behavior for every config
+/// that has one, and unchanged for every config that never sets
+/// `outcome_from`.
+///
+/// An `outcome_from` naming a task id this config's `phases` never declares
+/// AT ALL (a typo) — or one that resolves to zero real tasks by construction
+/// (a `grow`-templated task, never itself minted) — is a loud, named `Err`:
+/// a config author who explicitly names a task deserves the mistake surfaced
+/// at launch, not a close payload silently drawn from the wrong step (see
+/// [`MissionConfig::outcome_from`]'s own doc).
+///
+/// (#2345 CONSIDER-2, round 2) **A disabled `outcome_from` target is ALSO a
+/// loud `Err` here, not `Ok(None)`.** This function's own earlier revision
+/// treated a task pruned dynamically (`enabled: false` on the task or its
+/// phase) as "a legitimate runtime shape, not a config mistake" — that was
+/// wrong: `real_task_ids` (called below) does NOT check `enabled` at all,
+/// so a disabled task's real id still resolves cleanly, `tasks.iter()
+/// .find(...)` then finds nothing (the task was pruned before minting), and
+/// the whole call silently fell through to `Ok(None)` — a null close
+/// payload with no explanation anywhere. `MissionConfig::validate` now
+/// refuses this at validate/launch time (the primary defense — the mistake
+/// never reaches a real run), so reaching this branch here means either a
+/// caller skipped `validate` or a document was hand-edited after launch;
+/// either way this is the BACKSTOP, and a backstop that stays silent isn't
+/// one. The `None` (positional-default) branch is UNCHANGED — a config
+/// that never sets `outcome_from` still silently gets `Ok(None)` for every
+/// other "nothing to promote" reason (no last step, incomplete, non-object
+/// output), because there is no operator-named task to have failed.
 fn run_summary_payload(
     config: &MissionConfig,
     real_phase_ids: &BTreeMap<String, String>,
     tasks: &[crew::types::Task],
     steps: &BTreeMap<String, Step>,
-) -> Option<serde_json::Value> {
-    let last_phase = config.phases.last()?;
-    let real_phase_id = real_phase_ids.get(&last_phase.id)?;
-    let task = tasks.iter().rfind(|t| &t.phase_id == real_phase_id)?;
-    let step = steps.get(task.step_ids.last()?)?;
+) -> Result<Option<serde_json::Value>> {
+    let task: Option<&crew::types::Task> = match &config.outcome_from {
+        Some(doc_task_id) => {
+            // A minimal `LaunchParams` — `real_task_ids` reads only
+            // `phase_ids` to compose a document task id into its real one
+            // (see that function's own doc); the task/step overrides this
+            // struct also carries never affect id composition.
+            let params = LaunchParams {
+                phase_ids: real_phase_ids.clone(),
+                task_overrides: BTreeMap::new(),
+                step_config_overrides: BTreeMap::new(),
+            };
+            let real_ids = mission_config::interpret::real_task_ids(config, &params);
+            let real_id = match real_ids.get(doc_task_id) {
+                None => bail!(
+                    "mission config \"{}\" declares outcome_from \"{doc_task_id}\", but no task \
+                     with that id exists in its phases — name a real task id, or remove \
+                     outcome_from to fall back to the positional \"last phase's last task\" rule \
+                     (#2310 P3)",
+                    config.id
+                ),
+                Some(ids) if ids.is_empty() => bail!(
+                    "mission config \"{}\" declares outcome_from \"{doc_task_id}\", but that task \
+                     declares a `grow` template and is never itself minted — name a real, \
+                     non-template task id (#2310 P3)",
+                    config.id
+                ),
+                Some(ids) => &ids[0],
+            };
+            let found = tasks.iter().find(|t| &t.id == real_id);
+            if found.is_none() {
+                // (#2345 CONSIDER-2) `real_task_ids` resolved a real id
+                // (this is NOT the "unknown task id" case above), but no
+                // minted `Task` carries it — the declared task exists in
+                // the document but was pruned before minting (disabled, on
+                // itself or its phase). `MissionConfig::validate` refuses
+                // this before a mission ever mints; this is the backstop
+                // for whatever reaches it anyway.
+                bail!(
+                    "mission config \"{}\" declares outcome_from \"{doc_task_id}\", but no minted \
+                     task carries that id — it is declared in `phases` but was never minted this \
+                     run (most likely `enabled: false` on the task or its owning phase). Enable \
+                     the task, or name a different one (#2345 CONSIDER-2)",
+                    config.id
+                );
+            }
+            found
+        }
+        None => {
+            let real_phase_id = config.phases.last().and_then(|p| real_phase_ids.get(&p.id));
+            real_phase_id.and_then(|real_phase_id| tasks.iter().rfind(|t| &t.phase_id == real_phase_id))
+        }
+    };
+    let Some(task) = task else { return Ok(None) };
+    let Some(last_step_id) = task.step_ids.last() else { return Ok(None) };
+    let Some(step) = steps.get(last_step_id) else { return Ok(None) };
     if step.status != crew::types::NodeStatus::Complete {
-        return None;
+        return Ok(None);
     }
-    // (#2301) A typed output rides in a `step_output::Output` envelope;
-    // the payload readers want is the BODY, not the wrapper. An unwrapped
-    // object passes through as-is (the pre-wrapper shape).
-    match serde_json::from_str::<serde_json::Value>(step.output.as_deref()?.trim()) {
-        Ok(serde_json::Value::Object(mut o)) => match (o.contains_key("kind"), o.remove("body")) {
+    let Some(output) = step.output.as_deref() else { return Ok(None) };
+    Ok(match serde_json::from_str::<serde_json::Value>(output.trim()) {
+        Ok(v) => promoted_step_body(v),
+        Err(_) => None,
+    })
+}
+
+/// (#2301, extracted #2310 P3) A typed output rides in a
+/// `step_output::Output` envelope (`{"kind": ..., "body": {...}, ...}`) —
+/// the payload readers want is the BODY, not the wrapper. An unwrapped
+/// object passes through as-is (the pre-wrapper shape); anything that isn't
+/// a JSON object contributes nothing.
+///
+/// **Shared with `src/mission_launch_review.rs::finalize_review_mission`**
+/// (#2310 P3) — the review launcher's own close-payload promotion. That
+/// caller never walks a persisted `Step.output` string the way
+/// [`run_summary_payload`] does (the bespoke launcher's `dispatch_worker`
+/// thread boundary drops `tasks`/`steps` after persisting them, keeping
+/// only the finished `ReviewEnvelope` — see that call site's own comment);
+/// it calls this SAME unwrap on `serde_json::to_value(&env)` instead.
+///
+/// (#2345 I1) **Provably identical ONLY on a CLEAN run** — the case above
+/// actually describes: when `review-synthesis-task` reaches
+/// `NodeStatus::Complete`, its only step wraps EXACTLY `env` as its
+/// `Output` body (`ReviewSynthesisStepKind::run_streaming`'s
+/// `Output::wrap(REVIEW_ENVELOPE_OUTPUT_KIND, env, producer)`), so
+/// unwrapping that persisted step's output through this same function
+/// yields the identical JSON `env` already round-trips to. **The two
+/// launchers DIVERGE on an ERRORED run**, where `review-synthesis-task`
+/// never completes: `run_summary_payload`'s own `step.status !=
+/// NodeStatus::Complete` gate (a few lines up) makes it promote `None` —
+/// the generic launcher's honest "nothing to promote" for a task that
+/// never finished. The bespoke `finalize_review_mission` has no such gate:
+/// it always promotes whatever `Result<ReviewEnvelope>` it was handed,
+/// which on an errored run is the FALLBACK envelope `run_review_graph`
+/// built from whichever typed step outputs completed before the failure
+/// (see that function's own `fallback_env`/`fold_review_outputs_into_
+/// envelope` doc) — a real, useful payload, but not literally
+/// `review-synthesis-task`'s own output, since that task never ran. So
+/// "reusing the function keeps the two launchers from drifting" is true
+/// for the UNWRAP RULE (#2310 P3's own review gate: "one function, not a
+/// copy"); it does not mean the two launchers promote the same VALUE on
+/// every run outcome.
+pub(crate) fn promoted_step_body(value: serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(mut o) => match (o.contains_key("kind"), o.remove("body")) {
             (true, Some(body @ serde_json::Value::Object(_))) => Some(body),
             (true, _) => None,
             (false, _) => Some(serde_json::Value::Object(o)),
@@ -3416,6 +3546,7 @@ mod tests {
             };
             let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into();
             run_summary_payload(&cfg, &real_phase_ids, std::slice::from_ref(&task), &steps)
+                .expect("no outcome_from set on this fixture — never errors")
         };
 
         assert!(
@@ -3432,6 +3563,157 @@ mod tests {
             mk(crew::types::NodeStatus::Complete, r#"{"findings":2}"#),
             Some(serde_json::json!({"findings": 2})),
             "a JSON-object output still promotes — the rule is the shape, not the kind"
+        );
+    }
+
+    /// (#2310 P3) A two-task, ONE-phase config whose `outcome_from` names
+    /// the FIRST task — the positional rule would pick the SECOND (last)
+    /// task's output instead, so this is red before `outcome_from` is
+    /// honored and green after.
+    fn two_task_fixture(outcome_from: Option<&str>) -> (mission_config::MissionConfig, BTreeMap<String, String>, Vec<crew::types::Task>, BTreeMap<String, Step>) {
+        let mut cfg_json = serde_json::json!({
+            "id": "m", "name": "M", "schema_version": "3.3", "inputs": [],
+            "phases": [{"id": "p", "tasks": [
+                {"id": "first-task", "steps": [{"id": "first-step", "kind": "dispatch.internal", "config": {}}]},
+                {"id": "second-task", "steps": [{"id": "second-step", "kind": "dispatch.internal", "config": {}}]}
+            ]}]
+        });
+        if let Some(id) = outcome_from {
+            cfg_json["outcome_from"] = serde_json::json!(id);
+        }
+        let cfg: mission_config::MissionConfig = serde_json::from_value(cfg_json).unwrap();
+        let real_phase_ids: BTreeMap<String, String> = [("p".to_string(), "m-1-p".to_string())].into();
+        let mk_task = |id: &str, step_id: &str| crew::types::Task {
+            id: id.into(),
+            phase_id: "m-1-p".into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec![step_id.into()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        // `real_task_ids`/`substitute_id` only replace a task id's PREFIX
+        // when it literally starts with `"<doc_phase_id>-"` (`"p-"` here);
+        // neither `"first-task"` nor `"second-task"` does, so both pass
+        // through VERBATIM — these fixture task/step ids match that
+        // resolution exactly (no invented `"m-1-"` mission-scoped prefix).
+        let tasks = vec![mk_task("first-task", "first-step"), mk_task("second-task", "second-step")];
+        let mk_step = |id: &str, task_id: &str, body: &str| Step {
+            id: id.into(),
+            task_id: task_id.into(),
+            kind: "dispatch.internal".into(),
+            gate: None,
+            status: crew::types::NodeStatus::Complete,
+            config: serde_json::json!({}),
+            started_ts: None,
+            completed_ts: None,
+            output: Some(body.to_string()),
+        };
+        let steps: BTreeMap<String, Step> = [
+            ("first-step".to_string(), mk_step("first-step", "first-task", r#"{"from":"first"}"#)),
+            ("second-step".to_string(), mk_step("second-step", "second-task", r#"{"from":"second"}"#)),
+        ]
+        .into();
+        (cfg, real_phase_ids, tasks, steps)
+    }
+
+    #[test]
+    fn outcome_from_naming_the_first_task_overrides_the_positional_last_task_rule() {
+        let (cfg, real_phase_ids, tasks, steps) = two_task_fixture(Some("first-task"));
+        let payload = run_summary_payload(&cfg, &real_phase_ids, &tasks, &steps).unwrap();
+        assert_eq!(
+            payload,
+            Some(serde_json::json!({"from": "first"})),
+            "outcome_from names the FIRST task; the positional default would have picked \
+             \"second\" (the last task in the phase) — this pins that outcome_from actually wins"
+        );
+    }
+
+    #[test]
+    fn outcome_from_naming_an_unknown_task_id_is_a_loud_error() {
+        let (cfg, real_phase_ids, tasks, steps) = two_task_fixture(Some("no-such-task"));
+        let err = run_summary_payload(&cfg, &real_phase_ids, &tasks, &steps)
+            .expect_err("an outcome_from naming a task this config never declares must error, not silently promote nothing");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no-such-task"), "{msg}");
+        assert!(msg.contains("outcome_from"), "{msg}");
+    }
+
+    /// (#2345 CONSIDER-2, round 2) Simulates a disabled `outcome_from`
+    /// target reaching this function's BACKSTOP anyway (`MissionConfig::
+    /// validate` now refuses this earlier — see that fn's own `outcome_from`
+    /// checks — this test exercises the defense-in-depth layer, not the
+    /// primary one). The CONFIG still declares the task (`enabled: false`,
+    /// pruned before minting), so `real_task_ids` resolves a real id for
+    /// it, but no `Task` in the minted `tasks` slice carries that id —
+    /// exactly what a real pruned mint produces. Before this fix this fell
+    /// through to a silent `Ok(None)`.
+    #[test]
+    fn outcome_from_naming_a_task_absent_from_the_minted_tasks_is_a_loud_error() {
+        let cfg_json = serde_json::json!({
+            "id": "m", "name": "M", "schema_version": "3.3", "inputs": [],
+            "outcome_from": "disabled-task",
+            "phases": [{"id": "p", "tasks": [
+                {"id": "disabled-task", "enabled": false, "steps": [
+                    {"id": "disabled-step", "kind": "dispatch.internal", "config": {}}
+                ]},
+                {"id": "live-task", "steps": [
+                    {"id": "live-step", "kind": "dispatch.internal", "config": {}}
+                ]}
+            ]}]
+        });
+        let cfg: mission_config::MissionConfig = serde_json::from_value(cfg_json).unwrap();
+        let real_phase_ids: BTreeMap<String, String> = [("p".to_string(), "m-1-p".to_string())].into();
+        // Only "live-task" was actually minted — "disabled-task" was pruned
+        // before this point, matching real mint behavior (`prune.rs`).
+        let tasks = vec![crew::types::Task {
+            id: "live-task".into(),
+            phase_id: "m-1-p".into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["live-step".into()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        }];
+        let step = Step {
+            id: "live-step".into(),
+            task_id: "live-task".into(),
+            kind: "dispatch.internal".into(),
+            gate: None,
+            status: crew::types::NodeStatus::Complete,
+            config: serde_json::json!({}),
+            started_ts: None,
+            completed_ts: None,
+            output: Some(r#"{"from":"live"}"#.to_string()),
+        };
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into();
+
+        let err = run_summary_payload(&cfg, &real_phase_ids, &tasks, &steps).expect_err(
+            "a disabled outcome_from target reaching this backstop must error loudly, never \
+             silently promote None",
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("disabled-task"), "{msg}");
+        assert!(msg.contains("outcome_from"), "{msg}");
+    }
+
+    #[test]
+    fn outcome_from_absent_keeps_the_positional_last_task_rule_unchanged() {
+        let (cfg, real_phase_ids, tasks, steps) = two_task_fixture(None);
+        let payload = run_summary_payload(&cfg, &real_phase_ids, &tasks, &steps).unwrap();
+        assert_eq!(
+            payload,
+            Some(serde_json::json!({"from": "second"})),
+            "absent outcome_from keeps promoting the last phase's last task — the pre-#2310 \
+             P3 default every existing config (crawl.json included) still relies on"
         );
     }
 
@@ -4943,6 +5225,7 @@ mod tests {
             phases: Vec::new(),
             panel: None,
             cmd: None,
+            outcome_from: None,
             extras: BTreeMap::new(),
         };
         let missing = missing_required_inputs(&cfg, &BTreeMap::new());

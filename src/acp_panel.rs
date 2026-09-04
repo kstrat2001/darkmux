@@ -862,6 +862,7 @@ mod tests {
             phases,
             panel,
             cmd: None,
+            outcome_from: None,
             extras: Map::new(),
         }
     }

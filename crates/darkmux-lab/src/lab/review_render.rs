@@ -46,7 +46,7 @@
 //! review.
 //!
 //! Consumers: `darkmux mission launch review` (`src/mission_launch_review.rs`)
-//! drives the `darkmux_lab::lab::review::{build_review_graph, run_review_graph,
+//! drives the `crate::lab::review::{build_review_graph, run_review_graph,
 //! run_judge_only}` machinery and calls back into
 //! [`synthesize_review`]/[`emit_rendered`] here for its own render step.
 //! This module's synthesis logic (a `Tier::Confirmed` flag becomes an inline,
@@ -63,10 +63,10 @@
 //! dedup -> double-confirm judge -> synthesis) had earlier moved out of this
 //! module to `mission launch review` in #1284 Packet 4b.
 
+use crate::lab::bundle::{SkipReason, SkippedFile};
+use crate::lab::review::{DegenerateKind, JudgeRecord, ReviewEnvelope, Tier, VerifyRecord, VerifyRuling};
 use anyhow::{Context, Result};
 use darkmux_crew::run_outcome::RunOutcome;
-use darkmux_lab::lab::bundle::{SkipReason, SkippedFile};
-use darkmux_lab::lab::review::{DegenerateKind, JudgeRecord, ReviewEnvelope, Tier, VerifyRecord, VerifyRuling};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -242,7 +242,7 @@ fn degraded_with_footer(note: &str, footer: &str) -> Rendered {
 
 /// (#1605) The neutral no-op comment for a benign-empty run — every file
 /// the diff touched declined for a reason that means "nothing here to
-/// review" (today: [`darkmux_lab::lab::review::DegenerateKind::BenignEmpty`]
+/// review" (today: [`crate::lab::review::DegenerateKind::BenignEmpty`]
 /// fires only when every skip is non-code content — see
 /// `classify_zero_bundle_degenerate`'s own doc). Names what the diff
 /// actually contained (from `env.bundle_skip`) so the requester sees WHY,
@@ -286,7 +286,7 @@ fn render_benign_noop_comment(env: &ReviewEnvelope, footer: &str) -> String {
 
 /// (#1757) The neutral note for a run whose zero-bundle result is real
 /// source code the built-in bundler can't parse
-/// ([`darkmux_lab::lab::review::DegenerateKind::UnsupportedLanguage`] —
+/// ([`crate::lab::review::DegenerateKind::UnsupportedLanguage`] —
 /// see `classify_zero_bundle_degenerate`'s doc for exactly which skip
 /// mixes qualify). Deliberately NOT [`render_benign_noop_comment`]'s
 /// wording: that comment says "nothing here to review," which is false
@@ -452,9 +452,13 @@ fn unique_seat_models(env: &ReviewEnvelope, remote: bool) -> Vec<String> {
 /// `--emit <path>` writes the rendered payload to a file; `--emit -` or a
 /// bare omitted `--emit` writes to stdout (the `-` spelling is what makes
 /// a CI-testable `--from-envelope ... --emit -`-style path assertable
-/// without a scratch file). `pub(crate)` — `mission_launch_review::launch`
-/// calls this as its own final render step.
-pub(crate) fn emit_rendered(rendered: &Rendered, emit: Option<&Path>) -> Result<i32> {
+/// without a scratch file). `pub` (#2310 P3, widened from `pub(crate)` on
+/// the move into this crate) — both `src/mission_launch_review.rs`'s
+/// `from_envelope` path and this crate's own `review.report` step kind
+/// (`ReviewReportStepKind`, `crates/darkmux-lab/src/lab/review.rs`) call
+/// this as their final render step, from opposite sides of the crate
+/// boundary.
+pub fn emit_rendered(rendered: &Rendered, emit: Option<&Path>) -> Result<i32> {
     let out = serde_json::to_string(&rendered.to_value())?;
     match emit {
         Some(p) if p == Path::new("-") => println!("{out}"),
@@ -464,7 +468,7 @@ pub(crate) fn emit_rendered(rendered: &Rendered, emit: Option<&Path>) -> Result<
     Ok(0)
 }
 
-/// Real `Bundle.id`s are `"<fn>@<path>"` (`darkmux_lab::lab::bundle::
+/// Real `Bundle.id`s are `"<fn>@<path>"` (`crate::lab::bundle::
 /// build_bundles`); the provisional review-internal bundler used
 /// `id == path` with no `@`. `split_once('@')` — the FIRST `@` — handles
 /// both: function names never contain `@`, but paths can (an npm
@@ -575,7 +579,7 @@ fn public_safe_note(note: &str) -> String {
 ///   comment names the file count + extensions that went unreviewed and
 ///   points at the `--bundler` escape hatch's guide page instead of saying
 ///   "nothing to review" — see [`render_unsupported_language_comment`].
-/// - An envelope whose [`darkmux_lab::lab::review::review_outcome`] reads
+/// - An envelope whose [`crate::lab::review::review_outcome`] reads
 ///   [`RunOutcome::Empty`] (`env.degenerate.is_some()`, `degenerate_kind`
 ///   absent or [`DegenerateKind::Error`] — Gate 2's zero-usable-rulings
 ///   honesty gate, or the strict judge-exhaustion policy) -> `"degraded"`,
@@ -616,7 +620,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
     // zero-usable-rulings honesty gate, or the strict judge-exhaustion
     // policy opting back into the pre-#1876 behavior); the "produced no
     // signal" wording and the full discard are reserved for it alone.
-    let outcome = darkmux_lab::lab::review::review_outcome(env);
+    let outcome = crate::lab::review::review_outcome(env);
     if let RunOutcome::Empty { reason } = &outcome {
         // (#1298) Even a degenerate run posts the envelope-derived footer, so a
         // remote crew that produced no signal never claims "no cloud API".
@@ -865,7 +869,7 @@ fn run_warnings_block(env: &ReviewEnvelope) -> Vec<String> {
 /// coverage shortfall changes how the WHOLE posted review should be read,
 /// not just one more thing to note in passing. `reasons` comes straight from
 /// [`RunOutcome::Partial`] — already built from the envelope's own numbers
-/// (`darkmux_lab::lab::review::review_outcome`), so this function never
+/// (`crate::lab::review::review_outcome`), so this function never
 /// invents a count of its own; a fixed string here would defeat the whole
 /// point. Empty `reasons` (never reached by `synthesize_review`'s own call
 /// site, but kept total rather than partial) renders nothing.
@@ -1097,11 +1101,11 @@ mod tests {
     // production code (only inferred through `env.judged`/`env.members`
     // iteration), so importing them at file scope would warn "unused" on a
     // plain (non-test) `cargo build`.
-    use darkmux_lab::lab::review::{JudgeRuling, JudgedFlag, MemberRecord, NeedsCheckCluster, ProbeFlag};
+    use crate::lab::review::{JudgeRuling, JudgedFlag, MemberRecord, NeedsCheckCluster, ProbeFlag};
     // (#1605) Test-only — the no-op-comment tests build a `bundle_skip`
     // report by hand; production code only ever receives one already
     // populated by `ReviewBundleStepKind::run_streaming`.
-    use darkmux_lab::lab::bundle::{BundleSkipReport, SkipReason, SkippedFile};
+    use crate::lab::bundle::{BundleSkipReport, SkipReason, SkippedFile};
     // (#1876/#1877) Test-only — the partial-coverage tests build a
     // `remote_budgets` row by hand; production code only ever reads one
     // already populated by `judge_gate_outcome`/`RemoteBudget::record`.
@@ -1391,7 +1395,7 @@ mod tests {
     /// renders the non-blocking `COMMENT`).
     fn blocking_envelope(judged: Vec<JudgedFlag>) -> ReviewEnvelope {
         ReviewEnvelope {
-            staffing: Some(darkmux_lab::lab::review::StaffingSnapshot {
+            staffing: Some(crate::lab::review::StaffingSnapshot {
                 request_changes: true,
                 ..Default::default()
             }),

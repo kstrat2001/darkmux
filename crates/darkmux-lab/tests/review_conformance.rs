@@ -46,9 +46,9 @@
 use anyhow::Result;
 use darkmux_crew::resourcing::{ResolvedReviewRoles, ResolvedSeatStaffing};
 use darkmux_lab::lab::review::{
-    build_review_graph, fingerprint, run_review_graph, seat_identifier, staffing_snapshot, BundleBuildSpec,
-    BundleInput, BundleSourceSpec, ChatCall, ExecMode, NullEmitter, ReviewContextStepKind, ReviewContextTestOverrides,
-    ReviewStepContext,
+    build_review_graph, fingerprint, render_and_emit_review, run_review_graph, seat_identifier, staffing_snapshot,
+    BundleBuildSpec, BundleInput, BundleSourceSpec, ChatCall, ExecMode, NullEmitter, ReviewContextStepKind,
+    ReviewContextTestOverrides, ReviewStepContext,
 };
 use darkmux_crew::single_shot::SingleShotReply;
 use darkmux_crew::step_kinds::StepKind as _;
@@ -551,6 +551,28 @@ fn dummy_bundle_spec() -> BundleBuildSpec {
     }
 }
 
+/// (#2345 minor) `review-report-step`'s config stays `null` (unstamped) in
+/// every hermetic harness fixture in this file — a real `mission launch
+/// review` always stamps `emit` (`src/mission_launch_review.rs::run_
+/// dispatch`), but this harness never mints a launch, so nothing stamps it
+/// here. `null` config means `emit_path: None`, which `emit_rendered`'s own
+/// contract reads as "write to stdout" — so any scenario whose graph
+/// reaches a COMPLETED `review-report-step` (the two golden-comparison
+/// scenarios and the real-bundler scenario; the errored scenario's report
+/// step never runs at all) prints the whole rendered `{mode, review,
+/// comment}` payload to the TEST process's own stdout on every `cargo
+/// test` run. Call this right alongside the `context_out` stamp each of
+/// those scenarios already applies, so the report step's rendered output
+/// goes to a tempdir file instead — same "give it a real destination"
+/// discipline, one more step.
+fn stamp_report_emit(graph: &mut darkmux_lab::lab::review::BuiltReviewGraph, home: &Path) {
+    if let Some(report_step) = graph.steps.get_mut("review-report-step") {
+        report_step.config = serde_json::json!({
+            "emit": home.join("rendered-report.json").display().to_string()
+        });
+    }
+}
+
 // ─── Hole 4 (#2336 review): the bundle step's real path is out of the net ──
 //
 // Every OTHER test in this file sets `bundle_override: Some(...)`, which
@@ -731,6 +753,7 @@ fn review_bundle_step_runs_the_real_bundler_over_a_worktree() {
         // step-config key.
         context_step.config = cfg;
     }
+    stamp_report_emit(&mut graph, home.path());
 
     let (env, steps) = run_review_graph(
         &ctx,
@@ -930,6 +953,7 @@ fn review_pipeline_matches_the_committed_golden() {
         // step-config key.
         context_step.config = cfg;
     }
+    stamp_report_emit(&mut graph, home.path());
 
     let (env, steps) = run_review_graph(
         &ctx,
@@ -1050,6 +1074,618 @@ fn review_pipeline_matches_the_committed_golden() {
          then review the diff before committing.",
         golden_path().display()
     );
+}
+
+// ─── #2310 P3: harness scenarios beyond the one happy-path golden ─────────
+//
+// The P0 conformance golden pins ONE happy scenario — every probe/judge/
+// verify dispatch succeeds, `env.warnings` is empty, and every step reaches
+// `Complete`. Both critical findings on P2's own review lived in states that
+// golden never carries (a non-empty `env.warnings`, a step that genuinely
+// ERRORS). P3 adds two more scenarios BEFORE touching the `review.report`
+// step kind, so that step's own render golden (added alongside it) has a
+// warned/errored envelope to render against, not just the clean one.
+
+/// Like [`reply`], with an explicit `total_tokens` — the verify-exhaustion
+/// scenario below needs ONE call to report enough usage to actually spend
+/// down a small remote-token bucket; [`reply`]'s fixed `total_tokens: 1` is
+/// too small for `RemoteBudget::settle` to ever leave a bucket exhausted
+/// (see this function's one call site for the exact arithmetic).
+fn reply_with_tokens(content: &str, total_tokens: u64) -> SingleShotReply {
+    SingleShotReply {
+        content: content.to_string(),
+        total_tokens: Some(total_tokens),
+        prompt_tokens: Some(total_tokens / 2),
+        completion_tokens: Some(total_tokens / 2),
+        model: None,
+    }
+}
+
+/// The "warned" scenario's crew: probes stay LOCAL (unchanged from
+/// [`crew`]) — a probe dispatch failure needs no remote seat to produce its
+/// own warning (`reconstruct_probe_seat` fires on `errors > 0` regardless of
+/// `remote`). Judge AND verify are BOTH remote (mirroring `crew()`'s own
+/// `remote_seat` for verify) — a judge warning's two possible sources
+/// (`JudgeGateOutcome::dispatch_error_warning`/`coverage_warning`) both
+/// require `is_remote`, so a local judge structurally cannot produce one.
+fn warned_crew() -> ResolvedReviewRoles {
+    ResolvedReviewRoles {
+        probes: vec![
+            seat("review-probe-high", "review-conformance-probe-high", 2),
+            seat("review-probe-mid", "review-conformance-probe-mid", 2),
+            seat("review-probe-low", "review-conformance-probe-low", 2),
+        ],
+        judge: remote_seat("review-judge", "review-conformance-judge", 2),
+        verify: Some(remote_seat("review-verify", "review-conformance-verify", 2)),
+        request_changes: false,
+        warnings: vec![],
+    }
+}
+
+/// The warned scenario's canned dispatch — [`chat_fn`] plus four
+/// deliberate deviations, one per warning source this scenario exists to
+/// pin:
+///
+/// - **probe**: `probe-high` x `src/config.ts` (a pairing [`chat_fn`]
+///   answers with an empty reply — no flag either way) always ERRORS
+///   instead, so `reconstruct_probe_seat` records `errors == 1` and pushes
+///   its own "dispatch failed on 1 draw(s)" warning. `deduped_flags` stays
+///   identical to the happy path (an empty reply produces no flag; an
+///   errored one doesn't either).
+/// - **judge**: `docs/setup.md`'s pass-1 call ERRORS instead of ruling
+///   `false_positive`. `judge_pass_with_retry` retries once on
+///   `Unparsed`, never on a dispatch `Err` (see that function's own doc),
+///   so this fires the `JudgeGateOutcome::dispatch_error_warning` path
+///   unconditionally (`is_remote && dispatch_errors > 0`) — independent of
+///   any token budget. `docs` drops out of `usable` (an `Error` ruling
+///   isn't `Confirmed`/`NeedsCheck`/`FalsePositive`), but billing/auth/
+///   config still are, so the judge-dead gate never fires.
+/// - **verify**: billing's VERIFIED reply reports `total_tokens: 2000` —
+///   `warned_step_ctx`'s `remote_max_tokens_per_execution` is ALSO 2000, so
+///   this single call's `RemoteBudget::settle` leaves the bucket fully
+///   spent (see that scenario's own doc for the arithmetic). config's
+///   verify call — the docket's second and last confirmed finding — is
+///   never expected to reach this closure at all: the bucket denies it
+///   BEFORE dispatch, so `call.user.contains("src/config.ts")` under
+///   `VERIFY seat` panics here as a canary if that budget math ever drifts.
+/// - every other (seat, bundle) pairing is unchanged from [`chat_fn`].
+fn warned_chat_fn(
+    billing_pass: Arc<AtomicU32>,
+    auth_pass: Arc<AtomicU32>,
+    config_pass: Arc<AtomicU32>,
+    total_calls: Arc<AtomicU32>,
+) -> impl Fn(&ChatCall) -> Result<SingleShotReply> + Send + Sync + 'static {
+    move |call: &ChatCall| {
+        total_calls.fetch_add(1, Ordering::SeqCst);
+        if call.system.contains("VERIFY seat") {
+            if call.user.contains("src/billing.ts") {
+                return Ok(reply_with_tokens(VERIFIED_JSON, 2_000));
+            }
+            if call.user.contains("src/config.ts") {
+                panic!(
+                    "review-conformance warned scenario: the config verify call reached \
+                     chat_fn — the billing call's 2000-token settle should have exhausted the \
+                     2000-token bucket first (budget math drifted)"
+                );
+            }
+            panic!("review-conformance warned scenario: unexpected VERIFY call: {}", call.user);
+        }
+        if call.system.contains("JUDGE seat") {
+            if call.user.contains("docs/setup.md") {
+                anyhow::bail!("review-conformance warned scenario: synthetic judge dispatch failure");
+            }
+            if call.user.contains("src/billing.ts") {
+                billing_pass.fetch_add(1, Ordering::SeqCst);
+                return Ok(reply(CONFIRM_JSON));
+            }
+            if call.user.contains("src/config.ts") {
+                let idx = config_pass.fetch_add(1, Ordering::SeqCst);
+                return Ok(reply(match idx {
+                    0 | 1 => CONFIRM_JSON,
+                    other => panic!("review-conformance warned scenario: unexpected config judge pass {other}"),
+                }));
+            }
+            if call.user.contains("src/auth.ts") {
+                let idx = auth_pass.fetch_add(1, Ordering::SeqCst);
+                return Ok(reply(match idx {
+                    0 => CONFIRM_JSON,
+                    1 => NEEDS_CHECK_JSON,
+                    other => panic!("review-conformance warned scenario: unexpected auth judge pass {other}"),
+                }));
+            }
+            panic!("review-conformance warned scenario: unexpected JUDGE call: {}", call.user);
+        }
+        // Probe call — identical to `chat_fn` EXCEPT probe-high x
+        // src/config.ts, which always errors (see this function's own doc).
+        if call.model.contains("probe-high") && call.user.contains("src/config.ts") {
+            anyhow::bail!("review-conformance warned scenario: synthetic probe dispatch failure");
+        }
+        if call.model.contains("probe-high") && call.user.contains("src/billing.ts") {
+            return Ok(reply("a real defect: `const end = start.plus(30)`"));
+        }
+        if call.model.contains("probe-mid") && call.user.contains("src/billing.ts") {
+            return Ok(reply("a real defect: `const end = start.plus(30)`"));
+        }
+        if call.model.contains("probe-mid") && call.user.contains("src/auth.ts") {
+            return Ok(reply("a real defect: `if (user.role = \"admin\")`"));
+        }
+        if call.model.contains("probe-low") && call.user.contains("docs/setup.md") {
+            return Ok(reply("a suspicious change: `A new heading appears here`"));
+        }
+        if call.model.contains("probe-low") && call.user.contains("src/config.ts") {
+            return Ok(reply("a real defect: `const port = env.PORT + 1`"));
+        }
+        Ok(reply(""))
+    }
+}
+
+fn warned_step_ctx(
+    billing_pass: Arc<AtomicU32>,
+    auth_pass: Arc<AtomicU32>,
+    config_pass: Arc<AtomicU32>,
+    total_calls: Arc<AtomicU32>,
+) -> Arc<ReviewStepContext> {
+    Arc::new(ReviewStepContext {
+        case_id: "review-conformance-warned-case".to_string(),
+        roles: warned_crew(),
+        intent_title: "Fix billing rounding".to_string(),
+        intent_body: "Cleans up a couple of billing/auth edge cases.".to_string(),
+        diff: DIFF.to_string(),
+        probe_system: "You are the review-conformance PROBE seat.".to_string(),
+        probe_role_prompts: std::collections::BTreeMap::new(),
+        judge_system: "You are the review-conformance JUDGE seat.".to_string(),
+        verify_system: "You are the review-conformance VERIFY seat.".to_string(),
+        // (see `warned_chat_fn`'s own doc) — deliberately small: billing's
+        // 2000-token verify reply exhausts a 2000-token bucket exactly.
+        // Judge's OWN pass1/pass2 buckets get this SAME ceiling (each a
+        // SEPARATE `RemoteBudget` instance, not a shared pool — see
+        // `ReviewJudgeStepKind::run_streaming`'s construction) but never
+        // approach it: every judge reply in this scenario reports
+        // `total_tokens: 1` (`reply`'s fixed value), so cumulative real
+        // spend across every pass stays in the single digits.
+        remote_max_tokens_per_execution: 2_000,
+        judge_exhaustion_strict: false,
+        timeout_seconds: 30,
+        chat_override: Some(Arc::new(warned_chat_fn(billing_pass, auth_pass, config_pass, total_calls))),
+        bundle_override: Some(Arc::new(|| {
+            Ok(vec![billing_bundle(), auth_bundle(), docs_bundle(), config_bundle()])
+        })),
+        mission_id: None,
+        crew_name: None,
+        mode_label: None,
+        fingerprint: None,
+        staffing: None,
+        interpret_warnings: Vec::new(),
+        diff_file: None,
+        intent_file: None,
+        context_test_overrides: ReviewContextTestOverrides {
+            probe_system: Some("You are the review-conformance PROBE seat.".to_string()),
+            judge_system: Some("You are the review-conformance JUDGE seat.".to_string()),
+            verify_system: Some("You are the review-conformance VERIFY seat.".to_string()),
+            remote_max_tokens_per_execution: Some(2_000),
+            judge_exhaustion_strict: Some(false),
+        },
+    })
+}
+
+fn warned_golden_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/review-conformance/envelope-warned.json")
+}
+
+/// (#2310 P3) Every warning SOURCE fires at once, on an otherwise
+/// ruled-on (non-degenerate) docket — the shape #2310 P2's own review found
+/// missing from the P0 golden. `env.warnings`' pinned order is
+/// interpret -> judge -> verify -> probe (`fold_review_outputs_into_envelope`'s
+/// own doc); this test's `canonicalize`/golden-compare pins that order
+/// byte-for-byte, same as every other field.
+#[test]
+#[serial_test::serial]
+fn review_pipeline_warned_scenario_matches_the_committed_golden() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _guard = HomeGuard::set(home.path());
+
+    let total_calls = Arc::new(AtomicU32::new(0));
+    let ctx = warned_step_ctx(
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+        total_calls.clone(),
+    );
+    let judge = ctx.roles.judge.clone();
+    let verify = ctx.roles.verify.clone();
+    let probes = ctx.roles.probes.clone();
+
+    let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+    let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+    let crew_name = ctx.roles.distinct_profile_names();
+
+    let mut graph = build_review_graph(
+        ctx.clone(),
+        &dummy_bundle_spec(),
+        judge,
+        verify,
+        &probes,
+        "investigate",
+        "adjudicate",
+        "report",
+        1,
+    )
+    .expect("the shipped review.json builds cleanly");
+    {
+        let context_step = graph
+            .steps
+            .get_mut("review-context-step")
+            .expect("the shipped review.json declares a review-context-step");
+        let mut cfg = context_step.config.clone();
+        cfg["context_out"] = serde_json::json!(home.path().join("review-context.json").display().to_string());
+        context_step.config = cfg;
+    }
+    // (#2310 P3) "seed at the real site" — `graph.interpret_warnings` is the
+    // EXACT field `run_review_graph` reads at its own top (`let
+    // BuiltReviewGraph { .., interpret_warnings, .. } = graph;`) and folds
+    // into `ReviewStepContext::interpret_warnings` for
+    // `ReviewSynthesisStepKind` to read — production populates it from
+    // `mission_config::interpret`'s own pruning warnings inside
+    // `build_review_graph_from_config`; this scenario's own probe claim
+    // needs no pruning (all three declared probe tasks are claimed, same as
+    // every other scenario in this file), so this stands in for that real
+    // production source without contriving an actual pruned task.
+    graph.interpret_warnings.push(
+        "review-conformance: synthetic interpret-time warning (#2310 P3 harness)".to_string(),
+    );
+    stamp_report_emit(&mut graph, home.path());
+
+    let (env, steps) = run_review_graph(
+        &ctx,
+        &crew_name,
+        ExecMode::Sequential,
+        fingerprint_val,
+        staffing_snap,
+        graph,
+        &mut NullEmitter,
+        &mut |_step| {},
+    )
+    .expect("review-conformance warned-scenario graph run completes");
+
+    // Sanity checks BEFORE the golden compare (see the happy-path test's
+    // identical discipline).
+    assert!(
+        env.degenerate.is_none(),
+        "a partially-warned but still ruled-on docket must never read as degenerate: {:?}",
+        env.degenerate
+    );
+    assert_eq!(env.bundles, 4);
+    assert_eq!(env.deduped_flags, 4, "the probe-high x config.ts error produces no flag either way");
+    assert_eq!(
+        env.warnings.len(),
+        4,
+        "one warning per source (interpret, judge, verify, probe): {:?}",
+        env.warnings
+    );
+    assert!(env.warnings[0].contains("synthetic interpret-time warning"), "{:?}", env.warnings);
+    assert!(
+        env.warnings[1].contains("remote judge dispatch failed"),
+        "judge's warning must be second (interpret -> judge -> verify -> probe): {:?}",
+        env.warnings
+    );
+    assert!(
+        env.warnings[2].contains("verify budget exhausted"),
+        "verify's warning must be third: {:?}",
+        env.warnings
+    );
+    assert!(
+        env.warnings[3].contains("dispatch failed on 1 draw"),
+        "probe's warning must be last (dedup.warnings folds in last): {:?}",
+        env.warnings
+    );
+    let config_flag = env.judged.iter().find(|j| j.flag.bundle_id == "config@src/config.ts").expect("config flag present");
+    assert_eq!(
+        config_flag.tier,
+        darkmux_lab::lab::review::Tier::Confirmed,
+        "config keeps the manual-verification marker (a budget SKIP, not a Refuted ruling) — \
+         never silently demoted"
+    );
+    for step in steps.values() {
+        assert!(
+            matches!(step.status, darkmux_crew::types::NodeStatus::Complete | darkmux_crew::types::NodeStatus::Error),
+            "step `{}` must reach a terminal status, got {:?}",
+            step.id,
+            step.status
+        );
+    }
+
+    let actual = canonicalize(serde_json::to_value(&env).expect("ReviewEnvelope serializes"));
+    let pretty = serde_json::to_string_pretty(&actual).expect("pretty-print");
+
+    if std::env::var("DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN").is_ok() {
+        std::fs::write(warned_golden_path(), format!("{pretty}\n")).expect("write golden");
+        return;
+    }
+
+    let expected = std::fs::read_to_string(warned_golden_path()).unwrap_or_else(|_| {
+        panic!(
+            "missing golden at {} — run with DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN=1 to generate it",
+            warned_golden_path().display()
+        )
+    });
+    assert_eq!(
+        pretty.trim_end(),
+        expected.trim_end(),
+        "the warned-scenario envelope drifted from the committed conformance golden at {}. \
+         Regenerate with DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN=1 cargo test -p darkmux-lab \
+         --test review_conformance, then review the diff before committing.",
+        warned_golden_path().display()
+    );
+}
+
+fn errored_golden_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/review-conformance/envelope-errored.json")
+}
+
+/// (#2310 P3) The judge step itself ERRORS (not a per-flag dispatch
+/// failure — a genuine `NodeStatus::Error` at the scheduler level), landing
+/// `run_review_graph` on its `report.errored`-non-empty fallback path
+/// (review.rs, the `else` branch after the successful-path `if
+/// report.errored.is_empty()`). A plain `Err` returned from `chat_override`
+/// is swallowed per-flag by `judge_pass_with_retry`/`run_judge_pass` (see
+/// `warned_chat_fn`'s own doc) — it never reaches the scheduler as a step
+/// failure. A PANIC does: `ReviewJudgeStepKind::run_streaming` dispatches
+/// each flag inside a `std::thread::scope` (review.rs's judge chunk loop),
+/// and a panicking spawned thread re-panics the scope on join, which
+/// `darkmux_crew::concurrent_dispatch::run_bounded` (proven by its own unit
+/// test, `run_bounded_reconciles_a_panicking_local_job_to_a_terminal_error`)
+/// reconciles to a terminal `NodeStatus::Error` rather than crashing the
+/// process.
+fn errored_chat_fn(
+) -> impl Fn(&ChatCall) -> Result<SingleShotReply> + Send + Sync + 'static {
+    move |call: &ChatCall| {
+        if call.system.contains("JUDGE seat") {
+            panic!("review-conformance errored scenario: synthetic judge step panic");
+        }
+        if call.system.contains("VERIFY seat") {
+            panic!(
+                "review-conformance errored scenario: the judge step erroring must block the \
+                 verify task (unmet `depends_on`) — a verify call reaching this closure means \
+                 that no longer holds"
+            );
+        }
+        // Every probe call succeeds normally — the bundle/probe/dedup
+        // stages must all COMPLETE before the judge step's own panic is the
+        // interesting event; only the judge stage is meant to fail here.
+        if call.model.contains("probe-high") && call.user.contains("src/billing.ts") {
+            return Ok(reply("a real defect: `const end = start.plus(30)`"));
+        }
+        if call.model.contains("probe-mid") && call.user.contains("src/auth.ts") {
+            return Ok(reply("a real defect: `if (user.role = \"admin\")`"));
+        }
+        if call.model.contains("probe-low") && call.user.contains("docs/setup.md") {
+            return Ok(reply("a suspicious change: `A new heading appears here`"));
+        }
+        if call.model.contains("probe-low") && call.user.contains("src/config.ts") {
+            return Ok(reply("a real defect: `const port = env.PORT + 1`"));
+        }
+        Ok(reply(""))
+    }
+}
+
+fn errored_step_ctx() -> Arc<ReviewStepContext> {
+    Arc::new(ReviewStepContext {
+        case_id: "review-conformance-errored-case".to_string(),
+        roles: crew(),
+        intent_title: "Fix billing rounding".to_string(),
+        intent_body: "Cleans up a couple of billing/auth edge cases.".to_string(),
+        diff: DIFF.to_string(),
+        probe_system: "You are the review-conformance PROBE seat.".to_string(),
+        probe_role_prompts: std::collections::BTreeMap::new(),
+        judge_system: "You are the review-conformance JUDGE seat.".to_string(),
+        verify_system: "You are the review-conformance VERIFY seat.".to_string(),
+        remote_max_tokens_per_execution: 500_000,
+        judge_exhaustion_strict: false,
+        timeout_seconds: 30,
+        chat_override: Some(Arc::new(errored_chat_fn())),
+        bundle_override: Some(Arc::new(|| {
+            Ok(vec![billing_bundle(), auth_bundle(), docs_bundle(), config_bundle()])
+        })),
+        mission_id: None,
+        crew_name: None,
+        mode_label: None,
+        fingerprint: None,
+        staffing: None,
+        interpret_warnings: Vec::new(),
+        diff_file: None,
+        intent_file: None,
+        context_test_overrides: ReviewContextTestOverrides {
+            probe_system: Some("You are the review-conformance PROBE seat.".to_string()),
+            judge_system: Some("You are the review-conformance JUDGE seat.".to_string()),
+            verify_system: Some("You are the review-conformance VERIFY seat.".to_string()),
+            remote_max_tokens_per_execution: Some(500_000),
+            judge_exhaustion_strict: Some(false),
+        },
+    })
+}
+
+/// (#2310 P3) Red-proof for this scenario lives in the assertions below,
+/// not a separate mutation test: `env.degenerate` MUST be `Some`
+/// (naming the judge step by id) and MUST carry forward whatever the
+/// bundle/dedup stages already completed (`bundles == 4`, `raw_flags`/
+/// `deduped_flags` from the three probe seats that DID finish) — a
+/// regression that dropped the "rebuild from completed typed outputs"
+/// half of the fallback (#2310 P2 review finding C2) would silently
+/// revert to `fallback_env` alone (identity + reason, nothing else),
+/// which this test's own `bundles`/`deduped_flags` assertions would catch
+/// by reading back as zero.
+#[test]
+#[serial_test::serial]
+fn review_pipeline_errored_scenario_matches_the_committed_golden() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _guard = HomeGuard::set(home.path());
+
+    let ctx = errored_step_ctx();
+    let judge = ctx.roles.judge.clone();
+    let verify = ctx.roles.verify.clone();
+    let probes = ctx.roles.probes.clone();
+
+    let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+    let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+    let crew_name = ctx.roles.distinct_profile_names();
+
+    let mut graph = build_review_graph(
+        ctx.clone(),
+        &dummy_bundle_spec(),
+        judge,
+        verify,
+        &probes,
+        "investigate",
+        "adjudicate",
+        "report",
+        1,
+    )
+    .expect("the shipped review.json builds cleanly");
+    {
+        let context_step = graph
+            .steps
+            .get_mut("review-context-step")
+            .expect("the shipped review.json declares a review-context-step");
+        let mut cfg = context_step.config.clone();
+        cfg["context_out"] = serde_json::json!(home.path().join("review-context.json").display().to_string());
+        context_step.config = cfg;
+    }
+
+    let (env, steps) = run_review_graph(
+        &ctx,
+        &crew_name,
+        ExecMode::Sequential,
+        fingerprint_val,
+        staffing_snap,
+        graph,
+        &mut NullEmitter,
+        &mut |_step| {},
+    )
+    .expect("run_review_graph itself must still return Ok — a step ERROR is not a hard Err out of this call");
+
+    assert!(env.degenerate.is_some(), "an errored judge step must read as a named degenerate run");
+    assert_eq!(
+        env.degenerate_kind,
+        Some(darkmux_lab::lab::review::DegenerateKind::Error)
+    );
+    assert_eq!(env.bundles, 4, "the bundle step completed before the judge step failed");
+    assert_eq!(env.raw_flags, 4, "the probe stage completed before the judge step failed (no duplicate flag in this scenario's fixture)");
+    // (#2310 P2 review finding C2's own fallback, read empirically) The
+    // errored-run fallback folds `dedup.raw_flags`/`members`/`warnings`/
+    // `remote_budget`/`degenerate` via `fold_review_outputs_into_envelope`,
+    // but never assigns `env.deduped_flags`/`env.flags` — those two are
+    // set ONLY on the ordinary synthesis path (`ReviewSynthesisStepKind::
+    // run_streaming`'s own `env.deduped_flags = flags.len(); env.flags =
+    // flags;`, after the shared fold returns). A step ERROR never reaches
+    // that step, so both stay at `ReviewEnvelope::default()`'s zero value —
+    // `raw_flags` (the dedup stage's own count) is what actually survives.
+    assert_eq!(env.deduped_flags, 0, "deduped_flags/flags are synthesis-only fields, never set by the fallback");
+    assert!(env.judged.is_empty(), "the judge step never produced a typed output to fold in");
+    let judge_step = steps.values().find(|s| s.kind == "review.judge").expect("a review.judge step exists");
+    assert_eq!(
+        judge_step.status,
+        darkmux_crew::types::NodeStatus::Error,
+        "the judge step itself must be the one that reached NodeStatus::Error"
+    );
+    let verify_task_ran = steps.values().any(|s| {
+        s.kind.starts_with("review.verify") && s.status == darkmux_crew::types::NodeStatus::Complete
+    });
+    assert!(!verify_task_ran, "the verify task depends on the judge task and must never run");
+
+    let actual = canonicalize(serde_json::to_value(&env).expect("ReviewEnvelope serializes"));
+    let pretty = serde_json::to_string_pretty(&actual).expect("pretty-print");
+
+    if std::env::var("DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN").is_ok() {
+        std::fs::write(errored_golden_path(), format!("{pretty}\n")).expect("write golden");
+        return;
+    }
+
+    let expected = std::fs::read_to_string(errored_golden_path()).unwrap_or_else(|_| {
+        panic!(
+            "missing golden at {} — run with DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN=1 to generate it",
+            errored_golden_path().display()
+        )
+    });
+    assert_eq!(
+        pretty.trim_end(),
+        expected.trim_end(),
+        "the errored-scenario envelope drifted from the committed conformance golden at {}. \
+         Regenerate with DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN=1 cargo test -p darkmux-lab \
+         --test review_conformance, then review the diff before committing.",
+        errored_golden_path().display()
+    );
+}
+
+/// (#2345 C1) `review-report-step`'s task `depends_on: ["review-synthesis-
+/// task"]` — the judge step erroring above (same scenario as
+/// `review_pipeline_errored_scenario_matches_the_committed_golden`) means
+/// the report step never runs at all; it stays `NodeStatus::Planned`
+/// forever. `run_review_graph` still hands back a self-describing
+/// (degenerate) envelope on that path — this test proves
+/// `render_and_emit_review` (the SAME helper `review-report-step` itself
+/// calls to render + emit) can still turn that envelope into the
+/// operator-facing `{mode, review, comment}` payload, which is exactly what
+/// the launcher's own fallback (`src/mission_launch_review.rs::run_dispatch`,
+/// #2345 C1) calls when the step never completed. Before #2345 C1 this
+/// function did not exist — an errored run rendered nothing at all.
+#[test]
+#[serial_test::serial]
+fn errored_scenario_report_step_never_ran_but_the_shared_render_helper_still_renders_it() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _guard = HomeGuard::set(home.path());
+
+    let ctx = errored_step_ctx();
+    let judge = ctx.roles.judge.clone();
+    let verify = ctx.roles.verify.clone();
+    let probes = ctx.roles.probes.clone();
+
+    let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+    let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+    let crew_name = ctx.roles.distinct_profile_names();
+
+    let graph = build_review_graph(
+        ctx.clone(),
+        &dummy_bundle_spec(),
+        judge,
+        verify,
+        &probes,
+        "investigate",
+        "adjudicate",
+        "report",
+        1,
+    )
+    .expect("the shipped review.json builds cleanly");
+
+    let (env, steps) = run_review_graph(
+        &ctx,
+        &crew_name,
+        ExecMode::Sequential,
+        fingerprint_val,
+        staffing_snap,
+        graph,
+        &mut NullEmitter,
+        &mut |_step| {},
+    )
+    .expect("run_review_graph itself must still return Ok — a step ERROR is not a hard Err out of this call");
+
+    let report_step = steps.get("review-report-step").expect("review.json declares review-report-step");
+    assert_eq!(
+        report_step.status,
+        darkmux_crew::types::NodeStatus::Planned,
+        "the report task's unmet depends_on (the errored judge task) must leave it Planned, never run \
+         — this is the precondition #2345 C1's fallback exists for"
+    );
+    assert!(env.degenerate.is_some(), "sanity: this is the same errored scenario as the golden test above");
+
+    let emit_path = home.path().join("rendered.json");
+    let mode = render_and_emit_review(&env, &ctx.diff, None, Some(&emit_path), None)
+        .expect("render_and_emit_review must be able to render + emit an errored run's envelope");
+    assert_eq!(mode, "degraded", "a degenerate run with zero judged flags renders as degraded");
+
+    let written =
+        std::fs::read_to_string(&emit_path).expect("render_and_emit_review must have written to emit_path");
+    let payload: serde_json::Value = serde_json::from_str(&written).expect("emitted payload must be valid JSON");
+    assert_eq!(payload["mode"], "degraded", "the emitted payload's own mode field must agree");
 }
 
 // ─── #2310 P1: `review.context` step kind, standalone ─────────────────────

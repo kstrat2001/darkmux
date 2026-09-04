@@ -525,6 +525,7 @@ mod tests {
             phases,
             panel: None,
             cmd: None,
+            outcome_from: None,
             extras: Map::new(),
         }
     }

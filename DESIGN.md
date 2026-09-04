@@ -480,7 +480,7 @@ Ratified with the operator in #2297 and landing in pieces (#2298 plan step, #229
 
 ### The two documents: config is the shape, plan is the instance
 
-**Mission config** (`templates/builtin/mission-configs/crawl.json`, schema 3.2) is the shape of the work and is the same file for every crawl of every repo. It declares `inputs` (the workspace spec path, the rule ids, sizing knobs), and phases holding tasks holding steps. The `plan` phase holds **one task per rule**, explicitly, each with a single `crawl.plan` step:
+**Mission config** (`templates/builtin/mission-configs/crawl.json`, schema 3.3) is the shape of the work and is the same file for every crawl of every repo. It declares `inputs` (the workspace spec path, the rule ids, sizing knobs), and phases holding tasks holding steps. The `plan` phase holds **one task per rule**, explicitly, each with a single `crawl.plan` step:
 
 ```json
 { "id": "plan-unnamed-predicate", "enabled": true,

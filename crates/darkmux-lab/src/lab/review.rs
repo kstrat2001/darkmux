@@ -3768,6 +3768,12 @@ use super::review_context::{self, ReviewContext};
 // (#2310 P2) The remaining review pipeline hand-offs, typed — see
 // `review_outputs`'s own module doc.
 use super::review_outputs::{self, BundleSetOutput, DedupOutput, JudgeOutput, ProbeSeatOutput, VerifyOutput};
+// (#2310 P3) The envelope -> GitHub PR-payload render half — moved into
+// this crate from the bin crate's `src/pr_review.rs`; see that module's own
+// doc for why the move was possible (pure rendering, no CLI deps).
+// `ReviewReportStepKind` is its second caller, alongside
+// `src/mission_launch_review.rs`'s `from_envelope` path.
+use super::review_render;
 use std::path::{Path, PathBuf};
 
 // ─── #1530 Packets 0/1/3a: run-scoped ArtifactBus artifact names ──────────
@@ -7186,6 +7192,154 @@ impl StepKind for ReviewSynthesisStepKind {
     }
 }
 
+// ─── report: report (terminal step, #2310 P3) ───────────────────────────
+
+fn envelope_from_input(
+    kind_id: &str,
+    step_id: &str,
+    input: &std::collections::BTreeMap<String, String>,
+) -> Result<ReviewEnvelope> {
+    find_by_kind::<ReviewEnvelope>(kind_id, step_id, input, review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND)?
+        .map(|o| o.body)
+        .ok_or_else(|| {
+            anyhow!(
+                "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-synthesis-task` \
+                 — no `{}` output was found among its inputs (#2310)",
+                review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND
+            )
+        })
+}
+
+/// The diff TEXT this run reviewed — `synthesize_review`'s `diff` parameter,
+/// which resolves each finding's quoted anchor back to a diff line. Reads
+/// `review.context`'s typed output BY KIND (same discipline as every other
+/// `_from_input` helper in this section) — never a task id, so a
+/// `review.json` that renames `review-context-task` still resolves.
+fn diff_text_from_input(
+    kind_id: &str,
+    step_id: &str,
+    input: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    find_by_kind::<ReviewContext>(kind_id, step_id, input, review_context::REVIEW_CONTEXT_OUTPUT_KIND)?
+        .map(|o| o.body.diff)
+        .ok_or_else(|| {
+            anyhow!(
+                "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-context-task` \
+                 — no `{}` output was found among its inputs (#2310)",
+                review_context::REVIEW_CONTEXT_OUTPUT_KIND
+            )
+        })
+}
+
+/// Phase "report", terminal step (#2310 P3): reads the final
+/// [`ReviewEnvelope`] (`review.synthesis`'s typed output, by kind) and the
+/// diff text (`review.context`'s typed output, by kind), renders it via
+/// [`review_render::synthesize_review`], and emits the `{mode, review,
+/// comment}` payload via [`review_render::emit_rendered`] — the SAME two
+/// calls `src/mission_launch_review.rs::launch`'s tail used to make itself,
+/// after every dispatch, before this packet moved that tail into the graph
+/// (#2310 P3's whole point: the review's close payload is its own envelope
+/// — [`MissionConfig::outcome_from`] names `review-synthesis-task`, NOT this
+/// step — and the render/emit TAIL is graph-native work like every other
+/// stage, not a bespoke launcher afterthought).
+///
+/// **No GitHub post.** Posting the rendered payload is the CI WORKFLOW's job
+/// (`.github/workflows/darkmux-review.yml` reads the emitted file) — this
+/// step only writes it, exactly as the retired launcher tail did.
+///
+/// **Inputs (`step.config`, stamped at build time by
+/// `build_review_graph_from_config` — the SAME "compute at build time,
+/// stamp, read back in run_streaming" pattern the probe/judge/verify/dedup
+/// steps already use):** `emit` (a path, or `"-"`/absent for stdout —
+/// [`review_render::emit_rendered`]'s own contract), `envelope_out` (an
+/// optional path to also write the full envelope as pretty JSON),
+/// `attribution` (an optional string for the posted footer). None of these
+/// are task ids or step data — they are the operator's own `--param`
+/// values, threaded through unchanged from `mission launch review`'s
+/// launch-time inputs.
+pub struct ReviewReportStepKind;
+
+/// The write-`envelope_out` + [`review_render::synthesize_review`] +
+/// [`review_render::emit_rendered`] sequence [`ReviewReportStepKind::run`]
+/// performs for a normal run — factored out so a caller that never reaches
+/// that step at all can still produce the SAME rendered output through the
+/// SAME two calls, rather than a second, drifting copy.
+///
+/// (#2345 C1) `review-report-step`'s task `depends_on: ["review-synthesis-
+/// task"]` — when an earlier step (the judge, say) errors, the scheduler
+/// never runs the report step at all: it stays `NodeStatus::Planned`
+/// forever, and nothing renders. `run_review_graph` still returns a
+/// self-describing (if degenerate) envelope on that path (see its own
+/// `else` branch), so `src/mission_launch_review.rs::run_dispatch` calls
+/// THIS function on that envelope when `review-report-step` did not
+/// complete — the errored run gets rendered exactly like a clean one
+/// (#1486: blocked work must be as reasoned as running work), instead of
+/// silently producing no output.
+///
+/// Returns the rendered payload's `mode` (`"review"` | `"comment"` |
+/// `"partial"` | `"degraded"` | `"noop"`) for the caller's own logging.
+pub fn render_and_emit_review(
+    env: &ReviewEnvelope,
+    diff: &str,
+    attribution: Option<&str>,
+    emit_path: Option<&Path>,
+    envelope_out_path: Option<&Path>,
+) -> Result<&'static str> {
+    if let Some(path) = envelope_out_path {
+        let pretty = serde_json::to_string_pretty(env).context("serializing the review envelope")?;
+        std::fs::write(path, pretty).with_context(|| format!("writing envelope_out {}", path.display()))?;
+    }
+    let rendered = review_render::synthesize_review(env, diff, attribution);
+    review_render::emit_rendered(&rendered, emit_path)?;
+    Ok(rendered.mode)
+}
+
+impl StepKind for ReviewReportStepKind {
+    fn id(&self) -> &'static str {
+        "review.report"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Report"
+    }
+
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 2] = [
+            Port::data(review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND),
+            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
+        ];
+        &PORTS
+    }
+
+    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        let env = envelope_from_input(self.id(), &step.id, input)?;
+        let diff = diff_text_from_input(self.id(), &step.id, input)?;
+
+        let attribution = step.config.get("attribution").and_then(|v| v.as_str());
+        let emit_path = step.config.get("emit").and_then(|v| v.as_str()).map(PathBuf::from);
+        let envelope_out_path = step.config.get("envelope_out").and_then(|v| v.as_str()).map(PathBuf::from);
+
+        // (#2345 C1) The write-envelope_out + synthesize + emit sequence now
+        // lives in `render_and_emit_review`, above — this step's own output
+        // is still the destination the payload was written to, so a
+        // mission-status reader can see where the rendered comment landed
+        // without re-reading `step.config`; `emit_rendered`'s own return
+        // (folded into the helper) is a process EXIT CODE, never
+        // load-bearing data.
+        let mode = render_and_emit_review(&env, &diff, attribution, emit_path.as_deref(), envelope_out_path.as_deref())?;
+        let dest = emit_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".to_string());
+
+        emit_review_step_result(
+            "review.report",
+            &step.id,
+            &env.case_id,
+            None,
+            json!({ "mode": mode, "emit": dest }),
+        );
+        Ok(StepOutcome { output: dest, flow_records: Vec::new() })
+    }
+}
+
 /// The shared, mutex-guarded `ReviewEnvelope` every review step kind
 /// contributes cross-cutting metrics to (member records, warnings, remote
 /// budgets — fields with no single "owning" step) — the review's own
@@ -7230,8 +7384,9 @@ pub struct BuiltReviewGraph {
     pub phase_id_of_step: std::collections::BTreeMap<String, String>,
 }
 
-/// (#1402) Pure kind-id → display-name lookup for review's six Tier 3
-/// kinds, usable WITHOUT constructing a live `StepKind` instance (which
+/// (#1402) Pure kind-id → display-name lookup for review's Tier 3 kinds
+/// (seven as of #2310 P3's `review.report`), usable WITHOUT constructing a
+/// live `StepKind` instance (which
 /// needs a `ReviewStepContext`/staffing that only exist during a real
 /// dispatch). `darkmux-serve`'s `mission_graph` module — a pure read path
 /// over persisted JSON, never a live dispatch — calls this directly (the
@@ -7286,6 +7441,10 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
     }
     if kind == "review.synthesis" {
         return Some("Synthesis");
+    }
+    // (#2310 P3) The terminal render/emit step.
+    if kind == "review.report" {
+        return Some("Report");
     }
     None
 }
@@ -7374,6 +7533,12 @@ pub fn register_review_kinds(registry: &StepKindRegistry) -> Result<()> {
     registry
         .register_alias("funnel.synthesis", synthesis_kind)
         .context("registering funnel.synthesis legacy alias")?;
+
+    // (#2310 P3) The terminal render/emit step — no legacy alias (new this
+    // packet; it did not exist as a `funnel.*` kind, since the retired
+    // funnel pipeline never had a graph-native report step at all — the
+    // render/emit tail lived in the bespoke launcher instead).
+    registry.register(Arc::new(ReviewReportStepKind)).context("registering review.report")?;
 
     Ok(())
 }

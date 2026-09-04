@@ -84,7 +84,12 @@ mod mission_launch_review;
 // `review_finalize_guard.rs`, which this replaces.
 mod launch_guard;
 mod notebook;
-mod pr_review;
+// (#2310 P3) `src/pr_review.rs` moved to `darkmux-lab`'s own
+// `lab::review_render` module — pure rendering, needed by that crate's own
+// `review.report` step kind. Kept as a re-export under the old name so
+// every existing bin-crate caller (`src/mission_launch_review.rs`,
+// `src/acp.rs`, `tests/cli.rs`) keeps compiling unchanged.
+pub use darkmux_lab::lab::review_render as pr_review;
 pub use darkmux_lab::providers;
 // (#1698 Packet A) The radio interpreter core (catalog compiler, closed-set
 // router, frozen prompt assembly) — surface-neutral engine capability. See
