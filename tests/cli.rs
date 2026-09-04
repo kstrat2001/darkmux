@@ -4894,7 +4894,7 @@ fn review_v2_dry_run_warns_when_bundler_is_passed() {
         .env("DARKMUX_HOME", home.path())
         .output()
         .expect("mission launch review-v2 --dry-run runs");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(quiet.status.success(), "stderr: {}", String::from_utf8_lossy(&quiet.stderr));
     let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
     assert!(
         !quiet_stderr.contains("bundler"),

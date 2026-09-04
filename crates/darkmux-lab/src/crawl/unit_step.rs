@@ -757,8 +757,12 @@ pub struct UnitStepConfig {
     pub no_progress_turns: usize,
     pub timeout_seconds: Option<u32>,
     /// (#2310 P4c review round 2, item (e)) Path to the diff's stated
-    /// intent (a PR body or intent file) — `review-v2.json`'s own
-    /// `intent_file` input, templated in per unit-<rule> task. Optional:
+    /// intent (a PR body or intent file). Optional. NOT YET wired from a
+    /// document: `review-v2.json` declares an `intent_file` input, but no
+    /// launch-time override or grow template copies it into a unit step's
+    /// config yet (the same plumbing gap as `plan.sites`'s `{{workspace}}`;
+    /// second slice of #2310 P4c). Until then only a hand-written step
+    /// config sets it. Optional in any case:
     /// crawl.json's tasks never set this, and a review-v2 launch with no
     /// `intent_file` param leaves it `None` too. When present, its content
     /// is read at dispatch time and rendered into the unit's message —
