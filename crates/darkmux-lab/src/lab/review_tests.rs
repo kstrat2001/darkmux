@@ -6993,6 +6993,77 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// `[]` and `env.bundles` was `0`, even though three real probe
     /// dispatches and a real bundle set both completed before the judge
     /// step ever ran.
+    /// (#2342 round-2 review) When SYNTHESIS itself errors after verify
+    /// completed, the fallback must keep the verify seat's member (and its
+    /// budget row) — it used to pass `None` for verify on the premise that
+    /// verify output implies synthesis ran, which a synthesis-side error
+    /// disproves.
+    #[test]
+    fn errored_synthesis_fallback_envelope_keeps_the_verify_seat() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![remote_staffing("cloud", "gpt-probe-1", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![graph_staffing("fast", "verify-model", 1)]),
+        ]);
+        let ctx = step_ctx_with_chat(&crew, vec![bundle_input("a.ts")], |call: &ChatCall| {
+            let content = if call.model == "darkmux:judge-model" {
+                CONFIRM_JSON.to_string()
+            } else if call.model == "darkmux:verify-model" {
+                VERIFIED_JSON.to_string()
+            } else {
+                "a real defect `const end = start.plus(30)`".to_string()
+            };
+            Ok(SingleShotReply { content, total_tokens: Some(600), prompt_tokens: None, completion_tokens: None, model: None })
+        });
+        let judge = ctx.roles.judge.clone();
+        let verify = ctx.roles.verify.clone();
+        let probes = ctx.roles.probes.clone();
+        let mut graph = build_review_graph(
+            ctx.clone(),
+            &dummy_bundle_spec(),
+            judge.clone(),
+            verify.clone(),
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        // Strip the judged-flags edge from SYNTHESIS only: everything before it,
+        // verify included, completes; synthesis then errors by name.
+        graph
+            .tasks
+            .iter_mut()
+            .find(|t| t.id == "review-synthesis-task")
+            .expect("review-synthesis-task exists")
+            .reads
+            .retain(|id| id != "review-judge-task");
+        let context_out_dir = tempfile::tempdir().expect("tempdir for review-context-step's output");
+        stamp_context_step_for_test(&mut graph.steps, &ctx, context_out_dir.path());
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
+        let (env, steps) = run_review_graph(
+            &ctx,
+            &crew_name,
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut NullEmitter,
+            &mut |_step| {},
+        )
+        .expect("graph run completes with a per-step error");
+        assert_eq!(steps["review-synthesis-step"].status, NodeStatus::Error, "sanity: synthesis errored");
+        assert_eq!(steps["review-verify-step"].status, NodeStatus::Complete, "sanity: verify completed before synthesis failed");
+        assert!(
+            env.members.iter().any(|m| m.model == "darkmux:verify-model"),
+            "the verify seat's member must survive a synthesis-side error: {:?}",
+            env.members
+        );
+    }
+
     #[test]
     fn errored_run_fallback_envelope_carries_what_completed_before_the_failure() {
         let crew = crew_with(vec![

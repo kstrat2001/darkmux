@@ -8488,19 +8488,20 @@ pub fn run_review_graph(
                 });
             }
         }
-        // (#2310 P2 review finding C2) Verify never contributes here — the
-        // four kinds this fallback reconstructs from
-        // (bundles/probe-flags/deduped-flags/judged-flags) are exactly the
-        // stages that can complete BEFORE a later stage errors; a verify
-        // stage that itself produced real output would have let the graph
-        // reach `review-synthesis-step` normally (the `if` branch above),
-        // never landing here.
+        // (#2310 P2 review C2, round 2) Verify DOES contribute here: a
+        // synthesis-side error (a malformed judged body, a missing edge) lands
+        // in this fallback with the verify stage already Complete, and the
+        // verify seat's member and budget row must not vanish from the
+        // degenerate envelope. Read it from the completed steps like the
+        // other three kinds.
+        let verify_output =
+            find_completed_output_by_kind::<VerifyOutput>(&steps, review_outputs::VERIFY_OUTPUT_KIND);
         fold_review_outputs_into_envelope(
             &mut env,
             bundle_output.as_ref(),
             dedup_output.as_ref(),
             judge_output.as_ref(),
-            None,
+            verify_output.as_ref(),
         );
         if env.degenerate.is_none() {
             env.degenerate = Some(reason);
