@@ -842,6 +842,7 @@ mod tests {
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             reads: reads.iter().map(|s| s.to_string()).collect(),
             role_id: None,
+            run_on: None,
             steps,
             grow: None,
             extras: Map::new(),
@@ -1444,6 +1445,7 @@ mod tests {
         // test since `interpret()` itself has no live producer of a
         // non-empty warnings Vec today (see `InterpretedGraph`'s doc).
         let t = Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "t1".to_string(),
             phase_id: "p1".to_string(),
             description: String::new(),
@@ -1495,6 +1497,7 @@ mod tests {
     #[test]
     fn render_ephemeral_result_flips_success_false_when_a_side_branch_errored() {
         let t = Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "t1".to_string(),
             phase_id: "p1".to_string(),
             description: String::new(),

@@ -1616,21 +1616,29 @@ fn review_pipeline_errored_scenario_matches_the_committed_golden() {
     );
 }
 
-/// (#2345 C1) `review-report-step`'s task `depends_on: ["review-synthesis-
-/// task"]` — the judge step erroring above (same scenario as
-/// `review_pipeline_errored_scenario_matches_the_committed_golden`) means
-/// the report step never runs at all; it stays `NodeStatus::Planned`
-/// forever. `run_review_graph` still hands back a self-describing
-/// (degenerate) envelope on that path — this test proves
-/// `render_and_emit_review` (the SAME helper `review-report-step` itself
-/// calls to render + emit) can still turn that envelope into the
-/// operator-facing `{mode, review, comment}` payload, which is exactly what
-/// the launcher's own fallback (`src/mission_launch_review.rs::run_dispatch`,
-/// #2345 C1) calls when the step never completed. Before #2345 C1 this
-/// function did not exist — an errored run rendered nothing at all.
+/// (#2310 P4a, supersedes #2345 C1's premise) `review-report-task`
+/// declares `run_on: ["complete", "error"]` (review.json) and the
+/// scheduler's `cascade_abandon` (darkmux-crew) rolls
+/// `review-synthesis-task` to `Abandoned` the moment the judge step
+/// errors — `review-report-step` is READY the same scheduler pass, runs,
+/// finds no `review-synthesis-task` output, and degrades HONESTLY through
+/// its own `degraded_report_envelope` fallback (this crate,
+/// `lab::review`) instead of hard-failing. Pre-#2310-P4a, this same
+/// scenario left the step `Planned` forever (this test's old name/doc,
+/// preserved in git history) and only the LAUNCHER's own fallback
+/// (`src/mission_launch_review.rs::run_dispatch`, #2345 C1) ever rendered
+/// anything. That fallback still exists (untouched by P4a — steps 2-4 of
+/// #2310 are superseded, not started) but is now a documented, guarded
+/// no-op on this path: it checks `report_ran = steps.get("review-report-
+/// step").is_some_and(|s| s.status == NodeStatus::Complete)` BEFORE
+/// calling `render_and_emit_review` a second time — see that call site's
+/// own comment ("A no-op on the ordinary path, where the step already
+/// did this"). With the step now completing here, `report_ran` is `true`
+/// and the fallback never fires — no double-render, no code change
+/// needed there.
 #[test]
 #[serial_test::serial]
-fn errored_scenario_report_step_never_ran_but_the_shared_render_helper_still_renders_it() {
+fn errored_scenario_report_step_now_runs_and_renders_the_degraded_envelope_through_the_step() {
     let home = tempfile::tempdir().expect("tempdir");
     let _guard = HomeGuard::set(home.path());
 
@@ -1671,12 +1679,26 @@ fn errored_scenario_report_step_never_ran_but_the_shared_render_helper_still_ren
     let report_step = steps.get("review-report-step").expect("review.json declares review-report-step");
     assert_eq!(
         report_step.status,
-        darkmux_crew::types::NodeStatus::Planned,
-        "the report task's unmet depends_on (the errored judge task) must leave it Planned, never run \
-         — this is the precondition #2345 C1's fallback exists for"
+        darkmux_crew::types::NodeStatus::Complete,
+        "(#2310 P4a) review-report-task's run_on: [\"complete\", \"error\"] plus the scheduler's \
+         cascade-abandon make this step READY (its one dependency, review-synthesis-task, is \
+         Abandoned — a terminal status \"error\" accepts) and it runs to completion, rendering a \
+         degraded envelope through degraded_report_envelope rather than staying wedged Planned"
+    );
+    assert_eq!(
+        report_step.output.as_deref(),
+        Some("-"),
+        "no emit path is stamped in this harness (that's the LAUNCHER's job, unexercised here), \
+         so the step rendered to stdout — its own output records that destination, same as any \
+         other run"
     );
     assert!(env.degenerate.is_some(), "sanity: this is the same errored scenario as the golden test above");
 
+    // `render_and_emit_review` remains directly callable outside the graph
+    // for the OTHER entry points that render a synthesis-only envelope
+    // without ever building a graph at all (`charges_file` re-judge,
+    // `--from-envelope`) — exercised here against a fresh emit path to
+    // confirm it still produces the same degraded payload shape.
     let emit_path = home.path().join("rendered.json");
     let mode = render_and_emit_review(&env, &ctx.diff, None, Some(&emit_path), None)
         .expect("render_and_emit_review must be able to render + emit an errored run's envelope");
@@ -1755,6 +1777,7 @@ fn review_context_step_matches_the_committed_golden() {
         output: None,
     };
     let task = darkmux_crew::types::Task {
+        run_on: darkmux_crew::types::default_run_on(),
         id: "review-context-task".to_string(),
         phase_id: "investigate".to_string(),
         description: "context".to_string(),
@@ -1849,6 +1872,7 @@ fn review_context_step_config_level_overrides_have_no_effect() {
         output: None,
     };
     let task = darkmux_crew::types::Task {
+        run_on: darkmux_crew::types::default_run_on(),
         id: "review-context-task".to_string(),
         phase_id: "investigate".to_string(),
         description: "context".to_string(),
@@ -1928,6 +1952,7 @@ fn review_context_step_missing_diff_is_a_named_error() {
         output: None,
     };
     let task = darkmux_crew::types::Task {
+        run_on: darkmux_crew::types::default_run_on(),
         id: "review-context-task".to_string(),
         phase_id: "investigate".to_string(),
         description: "context".to_string(),

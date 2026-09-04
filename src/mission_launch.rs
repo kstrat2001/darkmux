@@ -3520,6 +3520,7 @@ mod tests {
         .unwrap();
         let real_phase_ids: BTreeMap<String, String> = [("p".to_string(), "m-1-p".to_string())].into();
         let task = crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "m-1-t".into(),
             phase_id: "m-1-p".into(),
             description: String::new(),
@@ -3584,6 +3585,7 @@ mod tests {
         let cfg: mission_config::MissionConfig = serde_json::from_value(cfg_json).unwrap();
         let real_phase_ids: BTreeMap<String, String> = [("p".to_string(), "m-1-p".to_string())].into();
         let mk_task = |id: &str, step_id: &str| crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: id.into(),
             phase_id: "m-1-p".into(),
             description: String::new(),
@@ -3671,6 +3673,7 @@ mod tests {
         // Only "live-task" was actually minted — "disabled-task" was pruned
         // before this point, matching real mint behavior (`prune.rs`).
         let tasks = vec![crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "live-task".into(),
             phase_id: "m-1-p".into(),
             description: String::new(),
@@ -5701,6 +5704,7 @@ mod tests {
     /// [`build_envelope`] read.
     fn task_with_step(phase_real_id: &str, step_id: &str) -> crew::types::Task {
         crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: format!("{phase_real_id}-task"),
             phase_id: phase_real_id.to_string(),
             description: "t".to_string(),
@@ -6567,6 +6571,7 @@ mod tests {
         registry.register(Arc::new(coder_phase::MissionWorktreeStepKind)).unwrap();
 
         let task = crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: "t1".to_string(),
             phase_id: "p-test".to_string(),
             description: "worktree".to_string(),

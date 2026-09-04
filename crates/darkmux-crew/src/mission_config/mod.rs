@@ -182,10 +182,26 @@ use std::collections::{BTreeMap, BTreeSet};
 /// rule unchanged — a pre-3.3 reader ignores the field and gets exactly the
 /// pre-existing behavior, the additive contract.
 ///
+/// Bumped to **"3.4"** (#2310 P4/P4a) — additive: [`TaskConfig`] gained
+/// the optional `run_on` field — which TERMINAL statuses of this task's
+/// dependencies satisfy readiness (see `crate::types::Task::run_on`'s doc
+/// and `scheduler::dependency_satisfies_run_on`). Absence (every pre-3.4
+/// document) resolves to `crate::types::default_run_on()`
+/// (`["complete"]`), the exact readiness rule every pre-3.4 document
+/// already had — a pre-3.4 reader ignores the field and gets identical
+/// behavior, the additive contract. (P4a) A task declaring `"error"` also
+/// accepts a dependency that reached `Abandoned` — the scheduler's
+/// `scheduler::cascade_abandon` rolls a task's TRANSITIVE dependents to
+/// `Abandoned`, eagerly, the moment an ancestor errors, so a task several
+/// hops downstream of the failure still sees a resolved terminal status
+/// this same pass rather than staying wedged `Planned`. See DESIGN.md's
+/// "Mission configs: a task's `run_on` decides which of its dependencies'
+/// failures it survives" for the full cascade design.
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "3.3";
+pub const MISSION_CONFIG_SCHEMA: &str = "3.4";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -405,6 +421,7 @@ pub fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &s
         depends_on: Vec::new(),
         reads: Vec::new(),
         role_id: None,
+        run_on: None,
         steps: vec![StepConfig {
             enabled: None,
             id: format!("{PANEL_ARGS_TASK_ID}-step"),
@@ -563,6 +580,17 @@ pub struct TaskConfig {
     /// exactly that intent — see its `inputs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_id: Option<String>,
+    /// (#2310 P4, schema 3.4) Which terminal statuses of this task's
+    /// `depends_on`/`reads` dependencies satisfy readiness — mirrors
+    /// [`crate::types::Task::run_on`]'s doc exactly (this field is copied
+    /// verbatim into that one at interpret time; `None` here resolves to
+    /// [`crate::types::default_run_on`], the same `["complete"]` every
+    /// pre-3.4 document already behaved as). `Some(vec![])` is legal JSON
+    /// but validated as an Error (see `validate`) — an empty `run_on`
+    /// would make the task permanently unready, the same "wedges forever"
+    /// failure mode a zero-step task already gets caught for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_on: Option<Vec<String>>,
     /// Ordered — step at index `i` depends on the step at index `i - 1`
     /// (mirrors `crew::types::Step`'s #1341 "no depends_on field" —
     /// purely positional intra-task ordering).
@@ -877,6 +905,44 @@ impl MissionConfig {
                         path: format!("{task_path}.id"),
                         message: format!("duplicate task id \"{}\"", task.id),
                     });
+                }
+
+                // (#2310 P4) `run_on` names which TERMINAL statuses of
+                // this task's dependencies satisfy readiness — only
+                // "complete" and "error" are recognized today (mirrors
+                // `scheduler::dependency_satisfies_run_on`'s literal
+                // match). An unknown value is refused loudly rather than
+                // silently never matching (which would wedge the task
+                // Planned forever, indistinguishable from a typo'd
+                // dependency). An explicitly empty `run_on: []` is the
+                // same failure shape as a zero-step task (below) — never
+                // satisfiable — so it's an Error too, not a silent
+                // fallback to the default.
+                if let Some(run_on) = &task.run_on {
+                    if run_on.is_empty() {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{task_path}.run_on"),
+                            message: format!(
+                                "task \"{}\" declares an empty run_on — no dependency status could \
+                                 ever satisfy it, so the task would wedge Planned forever",
+                                task.id
+                            ),
+                        });
+                    }
+                    for value in run_on {
+                        if value != "complete" && value != "error" {
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: format!("{task_path}.run_on"),
+                                message: format!(
+                                    "task \"{}\" run_on names unknown value \"{value}\" — only \
+                                     \"complete\" and \"error\" are recognized",
+                                    task.id
+                                ),
+                            });
+                        }
+                    }
                 }
 
                 // (#1619) `reads` gets the SAME structural checks as
@@ -1314,6 +1380,7 @@ mod tests {
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             reads: Vec::new(),
             role_id: None,
+            run_on: None,
             steps,
             grow: None,
             extras: BTreeMap::new(),
@@ -2273,7 +2340,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_3_3() {
+    fn schema_version_constant_is_3_4() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
@@ -2302,7 +2369,13 @@ mod tests {
         // outcome_from`. A pre-3.3 reader ignores the field and keeps the
         // positional "last phase's last task" close-payload rule, which is
         // correct: the field only OVERRIDES that default, never required.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "3.3");
+        //
+        // (#2310 P4) Bumped to "3.4" — additive: `TaskConfig::run_on`. A
+        // pre-3.4 reader ignores the field and every task resolves to
+        // `crate::types::default_run_on()` (`["complete"]`), the exact
+        // behavior every pre-3.4 document already had — so nothing already
+        // shipped changes meaning under this bump.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "3.4");
     }
 
     // ── (#2300) `grow` — the run-time fan-out ────────────────────────────

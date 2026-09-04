@@ -7194,6 +7194,41 @@ impl StepKind for ReviewSynthesisStepKind {
 
 // ─── report: report (terminal step, #2310 P3) ───────────────────────────
 
+/// (#2310 P4a) `envelope_from_input` found no `review-synthesis-task`
+/// output — build a minimal, self-describing DEGRADED [`ReviewEnvelope`]
+/// so [`ReviewReportStepKind::run`] can still render+emit through
+/// `render_and_emit_review` instead of hard-failing (#1486: blocked work
+/// must be as reasoned as running work). Deliberately NARROWER than
+/// `run_review_graph`'s own fallback (`fallback_env`/the
+/// `report.errored`-non-empty branch, both in this file): `StepKind::run`
+/// sees only THIS task's own gathered `input` (`review-synthesis-task`/
+/// `review-context-task`, per `review-report-task`'s `reads`), never the
+/// whole graph's `steps` map, so it cannot fold bundle/dedup/judge/verify
+/// outputs the way that richer reconstruction does — it degrades honestly
+/// with the identity it can actually recover (the context task's
+/// `case_id`, when that task ran) plus the one thing it always has: WHY.
+fn degraded_report_envelope(
+    input: &std::collections::BTreeMap<String, String>,
+    reason: String,
+) -> ReviewEnvelope {
+    let case_id = find_by_kind::<ReviewContext>(
+        "review.report",
+        "review-report-step",
+        input,
+        review_context::REVIEW_CONTEXT_OUTPUT_KIND,
+    )
+    .ok()
+    .flatten()
+    .map(|o| o.body.case_id)
+    .unwrap_or_else(|| "unknown".to_string());
+    ReviewEnvelope {
+        case_id,
+        degenerate: Some(reason),
+        degenerate_kind: Some(DegenerateKind::Error),
+        ..ReviewEnvelope::default()
+    }
+}
+
 fn envelope_from_input(
     kind_id: &str,
     step_id: &str,
@@ -7312,8 +7347,25 @@ impl StepKind for ReviewReportStepKind {
     }
 
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
-        let env = envelope_from_input(self.id(), &step.id, input)?;
-        let diff = diff_text_from_input(self.id(), &step.id, input)?;
+        // (#2310 P4a) `run_on: ["complete", "error"]` (review.json's
+        // `review-report-task`) plus the scheduler's cascade-abandon can
+        // now dispatch this step even when `review-synthesis-task` never
+        // ran (cascade-abandoned behind an earlier upstream error, see
+        // `darkmux_crew::scheduler::cascade_abandon`). Degrade honestly
+        // through THIS step instead of hard-failing it — see
+        // `degraded_report_envelope`'s own doc for why this reconstruction
+        // is deliberately narrower than `run_review_graph`'s fallback.
+        let env = match envelope_from_input(self.id(), &step.id, input) {
+            Ok(env) => env,
+            Err(e) => degraded_report_envelope(input, e.to_string()),
+        };
+        // Same honest-degradation posture for the diff: a missing
+        // `review-context-task` output (only reachable if the very FIRST
+        // task in the graph itself never ran) still lets the report render
+        // — anchors simply won't resolve against an empty diff, which is a
+        // strictly better outcome than this step erroring instead of
+        // rendering at all.
+        let diff = diff_text_from_input(self.id(), &step.id, input).unwrap_or_default();
 
         let attribution = step.config.get("attribution").and_then(|v| v.as_str());
         let emit_path = step.config.get("emit").and_then(|v| v.as_str()).map(PathBuf::from);

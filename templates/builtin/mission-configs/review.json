@@ -2,7 +2,7 @@
   "id": "review",
   "name": "PR Review",
   "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired the `pr-review run` verb in Packet 4b): investigate (resolve bundles from the diff, probe every explicit one-role probe task (#1512 -- no `expand` template, no crew-level probe-role enumeration), dedup the flags with domain reconstruction at the dedup boundary) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of #1512, the probe stage is three EXPLICIT tasks (`review-probe-high-task`/`-mid-task`/`-low-task`), each carrying its own `role_id` and depending only on `review-bundle-task` -- parallelism is emergent from `depends_on` (all three share one dependency, none depend on each other, so `review-dedup-task`'s three-way `depends_on` is a real fan-in). Changing the probe COUNT is a config edit (add/remove a probe task with its own `role_id`), never a Rust change -- as of #1513's review dissolution, roles are discovered by `darkmux_crew::resourcing::resolve_review_roles`, which classifies EVERY role-bearing task in this document STRUCTURALLY by its step kind (a `review.judge` step names the judge task; a `review.verify-render` step names the verify task; anything else carrying a `role_id` is a probe), never by enumerating role names in Rust and never by reading `review-dedup-task`'s `depends_on` (that list is `build_review_graph`'s CLAIM/PRUNE boundary only -- a resolved staffing claims its declared task by role_id, and any declared task nobody claims gets pruned, loudly, with a warning). This document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
-  "schema_version": "3.3",
+  "schema_version": "3.4",
   "panel": {
     "description": "Review the working-tree diff with darkmux's local-model review crew",
     "hint": "(no arguments)"
@@ -372,6 +372,7 @@
           "depends_on": [
             "review-synthesis-task"
           ],
+          "run_on": ["complete", "error"],
           "steps": [
             {
               "id": "review-report-step",

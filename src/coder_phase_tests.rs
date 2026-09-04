@@ -850,6 +850,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
     /// `mission.worktree`/`mission.coder`/`mission.verify` kinds).
     fn test_task(id: &str) -> Task {
         Task {
+            run_on: darkmux_crew::types::default_run_on(),
             id: id.to_string(),
             phase_id: "s1".to_string(),
             description: "test task".to_string(),

@@ -359,6 +359,7 @@ mod tests {
             depends_on: vec!["plan".into()],
             reads: Vec::new(),
             role_id: Some("crawler".into()),
+            run_on: None,
             steps: vec![StepConfig {
                 id: "unit-step".into(),
                 kind: "procedural.noop".into(),

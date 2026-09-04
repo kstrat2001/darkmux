@@ -101,6 +101,7 @@ fn unit_step(config: serde_json::Value) -> Step {
 
 fn unit_task() -> Task {
     Task {
+        run_on: darkmux_crew::types::default_run_on(),
         id: "unit-task".into(),
         phase_id: PHASE.into(),
         description: String::new(),
@@ -686,6 +687,7 @@ fn the_summary_reads_the_runs_own_plan_files_for_what_was_planned() {
 
 fn graph_task(id: &str, step_id: &str, depends_on: &[&str]) -> Task {
     Task {
+        run_on: darkmux_crew::types::default_run_on(),
         id: id.into(),
         phase_id: PHASE.into(),
         description: String::new(),
