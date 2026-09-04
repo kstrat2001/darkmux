@@ -639,6 +639,65 @@ The task is then a **template** and is never minted. After the phase containing 
 
 Provenance is on the record, not in the operator's head: every grown step's `config` carries `grown_from: {task, item, index}`, and the item's `rule` lands on `config.rule` through the template. Neither is *rendered* yet — the graph lens builds its step rows without `config`, and `finding list` reads the unit and rule out of a finding's own context — so surfacing them in the viewer, which is what would let an operator filter a run by track, is follow-up. What is readable today: the run's `graph-report.json` gains a `grown` entry per growth event naming the template, the producer, the artifact path, the item count and the real task ids minted; one `mission.grow` flow record carries the same facts live; the phase record's `task_ids` lists the grown tasks alongside the phase's declared ones (the generic launcher writes that field now, matching `crawl_launch.rs`); and `mission status` prints "grew N task(s) from `<from>`".
 
+## Code review as a second config on the crawl's building blocks (discovery, not ratified)
+
+Written 2026-09-04 with the operator, mid-way through retiring the bespoke review launcher (#2310). **Status: discovery.** Nothing in this section is built except where it says so; it exists so the next packet starts from the same map the conversation ended on, and so a reader can tell what is code-specific from what is general while that line is still being found.
+
+### What the retirement measured
+
+The review path was a funnel: probe the diff k times with an open "find anything wrong" prompt, dedup, judge, verify, synthesize prose, render. Ten bespoke step kinds and a launcher, about eleven thousand lines. Retiring the launcher onto the ten kinds went through three review rounds, and every defect those rounds found lived in the launcher: an errored run rendered nothing, the saved-flags re-judge path rendered nothing, the fallback ignored a document's own emit path. None were in a step. The conformance harness built for the retirement exercises steps, and the launcher sat outside it, so the one path that could be broken by a neighboring change without a test noticing was the bespoke one. That is the measured form of a rule this project already holds: well-tested building blocks execute many patterns; a bespoke path is where defects hide.
+
+Looked at beside the crawl (the section above), the funnel is the crawl's ladder re-derived under other names. A probe flag is a finding. Judge plus verify is confirmation. Synthesis is delivery. The operator's reading: review was never going to work as a wide-open probe; it was always going to be detections by rules, inference to confirm each finding in isolation, and a mod as the recommendation. Gemini Code Assist's rule files land in the same place from the other direction.
+
+### Separate config, shared blocks
+
+**Crawl is separate from code review, and stays general.** A crawl walks any corpus, code or not. Review is code-only and diff-scoped, and those two facts are advantages to exploit rather than a subset to trim crawl down to. Review therefore becomes its own mission config built from the same blocks, and neither config learns the other exists:
+
+- **Planner.** Crawl's plan step does rules times source, then windows, then units. The control flow is the same for review; only the source enumeration differs (a tree walk against a diff's hunks). The planner's source becomes a strategy on one shared pattern. Not built.
+- **Units.** Already generic: a map step over units with a role that carries the finding tool. Review supplies a reviewer role and its rules files. A draws-per-unit knob, off by default, ports the measured k-draw recall technique from the funnel. Not built.
+- **Findings and mods.** The stores, the runtime tools, and the hooks are shared infrastructure today (see "Findings and mods"). Review reuses the create-mods phase verbatim.
+- **Delivery.** Review's own kind: mods and findings in, the GitHub review payload out. Pure render, no model, so the harness covers it. Not built; the current `review.report` kind is its ancestor.
+- **Scheduler.** A delivery task has to run after an upstream error. That is the `run_on` contract (see "Mission configs: a task's `run_on`"), needed by both configs. Built in #2350.
+
+Working hypothesis, deliberately undecided: crawl may turn out to be *the pattern* (plan, detect by rule, confirm in isolation, mod) rather than a general tool, with crawl and review both configs on it. If the planner extraction produces exactly that shape, it belongs in `step_kinds/patterns/` as a named Tier 2 pattern. Decide from what the extraction looks like, not up front.
+
+### What is code-specific, so far
+
+- **The diff carries intent.** A PR body or intent file plus before and after per hunk. Intent-versus-diff is a rule review can run and crawl cannot.
+- **Hunks are natural windows.** No prefilter is needed to find sites; every hunk is a bounded site of the right size for a small seat.
+- **Changed files name the test targets.** A mod's gate can run the relevant tests rather than the suite, which is what makes confirmation cheap enough to do per finding.
+- **The PR is the delivery surface.** One-click suggestion blocks, review tiers, a summary line with honest partial counts. Crawl delivers to a tracker.
+- **The tree is the confirmation surface.** The diff is where triggers are detected; the whole worktree, with a search tool, is where they are confirmed. Review units keep both.
+
+### Confirmation is a mod, a search, or a question
+
+The funnel confirmed a finding with a second model pass. Here, confirmation takes one of three forms, and the delivery form says which one happened:
+
+- **A mod.** The finding is confirmed by producing a patch that passes its gate. Mechanical, per #799. Delivered as a GitHub suggestion block where the mod sits inside the diff's lines, a patch comment where it does not. A suggestion block always means "gated patch".
+- **A search.** Some findings are an intuition that an architectural issue may exist, whose confirmation is enumerating instances across the corpus, not reasoning inside the hunk: a shared auth middleware changed (correct in intent, but which endpoints use it?), a new string union introduced (does an enum already exist?). The rule declares the search; the unit runs it as a tool call; the delivered thread is the list ("fourteen endpoints use this; confirm each"). This is the review-side neighbor check and the typical human PR comment. The future contextual map of a corpus's relationships is the precomputed form of this search.
+- **A question.** "Did you check whether the repo already has this?" with candidates attached. Cheapest to produce, honest about being unconfirmed, and often the comment that changes what the author does next. Findings whose mod could not be built or failed its gate for a reason other than "the finding was wrong" also deliver as a thread: finding key, window, claim, what to check. That thread is an identifiable artifact the orchestrator can escalate by id to a stronger model, or to a person when the claimed severity warrants. Escalation stays outside darkmux (see "darkmux is the worker").
+
+Refused and rejected findings are counted in the summary line and never posted.
+
+### A rule is a procedure, because a small seat has no intuition
+
+A small model will not think "this might exist somewhere else". The rule file carries that idea as a standing procedure, so the model never has to have the intuition:
+
+1. `detect`: a concrete shape to recognize in the hunk (a new function or type whose name or body matches a utility class; an enum-like set of string literals; a shared symbol changed).
+2. `search`: a recipe the unit runs verbatim (grep and symbol search for the same verbs and nouns; existing enums with overlapping members; the package manifest for a known library).
+3. `compare`: the only inference, bounded ("does candidate X do the same job as the new code? yes, no, partly, one line why").
+4. `deliver`: mod, list, or question.
+
+For "a well-known package does this", the model's own knowledge is the unreliable part, so a rule reads per-repo data instead: a curated known-solutions list, operator-maintained, grown with every catch. The rules directory is where a codebase's tribal knowledge lives, and it is the review's quality lever: every shipped defect becomes a rule, a noisy rule is one flag from off, and the review gets better monotonically as standards are written down. The hit rate per seat is a measurement, not a promise; the conformance fixture should plant a re-implemented helper and a union with an existing enum, and the go/no-go run reads what each seat does with them.
+
+### The honest limit
+
+A rule-shaped review is narrow by construction: very good catches, rarely broad. A good comment on a big diff can need architectural knowledge that no window carries; out of context is out of knowledge, for a local seat and a frontier model alike. Two consequences. The review's summary must state its scope (rules run, windows covered, what it did not attempt) so a narrow review never reads as complete. And breadth stays where the two-tier review policy already puts it: the local rule-based review is the always-on first tier that logs onto the PR; the frontier gate keeps the architectural read.
+
+### Sequence
+
+P4a, the `run_on` scheduler contract, shipped first because both configs need it. P4b extracts the planner source into a strategy and adds the deliver kind, both model-free and golden-tested. P4c is the new review config with a first rules catalog (intent-vs-diff, existing-solution, shared-symbol-callers, union-vs-enum, swallowed-error, unnamed-predicate, test-gap), proven on the conformance fixture with fast seats; that run is the go or no-go. P4d deletes the ten review kinds and the launcher once a same-PR comparison against the old path holds. The command line the self-review workflow uses stays byte-identical throughout.
+
 ## ACP: darkmux inside the editor
 
 `darkmux acp` speaks the [Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol) over stdio, so an editor like Zed can drive darkmux from its own agent panel — you type `/review` in the editor and a local crew works the PR, with progress rendering in the panel rather than a terminal you have to go find.
