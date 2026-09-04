@@ -9,7 +9,7 @@
  * the SAME goldens `mission-graph-goldens.spec.ts` captured from the
  * standalone page, and the e2e behavioral specs assert on these classes too.
  */
-import { useLayoutEffect, useMemo, useRef } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef } from "react";
 import ReactFlow, {
   Background,
   Controls,
@@ -22,9 +22,15 @@ import ReactFlow, {
   type Node,
   type NodeMouseHandler,
   type NodeProps,
+  type OnNodesChange,
 } from "reactflow";
 import "reactflow/dist/style.css";
 import { StepRow } from "./StepRow";
+import {
+  recordDimensions,
+  withMeasuredDimensions,
+  type NodeDimensionsMap,
+} from "./measuredDims";
 import {
   computeLayout,
   drawnEdges,
@@ -229,8 +235,26 @@ export function MissionCanvas({
     };
   }, []);
   const layout = useMemo(() => computeLayout(graphNodes), [graphNodes]);
+  // (#2325) React Flow measures each node once and keeps the result in its own
+  // store — but a CONTROLLED `nodes` update throws that measurement away, and
+  // an unmeasured node renders `visibility: hidden`. Since this canvas rebuilds
+  // its node array on every metrics/clock tick, the graph painted and then went
+  // blank a second later. `measuredDims`'s own doc has the full mechanism; the
+  // fix is the other half of RF's controlled contract — take the `dimensions`
+  // changes back through `onNodesChange` and stamp them onto the nodes we hand
+  // over, so a rebuilt node is already measured. A ref (not state) on purpose:
+  // the map is READ while building the next array, and making it state would
+  // schedule a render for a value that only matters at the next rebuild.
+  const dimsRef = useRef<NodeDimensionsMap>({});
+  const onNodesChange = useCallback<OnNodesChange>((changes) => {
+    dimsRef.current = recordDimensions(dimsRef.current, changes);
+  }, []);
   const rfNodes = useMemo(
-    () => toRfNodes(graphNodes, layout, metrics, now, selectedStepId, onSelectStep),
+    () =>
+      withMeasuredDimensions(
+        toRfNodes(graphNodes, layout, metrics, now, selectedStepId, onSelectStep),
+        dimsRef.current,
+      ),
     [graphNodes, layout, metrics, now, selectedStepId, onSelectStep],
   );
   const rfEdges = useMemo(() => toRfEdges(graphEdges, graphNodes), [graphEdges, graphNodes]);
@@ -259,6 +283,7 @@ export function MissionCanvas({
         <ReactFlow
           nodes={rfNodes}
           edges={rfEdges}
+          onNodesChange={onNodesChange}
           nodeTypes={nodeTypes}
           fitView
           minZoom={0.1}
