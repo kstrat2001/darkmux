@@ -508,8 +508,9 @@ pub struct TaskConfig {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
-    /// (#1619, schema 1.4) Task ids whose LAST STEP OUTPUT this task's first
-    /// step receives as input — the run-scoped OUTPUT LEDGER made nameable.
+    /// (#1619, schema 1.4) Task ids whose LAST STEP OUTPUT every step of
+    /// this task receives as input (#2310 P2a — previously only the first
+    /// step) — the run-scoped OUTPUT LEDGER made nameable.
     /// Every completed task's output is available to any later task by
     /// naming it here; no `depends_on` edge is needed to receive data.
     ///

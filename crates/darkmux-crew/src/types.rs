@@ -594,8 +594,9 @@ pub struct Step {
     pub completed_ts: Option<u64>,
     /// The step kind's own output text on success (or an error summary on
     /// `NodeStatus::Error`). A downstream Step (same-task successor, or
-    /// the first step of a Task naming this one's Task in its own
-    /// `Task.depends_on`) reads a completed dependency's `output` as its
+    /// ANY step of a Task naming this one's Task in its own
+    /// `Task.depends_on`/`Task.reads` — #2310 P2a widened this from "the
+    /// first step only") reads a completed dependency's `output` as its
     /// own input (see `scheduler::gather_inputs`) — this is the mechanism
     /// that carries results between steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -638,26 +639,30 @@ pub struct Task {
     /// can run concurrently (unrelated Tasks, no edge between them
     /// directly or transitively, run concurrently; dependent ones run in
     /// order) AND the output→input wiring for merge points: when Task B
-    /// depends on Task A, Task B's FIRST step receives Task A's LAST
+    /// depends on Task A, EVERY step of Task B receives Task A's LAST
     /// step's `output` in its `input` map, keyed by Task A's id (see
-    /// `scheduler::gather_inputs`). **Settled design**: an upstream Task's
-    /// output reaches ONLY the downstream Task's FIRST step — a later step
-    /// in a multi-step Task sees only the immediately-previous SAME-TASK
-    /// step's output; it's that first step's job to carry forward anything
-    /// from an upstream Task a later same-task step still needs (into its
-    /// own `output`, which the next step then reads as ITS input — the
-    /// same step-to-step handoff every same-task pair already uses, no
-    /// separate mechanism). Every Task built by this codebase today is
-    /// single-step, so the distinction has no observable effect yet — it
-    /// applies only once a real multi-step Task exists.
+    /// `scheduler::gather_inputs`). **Revised design (#2310 P2a)**: a later
+    /// step in a multi-step Task now receives its Task's
+    /// `depends_on`/`reads` outputs CHAINED ONTO (not replaced by) its
+    /// immediately-previous SAME-TASK step's output — the earlier
+    /// "upstream Task output reaches only the first step" rule forced an
+    /// awkward workaround (the first step re-carrying an upstream value
+    /// forward through its own `output` just so a later step could see it
+    /// again); that workaround is no longer needed. A consumer that used
+    /// to infer "there is exactly one input" from a first step's
+    /// single-dependency shape must account for the extra entries a later
+    /// step now carries — see `step_kinds::builtins::resolve_map_collection`
+    /// for the pattern (prefer the known predecessor-step key over an
+    /// input-count heuristic).
     #[serde(default)]
     pub depends_on: Vec<String>,
     /// (#1619) The output-ledger reads resolved from `TaskConfig::reads` at
     /// interpret time (template references already expanded to real task
-    /// ids). Orders execution like `depends_on` and feeds this task's first
-    /// step's input, but is NOT drawn as a graph edge — see
-    /// `TaskConfig::reads` for the full design. Serde-defaulted so missions
-    /// stored before the field existed read cleanly (contract 5).
+    /// ids). Orders execution like `depends_on` and feeds EVERY step of this
+    /// task's input (#2310 P2a — previously only the first step's), but is
+    /// NOT drawn as a graph edge — see `TaskConfig::reads` for the full
+    /// design. Serde-defaulted so missions stored before the field existed
+    /// read cleanly (contract 5).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reads: Vec<String>,
     /// (#1230/#1341) A Task is the ASSIGNABLE unit — like a Jira ticket
