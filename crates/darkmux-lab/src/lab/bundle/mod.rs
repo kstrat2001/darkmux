@@ -212,7 +212,7 @@ pub enum SkipReason {
 
 /// One file the diff touched that ended up contributing zero bundles, with
 /// the mechanical reason why (#1605).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkippedFile {
     pub path: String,
     pub reason: SkipReason,
@@ -252,7 +252,7 @@ pub struct SkippedFile {
 /// files) is the one case this report can't explain further — see
 /// [`BundleSet::skip`]'s own doc for why an external bundler's zero-bundle
 /// result stays in that same unexplained state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BundleSkipReport {
     pub files_considered: usize,
     pub files_skipped: Vec<SkippedFile>,

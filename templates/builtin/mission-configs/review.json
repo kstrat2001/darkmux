@@ -189,10 +189,15 @@
               "id": "review-probe-high-step",
               "kind": "dispatch.map",
               "config": null
+            },
+            {
+              "id": "review-probe-high-collect-step",
+              "kind": "review.probe-collect",
+              "config": null
             }
           ],
           "notes": [
-            "always two steps (#1530 follow-on, Packet A1), mirroring the verify task's render/dispatch.map split: the render step (review.probe-render) reads this seat's selector + role id from its OWN config (stamped by build_review_graph_from_config) and this run's bundles off the ArtifactBus, renders the probe_user_message collection AT RUN TIME, and the dispatch.map step resolves that collection from the render step's output via resolve_map_collection's single-dependency fallback (config.collection is no longer stamped)."
+            "always three steps (#1530 follow-on Packet A1 + #2310 P2), mirroring the verify task's render/dispatch.map/collect split: the render step (review.probe-render) reads this seat's selector + role id from its OWN config (stamped by build_review_graph_from_config) and this run's bundles (the typed review-bundle-task output), renders the probe_user_message collection AT RUN TIME, and the dispatch.map step resolves that collection from the render step's output via resolve_map_collection's single-dependency fallback (config.collection is no longer stamped). The collect step (review.probe-collect) turns the map step's raw per-item results into this seat's typed review.probe-flags output -- it recomputes the render step's bundle selection itself (same selector, same typed bundle set) rather than reading a bus publish."
           ]
         },
         {
@@ -215,6 +220,11 @@
             {
               "id": "review-probe-mid-step",
               "kind": "dispatch.map",
+              "config": null
+            },
+            {
+              "id": "review-probe-mid-collect-step",
+              "kind": "review.probe-collect",
               "config": null
             }
           ]
@@ -239,6 +249,11 @@
             {
               "id": "review-probe-low-step",
               "kind": "dispatch.map",
+              "config": null
+            },
+            {
+              "id": "review-probe-low-collect-step",
+              "kind": "review.probe-collect",
               "config": null
             }
           ]
@@ -286,7 +301,8 @@
           ],
           "reads": [
             "review-dedup-task",
-            "review-context-task"
+            "review-context-task",
+            "review-bundle-task"
           ]
         }
       ]
@@ -311,15 +327,21 @@
               "id": "review-verify-step",
               "kind": "dispatch.map",
               "config": null
+            },
+            {
+              "id": "review-verify-collect-step",
+              "kind": "review.verify-collect",
+              "config": null
             }
           ],
           "notes": [
             "always present in the graph even when no verify seat is staffed -- the render step (review.verify-render) emits an EMPTY collection in that case (and on a judge-doomed run, and on a zero-confirmed docket), which makes the dispatch.map step a completed no-op with residency None: zero model loads, zero dispatches (#1442, the generic port of the empty-docket short-circuit).",
-            "the render step consumes the judge task's output and emits one frozen verify_prompt per CONFIRMED finding (byte parity with the #1256 golden by construction); build_review_graph stamps the map step's dispatch config (model/system/max_tokens/bucket_budget/...) only when a verify seat is staffed. The verify-APPLY boundary (state machine, member accounting, budget row) lives in the synthesis step."
+            "the render step consumes the judge task's output and emits one frozen verify_prompt per CONFIRMED finding (byte parity with the #1256 golden by construction); build_review_graph stamps the map step's dispatch config (model/system/max_tokens/bucket_budget/...) only when a verify seat is staffed. (#2310 P2) The collect step (review.verify-collect) is the verify-APPLY boundary's PARSE half -- it turns the map step's raw per-item results into typed review.verify-results (one VerifyRecord per confirmed flag plus the seat's member/warning/budget-row facts); the synthesis step applies those records back onto the judged docket."
           ],
           "reads": [
             "review-judge-task",
-            "review-context-task"
+            "review-context-task",
+            "review-bundle-task"
           ]
         },
         {
@@ -339,7 +361,8 @@
           "reads": [
             "review-dedup-task",
             "review-judge-task",
-            "review-context-task"
+            "review-context-task",
+            "review-bundle-task"
           ]
         }
       ]

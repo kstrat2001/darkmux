@@ -289,7 +289,7 @@ fn mode_label(mode: ExecMode) -> &'static str {
 /// `None` at construction — [`dedup_flags`] is where anchor extraction
 /// happens (it needs the diff to validate a quote against, so doing the
 /// extraction there keeps ONE place responsible for both jobs at once).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeFlag {
     pub bundle_id: String,
     pub fact_family: String,
@@ -316,7 +316,7 @@ pub struct ProbeFlag {
 /// Bookkeeping [`dedup_flags`] returns alongside the deduped list — the
 /// raw/deduped counts an envelope's `raw_flags`/`deduped_flags` fields are
 /// sourced from.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DedupStats {
     pub raw: usize,
     pub deduped: usize,
@@ -343,7 +343,7 @@ pub enum JudgeRuling {
 /// records internally but only the retry's outcome survives into a
 /// [`JudgedFlag`] (the first, unparsed attempt is discarded, not hidden —
 /// see `judge_pass_with_retry`'s doc for why that's honest).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JudgeRecord {
     pub ruling: JudgeRuling,
     pub decisive_evidence: String,
@@ -383,7 +383,7 @@ pub enum VerifyRuling {
 }
 
 /// (#1260) One verify-seat adjudication outcome for a confirmed finding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerifyRecord {
     pub ruling: VerifyRuling,
     pub decisive_evidence: String,
@@ -396,7 +396,7 @@ pub struct VerifyRecord {
 
 /// One flag's full judge record: pass-1 always present, pass-2 present iff
 /// pass-1 was `confirmed`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JudgedFlag {
     pub flag: ProbeFlag,
     pub pass1: JudgeRecord,
@@ -434,7 +434,7 @@ pub struct JudgedFlag {
 /// (#1748) The mechanical absence-claim backstop's per-flag outcome —
 /// present on a [`JudgedFlag`] only when the check actually demoted it.
 /// See [`apply_absence_backstop`] for the full check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AbsenceBackstopNote {
     /// The token the finding claimed was absent (`process.exitCode`,
     /// `.catch`) — the single backtick-quoted span
@@ -466,7 +466,7 @@ pub struct AbsenceBackstopNote {
 
 // ─── the envelope ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReviewEnvelope {
     pub case_id: String,
     pub crew: String,
@@ -1804,7 +1804,7 @@ pub fn parse_verify_ruling(text: &str) -> Option<(VerifyRuling, String, String)>
 /// sheet. Deliberately THIS module's own shape — see the module doc's
 /// "Bundling — the packet 3 seam" section for why, and [`bundles_from_diff`]
 /// for the reconciliation point.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BundleInput {
     pub id: String,
     pub fact_family: String,
@@ -3765,6 +3765,9 @@ use super::bundle::{
 // (#2310 P1) `ReviewContext` — the typed `review.context` step-output body;
 // see `ReviewContextStepKind`'s doc and `review_context`'s module doc.
 use super::review_context::{self, ReviewContext};
+// (#2310 P2) The remaining review pipeline hand-offs, typed — see
+// `review_outputs`'s own module doc.
+use super::review_outputs::{self, BundleSetOutput, DedupOutput, JudgeOutput, ProbeSeatOutput, VerifyOutput};
 use std::path::{Path, PathBuf};
 
 // ─── #1530 Packets 0/1/3a: run-scoped ArtifactBus artifact names ──────────
@@ -3817,85 +3820,29 @@ use std::path::{Path, PathBuf};
 // its OWN artifact ([`REVIEW_BUNDLES_ARTIFACT`]) rather than folded into the
 // context. `ReviewJudgeStepKind::residency()` now reads that artifact
 // directly instead of `ctx.bundles`.
-const REVIEW_ENVELOPE_ARTIFACT: &str = "review.envelope";
-const REVIEW_MEMBERS_ARTIFACT: &str = "review.members";
-const REVIEW_WARNINGS_ARTIFACT: &str = "review.warnings";
+// (#2310 P2) `REVIEW_ENVELOPE_ARTIFACT`/`REVIEW_MEMBERS_ARTIFACT`/
+// `REVIEW_WARNINGS_ARTIFACT`/`REVIEW_PROBE_SELECTION_ARTIFACT`/
+// `REVIEW_BUNDLES_ARTIFACT` — the five accumulator artifacts this section
+// used to declare — are RETIRED. Every one of them became a typed step
+// output instead (`review.bundles`/`review.probe-flags`/`review.deduped-
+// flags`/`review.judged-flags`/`review.verify-results`/`review.envelope` —
+// see `review_outputs`'s own module doc), read back by the per-body
+// `*_from_input` helpers above `ReviewBundleStepKind`'s own doc, never by
+// the run-scoped `ArtifactBus`. `REVIEW_CONTEXT_ARTIFACT` is the ONLY
+// artifact that survives — the two closure test seams (`chat_override`/
+// `bundle_override`), `mission_id`, and (added this packet)
+// `crew_name`/`mode_label`/`fingerprint`/`staffing`/`interpret_warnings`,
+// none of which is step-produced DATA a `reads` edge could carry (see
+// `ReviewStepContext`'s own field docs).
 const REVIEW_CONTEXT_ARTIFACT: &str = "review.context";
-/// (#1541) Per-seat probe bundle ATTRIBUTION, published by
-/// [`ReviewProbeRenderStepKind::run_streaming`] and consumed by
-/// [`reconstruct_probe_stage`] via [`ReviewDedupStepKind::run_streaming`].
-/// Keyed by the probe TASK id (the same key `gather_inputs` already uses for
-/// that task's dispatch results — see `ProbeSeatSpec::draw_task_ids`'s doc),
-/// mapping to the ORDERED `(bundle_id, fact_family)` pairs the render step
-/// selected for that task, index-aligned with the prompt collection it
-/// emitted as `Step.output`. Before this artifact, `reconstruct_probe_stage`
-/// aligned a probe seat's `dispatch.map` results back to bundles
-/// POSITIONALLY against a build-time snapshot (`ProbeSeatSpec.bundles`,
-/// retired — see git history) that only agreed with the run-time selection
-/// because both sides called the same pure function over the same bundles.
-/// Publishing the render step's ACTUAL selection onto the bus makes
-/// attribution travel through the graph instead of relying on that
-/// coincidence — see #1541 for the full failure mode this closes.
-const REVIEW_PROBE_SELECTION_ARTIFACT: &str = "review.probe-selection";
-/// (#1530) The resolved bundle set — published by
-/// [`ReviewBundleStepKind::run_streaming`], the pipeline's new EARLIEST
-/// data-producing step, and read by every downstream kind that used to read
-/// `ReviewStepContext::bundles` directly: [`ReviewProbeRenderStepKind`]'s
-/// selection, [`ReviewJudgeStepKind`]'s per-flag bundle lookup AND its
-/// `residency()` skip-load check, and [`ReviewVerifyRenderStepKind`]'s
-/// per-finding bundle lookup. Genuinely run-time data with no build-time
-/// equivalent now (the whole point of this packet — bundling used to run in
-/// `src/mission_launch_review.rs`'s pre-graph prelude; see
-/// `ReviewBundleStepKind`'s doc), so [`make_review_bundles_artifact`]'s empty
-/// default is the REAL starting state, mirroring
-/// [`REVIEW_PROBE_SELECTION_ARTIFACT`]'s own "never caller-seeded" shape —
-/// never [`REVIEW_CONTEXT_ARTIFACT`]'s "caller always overwrites the
-/// default" one. `ReviewJudgeStepKind`'s task depends (transitively, via
-/// dedup + the probe tasks) on `review-bundle-task`, so by the time its wave
-/// runs — the ONLY place this artifact is read on a production path — the
-/// bundle step's wave has already completed and this is populated; see
-/// `build_review_graph_from_config`'s own doc for the depends_on chain.
-const REVIEW_BUNDLES_ARTIFACT: &str = "review.bundles";
-
-fn make_review_envelope_artifact() -> Arc<dyn Any + Send + Sync> {
-    Arc::new(StdMutex::new(ReviewEnvelope::default()))
-}
-
-/// (#1530) Context-free default for [`REVIEW_BUNDLES_ARTIFACT`] — see that
-/// constant's own doc for why empty is the real starting state, not a
-/// placeholder some caller-seed later overwrites.
-fn make_review_bundles_artifact() -> Arc<dyn Any + Send + Sync> {
-    Arc::new(StdMutex::new(Vec::<BundleInput>::new()))
-}
-
-/// (#1541) Context-free default for [`REVIEW_PROBE_SELECTION_ARTIFACT`] — an
-/// empty map, populated in place by every claimed probe seat's
-/// `review.probe-render` step as it runs (one `insert` per seat, keyed by
-/// that seat's probe task id). Unlike [`REVIEW_CONTEXT_ARTIFACT`] this is
-/// never caller-seeded — genuinely run-time data with no build-time
-/// equivalent — so the empty default here is the REAL starting state, not a
-/// placeholder `run_review_graph` overwrites.
-fn make_review_probe_selection_artifact() -> Arc<dyn Any + Send + Sync> {
-    Arc::new(StdMutex::new(std::collections::BTreeMap::<String, Vec<(String, String)>>::new()))
-}
 
 /// (#1530 Packet 3a) Context-free default for [`REVIEW_CONTEXT_ARTIFACT`] —
 /// ALWAYS overwritten by `run_review_graph`'s caller-seed before any step
-/// reads it (see this constant's module-doc note). Unlike the envelope/
-/// members/warnings accumulators, this artifact is never mutated in place —
-/// every reader gets a read-only `Arc<ReviewStepContext>` (the SAME shape
-/// each kind used to hold as a constructor field), so it needs no
-/// `StdMutex` wrapper.
+/// reads it (see this constant's module-doc note). Never mutated in
+/// place — every reader gets a read-only `Arc<ReviewStepContext>`, so it
+/// needs no `StdMutex` wrapper.
 fn make_review_context_artifact() -> Arc<dyn Any + Send + Sync> {
     Arc::new(ReviewStepContext::default())
-}
-
-fn make_review_members_artifact() -> Arc<dyn Any + Send + Sync> {
-    Arc::new(StdMutex::new(Vec::<MemberRecord>::new()))
-}
-
-fn make_review_warnings_artifact() -> Arc<dyn Any + Send + Sync> {
-    Arc::new(StdMutex::new(Vec::<String>::new()))
 }
 
 /// Everything a review Step kind needs, OWNED (not borrowed) and
@@ -4087,6 +4034,31 @@ pub struct ReviewStepContext {
     /// (`FleetFlowEmitter`, `src/mission_launch_review.rs`) — this field
     /// covers the other, structurally-separate gap.
     pub mission_id: Option<String>,
+    /// (#2310 P2) The run's OWN identity/knob-config — crew display name,
+    /// resolved execution mode label, the fingerprint, and the resolved
+    /// staffing snapshot — every one of them a `run_review_graph`-level
+    /// value, never step data, so they ride the bus seam beside
+    /// `mission_id` rather than the typed `ReviewContext` output. Before
+    /// this packet these were stamped directly onto the shared envelope
+    /// `run_review_graph` minted at the top of the run
+    /// (`ReviewEnvelope { case_id: ctx.case_id.clone(), crew: crew_name.
+    /// to_string(), mode: mode_label(mode).to_string(), fingerprint:
+    /// fingerprint_val, staffing: Some(staffing), ..initial_env }`); now
+    /// `ReviewSynthesisStepKind` reads them off `ctx` (via
+    /// `review_context_from_input`'s seam passthrough, same as
+    /// `mission_id`) to build the FINAL envelope from typed inputs, with no
+    /// shared mutable envelope anywhere in the graph.
+    pub crew_name: Option<String>,
+    pub mode_label: Option<String>,
+    pub fingerprint: Option<serde_json::Value>,
+    pub staffing: Option<StaffingSnapshot>,
+    /// (#2310 P2) `build_review_graph`'s own interpret-time warnings (e.g.
+    /// "pruned an unclaimed probe task") — computed once, at BUILD time,
+    /// from `mission_config::interpret`'s own return; no step can
+    /// re-derive them later, so they ride the bus seam the same way the
+    /// four fields above do, and `ReviewSynthesisStepKind` folds them into
+    /// the final envelope's `warnings`.
+    pub interpret_warnings: Vec<String>,
     /// (#2310 P1 fix) See [`ReviewContextTestOverrides`]'s own doc — the
     /// five `review.context` step-config test seams, relocated here so
     /// they're reachable only by code that seeds this bus artifact
@@ -4808,12 +4780,148 @@ fn review_context_from_input(
         chat_override: seam.chat_override.clone(),
         bundle_override: seam.bundle_override.clone(),
         mission_id: seam.mission_id.clone(),
+        // (#2310 P2) Passed through unchanged, same as `mission_id` above.
+        crew_name: seam.crew_name.clone(),
+        mode_label: seam.mode_label.clone(),
+        fingerprint: seam.fingerprint.clone(),
+        staffing: seam.staffing.clone(),
+        interpret_warnings: seam.interpret_warnings.clone(),
         // (#2310 P1 fix) Downstream kinds never read this seam — only
         // `ReviewContextStepKind` itself applies it, before this
         // reconstruction even runs — so a fresh default here is correct,
         // not a gap.
         context_test_overrides: ReviewContextTestOverrides::default(),
     })
+}
+
+// ─── (#2310 P2) typed read-by-kind helpers ──────────────────────────────
+//
+// Mirrors `review_context_from_input` in shape (a per-body helper, a loud
+// by-name refusal on a missing/mis-wired edge) but reads by PORT KIND
+// (`Output.kind`) scanned across every value `gather_inputs` handed this
+// step, never by hardcoded task id — the OPEN QUESTION P1's own doc left
+// for this packet: a `review.json` that renames a task no longer silently
+// breaks a downstream kind reading `input["some-task-id"]` directly; it
+// simply has no `review.<kind>` output to find, and the refusal says so by
+// name.
+//
+// `probe_flags_from_inputs` is the one deliberate exception — see its own
+// doc for why it reads by the SAME known task ids `ProbeSeatSpec::
+// draw_task_ids` already carries, in that list's order, rather than
+// scanning `input`'s own (alphabetical, by task id) iteration order.
+
+/// A single, best-effort attempt to read `input`'s ONE `expected_kind`
+/// output. `None` when nothing in `input` carries that kind — the caller
+/// turns that into a by-name refusal.
+fn find_by_kind<T: serde::de::DeserializeOwned>(
+    input: &std::collections::BTreeMap<String, String>,
+    expected_kind: &str,
+) -> Option<darkmux_crew::step_output::Output<T>> {
+    input.values().find_map(|raw| darkmux_crew::step_output::Output::<T>::read(raw, expected_kind).ok())
+}
+
+fn bundles_from_input(
+    kind_id: &str,
+    step_id: &str,
+    input: &std::collections::BTreeMap<String, String>,
+) -> Result<BundleSetOutput> {
+    find_by_kind::<BundleSetOutput>(input, review_outputs::BUNDLE_SET_OUTPUT_KIND)
+        .map(|o| o.body)
+        .ok_or_else(|| {
+            anyhow!(
+                "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-bundle-task` \
+                 — no `{}` output was found among its inputs (#2310)",
+                review_outputs::BUNDLE_SET_OUTPUT_KIND
+            )
+        })
+}
+
+fn deduped_from_input(
+    kind_id: &str,
+    step_id: &str,
+    input: &std::collections::BTreeMap<String, String>,
+) -> Result<DedupOutput> {
+    find_by_kind::<DedupOutput>(input, review_outputs::DEDUP_OUTPUT_KIND).map(|o| o.body).ok_or_else(|| {
+        anyhow!(
+            "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-dedup-task` \
+             — no `{}` output was found among its inputs (#2310)",
+            review_outputs::DEDUP_OUTPUT_KIND
+        )
+    })
+}
+
+fn judged_from_input(
+    kind_id: &str,
+    step_id: &str,
+    input: &std::collections::BTreeMap<String, String>,
+) -> Result<JudgeOutput> {
+    find_by_kind::<JudgeOutput>(input, review_outputs::JUDGE_OUTPUT_KIND).map(|o| o.body).ok_or_else(|| {
+        anyhow!(
+            "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-judge-task` \
+             — no `{}` output was found among its inputs (#2310)",
+            review_outputs::JUDGE_OUTPUT_KIND
+        )
+    })
+}
+
+fn verify_from_input(
+    kind_id: &str,
+    step_id: &str,
+    input: &std::collections::BTreeMap<String, String>,
+) -> Result<VerifyOutput> {
+    find_by_kind::<VerifyOutput>(input, review_outputs::VERIFY_OUTPUT_KIND).map(|o| o.body).ok_or_else(|| {
+        anyhow!(
+            "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `review-verify-task` \
+             — no `{}` output was found among its inputs (#2310)",
+            review_outputs::VERIFY_OUTPUT_KIND
+        )
+    })
+}
+
+/// (#2310 P2) Fan-in: every probe TASK's typed output, in the SAME order
+/// `specs` (the mint-time `Vec<ProbeSeatSpec>` — `high`/`mid`/`low`,
+/// resolved-staffing order) already names, read by that spec's OWN
+/// `draw_task_ids[0]` — deliberately NOT a blind scan of `input`'s values.
+///
+/// **Why this one helper reads by task id.** `dedup_flags`'s first-
+/// survivor-wins tie-break is ORDER-SENSITIVE over the concatenated raw
+/// flags vector — which duplicate survives (and so which `bundle_id`/
+/// `member`/`draw` the surviving flag carries) depends on which seat's
+/// flags were concatenated first. `input` is a `BTreeMap<String, String>`,
+/// so scanning its VALUES in iteration order would concatenate seats in
+/// ALPHABETICAL task-id order (`…-high-task` < `…-low-task` <
+/// `…-mid-task`), not the resolved-staffing order the historical sequential
+/// probe loop (and every P0 golden pinned against it) used. `specs` is
+/// already build-time-stamped in the correct order for exactly this reason
+/// (`ReviewDedupStepKind`'s own doc); reusing it here — instead of
+/// re-deriving order from a map with no order to give — is what keeps the
+/// fan-in deterministic AND byte-identical to the pre-P2 pipeline. A spec
+/// whose task id has no matching output in `input` is a loud, by-name
+/// config error, same as every other helper in this section.
+fn probe_flags_from_inputs(
+    kind_id: &str,
+    step_id: &str,
+    input: &std::collections::BTreeMap<String, String>,
+    specs: &[ProbeSeatSpec],
+) -> Result<Vec<ProbeSeatOutput>> {
+    specs
+        .iter()
+        .flat_map(|spec| spec.draw_task_ids.iter())
+        .map(|task_id| {
+            let raw = input.get(task_id).ok_or_else(|| {
+                anyhow!(
+                    "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` `{task_id}` — \
+                     no probe output was found for it among its inputs (#2310)"
+                )
+            })?;
+            darkmux_crew::step_output::Output::<ProbeSeatOutput>::read(
+                raw,
+                review_outputs::PROBE_SEAT_OUTPUT_KIND,
+            )
+            .map(|o| o.body)
+            .with_context(|| format!("`{kind_id}`: step `{step_id}` reading `{task_id}`'s probe output"))
+        })
+        .collect()
 }
 
 /// Phase "investigate", step 1: resolves the review's bundle set AT RUN
@@ -4859,46 +4967,24 @@ impl StepKind for ReviewBundleStepKind {
         "Bundle"
     }
 
-    /// (#1530) `REVIEW_BUNDLES_ARTIFACT` is new here — this kind is its ONLY
-    /// writer. The ordinary `Step.output` `Data` port and
-    /// `REVIEW_CONTEXT_ARTIFACT` are unchanged from before this packet; this
-    /// is still the pipeline's EARLIEST consumer of the run-scoped context
-    /// (investigate phase, step 1), so declaring `provides()` here is
-    /// sufficient for the scheduler's pre-scan regardless of which wave the
-    /// other consumers land in (mirrors `ReviewDedupStepKind::provides()`'s
-    /// own reasoning for its three accumulators). `run_review_graph`'s
-    /// caller-seed always overwrites the context factory's context-free
-    /// default with the real, run-stamped value before any step reads it;
-    /// `REVIEW_BUNDLES_ARTIFACT`'s empty default is never caller-seeded —
-    /// this kind is what fills it, at run time (see that constant's doc).
+    /// (#2310 P2) `REVIEW_BUNDLES_ARTIFACT`/`REVIEW_ENVELOPE_ARTIFACT` are
+    /// retired — this kind's ONLY declared port beyond the ordinary `Data`
+    /// one is `REVIEW_CONTEXT_ARTIFACT` (the two closure test seams +
+    /// `mission_id`; see that constant's doc), still the pipeline's
+    /// earliest consumer.
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 3] = [
-            Port::data("bundles"),
-            Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
-            Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
-        ];
+        const PORTS: [Port; 2] =
+            [Port::data(review_outputs::BUNDLE_SET_OUTPUT_KIND), Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact)];
         &PORTS
     }
 
-    /// (#1530) `requires()` only for `REVIEW_ENVELOPE_ARTIFACT` — this kind
-    /// WRITES the resolved bundle count onto it (mirroring the pattern every
-    /// other artifact-writing kind in this file uses: declare `requires()`
-    /// for an artifact some OTHER kind's `provides()` already materializes,
-    /// per `ReviewJudgeStepKind::requires()`'s own doc). `ReviewDedupStepKind::
-    /// provides()` already declares `REVIEW_ENVELOPE_ARTIFACT`, and the
-    /// scheduler's pre-scan runs across every step kind present in the
-    /// graph before ANY wave (review-dedup-task is always present), so this
-    /// is materialized before `review-bundle-step`'s wave runs regardless.
-    /// (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND` is new here —
-    /// this task now formally `depends_on: ["review-context-task"]`
-    /// (`review.json`) — every review kind reads `ReviewContext` through
-    /// the typed graph output (`Output::read`, via `review_context_from_
-    /// input`) rather than the bus; see that function's own doc.
+    /// (#2310 P1/P2) `review_context::REVIEW_CONTEXT_OUTPUT_KIND` — this
+    /// task `depends_on: ["review-context-task"]` (`review.json`); every
+    /// review kind reads `ReviewContext` through the typed graph output
+    /// (`Output::read`, via `review_context_from_input`) rather than the
+    /// bus.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 2] = [
-            Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
-            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
-        ];
+        const PORTS: [Port; 1] = [Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND)];
         &PORTS
     }
 
@@ -4989,41 +5075,28 @@ impl StepKind for ReviewBundleStepKind {
             bundle_inputs_from_set(&bundle_set, &source)?
         };
 
-        // Publish for every downstream reader (probe-render's selection,
-        // judge's per-flag lookup + residency skip-load check,
-        // verify-render's per-finding lookup — see `REVIEW_BUNDLES_ARTIFACT`'s
-        // own doc for the full reader list).
-        *run_ctx
-            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
-            .expect("this kind's own provides() materializes review.bundles")
-            .lock()
-            .expect("review bundles mutex poisoned") = bundle_inputs.clone();
-
-        // (#1530) The envelope's `bundles` count used to be stamped once at
-        // BUILD time (`ctx.bundles.len()` in `build_review_graph_from_config`'s
-        // `initial_env`) — now that the real count isn't known until this
-        // step runs, it's written here instead, into the SAME shared
-        // envelope every other step reads/writes through
-        // `REVIEW_ENVELOPE_ARTIFACT`. This runs in the graph's FIRST wave,
-        // well before `ReviewSynthesisStepKind` reads `env.bundles` (the
-        // "no bundles produced from the diff" degenerate gate) or serializes
-        // its own envelope snapshot, so both see the real count.
-        {
-            let env_artifact = run_ctx
-                .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
-                .expect("review-dedup-task's provides() materializes review.envelope");
-            let mut env = env_artifact.lock().expect("shared review envelope mutex poisoned");
-            env.bundles = bundle_inputs.len();
-            // (#1605) Stamped alongside `bundles` for the same reason — the
-            // synthesis step's zero-bundle degenerate gate reads this to
-            // build a REASONED message instead of a bare count.
-            env.bundle_skip = bundle_skip;
-            // (#2119) Stamped alongside them — `None` on every run except
-            // the plugin-declined-and-fell-back-to-built-in one above.
-            env.bundler_fallback = bundler_fallback;
-        }
-
-        let output = serde_json::to_string(&bundle_inputs).context("serializing bundles")?;
+        // (#2310 P2) The typed output every downstream reader (probe-
+        // render/-collect, judge's per-flag lookup + residency skip-load
+        // check, verify-render's per-finding lookup, and synthesis's
+        // zero-bundle degenerate gate) reads through `bundles_from_input`
+        // instead of the retired `REVIEW_BUNDLES_ARTIFACT`/
+        // `REVIEW_ENVELOPE_ARTIFACT` bus artifacts — see `BundleSetOutput`'s
+        // own doc for why the bundle count/skip-report/bundler-fallback
+        // ride together in one body.
+        let body = BundleSetOutput {
+            schema_version: review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+            bundles: bundle_inputs.clone(),
+            skip: bundle_skip,
+            bundler_fallback,
+        };
+        let producer = darkmux_crew::step_output::Producer::of(
+            ctx.mission_id.as_deref().unwrap_or_default(),
+            _task.id.as_str(),
+            &step.id,
+        );
+        let output = darkmux_crew::step_output::Output::wrap(review_outputs::BUNDLE_SET_OUTPUT_KIND, body, producer)
+            .to_output_string()
+            .context("serializing bundles")?;
         emit_review_step_result(
             "review.bundle",
             &step.id,
@@ -5086,43 +5159,34 @@ impl StepKind for ReviewProbeRenderStepKind {
         "Probe prompts"
     }
 
-    /// `requires()` only — this kind consumes `REVIEW_CONTEXT_ARTIFACT` (the
-    /// `chat_override`/`bundle_override`/`mission_id` seam only — the typed
-    /// `review-context-task` output, declared below, carries `probe_system`/
-    /// `probe_role_prompts`; see `review_context_from_input`'s doc) and,
-    /// since #1530, `REVIEW_BUNDLES_ARTIFACT` (the bundle set, published by
-    /// `ReviewBundleStepKind::run_streaming` — this task depends directly on
-    /// `review-bundle-task`, so it's always populated by the time this runs)
-    /// but produces none of the three shared accumulators; `ReviewDedupStepKind::
-    /// provides()`'s doc explains why a downstream consumer declares
-    /// `requires()` rather than re-`provides()`ing an artifact another kind
-    /// already does. (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND`
-    /// is new here — this task now formally `reads: ["review-context-task"]`
-    /// (`review.json`).
+    /// (#2310 P2) `requires()` — `REVIEW_CONTEXT_ARTIFACT` (the
+    /// `chat_override`/`bundle_override`/`mission_id` seam only) plus the
+    /// two typed data ports this kind reads: the review context
+    /// (`probe_system`/`probe_role_prompts`) and the bundle set — this task
+    /// `depends_on: ["review-bundle-task"]`, so `bundles_from_input` always
+    /// finds it.
     fn requires(&self) -> &'static [Port] {
         const PORTS: [Port; 3] = [
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
-            Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
+            Port::data(review_outputs::BUNDLE_SET_OUTPUT_KIND),
             Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
     }
 
-    /// (#1541) Declares [`REVIEW_PROBE_SELECTION_ARTIFACT`] — this kind is
-    /// the one and only PRODUCER (every claimed probe seat's render step
-    /// `insert`s its own entry as it runs; `ReviewDedupStepKind::requires()`
-    /// reads the finished map back at the dedup boundary). Declaring the
-    /// `provides()` here, on the actual producer, rather than "the earliest
-    /// consumer" (the convention the three older accumulators use, per
-    /// `ReviewDedupStepKind::provides()`'s doc) is deliberate: this artifact
-    /// has no build-time equivalent for `run_review_graph` to caller-seed,
-    /// so the factory default genuinely IS the run's starting state, and the
-    /// producer is the natural, honest owner of that declaration.
+    /// (#2310 P2) `REVIEW_PROBE_SELECTION_ARTIFACT` is retired — this seat's
+    /// bundle SELECTION (the `(bundle_id, fact_family)` pairs each rendered
+    /// prompt corresponds to) is no longer published anywhere: it is a PURE
+    /// function of `(bundles, selector)`, both of which
+    /// `ReviewProbeCollectStepKind` (the task's third step) can read
+    /// itself — the bundle set through the SAME typed `review-bundle-task`
+    /// output this step reads, and `selector` from its own step config,
+    /// stamped identically to this step's. Recomputing costs one pure call
+    /// (`select_bundles_for_staffing`) and, unlike a bus publish, cannot
+    /// desync from what actually dispatched — see
+    /// `ReviewProbeCollectStepKind`'s own doc.
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 2] = [
-            Port::data("probe-prompts"),
-            Port::artifact(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact),
-        ];
+        const PORTS: [Port; 1] = [Port::data("probe-prompts")];
         &PORTS
     }
 
@@ -5136,7 +5200,7 @@ impl StepKind for ReviewProbeRenderStepKind {
     fn run_streaming(
         &self,
         step: &Step,
-        task: &Task,
+        _task: &Task,
         input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
@@ -5149,11 +5213,7 @@ impl StepKind for ReviewProbeRenderStepKind {
         // time — this seat's bundle selector (absent/null when the seat
         // runs unrestricted over every bundle, matching
         // `select_bundles_for_staffing`'s own `None` contract) and role id
-        // (for the per-seat prompt lookup below). Both are known at build
-        // time; only the SELECTION ITSELF (which needs the run's bundle
-        // set, only stable once `review-bundle-task` has run — see
-        // `REVIEW_BUNDLES_ARTIFACT`'s doc) moves to run time — see this
-        // kind's own doc.
+        // (for the per-seat prompt lookup below).
         let selector: Option<BundleSelector> = match step.config.get("selector") {
             None => None,
             Some(v) if v.is_null() => None,
@@ -5172,37 +5232,12 @@ impl StepKind for ReviewProbeRenderStepKind {
             .map(String::as_str)
             .unwrap_or(ctx.probe_system.as_str());
 
-        // (#1530) The bundle set — published by `review-bundle-task`'s own
-        // step, which this task depends on directly (`review.json`'s
-        // `review-probe-*-task.depends_on: ["review-bundle-task"]`).
-        let bundles = run_ctx
-            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
-            .expect("review-bundle-task's step must run before any probe task's own")
-            .lock()
-            .expect("review bundles mutex poisoned")
-            .clone();
+        // (#2310 P2) The bundle set — the typed output `review-bundle-task`
+        // produced; this task `depends_on` it directly.
+        let bundles = bundles_from_input(self.id(), &step.id, input)?.bundles;
 
         let selected = select_bundles_for_staffing(&bundles, selector.as_ref());
         let collection: Vec<String> = selected.iter().map(|b| probe_user_message(prior, b)).collect();
-
-        // (#1541) Publish THIS run's actual selection — index-aligned with
-        // `collection` above — onto the bus, keyed by this render step's OWN
-        // task id (the same key `gather_inputs` hands the dedup step's
-        // `input` for this task's dispatch results, since a probe task is
-        // exactly one role / one task / one dispatch — #1512). This is what
-        // lets `reconstruct_probe_stage` attribute results by data that
-        // actually flowed through the graph instead of a build-time
-        // snapshot; see `REVIEW_PROBE_SELECTION_ARTIFACT`'s own doc.
-        let pairs: Vec<(String, String)> =
-            selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
-        run_ctx
-            .artifact::<StdMutex<std::collections::BTreeMap<String, Vec<(String, String)>>>>(
-                REVIEW_PROBE_SELECTION_ARTIFACT,
-            )
-            .expect("run_step_graph materializes review.probe-selection via this kind's own provides()")
-            .lock()
-            .expect("probe selection mutex poisoned")
-            .insert(task.id.clone(), pairs);
 
         emit_review_step_result(
             "review.probe-render",
@@ -5272,75 +5307,164 @@ pub(crate) struct ProbeSeatSpec {
     pub(crate) draw_task_ids: Vec<String>,
 }
 
-/// Everything the dedup boundary reconstructs from the probe fan-out's raw
-/// per-item results, before dedup itself runs. Pure output of
-/// [`reconstruct_probe_stage`] — unit-testable without a graph.
-pub(crate) struct ProbeReconstruction {
-    /// Raw flags in the HISTORICAL probe order (seat → bundle → draw), so
-    /// dedup's first-survivor-wins semantics match the retired per-seat
-    /// probe loop exactly.
-    pub(crate) flags: Vec<ProbeFlag>,
-    pub(crate) members: Vec<MemberRecord>,
-    pub(crate) warnings: Vec<String>,
-    pub(crate) budget_row: Option<RemoteBudgetRecord>,
-    /// `Some(reason)` when at least one draw fired and EVERY fired draw was
-    /// a dispatch error — the all-draws-failed honesty gate. (Previously a
-    /// LOCAL seat's dispatch error was a hard step `Err` that aborted the
-    /// graph; `dispatch.map`'s per-item isolation carries the stage
-    /// through instead, so the gate lands here as a NAMED degenerate
-    /// reason — loud, never a silent zero-flag "clean pass".)
-    pub(crate) all_draws_failed: Option<String>,
-    /// (#1605) Total `retry_on_error` attempts consumed across every probe
-    /// draw (summed from each item's own [`MapItemResult::retried`]) — how
-    /// many transient dispatch errors self-healed on the probe stage's
-    /// bounded retry, folded into [`ReviewEnvelope::probe_retries`].
-    pub(crate) retries: u32,
+/// (#2310 P2) `reconstruct_probe_stage` (a single pass over ALL seats,
+/// reading everything off the run-scoped bus) split into two pure halves,
+/// following the data across its new typed-output boundary:
+///
+/// - [`reconstruct_probe_seat`] — ONE seat's own accounting, now computed
+///   inside that seat's OWN `review.probe-collect` step (the probe task's
+///   third step), from that step's own predecessor (the `dispatch.map`
+///   step's raw [`MapItemResult`]s) and a bundle SELECTION it recomputes
+///   itself (see [`ReviewProbeCollectStepKind`]'s own doc for why
+///   recomputing — a pure call over the SAME `(bundles, selector)` inputs
+///   the render step used — replaced the retired
+///   `REVIEW_PROBE_SELECTION_ARTIFACT` bus publish).
+/// - [`fold_probe_seats`] — the cross-seat combine (the probe stage's ONE
+///   shared remote-token bucket accounting, the all-draws-failed honesty
+///   gate, retries), now run by [`ReviewDedupStepKind`] over the fanned-in
+///   [`ProbeSeatOutput`]s.
+///
+/// Both keep the retired function's accounting semantics EXACTLY (see git
+/// history for the pre-split doc, preserved on each half below): a
+/// **draw** is an item whose call actually FIRED (a first-attempt
+/// remote-budget skip — recognized by [`MAP_BUDGET_SKIP_ERROR`] — is a
+/// skip, never a draw); a seat with zero fired draws records no
+/// `MemberRecord`; `wall_ms` sums each item's own per-dispatch wall (a COST
+/// metric, not a timeline, under concurrent draws).
+pub(crate) fn reconstruct_probe_seat(
+    name: &str,
+    identifier: &str,
+    remote: bool,
+    endpoint_host: Option<&str>,
+    results: &[MapItemResult],
+    pairs: &[(String, String)],
+) -> ProbeSeatOutput {
+    let mut flags = Vec::new();
+    let mut warnings = Vec::new();
+
+    // (#1541 successor) Attribution keys on `pairs` — this SAME step's own
+    // recomputed `(bundle_id, fact_family)` selection, index-aligned with
+    // `results` by construction (both are derived from the identical
+    // `select_bundles_for_staffing` call the render step made). A length
+    // mismatch can only mean the map step's collection resolution and this
+    // step's own recomputation disagreed — kept as a loud, named guard
+    // (unreachable on any graph this pipeline can mint today) rather than
+    // an assumed invariant, mirroring the retired function's own defensive
+    // posture.
+    let aligned: &[(String, String)] = if pairs.len() == results.len() {
+        pairs
+    } else {
+        warnings.push(format!(
+            "probe seat \"{name}\": recomputed {} bundle selection(s) but dispatch returned {} \
+             result(s) — attribution desync, this seat's flags are DROPPED rather than risk \
+             attributing them to the wrong bundle",
+            pairs.len(),
+            results.len()
+        ));
+        &[]
+    };
+    for (item, (bundle_id, fact_family)) in results.iter().zip(aligned.iter()) {
+        if item.ok && !item.content.trim().is_empty() {
+            flags.push(ProbeFlag {
+                bundle_id: bundle_id.clone(),
+                fact_family: fact_family.clone(),
+                member: identifier.to_string(),
+                draw: 0,
+                charge_text: item.content.trim().to_string(),
+                anchor: None,
+                also_flagged: Vec::new(),
+            });
+        }
+    }
+
+    let mut draws = 0u32;
+    let mut skips = 0u32;
+    let mut errors = 0u32;
+    let mut first_error: Option<String> = None;
+    let mut tokens = 0u64;
+    let mut wall_ms = 0u64;
+    let mut retries = 0u32;
+    let mut served_model: Option<String> = None;
+    for item in results {
+        if item.error.as_deref() == Some(MAP_BUDGET_SKIP_ERROR) {
+            skips += 1;
+            continue;
+        }
+        draws += 1;
+        tokens += item.total_tokens.unwrap_or(0);
+        wall_ms += item.wall_ms;
+        retries += item.retried;
+        if served_model.is_none() {
+            served_model = item.served_model.clone();
+        }
+        if !item.ok {
+            errors += 1;
+            if first_error.is_none() {
+                first_error = item.error.clone();
+            }
+        }
+    }
+    if errors > 0 {
+        // The retired kind aborted a remote seat's remaining draws on the
+        // first failure; `dispatch.map` isolates per item and keeps going,
+        // so the warning names the per-draw failure count.
+        let scope = if remote { "remote probe seat" } else { "probe seat" };
+        warnings.push(format!(
+            "{scope} \"{name}\" ({identifier}) dispatch failed on {errors} draw(s) — each \
+             failure isolated per draw (reduced coverage): {}",
+            first_error.clone().unwrap_or_default()
+        ));
+    }
+    let member = (draws > 0).then(|| MemberRecord {
+        model: identifier.to_string(),
+        seat: "review-probe".to_string(),
+        draws,
+        wall_ms,
+        total_tokens: tokens,
+        remote,
+        endpoint: endpoint_host.map(String::from),
+        served_model,
+    });
+
+    ProbeSeatOutput {
+        schema_version: review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+        seat: name.to_string(),
+        identifier: identifier.to_string(),
+        remote,
+        endpoint_host: endpoint_host.map(String::from),
+        flags,
+        member,
+        warnings,
+        fired: draws,
+        errors,
+        first_error,
+        retries,
+        remote_tokens: tokens,
+        remote_calls: draws,
+        remote_skips: skips,
+    }
 }
 
-/// (#1442 ship-2b) Rebuild the probe stage's domain results from the
-/// `seats x k` map steps' serialized [`MapItemResult`] arrays.
+/// The probe stage's cross-seat fold — everything [`ReviewDedupStepKind`]
+/// needs beyond the concatenated flags: the ONE shared remote-token bucket
+/// row (every probe seat's `dispatch.map` draws from the SAME
+/// `bucket_group: "probe"` per-execution allowance — see
+/// `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`'s doc — so the envelope
+/// reports it as one combined row, not one per seat), the all-draws-failed
+/// honesty gate, and the summed retry count.
 ///
-/// Accounting semantics preserved from the retired kind:
-/// - a **draw** = an item whose call actually FIRED (a first-attempt
-///   remote-budget skip — recognized by [`MAP_BUDGET_SKIP_ERROR`] — is a
-///   skip, never a draw);
-/// - `MemberRecord` per seat, summed across its k sibling steps
-///   (`draws`/`total_tokens`/`wall_ms`; `served_model` = the first
-///   endpoint-reported model, which stays `None` by construction on local
-///   seats — the [`MapItemResult`] contract);
-///   - (#1442) `wall_ms` SEMANTICS SHIFTED at the `dispatch.map` cutover:
-///     the retired bespoke probe kind recorded the seat's whole-step
-///     ELAPSED wall (`t0.elapsed()` around the seat's inner loop); this
-///     reconstruction SUMS each item's own per-dispatch wall
-///     (`item.wall_ms`). The new figure is more honest as a COST metric
-///     (it excludes per-step scheduling/idle overhead the old elapsed
-///     folded in), but it is NOT a timeline — under concurrent draws the
-///     per-item walls overlap in real time, so the sum can exceed the seat's
-///     wall-clock. Series comparisons ACROSS the cutover should read the
-///     probe `wall_ms` accordingly.
-/// - a seat with zero fired draws (empty selector match, or every attempt
-///   budget-skipped) records NO member — `member_summary()` must not
-///   credit work that never happened;
-/// - the probe stage's ONE remote budget row (`stage: "probe"`) and the
-///   exhaustion warning reconstruct from the same items.
-///
-/// (#1541) Attribution (WHICH bundle a flag came from) now keys on
-/// `selection` — the render step's OWN published `(bundle_id,
-/// fact_family)` pairs, per draw task id, off [`REVIEW_PROBE_SELECTION_ARTIFACT`]
-/// — rather than a build-time snapshot. A draw whose task id is absent from
-/// `selection` (the render step never ran or never published for that
-/// task), or whose published pair count doesn't match the `dispatch.map`
-/// result count for the same task (a desync between what the render step
-/// selected and what actually dispatched), is a loud, named warning and
-/// that draw's flags are DROPPED rather than risk attributing a real
-/// finding to the wrong bundle — see this function's own history for the
-/// silent-`continue` bug this replaces.
-pub(crate) fn reconstruct_probe_stage(
-    specs: &[ProbeSeatSpec],
-    input: &std::collections::BTreeMap<String, String>,
-    selection: &std::collections::BTreeMap<String, Vec<(String, String)>>,
+/// The six-part return tuple trips clippy's `type_complexity` lint; a named
+/// struct would cost the same information spread across more call-site
+/// boilerplate for the two tuple-destructuring callers (`ReviewDedupStepKind::
+/// run_streaming` and this function's own tests) — the fields are already
+/// self-explanatory from this doc, mirroring the same accepted trade-off
+/// `apply_verify_results`'s retired `#[allow(clippy::too_many_arguments)]`
+/// documented for its own signature.
+#[allow(clippy::type_complexity)]
+pub(crate) fn fold_probe_seats(
+    outputs: &[ProbeSeatOutput],
     budget: u64,
-) -> Result<ProbeReconstruction> {
+) -> (Vec<ProbeFlag>, Vec<MemberRecord>, Vec<String>, Option<RemoteBudgetRecord>, Option<String>, u32) {
     let mut flags = Vec::new();
     let mut members = Vec::new();
     let mut warnings = Vec::new();
@@ -5351,150 +5475,25 @@ pub(crate) fn reconstruct_probe_stage(
     let mut total_fired = 0u32;
     let mut total_errors = 0u32;
     let mut first_error: Option<String> = None;
-    // (#1605) Summed `MapItemResult::retried` across every probe draw —
-    // how many transient dispatch errors self-healed on the bounded
-    // `retry_on_error` retry, folded into `ReviewEnvelope::probe_retries`.
     let mut total_retries = 0u32;
 
-    for spec in specs {
-        let mut per_draw: Vec<Vec<MapItemResult>> = Vec::with_capacity(spec.draw_task_ids.len());
-        for task_id in &spec.draw_task_ids {
-            let raw = input.get(task_id).map(String::as_str).unwrap_or("[]");
-            let results: Vec<MapItemResult> = serde_json::from_str(raw).with_context(|| {
-                format!(
-                    "deserializing probe map results from task `{task_id}` (seat `{}`)",
-                    spec.name
-                )
-            })?;
-            per_draw.push(results);
+    for out in outputs {
+        flags.extend(out.flags.iter().cloned());
+        warnings.extend(out.warnings.iter().cloned());
+        if let Some(m) = &out.member {
+            members.push(m.clone());
         }
-
-        // Flags in the historical seat → bundle → draw order — with only
-        // one draw task id per seat (#1512), draw-major and bundle-major
-        // iteration produce an IDENTICAL sequence, so nesting draw outside
-        // bundle here (rather than the retired bundle-outside-draw order)
-        // is a byte-identical reordering, not a behavior change.
-        //
-        // (#1541) Scope of that equivalence, stated precisely: it holds for
-        // every spec GRAPH CONSTRUCTION can mint, because `build_review_graph
-        // _from_config` gives each seat exactly one draw task (#1512). This
-        // function itself still SUPPORTS multi-draw specs — `reconstruct_
-        // probe_stage_accounts_skips_errors_and_flags` hand-builds a two-draw
-        // spec as the retained coverage for per-seat summing across sibling
-        // draws — and for such a spec draw-major and bundle-major iteration
-        // yield DIFFERENT flag orders. That is unreachable from any real
-        // graph today, but dedup downstream is first-survivor-wins over this
-        // vector's order, so anything that re-introduces multi-draw seats at
-        // graph-construction time must restore bundle-major nesting here
-        // first, or it will silently change which flag survives. (Asserting
-        // single-draw here would be wrong: the multi-draw path is supported
-        // and tested — the constraint belongs to graph construction, not to
-        // this function.)
-        for (draw, task_id) in spec.draw_task_ids.iter().enumerate() {
-            let results = per_draw.get(draw).map(Vec::as_slice).unwrap_or(&[]);
-            let pairs = match selection.get(task_id) {
-                Some(pairs) if pairs.len() == results.len() => pairs,
-                Some(pairs) => {
-                    warnings.push(format!(
-                        "probe seat \"{}\" draw {draw} (task `{task_id}`): render step selected \
-                         {} bundle(s) but dispatch returned {} result(s) — attribution desync, \
-                         this draw's flags are DROPPED rather than risk attributing them to the \
-                         wrong bundle",
-                        spec.name,
-                        pairs.len(),
-                        results.len()
-                    ));
-                    continue;
-                }
-                None => {
-                    warnings.push(format!(
-                        "probe seat \"{}\" draw {draw} (task `{task_id}`): no bundle selection \
-                         published by the render step — attribution unavailable, this draw's \
-                         flags are DROPPED",
-                        spec.name
-                    ));
-                    continue;
-                }
-            };
-            for (item, (bundle_id, fact_family)) in results.iter().zip(pairs.iter()) {
-                if item.ok && !item.content.trim().is_empty() {
-                    flags.push(ProbeFlag {
-                        bundle_id: bundle_id.clone(),
-                        fact_family: fact_family.clone(),
-                        member: spec.identifier.clone(),
-                        draw: draw as u32,
-                        charge_text: item.content.trim().to_string(),
-                        anchor: None,
-                        also_flagged: Vec::new(),
-                    });
-                }
-            }
-        }
-
-        // Per-seat accounting, summed across the seat's k sibling steps.
-        let mut draws = 0u32;
-        let mut skips = 0u32;
-        let mut errors = 0u32;
-        let mut seat_first_error: Option<String> = None;
-        let mut tokens = 0u64;
-        let mut wall_ms = 0u64;
-        let mut served_model: Option<String> = None;
-        for results in &per_draw {
-            for item in results {
-                if item.error.as_deref() == Some(MAP_BUDGET_SKIP_ERROR) {
-                    skips += 1;
-                    continue;
-                }
-                draws += 1;
-                tokens += item.total_tokens.unwrap_or(0);
-                wall_ms += item.wall_ms;
-                total_retries += item.retried;
-                if served_model.is_none() {
-                    served_model = item.served_model.clone();
-                }
-                if !item.ok {
-                    errors += 1;
-                    if seat_first_error.is_none() {
-                        seat_first_error = item.error.clone();
-                    }
-                }
-            }
-        }
-        total_fired += draws;
-        total_errors += errors;
+        total_fired += out.fired;
+        total_errors += out.errors;
         if first_error.is_none() {
-            first_error = seat_first_error.clone();
+            first_error = out.first_error.clone();
         }
-        if spec.remote {
+        total_retries += out.retries;
+        if out.remote {
             any_remote_seat = true;
-            remote_used += tokens;
-            remote_calls += draws;
-            remote_skips += skips;
-        }
-        if errors > 0 {
-            // The retired kind aborted a remote seat's remaining draws on
-            // the first failure; `dispatch.map` isolates per item and keeps
-            // going, so the warning names the per-draw failure count.
-            let scope = if spec.remote { "remote probe seat" } else { "probe seat" };
-            warnings.push(format!(
-                "{scope} \"{}\" ({}) dispatch failed on {errors} draw(s) — each failure \
-                 isolated per draw (reduced coverage): {}",
-                spec.name,
-                spec.identifier,
-                seat_first_error.unwrap_or_default()
-            ));
-        }
-        if draws > 0 {
-            members.push(MemberRecord {
-                model: spec.identifier.clone(),
-                seat: "review-probe".to_string(),
-                draws,
-                wall_ms,
-                total_tokens: tokens,
-                remote: spec.remote,
-                endpoint: spec.endpoint_host.clone(),
-                served_model,
-            });
+            remote_used += out.remote_tokens;
+            remote_calls += out.remote_calls;
+            remote_skips += out.remote_skips;
         }
     }
 
@@ -5503,15 +5502,6 @@ pub(crate) fn reconstruct_probe_stage(
             stage: "probe".to_string(),
             max_tokens: budget,
             used_tokens: remote_used,
-            // (#1442 gate CONSIDER) `remote_used` SUMS the endpoint-REPORTED
-            // tokens, but the live `RemoteBudget` meters CONSERVATIVELY
-            // (it settles a usage-omitting reply at its granted cap). So a
-            // usage-omitting endpoint can exhaust the bucket — producing
-            // `remote_skips > 0` — while the summed reported total stays
-            // BELOW `budget`. `skipped_calls > 0` is itself proof the bucket
-            // exhausted (that is the only reason a draw is skipped), so it
-            // makes `exhausted` truthful regardless of what the endpoint
-            // reported.
             exhausted: remote_skips > 0 || remote_used >= budget,
             skipped_calls: remote_skips,
         });
@@ -5528,7 +5518,153 @@ pub(crate) fn reconstruct_probe_stage(
             first_error.unwrap_or_default()
         )
     });
-    Ok(ProbeReconstruction { flags, members, warnings, budget_row, all_draws_failed, retries: total_retries })
+    (flags, members, warnings, budget_row, all_draws_failed, total_retries)
+}
+
+// ─── investigate: probe collect (third step of EACH probe task) ────────
+
+/// (#2310 P2) Phase "investigate", step 3 of EACH probe TASK: turns the
+/// `dispatch.map` step's raw [`MapItemResult`]s (its own predecessor —
+/// `scheduler::gather_inputs`'s #2310 P2a chaining, one step back) into a
+/// typed [`ProbeSeatOutput`] — this seat's attributed flags plus every
+/// per-seat fact that used to accumulate on the retired
+/// `REVIEW_MEMBERS_ARTIFACT`/`REVIEW_WARNINGS_ARTIFACT` bus artifacts.
+///
+/// **Why this step recomputes the bundle selection instead of reading it
+/// off the render step (index 0 of this same task).** The render step's
+/// OWN `Step.output` must stay the PLAIN JSON array `dispatch.map`
+/// resolves as its collection (`resolve_map_collection` parses it and
+/// expects an array, full stop) — embedding `(bundle_id, fact_family)`
+/// metadata into each collection item is not available as a second
+/// channel: `dispatch.map`'s per-item shape detection
+/// (`item_system_and_payload`) only special-cases an EXACT `{system,
+/// item}` two-key object, so any extra field would either be silently
+/// substituted whole into the dispatched prompt (`map_item_text` on a
+/// plain object) or corrupt the `{system, item}` override — either way,
+/// the wrong thing to ship into a live dispatch for a bookkeeping need.
+/// And `scheduler::gather_inputs`'s "later step gets its predecessor" rule
+/// (#2310 P2a) only reaches ONE step back — this step (index 2) would need
+/// index 0's output directly, which the mechanism does not deliver.
+///
+/// The fix used instead: `select_bundles_for_staffing(bundles, selector)`
+/// is a PURE function of `(bundles, selector)` — this step reads the exact
+/// same typed `review-bundle-task` output the render step read (this
+/// task's own `depends_on`, delivered to every step of the task
+/// unconditionally — not just the predecessor) and the exact same
+/// `selector` `build_review_graph_from_config` stamps onto BOTH the render
+/// step's and this step's own config. Calling the pure function again
+/// reproduces the render step's selection exactly, with no publish step
+/// and — unlike the retired `REVIEW_PROBE_SELECTION_ARTIFACT` bus
+/// publish — no possibility of desync (both calls share the same inputs by
+/// construction within one graph run, so there is nothing FOR them to
+/// disagree about).
+pub struct ReviewProbeCollectStepKind;
+
+impl StepKind for ReviewProbeCollectStepKind {
+    fn id(&self) -> &'static str {
+        "review.probe-collect"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Probe collect"
+    }
+
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 3] = [
+            Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
+            Port::data(review_outputs::BUNDLE_SET_OUTPUT_KIND),
+            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
+        ];
+        &PORTS
+    }
+
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data(review_outputs::PROBE_SEAT_OUTPUT_KIND)];
+        &PORTS
+    }
+
+    fn run(&self, _s: &Step, _t: &Task, _i: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        panic!(
+            "ReviewProbeCollectStepKind only runs through `run_streaming` — it reads the \
+             run-scoped ArtifactBus (#2310 P2)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        step: &Step,
+        task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let seam_ctx = run_ctx
+            .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
+            .expect("run_review_graph seeds the context artifact before the graph runs");
+        let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
+        let bundles = bundles_from_input(self.id(), &step.id, input)?.bundles;
+
+        // Stamped identically to `review.probe-render`'s own config (both
+        // written by the same probe loop in `build_review_graph_from_config`)
+        // — see this kind's own doc for why recomputing beats publishing.
+        let selector: Option<BundleSelector> = match step.config.get("selector") {
+            None => None,
+            Some(v) if v.is_null() => None,
+            Some(v) => Some(serde_json::from_value(v.clone()).context("deserializing probe-collect selector")?),
+        };
+        let name = step
+            .config
+            .get("name")
+            .and_then(|v| v.as_str())
+            .context("darkmux: review-probe-collect-step config is missing \"name\"")?;
+        let identifier = step
+            .config
+            .get("identifier")
+            .and_then(|v| v.as_str())
+            .context("darkmux: review-probe-collect-step config is missing \"identifier\"")?;
+        let remote = step.config.get("remote").and_then(|v| v.as_bool()).unwrap_or(false);
+        let endpoint_host = step.config.get("endpoint_host").and_then(|v| v.as_str());
+
+        let selected = select_bundles_for_staffing(&bundles, selector.as_ref());
+        let pairs: Vec<(String, String)> =
+            selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
+
+        // The predecessor: this task's own `dispatch.map` step (index 1),
+        // one step back from this one (index 2) — `gather_inputs`'s #2310
+        // P2a same-task-predecessor chaining, keyed by that step's own id.
+        let map_step_id = task
+            .step_ids
+            .iter()
+            .position(|id| id == &step.id)
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| task.step_ids.get(i))
+            .ok_or_else(|| {
+                anyhow!("`{}`: step `{}` must be the third step of a probe task", self.id(), step.id)
+            })?;
+        let raw = input.get(map_step_id).map(String::as_str).unwrap_or("[]");
+        let results: Vec<MapItemResult> = serde_json::from_str(raw)
+            .with_context(|| format!("deserializing probe map results from step `{map_step_id}`"))?;
+
+        let body = reconstruct_probe_seat(name, identifier, remote, endpoint_host, &results, &pairs);
+
+        emit_review_step_result(
+            "review.probe-collect",
+            &step.id,
+            &ctx.case_id,
+            ctx.mission_id.as_deref(),
+            json!({ "items_in": results.len(), "items_out": body.flags.len() }),
+        );
+
+        let producer = darkmux_crew::step_output::Producer::of(
+            ctx.mission_id.as_deref().unwrap_or_default(),
+            task.id.as_str(),
+            &step.id,
+        );
+        let output =
+            darkmux_crew::step_output::Output::wrap(review_outputs::PROBE_SEAT_OUTPUT_KIND, body, producer)
+                .to_output_string()
+                .context("serializing probe seat output")?;
+        Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
 }
 
 // ─── investigate: dedup (terminal step of the phase) ────────────────────
@@ -5564,26 +5700,24 @@ pub(crate) fn reconstruct_probe_stage(
 /// precedent; this is the same pattern, not a new one.
 pub struct ReviewDedupStepKind;
 
-/// (#1530 Packet 3a follow-on) Reads `"probe_specs"`/`"remote_budget"` off
-/// `review-dedup-step`'s config — stamped by `build_review_graph_from_config`
-/// (see [`ReviewDedupStepKind`]'s own doc). Extracted into its own function,
-/// called from BOTH `run_streaming` below and the stamp/read agreement test
+/// (#2310 P2) Reads `"probe_specs"` off `review-dedup-step`'s config —
+/// stamped by `build_review_graph_from_config` (see [`ReviewDedupStepKind`]'s
+/// own doc). `remote_budget` no longer rides here — the fold uses `ctx.
+/// remote_max_tokens_per_execution` (the typed `review-context-task`
+/// output every kind already reads), one fewer stamped/read key to keep in
+/// agreement. Extracted into its own function, called from BOTH
+/// `run_streaming` below and the stamp/read agreement test
 /// (`dedup_and_synthesis_config_stamp_and_reader_agree`), so a key-name or
 /// shape mismatch between the stamper and the reader surfaces at TEST time
 /// instead of only inside a live graph run — mirrors
 /// `file_source_from_step_config`'s own shape.
-fn dedup_config_from_step(config: &serde_json::Value) -> Result<(Vec<ProbeSeatSpec>, u64)> {
-    let probe_specs: Vec<ProbeSeatSpec> = config
+fn dedup_config_from_step(config: &serde_json::Value) -> Result<Vec<ProbeSeatSpec>> {
+    config
         .get("probe_specs")
         .cloned()
         .map(|v| serde_json::from_value(v).context("deserializing \"probe_specs\" from step config"))
         .transpose()?
-        .context("darkmux: review-dedup-step config is missing \"probe_specs\"")?;
-    let remote_budget = config
-        .get("remote_budget")
-        .and_then(|v| v.as_u64())
-        .context("darkmux: review-dedup-step config is missing \"remote_budget\" (or it is not a u64)")?;
-    Ok((probe_specs, remote_budget))
+        .context("darkmux: review-dedup-step config is missing \"probe_specs\"")
 }
 
 impl StepKind for ReviewDedupStepKind {
@@ -5595,45 +5729,26 @@ impl StepKind for ReviewDedupStepKind {
         "Dedup"
     }
 
-    /// (#1530 Packets 1/3a) Declares the three run-scoped accumulator
-    /// `Artifact` handles this pipeline's dispatching kinds share — this is
-    /// the EARLIEST of the four accumulator consumers (dedup/judge/
-    /// verify-render/synthesis), and the scheduler's `provides()` pre-scan
-    /// runs once, before ANY wave, for every kind actually present in the
-    /// graph (see `scheduler::run_step_graph`'s pre-scan doc) — so declaring
-    /// them here is sufficient regardless of which wave each consumer lands
-    /// in. `run_review_graph` overwrites these context-free defaults with
-    /// the run-stamped values via the caller-seed path (module-level doc
-    /// note above `REVIEW_ENVELOPE_ARTIFACT`). Also declares the `Data` port
-    /// this step's own `Step.output` satisfies — the ordinary wiring is
-    /// unchanged; this is annotation only (`Port::data`'s doc).
-    ///
-    /// `REVIEW_CONTEXT_ARTIFACT` is declared as `requires()` below, not
-    /// here — `ReviewBundleStepKind` is the pipeline's earliest consumer of
-    /// THAT artifact (investigate phase, step 1, ahead of this step), so it
-    /// owns the `provides()` declaration for it (see that kind's own doc).
+    /// (#2310 P2) The three run-scoped accumulator artifacts are retired —
+    /// this kind's own `Data` port is the only thing it provides now.
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 4] = [
-            Port::data("deduped-flags"),
-            Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
-            Port::artifact(REVIEW_MEMBERS_ARTIFACT, make_review_members_artifact),
-            Port::artifact(REVIEW_WARNINGS_ARTIFACT, make_review_warnings_artifact),
-        ];
+        const PORTS: [Port; 1] = [Port::data(review_outputs::DEDUP_OUTPUT_KIND)];
         &PORTS
     }
 
-    /// (#1530 Packet 3a) `requires()` only — see `ReviewBundleStepKind::
-    /// provides()`'s doc for why the context artifact's `provides()`
-    /// declaration lives there instead. (#1541) Also `requires()`s
-    /// `REVIEW_PROBE_SELECTION_ARTIFACT` — `ReviewProbeRenderStepKind::
-    /// provides()`'s doc explains why the PRODUCER declares that one.
-    /// (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND` is new here —
-    /// this task now formally `reads: ["review-context-task"]`
-    /// (`review.json`) for `ctx.diff` (`dedup_flags`'s anchor matching).
+    /// (#2310 P2) `requires()` — `REVIEW_CONTEXT_ARTIFACT` (the two closure
+    /// seams + `mission_id`) plus the typed review-context data port (for
+    /// `ctx.diff`, `dedup_flags`'s anchor matching, and `ctx.
+    /// remote_max_tokens_per_execution`, the probe fold's budget). This
+    /// task's `depends_on` on every probe task delivers each one's
+    /// `review.probe-flags` output; `probe_flags_from_inputs` fans them in
+    /// by the SAME task ids `probe_specs` already names — see that
+    /// function's own doc for why this is the one helper that reads by
+    /// task id rather than scanning `input`'s values.
     fn requires(&self) -> &'static [Port] {
         const PORTS: [Port; 3] = [
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
-            Port::artifact(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact),
+            Port::data(review_outputs::PROBE_SEAT_OUTPUT_KIND),
             Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
@@ -5649,7 +5764,7 @@ impl StepKind for ReviewDedupStepKind {
     fn run_streaming(
         &self,
         step: &Step,
-        _task: &Task,
+        task: &Task,
         input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
@@ -5657,59 +5772,20 @@ impl StepKind for ReviewDedupStepKind {
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
         let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
-        let env = run_ctx
-            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
-            .expect("run_review_graph seeds the envelope artifact before the graph runs");
-        let members = run_ctx
-            .artifact::<StdMutex<Vec<MemberRecord>>>(REVIEW_MEMBERS_ARTIFACT)
-            .expect("run_review_graph seeds the members artifact before the graph runs");
-        let warnings = run_ctx
-            .artifact::<StdMutex<Vec<String>>>(REVIEW_WARNINGS_ARTIFACT)
-            .expect("run_review_graph seeds the warnings artifact before the graph runs");
-        // (#1541) The render step's published per-task selection — `None`
-        // only when NO `review.probe-render` step is present anywhere in
-        // this graph (so `probe_specs` below is empty too and the lookup
-        // below is a no-op either way); `unwrap_or_default` treats that the
-        // same as "materialized but still empty" rather than panicking on a
-        // legitimately probe-less graph.
-        let selection: std::collections::BTreeMap<String, Vec<(String, String)>> = run_ctx
-            .artifact::<StdMutex<std::collections::BTreeMap<String, Vec<(String, String)>>>>(
-                REVIEW_PROBE_SELECTION_ARTIFACT,
-            )
-            .map(|s| s.lock().expect("probe selection mutex poisoned").clone())
-            .unwrap_or_default();
 
-        // (#1530 Packet 3a follow-on) `probe_specs`/`remote_budget` now
-        // arrive via `step.config` — stamped once by
-        // `build_review_graph_from_config` — rather than constructor
-        // fields; see [`dedup_config_from_step`]'s own doc for why the read
-        // is a shared function rather than inlined here.
-        let (probe_specs, remote_budget) = dedup_config_from_step(&step.config)?;
+        // (#2310 P2) `probe_specs` still arrives via `step.config` — stamped
+        // once by `build_review_graph_from_config`; see
+        // [`dedup_config_from_step`]'s own doc.
+        let probe_specs = dedup_config_from_step(&step.config)?;
 
         let t0 = Instant::now();
-        // (#1442 ship-2b) Reconstruction boundary: raw flags + per-seat
-        // member accounting + warnings + the probe budget row, rebuilt from
-        // the seats x k map steps' per-item results.
-        let recon = reconstruct_probe_stage(&probe_specs, input, &selection, remote_budget)?;
-        members.lock().expect("probe members mutex poisoned").extend(recon.members);
-        warnings.lock().expect("probe warnings mutex poisoned").extend(recon.warnings);
-        let raw = recon.flags;
+        // (#2310 P2) Fan-in: every probe task's own typed `review.probe-
+        // collect` output, in `probe_specs`'s order.
+        let seat_outputs = probe_flags_from_inputs(self.id(), &step.id, input, &probe_specs)?;
+        let (raw, members, warnings, remote_budget, degenerate, probe_retries) =
+            fold_probe_seats(&seat_outputs, ctx.remote_max_tokens_per_execution);
         let raw_count = raw.len();
-        {
-            let mut env = env.lock().expect("shared review envelope mutex poisoned");
-            env.raw_flags = env.raw_flags.max(raw_count);
-            if let Some(row) = recon.budget_row {
-                env.remote_budgets.push(row);
-            }
-            if env.degenerate.is_none() {
-                if let Some(reason) = recon.all_draws_failed {
-                    env.degenerate = Some(reason);
-                    env.degenerate_kind = Some(DegenerateKind::Error);
-                }
-            }
-            env.probe_retries += recon.retries as usize;
-        }
-        let (deduped, _stats) = dedup_flags(raw, &ctx.diff);
+        let (deduped, stats) = dedup_flags(raw, &ctx.diff);
         let wall_ms = t0.elapsed().as_millis() as u64;
         emit_review_step_result(
             "review.dedup",
@@ -5718,7 +5794,26 @@ impl StepKind for ReviewDedupStepKind {
             ctx.mission_id.as_deref(),
             json!({ "items_in": raw_count, "items_out": deduped.len(), "wall_ms": wall_ms }),
         );
-        let output = serde_json::to_string(&deduped).context("serializing deduped flags")?;
+
+        let body = DedupOutput {
+            schema_version: review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+            flags: deduped,
+            stats,
+            members,
+            warnings,
+            remote_budget,
+            degenerate,
+            probe_retries: probe_retries as usize,
+            raw_flags: raw_count,
+        };
+        let producer = darkmux_crew::step_output::Producer::of(
+            ctx.mission_id.as_deref().unwrap_or_default(),
+            task.id.as_str(),
+            &step.id,
+        );
+        let output = darkmux_crew::step_output::Output::wrap(review_outputs::DEDUP_OUTPUT_KIND, body, producer)
+            .to_output_string()
+            .context("serializing deduped flags")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 }
@@ -5789,36 +5884,25 @@ impl StepKind for ReviewJudgeStepKind {
         "Judge"
     }
 
-    /// (#1530 Packets 1/3a) `requires()` only — this kind writes into the
-    /// `Artifact` handles `ReviewDedupStepKind::provides()` already
-    /// declares (materialized once, before any wave; see that method's
-    /// doc), and reads `REVIEW_CONTEXT_ARTIFACT` which `ReviewBundleStepKind::
-    /// provides()` declares — so it does not need to declare any of them
-    /// again as `provides()` itself. `Port::artifact`'s factory is never
-    /// invoked for a `requires()` port (only `provides()` ports are scanned
-    /// — see `scheduler::run_step_graph`'s pre-scan doc); it's supplied only
-    /// to satisfy `Port::artifact`'s constructor signature.
-    /// (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND` is new here —
-    /// this task now formally `reads: ["review-dedup-task",
-    /// "review-context-task"]` (`review.json`).
+    /// (#2310 P2) `requires()` — the typed deduped-flags output, the review
+    /// context (both artifact seam + data port), and, new this packet, the
+    /// bundle set's typed data port (`review-judge-task` now `reads:
+    /// ["review-bundle-task", ...]` directly — `residency()` needs it off
+    /// `input`, which only a declared `reads`/`depends_on` edge delivers;
+    /// see that method's own doc for why the transitive dependency through
+    /// dedup was no longer enough once the bus artifact retired).
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 6] = [
-            Port::data("deduped-flags"),
+        const PORTS: [Port; 4] = [
+            Port::data(review_outputs::DEDUP_OUTPUT_KIND),
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
-            Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
-            Port::artifact(REVIEW_MEMBERS_ARTIFACT, make_review_members_artifact),
-            // (#1530) The bundle set, published by `ReviewBundleStepKind::
-            // run_streaming` — `review-judge-task` depends (transitively, via
-            // dedup + the probe tasks) on `review-bundle-task`, so it's
-            // always populated by the time this kind's wave runs.
-            Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
+            Port::data(review_outputs::BUNDLE_SET_OUTPUT_KIND),
             Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
     }
 
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data("judged-flags")];
+        const PORTS: [Port; 1] = [Port::data(review_outputs::JUDGE_OUTPUT_KIND)];
         &PORTS
     }
 
@@ -5832,7 +5916,7 @@ impl StepKind for ReviewJudgeStepKind {
     fn run_streaming(
         &self,
         step: &Step,
-        _task: &Task,
+        task: &Task,
         input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
@@ -5840,42 +5924,14 @@ impl StepKind for ReviewJudgeStepKind {
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
         let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
-        let env = run_ctx
-            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
-            .expect("run_review_graph seeds the envelope artifact before the graph runs");
-        let members = run_ctx
-            .artifact::<StdMutex<Vec<MemberRecord>>>(REVIEW_MEMBERS_ARTIFACT)
-            .expect("run_review_graph seeds the members artifact before the graph runs");
 
-        // (#2310 P1) Explicit key, not `.values().next()` — this task's
-        // `input` now also carries `review-context-task`'s output (added so
-        // this kind can read the typed context above), and `BTreeMap`
-        // iteration order is alphabetical, not insertion order: "review-
-        // context-task" < "review-dedup-task", so `.values().next()` would
-        // silently hand this the WRONG entry the moment a second key
-        // existed. Named by the real dependency task id `gather_inputs`
-        // keys this entry with (#1341).
-        //
-        // (#2310 P1 review finding I2) A MISSING key (the edge itself
-        // renamed or dropped) is a loud config error, not a silent empty
-        // docket — `.unwrap_or_default()` used to make a renamed/dropped
-        // `review-dedup-task` `reads` edge indistinguishable from "dedup
-        // genuinely produced zero flags", which judges a silently EMPTY
-        // docket into a clean review with zero findings. A key that IS
-        // present but empty (dedup really did produce nothing) still falls
-        // through to `Vec::new()` below — that's real, not a config bug.
-        let dedup_output = input.get("review-dedup-task").cloned().ok_or_else(|| {
-            anyhow!(
-                "step `{}`: `{}` needs its task to `reads` `review-dedup-task` (the dedup output)",
-                step.id,
-                self.id()
-            )
-        })?;
-        let deduped: Vec<ProbeFlag> = if dedup_output.is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(&dedup_output).context("deserializing deduped flags")?
-        };
+        // (#2310 P2) The typed dedup output — carries the deduped flags AND
+        // (new this packet) the probe stage's own degenerate reason, which
+        // this step folds forward into its OWN `JudgeOutput.degenerate` so
+        // `ReviewVerifyRenderStepKind` (which only reads `review-judge-task`)
+        // still sees it without a new edge — see that kind's own doc.
+        let dedup_output = deduped_from_input(self.id(), &step.id, input)?;
+        let deduped = dedup_output.flags;
 
         let concurrency = step
             .config
@@ -5926,14 +5982,10 @@ impl StepKind for ReviewJudgeStepKind {
                 pass2: RemoteBudget::with_stage("judge-pass2", ctx.remote_max_tokens_per_execution, MIN_VIABLE_JUDGE_GRANT),
             })
         });
-        // (#1530) The bundle set — published by `review-bundle-task`'s own
-        // step, well before this kind's wave runs (see `requires()`'s doc).
-        let bundles = run_ctx
-            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
-            .expect("review-bundle-task's step must run before review-judge-task's own")
-            .lock()
-            .expect("review bundles mutex poisoned")
-            .clone();
+        // (#2310 P2) The bundle set — the typed output `review-bundle-task`
+        // produced; this task now `reads` it directly (see `requires()`'s
+        // doc).
+        let bundles = bundles_from_input(self.id(), &step.id, input)?.bundles;
 
         let t0 = Instant::now();
         let results: StdMutex<Vec<JudgeChunkResult>> = StdMutex::new(Vec::with_capacity(deduped.len()));
@@ -6088,20 +6140,23 @@ impl StepKind for ReviewJudgeStepKind {
             ctx.remote_max_tokens_per_execution,
             ctx.judge_exhaustion_strict,
         );
-        {
-            let mut env = env.lock().expect("shared review envelope mutex poisoned");
-            env.remote_budgets.extend(gate.remote_budget_rows);
-            if let Some(w) = gate.dispatch_error_warning {
-                env.warnings.push(w);
-            }
-            if let Some(w) = gate.coverage_warning {
-                env.warnings.push(w);
-            }
-            if gate.degenerate_reason.is_some() {
-                env.degenerate = gate.degenerate_reason;
-                env.degenerate_kind = Some(DegenerateKind::Error);
-            }
+        // (#2310 P2) These used to accumulate directly onto the shared
+        // `ArtifactBus` envelope; now they ride this step's OWN typed
+        // output — `ReviewSynthesisStepKind` folds them in. `degenerate`
+        // FOLDS FORWARD the dedup output's own degenerate reason (the
+        // all-draws-failed gate) when this step's own gate didn't already
+        // set one, so a single-`reads`-hop-away consumer
+        // (`ReviewVerifyRenderStepKind`, which reads only
+        // `review-judge-task`) still sees an upstream degenerate run
+        // without a new edge — see that kind's own doc.
+        let mut warnings: Vec<String> = Vec::new();
+        if let Some(w) = &gate.dispatch_error_warning {
+            warnings.push(w.clone());
         }
+        if let Some(w) = &gate.coverage_warning {
+            warnings.push(w.clone());
+        }
+        let degenerate = gate.degenerate_reason.clone().or_else(|| dedup_output.degenerate.clone());
 
         emit_review_step_result(
             "review.judge",
@@ -6117,36 +6172,40 @@ impl StepKind for ReviewJudgeStepKind {
             }),
         );
 
-        // (#1354 follow-up) Unlike `ReviewProbeStepKind`, this step never
-        // recorded a `MemberRecord` at all — the judge's real dispatch cost
-        // (tokens/calls/wall-time/model identity) was computed above and
-        // emitted into the flow-record stream but never landed in the
-        // envelope, so `member_summary()`'s "judged by ..." attribution
-        // fell back to "unknown" on every run. Same shared accumulator
-        // `ReviewProbeStepKind` writes to, merged into `shared_env` once
-        // `run_step_graph` returns.
-        // (#1355 follow-up) Only record a member when the judge actually
-        // dispatched — zero deduped flags means an empty `deduped` slice and
-        // the loop above never ran, so there's nothing to credit "judged
-        // by" with.
-        if judge_calls > 0 {
-            members.lock().expect("members mutex poisoned").push(MemberRecord {
-                model: judge_identifier,
-                seat: "review-judge".to_string(),
-                draws: judge_calls,
-                wall_ms: pass1_wall_ms + pass2_wall_ms,
-                total_tokens: judge_tokens,
-                remote: judge_endpoint.is_some(),
-                // (#1530 Packet 3a) `endpoint_host` is stamped into config
-                // at build time (`build_review_graph_from_config`) from
-                // `seat_endpoint_host(&judge.pm)` — the same value this used
-                // to compute here from a `self.judge` constructor field.
-                endpoint: step.config.get("endpoint_host").and_then(|v| v.as_str()).map(String::from),
-                served_model: judge_served_model,
-            });
-        }
+        // (#1355 follow-up, preserved) Only record a member when the judge
+        // actually dispatched — zero deduped flags means an empty `deduped`
+        // slice and the loop above never ran, so there's nothing to credit
+        // "judged by" with.
+        let member = (judge_calls > 0).then(|| MemberRecord {
+            model: judge_identifier,
+            seat: "review-judge".to_string(),
+            draws: judge_calls,
+            wall_ms: pass1_wall_ms + pass2_wall_ms,
+            total_tokens: judge_tokens,
+            remote: judge_endpoint.is_some(),
+            // (#1530 Packet 3a) `endpoint_host` is stamped into config at
+            // build time (`build_review_graph_from_config`) from
+            // `seat_endpoint_host(&judge.pm)`.
+            endpoint: step.config.get("endpoint_host").and_then(|v| v.as_str()).map(String::from),
+            served_model: judge_served_model,
+        });
 
-        let output = serde_json::to_string(&judged).context("serializing judged flags")?;
+        let body = JudgeOutput {
+            schema_version: review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+            judged,
+            member,
+            remote_budget_rows: gate.remote_budget_rows,
+            warnings,
+            degenerate,
+        };
+        let producer = darkmux_crew::step_output::Producer::of(
+            ctx.mission_id.as_deref().unwrap_or_default(),
+            task.id.as_str(),
+            &step.id,
+        );
+        let output = darkmux_crew::step_output::Output::wrap(review_outputs::JUDGE_OUTPUT_KIND, body, producer)
+            .to_output_string()
+            .context("serializing judged flags")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 
@@ -6184,14 +6243,21 @@ impl StepKind for ReviewJudgeStepKind {
         &self,
         step: &Step,
         _task: &Task,
-        _input: &std::collections::BTreeMap<String, String>,
-        run_ctx: &StepRunCtx,
+        input: &std::collections::BTreeMap<String, String>,
+        _run_ctx: &StepRunCtx,
     ) -> Option<darkmux_gestalt::Placement> {
         if step.config.get("endpoint").is_some() {
             return None;
         }
-        let bundles = run_ctx.artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)?;
-        if bundles.lock().expect("review bundles mutex poisoned").is_empty() {
+        // (#2310 P2) The bundle set now arrives through `input` (this
+        // task's own `reads: ["review-bundle-task", ...]` — see
+        // `requires()`'s doc) rather than the retired
+        // `REVIEW_BUNDLES_ARTIFACT` bus artifact. `residency()` runs on the
+        // main thread BEFORE this step's wave, once `review-bundle-task`
+        // has already completed (an earlier wave), so `gather_inputs` has
+        // already populated this entry by the time this runs.
+        let bundles = find_by_kind::<BundleSetOutput>(input, review_outputs::BUNDLE_SET_OUTPUT_KIND)?.body.bundles;
+        if bundles.is_empty() {
             return None;
         }
         let model_key = step.config.get("model_key").and_then(|v| v.as_str())?;
@@ -6251,23 +6317,16 @@ impl StepKind for ReviewVerifyRenderStepKind {
         "Verify prompts"
     }
 
-    /// (#1530 Packets 1/3a) `requires()` only — see `ReviewJudgeStepKind::
-    /// requires()`'s doc for why a downstream consumer of
-    /// `ReviewDedupStepKind::provides()`'s/`ReviewBundleStepKind::
-    /// provides()`'s artifacts declares `requires()` rather than
-    /// re-`provides()`ing them.
-    /// (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND` is new here —
-    /// this task now formally `reads: ["review-judge-task",
-    /// "review-context-task"]` (`review.json`).
+    /// (#2310 P2) `requires()` — the typed judged-flags output, the review
+    /// context (artifact seam + data port), and, new this packet, the
+    /// bundle set's typed data port (`review-verify-task` now also `reads:
+    /// "review-bundle-task"` directly, rather than relying on the retired
+    /// `REVIEW_BUNDLES_ARTIFACT` bus artifact being populated transitively).
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 5] = [
-            Port::data("judged-flags"),
+        const PORTS: [Port; 4] = [
+            Port::data(review_outputs::JUDGE_OUTPUT_KIND),
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
-            Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
-            // (#1530) The bundle set — always populated by this point:
-            // `review-verify-task` depends on `review-judge-task`, which
-            // itself depends (transitively) on `review-bundle-task`.
-            Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
+            Port::data(review_outputs::BUNDLE_SET_OUTPUT_KIND),
             Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
@@ -6296,34 +6355,13 @@ impl StepKind for ReviewVerifyRenderStepKind {
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
         let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
-        let env = run_ctx
-            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
-            .expect("run_review_graph seeds the envelope artifact before the graph runs");
 
-        // (#2310 P1) Explicit key, not `.values().next()` — same
-        // alphabetical-iteration hazard as `ReviewJudgeStepKind`'s own fix
-        // (see that kind's doc comment): "review-context-task" now shares
-        // this `input` map with "review-judge-task".
-        //
-        // (#2310 P1 review finding I2) A MISSING key is a loud config error
-        // — see `ReviewJudgeStepKind::run_streaming`'s identical fix for
-        // `review-dedup-task`, same reasoning: a renamed/dropped
-        // `review-judge-task` `reads` edge must not read as "judge produced
-        // zero confirmed flags" (a clean, silent, zero-finding review). A
-        // present-but-empty key (judge really did confirm nothing) still
-        // falls through to `Vec::new()` below.
-        let judge_output = input.get("review-judge-task").cloned().ok_or_else(|| {
-            anyhow!(
-                "step `{}`: `{}` needs its task to `reads` `review-judge-task` (the judge output)",
-                step.id,
-                self.id()
-            )
-        })?;
-        let judged: Vec<JudgedFlag> = if judge_output.is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(&judge_output).context("deserializing judged flags")?
-        };
+        // (#2310 P2) The typed judge output — carries `judged` AND (folded
+        // forward by `ReviewJudgeStepKind`) the run's degenerate reason, if
+        // any (its own gate's, or the probe/dedup stage's, folded forward —
+        // see that kind's own doc).
+        let judge_output = judged_from_input(self.id(), &step.id, input)?;
+        let judged = judge_output.judged;
 
         // (#1530 Packet 3a) Stamped by `build_review_graph_from_config` —
         // `verify.is_some()` at build time, read back here instead of a
@@ -6333,12 +6371,7 @@ impl StepKind for ReviewVerifyRenderStepKind {
         let confirmed: Vec<&JudgedFlag> = judged.iter().filter(|j| j.tier == Tier::Confirmed).collect();
         let skip_reason: Option<&str> = if !verify_seat_staffed {
             Some("no verify seat staffed — judged flags pass through unchanged")
-        } else if env
-            .lock()
-            .expect("shared review envelope mutex poisoned")
-            .degenerate
-            .is_some()
-        {
+        } else if judge_output.degenerate.is_some() {
             Some("run already degenerate — no verify dispatch on a doomed run")
         } else if confirmed.is_empty() {
             Some("zero confirmed findings — verify skipped before any model load")
@@ -6363,15 +6396,9 @@ impl StepKind for ReviewVerifyRenderStepKind {
         let prompts: Vec<serde_json::Value> = if skip_reason.is_some() {
             Vec::new()
         } else {
-            // (#1530) The bundle set — published by `review-bundle-task`'s
-            // own step; see `requires()`'s doc for why it's guaranteed
-            // populated by this point.
-            let bundles = run_ctx
-                .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
-                .expect("review-bundle-task's step must run before review-verify-task's own")
-                .lock()
-                .expect("review bundles mutex poisoned")
-                .clone();
+            // (#2310 P2) The bundle set — the typed output `review-bundle-
+            // task` produced; this task now `reads` it directly.
+            let bundles = bundles_from_input(self.id(), &step.id, input)?.bundles;
             confirmed
                 .iter()
                 .map(|j| {
@@ -6402,144 +6429,141 @@ impl StepKind for ReviewVerifyRenderStepKind {
     }
 }
 
-/// (#1442 ship-2b) What the verify-apply boundary contributes to the
-/// envelope beyond the in-place `judged` mutation: the seat's member row,
-/// the stage's exhaustion warning, and its remote budget row.
+/// (#2310 P2) What the verify boundary contributes to the envelope beyond
+/// the parsed [`VerifyRecord`]s themselves: the seat's member row, the
+/// stage's exhaustion warning, and its remote budget row.
 pub(crate) struct VerifyApplyOutcome {
     pub(crate) member: Option<MemberRecord>,
     pub(crate) warning: Option<String>,
     pub(crate) budget_row: Option<RemoteBudgetRecord>,
 }
 
-/// (#1442 ship-2b) Apply the verify map step's per-item results back onto
-/// the judged docket — the domain half of the retired `ReviewVerifyStepKind`
-/// loop, now running at the synthesis boundary. Item index i corresponds to
-/// the i-th CONFIRMED flag (the render step minted the collection in
-/// exactly that order — index alignment by construction).
+/// (#2310 P2) `apply_verify_results` (which used to both PARSE the verify
+/// map's raw results AND mutate the judged docket in place, at the
+/// synthesis boundary) split across the new `review.verify-collect` step:
 ///
-/// State machine preserved verbatim: `verified` keeps `Confirmed` (marker
-/// dropped downstream), `refuted` demotes to `Archived` +
-/// `demoted_by_verify`, everything inconclusive (`uncertain`/`unparsed`/
-/// `error`/budget-skip) keeps `Confirmed` WITH the manual-verification
-/// marker. Verify-stage exhaustion degrades the STAGE, never the run.
-///
-/// (#1530 Packet 3a) Takes the seat's already-derived identity
-/// (`identifier`/`remote`/`endpoint_host` — `seat_identifier(&vstaff.pm)`/
-/// `vstaff.pm.is_remote()`/`seat_endpoint_host(&vstaff.pm)`) rather than the
-/// whole `&ResolvedSeatStaffing` this used to take. Its one caller
-/// (`ReviewSynthesisStepKind::run_streaming`) no longer HOLDS a
-/// `ResolvedSeatStaffing` — `build_review_graph_from_config` computes these
-/// same three values at build time and stamps them onto the synthesis
-/// step's own config, the same "compute once, stamp, read back" pattern the
-/// judge/verify-render kinds now use — so this function's OWN logic is
-/// unchanged, only what it derives the values FROM moved to its caller.
-///
-/// Argument count exceeds clippy's default threshold (8 vs 7) since #1641's
-/// `mission_id` addition — every parameter is inherent to the call (the
-/// per-item results, the seat's derived identity, the budget, the run's own
-/// case/mission identity for the "step result" records this emits), not
-/// incidental bloat; mirrors the same accepted trade-off `run_step_graph`'s
-/// own `#[allow(clippy::too_many_arguments)]` documents.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_verify_results(
-    judged: &mut [JudgedFlag],
+/// - [`build_verify_records`] — the PARSE half. Turns each raw
+///   [`MapItemResult`] into a [`VerifyRecord`] (ruling/evidence/note/
+///   seconds/model) and emits the SAME per-item `"review.verify"`/
+///   `"review-ruling"` flow record the retired function did. Item index i
+///   still corresponds to the i-th CONFIRMED flag (the render step minted
+///   the collection in exactly that order) — `confirmed_bundle_ids` is
+///   that same ordering's `bundle_id`s, read-only, for the log line only.
+/// - [`fold_verify_results`] — the ACCOUNTING half (member/warning/budget
+///   row), needing only `results` + the seat's identity + the docket
+///   length (not the docket itself).
+/// - [`apply_verify_records`] — the APPLY half, now run by
+///   `ReviewSynthesisStepKind` over `review.verify-collect`'s typed
+///   `results`: state machine preserved verbatim (`verified` keeps
+///   `Confirmed`; `refuted` demotes to `Archived` + `demoted_by_verify`;
+///   everything inconclusive keeps `Confirmed` WITH the manual-verification
+///   marker — verify-stage exhaustion degrades the STAGE, never the run).
+pub(crate) fn build_verify_records(
+    confirmed_bundle_ids: &[String],
+    results: &[MapItemResult],
+    identifier: &str,
+    case_id: &str,
+    mission_id: Option<&str>,
+) -> Vec<VerifyRecord> {
+    confirmed_bundle_ids
+        .iter()
+        .zip(results.iter())
+        .map(|(bundle_id, item)| {
+            let record = if item.error.as_deref() == Some(MAP_BUDGET_SKIP_ERROR) {
+                VerifyRecord {
+                    ruling: VerifyRuling::Error,
+                    decisive_evidence: String::new(),
+                    note_for_author:
+                        "remote token budget exhausted for this stage — call skipped".to_string(),
+                    seconds: 0.0,
+                    model: identifier.to_string(),
+                }
+            } else {
+                let seconds = item.wall_ms as f64 / 1000.0;
+                if !item.ok {
+                    VerifyRecord {
+                        ruling: VerifyRuling::Error,
+                        decisive_evidence: String::new(),
+                        note_for_author: format!(
+                            "verify dispatch failed: {}",
+                            item.error.as_deref().unwrap_or_default()
+                        ),
+                        seconds,
+                        model: identifier.to_string(),
+                    }
+                } else {
+                    match parse_verify_ruling(&item.content) {
+                        Some((ruling, decisive_evidence, note_for_author)) => VerifyRecord {
+                            ruling,
+                            decisive_evidence,
+                            note_for_author,
+                            seconds,
+                            model: identifier.to_string(),
+                        },
+                        None => VerifyRecord {
+                            ruling: VerifyRuling::Unparsed,
+                            decisive_evidence: String::new(),
+                            note_for_author: String::new(),
+                            seconds,
+                            model: identifier.to_string(),
+                        },
+                    }
+                }
+            };
+            emit_review_step_result(
+                "review.verify",
+                "review-ruling",
+                case_id,
+                mission_id,
+                json!({ "bundle_id": bundle_id, "stage": "verify", "ruling": record.ruling, "seconds": record.seconds }),
+            );
+            record
+        })
+        .collect()
+}
+
+/// The accounting half — see [`build_verify_records`]'s doc.
+pub(crate) fn fold_verify_results(
     results: &[MapItemResult],
     identifier: &str,
     remote: bool,
     endpoint_host: Option<&str>,
     budget: u64,
-    case_id: &str,
-    mission_id: Option<&str>,
+    docket_len: usize,
 ) -> VerifyApplyOutcome {
-    let identifier = identifier.to_string();
-    let endpoint_host = endpoint_host.map(String::from);
-    let docket = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
-
     let mut calls = 0u32;
     let mut skipped = 0u32;
     let mut tokens = 0u64;
     let mut wall_ms = 0u64;
     let mut served_model: Option<String> = None;
-
-    for (j, item) in judged.iter_mut().filter(|j| j.tier == Tier::Confirmed).zip(results.iter()) {
-        let record = if item.error.as_deref() == Some(MAP_BUDGET_SKIP_ERROR) {
+    for item in results {
+        if item.error.as_deref() == Some(MAP_BUDGET_SKIP_ERROR) {
             skipped += 1;
-            VerifyRecord {
-                ruling: VerifyRuling::Error,
-                decisive_evidence: String::new(),
-                note_for_author:
-                    "remote token budget exhausted for this stage — call skipped".to_string(),
-                seconds: 0.0,
-                model: identifier.clone(),
-            }
-        } else {
-            calls += 1;
-            tokens += item.total_tokens.unwrap_or(0);
-            wall_ms += item.wall_ms;
-            if served_model.is_none() {
-                served_model = item.served_model.clone();
-            }
-            let seconds = item.wall_ms as f64 / 1000.0;
-            if !item.ok {
-                VerifyRecord {
-                    ruling: VerifyRuling::Error,
-                    decisive_evidence: String::new(),
-                    note_for_author: format!(
-                        "verify dispatch failed: {}",
-                        item.error.as_deref().unwrap_or_default()
-                    ),
-                    seconds,
-                    model: identifier.clone(),
-                }
-            } else {
-                match parse_verify_ruling(&item.content) {
-                    Some((ruling, decisive_evidence, note_for_author)) => VerifyRecord {
-                        ruling,
-                        decisive_evidence,
-                        note_for_author,
-                        seconds,
-                        model: identifier.clone(),
-                    },
-                    None => VerifyRecord {
-                        ruling: VerifyRuling::Unparsed,
-                        decisive_evidence: String::new(),
-                        note_for_author: String::new(),
-                        seconds,
-                        model: identifier.clone(),
-                    },
-                }
-            }
-        };
-        emit_review_step_result(
-            "review.verify",
-            "review-ruling",
-            case_id,
-            mission_id,
-            json!({ "bundle_id": j.flag.bundle_id, "stage": "verify", "ruling": record.ruling, "seconds": record.seconds }),
-        );
-        if record.ruling == VerifyRuling::Refuted {
-            j.tier = Tier::Archived;
-            j.demoted_by_verify = true;
+            continue;
         }
-        j.verify = Some(record);
+        calls += 1;
+        tokens += item.total_tokens.unwrap_or(0);
+        wall_ms += item.wall_ms;
+        if served_model.is_none() {
+            served_model = item.served_model.clone();
+        }
     }
-
     let member = (calls > 0).then(|| MemberRecord {
-        model: identifier,
+        model: identifier.to_string(),
         seat: "review-verify".to_string(),
         draws: calls,
         wall_ms,
         total_tokens: tokens,
         remote,
-        endpoint: endpoint_host,
+        endpoint: endpoint_host.map(String::from),
         served_model,
     });
     // Same wording as `verify_budget_outcome` (the sequential path's
     // helper) — stage-degrading, loud, never run-degrading.
     let warning = (skipped > 0).then(|| {
-        let adjudicated = docket.saturating_sub(skipped as usize);
+        let adjudicated = docket_len.saturating_sub(skipped as usize);
         format!(
-            "verify budget exhausted after {adjudicated} of {docket} adjudications — the \
+            "verify budget exhausted after {adjudicated} of {docket_len} adjudications — the \
              remaining {skipped} confirmed finding(s) keep the manual-verification marker (the \
              per-execution allowance of {budget} tokens ran out)"
         )
@@ -6558,6 +6582,159 @@ pub(crate) fn apply_verify_results(
         skipped_calls: skipped,
     });
     VerifyApplyOutcome { member, warning, budget_row }
+}
+
+/// The apply half — see [`build_verify_records`]'s doc. `records` is
+/// `review.verify-collect`'s typed `results`, index-aligned with `judged`'s
+/// CONFIRMED flags in docket order.
+pub(crate) fn apply_verify_records(judged: &mut [JudgedFlag], records: &[VerifyRecord]) {
+    for (j, record) in judged.iter_mut().filter(|j| j.tier == Tier::Confirmed).zip(records.iter()) {
+        if record.ruling == VerifyRuling::Refuted {
+            j.tier = Tier::Archived;
+            j.demoted_by_verify = true;
+        }
+        j.verify = Some(record.clone());
+    }
+}
+
+// ─── report: verify collect (third step of the verify task) ────────────
+
+/// (#2310 P2) Phase "report", step 3 of the verify TASK: turns the
+/// `dispatch.map` step's raw [`MapItemResult`]s (its own predecessor) into
+/// a typed [`VerifyOutput`] — one [`VerifyRecord`] per confirmed flag, plus
+/// the seat's member/warning/budget-row facts. `ReviewSynthesisStepKind`
+/// applies the parsed records back onto the judged docket via
+/// [`apply_verify_records`].
+///
+/// Unlike the probe stage's third step, this one needs NO recomputation
+/// trick: the verify TASK already `reads: ["review-judge-task",
+/// "review-context-task"]` (`review.json`), and `scheduler::gather_inputs`
+/// delivers a task's `depends_on`/`reads` outputs to EVERY step of the
+/// task, not just the first (#2310 P2a) — so this step (index 2) already
+/// has the judged docket in `input`, the same as the render step (index 0)
+/// and the map step (index 1) do, with no new edge required.
+pub struct ReviewVerifyCollectStepKind;
+
+impl StepKind for ReviewVerifyCollectStepKind {
+    fn id(&self) -> &'static str {
+        "review.verify-collect"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Verify collect"
+    }
+
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 3] = [
+            Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
+            Port::data(review_outputs::JUDGE_OUTPUT_KIND),
+            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
+        ];
+        &PORTS
+    }
+
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data(review_outputs::VERIFY_OUTPUT_KIND)];
+        &PORTS
+    }
+
+    fn run(&self, _s: &Step, _t: &Task, _i: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        panic!(
+            "ReviewVerifyCollectStepKind only runs through `run_streaming` — it reads the \
+             run-scoped ArtifactBus (#2310 P2)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        step: &Step,
+        task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let seam_ctx = run_ctx
+            .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
+            .expect("run_review_graph seeds the context artifact before the graph runs");
+        let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
+        let judge_output = judged_from_input(self.id(), &step.id, input)?;
+        let confirmed_bundle_ids: Vec<String> = judge_output
+            .judged
+            .iter()
+            .filter(|j| j.tier == Tier::Confirmed)
+            .map(|j| j.flag.bundle_id.clone())
+            .collect();
+
+        // The predecessor: this task's own `dispatch.map` step (index 1),
+        // one step back from this one (index 2).
+        let map_step_id = task
+            .step_ids
+            .iter()
+            .position(|id| id == &step.id)
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| task.step_ids.get(i))
+            .ok_or_else(|| {
+                anyhow!("`{}`: step `{}` must be the third step of the verify task", self.id(), step.id)
+            })?;
+        let raw = input.get(map_step_id).map(String::as_str).unwrap_or("[]");
+        let raw = raw.trim();
+        let results: Vec<MapItemResult> =
+            if raw.is_empty() { Vec::new() } else { serde_json::from_str(raw).with_context(|| {
+                format!("deserializing verify map results from step `{map_step_id}`")
+            })? };
+
+        // (#1530 Packet 3a pattern, moved here from synthesis) Stamped by
+        // `build_review_graph_from_config` — present iff a verify seat is
+        // staffed.
+        let identifier = step.config.get("verify_identifier").and_then(|v| v.as_str());
+        let (records, outcome) = match identifier {
+            Some(identifier) => {
+                let remote = step.config.get("verify_remote").and_then(|v| v.as_bool()).unwrap_or(false);
+                let endpoint_host = step.config.get("verify_endpoint_host").and_then(|v| v.as_str());
+                let records = build_verify_records(
+                    &confirmed_bundle_ids,
+                    &results,
+                    identifier,
+                    &ctx.case_id,
+                    ctx.mission_id.as_deref(),
+                );
+                let outcome = fold_verify_results(
+                    &results,
+                    identifier,
+                    remote,
+                    endpoint_host,
+                    ctx.remote_max_tokens_per_execution,
+                    confirmed_bundle_ids.len(),
+                );
+                (records, outcome)
+            }
+            None => (Vec::new(), VerifyApplyOutcome { member: None, warning: None, budget_row: None }),
+        };
+
+        emit_review_step_result(
+            "review.verify-collect",
+            &step.id,
+            &ctx.case_id,
+            ctx.mission_id.as_deref(),
+            json!({ "items_in": results.len(), "items_out": records.len() }),
+        );
+
+        let body = VerifyOutput {
+            schema_version: review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+            results: records,
+            member: outcome.member,
+            warning: outcome.warning,
+            budget_row: outcome.budget_row,
+        };
+        let producer = darkmux_crew::step_output::Producer::of(
+            ctx.mission_id.as_deref().unwrap_or_default(),
+            task.id.as_str(),
+            &step.id,
+        );
+        let output = darkmux_crew::step_output::Output::wrap(review_outputs::VERIFY_OUTPUT_KIND, body, producer)
+            .to_output_string()
+            .context("serializing verify results")?;
+        Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
 }
 
 // ─── report: synthesis (terminal step) ──────────────────────────────────
@@ -6601,36 +6778,6 @@ pub(crate) fn apply_verify_results(
 /// trivially round-tripped through JSON.
 pub struct ReviewSynthesisStepKind;
 
-/// (#1530 Packet 3a follow-on) Reads `"dedup_task_id"`/`"judge_task_id"`/
-/// `"verify_task_id"`/`"remote_budget"` off `review-synthesis-step`'s
-/// config — stamped unconditionally by `build_review_graph_from_config`
-/// (see [`ReviewSynthesisStepKind`]'s own doc). Extracted into its own
-/// function for the same reason [`dedup_config_from_step`] is — a
-/// key-name mismatch between stamper and reader surfaces at TEST time,
-/// not only inside a live graph run.
-fn synthesis_task_ids_from_step(config: &serde_json::Value) -> Result<(String, String, String, u64)> {
-    let dedup_task_id = config
-        .get("dedup_task_id")
-        .and_then(|v| v.as_str())
-        .context("darkmux: review-synthesis-step config is missing \"dedup_task_id\" (or it is not a string)")?
-        .to_string();
-    let judge_task_id = config
-        .get("judge_task_id")
-        .and_then(|v| v.as_str())
-        .context("darkmux: review-synthesis-step config is missing \"judge_task_id\" (or it is not a string)")?
-        .to_string();
-    let verify_task_id = config
-        .get("verify_task_id")
-        .and_then(|v| v.as_str())
-        .context("darkmux: review-synthesis-step config is missing \"verify_task_id\" (or it is not a string)")?
-        .to_string();
-    let remote_budget = config
-        .get("remote_budget")
-        .and_then(|v| v.as_u64())
-        .context("darkmux: review-synthesis-step config is missing \"remote_budget\" (or it is not a u64)")?;
-    Ok((dedup_task_id, judge_task_id, verify_task_id, remote_budget))
-}
-
 impl StepKind for ReviewSynthesisStepKind {
     fn id(&self) -> &'static str {
         "review.synthesis"
@@ -6640,26 +6787,28 @@ impl StepKind for ReviewSynthesisStepKind {
         "Synthesis"
     }
 
-    /// (#1530 Packets 1/3a) `requires()` only — see `ReviewJudgeStepKind::
-    /// requires()`'s doc. (#2310 P1) `review_context::
-    /// REVIEW_CONTEXT_OUTPUT_KIND` is new here — this task now formally
-    /// `reads: ["review-dedup-task", "review-judge-task",
-    /// "review-context-task"]` (`review.json`).
+    /// (#2310 P2) `requires()` — the typed dedup/judge/verify outputs, the
+    /// bundle set (new this packet: `review-synthesis-task` now `reads:
+    /// "review-bundle-task"` directly, for the zero-bundle degenerate gate
+    /// — see `run_streaming`'s own comment), and the review context
+    /// (artifact seam + data port). `ArtifactBus` no longer carries the
+    /// shared envelope/members accumulators — this step builds
+    /// `ReviewEnvelope` FRESH from these typed inputs, never from a
+    /// mutable shared value other steps also touched.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 7] = [
-            Port::data("deduped-flags"),
-            Port::data("judged-flags"),
-            Port::data("verify-results"),
+        const PORTS: [Port; 6] = [
+            Port::data(review_outputs::DEDUP_OUTPUT_KIND),
+            Port::data(review_outputs::JUDGE_OUTPUT_KIND),
+            Port::data(review_outputs::VERIFY_OUTPUT_KIND),
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
-            Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
-            Port::artifact(REVIEW_MEMBERS_ARTIFACT, make_review_members_artifact),
+            Port::data(review_outputs::BUNDLE_SET_OUTPUT_KIND),
             Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
     }
 
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data("envelope")];
+        const PORTS: [Port; 1] = [Port::data(review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND)];
         &PORTS
     }
 
@@ -6673,7 +6822,7 @@ impl StepKind for ReviewSynthesisStepKind {
     fn run_streaming(
         &self,
         step: &Step,
-        _task: &Task,
+        task: &Task,
         input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
@@ -6681,91 +6830,79 @@ impl StepKind for ReviewSynthesisStepKind {
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
         let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
-        // (named `shared_env`, not `env` — the function body below rebinds
-        // `env` to an owned, cloned-out `ReviewEnvelope` value partway
-        // through; this handle is what that clone gets written BACK onto.)
-        let shared_env = run_ctx
-            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
-            .expect("run_review_graph seeds the envelope artifact before the graph runs");
-        let members = run_ctx
-            .artifact::<StdMutex<Vec<MemberRecord>>>(REVIEW_MEMBERS_ARTIFACT)
-            .expect("run_review_graph seeds the members artifact before the graph runs");
-
-        // (#1530 Packet 3a follow-on) `dedup_task_id`/`judge_task_id`/
-        // `verify_task_id`/`remote_budget` now arrive via `step.config` —
-        // stamped once by `build_review_graph_from_config`, unconditionally
-        // (unlike the `verify_*` trio below, which is present only when a
-        // verify seat is staffed) — rather than constructor fields; see
-        // [`synthesis_task_ids_from_step`]'s own doc for why the read is a
-        // shared function rather than inlined here.
-        let (dedup_task_id, judge_task_id, verify_task_id, remote_budget) =
-            synthesis_task_ids_from_step(&step.config)?;
 
         let t0 = Instant::now();
-        let dedup_output = input.get(&dedup_task_id).cloned().unwrap_or_default();
-        let judge_output = input.get(&judge_task_id).cloned().unwrap_or_default();
-        let verify_output = input.get(&verify_task_id).cloned().unwrap_or_default();
-        let flags: Vec<ProbeFlag> = if dedup_output.is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(&dedup_output).context("deserializing deduped flags")?
-        };
-        let mut judged: Vec<JudgedFlag> = if judge_output.is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(&judge_output).context("deserializing judged flags")?
-        };
-        let verify_results: Vec<MapItemResult> = if verify_output.trim().is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(&verify_output).context("deserializing verify map results")?
-        };
+        // (#2310 P2) Every producer's typed output, read by kind — no more
+        // task-id-keyed lookups, no more shared mutable envelope.
+        let dedup_output = deduped_from_input(self.id(), &step.id, input)?;
+        let judge_output = judged_from_input(self.id(), &step.id, input)?;
+        let verify_output = verify_from_input(self.id(), &step.id, input)?;
+        let bundle_output = bundles_from_input(self.id(), &step.id, input)?;
 
-        // (#1442 ship-2b) Verify-APPLY boundary: fold the generic map's
-        // per-item results back onto the confirmed docket. An empty result
+        let flags = dedup_output.flags;
+        let mut judged = judge_output.judged;
+
+        // (#2310 P2) Verify-APPLY boundary: fold `review.verify-collect`'s
+        // typed `results` back onto the confirmed docket. An empty result
         // set covers every no-dispatch path in one shape (no seat staffed /
-        // doomed run / zero confirmed — the render step emitted an empty
-        // collection, the map short-circuited): the docket passes through
+        // doomed run / zero confirmed): the docket passes through
         // untouched, byte-identical to a crew with no verify seat.
-        //
-        // (#1530 Packet 3a) The verify seat's derived identity
-        // (`identifier`/`remote`/`endpoint_host`) is stamped by
-        // `build_review_graph_from_config` onto THIS step's own config
-        // (`"verify_identifier"` present iff a verify seat was staffed —
-        // the same `.is_some()` test `if let Some(vstaff) = &self.verify`
-        // used to make) instead of a `self.verify: Option<ResolvedSeatStaffing>`
-        // constructor field.
-        if let Some(identifier) = step.config.get("verify_identifier").and_then(|v| v.as_str()) {
-            if !verify_results.is_empty() {
-                let remote = step.config.get("verify_remote").and_then(|v| v.as_bool()).unwrap_or(false);
-                let endpoint_host = step.config.get("verify_endpoint_host").and_then(|v| v.as_str());
-                let outcome = apply_verify_results(
-                    &mut judged,
-                    &verify_results,
-                    identifier,
-                    remote,
-                    endpoint_host,
-                    remote_budget,
-                    &ctx.case_id,
-                    ctx.mission_id.as_deref(),
-                );
-                if let Some(member) = outcome.member {
-                    members.lock().expect("members mutex poisoned").push(member);
-                }
-                if outcome.warning.is_some() || outcome.budget_row.is_some() {
-                    let mut env = shared_env.lock().expect("shared review envelope mutex poisoned");
-                    if let Some(w) = outcome.warning {
-                        env.warnings.push(w);
-                    }
-                    if let Some(rec) = outcome.budget_row {
-                        env.remote_budgets.push(rec);
-                    }
-                }
-            }
+        apply_verify_records(&mut judged, &verify_output.results);
+
+        // (#2310 P2) Build the envelope FRESH — `case_id`/`crew`/`mode`/
+        // `fingerprint`/`staffing` come off the bus seam beside
+        // `mission_id` (`run_review_graph` seeds them there now instead of
+        // pre-stamping a shared envelope — see `ReviewStepContext`'s own
+        // doc on those four fields); every OTHER field folds from the
+        // typed producer outputs this step just read.
+        let mut env = ReviewEnvelope {
+            case_id: ctx.case_id.clone(),
+            crew: ctx.crew_name.clone().unwrap_or_default(),
+            mode: ctx.mode_label.clone().unwrap_or_default(),
+            fingerprint: ctx.fingerprint.clone().unwrap_or_default(),
+            staffing: ctx.staffing.clone(),
+            ..ReviewEnvelope::default()
+        };
+        env.bundles = bundle_output.bundles.len();
+        env.bundle_skip = bundle_output.skip;
+        env.bundler_fallback = bundle_output.bundler_fallback;
+        env.raw_flags = dedup_output.raw_flags;
+        env.probe_retries = dedup_output.probe_retries;
+        env.members.extend(dedup_output.members);
+        env.warnings.extend(dedup_output.warnings);
+        if let Some(row) = dedup_output.remote_budget {
+            env.remote_budgets.push(row);
+        }
+        env.degenerate = dedup_output.degenerate;
+        if env.degenerate.is_some() {
+            env.degenerate_kind = Some(DegenerateKind::Error);
         }
 
-        let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
-        env.raw_flags = env.raw_flags.max(flags.len());
+        if let Some(member) = judge_output.member {
+            env.members.push(member);
+        }
+        env.remote_budgets.extend(judge_output.remote_budget_rows);
+        env.warnings.extend(judge_output.warnings);
+        // (#2310 P2) `ReviewJudgeStepKind` already folds the dedup stage's
+        // own degenerate reason FORWARD into its own `degenerate` field
+        // when it had none of its own (see that kind's doc) — so reading
+        // `judge_output.degenerate` here covers BOTH stages without this
+        // step needing to compare the two.
+        if env.degenerate.is_none() && judge_output.degenerate.is_some() {
+            env.degenerate = judge_output.degenerate;
+            env.degenerate_kind = Some(DegenerateKind::Error);
+        }
+
+        if let Some(member) = verify_output.member {
+            env.members.push(member);
+        }
+        if let Some(w) = verify_output.warning {
+            env.warnings.push(w);
+        }
+        if let Some(rec) = verify_output.budget_row {
+            env.remote_budgets.push(rec);
+        }
+
         env.deduped_flags = flags.len();
         env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
         env.needs_check = judged.iter().filter(|j| j.tier == Tier::NeedsCheck).count();
@@ -6779,39 +6916,54 @@ impl StepKind for ReviewSynthesisStepKind {
         env.flags = flags;
         env.judged = judged;
 
-        // (#1355 follow-up) The two most fundamental "no signal" gates from
-        // the old `run_review_impl` driver (`bundles.is_empty()` / early
-        // `raw_flags.is_empty()`) were never ported when the graph engine
-        // replaced it — the graph never early-returns; every step just runs
-        // on whatever (possibly empty) data it's handed and synthesis is the
-        // only place with full visibility to catch this. Without these, a
-        // diff that produces zero bundles (or zero probe draws) silently
-        // renders as a clean pass instead of the LOUD degenerate outcome
-        // `ReviewEnvelope::degenerate`'s own doc comment promises ("never a
-        // silent pass") — confirmed as a real, live regression via the
-        // review-bench migration's degenerate-fixture test.
-        // (#1418) This step runs INSIDE `run_step_graph`, before
-        // `run_review_graph`'s post-run merge populates `env.members` from
-        // the probe accumulators (still empty here, see that merge's own
-        // doc), so synthesis can catch THAT draws were zero
-        // (`deduped_flags == 0`) but not WHY. `run_review_graph` replaces
-        // this generic reason with a more specific "no seat matched any
-        // bundle" one, once `env.members` is accurate, when that's the
-        // actual cause; see the doc there.
+        // (#1355 follow-up, preserved) The two most fundamental "no signal"
+        // gates: a diff that produces zero bundles (or zero probe draws)
+        // must never silently render as a clean pass — `ReviewEnvelope::
+        // degenerate`'s own doc promises "never a silent pass".
+        // (#2310 P2) This step now reads `review-bundle-task`'s typed
+        // output directly (a new `reads` edge — `bundle_output` above), so
+        // it has `env.bundle_skip` in hand immediately; the pre-P2
+        // "generic reason now, more specific one after the post-run merge"
+        // two-step (`run_review_graph`'s own doc note) is gone — every
+        // input this gate needs is already typed and already read.
         if env.degenerate.is_none() {
             if env.bundles == 0 {
-                // (#1605) The classifier reads `env.bundle_skip` (stamped by
-                // `ReviewBundleStepKind::run_streaming`, above) to build a
-                // REASONED summary and decide benign-vs-error — replacing
-                // the old fixed string, which could not distinguish "diff
-                // was entirely non-code" from "bundler bug" from "diff
-                // exceeded some internal bound".
                 let (msg, kind) = classify_zero_bundle_degenerate(&env.bundle_skip);
                 env.degenerate = Some(msg);
                 env.degenerate_kind = Some(kind);
-            } else if env.deduped_flags == 0 {
-                env.degenerate = Some("zero flags from all probe draws — never a silent pass".to_string());
-                env.degenerate_kind = Some(DegenerateKind::Error);
+            } else {
+                // (#2310 P2, folds forward `run_review_graph`'s retired
+                // post-run "no seat matched any bundle" reclassification)
+                // `total_draws == 0` STRICTLY IMPLIES `deduped_flags == 0`
+                // (a flag can only exist from a fired draw's own reply), so
+                // this specific check must run BEFORE the generic
+                // `deduped_flags == 0` one below — checking the generic one
+                // first would shadow this one every time, since its
+                // condition is always also true whenever this one's is.
+                // `env.staffing`, not `env.members` (a member is pushed
+                // only when `draws > 0`) — the staffing snapshot names how
+                // many seats were actually staffed.
+                let total_draws: u32 = env.members.iter().map(|m| m.draws).sum();
+                if total_draws == 0 && env.staffing.as_ref().map(|s| !s.probes.is_empty()).unwrap_or(false) {
+                    env.degenerate = Some(format!(
+                        "no probe seat placed a call: zero draws across {} staffed probe seat(s), \
+                         though the diff produced {} bundle(s) — every seat returned nothing usable \
+                         rather than failing, so check the probe seats' own output (their model may \
+                         be replying in a shape the parser rejects); a review that examined nothing \
+                         is never a clean pass",
+                        env.staffing.as_ref().map(|s| s.probes.len()).unwrap_or(0),
+                        env.bundles
+                    ));
+                    env.degenerate_kind = Some(DegenerateKind::Error);
+                } else if env.deduped_flags == 0 {
+                    // Draws fired (or no probe seats were even staffed) but
+                    // produced no usable content — distinct from the
+                    // zero-draws case above (a probe seat DID dispatch;
+                    // every reply was error/empty/unusable).
+                    env.degenerate =
+                        Some("zero flags from all probe draws — never a silent pass".to_string());
+                    env.degenerate_kind = Some(DegenerateKind::Error);
+                }
             }
         }
 
@@ -6838,8 +6990,6 @@ impl StepKind for ReviewSynthesisStepKind {
             }
         }
 
-        *shared_env.lock().expect("shared review envelope mutex poisoned") = env.clone();
-
         let wall_ms = t0.elapsed().as_millis() as u64;
         emit_review_step_result(
             "review.synthesis",
@@ -6852,7 +7002,18 @@ impl StepKind for ReviewSynthesisStepKind {
             }),
         );
 
-        let output = serde_json::to_string(&env).context("serializing final envelope")?;
+        let producer = darkmux_crew::step_output::Producer::of(
+            ctx.mission_id.as_deref().unwrap_or_default(),
+            task.id.as_str(),
+            &step.id,
+        );
+        let output = darkmux_crew::step_output::Output::wrap(
+            review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND,
+            env,
+            producer,
+        )
+        .to_output_string()
+        .context("serializing final envelope")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 }
@@ -6932,11 +7093,19 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
     if kind == "review.probe-render" {
         return Some("Probe prompts");
     }
+    // (#2310 P2) The probe stage's third step.
+    if kind == "review.probe-collect" {
+        return Some("Probe collect");
+    }
     if kind == "review.dedup" {
         return Some("Dedup");
     }
     if kind == "review.verify-render" {
         return Some("Verify prompts");
+    }
+    // (#2310 P2) The verify task's third step.
+    if kind == "review.verify-collect" {
+        return Some("Verify collect");
     }
     if kind == "review.judge" {
         return Some("Judge");
@@ -6996,6 +7165,11 @@ pub fn register_review_kinds(registry: &StepKindRegistry) -> Result<()> {
     registry
         .register(Arc::new(ReviewProbeRenderStepKind))
         .context("registering review.probe-render")?;
+    // (#2310 P2) The probe stage's third step — no legacy alias (new this
+    // packet).
+    registry
+        .register(Arc::new(ReviewProbeCollectStepKind))
+        .context("registering review.probe-collect")?;
 
     let dedup_kind = Arc::new(ReviewDedupStepKind);
     registry.register(dedup_kind.clone()).context("registering review.dedup")?;
@@ -7017,6 +7191,11 @@ pub fn register_review_kinds(registry: &StepKindRegistry) -> Result<()> {
     registry
         .register(Arc::new(ReviewVerifyRenderStepKind))
         .context("registering review.verify-render")?;
+    // (#2310 P2) The verify task's third step — no legacy alias (new this
+    // packet).
+    registry
+        .register(Arc::new(ReviewVerifyCollectStepKind))
+        .context("registering review.verify-collect")?;
 
     let synthesis_kind = Arc::new(ReviewSynthesisStepKind);
     registry.register(synthesis_kind.clone()).context("registering review.synthesis")?;
@@ -7457,18 +7636,20 @@ pub fn build_review_graph_from_config(
         // contract 7 puts loud validation at the consumption point and keeps
         // panics off the hot path, so this bails with the fix named rather
         // than aborting the process.
-        if task.step_ids.len() != 2 {
+        if task.step_ids.len() != 3 {
             anyhow::bail!(
                 "darkmux: \"review\" mission config's probe task `{task_id}` declares {} step(s), \
-                 but a probe task needs exactly two: a `review.probe-render` step followed by a \
-                 `dispatch.map` step. A user-tier copy at \
-                 ~/.darkmux/mission-configs/review.json predating the render-step split needs the \
-                 render step added (or delete the copy to fall back to the built-in document).",
+                 but a probe task needs exactly three: a `review.probe-render` step, a \
+                 `dispatch.map` step, then a `review.probe-collect` step. A user-tier copy at \
+                 ~/.darkmux/mission-configs/review.json predating the collect-step split (#2310 \
+                 P2) needs the collect step added (or delete the copy to fall back to the \
+                 built-in document).",
                 task.step_ids.len()
             );
         }
         let render_step_id = task.step_ids[0].clone();
         let map_step_id = task.step_ids[1].clone();
+        let collect_step_id = task.step_ids[2].clone();
 
         // (#1541) The FIRST step must actually be the render kind, not just
         // present. A hand-edited user-tier review.json whose probe task leads
@@ -7548,6 +7729,34 @@ pub fn build_review_graph_from_config(
             }
         }
         map_step.config = config;
+
+        // (#2310 P2) The THIRD step must actually be the collect kind —
+        // same "fail at the consumption point, naming the fix" posture as
+        // the render-step kind check above.
+        if steps.get(&collect_step_id).map(|s| s.kind.as_str()) != Some("review.probe-collect") {
+            anyhow::bail!(
+                "darkmux: \"review\" mission config's probe task `{task_id}` must end with a \
+                 `review.probe-collect` step (its third step is `{}`), because that step is what \
+                 turns the seat's raw dispatch results into its typed `review.probe-flags` \
+                 output. A user-tier copy at ~/.darkmux/mission-configs/review.json needs the \
+                 collect step added (or delete the copy to fall back to the built-in document).",
+                steps.get(&collect_step_id).map(|s| s.kind.as_str()).unwrap_or("<missing>")
+            );
+        }
+        // (#2310 P2) Stamped identically to the render step's own config
+        // (`selector`) plus this seat's identity — `ReviewProbeCollectStepKind`
+        // recomputes the render step's selection itself rather than reading
+        // it off a bus publish; see that kind's own doc.
+        let collect_step = steps.get_mut(&collect_step_id).unwrap_or_else(|| {
+            panic!("the interpreted graph must have a step `{collect_step_id}` for probe task `{task_id}`")
+        });
+        collect_step.config = json!({
+            "selector": selector_val,
+            "name": staffing.name,
+            "identifier": identifier,
+            "remote": endpoint.is_some(),
+            "endpoint_host": endpoint_host,
+        });
 
         probe_specs.push(ProbeSeatSpec {
             name: staffing.name.clone(),
@@ -7676,7 +7885,6 @@ pub fn build_review_graph_from_config(
             .expect("the step id was just read out of this same map");
         dedup_step.config = json!({
             "probe_specs": probe_specs,
-            "remote_budget": remote_budget,
         });
     }
 
@@ -7699,76 +7907,42 @@ pub fn build_review_graph_from_config(
         render_step.config = json!({ "verify_seat_staffed": verify.is_some() });
     }
 
-    // The interpreted graph's fixed ids for the upstream tasks
-    // `ReviewSynthesisStepKind` reads from — derived from the ACTUAL
-    // interpreted `steps` map (never hardcoded) so a document/interpreter
-    // drift surfaces as a clear panic here, not a silent mismatch.
-    let dedup_task_id = steps
-        .values()
-        .find(|s| s.kind == "review.dedup")
-        .map(|s| s.task_id.clone())
-        .expect("interpreted \"review\" graph must have a review.dedup step");
-    let judge_task_id = steps
-        .values()
-        .find(|s| s.kind == "review.judge")
-        .map(|s| s.task_id.clone())
-        .expect("interpreted \"review\" graph must have a review.judge step");
-    // The verify map step's kind is the generic `dispatch.map`, so its task
-    // resolves by the document's FIXED step id (same fixed-ids contract as
-    // the kind-keyed lookups above).
-    let verify_task_id = steps
-        .get("review-verify-step")
-        .map(|s| s.task_id.clone())
-        .expect("interpreted \"review\" graph must have a review-verify-step");
+    // The interpreted graph's fixed id for `ReviewSynthesisStepKind` —
+    // derived from the ACTUAL interpreted `steps` map (never hardcoded) so
+    // a document/interpreter drift surfaces as a clear panic here, not a
+    // silent mismatch. (#2310 P2) `dedup_task_id`/`judge_task_id`/
+    // `verify_task_id` are RETIRED — `ReviewSynthesisStepKind` reads every
+    // producer's typed output by KIND now (`deduped_from_input`/
+    // `judged_from_input`/`verify_from_input`), never by a stamped task id.
     let synthesis_step_id = steps
         .values()
         .find(|s| s.kind == "review.synthesis")
         .map(|s| s.id.clone())
         .expect("interpreted \"review\" graph must have a review.synthesis step");
 
-    // (#1530 Packet 3a) `ReviewSynthesisStepKind::run_streaming`'s ONLY use
-    // of the verify staffing is `apply_verify_results`'s three derived
-    // values (`identifier`/`remote`/`endpoint_host`) — stamp those onto this
-    // step's own config (present iff a verify seat was staffed, mirroring
-    // the `if let Some(vstaff) = &self.verify` test this replaces) instead
-    // of cloning the whole staffing into a constructor field.
-    //
-    // (#1530 Packet 3a follow-on) ALSO stamp `dedup_task_id`/`judge_task_id`/
-    // `verify_task_id`/`remote_budget` here, unconditionally (this step's
-    // pre-interpret config is `null` — see review.json's
-    // `review-synthesis-task` — so the first write below always establishes
-    // the config object; the verify-seat block afterward MERGES into it,
-    // mirroring the judge step's stamp above) — so `ReviewSynthesisStepKind`
-    // needs no constructor fields at all.
-    {
-        // (#1530) Reuses `synthesis_step_id`, already resolved BY KIND just
-        // above — so this stamp, which now runs unconditionally (it used to
-        // happen only when a verify seat was staffed), can't turn a renamed
-        // step in a user-tier config into a process abort.
-        let synthesis_step = steps
-            .get_mut(&synthesis_step_id)
-            .expect("the step id was just read out of this same map");
-        synthesis_step.config = json!({
-            "dedup_task_id": dedup_task_id,
-            "judge_task_id": judge_task_id,
-            "verify_task_id": verify_task_id,
-            "remote_budget": remote_budget,
+    // (#2310 P2) `ReviewSynthesisStepKind` needs NO config at all now — it
+    // reads every input by kind. `apply_verify_results`'s three derived
+    // seat values (`identifier`/`remote`/`endpoint_host`) moved to
+    // `review-verify-collect-step`'s own config instead (present iff a
+    // verify seat was staffed, mirroring the `if let Some(vstaff) = &self.
+    // verify` test this replaces) — see `ReviewVerifyCollectStepKind`'s own
+    // doc.
+    if let Some(vstaff) = &verify {
+        let identifier = seat_identifier(&vstaff.pm);
+        let remote = vstaff.pm.is_remote();
+        let endpoint_host = seat_endpoint_host(&vstaff.pm);
+        let collect_step = steps
+            .get_mut("review-verify-collect-step")
+            .expect("interpreted \"review\" graph must have a review-verify-collect-step");
+        collect_step.config = json!({
+            "verify_identifier": identifier,
+            "verify_remote": remote,
+            "verify_endpoint_host": endpoint_host,
         });
-        if let Some(vstaff) = &verify {
-            let identifier = seat_identifier(&vstaff.pm);
-            let remote = vstaff.pm.is_remote();
-            let endpoint_host = seat_endpoint_host(&vstaff.pm);
-            let config_obj = synthesis_step
-                .config
-                .as_object_mut()
-                .expect("review-synthesis-step config is always an object (stamped just above)");
-            config_obj.insert("verify_identifier".to_string(), json!(identifier));
-            config_obj.insert("verify_remote".to_string(), json!(remote));
-            config_obj.insert("verify_endpoint_host".to_string(), json!(endpoint_host));
-        }
     }
-    // (`review.synthesis` registered by [`register_review_kinds`] above,
-    // alongside its `funnel.synthesis` legacy alias.)
+    // (`review.synthesis`/`review.verify-collect` registered by
+    // [`register_review_kinds`] above, alongside `review.synthesis`'s
+    // `funnel.synthesis` legacy alias.)
 
     Ok(BuiltReviewGraph {
         tasks,
@@ -7896,43 +8070,48 @@ pub fn run_review_graph(
     let tasks_by_id: std::collections::BTreeMap<String, Task> =
         tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
 
-    // (#1530 Packet 1) The run-scoped state this pipeline's dispatching
-    // step kinds share, now minted HERE (at RUN time, not build time — see
-    // `BuiltReviewGraph::initial_env`'s doc for why that's the more honest
-    // home) and handed to `run_step_graph` via its caller-seed path, which
-    // MERGES them onto the `ArtifactBus` over whatever default
-    // `ReviewDedupStepKind::provides()`'s factories would otherwise
-    // materialize (`ArtifactBus::seed`'s own doc). `shared_env` starts from
-    // `initial_env` (already carrying the interpret-time warnings/bundle
-    // count from `build_review_graph`) plus this run's own
-    // case_id/crew/mode/fingerprint/staffing — exactly the same pre-stamp
-    // this function applied in place before #1530 Packet 1, just built
-    // fresh here instead of mutated through an `Arc` built earlier.
-    let shared_env: SharedReviewEnvelope = Arc::new(StdMutex::new(ReviewEnvelope {
+    // (#2310 P2) The three cross-cutting accumulators
+    // (`REVIEW_ENVELOPE_ARTIFACT`/`REVIEW_MEMBERS_ARTIFACT`/
+    // `REVIEW_WARNINGS_ARTIFACT`) are retired — `ReviewSynthesisStepKind`
+    // now builds the final envelope FRESH from every producer's typed
+    // output (see that kind's own doc). The ONLY thing this function still
+    // seeds onto the bus is the run-scoped context, `REVIEW_CONTEXT_
+    // ARTIFACT` — the two closure test seams (`chat_override`/
+    // `bundle_override`), `mission_id`, and (new this packet) the run's own
+    // identity/knob-config `ReviewSynthesisStepKind` needs to assemble the
+    // envelope (`crew_name`/`mode_label`/`fingerprint`/`staffing`) plus
+    // `build_review_graph`'s own interpret-time warnings (`initial_env.
+    // warnings` — see `ReviewStepContext::interpret_warnings`'s own doc).
+    // Overlaid onto `ctx.clone()` via struct-update syntax — the SAME
+    // pre-stamp this function used to apply to a separate shared envelope,
+    // now applied to the context every kind already reads.
+    let run_ctx_artifact: Arc<ReviewStepContext> = Arc::new(ReviewStepContext {
+        crew_name: Some(crew_name.to_string()),
+        mode_label: Some(mode_label(mode).to_string()),
+        fingerprint: Some(fingerprint_val.clone()),
+        staffing: Some(staffing.clone()),
+        interpret_warnings: initial_env.warnings.clone(),
+        ..ctx.clone()
+    });
+    // (#2310 P2) A fallback envelope, used only on the three paths that
+    // never reach `ReviewSynthesisStepKind`'s own typed output: a
+    // scheduling failure, a step error, or (defensively) a synthesis
+    // output that fails to parse. Carries the same case_id/crew/mode/
+    // fingerprint/staffing/interpret-warnings identity a successful run's
+    // envelope would, so even a degenerate run is self-describing.
+    let fallback_env = |reason: String| ReviewEnvelope {
         case_id: ctx.case_id.clone(),
         crew: crew_name.to_string(),
         mode: mode_label(mode).to_string(),
-        fingerprint: fingerprint_val,
-        staffing: Some(staffing),
-        ..initial_env
-    }));
-    let probe_members: Arc<StdMutex<Vec<MemberRecord>>> = Arc::new(StdMutex::new(Vec::new()));
-    let probe_warnings: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-    // (#1530 Packet 3a) The run-scoped context — every review kind now reads
-    // this off the bus (`ctx.artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)`
-    // in `run_streaming`, and `ReviewJudgeStepKind::residency`) instead of
-    // holding its own `Arc<ReviewStepContext>` constructor field. Seeded the
-    // SAME way the three accumulators above are: a real, run-owned value
-    // overwriting `make_review_context_artifact`'s context-free default via
-    // the caller-seed path. `Arc::new(ctx.clone())` — cheap (a handful of
-    // strings + a `Vec<BundleInput>` clone), once per run, not per step.
-    let run_ctx_artifact: Arc<ReviewStepContext> = Arc::new(ctx.clone());
-    let seed_artifacts: [(&'static str, Arc<dyn Any + Send + Sync>); 4] = [
-        (REVIEW_CONTEXT_ARTIFACT, run_ctx_artifact as Arc<dyn Any + Send + Sync>),
-        (REVIEW_ENVELOPE_ARTIFACT, shared_env.clone() as Arc<dyn Any + Send + Sync>),
-        (REVIEW_MEMBERS_ARTIFACT, probe_members.clone() as Arc<dyn Any + Send + Sync>),
-        (REVIEW_WARNINGS_ARTIFACT, probe_warnings.clone() as Arc<dyn Any + Send + Sync>),
-    ];
+        fingerprint: fingerprint_val.clone(),
+        staffing: Some(staffing.clone()),
+        warnings: initial_env.warnings.clone(),
+        degenerate: Some(reason),
+        degenerate_kind: Some(DegenerateKind::Error),
+        ..ReviewEnvelope::default()
+    };
+    let seed_artifacts: [(&'static str, Arc<dyn Any + Send + Sync>); 1] =
+        [(REVIEW_CONTEXT_ARTIFACT, run_ctx_artifact as Arc<dyn Any + Send + Sync>)];
 
     // (#1349) Host telemetry only — no bookend struct. The caller already
     // owns the run's liveness bookend (see this function's doc); this
@@ -7993,28 +8172,15 @@ pub fn run_review_graph(
         &seed_artifacts,
     );
 
-    // Merge the probe stage's NOW-populated accumulators (every probe step
-    // has run by the time `run_step_graph` returns, whether it errored or
-    // not) into the shared envelope — this can only happen AFTER the run,
-    // not at `build_review_graph` time when they were still empty.
-    // (#1442 ship-2b) The probe stage's budget row + exhaustion warning
-    // now reconstruct at the DEDUP boundary (`reconstruct_probe_stage`) and
-    // land in `shared_env` during the run; only the member/warning
-    // accumulators still merge here.
-    {
-        let mut env = shared_env.lock().expect("shared review envelope mutex poisoned");
-        env.members
-            .extend(probe_members.lock().expect("probe members mutex poisoned").iter().cloned());
-        env.warnings
-            .extend(probe_warnings.lock().expect("probe warnings mutex poisoned").iter().cloned());
-    }
-
+    // (#2310 P2) No post-run accumulator merge — every accumulator this
+    // used to fold in (probe members/warnings) is already inside
+    // `ReviewSynthesisStepKind`'s own typed output; see that kind's own
+    // "no probe seat placed a call" gate for the reclassification that
+    // used to require a SECOND pass here, now folded into the SAME pass.
     let report = match report {
         Ok(r) => r,
         Err(e) => {
-            let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
-            env.degenerate = Some(format!("review graph scheduling failed: {e:#}"));
-            env.degenerate_kind = Some(DegenerateKind::Error);
+            let env = fallback_env(format!("review graph scheduling failed: {e:#}"));
             for sample in telemetry.try_drain() {
                 emitter.emit(sample);
             }
@@ -8023,73 +8189,32 @@ pub fn run_review_graph(
     };
 
     let env = if report.errored.is_empty() {
-        let mut env = match steps.get(&synthesis_step_id).and_then(|s| s.output.as_deref()) {
-            Some(out) => serde_json::from_str::<ReviewEnvelope>(out)
-                .unwrap_or_else(|_| shared_env.lock().expect("shared review envelope mutex poisoned").clone()),
-            None => shared_env.lock().expect("shared review envelope mutex poisoned").clone(),
-        };
-        // The synthesis step's own serialized `output` was captured DURING
-        // the graph run — before the post-run merge above populated
-        // `shared_env`'s members/warnings/remote_budgets from the probe
-        // dispatch accumulators, which only land in `shared_env` after
-        // `run_step_graph` returns. Pulling from the synthesis step's
-        // snapshot alone silently drops real dispatch-provenance data (the
-        // posted review's "probed by ...; judged by ..." attribution and
-        // remote-budget warnings) even on a clean, fully-successful run.
-        let shared = shared_env.lock().expect("shared review envelope mutex poisoned");
-        env.members = shared.members.clone();
-        env.warnings = shared.warnings.clone();
-        env.remote_budgets = shared.remote_budgets.clone();
-        drop(shared);
-
-        // (#1418) `ReviewSynthesisStepKind::run` already catches a
-        // `deduped_flags == 0` run via its own "zero flags from all probe
-        // draws" gate, but synthesis runs INSIDE `run_step_graph`, before
-        // `env.members` is merged in (just above), so it can't tell WHY
-        // draws were zero. Now that `env.members` is accurate, name the
-        // SPECIFIC "no seat matched any bundle" cause when that's what
-        // actually happened (a selector/config problem, distinct from a
-        // probe that genuinely dispatched and came back with nothing),
-        // replacing synthesis's generic reason with a more actionable one.
-        // Two routes land here: every probe seat's selector matching zero
-        // of the diff's bundles, and a silently-zero-expanded probe
-        // template (`mission_config::interpret`'s absent-`expand.over`-key
-        // case, which also surfaces its own `env.warnings` entry). Either
-        // way, `env.bundles > 0` (the diff produced real bundles) but not
-        // one seat ever placed a call: a review that examined nothing
-        // must never read as Clean.
-        let total_draws: u32 = env.members.iter().map(|m| m.draws).sum();
-        if env.bundles > 0 && total_draws == 0 {
-            env.degenerate = Some(
-                // (#1530) Both causes this used to name were DEAD: per-seat
-                // `selector` is hardcoded `None` by the only production
-                // constructor of `ResolvedSeatStaffing`, and the "crew's probe
-                // expansion" retired in #1512 when the probe stage became
-                // static tasks in the document. A diagnostic that sends the
-                // operator hunting two knobs that cannot exist is worse than a
-                // terse one — it costs them the debugging session. Name what
-                // can actually be true instead.
-                format!(
-                    "no probe seat placed a call: zero draws across {} staffed probe seat(s), \
-                     though the diff produced {} bundle(s) — every seat returned nothing usable \
-                     rather than failing, so check the probe seats' own output (their model may \
-                     be replying in a shape the parser rejects); a review that examined nothing \
-                     is never a clean pass",
-                    // (#1530) `env.staffing`, NOT `env.members`: a member record
-                    // is pushed only `if draws > 0`, and this branch's guard is
-                    // `total_draws == 0` — so `members` is EMPTY by construction
-                    // here and would render "across 0 staffed seat(s)" on a run
-                    // that staffed three. The staffing snapshot is the count the
-                    // operator actually means.
-                    env.staffing.as_ref().map(|s| s.probes.len()).unwrap_or(0),
-                    env.bundles
-                ),
-            );
-            env.degenerate_kind = Some(DegenerateKind::Error);
+        // (#2310 P2) The FINAL envelope now lives ONLY on
+        // `review-synthesis-step`'s own typed output — no shared bus
+        // artifact to fall back to. A missing/malformed synthesis output
+        // (should be unreachable on any successful run — the step's own
+        // `?` would have propagated a serialization failure as a step
+        // error, landing in the `else` branch below instead) is named
+        // loudly rather than silently defaulted.
+        match steps.get(&synthesis_step_id).and_then(|s| s.output.as_deref()) {
+            Some(out) => darkmux_crew::step_output::Output::<ReviewEnvelope>::read(
+                out,
+                review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND,
+            )
+            .map(|o| o.body)
+            .unwrap_or_else(|e| {
+                fallback_env(format!(
+                    "review-synthesis-step completed but its output could not be read as the \
+                     final envelope: {e:#}"
+                ))
+            }),
+            None => fallback_env(
+                "review-synthesis-step completed with no recorded output — the final envelope is \
+                 missing"
+                    .to_string(),
+            ),
         }
-        env
     } else {
-        let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
         // (#1486) Surface each errored step's OWN failure message — the
         // residency block / model-load error / synthesized dispatch error
         // that `run_bounded` handed back and the scheduler stored in the
@@ -8101,10 +8226,7 @@ pub fn run_review_graph(
         // That is the dispatch-liveness contract's converse (#857/#1272):
         // blocked/failed work must be as visible — and as REASONED — as
         // running work, never a silent Clean.
-        if env.degenerate.is_none() {
-            env.degenerate = Some(errored_steps_degenerate_reason(&report.errored, &steps));
-            env.degenerate_kind = Some(DegenerateKind::Error);
-        }
+        let env = fallback_env(errored_steps_degenerate_reason(&report.errored, &steps));
         // (#1530) Say it on STDERR too, not only in the envelope. Since
         // bundling moved into the graph, a launch MISCONFIGURATION (a typo'd
         // `--bundler`, a `source.path` that doesn't exist) is no longer an

@@ -1730,14 +1730,18 @@ mod tests {
                 vec!["review-bundle-task".to_string()],
                 "task `{task_id}` depends only on the bundle task"
             );
-            // (#1530 follow-on, Packet A1) Each probe task is now TWO
-            // sequential steps — the Tier-3 `review.probe-render` step
-            // (renders this seat's prompt collection AT RUN TIME), then
-            // the generic `dispatch.map` — mirroring the verify task's own
-            // render/dispatch.map split (asserted below).
-            assert_eq!(task.steps.len(), 2);
+            // (#1530 follow-on Packet A1 + #2310 P2) Each probe task is now
+            // THREE sequential steps — the Tier-3 `review.probe-render`
+            // step (renders this seat's prompt collection AT RUN TIME),
+            // the generic `dispatch.map`, then the Tier-3
+            // `review.probe-collect` step (turns the map's raw results
+            // into this seat's typed `review.probe-flags` output) —
+            // mirroring the verify task's own render/dispatch.map/collect
+            // split (asserted below).
+            assert_eq!(task.steps.len(), 3);
             assert_eq!(task.steps[0].kind, "review.probe-render");
             assert_eq!(task.steps[1].kind, "dispatch.map");
+            assert_eq!(task.steps[2].kind, "review.probe-collect");
         }
         let dedup = investigate.tasks.iter().find(|t| t.id == "review-dedup-task").unwrap();
         assert_eq!(
@@ -1761,7 +1765,14 @@ mod tests {
         // cannot start before dedup completes, but the graph no longer draws
         // an investigate→adjudicate task connector that read as a bypass.
         assert_eq!(adjudicate.tasks[0].depends_on, Vec::<String>::new());
-        assert_eq!(adjudicate.tasks[0].reads, vec!["review-dedup-task", "review-context-task"]);
+        // (#2310 P2) `review-bundle-task` is new here — `ReviewJudgeStepKind::
+        // residency()` now reads the typed bundle set off `input` (the
+        // retired `REVIEW_BUNDLES_ARTIFACT` bus artifact used to reach it
+        // transitively, via dedup + the probe tasks).
+        assert_eq!(
+            adjudicate.tasks[0].reads,
+            vec!["review-dedup-task", "review-context-task", "review-bundle-task"]
+        );
         assert_eq!(adjudicate.tasks[0].steps[0].kind, "review.judge");
         // (#1475 packet 2) The judge task assigns the `review-judge` role — the
         // role→profile flip's model source (the crew is the task→role→profile
@@ -1777,12 +1788,14 @@ mod tests {
         assert_eq!(report_task_ids, vec!["review-verify-task", "review-synthesis-task"]);
         // (#1475 packet 2) The verify task assigns the `review-verify` role.
         assert_eq!(report.tasks[0].role_id.as_deref(), Some("review-verify"));
-        // (#1442 ship-2b) The verify task is two sequential steps — the
-        // bespoke frozen-prompt render, then the GENERIC dispatch.map the
-        // stage's dispatches now ride.
+        // (#1442 ship-2b + #2310 P2) The verify task is three sequential
+        // steps — the bespoke frozen-prompt render, the GENERIC
+        // dispatch.map the stage's dispatches ride, then the bespoke
+        // collect step (turns the map's raw results into typed
+        // `review.verify-results`).
         let verify_step_kinds: Vec<&str> =
             report.tasks[0].steps.iter().map(|s| s.kind.as_str()).collect();
-        assert_eq!(verify_step_kinds, vec!["review.verify-render", "dispatch.map"]);
+        assert_eq!(verify_step_kinds, vec!["review.verify-render", "dispatch.map", "review.verify-collect"]);
         // (#1619) synthesis still receives all three upstream outputs (#1442 —
         // the judged docket flows directly from the judge; verify's own
         // output is the map's result array), but the CROSS-PHASE pair now
@@ -1792,7 +1805,13 @@ mod tests {
         // synthesis... looks like the design includes short circuits":
         // same data, no more phantom bypass arrows.
         assert_eq!(report.tasks[1].depends_on, vec!["review-verify-task"]);
-        assert_eq!(report.tasks[1].reads, vec!["review-dedup-task", "review-judge-task", "review-context-task"]);
+        // (#2310 P2) `review-bundle-task` is new here — `ReviewSynthesisStepKind`
+        // now reads the typed bundle set (count/skip-report/bundler-fallback)
+        // directly, for its zero-bundle degenerate gate.
+        assert_eq!(
+            report.tasks[1].reads,
+            vec!["review-dedup-task", "review-judge-task", "review-context-task", "review-bundle-task"]
+        );
     }
 
     #[test]

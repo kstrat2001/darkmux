@@ -392,6 +392,11 @@ fn step_ctx(
             Ok(vec![billing_bundle(), auth_bundle(), docs_bundle(), config_bundle()])
         })),
         mission_id: None,
+        crew_name: None,
+        mode_label: None,
+        fingerprint: None,
+        staffing: None,
+        interpret_warnings: Vec::new(),
         // (#2310 P1 fix) `review-context-step` now reads its test overrides
         // off this bus seam, not step config — mirror the three fixture
         // prompts + two budget knobs above so a full `run_review_graph` run
@@ -661,6 +666,11 @@ fn review_bundle_step_runs_the_real_bundler_over_a_worktree() {
         // run_streaming`'s real `else` branch runs.
         bundle_override: None,
         mission_id: None,
+        crew_name: None,
+        mode_label: None,
+        fingerprint: None,
+        staffing: None,
+        interpret_warnings: Vec::new(),
         // (#2310 P1 fix) `review-context-step` now reads its test overrides
         // off this bus seam, not step config — mirror the three fixture
         // prompts above so this hermetic scenario's `chat_fn` (which
@@ -757,10 +767,16 @@ fn review_bundle_step_runs_the_real_bundler_over_a_worktree() {
         "output: {:?}",
         bundle_step.output
     );
-    let raw_output: serde_json::Value =
+    // (#2310 P2) `review-bundle-step`'s output is now a typed
+    // `Output<BundleSetOutput>` envelope — the golden compares the BODY's
+    // `bundles` array only (the identical data the pre-P2 bare array
+    // held), never the envelope's own producer/hash/timestamp fields
+    // (none of which are reproducible byte-for-byte between runs).
+    let wrapped: serde_json::Value =
         serde_json::from_str(bundle_step.output.as_deref().expect("review-bundle-step produced output"))
             .expect("review-bundle-step output is valid JSON");
-    let bundle_inputs = raw_output.as_array().expect("review-bundle-step output is a JSON array");
+    let raw_output = wrapped["body"]["bundles"].clone();
+    let bundle_inputs = raw_output.as_array().expect("review-bundle-step output body carries a JSON array of bundles");
     assert!(!bundle_inputs.is_empty(), "must actually carry bundle content, not just a nonzero count");
     let ids: Vec<&str> = bundle_inputs.iter().filter_map(|b| b["id"].as_str()).collect();
     assert!(
