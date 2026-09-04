@@ -410,24 +410,33 @@ pub fn kit_looks_json(text: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(text).is_ok()
 }
 
-/// (#2310 P4c) A mechanical, unvalidated hint at whether `kit` is a unified
-/// diff — the standard three-marker shape (`--- `/`+++ ` file headers plus
-/// at least one `@@ ` hunk header). Neither `create` (the CLI producer,
-/// whose `--kit-kind` is the proposer's own explicit word) nor
-/// `create_from_emission` before this packet had any way to tell a
+/// (#2310 P4c; loosened in review round 2 item (d)) A mechanical,
+/// unvalidated hint at whether `kit` is a unified diff. Neither `create`
+/// (the CLI producer, whose `--kit-kind` is the proposer's own explicit
+/// word) nor `create_from_emission` before #2310 P4c had any way to tell a
 /// runtime-produced kit apart from an opaque instruction string —
 /// `ModRecord::kit_kind`'s own doc names the consequence: a suggestion
 /// block requires `kit_kind == "unified-diff"`, so an unset kit never
-/// renders as one no matter how diff-shaped its text is. Deliberately loose
-/// (a false positive just means a malformed diff renders as a fenced patch
-/// once its `@@ ` line fails to parse) — a false negative is the only
-/// failure mode worth avoiding, hence three independent markers rather than
-/// a strict parse.
+/// renders as one no matter how diff-shaped its text is.
+///
+/// **Requires only an `@@ ` hunk header line** — not the original
+/// three-marker AND with `--- `/`+++ ` file headers too. `@@ ` is the one
+/// marker that actually carries line-anchoring data
+/// (`crate::diff::parse_diff` opens a `Hunk` from it); `--- `/`+++ ` are
+/// file-identity boilerplate a coder model asked for "the exact diff" for
+/// ONE file commonly omits, and their absence was a real false negative
+/// this function's own doc already claimed to avoid but didn't — a kit
+/// that is just a hunk plus its +/- lines is still, honestly, a unified
+/// diff. `parse_diff` itself still needs `+++ b/<path>` to bind a hunk to
+/// a file path, so a header-less kit still falls back to the opaque
+/// fenced-patch bullet in practice (`deliver_github_review::
+/// render_gated_mod`'s `hunks.is_empty()` branch) — this function only
+/// changes SELF-DESCRIPTION accuracy, not rendering behavior, for that
+/// case. Deliberately loose either way: a false positive just means a
+/// malformed diff renders as a fenced patch once its parse comes back
+/// empty; a false negative is the failure mode worth avoiding.
 pub fn looks_like_unified_diff(kit: &str) -> bool {
-    let has_old_header = kit.lines().any(|l| l.starts_with("--- "));
-    let has_new_header = kit.lines().any(|l| l.starts_with("+++ "));
-    let has_hunk_header = kit.lines().any(|l| l.starts_with("@@ "));
-    has_old_header && has_new_header && has_hunk_header
+    kit.lines().any(|l| l.starts_with("@@ "))
 }
 
 /// One finding, one address. `sess-a/01` and `sess-a/1` name the same finding,
@@ -915,24 +924,51 @@ mod tests {
         assert!(!root.join(STAGING_DIR).exists(), "nothing is left staged");
     }
 
-    /// (#2310 P4c) Mutation-kill for `looks_like_unified_diff`: all three
-    /// markers must be present, in any order, on their own lines — two
-    /// markers alone (a common false-shape: a real diff with its `@@ `
-    /// header truncated by a token cap) must NOT read as a diff.
+    /// (#2310 P4c review round 2, item (d) — proven) The original
+    /// three-marker AND required `--- `/`+++ `/`@@ ` all present, which was
+    /// itself the false-negative failure mode this function's own doc says
+    /// to avoid: a kit that is a single file's diff with no `diff --git`/
+    /// `--- `/`+++ ` header boilerplate — just the `@@ ` hunk plus its
+    /// +/- lines, a shape a coder model asked for "the exact diff" commonly
+    /// emits — used to read as NOT a unified diff. `@@ ` is the one marker
+    /// that actually carries line-anchoring data (`crate::diff::parse_diff`
+    /// needs it to open a `Hunk` at all); `--- `/`+++ ` are file-identity
+    /// boilerplate that parser also wants for PATH binding, but their
+    /// absence does not make the hunk itself any less a unified diff.
+    /// `looks_like_unified_diff` is now `@@ ` alone.
     #[test]
-    fn looks_like_unified_diff_requires_all_three_markers() {
+    fn looks_like_unified_diff_counts_a_hunk_with_no_file_headers() {
+        // Edge 1 (must be true): only `@@ ` hunks, no `--- `/`+++ ` at all
+        // — the shape this fix exists for.
+        let hunk_only = "@@ -1,2 +1,2 @@\n-old\n+new\n";
+        assert!(looks_like_unified_diff(hunk_only), "{hunk_only:?}");
+
+        // Edge 2 (must stay false): file headers with NO `@@ ` hunk at
+        // all — there is no line-anchoring data whatsoever, so this is
+        // not a usable diff shape no matter how diff-flavored its
+        // headers look.
+        let headers_only = "--- a/f.rs\n+++ b/f.rs\n";
+        assert!(!looks_like_unified_diff(headers_only), "{headers_only:?}");
+    }
+
+    /// The genuinely negative shapes: plain prose and JSON (`kit_looks_json`'s
+    /// own case) — neither carries an `@@ ` hunk header under any reading.
+    #[test]
+    fn looks_like_unified_diff_rejects_plain_prose_and_json() {
+        for not_a_diff in [
+            "just replace this one line with that one line",
+            "{\"n\": 1}",
+        ] {
+            assert!(!looks_like_unified_diff(not_a_diff), "{not_a_diff:?}");
+        }
+    }
+
+    /// The full-header shape still counts too — this fix widens what
+    /// counts, it does not narrow it.
+    #[test]
+    fn looks_like_unified_diff_still_counts_a_kit_with_full_headers() {
         let real = "--- a/f.rs\n+++ b/f.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n";
         assert!(looks_like_unified_diff(real), "{real:?}");
-
-        for missing in [
-            "+++ b/f.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n",   // no `--- `
-            "--- a/f.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n",   // no `+++ `
-            "--- a/f.rs\n+++ b/f.rs\n-old\n+new\n",         // no `@@ `
-            "just replace this one line with that one line", // a plain instruction
-            "{\"n\": 1}",                                    // JSON, kit_looks_json's own case
-        ] {
-            assert!(!looks_like_unified_diff(missing), "{missing:?}");
-        }
     }
 
     /// (#2310 P4c) `create_from_emission` — the runtime `create_mod` path,

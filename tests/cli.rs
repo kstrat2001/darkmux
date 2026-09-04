@@ -4827,6 +4827,81 @@ fn crawl_dry_run_prunes_the_rules_the_launch_did_not_select() {
     assert_ne!(all_out, one_out, "`--param rules=` must change the minted graph");
 }
 
+/// (#2310 P4c review round 2, item (f) — proven) `review-v2.json`'s
+/// `bundler` input was documented as "accepted and ignored" with no actual
+/// warning — a silent no-op that would leave an operator carrying the
+/// funnel's `bundler=` param over from the frozen `review` config with no
+/// signal that it does nothing here. `--param bundler=<anything>` must now
+/// print a named warning naming what it's ignored for, on the SAME
+/// `--dry-run` path (before any real dispatch), so the signal is visible
+/// with zero cost.
+#[test]
+fn review_v2_dry_run_warns_when_bundler_is_passed() {
+    let workdir = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let workspace_root = workdir.path().join("tree");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(
+        &spec_path,
+        serde_json::json!({
+            "name": "review-v2-fixture",
+            "sources": [{"id": "app", "path": workspace_root.to_string_lossy(), "ref": "main"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let diff_path = workdir.path().join("d.diff");
+    fs::write(&diff_path, "").unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "mission",
+            "launch",
+            "review-v2",
+            "--dry-run",
+            "--param",
+            &format!("workspace={}", spec_path.display()),
+            "--param",
+            &format!("diff_file={}", diff_path.display()),
+            "--param",
+            "bundler=/usr/bin/true",
+        ])
+        .env("DARKMUX_HOME", home.path())
+        .output()
+        .expect("mission launch review-v2 --dry-run runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("bundler") && stderr.contains("ignored"),
+        "a `bundler` param on review-v2 must warn that it is ignored: {stderr}"
+    );
+
+    // Negative leg: no `bundler` param, no warning.
+    let quiet = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "mission",
+            "launch",
+            "review-v2",
+            "--dry-run",
+            "--param",
+            &format!("workspace={}", spec_path.display()),
+            "--param",
+            &format!("diff_file={}", diff_path.display()),
+        ])
+        .env("DARKMUX_HOME", home.path())
+        .output()
+        .expect("mission launch review-v2 --dry-run runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains("bundler"),
+        "no `bundler` param means no warning: {quiet_stderr}"
+    );
+}
+
 
 #[test]
 fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {

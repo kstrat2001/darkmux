@@ -36,7 +36,7 @@
     },
     {
       "name": "bundler",
-      "description": "Mirrors the frozen `review` config's input (the external-bundler plugin path). Accepted and IGNORED — `review-v2` does not use the funnel's bundler; its planner reads `diff_file` directly. No explicit unused-param warning is emitted yet (the generic launcher has no such mechanism today); this is accepted-and-silent, not accepted-and-warned.",
+      "description": "Mirrors the frozen `review` config's input (the external-bundler plugin path). Accepted and IGNORED — `review-v2` does not use the funnel's bundler; its planner reads `diff_file` directly. Passing it prints a named warning at launch time (before dispatch, on the `--dry-run` path too) saying it is ignored, so an operator carrying a `bundler=` param over from a `review` launch line gets a visible signal rather than a silent no-op.",
       "required": false
     },
     {

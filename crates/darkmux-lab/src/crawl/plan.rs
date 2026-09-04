@@ -998,10 +998,27 @@ impl plan_sites::SiteSource for DiffSource<'_> {
 
 /// (#2310 P4c) A thin [`plan_sites::SiteSource`] adapter that filters
 /// [`DiffSource`]'s output through a rule's OWN `applies_to`/`exclude`
-/// globs (`workspace_spec::glob::applies`), the same filter
-/// `TreeSource`/`SourceFiles::matching` already apply for a tree walk.
-/// Without this, a rule reused across `scope: ["tree","diff"]` would fire
-/// on every file a diff touches regardless of its declared file types.
+/// globs, the same filter `TreeSource`/`SourceFiles::matching` already
+/// apply for a tree walk. Without this, a rule reused across
+/// `scope: ["tree","diff"]` would fire on every file a diff touches
+/// regardless of its declared file types.
+///
+/// (#2310 P4c review round 2, MUST FIX 1) Deliberately NOT
+/// `glob::applies` when `applies_to` is empty: `applies()` is `any-of
+/// applies_to AND none-of exclude`, so an EMPTY `applies_to` makes the
+/// `any()` vacuously `false` and `applies()` reject every file outright —
+/// exactly backwards from what an empty `applies_to` means here ("every
+/// file the diff touches", the same convention `plan_diff_rule`'s empty-
+/// prefilter handling already documents). The bug this replaces called
+/// `glob::applies` unconditionally when `applies_to` was non-empty but
+/// short-circuited to `Ok(all)` — UNFILTERED, `exclude` included — the
+/// moment `applies_to` was empty. Every rule in the P4c catalog with no
+/// file-type opinion (`intent-vs-diff`, `existing-solution`,
+/// `shared-symbol-callers`, `union-vs-enum`, `test-gap`) declares empty
+/// `applies_to` alongside a real `exclude` (test paths), so that bug
+/// meant every one of them planned sites inside its own excluded test
+/// files. `exclude` is therefore checked with `glob::matches` directly,
+/// independent of whether `applies_to` is empty.
 struct FilteredDiffSource<'a, 'b> {
     inner: &'a mut DiffSource<'b>,
     applies_to: &'a [String],
@@ -1011,8 +1028,9 @@ struct FilteredDiffSource<'a, 'b> {
 impl plan_sites::SiteSource for FilteredDiffSource<'_, '_> {
     fn files(&mut self) -> Result<Vec<plan_sites::SiteSourceFile>> {
         let all = self.inner.files()?;
+        let excluded = |f: &plan_sites::SiteSourceFile| self.exclude.iter().any(|p| glob::matches(p, &f.file));
         if self.applies_to.is_empty() {
-            return Ok(all);
+            return Ok(all.into_iter().filter(|f| !excluded(f)).collect());
         }
         Ok(all.into_iter().filter(|f| glob::applies(self.applies_to, self.exclude, &f.file)).collect())
     }
@@ -1049,6 +1067,17 @@ pub fn plan_diff_rule(materialized: &Materialized, rule: &Rule, diff_text: &str,
         rule.id,
         rule.kind
     );
+    // (#2310 P4c review round 2, MUST FIX 2) The tree-side twin of this
+    // check is `plan_step::plan_one_rule`'s own — see its doc for why
+    // `Rule::scope` needs enforcement on BOTH sides, not just documented.
+    if !rule.applies_to_scope(darkmux_crew::rules::RuleScope::Diff) {
+        let scope = serde_json::to_string(rule.scope_or_default()).unwrap_or_default();
+        anyhow::bail!(
+            "rule '{}' declares scope {scope} — a rule with no `diff` scope cannot be planned \
+             against a diff",
+            rule.id
+        );
+    }
     let source = &materialized.sources[0];
     let mut skipped: Vec<SkippedEntry> = materialized
         .skipped
@@ -2143,6 +2172,52 @@ line two
         assert_eq!(files, vec!["f.ts"], "the .py file must be filtered out by the rule's own applies_to: {files:?}");
     }
 
+    /// (#2310 P4c review round 2, MUST FIX 1 — proven) `FilteredDiffSource`
+    /// used to short-circuit `if applies_to.is_empty() { return all }`,
+    /// dropping `exclude` entirely for any rule with no `applies_to` glob
+    /// — exactly the shape every new review-catalog rule ships (empty
+    /// `applies_to` + a real `exclude` naming test paths). `test-gap`
+    /// itself is the reproduction: a diff touching `src/a.ts` AND
+    /// `tests/a.test.ts` must plan a site ONLY in `src/a.ts` — the
+    /// excluded test file must never reach the planner, whether or not
+    /// `applies_to` is empty.
+    #[test]
+    fn plan_diff_rule_honors_exclude_even_when_applies_to_is_empty() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(dir.path().join("src/a.ts"), "function f() {\n  doThing();\n}\n").unwrap();
+        fs::write(dir.path().join("tests/a.test.ts"), "function f() {\n  doThing();\n}\n").unwrap();
+        let diff_text = [
+            "diff --git a/src/a.ts b/src/a.ts",
+            "--- a/src/a.ts",
+            "+++ b/src/a.ts",
+            "@@ -1,3 +1,3 @@",
+            " function f() {",
+            "   doThing();",
+            " }",
+            "diff --git a/tests/a.test.ts b/tests/a.test.ts",
+            "--- a/tests/a.test.ts",
+            "+++ b/tests/a.test.ts",
+            "@@ -1,3 +1,3 @@",
+            " function f() {",
+            "   doThing();",
+            " }",
+        ]
+        .join("\n")
+            + "\n";
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"a".repeat(40))], Vec::new());
+        let (rules, _) = darkmux_crew::rules::load_all(None);
+        let rule = rules["test-gap"].clone();
+        assert!(rule.applies_to.is_empty(), "test-gap declares no applies_to — that is the case this bug needs");
+        assert!(!rule.exclude.is_empty(), "test-gap's exclude must be real for this test to mean anything");
+
+        let plan = plan_diff_rule(&materialized, &rule, &diff_text, PlanParams::default()).unwrap();
+        let files: Vec<&str> =
+            plan.units.iter().flat_map(|u| if let Unit::Site { sites, .. } = u { sites.iter().map(|s| s.file.as_str()).collect() } else { vec![] }).collect();
+        assert_eq!(files, vec!["src/a.ts"], "the excluded test file must never reach the planner: {files:?}");
+    }
+
     /// A `read`/`edge`-kind rule has no diff-scoped meaning (DESIGN.md
     /// "Hunks are natural windows") — `plan_diff_rule` refuses rather than
     /// silently producing zero units, which would be indistinguishable
@@ -2153,6 +2228,23 @@ line two
         let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"d".repeat(40))], Vec::new());
         let err = plan_diff_rule(&materialized, &read_rule(), "", PlanParams::default()).unwrap_err();
         assert!(err.to_string().contains("site"), "{err}");
+    }
+
+    /// (#2310 P4c review round 2, MUST FIX 2 — proven) `Rule::scope` was
+    /// enforced by nothing on the diff side either: a `site`-kind rule
+    /// declaring `scope: ["tree"]` ONLY (no `"diff"`) could still be
+    /// planned by `plan_diff_rule` with no error, silently running a
+    /// tree-only rule's prose against hunks it was never written for.
+    #[test]
+    fn plan_diff_rule_refuses_a_rule_with_no_diff_scope() {
+        let dir = TempDir::new().unwrap();
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"e".repeat(40))], Vec::new());
+        let mut tree_only = site_rule();
+        tree_only.scope = vec![darkmux_crew::rules::RuleScope::Tree];
+        let err = plan_diff_rule(&materialized, &tree_only, "", PlanParams::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&tree_only.id), "{msg}");
+        assert!(msg.contains("tree"), "the message must name the rule's actual declared scope: {msg}");
     }
 
     /// A diff correlates to one tree at one sha — a `Materialized` with

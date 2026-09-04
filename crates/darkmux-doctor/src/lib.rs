@@ -2845,49 +2845,15 @@ fn check_rules_registry() -> Check {
 }
 
 fn build_rules_check(user_dir: Option<&std::path::Path>) -> Check {
-    use darkmux_crew::rules::{ConfirmForm, RuleKind, RuleScope};
-
     let (embedded_only, _) = darkmux_crew::rules::load_all(None);
     let (map, mut warnings) = darkmux_crew::rules::load_all(user_dir);
 
+    // (#2310 P4c review round 2, MUST FIX 2) Was a hand-duplicated copy of
+    // `crew::rules::warn_on_thin_rules`'s own four checks — the exact
+    // drift `crew::rules::thin_rule_warnings`'s own doc names as the
+    // reason it exists. Both call sites now share ONE definition.
     for rule in map.values() {
-        // (#2310 P4c) Same tree-only reasoning as `crew::rules::
-        // warn_on_thin_rules` — a diff-only rule's empty `applies_to`/
-        // `prefilter` is deliberate ("every file the diff touches",
-        // "every hunk line is a candidate"), not thin config.
-        let tree_scoped = rule.applies_to_scope(RuleScope::Tree);
-        if tree_scoped && matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
-            warnings.push(format!(
-                "rule '{}' has an empty `applies_to` — it will never match any file",
-                rule.id
-            ));
-        }
-        if tree_scoped && rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
-            warnings.push(format!(
-                "rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
-                rule.id
-            ));
-        }
-        // (#2310 P4c) Same reasoning as the two checks above, extended to
-        // the review-side confirm shapes: a `confirm` form that declares no
-        // recipe/question is inert the same way an empty `applies_to`/
-        // `prefilter` is. A malformed `confirm`/`scope` VALUE (not one of
-        // the recognized strings) never reaches this loop at all — it
-        // fails `Rule`'s own `Deserialize` first, which `load_all` already
-        // turns into a loud "rule '<id>' failed to parse" warning folded
-        // into `warnings` above.
-        if rule.confirm == ConfirmForm::Search && rule.search.is_none() {
-            warnings.push(format!(
-                "rule '{}' declares `confirm: \"search\"` but has no `search` recipe — it will never enumerate anything",
-                rule.id
-            ));
-        }
-        if rule.confirm == ConfirmForm::Question && rule.compare.is_none() {
-            warnings.push(format!(
-                "rule '{}' declares `confirm: \"question\"` but has no `compare` question — it has nothing to ask",
-                rule.id
-            ));
-        }
+        warnings.extend(darkmux_crew::rules::thin_rule_warnings(rule));
     }
 
     let user_file_count = user_dir

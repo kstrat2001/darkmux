@@ -26,4 +26,19 @@ rules: Array<string>,
  * under, so a plan is self-describing for later comparison. Lenient on
  * read.
  */
-params: PlanParamsRecord | null, };
+params: PlanParamsRecord | null, 
+/**
+ * (#2310 P4c — additive, NOT a `PLAN_SCHEMA_VERSION` bump; see that
+ * constant's own doc for why) Which [`plan_sites_step`]
+ * (`crate::crawl::plan_sites_step`) strategy produced this plan —
+ * `"diff"` from `plan::plan_diff_rule`. `None`/omitted from every
+ * `plan()`/`plan_with_params` plan (the tree-walk path `crawl.plan`
+ * and `plan.sites`'s own `"source": "tree"` both still call), so a
+ * reader cannot distinguish "planned by the tree strategy" from "this
+ * plan predates the field" — which is fine, because nothing needs to
+ * today: `crawl.unit` reads a `Plan` the same way regardless of what
+ * planned it. A future consumer that DOES need to tell tree from
+ * pre-field-tree apart is the moment this earns its own real minor
+ * bump, together with a deliberate golden update.
+ */
+source_kind: string | null, };

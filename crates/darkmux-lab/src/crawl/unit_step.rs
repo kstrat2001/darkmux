@@ -320,7 +320,18 @@ const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `create_findin
 /// Build the dispatch message for one unit. Model-facing (AI-convention
 /// terms; the words `unit`/`ledger`/`corpus`/`packet` never appear —
 /// darkmux-internal vocabulary a clean-context model can't ground).
-pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<String> {
+///
+/// (#2310 P4c review round 2, item (e)) `intent` is the diff's stated
+/// intent (a PR body or intent file's own text), rendered up front when
+/// present — `intent-vs-diff`'s own `match`/`compare` prose already
+/// assumes "the intent you were given... provided alongside your window"
+/// is real; before this parameter existed, nothing ever supplied it, so
+/// that rule was structurally inert regardless of the seat. `None` for
+/// every crawl.json task (which never sets `config.intent_file`) and for
+/// a review-v2 launch with no `intent_file` param — the block is omitted
+/// entirely rather than rendered empty, so a unit's message is unchanged
+/// from before this parameter existed whenever there is nothing to say.
+pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: Option<&str>) -> Result<String> {
     let missing = |rule: &str| {
         anyhow!(
             "crawl.unit: no rule resolved for id `{rule}` — the plan names a rule the current \
@@ -328,6 +339,11 @@ pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Resul
         )
     };
     let mut out = String::new();
+    if let Some(text) = intent {
+        out.push_str(&format!(
+            "The stated intent for this change (a PR body or intent file) is:\n\n{text}\n\n"
+        ));
+    }
     match unit {
         Unit::Site { rule, sites, source, .. } => {
             let r = rules_by_id.get(rule).ok_or_else(|| missing(rule))?;
@@ -740,6 +756,14 @@ pub struct UnitStepConfig {
     pub rule: Option<String>,
     pub no_progress_turns: usize,
     pub timeout_seconds: Option<u32>,
+    /// (#2310 P4c review round 2, item (e)) Path to the diff's stated
+    /// intent (a PR body or intent file) — `review-v2.json`'s own
+    /// `intent_file` input, templated in per unit-<rule> task. Optional:
+    /// crawl.json's tasks never set this, and a review-v2 launch with no
+    /// `intent_file` param leaves it `None` too. When present, its content
+    /// is read at dispatch time and rendered into the unit's message —
+    /// see `build_message`'s `intent` parameter.
+    pub intent_file: Option<PathBuf>,
 }
 
 impl UnitStepConfig {
@@ -771,7 +795,17 @@ impl UnitStepConfig {
             .get("timeout_seconds")
             .and_then(|v| v.as_u64())
             .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-        Ok(Self { plan, unit, rule, no_progress_turns, timeout_seconds })
+        // Empty-string filtered (matches `str_field`'s convention above):
+        // an unresolved `{{intent_file}}` template on a launch with no
+        // `intent_file` param renders as `""`, which must read as ABSENT,
+        // not as a path to read-and-fail-and-warn about on every run.
+        let intent_file = step
+            .config
+            .get("intent_file")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from);
+        Ok(Self { plan, unit, rule, no_progress_turns, timeout_seconds, intent_file })
     }
 }
 
@@ -970,7 +1004,21 @@ impl StepKind for CrawlUnitStepKind {
             eprintln!("{}", darkmux_types::style::warn(&format!("crawl.unit: {w}")));
         }
         let rules_by_id: BTreeMap<String, Rule> = rules_vec.into_iter().map(|r| (r.id.clone(), r)).collect();
-        let message = build_message(&rules_by_id, unit)?;
+        // (#2310 P4c review round 2, item (e)) A read failure (missing
+        // file, not UTF-8) is a named warning, never a dispatch failure —
+        // same leniency posture as every other optional-input read in
+        // this function.
+        let intent_text = cfg.intent_file.as_ref().and_then(|p| match std::fs::read_to_string(p) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::warn(&format!("crawl.unit: reading intent_file {}: {e}", p.display()))
+                );
+                None
+            }
+        });
+        let message = build_message(&rules_by_id, unit, intent_text.as_deref())?;
 
         // Mint this unit's own out dir BEFORE dispatch (#2153): the dir is
         // then known and recorded even if the dispatch returns `Err` with
@@ -1025,10 +1073,20 @@ impl StepKind for CrawlUnitStepKind {
                 "sha": ctx.sha,
                 "rule": single_rule(&ctx.rule_ids),
                 "rules": ctx.rule_ids,
-                // (#2310 P4c) Host-stamped, never model-supplied — see
-                // `pattern_block`'s doc for why the confirmation form
-                // rides here (`context.confirm`) instead of a
-                // `create_finding` tool argument.
+                // (#2310 P4c review round 2, item (g) — stated precisely
+                // for the PR: `crawl.json`'s DISPATCHED MESSAGE
+                // (`build_message`'s own output) is byte-identical to
+                // before this packet for every `mod`-confirm rule — which
+                // is all four of crawl's own built-ins — since
+                // `pattern_block`'s confirm-form appendix renders nothing
+                // for `ConfirmForm::Mod`. The one thing that DOES change
+                // for every crawl unit, `mod`-confirm included, is this
+                // flow record's `context` blob: it gains exactly ONE new
+                // key, `confirm`, host-stamped here (never model-supplied
+                // — see `pattern_block`'s own doc for why the confirmation
+                // form rides in `context.confirm` rather than a
+                // `create_finding` tool argument). No other `context` key
+                // changes shape or value.
                 "confirm": single_confirm(&rules_by_id, &ctx.rule_ids),
                 "unit": ctx.unit_id,
                 "model": seat.model.clone(),

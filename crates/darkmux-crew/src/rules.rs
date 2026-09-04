@@ -448,42 +448,64 @@ fn merge_json_object_shallow(base: serde_json::Value, patch: serde_json::Value) 
 /// a mission config's `rules` input can name and folds these warnings into
 /// its report, so a thin or malformed rule is visible before a launch ever
 /// tries to plan against it.
+/// (#2310 P4c review round 2, MUST FIX 2) The ONE place every "this rule
+/// is thin/inert" check lives — `warn_on_thin_rules` (below, over a
+/// manifest's resolved subset) and `darkmux-doctor`'s `build_rules_check`
+/// (over the WHOLE registry) both call this per-rule function rather than
+/// each carrying its own copy of the same four checks, which is exactly
+/// how the two drifted before this extraction: P4c's own first pass added
+/// the `confirm`/`search`/`compare` checks to `warn_on_thin_rules` and had
+/// to remember to ALSO add them to doctor's separate copy — a repeat of
+/// #1959 finding 2's own lesson, one packet later, in this same file.
+///
+/// The `applies_to`/`prefilter` checks below assume a TREE walk, where an
+/// empty `applies_to`/`prefilter` really does mean "matches nothing" —
+/// `SourceFiles::matching`/`collect_site_units`'s own early return. A rule
+/// scoped to `["diff"]` only reads the OPPOSITE way under
+/// `plan_diff_rule`/`FilteredDiffSource`: empty `applies_to` means "every
+/// file the diff touches", and empty `prefilter` means "every hunk line
+/// is a candidate" (DESIGN.md "Hunks are natural windows. No prefilter is
+/// needed"). Firing these checks on a diff-only rule would call CORRECT,
+/// deliberate config "thin" — gated on `applies_to_scope(RuleScope::Tree)`
+/// below. That gate is airtight, not just conventional, now that
+/// `plan_step::plan_one_rule`/`plan::plan_diff_rule` (#2310 P4c review
+/// round 2, MUST FIX 2) both REFUSE to plan a rule outside its declared
+/// scope — a diff-only rule genuinely cannot reach the tree planner any
+/// more, so "this warning assumes tree scope" is a fact this function can
+/// rely on, not a convention a caller could silently violate.
+pub fn thin_rule_warnings(rule: &Rule) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let tree_scoped = rule.applies_to_scope(RuleScope::Tree);
+    if tree_scoped && matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
+        warnings.push(format!(
+            "rule '{}' has an empty `applies_to` — it will never match any file",
+            rule.id
+        ));
+    }
+    if tree_scoped && rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
+        warnings.push(format!(
+            "rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
+            rule.id
+        ));
+    }
+    if rule.confirm == ConfirmForm::Search && rule.search.is_none() {
+        warnings.push(format!(
+            "rule '{}' declares `confirm: \"search\"` but has no `search` recipe — it will never enumerate anything",
+            rule.id
+        ));
+    }
+    if rule.confirm == ConfirmForm::Question && rule.compare.is_none() {
+        warnings.push(format!(
+            "rule '{}' declares `confirm: \"question\"` but has no `compare` question — it has nothing to ask",
+            rule.id
+        ));
+    }
+    warnings
+}
+
 fn warn_on_thin_rules(resolved: &[Rule], warnings: &mut Vec<String>) {
     for rule in resolved {
-        // (#2310 P4c) Both checks below assume a TREE walk, where an empty
-        // `applies_to`/`prefilter` really does mean "matches nothing" —
-        // `SourceFiles::matching`/`collect_site_units`'s own early return.
-        // A rule scoped to `["diff"]` only reads the OPPOSITE way under
-        // `plan_diff_rule`/`FilteredDiffSource`: empty `applies_to` means
-        // "every file the diff touches", and empty `prefilter` means
-        // "every hunk line is a candidate" (DESIGN.md "Hunks are natural
-        // windows. No prefilter is needed"). Firing these checks on a
-        // diff-only rule would call CORRECT, deliberate config "thin".
-        let tree_scoped = rule.applies_to_scope(RuleScope::Tree);
-        if tree_scoped && matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
-            warnings.push(format!(
-                "rule '{}' has an empty `applies_to` — it will never match any file",
-                rule.id
-            ));
-        }
-        if tree_scoped && rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
-            warnings.push(format!(
-                "rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
-                rule.id
-            ));
-        }
-        if rule.confirm == ConfirmForm::Search && rule.search.is_none() {
-            warnings.push(format!(
-                "rule '{}' declares `confirm: \"search\"` but has no `search` recipe — it will never enumerate anything",
-                rule.id
-            ));
-        }
-        if rule.confirm == ConfirmForm::Question && rule.compare.is_none() {
-            warnings.push(format!(
-                "rule '{}' declares `confirm: \"question\"` but has no `compare` question — it has nothing to ask",
-                rule.id
-            ));
-        }
+        warnings.extend(thin_rule_warnings(rule));
     }
 }
 
@@ -747,6 +769,31 @@ mod tests {
         );
     }
 
+    /// (#2310 P4c review round 2, SHOULD FIX (a)) A `scope: ["diff"]`
+    /// `site` rule with an empty `applies_to`/`prefilter` is DELIBERATE
+    /// config (DESIGN.md "Hunks are natural windows") and must produce NO
+    /// thin-rule warning at all through `resolve()` — the manifest-scoped
+    /// path `warn_on_thin_rules` (via `thin_rule_warnings`) serves,
+    /// exactly mirroring `resolve_warns_on_empty_applies_to_and_empty_site_
+    /// prefilter` above but for the diff-only case that check's own
+    /// `tree_scoped` gate exists to exempt.
+    #[test]
+    fn resolve_does_not_warn_on_an_empty_applies_to_or_prefilter_for_a_diff_only_rule() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("diff-only-thin.json"),
+            serde_json::json!({"id": "diff-only-thin", "kind": "site", "scope": ["diff"]}).to_string(),
+        )
+        .unwrap();
+
+        let (rules, warnings) = resolve(&["diff-only-thin".to_string()], Some(dir.path())).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(
+            warnings.is_empty(),
+            "a diff-only rule's empty applies_to/prefilter is deliberate, not thin: {warnings:?}"
+        );
+    }
+
     #[test]
     fn user_tier_adds_a_new_rule_id() {
         let dir = TempDir::new().unwrap();
@@ -831,15 +878,37 @@ mod tests {
 
     #[test]
     fn search_confirm_with_no_recipe_warns_and_question_confirm_with_no_compare_warns() {
+        // (#2310 P4c review round 2, SHOULD FIX (b) — proven half-vacuous)
+        // The rule id `thin-search` itself contains the substring
+        // "search", so `w.contains("thin-search") && w.contains("search")`
+        // was satisfied by ANY warning naming this rule — including the
+        // unrelated "empty `applies_to`" warning this rule (declaring no
+        // `applies_to`/`prefilter`) also triggers. The original assertion
+        // could pass even if the search-recipe-specific check never fired
+        // at all. Fixed two ways: `applies_to`/`prefilter` are populated
+        // so the unrelated thin-rule checks stay quiet (same fix already
+        // applied to `an_absent_confirm_defaults_to_mod` and
+        // `a_search_recipe_and_a_compare_question_round_trip` above), and
+        // the assertion checks for "recipe" — a word that appears ONLY in
+        // the search-confirm-specific warning text, never in the rule id
+        // or any other warning here.
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("thin-search.json"),
-            serde_json::json!({"id": "thin-search", "kind": "site", "confirm": "search"}).to_string(),
+            serde_json::json!({
+                "id": "thin-search", "kind": "site", "confirm": "search",
+                "applies_to": ["**/*.rs"], "prefilter": ["x"]
+            })
+            .to_string(),
         )
         .unwrap();
         fs::write(
             dir.path().join("thin-question.json"),
-            serde_json::json!({"id": "thin-question", "kind": "site", "confirm": "question"}).to_string(),
+            serde_json::json!({
+                "id": "thin-question", "kind": "site", "confirm": "question",
+                "applies_to": ["**/*.rs"], "prefilter": ["x"]
+            })
+            .to_string(),
         )
         .unwrap();
         let (_, warnings) = resolve(
@@ -847,8 +916,13 @@ mod tests {
             Some(dir.path()),
         )
         .unwrap();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "with applies_to/prefilter populated, only the confirm-specific checks should fire: {warnings:?}"
+        );
         assert!(
-            warnings.iter().any(|w| w.contains("thin-search") && w.contains("search")),
+            warnings.iter().any(|w| w.contains("thin-search") && w.contains("recipe")),
             "{warnings:?}"
         );
         assert!(

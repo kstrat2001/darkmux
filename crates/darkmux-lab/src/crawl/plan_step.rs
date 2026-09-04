@@ -155,11 +155,32 @@ impl PlanStepConfig {
 
 /// Plan ONE rule against the spec's workspace. Refuses an unknown rule
 /// naming the known ones (the rules module's own message).
+///
+/// (#2310 P4c review round 2, MUST FIX 2) Also refuses a rule that does
+/// not declare TREE scope — `Rule::scope` was, before this, enforced by
+/// nothing: a diff-only rule (`test-gap`, part of the review catalog)
+/// could be silently planned by a tree walk, producing a plan the rule's
+/// own `match`/`no_match` prose was never written against (every
+/// diff-only rule's prose talks about "this hunk", not "this file"). This
+/// is the tree-side twin of `plan::plan_diff_rule`'s own `RuleKind::Site`
+/// refusal just below — same shape, same reasoning, the OTHER half of
+/// what makes `Rule::scope_or_default`'s doc ("read it through this,
+/// never the field directly") actually true rather than aspirational.
 pub fn plan_one_rule(cfg: &PlanStepConfig) -> Result<Plan> {
     let (rules_vec, warnings) = rules::resolve_default(std::slice::from_ref(&cfg.rule))?;
     // Load warnings cover every rule file; this step speaks only for its own.
     for w in warnings.iter().filter(|w| w.contains(&cfg.rule)) {
         eprintln!("[darkmux] warning: crawl.plan: {w}");
+    }
+    for rule in &rules_vec {
+        if !rule.applies_to_scope(rules::RuleScope::Tree) {
+            let scope = serde_json::to_string(rule.scope_or_default()).unwrap_or_default();
+            bail!(
+                "rule '{}' declares scope {scope} — a rule with no `tree` scope cannot be planned \
+                 by a tree walk (`crawl.plan` / `plan.sites`'s `\"source\": \"tree\"`)",
+                rule.id
+            );
+        }
     }
     let (spec, spec_warnings) = WorkspaceSpec::load(&cfg.workspace)
         .with_context(|| format!("loading workspace spec {}", cfg.workspace.display()))?;
@@ -369,6 +390,29 @@ mod tests {
         assert!(!out.exists(), "a refused plan writes nothing");
         let msg = format!("{err:#}");
         assert!(msg.contains("no-such-rule") && msg.contains("unnamed-predicate"), "{msg}");
+    }
+
+    /// (#2310 P4c review round 2, MUST FIX 2 — proven) `Rule::scope` was
+    /// enforced by NOTHING: a rule declaring `scope: ["diff"]` only
+    /// (`test-gap`, part of the review catalog) could still be planned by
+    /// the TREE walk with no error at all, silently producing a plan a
+    /// diff-scoped rule's own prose was never written for. `plan_one_rule`
+    /// must refuse a rule that does not declare tree scope, naming the
+    /// rule and its declared scope.
+    #[test]
+    fn plan_one_rule_refuses_a_rule_with_no_tree_scope() {
+        let source = git_repo_with(&[("src/a.ts", UNNAMED)]);
+        let root = TempDir::new().unwrap();
+        let spec = spec_file(root.path(), source.path());
+        let out = root.path().join("plan.json");
+        let step = step_with(serde_json::json!({
+            "rule": "test-gap", "workspace": spec.to_string_lossy(), "plan_out": out.to_string_lossy()
+        }));
+        let err = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new()).unwrap_err();
+        assert!(!out.exists(), "a refused plan writes nothing");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("test-gap"), "{msg}");
+        assert!(msg.contains("diff"), "the message must name the rule's actual declared scope: {msg}");
     }
 
     #[test]
