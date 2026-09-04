@@ -612,6 +612,7 @@ fn build_mission_config(
         // config into the panel by hand-editing its saved JSON afterward.
         panel: None,
         cmd: None,
+        outcome_from: None,
         extras,
     }
 }

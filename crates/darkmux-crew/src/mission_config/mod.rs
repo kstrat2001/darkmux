@@ -173,10 +173,19 @@ use std::collections::{BTreeMap, BTreeSet};
 /// which is the additive contract (the template is not executable on its
 /// own in any reader).
 ///
+/// Bumped to **"3.3"** (#2310 P3) — additive: [`MissionConfig`] gained the
+/// optional `outcome_from` field — the document task id whose last step's
+/// body the launcher promotes as the `mission close` record's payload,
+/// overriding the positional "the last phase's last task" default (see
+/// `src/mission_launch.rs::run_summary_payload`'s own doc for the full
+/// promotion rule). Absence (every pre-3.3 document) keeps the positional
+/// rule unchanged — a pre-3.3 reader ignores the field and gets exactly the
+/// pre-existing behavior, the additive contract.
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "3.2";
+pub const MISSION_CONFIG_SCHEMA: &str = "3.3";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,6 +248,24 @@ pub struct MissionConfig {
     /// GitHub itself never enters this crate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
+    /// (#2310 P3, schema 3.3) The document task id whose last step's body
+    /// becomes the `mission close` record's payload — an explicit override
+    /// of the positional "the last phase's last task" default
+    /// (`src/mission_launch.rs::run_summary_payload`). `Some(id)` names a
+    /// task that MUST exist somewhere in [`Self::phases`]; a config
+    /// declaring an id that resolves to no real task (a typo, or a
+    /// `grow`-templated task, which is never itself minted) is a loud error
+    /// at launch time, not a silent fall-through to the positional rule —
+    /// the whole point of naming a task explicitly is that a config author
+    /// gets a config-authoring MISTAKE surfaced immediately, not a close
+    /// payload silently drawn from the wrong step. `None` (every pre-3.3
+    /// document, and any config with no reason to override the positional
+    /// default) keeps that default unchanged — `review.json` is the first
+    /// consumer, naming `review-synthesis-task` so the review mission's
+    /// close payload is the final envelope, not the report step's rendered
+    /// GitHub comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_from: Option<String>,
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer document read by an older binary).
     #[serde(flatten)]
@@ -1248,6 +1275,7 @@ mod tests {
             phases,
             panel: None,
             cmd: None,
+            outcome_from: None,
             extras: BTreeMap::new(),
         }
     }
@@ -1785,7 +1813,13 @@ mod tests {
 
         let report = &cfg.phases[2];
         let report_task_ids: Vec<&str> = report.tasks.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(report_task_ids, vec!["review-verify-task", "review-synthesis-task"]);
+        // (#2310 P3) `review-report-task` is new — the terminal render/emit
+        // step, graph-native now instead of living in the bespoke
+        // launcher's own post-dispatch tail.
+        assert_eq!(
+            report_task_ids,
+            vec!["review-verify-task", "review-synthesis-task", "review-report-task"]
+        );
         // (#1475 packet 2) The verify task assigns the `review-verify` role.
         assert_eq!(report.tasks[0].role_id.as_deref(), Some("review-verify"));
         // (#1442 ship-2b + #2310 P2) The verify task is three sequential
@@ -1823,6 +1857,23 @@ mod tests {
             report.tasks[1].reads,
             vec!["review-dedup-task", "review-judge-task", "review-context-task", "review-bundle-task"]
         );
+        // (#2310 P3) The report task: depends on synthesis (its envelope),
+        // reads synthesis + context (the diff text) — a single
+        // `review.report` step, config `null` in the document (stamped at
+        // launch time from `emit`/`envelope_out`/`attribution`, never from
+        // the document itself — see `ReviewReportStepKind`'s own doc).
+        assert_eq!(report.tasks[2].id, "review-report-task");
+        assert_eq!(report.tasks[2].depends_on, vec!["review-synthesis-task"]);
+        assert_eq!(report.tasks[2].reads, vec!["review-synthesis-task", "review-context-task"]);
+        assert_eq!(report.tasks[2].steps.len(), 1);
+        assert_eq!(report.tasks[2].steps[0].kind, "review.report");
+
+        // (#2310 P3) The close-payload override: the review mission's
+        // `mission close` record promotes `review-synthesis-task`'s body
+        // (the final `ReviewEnvelope`), never the report task's own
+        // rendered-comment output, even though the report task is
+        // graph-positionally last.
+        assert_eq!(cfg.outcome_from.as_deref(), Some("review-synthesis-task"));
     }
 
     #[test]
@@ -2156,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_3_2() {
+    fn schema_version_constant_is_3_3() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
@@ -2180,7 +2231,12 @@ mod tests {
         // run-time fan-out fed by a step's OUTPUT. A pre-3.2 reader ignores
         // the field and mints nothing for the template, which is correct:
         // a template is not executable on its own in any reader.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "3.2");
+        //
+        // (#2310 P3) Bumped to "3.3" — additive: `MissionConfig::
+        // outcome_from`. A pre-3.3 reader ignores the field and keeps the
+        // positional "last phase's last task" close-payload rule, which is
+        // correct: the field only OVERRIDES that default, never required.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "3.3");
     }
 
     // ── (#2300) `grow` — the run-time fan-out ────────────────────────────

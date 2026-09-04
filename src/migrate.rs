@@ -303,6 +303,7 @@ fn synthesize_config_snapshot(mission_id: &str) -> Result<()> {
         phases,
         panel: None,
         cmd: None,
+        outcome_from: None,
         extras: BTreeMap::new(),
     };
     lifecycle::save_config_snapshot(mission_id, &config)

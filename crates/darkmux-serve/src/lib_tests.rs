@@ -4803,14 +4803,15 @@
         assert_eq!(count_kind("phase"), 3, "{nodes:?}");
         // (#1512, #2310 P1) Three EXPLICIT one-role probe tasks, statically
         // declared — context + bundle + 3 probe maps + dedup + judge +
-        // verify + synthesis. `review-context-task` (#2310 P1) is the
-        // pipeline's first task now — it resolves the review's shared
+        // verify + synthesis + report. `review-context-task` (#2310 P1) is
+        // the pipeline's first task now — it resolves the review's shared
         // context as a real typed step output, and every other review task
-        // formally `reads` it.
+        // formally `reads` it. `review-report-task` (#2310 P3) is the
+        // terminal render/emit task.
         assert_eq!(
             count_kind("task"),
-            9,
-            "expected context+bundle+3 probe maps+dedup+judge+verify+synthesis: {nodes:?}"
+            10,
+            "expected context+bundle+3 probe maps+dedup+judge+verify+synthesis+report: {nodes:?}"
         );
         // (#1401) No separate "step" node kind anymore — every task's
         // steps render as rows on ITS OWN node instead.
@@ -4820,19 +4821,19 @@
             .filter(|n| n["kind"] == "task")
             .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
             .sum();
-        // (#1530, #2310 P1/P2) Each of the three probe tasks and the verify
-        // task carries THREE rows (a bespoke render step + the generic
-        // `dispatch.map` + a bespoke collect step); every other task
-        // (context, bundle, dedup, judge, synthesis) carries ONE. 9 tasks:
-        // context(1) + bundle(1) + 3×probe(3) + dedup(1) + judge(1) +
-        // verify(3) + synthesis(1) = 17 step rows.
+        // (#1530, #2310 P1/P2/P3) Each of the three probe tasks and the
+        // verify task carries THREE rows (a bespoke render step + the
+        // generic `dispatch.map` + a bespoke collect step); every other
+        // task (context, bundle, dedup, judge, synthesis, report) carries
+        // ONE. 10 tasks: context(1) + bundle(1) + 3×probe(3) + dedup(1) +
+        // judge(1) + verify(3) + synthesis(1) + report(1) = 18 step rows.
         assert_eq!(
             total_step_rows,
-            17,
-            "context/bundle/dedup/judge/synthesis carry one row each, probe + verify carry three: {nodes:?}"
+            18,
+            "context/bundle/dedup/judge/synthesis/report carry one row each, probe + verify carry three: {nodes:?}"
         );
-        assert_eq!(tasks.len(), 9);
-        assert_eq!(steps.len(), 17);
+        assert_eq!(tasks.len(), 10);
+        assert_eq!(steps.len(), 18);
 
         // (#1402) Every row's label resolves through the real StepKind
         // display-name fallback chain — the probe/verify dispatch rows are

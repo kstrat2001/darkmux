@@ -712,9 +712,26 @@ fn review_result_to_mission_envelope(
 /// there is exactly ONE place that ever writes a review mission's terminal
 /// record, whether the run finished normally, errored, panicked, or was
 /// cut short by SIGTERM/SIGINT/SIGHUP.
+///
+/// (#2310 P3) `finalize_mission_with_payload`, not the bare `finalize_mission`
+/// this used to call — the `mission close` FLOW RECORD's payload used to be
+/// unconditionally `None` for every review run (`MissionEnvelope::payload`
+/// on `envelope` above is a DIFFERENT field, read by other consumers, never
+/// by the close record itself). `Ok(env)` promotes `env` through
+/// [`mission_launch::promoted_step_body`] — the SAME unwrap the generic
+/// launcher's `run_summary_payload` applies to a persisted `Step.output`
+/// string; see that function's own doc for why this is the provably
+/// identical value for `review.json`'s `outcome_from: "review-synthesis-task"`.
+/// `Err(e)` (a hard failure before any envelope was produced) promotes
+/// nothing, same as before.
 pub(crate) fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result<ReviewEnvelope>) {
     let envelope = review_result_to_mission_envelope(mission_id, phase_ids, result);
-    crew::envelope::finalize_mission(&envelope);
+    let close_payload = result
+        .as_ref()
+        .ok()
+        .and_then(|env| serde_json::to_value(env).ok())
+        .and_then(mission_launch::promoted_step_body);
+    crew::envelope::finalize_mission_with_payload(&envelope, close_payload);
 }
 
 /// The review launcher's per-dispatch timeout default when `--timeout` is
@@ -788,11 +805,7 @@ pub(crate) fn launch(
     crate::preflight::check_power_posture(params)?;
     let _sleep_assertion = darkmux_crew::sleep_assertion::SleepAssertion::hold(&format!("darkmux mission review {}", config.id));
 
-    let envelope_out = path_input(&collected, "envelope_out");
-    let emit = path_input(&collected, "emit");
-    let attribution = str_input(&collected, "attribution").map(str::to_string);
-
-    let env: ReviewEnvelope = match path_input(&collected, "from_envelope") {
+    match path_input(&collected, "from_envelope") {
         Some(path) => {
             // Synthesis-only: dispatch-shaping inputs have nothing to
             // shape. Warn (don't error) — operator sovereignty: surface,
@@ -837,27 +850,51 @@ pub(crate) fn launch(
             }
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading from_envelope {}", path.display()))?;
-            serde_json::from_str(&raw).with_context(|| {
+            let env: ReviewEnvelope = serde_json::from_str(&raw).with_context(|| {
                 format!("parsing from_envelope {} as a review envelope", path.display())
-            })?
+            })?;
+
+            // (#2310 P3) `from_envelope` is synthesis-only — there is no
+            // graph, so no `review.report` step ever runs to do this tail's
+            // job. This launcher keeps doing it itself here, unchanged from
+            // before this packet (P4 turns this whole branch into a config
+            // VARIANT instead of a launcher-level special case; P3
+            // deliberately leaves it — see this function's own module doc).
+            if let Some(path) = path_input(&collected, "envelope_out") {
+                let pretty =
+                    serde_json::to_string_pretty(&env).context("serializing the review envelope")?;
+                std::fs::write(&path, pretty)
+                    .with_context(|| format!("writing envelope_out {}", path.display()))?;
+            }
+            // (#1311) Dispatch is done (or was synthesis-only); the model
+            // work is behind us. `synthesis` then `done` bracket the
+            // pure-CPU render so a wedge in the (local) synthesis code is
+            // still visible.
+            liveness("synthesis");
+            let attribution = str_input(&collected, "attribution");
+            let rendered = pr_review::synthesize_review(&env, &diff_text, attribution);
+            let code = pr_review::emit_rendered(&rendered, path_input(&collected, "emit").as_deref())?;
+            liveness("done");
+            Ok(code)
         }
-        None => run_dispatch(config, &collected, &diff_file, &diff_text, timeout_seconds, spec_origin)?,
-    };
-
-    if let Some(path) = &envelope_out {
-        let pretty = serde_json::to_string_pretty(&env).context("serializing the review envelope")?;
-        std::fs::write(path, pretty)
-            .with_context(|| format!("writing envelope_out {}", path.display()))?;
+        None => {
+            // (#2310 P3) The graph path's own render/emit tail: the SAME
+            // envelope_out write + synthesize + emit this function used to
+            // do itself, unconditionally, after every dispatch — now
+            // `review-report-step`'s own job (`ReviewReportStepKind`,
+            // `crates/darkmux-lab/src/lab/review.rs`), stamped from this
+            // launch's `emit`/`envelope_out`/`attribution` inputs at graph-
+            // build time (see `run_dispatch`'s own stamp, right after its
+            // `build_review_graph_from_config` call). Nothing left here to
+            // do with the returned envelope beyond letting `run_dispatch`
+            // finish the run's own mission-finalize bookkeeping — the exit
+            // code is always `0` on any produced review output (same
+            // contract `emit_rendered` itself always returns), matching
+            // this function's own documented contract.
+            run_dispatch(config, &collected, &diff_file, &diff_text, timeout_seconds, spec_origin)?;
+            Ok(0)
+        }
     }
-
-    // (#1311) Dispatch is done (or was synthesis-only); the model work is
-    // behind us. `synthesis` then `done` bracket the pure-CPU render so a
-    // wedge in the (local) synthesis code is still visible.
-    liveness("synthesis");
-    let rendered = pr_review::synthesize_review(&env, &diff_text, attribution.as_deref());
-    let code = pr_review::emit_rendered(&rendered, emit.as_deref())?;
-    liveness("done");
-    Ok(code)
 }
 
 /// Everything but `from_envelope`: resolve the source + crew, then dispatch
@@ -1353,7 +1390,7 @@ fn run_dispatch(
         // built-in no matter what was launched — the silent-wrong-execution bug
         // this fix exists to close. `build_review_graph_from_config` is the same
         // function minus that hardcoded load.
-        let graph = build_review_graph_from_config(
+        let mut graph = build_review_graph_from_config(
             review_config_doc,
             &format!("the launched config `{}`", config.id),
             ctx.clone(),
@@ -1366,6 +1403,37 @@ fn run_dispatch(
             &report_phase_id,
             judge_concurrency,
         )?;
+        // (#2310 P3) Stamp `review-report-step`'s config from this launch's
+        // own `emit`/`envelope_out`/`attribution` inputs — the SAME
+        // "compute at build time, stamp, read back in run_streaming"
+        // pattern every other dispatching step's config already uses (see
+        // e.g. the verify seat's config stamp a few hundred lines up in
+        // `review.rs::build_review_graph_from_config`). These three are
+        // launch-time operator inputs, never task/step data, so they are
+        // NOT threaded through `build_review_graph_from_config`'s own
+        // signature (which is called from dozens of hermetic test sites
+        // that have no reason to know about them) — the launcher stamps
+        // them here instead, the same "extra step outside the pure
+        // builder" shape `review_conformance.rs`'s own harness already uses
+        // for `review-context-step`'s `context_out` escape hatch. Absent
+        // when a user-tier `review.json` doesn't declare the report task at
+        // all (a pre-P3 copy) — `get_mut` returns `None` and this is a
+        // silent no-op, matching that document's own pre-P3 behavior
+        // (nothing rendered by the graph; `launch`'s own `from_envelope`
+        // tail is the only render path such a document has).
+        if let Some(report_step) = graph.steps.get_mut("review-report-step") {
+            let mut cfg = serde_json::Map::new();
+            if let Some(p) = path_input(collected, "emit") {
+                cfg.insert("emit".to_string(), serde_json::json!(p.display().to_string()));
+            }
+            if let Some(p) = path_input(collected, "envelope_out") {
+                cfg.insert("envelope_out".to_string(), serde_json::json!(p.display().to_string()));
+            }
+            if let Some(a) = str_input(collected, "attribution") {
+                cfg.insert("attribution".to_string(), serde_json::json!(a));
+            }
+            report_step.config = serde_json::Value::Object(cfg);
+        }
 
         // (#1417, id-minting fixed #1503) Mint the Mission + the SAME three
         // phases review.json declares (investigate/adjudicate/report) — the
@@ -2713,6 +2781,50 @@ mod tests {
             assert_eq!(phase_status(&mission_id, phase_id), "complete", "clean run completes every phase");
         }
         assert_eq!(mission_status_str(&mission_id), "finalized", "clean run finalizes the mission");
+    }
+
+    /// (#2310 P3) The `mission close` FLOW RECORD's payload — a DIFFERENT
+    /// thing from `MissionEnvelope::payload` (`envelope.rs`'s own field,
+    /// read by other consumers) — used to be unconditionally `None` for
+    /// every review run (`finalize_review_mission` called the bare
+    /// `finalize_mission`, never the `_with_payload` variant). Red before
+    /// this packet's fix: `records[0]["payload"]` was `Null`.
+    #[test]
+    #[serial_test::serial]
+    fn finalize_review_mission_promotes_the_envelope_as_the_close_record_payload() {
+        let g = CrewDirGuard::new();
+        let (mission_id, phase_ids) = mint_review_instance("owner/repo@closepayload");
+
+        let result: Result<ReviewEnvelope> = Ok(ReviewEnvelope {
+            case_id: "owner/repo@closepayload".to_string(),
+            crew: "review-conformance".to_string(),
+            confirmed: 2,
+            needs_check: 1,
+            archived: 3,
+            degenerate: None,
+            ..Default::default()
+        });
+        let ids: [&str; 3] = [&phase_ids[0], &phase_ids[1], &phase_ids[2]];
+        finalize_review_mission(&mission_id, &ids, &result);
+
+        let flows_dir = std::env::var("DARKMUX_FLOWS_DIR").unwrap();
+        let day = darkmux_flow::day_utc_now();
+        let path = PathBuf::from(flows_dir).join(format!("{day}.jsonl"));
+        let raw = std::fs::read_to_string(&path).expect("flow file should have been created");
+        let records: Vec<Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["action"] == "mission close" && v["mission_id"] == mission_id)
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let payload = &records[0]["payload"];
+        assert!(!payload.is_null(), "the close record's payload must not be null: {records:?}");
+        assert_eq!(payload["case_id"], "owner/repo@closepayload");
+        assert_eq!(payload["crew"], "review-conformance");
+        assert_eq!(payload["confirmed"], 2);
+        assert_eq!(payload["needs_check"], 1);
+        assert_eq!(payload["archived"], 3);
+        let _ = g;
     }
 
     #[test]

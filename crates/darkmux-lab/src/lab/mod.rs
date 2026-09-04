@@ -29,6 +29,14 @@ pub mod review;
 pub mod review_bench;
 pub mod review_context;
 pub mod review_outputs;
+// (#2310 P3) The review envelope -> GitHub PR-payload RENDER half, moved
+// here from the bin crate's `src/pr_review.rs` — pure rendering (no CLI
+// deps), needed by this crate's own `review.report` step kind
+// (`ReviewReportStepKind`, `review.rs`) as well as the bin crate's
+// `mission_launch_review::launch`'s `from_envelope` path. `src/main.rs`
+// keeps a `pub use darkmux_lab::lab::review_render as pr_review;`
+// re-export so every existing bin-crate caller keeps compiling unchanged.
+pub mod review_render;
 pub mod run;
 pub mod sandbox_hash;
 // (#1198) scores.json — the bench suite's persisted score artifact (#1197).

@@ -4188,7 +4188,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let adjudicate_tasks: Vec<_> = graph.tasks.iter().filter(|t| t.phase_id == "adjudicate").collect();
         assert_eq!(adjudicate_tasks.len(), 1, "judge only");
         let report_tasks: Vec<_> = graph.tasks.iter().filter(|t| t.phase_id == "report").collect();
-        assert_eq!(report_tasks.len(), 2, "verify (render + map) + synthesis");
+        // (#2310 P3) `review-report-task` is new — verify + synthesis + report.
+        assert_eq!(report_tasks.len(), 3, "verify (render + map) + synthesis + report");
         // (#1442 ship-2b + #2310 P2) The verify task is three sequential
         // steps: the Tier-3 render step, the generic dispatch.map, then the
         // Tier-3 collect step.
@@ -4259,9 +4260,9 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // task's own three-step split.
         assert_eq!(
             graph.steps.len(),
-            14,
-            "(#2310 P2) context + bundle + 2 claimed probe (render + map + collect) tasks + dedup \
-             + judge + verify render + verify map + verify collect + synthesis"
+            15,
+            "(#2310 P2/P3) context + bundle + 2 claimed probe (render + map + collect) tasks + dedup \
+             + judge + verify render + verify map + verify collect + synthesis + report"
         );
 
         // (#1513 review C1) The SAME scenario above prunes the third,
