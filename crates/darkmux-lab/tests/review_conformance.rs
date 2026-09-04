@@ -312,10 +312,12 @@ fn chat_fn(
         if call.system.contains("JUDGE seat") {
             if call.user.contains("src/billing.ts") {
                 let idx = billing_pass.fetch_add(1, Ordering::SeqCst);
-                return Ok(reply(match idx {
-                    0 | 1 => CONFIRM_JSON, // billing: pass1 confirmed, pass2 confirmed
-                    other => panic!("review-conformance: unexpected billing judge pass {other}"),
-                }));
+                // billing: pass1 confirmed, pass2 confirmed. Any FURTHER pass
+                // only exists when dedup failed to collapse the second billing
+                // flag — answer it too, so that regression is reported by the
+                // collapse assertion (raw 5 / deduped 4), not by a panic here.
+                let _ = idx;
+                return Ok(reply(CONFIRM_JSON));
             }
             if call.user.contains("src/config.ts") {
                 let idx = config_pass.fetch_add(1, Ordering::SeqCst);
