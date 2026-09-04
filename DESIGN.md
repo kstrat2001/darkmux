@@ -287,7 +287,7 @@ ones were already spoken for. This is the map.
 | **profile** | The staffing registry entry: which model at what context, local or hosted endpoint. |
 | **seat** | A staffed model position within a run (`MemberRecord`), with a `draws` count. |
 | **draw** | One invocation of a seat. |
-| **item** | One element of a `dispatch.map` collection. |
+| **item** | One element of a `dispatch.map` collection. Reserved shape: an object with exactly the keys `system` (a string) and `item` is a per-item persona override, and the `item` field is the payload; every other value is the item itself (#2310 P1). |
 | **session** | An INTERNAL join key tying a family of flow records together. Never operator-facing. |
 | **workload** / **fixture** | Lab-only: the thing being run, and the pinned sandbox it runs against. |
 

@@ -4157,14 +4157,14 @@ const REVIEW_CONTEXT_KIND: &str = "review.context";
 /// read by THIS step — the shape a fresh `mission launch review` config's
 /// `--param intent_file` names) and `intent_body` (the text directly, when
 /// a caller has already resolved it — the shape `build_review_graph_from_
-/// config` stamps, since `ctx.intent_body` is text by the time that
-/// function runs, not a retained path) are both accepted; `intent_body`
+/// config` stamps, since the builder stamps `intent_file` when the launcher retained
+/// a path and `intent_body` only when it did not) are both accepted; `intent_body`
 /// wins when both are present (config leniency, #1269 — never a hot-path
 /// panic over which shape a caller chose).
 struct ReviewContextStepConfig {
     /// One of `diff_file`/`diff` is required — same leniency shape as
     /// intent (see this struct's own doc): `build_review_graph_from_config`
-    /// stamps `diff` INLINE (the launcher already read `diff_file` into
+    /// stamps `diff_file` (the path) on the production launch path, and `diff` inline only when the caller has no file (a hand-built graph already read `diff_file` into
     /// text before this point, same as `ctx.intent_body` — re-reading the
     /// file a second time here would be wasted I/O), while a hand-built
     /// graph (a `plan_out`-style test, or a config authored by hand) can

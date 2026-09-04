@@ -891,20 +891,24 @@ fn map_item_text(v: &serde_json::Value) -> String {
 /// `config.system` (fixed at BUILD time) cannot see. Zero domain knowledge
 /// added: this is still config-driven (the SHAPE of an item, not what it
 /// means), matching this kind's Tier 1 classification — see its own doc.
-/// Everything else (a bare string, a number, any other object — including
-/// one that happens to carry only ONE of the two keys) is the plain item as
-/// before: no override, and the whole value substitutes via
-/// [`map_item_text`] under the step's own `config.system`.
+/// The override shape is EXACT (round-2 review of #2339): an object with
+/// exactly the two keys `system` and `item`, and `system` a string. Anything
+/// else — a bare string, a number, an object with only one of the keys, an
+/// object with the two keys plus extras, or a non-string `system` — is the
+/// plain item as before: no override, and the whole value substitutes via
+/// [`map_item_text`] under the step's own `config.system`. Exactness is what
+/// keeps a legitimate collection item that merely CONTAINS those keys from
+/// being hijacked; the shape is reserved and named in DESIGN.md's glossary.
 ///
 /// Returns `(system_override, payload)` — `payload` is the `"item"` field
-/// when both keys are present, else the item unchanged (so the two never
-/// disagree about which shape won).
+/// when the shape matched, else the item unchanged (so the two never disagree
+/// about which shape won).
 fn item_system_and_payload(item: &serde_json::Value) -> (Option<&str>, &serde_json::Value) {
     match item.as_object() {
-        Some(obj) if obj.contains_key("system") && obj.contains_key("item") => (
-            obj.get("system").and_then(|v| v.as_str()),
-            obj.get("item").expect("just checked contains_key"),
-        ),
+        Some(obj) if obj.len() == 2 => match (obj.get("system").and_then(|v| v.as_str()), obj.get("item")) {
+            (Some(system), Some(payload)) => (Some(system), payload),
+            _ => (None, item),
+        },
         _ => (None, item),
     }
 }
@@ -2515,6 +2519,16 @@ mod tests {
         let (system, payload) = item_system_and_payload(&system_only);
         assert_eq!(system, None, "a \"system\" key with no \"item\" sibling is not an override");
         assert_eq!(payload, &system_only);
+
+        let extra_key = json!({ "system": "OVERRIDE", "item": "hello", "id": "b1" });
+        let (system, payload) = item_system_and_payload(&extra_key);
+        assert_eq!(system, None, "an object with the two keys PLUS extras is a plain item, not an override");
+        assert_eq!(payload, &extra_key);
+
+        let non_string_system = json!({ "system": 5, "item": "hello" });
+        let (system, payload) = item_system_and_payload(&non_string_system);
+        assert_eq!(system, None, "a non-string system is not an override, and the payload is NOT swapped either");
+        assert_eq!(payload, &non_string_system);
 
         let item_only = json!({ "item": "lonely" });
         let (system, payload) = item_system_and_payload(&item_only);
