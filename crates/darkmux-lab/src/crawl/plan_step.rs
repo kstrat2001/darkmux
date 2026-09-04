@@ -43,6 +43,14 @@
 //! `rule` and `workspace` are required. Without `plan_out` the plan is
 //! written under the run: `<missions>/<mission-id>/plan/<rule>.json`, the
 //! mission being the one that owns the step's task's phase.
+//!
+//! (#2310 P4c-2 item 0/review item 6) A launcher no longer injects
+//! `sizing`/`no_fetch` into this step's config on its own — a mission
+//! config's OWN document must declare the input AND reference
+//! `{{max_sites_per_unit}}`/`{{max_est_tokens_per_unit}}`/`{{no_fetch}}`
+//! (as `crawl.json` does) for an operator's `--param` to reach here; an
+//! undeclared or unreferenced `--param` is now inert, not silently
+//! applied to every `crawl.plan` step in the document.
 
 use crate::crawl::plan::{self, Plan, PlanParams};
 use anyhow::{anyhow, bail, Context, Result};
@@ -130,24 +138,10 @@ impl PlanStepConfig {
         };
         let rule = str_field("rule")?;
         let workspace = PathBuf::from(str_field("workspace")?);
-        let mut params = PlanParams::default();
-        if let Some(sizing) = step.config.get("sizing") {
-            for (key, slot) in [
-                ("max_sites_per_unit", &mut params.max_sites_per_unit),
-                ("max_est_tokens_per_unit", &mut params.max_est_tokens_per_unit),
-            ] {
-                if let Some(v) = sizing.get(key) {
-                    let n = v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                        anyhow!(
-                            "step `{}`: `{CRAWL_PLAN_KIND}` config.sizing.{key} must be a positive integer, got {v}",
-                            step.id
-                        )
-                    })?;
-                    *slot = usize::try_from(n).context("sizing value does not fit usize")?;
-                }
-            }
-        }
-        let fetch = !step.config.get("no_fetch").and_then(|v| v.as_bool()).unwrap_or(false);
+        // (#2310 P4c-2 review MUST-do 1) Shared with `plan_sites_step.rs`
+        // so the two `plan.*` kinds cannot silently drift back apart on
+        // CLI-string leniency the way they did before this review.
+        let (params, fetch) = plan::parse_sizing_and_no_fetch(&step.config, &step.id, CRAWL_PLAN_KIND)?;
         let plan_out = step.config.get("plan_out").and_then(|v| v.as_str()).map(PathBuf::from);
         Ok(Self { rule, workspace, params, fetch, plan_out })
     }
@@ -428,6 +422,46 @@ mod tests {
         }));
         let err = PlanStepConfig::from_step(&step).unwrap_err();
         assert!(format!("{err}").contains("positive integer"), "{err}");
+    }
+
+    /// (#2310 P4c-2 item 0) `sizing.*`/`no_fetch` now reach this step
+    /// through `mission_config::substitute_step_config`'s generic
+    /// `{{<input-id>}}` substitution, which carries a `--param`-sourced
+    /// value through as the JSON STRING the CLI always collects it as —
+    /// `crawl.json`'s own `sizing`/`no_fetch` placeholders substitute to
+    /// exactly this shape on a real `--param max_sites_per_unit=7 --param
+    /// no_fetch=true` launch. Lenient-on-read: string-or-typed, same as
+    /// `bool_param` at the CLI layer.
+    #[test]
+    fn sizing_and_no_fetch_parse_leniently_from_cli_param_strings() {
+        let step = step_with(serde_json::json!({
+            "rule": "unnamed-predicate", "workspace": "/x.json",
+            "sizing": {"max_sites_per_unit": "7", "max_est_tokens_per_unit": "1200"},
+            "no_fetch": "true"
+        }));
+        let cfg = PlanStepConfig::from_step(&step).unwrap();
+        assert_eq!(cfg.params.max_sites_per_unit, 7);
+        assert_eq!(cfg.params.max_est_tokens_per_unit, 1200);
+        assert!(!cfg.fetch, "`no_fetch: \"true\"` (a string) must be honored, not silently ignored");
+
+        let step = step_with(serde_json::json!({
+            "rule": "unnamed-predicate", "workspace": "/x.json", "no_fetch": "false"
+        }));
+        assert!(PlanStepConfig::from_step(&step).unwrap().fetch, "a string \"false\" must not fetch=false");
+    }
+
+    /// (#2310 P4c-2 item 0) A `sizing`/`no_fetch` key the generic
+    /// substitution OMITTED (the operator left the input unset) must
+    /// behave exactly as if the document never declared the placeholder —
+    /// the built-in defaults, not an error.
+    #[test]
+    fn an_absent_sizing_or_no_fetch_key_keeps_the_defaults() {
+        let step = step_with(serde_json::json!({
+            "rule": "unnamed-predicate", "workspace": "/x.json", "sizing": {}
+        }));
+        let cfg = PlanStepConfig::from_step(&step).unwrap();
+        assert_eq!(cfg.params.max_sites_per_unit, PlanParams::default().max_sites_per_unit);
+        assert!(cfg.fetch, "no `no_fetch` key at all must default to fetching");
     }
 
     #[test]

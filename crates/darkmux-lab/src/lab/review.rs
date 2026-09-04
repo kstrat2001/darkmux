@@ -7847,6 +7847,11 @@ pub fn build_review_graph_from_config(
         phase_ids,
         task_overrides: std::collections::BTreeMap::new(),
         step_config_overrides,
+        // (#2310 P4c-2 item 0) `review.json` declares no `{{<input-id>}}`
+        // placeholders — the frozen review launcher resolves everything it
+        // needs (workspace/bundling/staffing) through its own bespoke
+        // config-building code, not the generic substitution mechanism.
+        input_values: std::collections::BTreeMap::new(),
     };
 
     let (mut tasks, mut steps, mut interpret_warnings) = interpret(config, &params)

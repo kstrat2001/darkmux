@@ -206,6 +206,12 @@ pub(crate) struct InputJson {
     pub name: String,
     pub description: Option<String>,
     pub required: bool,
+    /// (#2310 P4c-2 review item 3) `true` when the document declared
+    /// `"ignored": true` on this input — mirrors `mission_config::
+    /// MissionInput::ignored`, always present (never `Option`) so a
+    /// `--json` consumer never has to distinguish "false" from "absent".
+    pub ignored: bool,
+    pub ignored_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -580,6 +586,8 @@ pub(crate) fn build_show(
                 name: i.name.clone(),
                 description: i.description.clone(),
                 required: i.required.unwrap_or(true),
+                ignored: i.ignored.unwrap_or(false),
+                ignored_reason: i.ignored_reason.clone(),
             })
             .collect(),
         panel,
@@ -692,7 +700,16 @@ fn render_show_text(show: &ConfigShow) -> String {
         out.push_str("  inputs:\n");
         for i in &other_inputs {
             let req = if i.required { "required" } else { "optional" };
-            out.push_str(&format!("    {} ({req})\n", i.name));
+            // (#2310 P4c-2 review item 3) An ignored input's line names
+            // WHY, so an operator reading `mission config show` sees the
+            // same signal the launch-time warning gives, without having to
+            // launch first.
+            if i.ignored {
+                let reason = i.ignored_reason.as_deref().unwrap_or("no reason given");
+                out.push_str(&format!("    {} ({req}, ignored: {reason})\n", i.name));
+            } else {
+                out.push_str(&format!("    {} ({req})\n", i.name));
+            }
         }
         if !role_inputs.is_empty() {
             let names: Vec<&str> = role_inputs.iter().map(|i| i.name.as_str()).collect();
@@ -1449,12 +1466,16 @@ mod tests {
                 name: "review-judge".to_string(),
                 description: None,
                 required: Some(false),
+                ignored: None,
+                ignored_reason: None,
                 extras: Default::default(),
             },
             MissionInput {
                 name: "diff_file".to_string(),
                 description: None,
                 required: Some(true),
+                ignored: None,
+                ignored_reason: None,
                 extras: Default::default(),
             },
         ];
