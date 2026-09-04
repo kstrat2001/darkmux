@@ -121,6 +121,71 @@
         .expect("serializing a test review-context output")
     }
 
+    /// (#2310 P2) The bundle step's typed output — a test that calls a
+    /// downstream kind's `run_streaming` directly (bypassing
+    /// `ReviewBundleStepKind`) seeds this by hand, the same as
+    /// `context_task_output` above.
+    fn bundle_task_output(bundles: &[BundleInput]) -> String {
+        let body = crate::lab::review_outputs::BundleSetOutput {
+            schema_version: crate::lab::review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+            bundles: bundles.to_vec(),
+            skip: None,
+            bundler_fallback: None,
+        };
+        darkmux_crew::step_output::Output::wrap(
+            crate::lab::review_outputs::BUNDLE_SET_OUTPUT_KIND,
+            body,
+            darkmux_crew::step_output::Producer::default(),
+        )
+        .to_output_string()
+        .expect("serializing a test bundle output")
+    }
+
+    /// (#2310 P2) The dedup step's typed output — a test that calls a
+    /// downstream kind's `run_streaming` directly seeds this by hand, same
+    /// as `bundle_task_output` above.
+    fn dedup_task_output(flags: Vec<ProbeFlag>) -> String {
+        let raw_flags = flags.len();
+        let body = crate::lab::review_outputs::DedupOutput {
+            schema_version: crate::lab::review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+            flags,
+            stats: DedupStats { raw: raw_flags, deduped: raw_flags },
+            members: Vec::new(),
+            warnings: Vec::new(),
+            remote_budget: None,
+            degenerate: None,
+            probe_retries: 0,
+            raw_flags,
+        };
+        darkmux_crew::step_output::Output::wrap(
+            crate::lab::review_outputs::DEDUP_OUTPUT_KIND,
+            body,
+            darkmux_crew::step_output::Producer::default(),
+        )
+        .to_output_string()
+        .expect("serializing a test dedup output")
+    }
+
+    /// (#2310 P2) The judge step's typed output — see `bundle_task_output`'s
+    /// own doc for why a downstream test seeds this by hand.
+    fn judge_task_output(judged: Vec<JudgedFlag>) -> String {
+        let body = crate::lab::review_outputs::JudgeOutput {
+            schema_version: crate::lab::review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION.to_string(),
+            judged,
+            member: None,
+            remote_budget_rows: Vec::new(),
+            warnings: Vec::new(),
+            degenerate: None,
+        };
+        darkmux_crew::step_output::Output::wrap(
+            crate::lab::review_outputs::JUDGE_OUTPUT_KIND,
+            body,
+            darkmux_crew::step_output::Producer::default(),
+        )
+        .to_output_string()
+        .expect("serializing a test judge output")
+    }
+
     /// (#2310 P1) A test that actually RUNS the built graph (`run_graph`/
     /// `run_graph_recording_loads`/`run_graph_against`, and the standalone
     /// tests that drive `run_step_graph`/`run_review_graph` directly) needs
@@ -3593,12 +3658,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// (that field retired — bundling is now `review-bundle-step`'s own
     /// run-time work) — this helper instead wires it through
     /// `bundle_override`, so a full graph run through `run_review_graph`
-    /// (its own `review-bundle-step` reads the override at run time,
-    /// publishing straight onto `REVIEW_BUNDLES_ARTIFACT`) behaves exactly
-    /// like every test did before this packet. Tests that call an isolated
-    /// StepKind's `run_streaming`/`residency` directly (bypassing the bundle
-    /// step entirely) additionally seed `REVIEW_BUNDLES_ARTIFACT` by hand —
-    /// see those tests' own hand-built `ArtifactBus`es.
+    /// (its own `review-bundle-step` reads the override at run time and
+    /// publishes the typed `review.bundles` output — see `BundleSetOutput`'s
+    /// own doc) behaves exactly like every test did before this packet.
+    /// (#2310 P2) Tests that call an isolated StepKind's `run_streaming`/
+    /// `residency` directly (bypassing the bundle step entirely) instead
+    /// seed a `bundle_task_output(&bundles)` entry into that call's own
+    /// `input` map by hand.
     fn step_ctx(crew: &ResolvedReviewRoles, bundles: Vec<BundleInput>) -> Arc<ReviewStepContext> {
         Arc::new(ReviewStepContext {
             case_id: "case-1".to_string(),
@@ -3616,6 +3682,16 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: None,
             bundle_override: Some(Arc::new(move || Ok(bundles.clone()))),
             mission_id: None,
+            // (#2310 P2) `run_review_graph` overlays these onto its own
+            // bus-seeded copy before any step reads them for a full graph
+            // run; a hand-built fixture that reads `ReviewStepContext`
+            // directly (never through `run_review_graph`) just gets the
+            // fresh defaults.
+            crew_name: None,
+            mode_label: None,
+            fingerprint: None,
+            staffing: None,
+            interpret_warnings: Vec::new(),
             // (#2310 P1 fix) The graph's own `review-context-step` now
             // reads its test overrides off THIS bus seam, not step config
             // — mirror the fields above so a full `run_review_graph` run
@@ -3753,84 +3829,50 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// `dedup_task_id`/`judge_task_id`/`verify_task_id`/`remote_budget`
     /// (synthesis) are stamped onto EACH step's own `Step.config` by
     /// `build_review_graph_from_config` and read back by
-    /// [`dedup_config_from_step`]/[`synthesis_task_ids_from_step`] — two
-    /// hand-written call sites (the stamper, the reader) with no compiler
-    /// check keeping them in sync, exactly the risk
-    /// `bundle_spec_stamp_and_reader_agree_for_every_source_shape` guards
-    /// against on the bundle step. Covers both the no-verify-seat and
-    /// verify-seat-staffed shapes (the synthesis step's config gains three
-    /// extra keys only in the latter — see `build_review_graph_from_config`'s
-    /// own doc), and a two-probe crew (so `probe_specs` round-trips more
-    /// than one entry, in claim order).
+    /// [`dedup_config_from_step`] — the stamper (`build_review_graph_from_config`)
+    /// and the reader, with no compiler check keeping them in sync, exactly
+    /// the risk `bundle_spec_stamp_and_reader_agree_for_every_source_shape`
+    /// guards against on the bundle step. (#2310 P2) `ReviewSynthesisStepKind`
+    /// needs no config at all now — reads every input by kind — so this
+    /// test's OWN scope narrowed to `probe_specs` alone; the verify-seat
+    /// identity stamp moved to `review-verify-collect-step`'s config
+    /// (asserted by the verify-collect step's own tests). Covers a
+    /// two-probe crew (so `probe_specs` round-trips more than one entry, in
+    /// claim order).
     #[test]
-    fn dedup_and_synthesis_config_stamp_and_reader_agree_with_and_without_verify_seat() {
+    fn dedup_config_stamp_and_reader_agree() {
         let probes = vec![graph_staffing("phigh", "probe-model-a", 1), graph_staffing("plow", "probe-model-b", 1)];
-        for verify in [None, Some(graph_staffing("careful", "verify-model", 1))] {
-            let graph = build_review_graph(
-                // (#1530) A DISTINCTIVE budget, not `default()`'s 0 — otherwise
-                // `synth == dedup` is `0 == 0` and would still pass if a future
-                // change stamped a literal zero or read the wrong field.
-                std::sync::Arc::new(ReviewStepContext {
-                    remote_max_tokens_per_execution: 12_345,
-                    ..Default::default()
-                }),
-                &dummy_bundle_spec(),
-                graph_staffing("fast", "judge-model", 1),
-                verify.clone(),
-                &probes,
-                "investigate",
-                "adjudicate",
-                "report",
-                1,
-            )
-            .expect("graph builds");
+        let graph = build_review_graph(
+            std::sync::Arc::new(ReviewStepContext { remote_max_tokens_per_execution: 12_345, ..Default::default() }),
+            &dummy_bundle_spec(),
+            graph_staffing("fast", "judge-model", 1),
+            None,
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
 
-            let dedup_config =
-                &graph.steps.get("review-dedup-step").expect("the dedup step exists").config;
-            let (probe_specs, dedup_remote_budget) = dedup_config_from_step(dedup_config)
-                .unwrap_or_else(|e| panic!("the dedup step's reader rejected the stamper's own config: {e:#}"));
-            assert_eq!(probe_specs.len(), probes.len(), "every claimed probe seat must round-trip a spec");
-            assert_eq!(
-                probe_specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-                vec!["phigh", "plow"],
-                "probe spec identity must survive the stamp, in claim order"
-            );
-
-            let synthesis_config =
-                &graph.steps.get("review-synthesis-step").expect("the synthesis step exists").config;
-            let (dedup_task_id, judge_task_id, verify_task_id, synth_remote_budget) =
-                synthesis_task_ids_from_step(synthesis_config).unwrap_or_else(|e| {
-                    panic!("the synthesis step's reader rejected the stamper's own config: {e:#}")
-                });
-            assert_eq!(dedup_task_id, "review-dedup-task", "task ids are FIXED, unaffected by phase-id args");
-            assert_eq!(judge_task_id, "review-judge-task");
-            assert_eq!(verify_task_id, "review-verify-task");
-            assert_eq!(dedup_remote_budget, 12_345, "the dedup stamp must carry the ctx's real budget");
-            assert_eq!(synth_remote_budget, 12_345, "the synthesis stamp must carry the same real budget");
-            // (#1530) The join key attribution depends on (#1541) and the
-            // seat identity the envelope reports — pinned here so the
-            // round-trip is self-contained rather than leaning on the golden.
-            assert_eq!(
-                probe_specs.iter().map(|s| s.identifier.as_str()).collect::<Vec<_>>(),
-                probes.iter().map(|p| seat_identifier(&p.pm)).collect::<Vec<_>>(),
-                "each seat's dispatch identifier must survive the round trip"
-            );
-            assert!(
-                probe_specs.iter().all(|s| s.draw_task_ids.len() == 1 && !s.draw_task_ids[0].is_empty()),
-                "draw_task_ids is the key reconstruct_probe_stage joins on — it must survive: {probe_specs:?}"
-            );
-            assert_eq!(
-                synth_remote_budget, dedup_remote_budget,
-                "both steps stamp the SAME per-execution remote budget"
-            );
-
-            assert_eq!(
-                synthesis_config.get("verify_identifier").is_some(),
-                verify.is_some(),
-                "verify_identifier (and its remote/endpoint_host siblings) is present iff a \
-                 verify seat was staffed"
-            );
-        }
+        let dedup_config = &graph.steps.get("review-dedup-step").expect("the dedup step exists").config;
+        let probe_specs = dedup_config_from_step(dedup_config)
+            .unwrap_or_else(|e| panic!("the dedup step's reader rejected the stamper's own config: {e:#}"));
+        assert_eq!(probe_specs.len(), probes.len(), "every claimed probe seat must round-trip a spec");
+        assert_eq!(
+            probe_specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["phigh", "plow"],
+            "probe spec identity must survive the stamp, in claim order"
+        );
+        assert_eq!(
+            probe_specs.iter().map(|s| s.identifier.as_str()).collect::<Vec<_>>(),
+            probes.iter().map(|p| seat_identifier(&p.pm)).collect::<Vec<_>>(),
+            "each seat's dispatch identifier must survive the round trip"
+        );
+        assert!(
+            probe_specs.iter().all(|s| s.draw_task_ids.len() == 1 && !s.draw_task_ids[0].is_empty()),
+            "draw_task_ids is the key the dedup fan-in joins on — it must survive: {probe_specs:?}"
+        );
     }
 
     /// `staffing()`'s graph-test twin: a LOCAL seat whose `ProfileModel`
@@ -3916,6 +3958,16 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             // (#1530) See `step_ctx`'s own doc — same `bundle_override` wiring.
             bundle_override: Some(Arc::new(move || Ok(bundles.clone()))),
             mission_id: None,
+            // (#2310 P2) `run_review_graph` overlays these onto its own
+            // bus-seeded copy before any step reads them for a full graph
+            // run; a hand-built fixture that reads `ReviewStepContext`
+            // directly (never through `run_review_graph`) just gets the
+            // fresh defaults.
+            crew_name: None,
+            mode_label: None,
+            fingerprint: None,
+            staffing: None,
+            interpret_warnings: Vec::new(),
             // (#2310 P1 fix) Mirror the fields above — see `step_ctx`'s own
             // doc. Callers that flip `judge_exhaustion_strict` via
             // `Arc::get_mut` after construction flip this override's copy
@@ -4137,16 +4189,22 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(adjudicate_tasks.len(), 1, "judge only");
         let report_tasks: Vec<_> = graph.tasks.iter().filter(|t| t.phase_id == "report").collect();
         assert_eq!(report_tasks.len(), 2, "verify (render + map) + synthesis");
-        // (#1442 ship-2b) The verify task is two sequential steps: the
-        // Tier-3 render step, then the generic dispatch.map.
+        // (#1442 ship-2b + #2310 P2) The verify task is three sequential
+        // steps: the Tier-3 render step, the generic dispatch.map, then the
+        // Tier-3 collect step.
         let verify_task = graph.tasks.iter().find(|t| t.id == "review-verify-task").unwrap();
         assert_eq!(
             verify_task.step_ids,
-            vec!["review-verify-render-step".to_string(), "review-verify-step".to_string()],
-            "render precedes the map within the verify task"
+            vec![
+                "review-verify-render-step".to_string(),
+                "review-verify-step".to_string(),
+                "review-verify-collect-step".to_string()
+            ],
+            "render precedes the map precedes collect within the verify task"
         );
         assert_eq!(graph.steps["review-verify-render-step"].kind, "review.verify-render");
         assert_eq!(graph.steps["review-verify-step"].kind, "dispatch.map");
+        assert_eq!(graph.steps["review-verify-collect-step"].kind, "review.verify-collect");
 
         // (#1619) Cross-phase DATA now rides `Task.reads` (the output
         // ledger); `depends_on` is left for the ordering the graph should
@@ -4196,24 +4254,26 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
         // ONE call is the whole point: no separate driver loop needed to
         // reach every step — `depends_on` alone determines readiness.
-        // (#1530 follow-on, Packet A1) Each claimed probe task is now TWO
-        // steps (render + map), mirroring the verify task's own split.
+        // (#1530 follow-on Packet A1 + #2310 P2) Each claimed probe task is
+        // now THREE steps (render + map + collect), mirroring the verify
+        // task's own three-step split.
         assert_eq!(
             graph.steps.len(),
-            11,
-            "(#2310 P1) context + bundle + 2 claimed probe (render + map) tasks + dedup + judge + \
-             verify render + verify map + synthesis"
+            14,
+            "(#2310 P2) context + bundle + 2 claimed probe (render + map + collect) tasks + dedup \
+             + judge + verify render + verify map + verify collect + synthesis"
         );
 
         // (#1513 review C1) The SAME scenario above prunes the third,
         // unclaimed declared probe task — that pruning must be LOUD, not
         // silent, since a production run pruning a declared task is exactly
         // the reduced-coverage failure mode a Studio hand-edit can trigger.
-        // (#1530 Packet 1) `BuiltReviewGraph` now carries the envelope's
-        // build-time contents as a plain value (`initial_env`), not an
-        // `Arc<Mutex<_>>` — the Arc is minted inside `run_review_graph`,
-        // not here (see `BuiltReviewGraph::initial_env`'s doc).
-        let warnings = graph.initial_env.warnings.clone();
+        // (#1530 Packet 1; narrowed to a plain `Vec<String>` by #2310 P2
+        // review — see `BuiltReviewGraph::interpret_warnings`'s doc)
+        // `BuiltReviewGraph` carries the build-time interpret warnings as a
+        // plain value, not an `Arc<Mutex<_>>` — the Arc is minted inside
+        // `run_review_graph`, not here.
+        let warnings = graph.interpret_warnings.clone();
         assert!(
             warnings.iter().any(|w| w.contains("pruned")),
             "pruning an unclaimed declared probe task must warn: {warnings:?}"
@@ -4441,7 +4501,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                             "reads": ["review-context-task"],
                             "steps": [
                                 {"id": "review-probe-only-render-step", "kind": "review.probe-render"},
-                                {"id": "review-probe-only-step", "kind": "dispatch.map"}
+                                {"id": "review-probe-only-step", "kind": "dispatch.map"},
+                                {"id": "review-probe-only-collect-step", "kind": "review.probe-collect"}
                             ]
                         },
                         {
@@ -4458,7 +4519,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                         {
                             "id": "review-judge-task",
                             "role_id": "review-judge",
-                            "reads": ["review-dedup-task", "review-context-task"],
+                            "reads": ["review-dedup-task", "review-context-task", "review-bundle-task"],
                             "steps": [{"id": "review-judge-step", "kind": "review.judge", "config": {"concurrency": 1}}]
                         }
                     ]
@@ -4469,16 +4530,17 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                         {
                             "id": "review-verify-task",
                             "role_id": "review-verify",
-                            "reads": ["review-judge-task", "review-context-task"],
+                            "reads": ["review-judge-task", "review-context-task", "review-bundle-task"],
                             "steps": [
                                 {"id": "review-verify-render-step", "kind": "review.verify-render"},
-                                {"id": "review-verify-step", "kind": "dispatch.map"}
+                                {"id": "review-verify-step", "kind": "dispatch.map"},
+                                {"id": "review-verify-collect-step", "kind": "review.verify-collect"}
                             ]
                         },
                         {
                             "id": "review-synthesis-task",
                             "depends_on": ["review-dedup-task", "review-judge-task", "review-verify-task"],
-                            "reads": ["review-context-task"],
+                            "reads": ["review-context-task", "review-bundle-task"],
                             "steps": [{"id": "review-synthesis-step", "kind": "review.synthesis"}]
                         }
                     ]
@@ -4656,7 +4718,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                     "depends_on": ["review-bundle-task"],
                     "steps": [
                         {"id": format!("{id}-render-step"), "kind": "review.probe-render"},
-                        {"id": format!("{id}-step"), "kind": "dispatch.map"}
+                        {"id": format!("{id}-step"), "kind": "dispatch.map"},
+                        {"id": format!("{id}-collect-step"), "kind": "review.probe-collect"}
                     ]
                 })
             })
@@ -4689,17 +4752,18 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             "phases": [
                 {"id": "investigate", "tasks": tasks},
                 {"id": "adjudicate", "tasks": [
-                    {"id": "review-judge-task", "role_id": "review-judge", "reads": ["review-dedup-task", "review-context-task"],
+                    {"id": "review-judge-task", "role_id": "review-judge", "reads": ["review-dedup-task", "review-context-task", "review-bundle-task"],
                      "steps": [{"id": "review-judge-step", "kind": "review.judge", "config": {"concurrency": 1}}]}
                 ]},
                 {"id": "report", "tasks": [
-                    {"id": "review-verify-task", "role_id": "review-verify", "reads": ["review-judge-task", "review-context-task"],
+                    {"id": "review-verify-task", "role_id": "review-verify", "reads": ["review-judge-task", "review-context-task", "review-bundle-task"],
                      "steps": [
                         {"id": "review-verify-render-step", "kind": "review.verify-render"},
-                        {"id": "review-verify-step", "kind": "dispatch.map"}
+                        {"id": "review-verify-step", "kind": "dispatch.map"},
+                        {"id": "review-verify-collect-step", "kind": "review.verify-collect"}
                      ]},
                     {"id": "review-synthesis-task", "depends_on": ["review-dedup-task", "review-judge-task", "review-verify-task"],
-                     "reads": ["review-context-task"],
+                     "reads": ["review-context-task", "review-bundle-task"],
                      "steps": [{"id": "review-synthesis-step", "kind": "review.synthesis"}]}
                 ]}
             ]
@@ -5520,8 +5584,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // record — read from the synthesis step's final envelope (the
         // judged docket flows judge -> synthesis directly now).
         let synth = &steps["review-synthesis-step"];
-        let env: ReviewEnvelope =
-            serde_json::from_str(synth.output.as_deref().unwrap()).expect("envelope parses");
+        let env: ReviewEnvelope = darkmux_crew::step_output::Output::<ReviewEnvelope>::read(
+            synth.output.as_deref().unwrap(),
+            crate::lab::review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND,
+        )
+        .expect("envelope parses")
+        .body;
         assert_eq!(env.judged.len(), 1);
         assert_eq!(env.judged[0].tier, Tier::NeedsCheck);
         assert!(env.judged[0].verify.is_none());
@@ -5565,8 +5633,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(results[0].ok);
         // …and the APPLIED verdict lands on the synthesis envelope's docket.
         let synth = &steps["review-synthesis-step"];
-        let env: ReviewEnvelope =
-            serde_json::from_str(synth.output.as_deref().unwrap()).expect("envelope parses");
+        let env: ReviewEnvelope = darkmux_crew::step_output::Output::<ReviewEnvelope>::read(
+            synth.output.as_deref().unwrap(),
+            crate::lab::review_outputs::REVIEW_ENVELOPE_OUTPUT_KIND,
+        )
+        .expect("envelope parses")
+        .body;
         assert_eq!(env.judged.len(), 1);
         assert_eq!(env.judged[0].tier, Tier::Confirmed);
         let vrec = env.judged[0].verify.as_ref().expect("verify record present — the pass dispatched");
@@ -5584,7 +5656,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
     #[test]
     fn judge_indices_are_deterministic_under_permuted_completion_order() {
-        use std::sync::{Arc as StdArc, Mutex as TestMutex};
+        use std::sync::Arc as StdArc;
         let crew = crew_with(vec![
             ("review-probe", vec![staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![{
@@ -5620,28 +5692,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             j.passes = 1;
             j
         };
-        // (#1530 Packets 1/3a) `members`/`env`/the run-scoped `ctx` (context)
-        // moved off `ReviewJudgeStepKind`'s own fields onto the run-scoped
-        // `ArtifactBus` — a direct `run_streaming` call (bypassing the full
-        // scheduler) hand-seeds the same bus a real `run_review_graph` call
-        // would build, via `ArtifactBus::seed` + a bare `StepRunCtx` (no
-        // emitter/bucket/override needed for this test). The judge seat's
+        // (#2310 P2) The run-scoped `ctx` (context) is the ONLY thing this
+        // kind still reads off the `ArtifactBus` — a direct `run_streaming`
+        // call (bypassing the full scheduler) hand-seeds it via
+        // `ArtifactBus::seed` + a bare `StepRunCtx`. The judge seat's
         // staffing (model/passes/max_tokens) is likewise stamped onto the
         // step's own `config`, mirroring `build_review_graph_from_config`'s
-        // production stamp.
-        let members: StdArc<TestMutex<Vec<MemberRecord>>> = StdArc::new(TestMutex::new(Vec::new()));
-        let env: StdArc<TestMutex<ReviewEnvelope>> = StdArc::new(TestMutex::new(ReviewEnvelope::default()));
-        // (#1530) `ReviewJudgeStepKind::run_streaming` now reads its bundle
-        // lookup off `REVIEW_BUNDLES_ARTIFACT` — this test's flags reference
-        // no real bundle ids (`b0`..`b3`), so an EMPTY bundle set is the
-        // exact pre-#1530 fixture behavior (`step_ctx_with_chat`'s own
-        // `vec![]` above).
-        let bundles: StdArc<TestMutex<Vec<BundleInput>>> = StdArc::new(TestMutex::new(Vec::new()));
+        // production stamp. Members/warnings/degenerate now ride this
+        // kind's own typed output instead of a shared bus accumulator; the
+        // bundle lookup arrives via `input` (this test's flags reference no
+        // real bundle ids, so an EMPTY bundle set matches the pre-#2310
+        // fixture behavior).
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as StdArc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as StdArc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_MEMBERS_ARTIFACT, members.clone() as StdArc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_BUNDLES_ARTIFACT, bundles.clone() as StdArc<dyn Any + Send + Sync>);
         let run_ctx = StepRunCtx::new(None, None, None, StdArc::new(bus));
         let mut judge_config = serde_json::json!({
             "concurrency": 2,
@@ -5679,16 +5742,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             image: None,
         };
         let mut input = BTreeMap::new();
-        input.insert("review-dedup-task".to_string(), serde_json::to_string(&flags).unwrap());
-        // (#2310 P1) This task now formally `reads: ["review-dedup-task",
-        // "review-context-task"]` — a direct `run_streaming` call bypassing
-        // the scheduler seeds both entries by hand, same as the bundle
-        // kind's own tests (`context_task_output`).
+        input.insert("review-dedup-task".to_string(), dedup_task_output(flags.clone()));
+        // (#2310 P1/P2) This task now formally `reads: ["review-dedup-task",
+        // "review-context-task", "review-bundle-task"]` — a direct
+        // `run_streaming` call bypassing the scheduler seeds all three by
+        // hand.
         input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-bundle-task".to_string(), bundle_task_output(&[]));
 
         use darkmux_crew::step_kinds::StepKind as _;
         let outcome = kind.run_streaming(&step, &task, &input, &run_ctx).expect("judge step completes");
-        let judged: Vec<JudgedFlag> = serde_json::from_str(&outcome.output).expect("judged parses");
+        let judged: Vec<JudgedFlag> = darkmux_crew::step_output::Output::<crate::lab::review_outputs::JudgeOutput>::read(&outcome.output, crate::lab::review_outputs::JUDGE_OUTPUT_KIND)
+            .expect("judged parses")
+            .body
+            .judged;
         let order: Vec<&str> = judged.iter().map(|j| j.flag.charge_text.as_str()).collect();
         assert_eq!(
             order,
@@ -5706,7 +5773,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// serialized as this step's output.
     #[test]
     fn graph_judge_step_applies_the_absence_backstop_when_source_is_stamped() {
-        use std::sync::{Arc as StdArc, Mutex as TestMutex};
+        use std::sync::Arc as StdArc;
         let dir = tempfile::TempDir::new().expect("tempdir");
         std::fs::write(dir.path().join("cli.ts"), "process.exitCode = 1;\n").unwrap();
 
@@ -5728,14 +5795,9 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             j.passes = 1;
             j
         };
-        let members: StdArc<TestMutex<Vec<MemberRecord>>> = StdArc::new(TestMutex::new(Vec::new()));
-        let env: StdArc<TestMutex<ReviewEnvelope>> = StdArc::new(TestMutex::new(ReviewEnvelope::default()));
-        let bundles: StdArc<TestMutex<Vec<BundleInput>>> = StdArc::new(TestMutex::new(one_bundle("cli.ts")));
+        let bundles = one_bundle("cli.ts");
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as StdArc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as StdArc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_MEMBERS_ARTIFACT, members.clone() as StdArc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_BUNDLES_ARTIFACT, bundles.clone() as StdArc<dyn Any + Send + Sync>);
         let run_ctx = StepRunCtx::new(None, None, None, StdArc::new(bus));
         let mut judge_config = serde_json::json!({
             "concurrency": 1,
@@ -5776,16 +5838,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             image: None,
         };
         let mut input = BTreeMap::new();
-        input.insert("review-dedup-task".to_string(), serde_json::to_string(&flags).unwrap());
-        // (#2310 P1) This task now formally `reads: ["review-dedup-task",
-        // "review-context-task"]` — a direct `run_streaming` call bypassing
-        // the scheduler seeds both entries by hand, same as the bundle
-        // kind's own tests (`context_task_output`).
+        input.insert("review-dedup-task".to_string(), dedup_task_output(flags.clone()));
+        // (#2310 P1/P2) This task now formally `reads: ["review-dedup-task",
+        // "review-context-task", "review-bundle-task"]` — a direct
+        // `run_streaming` call bypassing the scheduler seeds all three by
+        // hand.
         input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-bundle-task".to_string(), bundle_task_output(&bundles));
 
         use darkmux_crew::step_kinds::StepKind as _;
         let outcome = kind.run_streaming(&step, &task, &input, &run_ctx).expect("judge step completes");
-        let judged: Vec<JudgedFlag> = serde_json::from_str(&outcome.output).expect("judged parses");
+        let judged: Vec<JudgedFlag> = darkmux_crew::step_output::Output::<crate::lab::review_outputs::JudgeOutput>::read(&outcome.output, crate::lab::review_outputs::JUDGE_OUTPUT_KIND)
+            .expect("judged parses")
+            .body
+            .judged;
         assert_eq!(judged.len(), 1);
         assert_eq!(
             judged[0].tier,
@@ -5803,7 +5869,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// did before #1748.
     #[test]
     fn graph_judge_step_is_a_no_op_backstop_without_a_source_key() {
-        use std::sync::{Arc as StdArc, Mutex as TestMutex};
+        use std::sync::Arc as StdArc;
         let crew = crew_with(vec![
             ("review-probe", vec![staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![{
@@ -5822,16 +5888,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             j.passes = 1;
             j
         };
-        let members: StdArc<TestMutex<Vec<MemberRecord>>> = StdArc::new(TestMutex::new(Vec::new()));
-        let env: StdArc<TestMutex<ReviewEnvelope>> = StdArc::new(TestMutex::new(ReviewEnvelope::default()));
         // No real bundle for "cli.ts" either — this is the exact pre-#1748
         // fixture shape every other graph-judge test in this file uses.
-        let bundles: StdArc<TestMutex<Vec<BundleInput>>> = StdArc::new(TestMutex::new(Vec::new()));
+        let bundles: Vec<BundleInput> = Vec::new();
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as StdArc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as StdArc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_MEMBERS_ARTIFACT, members.clone() as StdArc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_BUNDLES_ARTIFACT, bundles.clone() as StdArc<dyn Any + Send + Sync>);
         let run_ctx = StepRunCtx::new(None, None, None, StdArc::new(bus));
         let mut judge_config = serde_json::json!({
             "concurrency": 1,
@@ -5870,16 +5931,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             image: None,
         };
         let mut input = BTreeMap::new();
-        input.insert("review-dedup-task".to_string(), serde_json::to_string(&flags).unwrap());
-        // (#2310 P1) This task now formally `reads: ["review-dedup-task",
-        // "review-context-task"]` — a direct `run_streaming` call bypassing
-        // the scheduler seeds both entries by hand, same as the bundle
-        // kind's own tests (`context_task_output`).
+        input.insert("review-dedup-task".to_string(), dedup_task_output(flags.clone()));
+        // (#2310 P1/P2) This task now formally `reads: ["review-dedup-task",
+        // "review-context-task", "review-bundle-task"]` — a direct
+        // `run_streaming` call bypassing the scheduler seeds all three by
+        // hand.
         input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-bundle-task".to_string(), bundle_task_output(&bundles));
 
         use darkmux_crew::step_kinds::StepKind as _;
         let outcome = kind.run_streaming(&step, &task, &input, &run_ctx).expect("judge step completes");
-        let judged: Vec<JudgedFlag> = serde_json::from_str(&outcome.output).expect("judged parses");
+        let judged: Vec<JudgedFlag> = darkmux_crew::step_output::Output::<crate::lab::review_outputs::JudgeOutput>::read(&outcome.output, crate::lab::review_outputs::JUDGE_OUTPUT_KIND)
+            .expect("judged parses")
+            .body
+            .judged;
         assert_eq!(judged.len(), 1);
         assert_eq!(
             judged[0].tier,
@@ -6787,6 +6852,16 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             })),
             bundle_override: Some(Arc::new(move || Ok(bundles.clone()))),
             mission_id: None,
+            // (#2310 P2) `run_review_graph` overlays these onto its own
+            // bus-seeded copy before any step reads them for a full graph
+            // run; a hand-built fixture that reads `ReviewStepContext`
+            // directly (never through `run_review_graph`) just gets the
+            // fresh defaults.
+            crew_name: None,
+            mode_label: None,
+            fingerprint: None,
+            staffing: None,
+            interpret_warnings: Vec::new(),
             context_test_overrides: ReviewContextTestOverrides {
                 probe_system: Some("probe prior".to_string()),
                 judge_system: Some("judge persona".to_string()),
@@ -6892,6 +6967,191 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(
             env.degenerate.is_some(),
             "a judge step that never ran must not finalize as a clean review: {:?}",
+            env.degenerate
+        );
+    }
+
+    /// (#2310 P2 review finding C2) An errored run's fallback envelope used
+    /// to be built from `fallback_env` ALONE — identity fields plus the
+    /// errored reason, nothing else — which silently discarded whatever
+    /// completed BEFORE the failure. Pre-P2, the shared envelope's
+    /// accumulated `bundles`/probe `members`/`remote_budgets` survived a
+    /// later step's error (they had already been written into the shared,
+    /// mutex-guarded envelope); the typed-output graph has no such shared
+    /// state, so `run_review_graph`'s errored branch must rebuild those
+    /// same facts from whichever producer typed outputs actually completed.
+    ///
+    /// Scenario: three REMOTE probe seats all complete (their own
+    /// `review.probe-flags` outputs, then `review.dedup`'s own
+    /// `review.deduped-flags` fold of them — dedup has no dependency on
+    /// judge, so it always completes here), then the JUDGE step itself
+    /// fails LOUDLY (same `reads`-edge-severed mechanism the sibling test
+    /// above uses, for the same reliability reason — a chat-level judge
+    /// dispatch failure is handled gracefully per-flag by `judge_gate_
+    /// outcome` and would reach synthesis normally, never landing in
+    /// `report.errored` at all). Red before the fix: `env.members` was
+    /// `[]` and `env.bundles` was `0`, even though three real probe
+    /// dispatches and a real bundle set both completed before the judge
+    /// step ever ran.
+    /// (#2342 round-2 review) When SYNTHESIS itself errors after verify
+    /// completed, the fallback must keep the verify seat's member (and its
+    /// budget row) — it used to pass `None` for verify on the premise that
+    /// verify output implies synthesis ran, which a synthesis-side error
+    /// disproves.
+    #[test]
+    fn errored_synthesis_fallback_envelope_keeps_the_verify_seat() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![remote_staffing("cloud", "gpt-probe-1", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![graph_staffing("fast", "verify-model", 1)]),
+        ]);
+        let ctx = step_ctx_with_chat(&crew, vec![bundle_input("a.ts")], |call: &ChatCall| {
+            let content = if call.model == "darkmux:judge-model" {
+                CONFIRM_JSON.to_string()
+            } else if call.model == "darkmux:verify-model" {
+                VERIFIED_JSON.to_string()
+            } else {
+                "a real defect `const end = start.plus(30)`".to_string()
+            };
+            Ok(SingleShotReply { content, total_tokens: Some(600), prompt_tokens: None, completion_tokens: None, model: None })
+        });
+        let judge = ctx.roles.judge.clone();
+        let verify = ctx.roles.verify.clone();
+        let probes = ctx.roles.probes.clone();
+        let mut graph = build_review_graph(
+            ctx.clone(),
+            &dummy_bundle_spec(),
+            judge.clone(),
+            verify.clone(),
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        // Strip the judged-flags edge from SYNTHESIS only: everything before it,
+        // verify included, completes; synthesis then errors by name.
+        graph
+            .tasks
+            .iter_mut()
+            .find(|t| t.id == "review-synthesis-task")
+            .expect("review-synthesis-task exists")
+            .reads
+            .retain(|id| id != "review-judge-task");
+        let context_out_dir = tempfile::tempdir().expect("tempdir for review-context-step's output");
+        stamp_context_step_for_test(&mut graph.steps, &ctx, context_out_dir.path());
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
+        let (env, steps) = run_review_graph(
+            &ctx,
+            &crew_name,
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut NullEmitter,
+            &mut |_step| {},
+        )
+        .expect("graph run completes with a per-step error");
+        assert_eq!(steps["review-synthesis-step"].status, NodeStatus::Error, "sanity: synthesis errored");
+        assert_eq!(steps["review-verify-step"].status, NodeStatus::Complete, "sanity: verify completed before synthesis failed");
+        assert!(
+            env.members.iter().any(|m| m.model == "darkmux:verify-model"),
+            "the verify seat's member must survive a synthesis-side error: {:?}",
+            env.members
+        );
+    }
+
+    #[test]
+    fn errored_run_fallback_envelope_carries_what_completed_before_the_failure() {
+        let crew = crew_with(vec![
+            (
+                "review-probe",
+                vec![
+                    remote_staffing("cloud", "gpt-probe-1", 1),
+                    remote_staffing("cloud", "gpt-probe-2", 1),
+                    remote_staffing("cloud", "gpt-probe-3", 1),
+                ],
+            ),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let ctx = step_ctx_with_chat(&crew, vec![bundle_input("a.ts")], |call: &ChatCall| {
+            assert_ne!(
+                call.model, "darkmux:judge-model",
+                "the judge step must fail before ever reaching a model call"
+            );
+            Ok(SingleShotReply {
+                content: "a real defect `const end = start.plus(30)`".to_string(),
+                total_tokens: Some(600),
+                prompt_tokens: None,
+                completion_tokens: None,
+                model: None,
+            })
+        });
+        let judge = ctx.roles.judge.clone();
+        let probes = ctx.roles.probes.clone();
+        let mut graph = build_review_graph(
+            ctx.clone(),
+            &dummy_bundle_spec(),
+            judge.clone(),
+            None,
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        graph
+            .tasks
+            .iter_mut()
+            .find(|t| t.id == "review-judge-task")
+            .expect("review-judge-task exists")
+            .reads
+            .retain(|id| id != "review-dedup-task");
+        let context_out_dir = tempfile::tempdir().expect("tempdir for review-context-step's output");
+        stamp_context_step_for_test(&mut graph.steps, &ctx, context_out_dir.path());
+
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, None, ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
+        let (env, steps) = run_review_graph(
+            &ctx,
+            &crew_name,
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut NullEmitter,
+            &mut |_step| {},
+        )
+        .expect("graph run completes (a loud PER-STEP error, not a hard Err)");
+
+        assert_eq!(
+            steps["review-judge-step"].status,
+            NodeStatus::Error,
+            "sanity: the judge step must have actually errored (the fallback path this test pins)"
+        );
+        assert_eq!(env.bundles, 1, "the bundle step completed before judge ever ran: {:?}", env);
+        assert_eq!(
+            env.members.len(),
+            3,
+            "all three probe seats' own members must survive the judge step's failure: {:?}",
+            env.members
+        );
+        for m in &env.members {
+            assert!(m.total_tokens > 0, "each surviving member must keep its real token count: {m:?}");
+        }
+        assert!(
+            env.remote_budgets.iter().any(|r| r.stage == "probe"),
+            "the probe stage's own remote-budget row must survive too: {:?}",
+            env.remote_budgets
+        );
+        assert!(
+            env.degenerate.is_some(),
+            "an errored run is still named as degenerate: {:?}",
             env.degenerate
         );
     }
@@ -7383,6 +7643,203 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         );
     }
 
+    /// (#2310 P2 review finding C1) `ReviewSynthesisStepKind` folded
+    /// dedup/judge/verify warnings into the final envelope but never
+    /// `ctx.interpret_warnings` — `build_review_graph`'s own interpret-time
+    /// warnings (e.g. "pruned an unclaimed probe task") silently vanished
+    /// from every SUCCESSFUL run's envelope; pre-P2 they always arrived via
+    /// the pre-seeded shared envelope. This combines all four warning
+    /// sources in ONE run and pins the fold order the fix restores:
+    /// interpret -> judge -> verify -> probe (see `ReviewSynthesisStepKind::
+    /// run_streaming`'s own comment on that order). Seeds the interpret
+    /// warning at the REAL site (`BuiltReviewGraph.initial_env.warnings`,
+    /// what `run_review_graph` actually reads — not `ctx.interpret_warnings`
+    /// directly, which `run_review_graph`'s own overlay would clobber
+    /// anyway). Red before the fix (index 0 is the judge warning, not the
+    /// interpret one — or a panic if `env.warnings` was shorter);
+    /// also red under a reversed fold (wrong warning at each index).
+    #[test]
+    fn synthesis_folds_warnings_in_pinned_order() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-a", 1), graph_staffing("fast", "probe-b", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+            ("review-verify", vec![remote_staffing("frontier", "gpt-verify", 1)]),
+        ]);
+        let bundles = vec![bundle_input("a.ts"), bundle_input("b.ts"), bundle_input("c.ts")];
+        let judge_call_index = std::sync::atomic::AtomicU32::new(0);
+        // The DEFAULT (500_000) per-execution allowance — NOT tightened —
+        // so the judge stage's own bucket (a SEPARATE bucket from verify's,
+        // per `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`'s "one execution =
+        // one pipeline stage" contract) has room for 6 ordinary 10-token
+        // calls without tripping its own exhaustion path; only the verify
+        // reply below is scaled to exceed it deliberately.
+        let ctx = step_ctx_with_chat(&crew, bundles, move |call: &ChatCall| {
+            if call.model == "darkmux:probe-b" {
+                // Every probe-b draw errors — this seat's own per-seat
+                // "dispatch failed on N draw(s)" warning, the probe stage's
+                // contribution to `DedupOutput::warnings` (folded LAST).
+                Err(anyhow!("probe-b endpoint down"))
+            } else if call.model == "darkmux:probe-a" {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else if call.model == "gpt-judge" {
+                // Same flag-major call order as `graph_remote_judge_
+                // dispatch_error_on_minority_of_flags_does_not_degrade_
+                // the_run`: f1.p1, f1.p2, f2.p1, f2.p2, f3.p1, f3.p2 — fail
+                // only f2's pass-2 (call index 3), demoting f2 alone and
+                // leaving f1/f3 confirmed (2 confirmed flags for the
+                // verify stage below to adjudicate).
+                let idx = judge_call_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx == 3 { Err(anyhow!("judge endpoint 503")) } else { Ok(reply(CONFIRM_JSON)) }
+            } else if call.model == "gpt-verify" {
+                // Each adjudication reports 600_000 tokens against the
+                // 500_000-token default allowance — the first call exceeds
+                // it, the second is skipped, producing the verify stage's
+                // own budget warning (same mechanism as
+                // `graph_remote_verify_budget_exhaustion_degrades_the_
+                // stage_not_the_run`, scaled up so it doesn't also starve
+                // the judge stage's own SEPARATE bucket above).
+                Ok(SingleShotReply {
+                    content: VERIFIED_JSON.to_string(),
+                    total_tokens: Some(600_000),
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: None,
+                })
+            } else {
+                panic!("unexpected dispatch: model={}", call.model);
+            }
+        });
+
+        let judge = ctx.roles.judge.clone();
+        let verify = ctx.roles.verify.clone();
+        let probes = ctx.roles.probes.clone();
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
+        let mut graph = build_review_graph(
+            ctx.clone(),
+            &dummy_bundle_spec(),
+            judge,
+            verify,
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("built-in review config builds cleanly");
+        let context_out_dir = tempfile::tempdir().expect("tempdir for review-context-step's output");
+        stamp_context_step_for_test(&mut graph.steps, &ctx, context_out_dir.path());
+        // The real seed site: `run_review_graph` reads `graph.
+        // interpret_warnings` (never `ctx.interpret_warnings` directly —
+        // its own overlay clobbers that field with THIS one) to build the
+        // bus context's `interpret_warnings`. Pushing here is exactly what
+        // a real `mission_config::interpret` prune would have populated.
+        graph.interpret_warnings.push("pruned an unclaimed probe task".to_string());
+
+        let (env, _steps) = run_review_graph(
+            &ctx,
+            &crew_name,
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut NullEmitter,
+            &mut |_step| {},
+        )
+        .expect("graph run completes");
+
+        assert_eq!(env.confirmed, 2, "sanity: f1/f3 confirmed, f2 demoted by the judge dispatch error");
+
+        // (position-based, not a fixed index) The built-in `review` config
+        // declares MORE probe tasks (review-probe-high/-mid/-low) than this
+        // fixture staffs (two, unclaimed role_id `None`), so the interpreter
+        // ALSO contributes its OWN "no resolved probe staffing claimed"
+        // prune warning ahead of the one this test injects — both are
+        // genuine interpret-time warnings, and their relative order between
+        // each other is not this test's concern (`build_review_graph`'s own
+        // internal ordering, not `ReviewSynthesisStepKind`'s pinned fold).
+        // What this test pins is that EVERY interpret-time warning —
+        // including the one this test injects — lands strictly BEFORE
+        // every judge/verify/probe warning.
+        let mine_pos = env
+            .warnings
+            .iter()
+            .position(|w| w == "pruned an unclaimed probe task")
+            .expect("the injected interpret-time warning must reach the envelope — this is C1 itself");
+        let judge_pos = env
+            .warnings
+            .iter()
+            .position(|w| w.contains("remote judge dispatch failed on 1 of 3 flag"))
+            .expect("the judge warning must reach the envelope");
+        let verify_pos = env
+            .warnings
+            .iter()
+            .position(|w| w.contains("verify budget exhausted after 1 of 2 adjudications"))
+            .expect("the verify warning must reach the envelope");
+        let probe_pos = env
+            .warnings
+            .iter()
+            .position(|w| w.contains("dispatch failed on") && w.contains("draw(s)"))
+            .expect("the probe stage's own warning must reach the envelope");
+
+        assert!(mine_pos < judge_pos, "interpret must fold before judge: {:?}", env.warnings);
+        assert!(judge_pos < verify_pos, "judge must fold before verify: {:?}", env.warnings);
+        assert!(verify_pos < probe_pos, "verify must fold before probe (probe folds LAST): {:?}", env.warnings);
+    }
+
+    /// (#2310 P2 review finding I3) `find_by_kind`'s old `Output::read(raw,
+    /// kind).ok()` folded TWO different failure shapes into the same
+    /// `None`: a genuinely absent edge, and a `review.deduped-flags` body
+    /// that IS the right output but fails to deserialize (a missing
+    /// required field). Both used to surface as the same generic "no
+    /// `review.deduped-flags` output was found among its inputs" — a real
+    /// producer bug read identically to a perfectly ordinary missing
+    /// `reads` edge. Red before the fix: the assertion on `stats` fails
+    /// (the error names the EDGE, never the field) and the "must not read
+    /// as a missing edge" assertion fails too (it DOES).
+    #[test]
+    fn find_by_kind_propagates_a_body_deserialize_failure_by_field_name() {
+        // Hand-built envelope, hash deliberately empty (an unstamped/
+        // unverified body — `Output::from_value`'s own documented escape
+        // hatch) so this test can drop a required field from `body` without
+        // also having to keep a real blake3 hash in sync with it; the
+        // MISSING-FIELD deserialize failure is what this test is pinning,
+        // not the separate hash-integrity check.
+        let raw = serde_json::json!({
+            "schema_version": "1.0",
+            "kind": review_outputs::DEDUP_OUTPUT_KIND,
+            "producer": {},
+            "produced_at": "",
+            "hash": "",
+            "body": {
+                "schema_version": review_outputs::REVIEW_OUTPUTS_SCHEMA_VERSION,
+                "flags": [],
+                // "stats" deliberately omitted — DedupOutput::stats has no
+                // #[serde(default)], so this must fail the deserialize.
+                "members": [],
+                "warnings": [],
+                "remote_budget": null,
+                "degenerate": null,
+                "probe_retries": 0,
+                "raw_flags": 0,
+            },
+        })
+        .to_string();
+
+        let mut input = BTreeMap::new();
+        input.insert("review-dedup-task".to_string(), raw);
+
+        let err = deduped_from_input("review.synthesis", "review-synthesis-step", &input)
+            .expect_err("a malformed body of the RIGHT kind must fail loudly, not read as absent");
+        let msg = err.to_string();
+        assert!(msg.contains("stats"), "must name the broken FIELD: {msg}");
+        assert!(
+            !msg.contains("no `review.deduped-flags` output was found among its inputs"),
+            "must NOT read as a missing EDGE: {msg}"
+        );
+    }
+
     /// Was `local_judge_dispatch_failure_keeps_today_behavior`.
     #[test]
     fn graph_local_judge_dispatch_failure_keeps_today_behavior() {
@@ -7527,15 +7984,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // seat's ONLY thing this kind reads (`.is_none()`) is stamped onto
         // the step's own config as `verify_seat_staffed`, mirroring
         // `build_review_graph_from_config`'s production stamp.
-        let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
-        // (#1530) This test calls `run_streaming` directly, bypassing
-        // `ReviewBundleStepKind` entirely, so `REVIEW_BUNDLES_ARTIFACT` needs
-        // seeding by hand — same bundles `ctx`'s own `bundle_override` holds.
-        let bundles_artifact: Arc<StdMutex<Vec<BundleInput>>> = Arc::new(StdMutex::new(bundles.clone()));
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as Arc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_BUNDLES_ARTIFACT, bundles_artifact as Arc<dyn Any + Send + Sync>);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
         let step = darkmux_crew::types::Step {
             id: "review-verify-render-step".to_string(),
@@ -7562,11 +8012,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             image: None,
         };
         let mut input = BTreeMap::new();
-        input.insert("review-judge-task".to_string(), serde_json::to_string(&judged).unwrap());
-        // (#2310 P1) This task now formally `reads: ["review-judge-task",
-        // "review-context-task"]` — seed both by hand, same as the judge
-        // kind's own tests.
+        input.insert("review-judge-task".to_string(), judge_task_output(judged.clone()));
+        // (#2310 P1/P2) This task now formally `reads: ["review-judge-task",
+        // "review-context-task", "review-bundle-task"]` — seed all three by
+        // hand, same as the judge kind's own tests.
         input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-bundle-task".to_string(), bundle_task_output(&bundles));
 
         use darkmux_crew::step_kinds::StepKind as _;
         let out = kind.run_streaming(&step, &task, &input, &run_ctx).expect("render completes");
@@ -7599,7 +8050,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
     /// (#1530 follow-on, Packet A1) The faithfulness pin this packet's own
     /// PR description promises: the probe render step's RUN-TIME output —
-    /// selector applied to the bundle set off `REVIEW_BUNDLES_ARTIFACT`, then
+    /// selector applied to the typed `review-bundle-task` output, then
     /// `probe_user_message` rendered per selected bundle — is byte-identical
     /// (same selection, same per-item text, same ORDER) to what the
     /// RETIRED build-time stamping loop in `build_review_graph_from_config`
@@ -7653,18 +8104,6 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let selector = BundleSelector { fact_families: vec!["auth".to_string()], ..Default::default() };
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
-        // (#1530) This test calls `run_streaming` directly, bypassing
-        // `ReviewBundleStepKind`, so `REVIEW_BUNDLES_ARTIFACT` needs seeding
-        // by hand.
-        bus.seed(
-            REVIEW_BUNDLES_ARTIFACT,
-            Arc::new(StdMutex::new(bundles.clone())) as Arc<dyn Any + Send + Sync>,
-        );
-        // (#1541) Mirrors the scheduler's own `provides()` pre-scan for a
-        // graph containing a `review.probe-render` step — this test calls
-        // `run_streaming` directly, bypassing the scheduler, so it
-        // materializes the artifact by hand the same way.
-        bus.materialize(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
         let step = darkmux_crew::types::Step {
             id: "review-probe-high-render-step".to_string(),
@@ -7694,10 +8133,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             image: None,
         };
         let mut input = BTreeMap::new();
-        // (#2310 P1) This task now formally `reads: ["review-context-task"]`
-        // — a direct `run_streaming` call bypassing the scheduler seeds it
-        // by hand, same as the bundle/judge/verify-render kinds' own tests.
+        // (#2310 P1/P2) This task now formally `reads: ["review-context-task"]`
+        // and `depends_on: ["review-bundle-task"]` — a direct `run_streaming`
+        // call bypassing the scheduler seeds both by hand.
         input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-bundle-task".to_string(), bundle_task_output(&bundles));
 
         use darkmux_crew::step_kinds::StepKind as _;
         let kind = ReviewProbeRenderStepKind;
@@ -7741,16 +8181,6 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
-        // (#1530) This test calls `run_streaming` directly, bypassing
-        // `ReviewBundleStepKind`, so `REVIEW_BUNDLES_ARTIFACT` needs seeding
-        // by hand.
-        bus.seed(
-            REVIEW_BUNDLES_ARTIFACT,
-            Arc::new(StdMutex::new(bundles.clone())) as Arc<dyn Any + Send + Sync>,
-        );
-        // (#1541) Mirrors the scheduler's own `provides()` pre-scan — see
-        // the sibling test above for why this test needs it too.
-        bus.materialize(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
         let step = darkmux_crew::types::Step {
             id: "review-probe-high-render-step".to_string(),
@@ -7777,10 +8207,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             image: None,
         };
         let mut input = BTreeMap::new();
-        // (#2310 P1) This task now formally `reads: ["review-context-task"]`
-        // — a direct `run_streaming` call bypassing the scheduler seeds it
-        // by hand, same as the bundle/judge/verify-render kinds' own tests.
+        // (#2310 P1/P2) This task now formally `reads: ["review-context-task"]`
+        // and `depends_on: ["review-bundle-task"]` — a direct `run_streaming`
+        // call bypassing the scheduler seeds both by hand.
         input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-bundle-task".to_string(), bundle_task_output(&bundles));
 
         use darkmux_crew::step_kinds::StepKind as _;
         let kind = ReviewProbeRenderStepKind;
@@ -7800,27 +8231,23 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     // recall breadth is now a review.json edit, never a per-run draw
     // multiplier) — `build_review_graph` no longer mints sibling tasks for
     // k>1, so the scenario this test built can no longer occur. The
-    // per-seat SUMMING mechanism it was also exercising (multiple
-    // `draw_task_ids` collapsing into one `MemberRecord`) remains fully
-    // covered independent of graph construction by
-    // `reconstruct_probe_stage_accounts_skips_errors_and_flags` below,
-    // which hand-builds a `ProbeSeatSpec` with two `draw_task_ids` and
-    // calls `reconstruct_probe_stage` directly — so no coverage is lost,
-    // only the now-impossible integration shape.
+    // per-seat SUMMING mechanism it was also exercising is now covered by
+    // `reconstruct_probe_seat_accounts_skips_errors_and_flags` below, which
+    // calls `reconstruct_probe_seat` directly over a hand-built results/
+    // pairs list — so no coverage is lost, only the now-impossible
+    // integration shape.
 
-    /// `reconstruct_probe_stage` pure-function coverage: budget-skips are
-    /// never draws, dispatch errors are, per-seat accounting sums across
-    /// sibling draw tasks, and the all-draws-failed gate names its reason.
+    /// (#2310 P2) `reconstruct_probe_seat` pure-function coverage: budget-
+    /// skips are never draws, dispatch errors are, and the fired/error
+    /// counts it reports are exactly what `fold_probe_seats` needs to name
+    /// the all-draws-failed gate. Single-draw only now (#1512's "one role,
+    /// one task, one dispatch" plus #2310 P2's collect step reading exactly
+    /// one predecessor) — the retired multi-draw-per-seat summing this test
+    /// used to cover is gone along with the graph shape that could produce
+    /// it (see the retirement note above this test, on the #1512 cut).
     #[test]
-    fn reconstruct_probe_stage_accounts_skips_errors_and_flags() {
+    fn reconstruct_probe_seat_accounts_skips_errors_and_flags() {
         use darkmux_crew::step_kinds::{MapItemResult, MAP_BUDGET_SKIP_ERROR};
-        let spec = ProbeSeatSpec {
-            name: "cloud".to_string(),
-            identifier: "gpt-remote".to_string(),
-            remote: true,
-            endpoint_host: Some("example.com".to_string()),
-            draw_task_ids: vec!["t-draw0".to_string(), "t-draw1".to_string()],
-        };
         let item = |index: usize, ok: bool, content: &str, error: Option<&str>, tokens: Option<u64>| MapItemResult {
             index,
             ok,
@@ -7833,80 +8260,69 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             wall_ms: 5,
             retried: 0,
         };
-        // draw 0: b1 flags, b2 dispatch-errors. draw 1: b1 budget-skipped,
-        // b2 empty-but-dispatched.
-        let draw0 = vec![item(0, true, "a defect", None, Some(100)), item(1, false, "", Some("endpoint 503"), None)];
-        let draw1 = vec![
-            item(0, false, "", Some(MAP_BUDGET_SKIP_ERROR), None),
-            item(1, true, "  ", None, Some(50)),
+        // b1 flags, b2 dispatch-errors, b3 budget-skipped, b4 empty-but-dispatched.
+        let results = vec![
+            item(0, true, "a defect", None, Some(100)),
+            item(1, false, "", Some("endpoint 503"), None),
+            item(2, false, "", Some(MAP_BUDGET_SKIP_ERROR), None),
+            item(3, true, "  ", None, Some(50)),
         ];
-        let mut input = BTreeMap::new();
-        input.insert("t-draw0".to_string(), serde_json::to_string(&draw0).unwrap());
-        input.insert("t-draw1".to_string(), serde_json::to_string(&draw1).unwrap());
-        // (#1541) The render step's published selection — one entry per
-        // draw task id, replacing the retired `ProbeSeatSpec.bundles`
-        // build-time snapshot.
-        let mut selection: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        selection.insert(
-            "t-draw0".to_string(),
-            vec![("b1".to_string(), "unscoped".to_string()), ("b2".to_string(), "unscoped".to_string())],
+        let pairs = vec![
+            ("b1".to_string(), "unscoped".to_string()),
+            ("b2".to_string(), "unscoped".to_string()),
+            ("b3".to_string(), "unscoped".to_string()),
+            ("b4".to_string(), "unscoped".to_string()),
+        ];
+
+        let out = reconstruct_probe_seat("cloud", "gpt-remote", true, Some("example.com"), &results, &pairs);
+
+        assert_eq!(out.flags.len(), 1, "only the non-empty ok item flags");
+        assert_eq!(out.flags[0].bundle_id, "b1");
+        assert_eq!(out.flags[0].draw, 0);
+        assert_eq!(out.flags[0].charge_text, "a defect", "trimmed charge text");
+
+        assert_eq!(out.fired, 3, "fired = 4 items - 1 budget skip");
+        assert_eq!(out.errors, 1);
+        assert_eq!(out.first_error.as_deref(), Some("endpoint 503"));
+        assert_eq!(out.remote_tokens, 150);
+        assert_eq!(out.remote_calls, 3);
+        assert_eq!(out.remote_skips, 1);
+        let member = out.member.as_ref().expect("draws > 0 records a member");
+        assert_eq!(member.draws, 3);
+        assert_eq!(member.total_tokens, 150);
+        assert_eq!(member.wall_ms, 15, "wall summed over FIRED items only");
+        assert_eq!(member.served_model.as_deref(), Some("gpt-served"));
+        assert!(
+            out.warnings.iter().any(|w| w.contains("remote probe seat \"cloud\"") && w.contains("endpoint 503")),
+            "dispatch error named: {:?}",
+            out.warnings
         );
-        selection.insert(
-            "t-draw1".to_string(),
-            vec![("b1".to_string(), "unscoped".to_string()), ("b2".to_string(), "unscoped".to_string())],
-        );
 
-        let recon =
-            reconstruct_probe_stage(std::slice::from_ref(&spec), &input, &selection, 120).expect("parses");
-
-        assert_eq!(recon.flags.len(), 1, "only the non-empty ok item flags");
-        assert_eq!(recon.flags[0].bundle_id, "b1");
-        assert_eq!(recon.flags[0].draw, 0);
-        assert_eq!(recon.flags[0].charge_text, "a defect", "trimmed charge text");
-
-        assert_eq!(recon.members.len(), 1);
-        let m = &recon.members[0];
-        assert_eq!(m.draws, 3, "fired = 4 items - 1 budget skip");
-        assert_eq!(m.total_tokens, 150);
-        assert_eq!(m.wall_ms, 15, "wall summed over FIRED items only");
-        assert_eq!(m.served_model.as_deref(), Some("gpt-served"));
-
-        let row = recon.budget_row.as_ref().expect("remote seat -> probe budget row");
+        let (flags, members, warnings, budget_row, all_draws_failed, _retries) =
+            fold_probe_seats(std::slice::from_ref(&out), 120);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(members.len(), 1);
+        let row = budget_row.expect("remote seat -> probe budget row");
         assert_eq!(row.stage, "probe");
         assert_eq!(row.used_tokens, 150);
         assert!(row.exhausted, "150 >= 120");
         assert_eq!(row.skipped_calls, 1);
-
         assert!(
-            recon.warnings.iter().any(|w| w.contains("remote probe seat \"cloud\"") && w.contains("endpoint 503")),
-            "dispatch error named: {:?}",
-            recon.warnings
-        );
-        assert!(
-            recon.warnings.iter().any(|w| w.contains("remote probe token budget exhausted — 1 draw(s) skipped")),
+            warnings.iter().any(|w| w.contains("remote probe token budget exhausted — 1 draw(s) skipped")),
             "exhaustion named: {:?}",
-            recon.warnings
+            warnings
         );
-        // (#1888 same class, probe stage) The allowance figure is the
-        // caller's real budget (120), never a stray literal.
         assert!(
-            recon.warnings.iter().any(|w| w.contains("(120 tokens)")),
+            warnings.iter().any(|w| w.contains("(120 tokens)")),
             "the probe budget warning's allowance must be the real budget passed in: {:?}",
-            recon.warnings
+            warnings
         );
-        assert!(recon.all_draws_failed.is_none(), "real signal landed — not the all-failed case");
+        assert!(all_draws_failed.is_none(), "real signal landed — not the all-failed case");
     }
 
     #[test]
-    fn reconstruct_probe_stage_all_fired_draws_erroring_names_the_degenerate_reason() {
+    fn fold_probe_seats_all_fired_draws_erroring_names_the_degenerate_reason() {
         use darkmux_crew::step_kinds::MapItemResult;
-        let spec = ProbeSeatSpec {
-            name: "fast".to_string(),
-            identifier: "darkmux:probe-model".to_string(),
-            remote: false,
-            endpoint_host: None,
-            draw_task_ids: vec!["t-draw0".to_string()],
-        };
         let items = vec![MapItemResult {
             index: 0,
             ok: false,
@@ -7919,38 +8335,34 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             wall_ms: 3,
             retried: 1,
         }];
-        let mut input = BTreeMap::new();
-        input.insert("t-draw0".to_string(), serde_json::to_string(&items).unwrap());
-        let mut selection: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        selection.insert("t-draw0".to_string(), vec![("b1".to_string(), "unscoped".to_string())]);
-        let recon =
-            reconstruct_probe_stage(std::slice::from_ref(&spec), &input, &selection, 500_000).expect("parses");
-        assert!(recon.flags.is_empty());
-        let reason = recon.all_draws_failed.expect("every fired draw errored");
+        let pairs = vec![("b1".to_string(), "unscoped".to_string())];
+        let out = reconstruct_probe_seat("fast", "darkmux:probe-model", false, None, &items, &pairs);
+        assert!(out.flags.is_empty());
+        assert_eq!(out.first_error.as_deref(), Some("network down"));
+        // (#1605) The item's own `retried: 1` sums into `retries` — the
+        // figure `ReviewDedupStepKind` folds into `DedupOutput::probe_retries`
+        // (and from there, `ReviewEnvelope::probe_retries`).
+        assert_eq!(out.retries, 1, "the item's retried attempt must be summed, not dropped");
+
+        let (flags, _members, _warnings, budget_row, all_draws_failed, retries) =
+            fold_probe_seats(std::slice::from_ref(&out), 500_000);
+        assert!(flags.is_empty());
+        let reason = all_draws_failed.expect("every fired draw errored");
         assert!(reason.contains("errored"), "{reason}");
         assert!(reason.contains("network down"), "the first error is named: {reason}");
-        assert!(recon.budget_row.is_none(), "local-only stage carries no budget row");
-        // (#1605) The item's own `retried: 1` (it consumed its one
-        // `retry_on_error` attempt before still failing) sums into the
-        // reconstruction's `retries` — the figure `run_review_graph` folds
-        // into `ReviewEnvelope::probe_retries`.
-        assert_eq!(recon.retries, 1, "the item's retried attempt must be summed, not dropped");
+        assert!(budget_row.is_none(), "local-only stage carries no budget row");
+        assert_eq!(retries, 1);
     }
 
-    /// (#1541) THE no-op proof: what `ReviewProbeRenderStepKind::run_streaming`
-    /// PUBLISHES onto `REVIEW_PROBE_SELECTION_ARTIFACT` is byte-identical to
-    /// what the RETIRED build-time `ProbeSeatSpec.bundles` snapshot used to
-    /// hold for the same inputs (`select_bundles_for_staffing(&ctx.bundles,
-    /// selector).map(|b| (b.id, b.fact_family))` — the exact call
-    /// `build_review_graph_from_config`'s probe loop used to make before this
-    /// packet). Same selection, same order. Since attribution now keys
-    /// entirely on the published pairs (`reconstruct_probe_stage`'s own
-    /// `selection` parameter), this equality IS the claim that today's
-    /// behavior is unchanged — the bug #1541 fixes is a divergence that can
-    /// only appear once bundle selection itself becomes run-time work,
-    /// which this packet does not do.
+    /// (#2310 P2) `ReviewProbeCollectStepKind` recomputes the render step's
+    /// bundle SELECTION itself — a pure call over the SAME typed bundle set
+    /// and selector both steps read — rather than reading a bus publish
+    /// (the retired `REVIEW_PROBE_SELECTION_ARTIFACT`). This is the no-op
+    /// proof: the recomputed pairs are byte-identical to what
+    /// `select_bundles_for_staffing` called directly over the same inputs
+    /// produces — same selection, same order.
     #[test]
-    fn probe_render_step_publishes_the_same_selection_the_retired_build_time_snapshot_held() {
+    fn probe_collect_step_recomputes_the_same_selection_render_would_have_published() {
         let bundles = vec![
             BundleInput {
                 id: "a.ts".into(),
@@ -7986,28 +8398,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let selector = BundleSelector { fact_families: vec!["auth".to_string()], ..Default::default() };
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
-        // (#1530) This test calls `run_streaming` directly, bypassing
-        // `ReviewBundleStepKind`, so `REVIEW_BUNDLES_ARTIFACT` needs seeding
-        // by hand.
-        bus.seed(
-            REVIEW_BUNDLES_ARTIFACT,
-            Arc::new(StdMutex::new(bundles.clone())) as Arc<dyn Any + Send + Sync>,
-        );
-        // Mirrors exactly what the scheduler's `provides()` pre-scan does
-        // for a graph that contains a `review.probe-render` step — this
-        // test bypasses the scheduler, so it materializes the artifact by
-        // hand the same way.
-        bus.materialize(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
         let step = darkmux_crew::types::Step {
-            id: "review-probe-high-render-step".to_string(),
+            id: "review-probe-high-collect-step".to_string(),
             task_id: "review-probe-high-task".to_string(),
             gate: None,
-            kind: "review.probe-render".to_string(),
+            kind: "review.probe-collect".to_string(),
             status: NodeStatus::default(),
             config: serde_json::json!({
                 "selector": serde_json::to_value(&selector).unwrap(),
-                "role_id": "review-probe-high",
+                "name": "fast",
+                "identifier": "darkmux:probe-model",
+                "remote": false,
+                "endpoint_host": null,
             }),
             started_ts: None,
             completed_ts: None,
@@ -8018,66 +8421,218 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             phase_id: "investigate".to_string(),
             description: "probe high".to_string(),
             display_name: None,
-            step_ids: vec!["review-probe-high-render-step".to_string(), "review-probe-high-step".to_string()],
+            step_ids: vec![
+                "review-probe-high-render-step".to_string(),
+                "review-probe-high-step".to_string(),
+                "review-probe-high-collect-step".to_string(),
+            ],
             depends_on: vec!["review-bundle-task".to_string()],
-            reads: Vec::new(),
+            reads: vec!["review-context-task".to_string()],
+            role_id: Some("review-probe-high".to_string()),
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        // The "old build-time stamping"/render-step reference: the SAME
+        // call the render step itself makes — two "auth" bundles selected,
+        // so the map step's real output would carry exactly two results.
+        let selected = select_bundles_for_staffing(&bundles, Some(&selector));
+        let expected_pairs: Vec<(String, String)> =
+            selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
+        assert_eq!(expected_pairs.len(), 2, "selector restricts to the two \"auth\" bundles");
+
+        let map_results: Vec<darkmux_crew::step_kinds::MapItemResult> = expected_pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (bundle_id, _))| darkmux_crew::step_kinds::MapItemResult {
+                index: i,
+                ok: true,
+                content: format!("finding for {bundle_id}"),
+                error: None,
+                total_tokens: Some(10),
+                prompt_tokens: None,
+                completion_tokens: None,
+                served_model: None,
+                wall_ms: 1,
+                retried: 0,
+            })
+            .collect();
+
+        let mut input = BTreeMap::new();
+        input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-bundle-task".to_string(), bundle_task_output(&bundles));
+        input.insert(
+            "review-probe-high-step".to_string(),
+            serde_json::to_string(&map_results).unwrap(),
+        );
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let kind = ReviewProbeCollectStepKind;
+        let out = kind.run_streaming(&step, &task, &input, &run_ctx).expect("probe collect completes");
+        let body = darkmux_crew::step_output::Output::<ProbeSeatOutput>::read(
+            &out.output,
+            crate::lab::review_outputs::PROBE_SEAT_OUTPUT_KIND,
+        )
+        .expect("typed probe-collect output parses")
+        .body;
+
+        assert!(
+            body.warnings.is_empty(),
+            "the collect step's recomputed selection must match the map step's real result \
+             count exactly (both derive from the SAME bundles + selector): {:?}",
+            body.warnings
+        );
+        assert_eq!(body.flags.len(), 2, "one flag per matched dispatch result");
+        let flagged_bundle_ids: Vec<&str> = body.flags.iter().map(|f| f.bundle_id.as_str()).collect();
+        assert_eq!(
+            flagged_bundle_ids,
+            expected_pairs.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            "the collect step's recomputed selection is byte-identical (same bundles, same \
+             order) to the render step's own selection for the same inputs"
+        );
+    }
+
+    /// (#2310 P2 review, minor finding) A MISSING predecessor entry (this
+    /// step's own `dispatch.map` output absent from `input` — a graph
+    /// wiring gap, `gather_inputs` never chained it) used to silently read
+    /// as `"[]"` (zero draws), indistinguishable from a genuine no-op
+    /// short-circuit. Red before the fix: this would have completed with
+    /// zero flags and zero warnings instead of failing loudly by name.
+    #[test]
+    fn probe_collect_step_missing_predecessor_input_fails_loudly_not_as_empty() {
+        let bundles = vec![bundle_input("a.ts")];
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let ctx = step_ctx(&crew, bundles.clone());
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
+        let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
+        let step = darkmux_crew::types::Step {
+            id: "review-probe-high-collect-step".to_string(),
+            task_id: "review-probe-high-task".to_string(),
+            gate: None,
+            kind: "review.probe-collect".to_string(),
+            status: NodeStatus::default(),
+            config: serde_json::json!({
+                "selector": null,
+                "name": "fast",
+                "identifier": "darkmux:probe-model",
+                "remote": false,
+                "endpoint_host": null,
+            }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "review-probe-high-task".to_string(),
+            phase_id: "investigate".to_string(),
+            description: "probe high".to_string(),
+            display_name: None,
+            step_ids: vec![
+                "review-probe-high-render-step".to_string(),
+                "review-probe-high-step".to_string(),
+                "review-probe-high-collect-step".to_string(),
+            ],
+            depends_on: vec!["review-bundle-task".to_string()],
+            reads: vec!["review-context-task".to_string()],
             role_id: Some("review-probe-high".to_string()),
             profile_name: None,
             workdir: None,
             image: None,
         };
         let mut input = BTreeMap::new();
-        // (#2310 P1) This task now formally `reads: ["review-context-task"]`
-        // — a direct `run_streaming` call bypassing the scheduler seeds it
-        // by hand, same as the bundle/judge/verify-render kinds' own tests.
         input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-bundle-task".to_string(), bundle_task_output(&bundles));
+        // Deliberately NO "review-probe-high-step" entry — the map step's
+        // own output is absent, not empty.
 
         use darkmux_crew::step_kinds::StepKind as _;
-        let kind = ReviewProbeRenderStepKind;
-        kind.run_streaming(&step, &task, &input, &run_ctx).expect("probe render completes");
-
-        let published: BTreeMap<String, Vec<(String, String)>> = run_ctx
-            .artifact::<StdMutex<BTreeMap<String, Vec<(String, String)>>>>(REVIEW_PROBE_SELECTION_ARTIFACT)
-            .expect("the render step materializes this artifact via its own provides()")
-            .lock()
-            .expect("probe selection mutex poisoned")
-            .clone();
-        let published_pairs = published.get(&task.id).expect("the render step publishes under its own task id");
-
-        // The "old build-time stamping" reference: the SAME call
-        // `build_review_graph_from_config`'s probe loop used to make before
-        // #1541, invoked directly here as the retired snapshot's stand-in.
-        let selected = select_bundles_for_staffing(&bundles, Some(&selector));
-        let expected_pairs: Vec<(String, String)> =
-            selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
-
-        assert_eq!(expected_pairs.len(), 2, "selector restricts to the two \"auth\" bundles");
-        assert_eq!(
-            published_pairs, &expected_pairs,
-            "the render step's published selection is byte-identical (same bundles, same order) \
-             to the retired build-time snapshot for the same inputs"
+        let kind = ReviewProbeCollectStepKind;
+        let err = kind
+            .run_streaming(&step, &task, &input, &run_ctx)
+            .expect_err("a missing predecessor entry must fail loudly, never read as zero draws");
+        let msg = err.to_string();
+        assert!(msg.contains("review-probe-high-step"), "must name the missing predecessor: {msg}");
+        assert!(
+            msg.contains("no input") || msg.contains("missing"),
+            "must say the entry is ABSENT, not merely empty: {msg}"
         );
     }
 
-    /// (#1541) The "fail loudly instead of silently" half of the fix: a
-    /// draw whose published selection LENGTH doesn't match its dispatch
-    /// result count (the desync run-time bundling would introduce) is a
-    /// NAMED warning, and that draw's flags are DROPPED rather than
-    /// misattributed via the old bug's positional `results.get(b_idx)`
-    /// (which would have silently paired the wrong bundle to a result, or
-    /// silently skipped a result past the snapshot's length).
+    /// (#2310 P2 review, minor finding) The verify-collect sibling of the
+    /// probe-collect test above — same fix, same shape: a MISSING
+    /// predecessor entry must fail loudly, never silently read as zero
+    /// adjudications. Red before the fix.
     #[test]
-    fn reconstruct_probe_stage_desynced_selection_warns_loudly_and_drops_the_draws_flags() {
-        use darkmux_crew::step_kinds::MapItemResult;
-        let spec = ProbeSeatSpec {
-            name: "fast".to_string(),
-            identifier: "darkmux:probe-model".to_string(),
-            remote: false,
-            endpoint_host: None,
-            draw_task_ids: vec!["t-draw0".to_string()],
+    fn verify_collect_step_missing_predecessor_input_fails_loudly_not_as_empty() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![graph_staffing("frontier", "verify-model", 1)]),
+        ]);
+        let ctx = step_ctx(&crew, vec![bundle_input("a.ts")]);
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
+        let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
+        let step = darkmux_crew::types::Step {
+            id: "review-verify-collect-step".to_string(),
+            task_id: "review-verify-task".to_string(),
+            gate: None,
+            kind: "review.verify-collect".to_string(),
+            status: NodeStatus::default(),
+            config: serde_json::json!({}),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
         };
+        let task = darkmux_crew::types::Task {
+            id: "review-verify-task".to_string(),
+            phase_id: "report".to_string(),
+            description: "verify".to_string(),
+            display_name: None,
+            step_ids: vec![
+                "review-verify-render-step".to_string(),
+                "review-verify-step".to_string(),
+                "review-verify-collect-step".to_string(),
+            ],
+            depends_on: vec!["review-judge-task".to_string()],
+            reads: vec!["review-context-task".to_string()],
+            role_id: Some("review-verify".to_string()),
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mut input = BTreeMap::new();
+        input.insert("review-context-task".to_string(), context_task_output(&ctx));
+        input.insert("review-judge-task".to_string(), judge_task_output(vec![]));
+        // Deliberately NO "review-verify-step" entry — the map step's own
+        // output is absent, not empty.
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let kind = ReviewVerifyCollectStepKind;
+        let err = kind
+            .run_streaming(&step, &task, &input, &run_ctx)
+            .expect_err("a missing predecessor entry must fail loudly, never read as zero items");
+        let msg = err.to_string();
+        assert!(msg.contains("review-verify-step"), "must name the missing predecessor: {msg}");
+        assert!(
+            msg.contains("no input") || msg.contains("missing"),
+            "must say the entry is ABSENT, not merely empty: {msg}"
+        );
+    }
+
+    /// (#2310 P2) The "fail loudly instead of silently" half of the fix: a
+    /// draw whose recomputed selection LENGTH doesn't match its dispatch
+    /// result count is a NAMED warning, and that draw's flags are DROPPED
+    /// rather than misattributed.
+    #[test]
+    fn reconstruct_probe_seat_desynced_selection_warns_loudly_and_drops_the_flags() {
+        use darkmux_crew::step_kinds::MapItemResult;
         // Two dispatch results came back...
-        let items = vec![
+        let results = vec![
             MapItemResult {
                 index: 0,
                 ok: true,
@@ -8103,45 +8658,22 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 retried: 0,
             },
         ];
-        let mut input = BTreeMap::new();
-        input.insert("t-draw0".to_string(), serde_json::to_string(&items).unwrap());
-        // ...but the render step only published ONE selected bundle for
-        // this task — a desync, exactly the shape run-time bundling could
-        // introduce without this fix.
-        let mut selection: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        selection.insert("t-draw0".to_string(), vec![("b1".to_string(), "unscoped".to_string())]);
+        // ...but the recomputed selection only names ONE bundle — a
+        // desync, exactly the shape a mismatched build-time stamp between
+        // the render and collect steps' config could introduce.
+        let pairs = vec![("b1".to_string(), "unscoped".to_string())];
 
-        let recon =
-            reconstruct_probe_stage(std::slice::from_ref(&spec), &input, &selection, 500_000).expect("parses");
+        let out = reconstruct_probe_seat("fast", "darkmux:probe-model", false, None, &results, &pairs);
 
         assert!(
-            recon.flags.is_empty(),
+            out.flags.is_empty(),
             "a desynced draw's flags are DROPPED rather than misattributed: {:?}",
-            recon.flags
+            out.flags
         );
         assert!(
-            recon.warnings.iter().any(|w| {
-                w.contains("probe seat \"fast\"") && w.contains("desync") && w.contains("t-draw0")
-            }),
+            out.warnings.iter().any(|w| w.contains("probe seat \"fast\"") && w.contains("desync")),
             "the desync is named loudly, not swallowed: {:?}",
-            recon.warnings
-        );
-
-        // The absent-selection half of the same loud-failure path: no entry
-        // at all for the draw's task id (the render step never ran, or
-        // never published for it).
-        let empty_selection: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        let recon_absent =
-            reconstruct_probe_stage(std::slice::from_ref(&spec), &input, &empty_selection, 500_000)
-                .expect("parses");
-        assert!(recon_absent.flags.is_empty(), "no published selection ⇒ no attributable flags");
-        assert!(
-            recon_absent
-                .warnings
-                .iter()
-                .any(|w| w.contains("probe seat \"fast\"") && w.contains("no bundle selection published")),
-            "the absence is named loudly, not swallowed: {:?}",
-            recon_absent.warnings
+            out.warnings
         );
     }
 
@@ -8198,15 +8730,22 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: None,
             bundle_override: None,
             mission_id: None,
+            // (#2310 P2) `run_review_graph` overlays these onto its own
+            // bus-seeded copy before any step reads them for a full graph
+            // run; a hand-built fixture that reads `ReviewStepContext`
+            // directly (never through `run_review_graph`) just gets the
+            // fresh defaults.
+            crew_name: None,
+            mode_label: None,
+            fingerprint: None,
+            staffing: None,
+            interpret_warnings: Vec::new(),
             diff_file: None,
             intent_file: None,
             context_test_overrides: Default::default(),
         });
-        let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as Arc<dyn Any + Send + Sync>);
-        bus.materialize(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
 
         let step = darkmux_crew::types::Step {
@@ -8245,47 +8784,40 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let kind = ReviewBundleStepKind;
         let out = kind.run_streaming(&step, &task, &input, &run_ctx).expect("bundle step completes");
 
-        let published: Vec<BundleInput> = run_ctx
-            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
-            .expect("this kind's own provides() materializes review.bundles")
-            .lock()
-            .expect("review bundles mutex poisoned")
-            .clone();
+        // (#2310 P2) The typed output IS the published result now — no
+        // separate bus artifact to read back.
+        let from_output = darkmux_crew::step_output::Output::<crate::lab::review_outputs::BundleSetOutput>::read(
+            &out.output,
+            crate::lab::review_outputs::BUNDLE_SET_OUTPUT_KIND,
+        )
+        .expect("Step.output parses as the typed bundle output")
+        .body;
 
-        // Compared as JSON (BundleInput derives no PartialEq) — an exact
-        // structural equality check, same discipline the golden tests in
-        // this file already use.
+        // Compared as JSON (BundleInput derives `PartialEq` since #2310 P2,
+        // but this stays a structural-JSON check for message quality on a
+        // mismatch, same discipline the golden tests in this file already
+        // use).
         assert_eq!(
-            serde_json::to_value(&published).unwrap(),
+            serde_json::to_value(&from_output.bundles).unwrap(),
             serde_json::to_value(&expected).unwrap(),
-            "the run-time bundle step's published output must be byte-identical to the retired \
+            "the run-time bundle step's typed output must be byte-identical to the retired \
              pre-graph prelude's own computation for the same inputs — that equality IS this \
              packet's faithfulness claim"
         );
-
-        // `Step.output` and the shared envelope's `bundles` count are both
-        // derived from the same run-time result — see this kind's own doc.
-        let from_output: Vec<BundleInput> =
-            serde_json::from_str(&out.output).expect("Step.output parses as the bundle list");
         assert_eq!(
-            serde_json::to_value(&from_output).unwrap(),
-            serde_json::to_value(&expected).unwrap(),
-            "Step.output must carry the same bundles"
-        );
-        assert_eq!(
-            env.lock().expect("shared review envelope mutex poisoned").bundles,
+            from_output.bundles.len(),
             expected.len(),
-            "the shared envelope's bundle count is stamped from the real run-time result, not a \
+            "the typed output's bundle count is stamped from the real run-time result, not a \
              build-time snapshot"
         );
     }
 
     /// The degenerate empty-bundle-set behavior is UNCHANGED by this
-    /// packet: an empty worktree/diff still publishes an empty
-    /// `REVIEW_BUNDLES_ARTIFACT`, still yields a zero envelope count, and
+    /// packet: an empty worktree/diff still produces an empty typed
+    /// `review.bundles` output, still yields a zero envelope count, and
     /// still leaves `ReviewJudgeStepKind::residency()`'s skip-load check
-    /// (which reads the SAME artifact — see that method's own doc) with
-    /// nothing to load, exactly like the pre-#1530 `ctx.bundles.is_empty()`
+    /// (which reads the SAME typed output off `input` — see that method's
+    /// own doc) with nothing to load, exactly like the pre-#1530 `ctx.bundles.is_empty()`
     /// check did.
     #[test]
     fn review_bundle_step_empty_diff_publishes_empty_bundles_and_zero_count() {
@@ -8308,15 +8840,22 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: None,
             bundle_override: None,
             mission_id: None,
+            // (#2310 P2) `run_review_graph` overlays these onto its own
+            // bus-seeded copy before any step reads them for a full graph
+            // run; a hand-built fixture that reads `ReviewStepContext`
+            // directly (never through `run_review_graph`) just gets the
+            // fresh defaults.
+            crew_name: None,
+            mode_label: None,
+            fingerprint: None,
+            staffing: None,
+            interpret_warnings: Vec::new(),
             diff_file: None,
             intent_file: None,
             context_test_overrides: Default::default(),
         });
-        let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as Arc<dyn Any + Send + Sync>);
-        bus.materialize(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
 
         let step = darkmux_crew::types::Step {
@@ -8353,20 +8892,23 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
         use darkmux_crew::step_kinds::StepKind as _;
         let kind = ReviewBundleStepKind;
-        kind.run_streaming(&step, &task, &input, &run_ctx).expect("bundle step completes on an empty diff");
+        let out = kind
+            .run_streaming(&step, &task, &input, &run_ctx)
+            .expect("bundle step completes on an empty diff");
 
-        let published = run_ctx
-            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
-            .expect("this kind's own provides() materializes review.bundles")
-            .lock()
-            .expect("review bundles mutex poisoned")
-            .clone();
-        assert!(published.is_empty(), "an empty diff produces an empty bundle set");
-        assert_eq!(env.lock().expect("shared review envelope mutex poisoned").bundles, 0);
+        // (#2310 P2) The typed output IS the published result now.
+        let from_output = darkmux_crew::step_output::Output::<crate::lab::review_outputs::BundleSetOutput>::read(
+            &out.output,
+            crate::lab::review_outputs::BUNDLE_SET_OUTPUT_KIND,
+        )
+        .expect("Step.output parses as the typed bundle output")
+        .body;
+        assert!(from_output.bundles.is_empty(), "an empty diff produces an empty bundle set");
 
         // `ReviewJudgeStepKind::residency()` skips loading a model whose
-        // corresponding bundle set is empty — same downstream consumer this
-        // packet re-pointed at `REVIEW_BUNDLES_ARTIFACT`.
+        // corresponding bundle set is empty — reads the typed bundle output
+        // off `input` now, so this test seeds it there too.
+        input.insert("review-bundle-task".to_string(), out.output.clone());
         let judge_kind = ReviewJudgeStepKind;
         let judge_step = darkmux_crew::types::Step {
             id: "review-judge-step".to_string(),
@@ -8491,15 +9033,22 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: None,
             bundle_override: None,
             mission_id: None,
+            // (#2310 P2) `run_review_graph` overlays these onto its own
+            // bus-seeded copy before any step reads them for a full graph
+            // run; a hand-built fixture that reads `ReviewStepContext`
+            // directly (never through `run_review_graph`) just gets the
+            // fresh defaults.
+            crew_name: None,
+            mode_label: None,
+            fingerprint: None,
+            staffing: None,
+            interpret_warnings: Vec::new(),
             diff_file: None,
             intent_file: None,
             context_test_overrides: Default::default(),
         });
-        let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as Arc<dyn Any + Send + Sync>);
-        bus.materialize(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
 
         let diff_file = stub_dir.path().join("d.diff");
@@ -8538,29 +9087,29 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
         use darkmux_crew::step_kinds::StepKind as _;
         let kind = ReviewBundleStepKind;
-        kind.run_streaming(&step, &task, &input, &run_ctx)
+        let out = kind
+            .run_streaming(&step, &task, &input, &run_ctx)
             .expect("a plugin decline must fall back to the built-in bundler, not error the step");
 
-        let published: Vec<BundleInput> = run_ctx
-            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
-            .expect("this kind's own provides() materializes review.bundles")
-            .lock()
-            .expect("review bundles mutex poisoned")
-            .clone();
+        let from_output = darkmux_crew::step_output::Output::<crate::lab::review_outputs::BundleSetOutput>::read(
+            &out.output,
+            crate::lab::review_outputs::BUNDLE_SET_OUTPUT_KIND,
+        )
+        .expect("Step.output parses as the typed bundle output")
+        .body;
         assert_eq!(
-            serde_json::to_value(&published).unwrap(),
+            serde_json::to_value(&from_output.bundles).unwrap(),
             serde_json::to_value(&expected).unwrap(),
             "the fallback must publish exactly what an unpinned (built-in-bundler) run would have"
         );
 
-        let env = env.lock().expect("shared review envelope mutex poisoned");
-        assert_eq!(env.bundles, expected.len());
+        assert_eq!(from_output.bundles.len(), expected.len());
         assert!(
-            env.bundle_skip.is_some(),
+            from_output.skip.is_some(),
             "the fallback must carry the BUILT-IN bundler's real per-file skip accounting, not the \
              plugin's empty default"
         );
-        let fallback = env
+        let fallback = from_output
             .bundler_fallback
             .as_deref()
             .expect("bundler_fallback must be set when a plugin declined and the step fell back");
@@ -8602,15 +9151,22 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: None,
             bundle_override: None,
             mission_id: None,
+            // (#2310 P2) `run_review_graph` overlays these onto its own
+            // bus-seeded copy before any step reads them for a full graph
+            // run; a hand-built fixture that reads `ReviewStepContext`
+            // directly (never through `run_review_graph`) just gets the
+            // fresh defaults.
+            crew_name: None,
+            mode_label: None,
+            fingerprint: None,
+            staffing: None,
+            interpret_warnings: Vec::new(),
             diff_file: None,
             intent_file: None,
             context_test_overrides: Default::default(),
         });
-        let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
-        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as Arc<dyn Any + Send + Sync>);
-        bus.materialize(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
 
         let diff_file = stub_dir.path().join("d.diff");
@@ -8745,6 +9301,16 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             })),
             bundle_override: None,
             mission_id: Some("mission-token-test".to_string()),
+            // (#2310 P2) `run_review_graph` overlays these onto its own
+            // bus-seeded copy before any step reads them for a full graph
+            // run; a hand-built fixture that reads `ReviewStepContext`
+            // directly (never through `run_review_graph`) just gets the
+            // fresh defaults.
+            crew_name: None,
+            mode_label: None,
+            fingerprint: None,
+            staffing: None,
+            interpret_warnings: Vec::new(),
             diff_file: None,
             intent_file: None,
             context_test_overrides: Default::default(),

@@ -74,7 +74,10 @@ use serde::{Deserialize, Serialize};
 /// probe pass, each judge pass, the verify pass), each drawing from its own
 /// `remote.max_tokens_per_execution` allowance so a runaway stage is caught
 /// at the cap without starving later stages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// (#2310 P2) `PartialEq` is new — every field is a plain String/u64/bool/
+// u32, so this rides inside a typed `Output<T>` body (which derives
+// `PartialEq` throughout — see `darkmux_crew::step_output`'s module doc).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteBudgetRecord {
     /// e.g. `probe` | `judge-pass1` | `judge-pass2` | `verify`.
     pub stage: String,

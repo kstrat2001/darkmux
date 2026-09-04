@@ -1300,6 +1300,15 @@ fn run_dispatch(
             bundle_override: None,
             // (#1641) See `ReviewStepContext::mission_id`'s doc.
             mission_id: Some(mission_id.clone()),
+            // (#2310 P2) `run_review_graph` overlays these onto its own
+            // bus-seeded copy from its own `crew_name`/`mode`/
+            // `fingerprint_val`/`staffing` parameters, computed further
+            // below — this literal's values are never read.
+            crew_name: None,
+            mode_label: None,
+            fingerprint: None,
+            staffing: None,
+            interpret_warnings: Vec::new(),
             // (#2310 P1 fix) The real launch path never overrides
             // `review.context`'s resolution — it resolves for real.
             context_test_overrides: Default::default(),

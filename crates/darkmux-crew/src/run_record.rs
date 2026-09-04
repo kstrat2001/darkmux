@@ -109,7 +109,11 @@ use serde::{Deserialize, Serialize};
 /// Per-model resource accounting — one row per seat a run staffed (a
 /// review's probe staffings plus its judge seat; any future mission's own
 /// per-seat dispatch accounting).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// (#2310 P2) `PartialEq` is new — every field is already `PartialEq`-able
+// (String/u32/u64/bool/Option<String>); added so `MemberRecord` can ride
+// inside a typed `Output<T>` body, which derives `PartialEq` throughout
+// (see `darkmux_crew::step_output`'s module doc).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemberRecord {
     pub model: String,
     pub seat: String,
@@ -146,7 +150,7 @@ pub struct MemberRecord {
 /// today: `crate::scheduler::run_step_graph` (every step, every mission,
 /// `items_in`/`items_out` always `None`) and review's own two drivers
 /// (`items_in`/`items_out` always `Some`, since they know the counts).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepRecord {
     /// Mission-defined step identity (review's steps are `bundle` |
     /// `probe` | `dedup` | `judge-pass1` | `judge-pass2`). A
@@ -218,7 +222,7 @@ pub fn seat_endpoint(pm: &ProfileModel) -> Option<&ModelEndpoint> {
 /// One seat staffing's resolved config, snapshotted as ACTUALLY used — see
 /// [`StaffingSnapshot`], and `darkmux_lab::lab::review::ReviewEnvelope::
 /// staffing` for the first consumer's own envelope field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeatStaffingSnapshot {
     pub name: String,
     /// (#1475 packet 2) The task ROLE this seat was staffed for (review's
@@ -286,7 +290,7 @@ pub struct SeatStaffingSnapshot {
 /// mission with a probe/judge/verify-shaped seat set reuses it as-is. See
 /// `darkmux_lab::lab::review::ReviewEnvelope::staffing` for the first
 /// consumer's own envelope field.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StaffingSnapshot {
     pub probes: Vec<SeatStaffingSnapshot>,
     pub judge: Option<SeatStaffingSnapshot>,

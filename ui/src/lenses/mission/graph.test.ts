@@ -301,6 +301,10 @@ describe("isAiKind", () => {
     expect(isAiKind("review.probe-render")).toBe(false);
     expect(isAiKind("review.verify-render")).toBe(false);
   });
+  it("-collect kinds are excluded too (#2310 P2 review finding I4) — the procedural fan-in step after a dispatch.map, never a dispatcher itself", () => {
+    expect(isAiKind("review.probe-collect")).toBe(false);
+    expect(isAiKind("review.verify-collect")).toBe(false);
+  });
 });
 
 describe("applyRecordToMetrics", () => {

@@ -120,8 +120,7 @@
             "name": "plow",
             "remote": false
           }
-        ],
-        "remote_budget": 500000
+        ]
       },
       "id": "review-dedup-step",
       "kind": "review.dedup",
@@ -147,6 +146,19 @@
       "kind": "review.judge",
       "status": "planned",
       "task_id": "review-judge-task"
+    },
+    "review-probe-high-collect-step": {
+      "config": {
+        "endpoint_host": null,
+        "identifier": "darkmux:probe-model-a",
+        "name": "phigh",
+        "remote": false,
+        "selector": null
+      },
+      "id": "review-probe-high-collect-step",
+      "kind": "review.probe-collect",
+      "status": "planned",
+      "task_id": "review-probe-high-task"
     },
     "review-probe-high-render-step": {
       "config": {
@@ -179,6 +191,19 @@
       "status": "planned",
       "task_id": "review-probe-high-task"
     },
+    "review-probe-low-collect-step": {
+      "config": {
+        "endpoint_host": null,
+        "identifier": "darkmux:probe-model-c",
+        "name": "plow",
+        "remote": false,
+        "selector": null
+      },
+      "id": "review-probe-low-collect-step",
+      "kind": "review.probe-collect",
+      "status": "planned",
+      "task_id": "review-probe-low-task"
+    },
     "review-probe-low-render-step": {
       "config": {
         "role_id": "review-probe-low",
@@ -209,6 +234,19 @@
       "kind": "dispatch.map",
       "status": "planned",
       "task_id": "review-probe-low-task"
+    },
+    "review-probe-mid-collect-step": {
+      "config": {
+        "endpoint_host": null,
+        "identifier": "darkmux:probe-model-b",
+        "name": "pmid",
+        "remote": false,
+        "selector": null
+      },
+      "id": "review-probe-mid-collect-step",
+      "kind": "review.probe-collect",
+      "status": "planned",
+      "task_id": "review-probe-mid-task"
     },
     "review-probe-mid-render-step": {
       "config": {
@@ -242,16 +280,18 @@
       "task_id": "review-probe-mid-task"
     },
     "review-synthesis-step": {
-      "config": {
-        "dedup_task_id": "review-dedup-task",
-        "judge_task_id": "review-judge-task",
-        "remote_budget": 500000,
-        "verify_task_id": "review-verify-task"
-      },
+      "config": null,
       "id": "review-synthesis-step",
       "kind": "review.synthesis",
       "status": "planned",
       "task_id": "review-synthesis-task"
+    },
+    "review-verify-collect-step": {
+      "config": null,
+      "id": "review-verify-collect-step",
+      "kind": "review.verify-collect",
+      "status": "planned",
+      "task_id": "review-verify-task"
     },
     "review-verify-render-step": {
       "config": {
@@ -307,7 +347,8 @@
       "role_id": "review-probe-high",
       "step_ids": [
         "review-probe-high-render-step",
-        "review-probe-high-step"
+        "review-probe-high-step",
+        "review-probe-high-collect-step"
       ]
     },
     {
@@ -324,7 +365,8 @@
       "role_id": "review-probe-mid",
       "step_ids": [
         "review-probe-mid-render-step",
-        "review-probe-mid-step"
+        "review-probe-mid-step",
+        "review-probe-mid-collect-step"
       ]
     },
     {
@@ -341,7 +383,8 @@
       "role_id": "review-probe-low",
       "step_ids": [
         "review-probe-low-render-step",
-        "review-probe-low-step"
+        "review-probe-low-step",
+        "review-probe-low-collect-step"
       ]
     },
     {
@@ -369,7 +412,8 @@
       "phase_id": "pr-review-golden-adjudicate",
       "reads": [
         "review-dedup-task",
-        "review-context-task"
+        "review-context-task",
+        "review-bundle-task"
       ],
       "role_id": "review-judge",
       "step_ids": [
@@ -384,12 +428,14 @@
       "phase_id": "pr-review-golden-report",
       "reads": [
         "review-judge-task",
-        "review-context-task"
+        "review-context-task",
+        "review-bundle-task"
       ],
       "role_id": "review-verify",
       "step_ids": [
         "review-verify-render-step",
-        "review-verify-step"
+        "review-verify-step",
+        "review-verify-collect-step"
       ]
     },
     {
@@ -403,7 +449,8 @@
       "reads": [
         "review-dedup-task",
         "review-judge-task",
-        "review-context-task"
+        "review-context-task",
+        "review-bundle-task"
       ],
       "step_ids": [
         "review-synthesis-step"

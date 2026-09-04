@@ -1168,6 +1168,17 @@ fn run_funnel_case(
         // no Mission is ever minted for it, so `None` here matches the
         // `--charges-file` path's own honest `None`.
         mission_id: None,
+        // (#2310 P2) `run_review_graph` overlays these four onto its OWN
+        // bus-seeded copy from its own `crew_name`/`mode`/`fingerprint_val`/
+        // `staffing` parameters (below) before any step reads them — same
+        // "always overwritten by the caller-seed" contract `mission_id`
+        // above never needed but these four do; this initializer's values
+        // are never read.
+        crew_name: None,
+        mode_label: None,
+        fingerprint: None,
+        staffing: None,
+        interpret_warnings: Vec::new(),
         // (#2310 P1 review finding I4) Bench already writes the diff to a
         // real temp file (`diff_path`, above — the external bundler needs
         // one) — hand its path to `review-context-step` too, instead of

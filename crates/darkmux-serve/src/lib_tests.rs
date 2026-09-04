@@ -4820,19 +4820,19 @@
             .filter(|n| n["kind"] == "task")
             .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
             .sum();
-        // (#1530, #2310 P1) Each of the three probe tasks and the verify
-        // task carries TWO rows (a bespoke render step + the generic
-        // `dispatch.map`); every other task (context, bundle, dedup, judge,
-        // synthesis) carries ONE. 9 tasks: context(1) + bundle(1) +
-        // 3×probe(2) + dedup(1) + judge(1) + verify(2) + synthesis(1) = 13
-        // step rows.
+        // (#1530, #2310 P1/P2) Each of the three probe tasks and the verify
+        // task carries THREE rows (a bespoke render step + the generic
+        // `dispatch.map` + a bespoke collect step); every other task
+        // (context, bundle, dedup, judge, synthesis) carries ONE. 9 tasks:
+        // context(1) + bundle(1) + 3×probe(3) + dedup(1) + judge(1) +
+        // verify(3) + synthesis(1) = 17 step rows.
         assert_eq!(
             total_step_rows,
-            13,
-            "context/bundle/dedup/judge/synthesis carry one row each, probe + verify carry two: {nodes:?}"
+            17,
+            "context/bundle/dedup/judge/synthesis carry one row each, probe + verify carry three: {nodes:?}"
         );
         assert_eq!(tasks.len(), 9);
-        assert_eq!(steps.len(), 13);
+        assert_eq!(steps.len(), 17);
 
         // (#1402) Every row's label resolves through the real StepKind
         // display-name fallback chain — the probe/verify dispatch rows are
