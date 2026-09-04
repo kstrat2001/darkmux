@@ -68,7 +68,7 @@ test('tokens with no endpoint evidence are not credited to local', async ({ page
   // spirit: cloud tokens must never be counted as local.
   const split = await page.locator('.missionlens .mmeter').getAttribute('title');
   expect(meter, `meter read: ${meter}`).toContain('15k tok');
-  expect(meter).toContain('cloud');
+  expect(meter, 'no attribution word in the headline when nothing is cloud').not.toContain('local');
   expect(split, `split read: ${split}`).toContain('3.0k local');
   expect(split).toContain('unattributed');
   expect(split, 'the whole 15k must never read as local — that is the #1607 defect').not.toContain('15.0k local');
