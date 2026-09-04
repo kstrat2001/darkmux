@@ -63,9 +63,15 @@ test('tokens with no endpoint evidence are not credited to local', async ({ page
   const errors = await open(page, RECORDS);
   const meter = (await page.locator('.missionlens .mmeter').innerText()).replace(/\s+/g, ' ');
 
-  expect(meter, `meter read: ${meter}`).toContain('3.0k local');
-  expect(meter).toContain('unattributed');
-  expect(meter, 'the whole 15k must never read as local — that is the #1607 defect').not.toContain('15.0k local');
+  // (#2332) The header shows the total and the cloud share; the three-way
+  // split lives in the meter's tooltip. The #1607 guard is unchanged in
+  // spirit: cloud tokens must never be counted as local.
+  const split = await page.locator('.missionlens .mmeter').getAttribute('title');
+  expect(meter, `meter read: ${meter}`).toContain('15.0k tok');
+  expect(meter).toContain('cloud');
+  expect(split, `split read: ${split}`).toContain('3.0k local');
+  expect(split).toContain('unattributed');
+  expect(split, 'the whole 15k must never read as local — that is the #1607 defect').not.toContain('15.0k local');
 
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
@@ -73,8 +79,10 @@ test('tokens with no endpoint evidence are not credited to local', async ({ page
 test('the split is shown even when nothing is attributed to cloud', async ({ page }) => {
   const errors = await open(page, RECORDS.filter((r) => r.session_id !== 'step-local-1'));
   const meter = (await page.locator('.missionlens .mmeter').innerText()).replace(/\s+/g, ' ');
-  expect(meter, `meter read: ${meter}`).toContain('unattributed');
-  expect(meter).toContain('0 local');
+  const split = await page.locator('.missionlens .mmeter').getAttribute('title');
+  expect(split, `split read: ${split}`).toContain('unattributed');
+  expect(split).toContain('0 local');
+  expect(meter, 'no cloud share → no attribution word in the headline').not.toContain('cloud');
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 

@@ -54,12 +54,13 @@
  *   reads the `flowTail` cache slot that mount writes. The header badge is
  *   the liveness indicator; this lens paints no pill.
  */
+import { clkhm } from "../../lib/format";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
 import { getSource } from "../../lib/source";
-import { WorkStatus } from "../../components/WorkStatus";
+import { WorkStatus, workStatusKind } from "../../components/WorkStatus";
 import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
 import { MissionCanvas } from "./MissionCanvas";
 import { MissionTimelineView } from "./MissionTimelineView";
@@ -77,6 +78,7 @@ import {
   type MetricsMap,
   type MissionGraph,
   type StepHeaderField,
+  fmtElapsed,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import type { FlowRecord } from "../../types/handwritten";
@@ -241,25 +243,51 @@ function legendDots() {
   ));
 }
 
-function MeterEl({ tot }: { tot: ReturnType<typeof missionTotals> }) {
-  if (!tot.total && !tot.turns) return null;
-  const attributed = tot.cloud || tot.unknown;
+/** (#2332) `<name>-<epoch>-<hash>` is how every minted mission id reads
+ * (`crawl-create-mods-1788484173-b562e3`). The name is what a person
+ * recognizes, the hash is what tells two crawls apart, the epoch is what
+ * nobody types — so the header shows the name, the sub-line shows the hash,
+ * and the epoch becomes the start time when no record has said otherwise.
+ * An id in any other shape is shown whole. */
+export function splitMissionId(id: string): { name: string; epoch: number | null; hash: string | null } {
+  const m = /^(.+)-(\d{10})-([0-9a-f]{4,8})$/.exec(id);
+  if (!m) return { name: id, epoch: null, hash: null };
+  return { name: m[1], epoch: Number(m[2]) * 1000, hash: m[3] };
+}
+/** Mission-wide span from the per-step metrics the fold already keeps:
+ * earliest step start, latest step end (0 when unknown). */
+export function missionSpan(metrics: MetricsMap): { start: number; end: number } {
+  let start = 0;
+  let end = 0;
+  for (const k of Object.keys(metrics)) {
+    const m = metrics[k];
+    if (m.startTs) start = start ? Math.min(start, m.startTs) : m.startTs;
+    if (m.endTs) end = Math.max(end, m.endTs);
+  }
+  return { start, end };
+}
+function HelpGlyph() {
   return (
-    <span className="mmeter">
-      {tot.total ? <b>{fmtTok(tot.total) + " tok"}</b> : null}
-      {tot.total && attributed ? (
-        <span className="split">
-          {fmtTok(tot.local) + " local"}
-          {tot.cloud ? (
-            <span>
-              {" + "}
-              <span className="cloud">{fmtTok(tot.cloud) + " cloud"}</span>
-            </span>
-          ) : null}
-          {tot.unknown ? <span className="unknown">{" + " + fmtTok(tot.unknown) + " unattributed"}</span> : null}
-        </span>
-      ) : null}
-      {tot.turns ? <span className="split">{"· " + tot.turns + (tot.turns === 1 ? " turn" : " turns")}</span> : null}
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.5" />
+      <path d="M6.2 6.2a1.9 1.9 0 0 1 3.7.5c0 1.3-1.9 1.4-1.9 2.6" />
+      <circle cx="8" cy="11.6" r=".6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+function MeterEl({ tot }: { tot: ReturnType<typeof missionTotals> }) {
+  // (#2332) One number a person can act on — the mission's cost — plus the
+  // cloud share ONLY when there is one. "unattributed" is bookkeeping (its
+  // cause is #2106/#2188), not a headline; the three-way split stays
+  // reachable in the tooltip. Turns are gone from this scope: a sum of model
+  // calls across every step of every role drives no decision here (they
+  // stay per-step on the run view).
+  if (!tot.total) return null;
+  const split = `${fmtTok(tot.local)} local · ${fmtTok(tot.cloud)} cloud · ${fmtTok(tot.unknown)} unattributed`;
+  return (
+    <span className="mmeter" title={split}>
+      <b>{fmtTok(tot.total) + " tok"}</b>
+      {tot.cloud ? <span className="cloud">{"(" + fmtTok(tot.cloud) + " cloud)"}</span> : null}
     </span>
   );
 }
@@ -625,41 +653,58 @@ export function MissionGraphLens({
   const useTimeline = timelineActive(viewMode, isMobile);
   const tot = missionTotals(metrics);
   const status = normalizeMissionStatus(graph.mission_status);
-
+  const running = workStatusKind(status) === "running";
+  const idParts = splitMissionId(graph.mission_id);
+  const span = missionSpan(metrics);
+  // (#2332) The first-second facts: when it started and how long it ran.
+  // Start = earliest step start, else the id's own epoch; elapsed while
+  // running, final duration once it is not.
+  const startMs = span.start || idParts.epoch || 0;
+  const endMs = running ? now : span.end || span.start;
+  const elapsed = startMs && endMs && endMs >= startMs ? fmtElapsed(endMs - startMs) : null;
+  const copyId = () => {
+    void navigator.clipboard?.writeText(graph.mission_id).catch(() => {});
+  };
   return (
     <div className="missionlens">
+      {/* (#2332) Two rows on a phone, one on a wide lens, never a third —
+          the layout is keyed on the lens's own width (container query), not
+          the window's. Row 1: identity + state. Row 2: cost + controls.
+          Nothing changes rows with content length: the NAME ellipsizes, the
+          numbers and controls never move. */}
       <div className="top missionlens__top">
-        <span className="midname" title={graph.mission_id}>
-          {graph.mission_id}
-        </span>
-        <WorkStatus status={status} className="mstatus" />
-        <MeterEl tot={tot} />
-        <ProcEl proc={proc} />
-        {/* (#2032 packet 2) No daemon behind a static build to refetch
-            against — `refresh()` would only invalidate queries that are
-            `enabled: false` and never re-run. Hidden rather than left as a
-            dead click. */}
-        {daemonBacked ? (
-          <button type="button" className="evbtn" title="refresh — refetch graph + events" onClick={refresh}>
-            ↻
-          </button>
-        ) : null}
-        <button type="button" className="evbtn" title="switch renderer" onClick={() => setViewMode(useTimeline ? "canvas" : "timeline")}>
-          {useTimeline ? "graph" : "list"}
-        </button>
-        {!useTimeline ? (
-          <button type="button" className={`evbtn${minimapOn ? " on" : ""}`} title="toggle minimap" onClick={toggleMinimap}>
-            map
-          </button>
-        ) : null}
-        {/* (#1868) `.legbtn` — hidden above the ~700px breakpoint (CSS),
-            visible only where `.legend` itself is hidden. A real `<button>`
-            gets Tab/Enter/Space activation for free, matching every other
-            control in this header. */}
-        <button type="button" className="legbtn" title="status legend" onClick={() => setLegendOpen((v) => !v)}>
-          legend
-        </button>
-        <div className="legend">{legendDots()}</div>
+        <div className="mhead-id">
+          <span className="midname" title={graph.mission_id + " — tap to copy"} onClick={copyId}>
+            {idParts.name}
+          </span>
+          <WorkStatus status={status} className="mstatus" />
+        </div>
+        <div className="msub">
+          {startMs ? <span>{"started " + clkhm(startMs)}</span> : null}
+          {elapsed ? <span>{running ? elapsed + " elapsed" : "ran " + elapsed}</span> : null}
+          {idParts.hash ? <span className="mhash">{idParts.hash}</span> : null}
+          {running ? <ProcEl proc={proc} /> : null}
+        </div>
+        <div className="mhead-meter">
+          <MeterEl tot={tot} />
+          <div className="mctl">
+            <button type="button" className="evbtn" title="switch renderer" onClick={() => setViewMode(useTimeline ? "canvas" : "timeline")}>
+              {useTimeline ? "graph" : "list"}
+            </button>
+            {!useTimeline ? (
+              <button type="button" className={`evbtn${minimapOn ? " on" : ""}`} title="toggle minimap" onClick={toggleMinimap}>
+                map
+              </button>
+            ) : null}
+            {/* (#1868 → #2332) The status legend is a help glyph at every
+                width; the inline dot row is gone. A real <button> for
+                Tab/Enter/Space; the visually-hidden label keeps its name. */}
+            <button type="button" className="legbtn" title="status legend" onClick={() => setLegendOpen((v) => !v)}>
+              <HelpGlyph />
+              <span className="mm-sr-only">legend</span>
+            </button>
+          </div>
+        </div>
         {legendOpen ? <div className="legendpop on">{legendDots()}</div> : null}
       </div>
       <div className="body missionlens__body">

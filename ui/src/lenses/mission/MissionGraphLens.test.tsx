@@ -76,6 +76,9 @@ const GRAPH: MissionGraph = {
   ],
   edges: [{ id: "e1", source: "p1", target: "a", kind: "contains" }],
 };
+// (#2332) The host readout is gated to RUNNING missions — a machine fact on a
+// finalized mission is noise — so the readout tests render this twin.
+const RUNNING_GRAPH: MissionGraph = { ...GRAPH, mission_status: "active" };
 
 function mockFetch(
   opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[]; flowMissionTruncated?: boolean } = {},
@@ -364,7 +367,7 @@ describe("MissionGraphLens", () => {
   });
 
   it("(#1483) shows the host-activity readout once a telemetry.process sample lands on the live tail", async () => {
-    mockFetch();
+    mockFetch({ graph: RUNNING_GRAPH });
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     expect(document.querySelector(".mproc")).toBeNull();
@@ -383,12 +386,23 @@ describe("MissionGraphLens", () => {
     // class, matching legacy's own `proc.gpu >= 60 ? "hot" : ""`.
     expect(document.querySelector(".mproc b.hot")?.textContent).toBe("72%");
   });
+  it("(#2332) the host readout is for RUNNING missions only — a finalized mission shows none even with a fresh sample", async () => {
+    mockFetch();
+    const { queryClient } = renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    seedLiveTail(queryClient, [
+      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 41, gpu: 72 } },
+    ]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(document.querySelector(".mproc")).toBeNull();
+    expect(document.querySelector(".mstatus")?.textContent).toBe("finalized");
+  });
 
   it("(#1483) MACHINE-level, not mission-scoped — a telemetry.process sample with no mission_id still shows", async () => {
     // Host telemetry is never stamped with a mission_id (it's a whole-box
     // sample, not per-dispatch) — this proves the readout isn't accidentally
     // filtered through `recordInMission` the way the events pane is.
-    mockFetch();
+    mockFetch({ graph: RUNNING_GRAPH });
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
 
@@ -407,7 +421,7 @@ describe("MissionGraphLens", () => {
   });
 
   it("(#1483) a telemetry.process sample expires after the 12s freshness window, on the next render", async () => {
-    mockFetch();
+    mockFetch({ graph: RUNNING_GRAPH });
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
 
