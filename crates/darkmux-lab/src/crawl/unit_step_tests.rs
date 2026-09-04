@@ -623,6 +623,34 @@ fn a_unit_step_reading_a_plan_wired_to_the_wrong_producer_is_refused() {
     assert!(err.contains(UNIT_OUTCOME_KIND) && err.contains("crawl.plan"), "{err}");
 }
 
+
+/// A `ModelHost` handle onto ONE shared [`MockHost`], so a factory that is
+/// asked for a fresh host per call still records every op in one place.
+struct SharedHost(Arc<std::sync::Mutex<darkmux_gestalt::mock::MockHost>>);
+impl darkmux_gestalt::ModelHost for SharedHost {
+    fn list_resident(&mut self) -> std::result::Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError> {
+        self.0.lock().unwrap().list_resident()
+    }
+    fn list_catalog(&mut self) -> std::result::Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError> {
+        self.0.lock().unwrap().list_catalog()
+    }
+    fn load(
+        &mut self,
+        model_key: &str,
+        identifier: &str,
+        min_ctx: u32,
+        deadline: darkmux_gestalt::Deadline,
+    ) -> std::result::Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+        self.0.lock().unwrap().load(model_key, identifier, min_ctx, deadline)
+    }
+    fn unload(
+        &mut self,
+        target: &darkmux_gestalt::plan::OwnedTarget,
+        deadline: darkmux_gestalt::Deadline,
+    ) -> std::result::Result<(), darkmux_gestalt::HostError> {
+        self.0.lock().unwrap().unload(target, deadline)
+    }
+}
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
 fn the_summary_reads_the_runs_own_plan_files_for_what_was_planned() {
@@ -763,9 +791,15 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
     .collect();
     let tasks_by_id: BTreeMap<String, Task> = tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
 
-    let resident_host = || darkmux_gestalt::mock::MockHost::new().resident("darkmux:m-local", "m-local", 8192, Some(1 << 30));
-    let facts = resident_host().facts(Default::default(), Default::default());
-    let host_factory = || -> Box<dyn darkmux_gestalt::ModelHost> { Box::new(resident_host()) };
+    // ONE mock host behind the factory (the scheduler asks for a fresh host per
+    // call and drops it, so a per-call mock's op log is never inspectable): the
+    // wave must SEE the resident model and must NOT load anything.
+    let shared_host = Arc::new(std::sync::Mutex::new(
+        darkmux_gestalt::mock::MockHost::new().resident("darkmux:m-local", "m-local", 8192, Some(1 << 30)),
+    ));
+    let facts = shared_host.lock().unwrap().facts(Default::default(), Default::default());
+    let host_for_factory = shared_host.clone();
+    let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> { Box::new(SharedHost(host_for_factory.clone())) };
     let est = darkmux_gestalt::FixedEstimator(Default::default());
 
     // One `run_step_graph` call per phase, in order — what
@@ -796,6 +830,19 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
 
     // The scheduler's own shape, asserted rather than assumed: the failed
     // unit's output is its error TEXT, not a `UnitOutcome`.
+    // (#2321) The wave path ran, and it ran on the resident model: the packer
+    // asked the host what is resident and issued no load. Delete the unit
+    // kind's `residency()` and this goes red — the units then queue as remote
+    // jobs and the host is never consulted at all.
+    let ops = shared_host.lock().unwrap().ops.clone();
+    assert!(
+        ops.iter().any(|op| matches!(op, darkmux_gestalt::mock::HostOp::ListResident)),
+        "the scheduler took the wave path (it consulted the host): {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(op, darkmux_gestalt::mock::HostOp::Load { .. })),
+        "the model was already resident, so the wave must not load: {ops:?}"
+    );
     let unit_b = &steps["unit-b-step"];
     assert_eq!(unit_b.status, NodeStatus::Error);
     let text = unit_b.output.as_deref().expect("the scheduler records the error text as the output");

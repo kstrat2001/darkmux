@@ -799,10 +799,14 @@ impl StepKind for CrawlUnitStepKind {
     /// job under `remote_cap` (1 on the launch path), which is how sibling
     /// units of one plan ran strictly one at a time on an already-resident
     /// model — 3× the wall-clock of the same three units wave-packed. The
-    /// dispatch below always runs the `crawler` role on the registry's
-    /// role-aware profile (`profile_name: None`, see `resolve_crawler_seat`),
-    /// so that is the placement declared; a registry that cannot resolve it
-    /// yields `None`, and the dispatch then surfaces the real error itself.
+    /// dispatch below always runs the `crawler` role with no explicit profile
+    /// (`profile_name: None`), which the dispatch resolves as `role_profiles.
+    /// crawler` first, `default_profile` second — and `resolve_local_placement`
+    /// now resolves the very same way (#2329 review), so the wave leases the
+    /// model the dispatch will actually use. A registry that cannot resolve
+    /// yields `None` (one stderr warning per unit) and the units fall back to
+    /// the remote queue; the dispatch then surfaces the real error itself.
+
     fn residency(
         &self,
         step: &Step,
@@ -812,7 +816,6 @@ impl StepKind for CrawlUnitStepKind {
     ) -> Option<darkmux_crew::step_kinds::Placement> {
         darkmux_crew::step_kinds::resolve_local_placement("crawler", None, None, &format!("step:{}", step.id))
     }
-
     fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let cfg = UnitStepConfig::from_step(step)?;
         let mission_id = mission_id_for(task)?;
