@@ -2241,36 +2241,59 @@ fn pr_review_run_from_envelope_synthesizes_confirmed_review_to_stdout() {
 // top-level verb — see `retired_top_level_pr_review_verb_is_unknown` above,
 // that spelling was retired and this is the real one) against the SAME
 // `ReviewEnvelope` the conformance harness's graph run produced and pinned
-// as its own golden (`tests/fixtures/review-conformance/envelope.json` is a
-// copy of `crates/darkmux-lab/tests/golden/review-conformance/envelope.json`
-// — same content, different location, since a CLI integration test needs an
-// on-disk fixture rather than a crate-internal one). Together the two
-// goldens cover both halves of the bespoke `src/mission_launch_review.rs`
+// as its own golden — read directly from
+// `crates/darkmux-lab/tests/golden/review-conformance/envelope.json` (Hole
+// 5, #2336 review: this used to be a byte-copy at
+// `tests/fixtures/review-conformance/envelope.json` with nothing asserting
+// the two stayed in sync; single-sourced now, one file on disk, not two).
+// Together the two goldens (this render golden + the crate's pipeline
+// golden) cover both halves of the bespoke `src/mission_launch_review.rs`
 // launcher #2310 P4 will retire: build+run the graph (pipeline golden) and
 // render the resulting envelope into a postable payload (this golden).
 mod review_conformance {
     use super::*;
     use std::path::PathBuf;
 
+    /// (Hole 5, #2336 review) The CLI-only fixtures (the render golden —
+    /// no crate-side equivalent exists for it).
     fn fixture_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/review-conformance")
     }
 
+    /// (Hole 5, #2336 review) `envelope.json` and `diff.patch` used to be
+    /// byte-copies duplicated under `tests/fixtures/review-conformance/`,
+    /// with nothing asserting the two copies stayed in sync — a hand-edit
+    /// to one drifts from the other silently. Single-sourced now: this
+    /// reads the SAME files `crates/darkmux-lab/tests/review_conformance.rs`
+    /// pins as its own golden/fixture, so there is exactly one envelope and
+    /// one diff on disk, not two that happen to match today.
+    fn crate_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/darkmux-lab/tests/fixtures/review-conformance")
+    }
+
+    fn crate_golden_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/darkmux-lab/tests/golden/review-conformance")
+    }
+
     /// Run the CLI's `from_envelope` synthesis path over the committed
     /// envelope + diff fixtures and return the parsed `{mode, review,
-    /// comment}` stdout payload.
+    /// comment}` stdout payload. (Hole 5, #2336 review) `DARKMUX_HOME`
+    /// scopes to a per-call tempdir — mirrors the 26+ other `cli.rs` tests
+    /// that set it — so a user-tier `~/.darkmux/mission-configs/review.json`
+    /// on the box running this test cannot change what gets rendered.
     fn render_conformance_envelope() -> serde_json::Value {
-        let dir = fixture_dir();
+        let home = TempDir::new().unwrap();
         let output = Command::cargo_bin("darkmux")
             .unwrap()
+            .env("DARKMUX_HOME", home.path())
             .args([
                 "mission",
                 "launch",
                 "review",
                 "--param",
-                &format!("from_envelope={}", dir.join("envelope.json").to_str().unwrap()),
+                &format!("from_envelope={}", crate_golden_dir().join("envelope.json").to_str().unwrap()),
                 "--param",
-                &format!("diff_file={}", dir.join("diff.patch").to_str().unwrap()),
+                &format!("diff_file={}", crate_fixture_dir().join("diff.patch").to_str().unwrap()),
                 "--param",
                 "emit=-",
             ])
@@ -2335,6 +2358,47 @@ mod review_conformance {
         assert_eq!(comments[0]["path"], "src/billing.ts");
         let body = comments[0]["body"].as_str().unwrap();
         assert!(body.contains("numeric-add bug"), "{body}");
+    }
+
+    /// (Hole 5, #2336 review) Positive proof the `DARKMUX_HOME` scoping in
+    /// `render_conformance_envelope` is real containment, not decoration.
+    /// `mission launch review`'s liveness floor
+    /// (`darkmux_types::dispatch_liveness::liveness_dir`) writes a heartbeat
+    /// file straight to `<DARKMUX_HOME>/liveness/<pid>.log` with NO config
+    /// load in between (its own doc: "resolves the darkmux home WITHOUT
+    /// touching config resolution"), and falls back to the real `~/.darkmux`
+    /// when `DARKMUX_HOME` is unset. Asserting the heartbeat file lands
+    /// inside OUR tempdir is the closest this suite can get to red-proving
+    /// the scoping without ever actually letting an unscoped run touch the
+    /// operator's real home (which this harness's own rules forbid) —
+    /// dropping `.env("DARKMUX_HOME", ...)` here would make this assertion
+    /// fail (no `liveness/` dir under the tempdir at all) while silently
+    /// writing the heartbeat to the real `~/.darkmux/liveness/` instead.
+    #[test]
+    fn render_conformance_envelope_confines_its_liveness_heartbeat_to_the_scoped_home() {
+        let home = TempDir::new().unwrap();
+        let output = Command::cargo_bin("darkmux")
+            .unwrap()
+            .env("DARKMUX_HOME", home.path())
+            .args([
+                "mission",
+                "launch",
+                "review",
+                "--param",
+                &format!("from_envelope={}", crate_golden_dir().join("envelope.json").to_str().unwrap()),
+                "--param",
+                &format!("diff_file={}", crate_fixture_dir().join("diff.patch").to_str().unwrap()),
+                "--param",
+                "emit=-",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+        let liveness_dir = home.path().join("liveness");
+        let entries: Vec<_> = fs::read_dir(&liveness_dir)
+            .unwrap_or_else(|e| panic!("expected a liveness heartbeat under the scoped DARKMUX_HOME at {}: {e}", liveness_dir.display()))
+            .collect();
+        assert!(!entries.is_empty(), "the liveness heartbeat file must exist under the scoped home");
     }
 }
 

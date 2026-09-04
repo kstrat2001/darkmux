@@ -1,0 +1,36 @@
+[
+  {
+    "code": "// src/billing.ts (lines 1-4)\nfunction computeTotal(start) {\n  const end = start.plus(30)\n  return end\n}\n\n// src/billing.ts (lines 1-4)\nfunction computeTotal(start) {\n  const end = start.plus(30)\n  return end\n}\n\n",
+    "fact_family": "param-flow",
+    "facts": [
+      "whole function: 1 references to `start`",
+      "call `start.plus(...)`: 1 arg(s)"
+    ],
+    "id": "computeTotal@src/billing.ts",
+    "manifest": [
+      "referenced but not defined in bundle: plus <- unknown"
+    ],
+    "probe_code": "### `src/billing.ts` (lines 1-4)\n```typescript\nfunction computeTotal(start) {\n  const end = start.plus(30)\n  return end\n}\n```"
+  },
+  {
+    "code": "// src/billing.ts (lines 6-9)\nfunction applyDiscount(total, pct) {\n  const rate = pct / 100\n  return total - rate\n}\n\n// src/billing.ts (lines 6-9)\nfunction applyDiscount(total, pct) {\n  const rate = pct / 100\n  return total - rate\n}\n\n",
+    "fact_family": "param-flow",
+    "facts": [
+      "whole function: 1 references to `total`",
+      "whole function: 1 references to `pct`"
+    ],
+    "id": "applyDiscount@src/billing.ts",
+    "manifest": [],
+    "probe_code": "### `src/billing.ts` (lines 6-9)\n```typescript\nfunction applyDiscount(total, pct) {\n  const rate = pct / 100\n  return total - rate\n}\n```"
+  },
+  {
+    "code": "// src/auth.ts (lines 1-5)\nfunction checkAccess(user) {\n  if (user.role = \"admin\") {\n    return true\n  }\n}\n\n// src/auth.ts (lines 1-5)\nfunction checkAccess(user) {\n  if (user.role = \"admin\") {\n    return true\n  }\n}\n\n",
+    "fact_family": "param-flow",
+    "facts": [
+      "whole function: 1 references to `user`"
+    ],
+    "id": "checkAccess@src/auth.ts",
+    "manifest": [],
+    "probe_code": "### `src/auth.ts` (lines 1-5)\n```typescript\nfunction checkAccess(user) {\n  if (user.role = \"admin\") {\n    return true\n  }\n}\n```"
+  }
+]

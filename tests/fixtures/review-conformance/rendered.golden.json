@@ -2,15 +2,15 @@
   "mode": "review",
   "review": {
     "event": "COMMENT",
-    "body": "### 🤖 PR review\n\n**Verdict: flag** · 1 confirmed (1 inline, 0 general)\n\n**Worth a double check** (not merge-blocking):\n- `src/auth.ts` (`if (user.role = \"admin\")`) — worth a second look\n\n---\n<sub>Automated review — on a local model, no cloud API (darkmux:review-conformance-probe-high, darkmux:review-conformance-probe-mid, darkmux:review-conformance-probe-low, darkmux:review-conformance-judge, darkmux:review-conformance-verify) — Advisory, not a merge gate. · [Powered by darkmux](https://darkmux.com)</sub>",
+    "body": "### 🤖 PR review\n\n**Verdict: flag** · 1 confirmed (1 inline, 0 general)\n\n**Worth a double check** (not merge-blocking):\n- `src/auth.ts` (`if (user.role = \"admin\")`) — worth a second look\n\n---\n<sub>Automated review — on a mixed crew (local: darkmux:review-conformance-probe-high, darkmux:review-conformance-probe-mid, darkmux:review-conformance-probe-low, darkmux:review-conformance-judge; hosted cloud endpoint: review-conformance-verify) — Advisory, not a merge gate. · [Powered by darkmux](https://darkmux.com)</sub>",
     "comments": [
       {
         "path": "src/billing.ts",
         "line": 2,
         "side": "RIGHT",
-        "body": "looks like a numeric-add bug\n\nEvidence: the value is treated as a string\n\n✓ verified by darkmux:review-conformance-verify adjudication"
+        "body": "looks like a numeric-add bug\n\nEvidence: the value is treated as a string\n\n✓ verified by review-conformance-verify adjudication\n\nAlso flagged (same location): a real defect: `const end = start.plus(30)`"
       }
     ]
   },
-  "comment": "### 🤖 PR review\n\n**Verdict: flag** · 1 confirmed\n_Inline anchoring was unavailable for this run, so every finding is listed below with its file. This lists every anchored AND unanchored confirmed finding — nothing is dropped for lack of an anchor._\n\n**Confirmed findings:**\n- `src/billing.ts` — looks like a numeric-add bug _Evidence: the value is treated as a string_ (✓ verified by darkmux:review-conformance-verify adjudication)\n\n**Worth a double check** (not merge-blocking):\n- `src/auth.ts` (`if (user.role = \"admin\")`) — worth a second look\n\n---\n<sub>Automated review — on a local model, no cloud API (darkmux:review-conformance-probe-high, darkmux:review-conformance-probe-mid, darkmux:review-conformance-probe-low, darkmux:review-conformance-judge, darkmux:review-conformance-verify) — Advisory, not a merge gate. · [Powered by darkmux](https://darkmux.com)</sub>"
+  "comment": "### 🤖 PR review\n\n**Verdict: flag** · 1 confirmed\n_Inline anchoring was unavailable for this run, so every finding is listed below with its file. This lists every anchored AND unanchored confirmed finding — nothing is dropped for lack of an anchor._\n\n**Confirmed findings:**\n- `src/billing.ts` — looks like a numeric-add bug _Evidence: the value is treated as a string_ (✓ verified by review-conformance-verify adjudication) _Also flagged (same location): a real defect: `const end = start.plus(30)`_\n\n**Worth a double check** (not merge-blocking):\n- `src/auth.ts` (`if (user.role = \"admin\")`) — worth a second look\n\n---\n<sub>Automated review — on a mixed crew (local: darkmux:review-conformance-probe-high, darkmux:review-conformance-probe-mid, darkmux:review-conformance-probe-low, darkmux:review-conformance-judge; hosted cloud endpoint: review-conformance-verify) — Advisory, not a merge gate. · [Powered by darkmux](https://darkmux.com)</sub>"
 }

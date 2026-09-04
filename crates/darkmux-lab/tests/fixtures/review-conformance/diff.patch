@@ -21,3 +21,11 @@ diff --git a/docs/setup.md b/docs/setup.md
  # Setup
 +A new heading appears here
  more docs
+diff --git a/src/config.ts b/src/config.ts
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -1,3 +1,4 @@
+ function loadPort(env) {
++  const port = env.PORT + 1
+   return port
+ }

@@ -1,0 +1,74 @@
+{
+  "review-judge-step": {
+    "concurrency": 1,
+    "endpoint_host": null,
+    "identifier": "darkmux:review-conformance-judge",
+    "max_tokens": 20000,
+    "model": "darkmux:review-conformance-judge",
+    "model_key": "review-conformance-judge",
+    "n_ctx": 32768,
+    "passes": 2,
+    "source": {
+      "kind": "worktree",
+      "path": "/nonexistent-review-conformance-worktree"
+    }
+  },
+  "review-probe-high-step": {
+    "bucket_budget": 500000,
+    "bucket_group": "probe",
+    "identifier": "darkmux:review-conformance-probe-high",
+    "max_tokens": 4000,
+    "model": "darkmux:review-conformance-probe-high",
+    "model_key": "review-conformance-probe-high",
+    "n_ctx": 65536,
+    "retry_on_empty": 1,
+    "retry_on_error": 1,
+    "system": "",
+    "temperature": 0.20000000298023224,
+    "timeout_seconds": 30,
+    "user_template": "{item}"
+  },
+  "review-probe-low-step": {
+    "bucket_budget": 500000,
+    "bucket_group": "probe",
+    "identifier": "darkmux:review-conformance-probe-low",
+    "max_tokens": 4000,
+    "model": "darkmux:review-conformance-probe-low",
+    "model_key": "review-conformance-probe-low",
+    "n_ctx": 8192,
+    "retry_on_empty": 1,
+    "retry_on_error": 1,
+    "system": "",
+    "temperature": 0.20000000298023224,
+    "timeout_seconds": 30,
+    "user_template": "{item}"
+  },
+  "review-probe-mid-step": {
+    "bucket_budget": 500000,
+    "bucket_group": "probe",
+    "identifier": "darkmux:review-conformance-probe-mid",
+    "max_tokens": 4000,
+    "model": "darkmux:review-conformance-probe-mid",
+    "model_key": "review-conformance-probe-mid",
+    "n_ctx": 24576,
+    "retry_on_empty": 1,
+    "retry_on_error": 1,
+    "system": "",
+    "temperature": 0.20000000298023224,
+    "timeout_seconds": 30,
+    "user_template": "{item}"
+  },
+  "review-verify-step": {
+    "bucket_budget": 500000,
+    "identifier": "darkmux:review-conformance-verify",
+    "max_tokens": 20000,
+    "model": "darkmux:review-conformance-verify",
+    "model_key": "review-conformance-verify",
+    "n_ctx": 16384,
+    "retry_on_empty": 1,
+    "system": "You are the review-conformance VERIFY seat.",
+    "temperature": 0.20000000298023224,
+    "timeout_seconds": 30,
+    "user_template": "{item}"
+  }
+}
