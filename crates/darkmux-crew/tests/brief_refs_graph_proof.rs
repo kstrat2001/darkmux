@@ -291,3 +291,52 @@ fn a_step_config_naming_a_missing_record_fails_the_step_before_any_container_wor
         );
     }
 }
+
+/// A step minted from a mission config carries its phase on the TASK, not in
+/// its own config. The generic dispatch kind must stamp that phase on the
+/// dispatch it issues, or the run's records never join the mission: no drill
+/// link from the mission view, "Events · 0" in the sheet, no token
+/// attribution (operator screenshot 2026-09-04, the grown follow-on steps).
+#[test]
+#[serial_test::serial] // env-scoped flows dir, like its neighbors
+fn a_step_whose_task_names_the_phase_stamps_it_on_the_dispatch_record() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST);
+        then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
+            "id": "mock-2", "object": "chat.completion", "created": 0, "model": "stub-model",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10 },
+        }));
+    });
+    let registry = tempfile::tempdir().unwrap();
+    let flows = tempfile::tempdir().unwrap();
+    let profiles = write_endpoint_profiles(registry.path(), &server.base_url());
+    let _env = EnvGuard::set(&[("DARKMUX_FLOWS_DIR", flows.path())]);
+    let session_id = format!("phase-stamp-graph-{}", std::process::id());
+    let step = step_with(serde_json::json!({
+        "role_id": "review-judge",
+        "message": "phase stamp",
+        "session_id": session_id,
+        "skip_preflight": true,
+        "json": false,
+        "profile_name": "stub",
+        "config_path": profiles.to_string_lossy(),
+    }));
+    // No `phase_id` in the step config: the task is the only source.
+    DispatchInternalStepKind.run(&step, &empty_task(), &BTreeMap::new()).expect("runs against the mock");
+    mock.assert();
+    let mut start: Option<Value> = None;
+    let mut seen: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(flows.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            let Ok(rec) = serde_json::from_str::<Value>(line) else { continue };
+            seen.push(format!("{} {} phase={}", rec["action"], rec["session_id"], rec["phase_id"]));
+            if rec["action"] == "dispatch start" && rec["session_id"] == session_id.as_str() { start = Some(rec); }
+        }
+    }
+    let start = start.unwrap_or_else(|| panic!("a `dispatch start` flow record for this step; saw: {seen:?}"));
+    assert_eq!(start["phase_id"], "phase-graph", "the task's phase must ride the dispatch record: {start}");
+}
