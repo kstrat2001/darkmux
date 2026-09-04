@@ -2240,16 +2240,30 @@ fn run_summary_payload(
 /// [`run_summary_payload`] does (the bespoke launcher's `dispatch_worker`
 /// thread boundary drops `tasks`/`steps` after persisting them, keeping
 /// only the finished `ReviewEnvelope` — see that call site's own comment);
-/// it calls this SAME unwrap on `serde_json::to_value(&env)` instead. That is
-/// provably the identical value `run_summary_payload` would derive by
-/// walking the graph: `review.json`'s `outcome_from: "review-synthesis-task"`
-/// names the task whose only step wraps EXACTLY `env` as its `Output` body
-/// (`ReviewSynthesisStepKind::run_streaming`'s `Output::wrap(REVIEW_ENVELOPE_OUTPUT_KIND,
-/// env, producer)`), so unwrapping that persisted step's output through
-/// this same function yields the identical JSON `env` already round-trips
-/// to. Reusing the function, rather than hand-rolling a second unwrap, is
-/// what keeps the two launchers from silently drifting apart on this rule
-/// (#2310 P3's own review gate: "one function, not a copy").
+/// it calls this SAME unwrap on `serde_json::to_value(&env)` instead.
+///
+/// (#2345 I1) **Provably identical ONLY on a CLEAN run** — the case above
+/// actually describes: when `review-synthesis-task` reaches
+/// `NodeStatus::Complete`, its only step wraps EXACTLY `env` as its
+/// `Output` body (`ReviewSynthesisStepKind::run_streaming`'s
+/// `Output::wrap(REVIEW_ENVELOPE_OUTPUT_KIND, env, producer)`), so
+/// unwrapping that persisted step's output through this same function
+/// yields the identical JSON `env` already round-trips to. **The two
+/// launchers DIVERGE on an ERRORED run**, where `review-synthesis-task`
+/// never completes: `run_summary_payload`'s own `step.status !=
+/// NodeStatus::Complete` gate (a few lines up) makes it promote `None` —
+/// the generic launcher's honest "nothing to promote" for a task that
+/// never finished. The bespoke `finalize_review_mission` has no such gate:
+/// it always promotes whatever `Result<ReviewEnvelope>` it was handed,
+/// which on an errored run is the FALLBACK envelope `run_review_graph`
+/// built from whichever typed step outputs completed before the failure
+/// (see that function's own `fallback_env`/`fold_review_outputs_into_
+/// envelope` doc) — a real, useful payload, but not literally
+/// `review-synthesis-task`'s own output, since that task never ran. So
+/// "reusing the function keeps the two launchers from drifting" is true
+/// for the UNWRAP RULE (#2310 P3's own review gate: "one function, not a
+/// copy"); it does not mean the two launchers promote the same VALUE on
+/// every run outcome.
 pub(crate) fn promoted_step_body(value: serde_json::Value) -> Option<serde_json::Value> {
     match value {
         serde_json::Value::Object(mut o) => match (o.contains_key("kind"), o.remove("body")) {

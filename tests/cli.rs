@@ -2610,6 +2610,209 @@ fn pr_review_run_no_profile_binding_or_default_errors_loudly() {
         .stderr(predicate::str::contains("default_profile"));
 }
 
+/// (#2345 C1) `review-report-step`'s task `depends_on: ["review-synthesis-
+/// task"]` — an upstream step erroring leaves it `NodeStatus::Planned`
+/// forever, so before this fix an errored graph run rendered nothing at
+/// all: exit 0, empty stdout. Forces a hermetic, no-network step error via
+/// a `--bundler` pointed at a nonexistent executable — `review-bundle-
+/// step`'s own `run_streaming` propagates that spawn failure as a genuine
+/// `NodeStatus::Error`, which blocks every downstream task (probe/dedup/
+/// judge/verify/synthesis/report) from ever reaching `Complete` — no real
+/// LMStudio/Docker/network needed, matching this suite's hermeticity rules
+/// (the graph never gets far enough to dispatch a single model call).
+#[test]
+fn pr_review_run_errored_graph_still_emits_a_degraded_payload() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let profiles = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles,
+        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        // Isolate the config root — same hermeticity discipline as every
+        // other graph-path test in this file.
+        .env("DARKMUX_HOME", tmp.path())
+        .args([
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("worktree={}", tmp.path().to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("profiles={}", profiles.to_str().unwrap()),
+            "--param",
+            "bundler=/definitely/not/a/real/darkmux-bundler-xyz",
+            "--param",
+            "emit=-",
+        ])
+        .output()
+        .unwrap();
+
+    // (#2345 C1) `run_dispatch` never turns a step-level error into a hard
+    // process `Err` — the exit code stays 0 on any produced review output,
+    // matching `mission_launch_review::launch`'s own documented contract.
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("stdout was not JSON — the errored graph run rendered nothing ({e}): {stdout}")
+    });
+    assert_eq!(v["mode"], "degraded", "an errored graph run must still render as degraded, not silence");
+}
+
+/// (#1311, restored #2345 I2) The GRAPH path's own `synthesis`/`done`
+/// liveness markers, dropped when #2310 P3 moved the render itself into
+/// `review-report-step` without carrying the bracket along — the
+/// `from_envelope` path (`pr_review_run_emits_liveness_floor_markers_in_order`)
+/// never lost them, since it renders inline in the launcher and always
+/// has. Reuses the same hermetic errored-graph fixture as the C1 test
+/// above (the fallback path is exactly where these markers were missing).
+#[test]
+fn pr_review_run_errored_graph_still_emits_synthesis_and_done_liveness_markers() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let profiles = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles,
+        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args([
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("worktree={}", tmp.path().to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("profiles={}", profiles.to_str().unwrap()),
+            "--param",
+            "bundler=/definitely/not/a/real/darkmux-bundler-xyz",
+            "--param",
+            "emit=-",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_in_order(&stderr, &["process-start", "synthesis", "done"], "stderr");
+
+    let liveness_dir = tmp.path().join("liveness");
+    let mut logs: Vec<_> = fs::read_dir(&liveness_dir)
+        .expect("liveness dir should exist")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .collect();
+    assert_eq!(logs.len(), 1, "expected one heartbeat file, got {logs:?}");
+    let file_body = fs::read_to_string(logs.pop().unwrap()).unwrap();
+    assert_in_order(&file_body, &["process-start", "synthesis", "done"], "heartbeat file");
+}
+
+/// (#2345 I3) `run_dispatch` used to REPLACE `review-report-step`'s whole
+/// `config` with only the launch's own `emit`/`envelope_out`/`attribution`
+/// — silently discarding whatever the document itself already declared
+/// there (a user-tier config may pin a fixed `attribution`). It now MERGES,
+/// launcher values winning only for keys the launch actually supplied.
+/// Proven with a launch that passes NO `--param attribution=` of its own:
+/// the document's own stamped attribution must still appear in the
+/// rendered footer. An empty diff + empty worktree (no `--param bundler`)
+/// exercises the WHOLE graph — bundle -> probe -> dedup -> judge -> verify
+/// -> synthesis -> report — hermetically: the built-in bundler yields zero
+/// bundles for an empty diff, so every downstream stage completes
+/// trivially with zero model calls, and `review-report-step` itself runs
+/// and renders (unlike the C1/I2 tests above, which force an upstream
+/// ERROR so the step never runs at all — exactly the case this test needs
+/// to AVOID, since the step's own config merge is what's under test).
+#[test]
+fn pr_review_run_document_stamped_attribution_survives_the_launcher_merge() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("empty.diff");
+    fs::write(&diff_path, "").unwrap();
+    let profiles = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles,
+        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
+    )
+    .unwrap();
+
+    let builtin_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates/builtin/mission-configs/review.json");
+    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&builtin_path).unwrap()).unwrap();
+    doc["id"] = serde_json::json!("review-attrib-test");
+    let report_phase = doc["phases"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["id"] == "report")
+        .expect("review.json declares a report phase");
+    let report_task = report_phase["tasks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|t| t["id"] == "review-report-task")
+        .expect("review.json declares review-report-task");
+    let report_step = report_task["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == "review-report-step")
+        .expect("review.json declares review-report-step");
+    report_step["config"] = serde_json::json!({ "attribution": "custom-doc-attribution-marker" });
+
+    let config_dir = tmp.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("review-attrib-test.json"), serde_json::to_string(&doc).unwrap()).unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args([
+            "mission",
+            "launch",
+            "review-attrib-test",
+            "--param",
+            &format!("worktree={}", tmp.path().to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("profiles={}", profiles.to_str().unwrap()),
+            "--param",
+            "emit=-",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("custom-doc-attribution-marker"),
+        "the document's own stamped attribution must survive the launcher's config merge: {stdout}"
+    );
+}
+
 // ─── #2124: SIGTERM mid-probe leaves a terminal record + no orphaned curl ──
 
 /// A tiny local server that ACCEPTS every connection and never responds —
@@ -3133,6 +3336,53 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
         saw_a_phase = true;
     }
     assert!(saw_a_phase, "the mint must have produced at least one phase to check");
+}
+
+/// (#2345 C2) `outcome_from` names the task whose last step's output the
+/// launcher promotes as the `mission close` record's payload. Before this
+/// fix, a typo'd `outcome_from` was refused only AFTER the whole run — the
+/// close-time check in `run_summary_payload` — so a config-authoring
+/// mistake on a long-running mission surfaced only once every step had
+/// already dispatched. `MissionConfig::validate` now catches it
+/// statically, and `mission_launch::launch` runs `validate` (and `bail!`s
+/// on any `Error` finding) BEFORE minting a mission at all — so a bad
+/// `outcome_from` must fail loud with NO `missions/` entry ever created.
+/// `procedural.noop` needs no model/network/Docker — purely hermetic.
+#[test]
+fn mission_launch_outcome_from_unknown_task_refused_before_minting() {
+    let home = TempDir::new().unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "outcome-from-typo-test",
+        "name": "Outcome From Typo Test",
+        "schema_version": "3.3",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{ "id": "s1", "kind": "procedural.noop" }]
+            }]
+        }],
+        "outcome_from": "no-such-task"
+    }"#;
+    fs::write(config_dir.join("outcome-from-typo-test.json"), config_json).unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .args(["mission", "launch", "outcome-from-typo-test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("outcome_from"))
+        .stderr(predicate::str::contains("no-such-task"));
+
+    let missions_dir = home.path().join("missions");
+    assert!(
+        !missions_dir.is_dir() || fs::read_dir(&missions_dir).unwrap().next().is_none(),
+        "a refused outcome_from must never mint a mission — no missions/ entry may exist"
+    );
 }
 
 // ─── review-bench --funnel flag plumbing (#1222 Phase B packet 7) ─────────

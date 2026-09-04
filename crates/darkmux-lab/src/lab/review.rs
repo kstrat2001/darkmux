@@ -7259,6 +7259,41 @@ fn diff_text_from_input(
 /// launch-time inputs.
 pub struct ReviewReportStepKind;
 
+/// The write-`envelope_out` + [`review_render::synthesize_review`] +
+/// [`review_render::emit_rendered`] sequence [`ReviewReportStepKind::run`]
+/// performs for a normal run — factored out so a caller that never reaches
+/// that step at all can still produce the SAME rendered output through the
+/// SAME two calls, rather than a second, drifting copy.
+///
+/// (#2345 C1) `review-report-step`'s task `depends_on: ["review-synthesis-
+/// task"]` — when an earlier step (the judge, say) errors, the scheduler
+/// never runs the report step at all: it stays `NodeStatus::Planned`
+/// forever, and nothing renders. `run_review_graph` still returns a
+/// self-describing (if degenerate) envelope on that path (see its own
+/// `else` branch), so `src/mission_launch_review.rs::run_dispatch` calls
+/// THIS function on that envelope when `review-report-step` did not
+/// complete — the errored run gets rendered exactly like a clean one
+/// (#1486: blocked work must be as reasoned as running work), instead of
+/// silently producing no output.
+///
+/// Returns the rendered payload's `mode` (`"review"` | `"comment"` |
+/// `"partial"` | `"degraded"` | `"noop"`) for the caller's own logging.
+pub fn render_and_emit_review(
+    env: &ReviewEnvelope,
+    diff: &str,
+    attribution: Option<&str>,
+    emit_path: Option<&Path>,
+    envelope_out_path: Option<&Path>,
+) -> Result<&'static str> {
+    if let Some(path) = envelope_out_path {
+        let pretty = serde_json::to_string_pretty(env).context("serializing the review envelope")?;
+        std::fs::write(path, pretty).with_context(|| format!("writing envelope_out {}", path.display()))?;
+    }
+    let rendered = review_render::synthesize_review(env, diff, attribution);
+    review_render::emit_rendered(&rendered, emit_path)?;
+    Ok(rendered.mode)
+}
+
 impl StepKind for ReviewReportStepKind {
     fn id(&self) -> &'static str {
         "review.report"
@@ -7284,20 +7319,14 @@ impl StepKind for ReviewReportStepKind {
         let emit_path = step.config.get("emit").and_then(|v| v.as_str()).map(PathBuf::from);
         let envelope_out_path = step.config.get("envelope_out").and_then(|v| v.as_str()).map(PathBuf::from);
 
-        if let Some(path) = &envelope_out_path {
-            let pretty = serde_json::to_string_pretty(&env).context("serializing the review envelope")?;
-            std::fs::write(path, pretty)
-                .with_context(|| format!("writing envelope_out {}", path.display()))?;
-        }
-
-        let rendered = review_render::synthesize_review(&env, &diff, attribution);
-        // (#2310 P3) `emit_rendered`'s own return is a process EXIT CODE
-        // (always `Ok(0)` on a successful write — see that function's own
-        // doc), never load-bearing data; this step's own output is the
-        // destination the payload was written to, so a mission-status
-        // reader can see where the rendered comment landed without
-        // re-reading `step.config`.
-        review_render::emit_rendered(&rendered, emit_path.as_deref())?;
+        // (#2345 C1) The write-envelope_out + synthesize + emit sequence now
+        // lives in `render_and_emit_review`, above — this step's own output
+        // is still the destination the payload was written to, so a
+        // mission-status reader can see where the rendered comment landed
+        // without re-reading `step.config`; `emit_rendered`'s own return
+        // (folded into the helper) is a process EXIT CODE, never
+        // load-bearing data.
+        let mode = render_and_emit_review(&env, &diff, attribution, emit_path.as_deref(), envelope_out_path.as_deref())?;
         let dest = emit_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".to_string());
 
         emit_review_step_result(
@@ -7305,7 +7334,7 @@ impl StepKind for ReviewReportStepKind {
             &step.id,
             &env.case_id,
             None,
-            json!({ "mode": rendered.mode, "emit": dest }),
+            json!({ "mode": mode, "emit": dest }),
         );
         Ok(StepOutcome { output: dest, flow_records: Vec::new() })
     }

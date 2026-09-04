@@ -65,7 +65,7 @@
 //! failing to resolve — nothing to show at all.
 
 use crate::cli;
-use crate::crew::mission_config::{self, LoadedMissionConfig, MissionConfig};
+use crate::crew::mission_config::{self, FindingSeverity, LoadedMissionConfig, MissionConfig};
 use crate::crew::step_kinds::StepKindRegistry;
 use anyhow::{anyhow, Context, Result};
 use darkmux_gestalt::{decide_residency, namespaced_identifier, Placement, ResidencyDecision, ResidentFact};
@@ -878,13 +878,29 @@ fn show(id: &str, params: &[String], profiles_file: Option<&str>, json: bool) ->
     })?;
 
     let raw_overrides = parse_role_overrides(params)?;
-    let (overrides, warnings) = effective_overrides_and_warnings(&loaded.config, raw_overrides);
+    let (overrides, mut warnings) = effective_overrides_and_warnings(&loaded.config, raw_overrides);
     let bindings = move |role: &str| -> RoleBinding {
         binding_for(role, &overrides, darkmux_types::config_access::role_profile(role))
     };
 
     let registry = crate::mission_launch::all_step_kinds()
         .context("building the step-kind registry")?;
+
+    // (#2345 C2) Semantic validation, surfaced here too — same call
+    // `mission launch` refuses a config on (`config.validate`), so a
+    // config-authoring mistake (e.g. an `outcome_from` naming an unknown
+    // task, or a `grow` template) is visible via `mission config show`
+    // BEFORE anyone runs `mission launch` and hits the refusal — never a
+    // second, drifting check. Only `Error`-severity findings: this show
+    // command's existing `warnings` bucket is for launch-time actionable
+    // items, and validate's own `Warning`-severity findings (schema-version
+    // drift, an unrecognized step kind) are routine noise this command
+    // doesn't otherwise surface — an `Error` finding is not.
+    let known_kind_ids = registry.ids();
+    let known_kinds: Vec<&str> = known_kind_ids.iter().map(String::as_str).collect();
+    for f in loaded.config.validate(&known_kinds).into_iter().filter(|f| f.severity == FindingSeverity::Error) {
+        warnings.push(format!("config validation: {f}"));
+    }
 
     // (merge-gate CONSIDER 7) Mirrors `machine status`'s own rule
     // (src/main.rs, `cmd_machine_status`): an EXPLICIT `--profiles-file`

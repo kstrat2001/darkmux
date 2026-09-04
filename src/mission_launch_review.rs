@@ -96,9 +96,10 @@ use darkmux_crew::single_shot::{
 };
 use darkmux_lab::lab::bundle::{build_bundles, external_bundles, FileSource};
 use darkmux_lab::lab::review::{
-    build_review_graph_from_config, bundle_inputs_from_set, fingerprint, review_mission_outcome, run_judge_only,
-    run_review_graph, seat_identifier, staffing_snapshot, BundleBuildSpec, BundleInput, BundleSourceSpec, ChatCall,
-    ExecMode, LmsCycler, ProbeFlag, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
+    build_review_graph_from_config, bundle_inputs_from_set, fingerprint, render_and_emit_review,
+    review_mission_outcome, run_judge_only, run_review_graph, seat_identifier, staffing_snapshot, BundleBuildSpec,
+    BundleInput, BundleSourceSpec, ChatCall, ExecMode, LmsCycler, ProbeFlag, ReviewEmitter, ReviewEnvelope,
+    ReviewInputs, ReviewStepContext,
 };
 use darkmux_crew::resourcing::{resolve_review_roles, ResolvedReviewRoles, ResolvedSeatStaffing, ReviewRoleStaffing};
 // (#1959) The review's optional `workspace` input.
@@ -724,6 +725,21 @@ fn review_result_to_mission_envelope(
 /// identical value for `review.json`'s `outcome_from: "review-synthesis-task"`.
 /// `Err(e)` (a hard failure before any envelope was produced) promotes
 /// nothing, same as before.
+///
+/// (#2345 C2) This bespoke path does NOT read `config.outcome_from` at
+/// all — it always promotes the envelope, which is only provably identical
+/// to what `outcome_from` would select when the launched document names
+/// `"review-synthesis-task"` (the shipped `review.json`'s own value). A
+/// user-tier review variant that points `outcome_from` at some OTHER real
+/// task is silently ignored here: this function still promotes the
+/// envelope, not that task's own output. `MissionConfig::validate` (#2345
+/// C2) still catches a genuinely BROKEN `outcome_from` (an unknown id, or a
+/// `grow` template) before this launcher ever mints a mission — what it
+/// can't catch is "valid but different from what this bespoke path
+/// hardcodes." Deliberately not plumbed through: this whole launcher is
+/// retired in P4 (folded into the generic `run_summary_payload` path, which
+/// DOES honor `outcome_from` per-document), so `outcome_from` is honestly
+/// honored by the generic path only until then.
 pub(crate) fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result<ReviewEnvelope>) {
     let envelope = review_result_to_mission_envelope(mission_id, phase_ids, result);
     let close_payload = result
@@ -1421,17 +1437,46 @@ fn run_dispatch(
         // silent no-op, matching that document's own pre-P3 behavior
         // (nothing rendered by the graph; `launch`'s own `from_envelope`
         // tail is the only render path such a document has).
+        //
+        // (#2345 C1) Captured as owned locals, not read straight off
+        // `collected` inline, because the errored-run FALLBACK below
+        // (`render_and_emit_review`) needs the same three values inside the
+        // `move` dispatch-worker closure a few hundred lines down — and
+        // `collected` is a borrow this function doesn't own, so it can't
+        // cross into a `'static` thread closure.
+        let launch_emit_path = path_input(collected, "emit");
+        let launch_envelope_out_path = path_input(collected, "envelope_out");
+        let launch_attribution = str_input(collected, "attribution").map(str::to_string);
+        // (#2345 I3) The attribution the fallback render below must use is
+        // the EFFECTIVE one after the merge — launch value if supplied, else
+        // whatever the document stamped on the report step — so the fallback
+        // and the step render the same attribution.
+        let mut effective_attribution = launch_attribution.clone();
         if let Some(report_step) = graph.steps.get_mut("review-report-step") {
-            let mut cfg = serde_json::Map::new();
-            if let Some(p) = path_input(collected, "emit") {
+            // (#2345 I3) MERGE into whatever `report_step.config` already
+            // carries — the shipped `review.json` stamps `null` here, but a
+            // user-tier document is free to declare its own fixed
+            // `attribution` (or any other field a future consumer reads)
+            // directly on the task. This used to REPLACE the whole config
+            // wholesale, so a config-declared `attribution` was silently
+            // discarded on every launch that didn't pass `--param
+            // attribution=...` of its own. Launcher values win only for the
+            // keys the launch actually supplied; every other key the
+            // document already set survives untouched.
+            let mut cfg = match std::mem::take(&mut report_step.config) {
+                serde_json::Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            };
+            if let Some(p) = &launch_emit_path {
                 cfg.insert("emit".to_string(), serde_json::json!(p.display().to_string()));
             }
-            if let Some(p) = path_input(collected, "envelope_out") {
+            if let Some(p) = &launch_envelope_out_path {
                 cfg.insert("envelope_out".to_string(), serde_json::json!(p.display().to_string()));
             }
-            if let Some(a) = str_input(collected, "attribution") {
+            if let Some(a) = &launch_attribution {
                 cfg.insert("attribution".to_string(), serde_json::json!(a));
             }
+            effective_attribution = cfg.get("attribution").and_then(|v| v.as_str()).map(str::to_string);
             report_step.config = serde_json::Value::Object(cfg);
         }
 
@@ -1655,6 +1700,50 @@ fn run_dispatch(
                                 );
                             }
                         }
+                        // (#1311, restored #2345 I2) Dispatch is done; the
+                        // model work is behind us. `synthesis` then `done`
+                        // bracket the pure-CPU render so a wedge in the
+                        // (local) synthesis code is still visible — the
+                        // SAME liveness pair the `from_envelope` path still
+                        // emits around its own render call. #2310 P3 moved
+                        // the render itself into `review-report-step` (so
+                        // there is nothing left to bracket on the ORDINARY
+                        // path) without carrying the markers along; restored
+                        // here so they fire whether the step rendered it or
+                        // the fallback below did.
+                        liveness("synthesis");
+                        // (#2345 C1) `review-report-step`'s task
+                        // `depends_on: ["review-synthesis-task"]` — an
+                        // upstream step erroring (the judge, say) leaves it
+                        // `Planned` forever, and nothing renders. The run's
+                        // envelope must ALWAYS get rendered (#1486: blocked
+                        // work must be as reasoned as running work), so this
+                        // is the fallback for exactly that case, through the
+                        // SAME helper the step itself calls
+                        // (`render_and_emit_review`) — never a second,
+                        // drifting render. A no-op on the ordinary path,
+                        // where the step already did this.
+                        let report_ran = steps
+                            .get("review-report-step")
+                            .is_some_and(|s| s.status == crew::types::NodeStatus::Complete);
+                        if !report_ran {
+                            if let Err(e) = render_and_emit_review(
+                                &env,
+                                &ctx.diff,
+                                effective_attribution.as_deref(),
+                                launch_emit_path.as_deref(),
+                                launch_envelope_out_path.as_deref(),
+                            ) {
+                                eprintln!(
+                                    "{}",
+                                    style::error(&format!(
+                                        "✗ review: fallback render/emit failed (review-report-step \
+                                         never ran): {e:#}"
+                                    ))
+                                );
+                            }
+                        }
+                        liveness("done");
                         env
                     })
                 },

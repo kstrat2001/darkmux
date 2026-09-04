@@ -46,9 +46,9 @@
 use anyhow::Result;
 use darkmux_crew::resourcing::{ResolvedReviewRoles, ResolvedSeatStaffing};
 use darkmux_lab::lab::review::{
-    build_review_graph, fingerprint, run_review_graph, seat_identifier, staffing_snapshot, BundleBuildSpec,
-    BundleInput, BundleSourceSpec, ChatCall, ExecMode, NullEmitter, ReviewContextStepKind, ReviewContextTestOverrides,
-    ReviewStepContext,
+    build_review_graph, fingerprint, render_and_emit_review, run_review_graph, seat_identifier, staffing_snapshot,
+    BundleBuildSpec, BundleInput, BundleSourceSpec, ChatCall, ExecMode, NullEmitter, ReviewContextStepKind,
+    ReviewContextTestOverrides, ReviewStepContext,
 };
 use darkmux_crew::single_shot::SingleShotReply;
 use darkmux_crew::step_kinds::StepKind as _;
@@ -551,6 +551,28 @@ fn dummy_bundle_spec() -> BundleBuildSpec {
     }
 }
 
+/// (#2345 minor) `review-report-step`'s config stays `null` (unstamped) in
+/// every hermetic harness fixture in this file — a real `mission launch
+/// review` always stamps `emit` (`src/mission_launch_review.rs::run_
+/// dispatch`), but this harness never mints a launch, so nothing stamps it
+/// here. `null` config means `emit_path: None`, which `emit_rendered`'s own
+/// contract reads as "write to stdout" — so any scenario whose graph
+/// reaches a COMPLETED `review-report-step` (the two golden-comparison
+/// scenarios and the real-bundler scenario; the errored scenario's report
+/// step never runs at all) prints the whole rendered `{mode, review,
+/// comment}` payload to the TEST process's own stdout on every `cargo
+/// test` run. Call this right alongside the `context_out` stamp each of
+/// those scenarios already applies, so the report step's rendered output
+/// goes to a tempdir file instead — same "give it a real destination"
+/// discipline, one more step.
+fn stamp_report_emit(graph: &mut darkmux_lab::lab::review::BuiltReviewGraph, home: &Path) {
+    if let Some(report_step) = graph.steps.get_mut("review-report-step") {
+        report_step.config = serde_json::json!({
+            "emit": home.join("rendered-report.json").display().to_string()
+        });
+    }
+}
+
 // ─── Hole 4 (#2336 review): the bundle step's real path is out of the net ──
 //
 // Every OTHER test in this file sets `bundle_override: Some(...)`, which
@@ -731,6 +753,7 @@ fn review_bundle_step_runs_the_real_bundler_over_a_worktree() {
         // step-config key.
         context_step.config = cfg;
     }
+    stamp_report_emit(&mut graph, home.path());
 
     let (env, steps) = run_review_graph(
         &ctx,
@@ -930,6 +953,7 @@ fn review_pipeline_matches_the_committed_golden() {
         // step-config key.
         context_step.config = cfg;
     }
+    stamp_report_emit(&mut graph, home.path());
 
     let (env, steps) = run_review_graph(
         &ctx,
@@ -1309,6 +1333,7 @@ fn review_pipeline_warned_scenario_matches_the_committed_golden() {
     graph.interpret_warnings.push(
         "review-conformance: synthetic interpret-time warning (#2310 P3 harness)".to_string(),
     );
+    stamp_report_emit(&mut graph, home.path());
 
     let (env, steps) = run_review_graph(
         &ctx,
@@ -1589,6 +1614,78 @@ fn review_pipeline_errored_scenario_matches_the_committed_golden() {
          --test review_conformance, then review the diff before committing.",
         errored_golden_path().display()
     );
+}
+
+/// (#2345 C1) `review-report-step`'s task `depends_on: ["review-synthesis-
+/// task"]` — the judge step erroring above (same scenario as
+/// `review_pipeline_errored_scenario_matches_the_committed_golden`) means
+/// the report step never runs at all; it stays `NodeStatus::Planned`
+/// forever. `run_review_graph` still hands back a self-describing
+/// (degenerate) envelope on that path — this test proves
+/// `render_and_emit_review` (the SAME helper `review-report-step` itself
+/// calls to render + emit) can still turn that envelope into the
+/// operator-facing `{mode, review, comment}` payload, which is exactly what
+/// the launcher's own fallback (`src/mission_launch_review.rs::run_dispatch`,
+/// #2345 C1) calls when the step never completed. Before #2345 C1 this
+/// function did not exist — an errored run rendered nothing at all.
+#[test]
+#[serial_test::serial]
+fn errored_scenario_report_step_never_ran_but_the_shared_render_helper_still_renders_it() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let _guard = HomeGuard::set(home.path());
+
+    let ctx = errored_step_ctx();
+    let judge = ctx.roles.judge.clone();
+    let verify = ctx.roles.verify.clone();
+    let probes = ctx.roles.probes.clone();
+
+    let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+    let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+    let crew_name = ctx.roles.distinct_profile_names();
+
+    let graph = build_review_graph(
+        ctx.clone(),
+        &dummy_bundle_spec(),
+        judge,
+        verify,
+        &probes,
+        "investigate",
+        "adjudicate",
+        "report",
+        1,
+    )
+    .expect("the shipped review.json builds cleanly");
+
+    let (env, steps) = run_review_graph(
+        &ctx,
+        &crew_name,
+        ExecMode::Sequential,
+        fingerprint_val,
+        staffing_snap,
+        graph,
+        &mut NullEmitter,
+        &mut |_step| {},
+    )
+    .expect("run_review_graph itself must still return Ok — a step ERROR is not a hard Err out of this call");
+
+    let report_step = steps.get("review-report-step").expect("review.json declares review-report-step");
+    assert_eq!(
+        report_step.status,
+        darkmux_crew::types::NodeStatus::Planned,
+        "the report task's unmet depends_on (the errored judge task) must leave it Planned, never run \
+         — this is the precondition #2345 C1's fallback exists for"
+    );
+    assert!(env.degenerate.is_some(), "sanity: this is the same errored scenario as the golden test above");
+
+    let emit_path = home.path().join("rendered.json");
+    let mode = render_and_emit_review(&env, &ctx.diff, None, Some(&emit_path), None)
+        .expect("render_and_emit_review must be able to render + emit an errored run's envelope");
+    assert_eq!(mode, "degraded", "a degenerate run with zero judged flags renders as degraded");
+
+    let written =
+        std::fs::read_to_string(&emit_path).expect("render_and_emit_review must have written to emit_path");
+    let payload: serde_json::Value = serde_json::from_str(&written).expect("emitted payload must be valid JSON");
+    assert_eq!(payload["mode"], "degraded", "the emitted payload's own mode field must agree");
 }
 
 // ─── #2310 P1: `review.context` step kind, standalone ─────────────────────

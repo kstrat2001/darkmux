@@ -1121,6 +1121,42 @@ impl MissionConfig {
             }
         }
 
+        // (#2345 C2) `outcome_from` names the task whose last step's output
+        // the launcher promotes as the `mission close` record's payload
+        // (see its own field doc). A typo here used to be refused only
+        // AFTER the whole run (`src/mission_launch.rs::run_summary_
+        // payload`'s close-time check) — for a long-running mission (a
+        // crawl, a review) that means every step dispatches, every token
+        // spends, hours pass, before the config-authoring mistake ever
+        // surfaces, landing as an abandoned phase and a null payload.
+        // Refused HERE instead, at validate time, before a single step
+        // ever runs — the close-time check stays in place as the backstop
+        // for whatever reaches it without going through `validate` first
+        // (a hand-edited document swapped in after launch, say).
+        if let Some(outcome_from) = &self.outcome_from {
+            if !all_task_ids.contains(outcome_from.as_str()) {
+                findings.push(ValidationFinding {
+                    severity: FindingSeverity::Error,
+                    path: "outcome_from".to_string(),
+                    message: format!(
+                        "outcome_from names unknown task id \"{outcome_from}\" — must name a real \
+                         task declared somewhere in `phases`"
+                    ),
+                });
+            } else if grow_templates.contains(outcome_from.as_str()) {
+                findings.push(ValidationFinding {
+                    severity: FindingSeverity::Error,
+                    path: "outcome_from".to_string(),
+                    message: format!(
+                        "outcome_from names \"{outcome_from}\", which declares `grow` — a grow \
+                         TEMPLATE is never itself minted (it stamps zero-or-more real copies at its \
+                         phase boundary instead), so it has no `Step.output` of its own to promote \
+                         as the close payload"
+                    ),
+                });
+            }
+        }
+
         findings
     }
 
@@ -2365,6 +2401,54 @@ mod tests {
         let errs = grow_errors(&cfg);
         assert_eq!(errs.len(), 2, "one per relation: {errs:?}");
         assert!(errs.iter().all(|e| e.contains("grow` TEMPLATE")), "{errs:?}");
+    }
+
+    // ── (#2345 C2) `outcome_from` validation ────────────────────────────
+
+    #[test]
+    fn outcome_from_naming_a_real_task_validates_clean() {
+        let cfg = MissionConfig {
+            outcome_from: Some("t".into()),
+            ..doc(vec![phase("p1", vec![task("t", &[], vec![step("s", "procedural.noop")])])])
+        };
+        assert!(grow_errors(&cfg).is_empty(), "{:?}", grow_errors(&cfg));
+    }
+
+    #[test]
+    fn outcome_from_naming_an_unknown_task_is_an_error() {
+        let cfg = MissionConfig {
+            outcome_from: Some("no-such-task".into()),
+            ..doc(vec![phase("p1", vec![task("t", &[], vec![step("s", "procedural.noop")])])])
+        };
+        let errs = grow_errors(&cfg);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].starts_with("outcome_from:"), "{errs:?}");
+        assert!(errs[0].contains("unknown task id \"no-such-task\""), "{errs:?}");
+    }
+
+    #[test]
+    fn outcome_from_naming_a_grow_template_is_an_error() {
+        // The template is never itself minted (#2300) — it has no
+        // `Step.output` of its own, exactly the same "would resolve to
+        // nothing" failure class `depending_on_a_grow_template_is_an_error`
+        // guards for the `depends_on`/`reads` relations.
+        let mut cfg = grow_doc("p1", "p2");
+        cfg.outcome_from = Some("unit-task".into());
+        let errs = grow_errors(&cfg);
+        assert!(
+            errs.iter().any(|e| e.starts_with("outcome_from:") && e.contains("TEMPLATE")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn absent_outcome_from_is_never_a_validation_error() {
+        // Every pre-3.3 document omits the field — must never trip
+        // validate() on its own (the additive contract MISSION_CONFIG_
+        // SCHEMA's own "3.3" doc note describes).
+        let cfg = doc(vec![phase("p1", vec![task("t", &[], vec![step("s", "procedural.noop")])])]);
+        assert!(cfg.outcome_from.is_none());
+        assert!(grow_errors(&cfg).is_empty(), "{:?}", grow_errors(&cfg));
     }
 
     // ── (#1684) `panel` schema field ─────────────────────────────────────
