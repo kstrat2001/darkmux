@@ -1,5 +1,6 @@
 import { speedLabel } from "../../hooks/usePlaybackTransport";
 import { clkhm, clkrange } from "../../lib/format";
+import { fmtElapsed } from "../mission/graph";
 
 /**
  * The playback transport — restored from the legacy viewer (#1869;
@@ -62,6 +63,14 @@ export interface ScrubberProps {
    * gone too — the range input IS the progress indicator; the counts
    * moved to that same modal row alongside the id. */
   label?: string | null;
+  /** (#2346) The FOCUS's own elapsed time (`t - tMin` of a dispatch/mission
+   * focus, never the day's), rendered via the SAME `fmtElapsed` the run
+   * detail's own WALL CLOCK tile uses — one producer, so the two clocks
+   * agree by construction rather than by two call sites happening to
+   * compute the same subtraction the same way. `null`/`undefined` for the
+   * day focus: elapsed-since-the-day's-first-record is meaningless, so the
+   * clock names only the time of day, same as before this prop existed. */
+  elapsedMs?: number | null;
 }
 
 export function Scrubber({
@@ -75,6 +84,7 @@ export function Scrubber({
   onTogglePlay,
   onCycleSpeed,
   label,
+  elapsedMs,
 }: ScrubberProps) {
   // `span` (floored to 1) feeds `onScrub`'s drag math below, so a drag on a
   // zero-span day never divides by zero. The RENDERED value is a separate
@@ -133,6 +143,7 @@ export function Scrubber({
         {speedLabel(speed)}
       </button>
       <span className="clock" data-testid="scrubber-clock">
+        {elapsedMs != null ? `${fmtElapsed(elapsedMs)} · ` : ""}
         {clkhm(t)}
         {label ? ` · ${label}` : ""}
       </span>

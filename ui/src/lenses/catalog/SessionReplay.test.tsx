@@ -529,3 +529,66 @@ describe("SessionReplay — static build (#2065)", () => {
     expect(seen.filter((u) => u.startsWith("/flow-session/"))).toEqual([]);
   });
 });
+
+// (#2346) A DISPATCH focus bounds the transport's playhead to the run's OWN
+// span (its first record to its last) — never the whole day's. The direct
+// consequence, proven here at the component level: a playhead sitting
+// anywhere inside that bound can never precede the run's own first record,
+// so the "has not started yet at this point of the day" empty state — still
+// reachable when a MISSION focus scrubs to a moment before one of ITS
+// dispatches has started (that code path stays; see #2346's issue text) —
+// is never rendered for a dispatch-focus playhead.
+describe("SessionReplay — dispatch-focus playhead never precedes the run's own start (#2346)", () => {
+  function stubOneSession(sessionId: string) {
+    const records = [
+      { ts: "2026-08-07T08:11:48Z", action: "dispatch.start", session_id: sessionId, machine_id: "MacBook-Pro", category: "work", source: "crew", payload: { role: "coder" } },
+      { ts: "2026-08-07T09:00:00Z", action: "dispatch.reasoning", session_id: sessionId, machine_id: "MacBook-Pro", category: "work", source: "crew" },
+      { ts: "2026-08-07T10:06:37Z", action: "dispatch.complete", session_id: sessionId, machine_id: "MacBook-Pro", category: "work", source: "crew", payload: { wall_ms: 6_889_000 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+  }
+
+  it("playhead at the run's own tMax (its wall clock end) shows every record", async () => {
+    stubOneSession("s-focus");
+    const tMax = Date.parse("2026-08-07T10:06:37Z");
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-focus" playhead={tMax} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(screen.queryByRole("status", { name: /not started yet/i })).not.toBeInTheDocument();
+    // The terminal record landed: this reads as a finished run, not RUNNING.
+    expect(document.querySelector(".session-run__header .pill")?.textContent).not.toMatch(/running/i);
+  });
+
+  it("playhead at the run's own tMin (its dispatch start) shows the first record only — never 'not started yet'", async () => {
+    stubOneSession("s-focus");
+    const tMin = Date.parse("2026-08-07T08:11:48Z");
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-focus" playhead={tMin} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(screen.queryByRole("status", { name: /not started yet/i })).not.toBeInTheDocument();
+    // Only the dispatch.start record is at-or-before tMin: no terminal yet.
+    expect(document.querySelector(".session-run__header .pill")?.textContent).toMatch(/running/i);
+  });
+
+  it("a playhead genuinely BEFORE the run's own first record still says so (the code path a mission focus needs)", async () => {
+    // Not reachable via a dispatch-focus transport (its own tMin IS the
+    // run's start), but SessionReplay is a general component — a mission
+    // focus can legitimately scrub to a moment before one of its OWN later
+    // dispatches has started, and that must still render honestly rather
+    // than crash.
+    stubOneSession("s-focus");
+    const beforeStart = Date.parse("2026-08-07T08:00:00Z");
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-focus" playhead={beforeStart} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByRole("status", { name: /not started yet/i })).toBeInTheDocument());
+  });
+});

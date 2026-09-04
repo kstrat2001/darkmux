@@ -2,6 +2,8 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
+import { clkhm } from "./lib/format";
+import { fmtElapsed } from "./lenses/mission/graph";
 
 /**
  * Regression test for the `useSyncExternalStore` snapshot-stability bug
@@ -1272,18 +1274,173 @@ describe("App", () => {
     }
   });
 
-  it("(#2071) a dispatch route scrubbed to BEFORE its run's first record says so, instead of crashing the lens", async () => {
+  // (#2346) Superseded the old day-wide scrub-before-start test below: with
+  // the transport bounded to the OPEN dispatch's own span, s2's range is
+  // its own single record (00:45-00:45) — there is no "before the day's
+  // start but before this run's start" position left to scrub to. The
+  // "not started yet" empty state is still exercised (for a MISSION focus)
+  // by `SessionReplay.test.tsx`'s own #2346 suite.
+  it("(#2346) a dispatch route's scrubber is bounded to that run's OWN span, not the day's — scrubbing it can never read 'not started yet'", async () => {
     const meta = mockStaticDay();
-    window.location.hash = "#dispatch=s2"; // s2 starts at 00:45, the day at 00:00
+    window.location.hash = "#dispatch=s2"; // s2's only record is at 00:45; the day runs 00:00-01:00
     try {
       renderApp();
       await waitFor(() => expect(document.querySelector(".session-run__header .pill")).toBeTruthy());
+      // A zero-span range (tMin === tMax, s2's one record) pins the thumb at
+      // the end — the same rule a fresh, unscrubbed focus gets (#1640).
+      expect(screen.getByRole("slider")).toHaveValue("100");
       fireEvent.change(screen.getByRole("slider"), { target: { value: "0" } });
-      await waitFor(() => expect(screen.getByRole("status", { name: /not started yet/i })).toBeInTheDocument());
+      expect(screen.queryByRole("status", { name: /not started yet/i })).not.toBeInTheDocument();
       expect(document.body.textContent).not.toMatch(/stopped rendering/i);
     } finally {
       meta.remove();
     }
+  });
+
+  // (#2346) The bug report's own shape: a run that ended hours before the
+  // day's last record. A day-wide scrubber would pin the playhead at the
+  // day's own last record (20:43 in the report) while the run detail's own
+  // WALL CLOCK read 10:06:37 — two clocks, two subjects. This fixture
+  // reproduces it: `s-narrow` runs 08:11:48-10:06:37, `s-other` (a
+  // different session) is the day's true last record at 20:43.
+  const DAY_WITH_GAP = [
+    { ts: "2026-08-07T08:11:48.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-narrow" },
+    { ts: "2026-08-07T10:06:37.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-narrow" },
+    { ts: "2026-08-07T20:43:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-other" },
+  ];
+  function mockDayWithGap() {
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-flow-src";
+    meta.content = "./demo-flow.jsonl";
+    document.head.appendChild(meta);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url) === "./demo-flow.jsonl") {
+          return Promise.resolve(new Response(DAY_WITH_GAP.map((r) => JSON.stringify(r)).join("\n") + "\n", { status: 200 }));
+        }
+        if (String(url) === "/runs") return Promise.resolve(new Response(JSON.stringify({ runs: [], generated_at_ms: 1 }), { status: 200 }));
+        if (String(url) === "/lab/runs") return Promise.resolve(new Response(JSON.stringify({ configured: false, dir: null, exists: false, runs: [] }), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    return meta;
+  }
+
+  it("(#2346) the scrubber's range AND clock scope to the open dispatch, not the whole day — the two clocks agree", async () => {
+    const meta = mockDayWithGap();
+    window.location.hash = "#dispatch=s-narrow";
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".session-run__header .pill")).toBeTruthy());
+      const slider = screen.getByRole("slider");
+      const runEndMs = Date.parse("2026-08-07T10:06:37.000Z");
+      const dayEndMs = Date.parse("2026-08-07T20:43:00.000Z");
+      const runStartMs = Date.parse("2026-08-07T08:11:48.000Z");
+      // The range is s-narrow's own span — NOT the day's (which runs to
+      // 20:43) — so, at rest (unscrubbed), the thumb sits at 100 either
+      // way; what proves the bound is the aria-valuetext naming the RUN's
+      // own end, not the day's.
+      expect(slider).toHaveAttribute("aria-valuetext", expect.stringContaining(clkhm(runEndMs)));
+      expect(slider).not.toHaveAttribute("aria-valuetext", expect.stringContaining(clkhm(dayEndMs)));
+      // The clock readout carries the run's own elapsed time beside the
+      // time of day — 08:11:48 to 10:06:37 — the SAME quantity the run
+      // detail's own WALL CLOCK tile shows (`fmtElapsed`, one producer).
+      expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(runEndMs - runStartMs)} · ${clkhm(runEndMs)}`);
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2346) a playback (day-focus) route's clock names only the time of day — no elapsed segment", async () => {
+    const meta = mockDayWithGap();
+    window.location.hash = "#lens=runs";
+    try {
+      renderApp();
+      await screen.findByRole("group", { name: "playback transport" });
+      const dayEndMs = Date.parse("2026-08-07T20:43:00.000Z");
+      expect(screen.getByTestId("scrubber-clock").textContent).toBe(clkhm(dayEndMs));
+    } finally {
+      meta.remove();
+    }
+  });
+
+  // (#2346, redesigned after a live-render finding) A DAEMON's own
+  // `/flow/<date>` is a CAPPED, TIME-WINDOWED slice — the operator's own
+  // run (evidence: `dispatch start` 2026-09-04T00:11:48Z, `dispatch
+  // complete` 02:06:37Z, `wall_ms` 6888067) started hours before the loaded
+  // window's floor, so NONE of its records were ever in `dayRecords`. The
+  // first cut of this fix derived the focus range by filtering
+  // `dayRecords`; every fixture above (`DAY_FOR_TRANSPORT`, `DAY_WITH_GAP`)
+  // happens to hold the open session's own records too, so that version
+  // passed every one of those tests and still reproduced the bug live.
+  // This fixture deliberately keeps the day window and the session's own
+  // records DISJOINT — the day names only an UNRELATED session, and the
+  // real run's records arrive solely through `/flow-session/<id>`
+  // (`routeRecords.records`), exactly mirroring the live daemon's shape.
+  it("(#2346) a dispatch whose records are NOT in the loaded day window still gets its OWN span — the live-render finding", async () => {
+    const runRecords = [
+      {
+        ts: "2026-09-04T00:11:48.000Z",
+        category: "dispatch",
+        action: "dispatch start",
+        machine_uid: "m1",
+        machine_id: "MacBook-Pro",
+        session_id: "s-narrow",
+      },
+      {
+        ts: "2026-09-04T02:06:37.000Z",
+        category: "dispatch",
+        action: "dispatch complete",
+        machine_uid: "m1",
+        machine_id: "MacBook-Pro",
+        session_id: "s-narrow",
+        payload: { wall_ms: 6_888_067 },
+      },
+    ];
+    // The loaded DAY WINDOW carries only a wholly unrelated session, hours
+    // later — s-narrow's own records are nowhere in it (the capped,
+    // time-windowed `/flow/<date>` shape).
+    const dayWindow = [
+      { ts: "2026-09-04T20:00:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-other" },
+      { ts: "2026-09-04T21:00:00.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-other" },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "/flow-session/s-narrow") {
+          return Promise.resolve(new Response(JSON.stringify({ records: runRecords, count: runRecords.length, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        }
+        if (path === "/flow/2026-09-04") return Promise.resolve(new Response(JSON.stringify(dayWindow), { status: 200 }));
+        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    window.location.hash = "#dispatch=s-narrow";
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".session-run__header .pill")).toBeTruthy());
+    const slider = screen.getByRole("slider");
+    const runStartMs = Date.parse("2026-09-04T00:11:48.000Z");
+    const runEndMs = Date.parse("2026-09-04T02:06:37.000Z");
+    const dayEndMs = Date.parse("2026-09-04T21:00:00.000Z");
+    // The range names the RUN's own bookends, not the disjoint day window's.
+    expect(slider).toHaveAttribute("aria-valuetext", expect.stringContaining(clkhm(runStartMs)));
+    expect(slider).toHaveAttribute("aria-valuetext", expect.stringContaining(clkhm(runEndMs)));
+    expect(slider).not.toHaveAttribute("aria-valuetext", expect.stringContaining(clkhm(dayEndMs)));
+    // At rest, the elapsed readout is the run's own recorded `wall_ms`
+    // (6888067ms = "1:54:48") — ONE SECOND shy of the raw bookend
+    // subtraction (runEndMs - runStartMs = 6889000ms = "1:54:49"), because
+    // the flow record `ts`s are second-precision while `wall_ms` is the
+    // runtime's own sub-second measured duration. Asserting the two DIFFER
+    // (not merely asserting the final string) is what proves `wall_ms` is
+    // actually preferred here, rather than the assertion happening to pass
+    // by coincidence — preferring it is what makes this readout agree with
+    // the run detail's own WALL CLOCK tile exactly, rather than merely
+    // closely.
+    expect(fmtElapsed(6_888_067)).not.toBe(fmtElapsed(runEndMs - runStartMs));
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_067)} · ${clkhm(runEndMs)}`);
   });
 
   it("(#2071) play advances the playhead from the shell's transport and stops at the end", async () => {
