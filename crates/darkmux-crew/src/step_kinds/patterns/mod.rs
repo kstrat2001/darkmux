@@ -19,7 +19,7 @@
 //!   genuinely bespoke, stays physically co-located with the mission that
 //!   owns it, never migrates here "just in case."
 //!
-//! Two patterns live here today:
+//! Three patterns live here today:
 //!
 //! - [`multi_pass_confirm::multi_pass_confirm`] — the "run a pass,
 //!   conditionally run more confirmation passes, demote on the first
@@ -29,6 +29,12 @@
 //!   candidate collapses into, per a pluggable match/merge strategy"
 //!   procedure, generalized from the PR-review pipeline's probe-flag dedup
 //!   stage.
+//! - [`plan_sites::plan_site_units`] — the "prefilter hits over a source,
+//!   window each hit, pack windows into sizing-bounded units" procedure
+//!   (#2310 P4b), generalized from the crawl planner so a diff-scoped
+//!   planner (a future review config) can plug in a different SOURCE
+//!   without duplicating the windowing/packing math.
 
 pub mod dedup;
 pub mod multi_pass_confirm;
+pub mod plan_sites;

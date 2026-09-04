@@ -37,6 +37,12 @@
 //! tiering" section for the doctrine this physical layout enforces.
 
 mod builtins;
+/// `deliver.github_review` (#2310 P4b) — Tier 1 by classification (a fixed,
+/// config-driven render, no caller-supplied strategy), physically its own
+/// file rather than added to `builtins.rs` (already ~4200 lines) or folded
+/// into `StepKindRegistry::with_builtins()`'s always-on five. See the
+/// module's own doc for the full reasoning.
+mod deliver_github_review;
 pub mod patterns;
 mod registry;
 mod types;
@@ -63,6 +69,10 @@ pub use builtins::{
     ProceduralNoopStepKind, ProceduralShellStepKind, RawDispatchOutcome,
 };
 pub use builtins::MAP_BUDGET_SKIP_ERROR;
+pub use deliver_github_review::{
+    register_deliver_kind, render_github_review, DeliverGithubReviewStepKind, DeliverOutcome,
+    DeliverScope, GatedMod, GithubReviewComment, GithubReviewPayload, DELIVER_GITHUB_REVIEW_KIND,
+};
 pub use registry::StepKindRegistry;
 pub use types::{
     ArtifactBus, MapDispatchOverride, OverrideDispatchCall, Port, PortKind, StepKind,

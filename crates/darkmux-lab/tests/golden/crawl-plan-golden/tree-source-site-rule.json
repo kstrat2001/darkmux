@@ -1,0 +1,56 @@
+{
+  "params": {
+    "max_est_tokens_per_unit": 16000,
+    "max_sites_per_unit": 40
+  },
+  "planned_at": "<redacted: timestamp>",
+  "rules": [
+    "swallowed-error"
+  ],
+  "schema_version": "1.1",
+  "sources": [
+    {
+      "files_walked": 2,
+      "id": "app",
+      "out_of_scope": 0,
+      "ref": "main",
+      "sha": "deadbeef",
+      "tree": "<redacted: absolute checkout path>"
+    }
+  ],
+  "totals": {
+    "by_rule": {
+      "swallowed-error": {
+        "est_tokens": 56,
+        "sites": 1,
+        "units": 1
+      }
+    },
+    "edges": [],
+    "est_tokens": 56,
+    "skipped": [],
+    "units": 1
+  },
+  "units": [
+    {
+      "est_tokens": 56,
+      "id": "u-0001",
+      "kind": "site",
+      "rule": "swallowed-error",
+      "sites": [
+        {
+          "end": 15,
+          "file": "src/orders.ts",
+          "hits": [
+            4,
+            11
+          ],
+          "line": 4,
+          "start": 1
+        }
+      ],
+      "source": "app"
+    }
+  ],
+  "workspace": "t"
+}
