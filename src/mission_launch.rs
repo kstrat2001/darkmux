@@ -3374,9 +3374,9 @@ mod tests {
     /// (#2302) What the close payload actually does with a LAST step that
     /// is a dispatch. The rule is "promote the last phase's last step
     /// output when it is a JSON OBJECT", and a `dispatch.internal` step's
-    /// output is the model's final text — so an enabled crawl follow-on
+    /// output is the model's final text — so an enabled crawl create-mods phase
     /// (which becomes the last phase) closes with NO payload, rather than
-    /// with the follow-on's outcome. Pinned here because the follow-on
+    /// with the create-mods outcome. Pinned here because create-mods
     /// phase's own description and DESIGN.md both state it; a prose claim
     /// about a promotion rule should be executable.
     #[test]

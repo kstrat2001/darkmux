@@ -296,7 +296,7 @@ fn a_step_config_naming_a_missing_record_fails_the_step_before_any_container_wor
 /// its own config. The generic dispatch kind must stamp that phase on the
 /// dispatch it issues, or the run's records never join the mission: no drill
 /// link from the mission view, "Events · 0" in the sheet, no token
-/// attribution (operator screenshot 2026-09-04, the grown follow-on steps).
+/// attribution (operator screenshot 2026-09-04, the grown create-mod steps).
 #[test]
 #[serial_test::serial] // env-scoped flows dir, like its neighbors
 fn a_step_whose_task_names_the_phase_stamps_it_on_the_dispatch_record() {

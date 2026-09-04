@@ -37,7 +37,7 @@ file: string | null, line: bigint | null,
 rule: string, 
 /**
  * The materialized workspace root the unit was dispatched against —
- * the same directory `crawl.unit` mounts, so a follow-on step can
+ * the same directory `crawl.unit` mounts, so a create-mods step can
  * name it as its `workdir` and see the very tree the finding cites.
  */
 tree_root: string, };

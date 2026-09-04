@@ -31,7 +31,7 @@ units_skipped: number, findings: bigint, prompt_tokens: bigint, completion_token
 units: Array<UnitOutcome>, 
 /**
  * (#2302) Every finding this run recorded, named by store key — the
- * union over [`Self::units`] in unit order, and the array a follow-on
+ * union over [`Self::units`] in unit order, and the array a create-mods phase
  * phase GROWS one task from (`grow: { from: "summary", items:
  * "finding_refs" }`). `findings` above stays the COUNT under the name
  * the retired launcher's close payload used; this is the roster.

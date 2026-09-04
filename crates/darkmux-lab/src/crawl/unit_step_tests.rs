@@ -879,7 +879,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
     assert_eq!(
         body.finding_refs[0].tree_root,
         ws.path().join("tree").to_string_lossy(),
-        "the materialized root a follow-on step names as its workdir"
+        "the materialized root a create-mods step names as its workdir"
     );
 
     // And every key ADDRESSES a record: it parses, and it resolves through
