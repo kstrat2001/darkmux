@@ -139,6 +139,30 @@ pub struct ModContext {
     pub findings: Vec<ForFinding>,
 }
 
+/// (#2310 P4c-2b) The result of running a review's confirmation gate — a
+/// `test_command` — against one mod's targets. DESIGN.md "the changed
+/// files name the test targets, which is what makes confirmation cheap
+/// enough to do per finding". Written once, by [`record_gate`], never
+/// re-run: a mod is a moment someone proposed a change, and confirming it
+/// is a moment too.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GateOutcome {
+    /// `true` — the command exited `0`. `false` — anything else (nonzero
+    /// exit, or the process could not even be spawned; see
+    /// [`Self::exit_code`]).
+    pub passed: bool,
+    /// The command that ran, verbatim, so a gated mod is self-describing —
+    /// a reader never has to go find `review-v2.json`'s own `test_command`
+    /// input to know what confirmed (or failed to confirm) this mod.
+    pub command: String,
+    /// The process's own exit code, when it ran to completion. `None`
+    /// when the command could not be spawned at all (a missing
+    /// interpreter, an unreadable `workdir`) — that failure still sets
+    /// `passed: false`, but there is no exit code to report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
 /// One mod, as stored at `<mods dir>/<key>/mod.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModRecord {
@@ -218,6 +242,23 @@ pub struct ModRecord {
     pub phase_id: Option<String>,
     #[serde(default)]
     pub step_id: Option<String>,
+    /// (#2310 P4c-2b) The confirmation gate — DESIGN.md "the changed files
+    /// name the test targets, which is what makes confirmation cheap
+    /// enough to do per finding": a `test_command` run against this mod's
+    /// finding's targets. `None` when nothing has gated this mod yet OR
+    /// when create-mods deliberately skipped gating — those two cases are
+    /// told apart by [`Self::gate_skipped_reason`], never conflated.
+    /// Additive (`#[serde(default)]`), so a record written before this
+    /// field reads back `None` — the same read-only-required-fields rule
+    /// every other additive field on this record follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateOutcome>,
+    /// Why no gate ran, set the moment create-mods DECIDES to skip (no
+    /// `test_command` configured) — distinct from `gate: None` meaning
+    /// "not yet examined". `Some` and [`Self::gate`]`: Some` are mutually
+    /// exclusive; [`record_gate`] refuses to set both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_skipped_reason: Option<String>,
     pub schema_version: String,
     /// Lenient-on-read overflow, so a newer writer's fields survive a round
     /// trip through an older reader.
@@ -519,6 +560,39 @@ pub fn materialize(root: &Path, record: &ModRecord) -> Result<Materialized> {
     }
 }
 
+/// Record ONE mod's confirmation gate — the one deliberate exception to
+/// [`materialize`]'s write-once discipline. A gate result is darkmux's OWN
+/// annotation about an already-stored mod (never a competing proposal, and
+/// never a rewrite of the kit itself), so this patches `gate`/
+/// `gate_skipped_reason` onto the existing record in place. The exception
+/// stays narrow, not a general "mods are mutable" door: exactly one of
+/// `outcome`/`skipped_reason` is expected non-`None` (a caller passing
+/// both, or neither, is a caller bug — `mods.gate`'s own step kind is the
+/// only production caller and never does either), and a mod that already
+/// carries a gate or a skip reason is left untouched, reported the same
+/// [`Materialized::AlreadyPresent`] shape `materialize` uses for "this
+/// call changed nothing" — a mod is gated at most once.
+pub fn record_gate(
+    root: &Path,
+    key: &str,
+    outcome: Option<GateOutcome>,
+    skipped_reason: Option<&str>,
+) -> Result<Materialized> {
+    anyhow::ensure!(is_safe_key(key), "refusing to gate a mod under an unsafe key {key:?}");
+    let path = record_path_at(root, key);
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("reading mod {}", path.display()))?;
+    let mut record: ModRecord =
+        serde_json::from_str(&raw).with_context(|| format!("parsing mod {}", path.display()))?;
+    if record.gate.is_some() || record.gate_skipped_reason.is_some() {
+        return Ok(Materialized::AlreadyPresent);
+    }
+    record.gate = outcome;
+    record.gate_skipped_reason = skipped_reason.map(str::to_string);
+    let body = serde_json::to_string_pretty(&record)? + "\n";
+    std::fs::write(&path, body).with_context(|| format!("writing gated mod {}", path.display()))?;
+    Ok(Materialized::Created)
+}
+
 /// Mint a key, copy the attachments, and write one mod.
 ///
 /// **Idempotence is not a goal.** Every call mints a new key: two agents
@@ -590,6 +664,10 @@ pub fn create(
         mission_id: None,
         phase_id: None,
         step_id: None,
+        // (#2310 P4c-2b) `mod create` is a one-shot CLI write, not part of
+        // any create-mods gate loop — never gated at create time.
+        gate: None,
+        gate_skipped_reason: None,
         schema_version: MOD_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     };
@@ -765,6 +843,11 @@ pub fn create_from_emission(
         mission_id: scope.mission_id,
         phase_id: scope.phase_id,
         step_id: scope.step_id,
+        // (#2310 P4c-2b) Gated after the fact, by `mods.gate` — never at
+        // creation time (the coder proposing the mod hasn't run any test
+        // yet).
+        gate: None,
+        gate_skipped_reason: None,
         schema_version: MOD_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     };
@@ -1416,6 +1499,8 @@ mod tests {
             mission_id: None,
             phase_id: None,
             step_id: None,
+            gate: None,
+            gate_skipped_reason: None,
             schema_version: MOD_SCHEMA_VERSION.into(),
             extras: serde_json::Map::new(),
         };
@@ -1451,6 +1536,8 @@ mod tests {
             mission_id: None,
             phase_id: None,
             step_id: None,
+            gate: None,
+            gate_skipped_reason: None,
             schema_version: MOD_SCHEMA_VERSION.into(),
             extras: serde_json::Map::new(),
         };

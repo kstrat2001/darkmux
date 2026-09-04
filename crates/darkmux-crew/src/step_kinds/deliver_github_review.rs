@@ -43,7 +43,7 @@ use crate::mods::ModRecord;
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{Port, StepKind, StepOutcome};
 use crate::types::{Step, Task};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -388,8 +388,20 @@ enum DeliveryForm {
     Question,
 }
 
+/// (#2310 P4c-2b fix) Reads `context.confirm` — the SAME key
+/// `crawl::unit_step::run` host-stamps on every real finding's
+/// `record_context` (`"confirm": single_confirm(&rules_by_id, &ctx.
+/// rule_ids)`, itself copied straight from a `Rule`'s own `confirm` field:
+/// `templates/builtin/rules/*.json`'s `"confirm": "mod"|"search"|
+/// "question"`). This function used to read `context.get("form")` — a key
+/// NOTHING in the codebase ever stamped (P4b wrote this module before P4c
+/// decided the crawl unit's own stamped key name), so every real finding
+/// silently rendered as `DeliveryForm::Mod` regardless of its rule's
+/// declared confirm form until #2310 P4c-2b's own end-to-end wiring
+/// surfaced the mismatch. `deliver_github_review`'s OWN tests below
+/// updated to the real key in the same fix.
 fn delivery_form(finding: &FindingRecord) -> DeliveryForm {
-    match finding.context.get("form").and_then(|v| v.as_str()) {
+    match finding.context.get("confirm").and_then(|v| v.as_str()) {
         Some("search") => DeliveryForm::Search,
         Some("question") => DeliveryForm::Question,
         _ => DeliveryForm::Mod,
@@ -469,16 +481,23 @@ fn diff_touched_lines(diff_text: &str) -> BTreeMap<String, BTreeSet<u32>> {
 /// `Step.config` shape: `{"findings": [FindingRecord...], "mods":
 /// [GatedMod...], "diff": "<unified diff text>", "scope": DeliverScope,
 /// "attribution": "<optional string>", "emit": "<path, or \"-\"/absent
-/// for stdout>"}`. Every field but `findings`/`mods`/`diff` is optional.
+/// for stdout>"}`. Every field but `findings`/`mods`/`diff` is optional —
+/// EXCEPT that `findings`/`mods`/`diff`/`scope` may ALSO be supplied as a
+/// group by a same-task predecessor step's output instead of embedded
+/// literally (see [`DeliverConfig::from_step`]'s second branch below).
+///
 /// Reads its inputs from `Step.config` directly rather than through typed
-/// graph ports (#2301's `Output<T>` envelope convention): no producer for
-/// "findings as one bulk typed value" exists anywhere in the codebase
-/// today (a finding is read from the finding STORE by key, per
-/// `crawl.summary`'s own "the same one read of the dispatch's
-/// findings.jsonl" pattern, DESIGN.md's record table) — inventing four
-/// speculative port kinds nothing will ever produce is worse than the
-/// config-embedded shape a future caller (#2310 P4c) can trivially swap
-/// for a store read once that caller exists.
+/// graph ports (#2301's `Output<T>` envelope convention) for the ORIGINAL
+/// three fields — no producer for "findings as one bulk typed value"
+/// existed when this module was written (a finding is read from the
+/// finding STORE by key, per `crawl.summary`'s own "the same one read of
+/// the dispatch's findings.jsonl" pattern, DESIGN.md's record table) —
+/// inventing four speculative port kinds nothing would ever produce was
+/// worse than the config-embedded shape. #2310 P4c-2b is the future caller
+/// that module doc predicted: `records.gather` (`step_kinds::
+/// records_gather`) IS that store read, and this struct now accepts its
+/// output too, over the SAME `Data`-port `Step.output` -> `gather_inputs`
+/// wiring `Port`'s own doc describes — never a NEW mechanism.
 struct DeliverConfig {
     findings: Vec<FindingRecord>,
     mods: Vec<GatedMod>,
@@ -489,29 +508,62 @@ struct DeliverConfig {
 }
 
 impl DeliverConfig {
-    fn from_step(step: &Step) -> Result<Self> {
-        let field = |key: &str| -> Result<serde_json::Value> {
-            step.config
-                .get(key)
-                .cloned()
-                .ok_or_else(|| anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.{key}", step.id))
-        };
-        let findings: Vec<FindingRecord> = serde_json::from_value(field("findings")?)
-            .with_context(|| format!("step `{}`: config.findings", step.id))?;
-        let mods: Vec<GatedMod> =
-            serde_json::from_value(field("mods")?).with_context(|| format!("step `{}`: config.mods", step.id))?;
-        let diff = field("diff")?
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("step `{}`: config.diff must be a string", step.id))?;
-        let scope: DeliverScope = match step.config.get("scope") {
-            Some(v) => serde_json::from_value(v.clone())
-                .with_context(|| format!("step `{}`: config.scope", step.id))?,
-            None => DeliverScope::default(),
-        };
+    /// `input` is the step's own `gather_inputs` map (unused by every
+    /// existing caller — every current test embeds `findings`/`mods`/
+    /// `diff` literally in `step.config`, which this function still
+    /// prefers outright when present, so NOTHING about their behavior
+    /// changes). When `config.findings` is absent, this looks instead for
+    /// a [`super::records_gather::GatherOutput`] envelope among `input`'s
+    /// values — the shape a `records.gather` step run as this step's
+    /// immediately-previous SAME-TASK step produces (`scheduler::
+    /// gather_inputs`'s documented same-task-predecessor entry, keyed by
+    /// that step's own id) — and pulls `findings`/`mods`/`diff`/`scope`
+    /// from it as a group. `attribution`/`emit` are launch-time strings,
+    /// never data, and always come from `step.config` either way.
+    fn from_step(step: &Step, input: &BTreeMap<String, String>) -> Result<Self> {
         let attribution = step.config.get("attribution").and_then(|v| v.as_str()).map(str::to_string);
         let emit = step.config.get("emit").and_then(|v| v.as_str()).map(PathBuf::from);
-        Ok(Self { findings, mods, diff, scope, attribution, emit })
+
+        if step.config.get("findings").is_some() {
+            let field = |key: &str| -> Result<serde_json::Value> {
+                step.config.get(key).cloned().ok_or_else(|| {
+                    anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.{key}", step.id)
+                })
+            };
+            let findings: Vec<FindingRecord> = serde_json::from_value(field("findings")?)
+                .with_context(|| format!("step `{}`: config.findings", step.id))?;
+            let mods: Vec<GatedMod> = serde_json::from_value(field("mods")?)
+                .with_context(|| format!("step `{}`: config.mods", step.id))?;
+            let diff = field("diff")?
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("step `{}`: config.diff must be a string", step.id))?;
+            let scope: DeliverScope = match step.config.get("scope") {
+                Some(v) => serde_json::from_value(v.clone())
+                    .with_context(|| format!("step `{}`: config.scope", step.id))?,
+                None => DeliverScope::default(),
+            };
+            return Ok(Self { findings, mods, diff, scope, attribution, emit });
+        }
+
+        let gathered = input.values().find_map(|raw| {
+            crate::step_output::Output::<super::records_gather::GatherOutput>::read(
+                raw,
+                super::records_gather::RECORDS_GATHER_OUTPUT_KIND,
+            )
+            .ok()
+        });
+        let Some(gathered) = gathered else {
+            bail!(
+                "step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.findings (embedded) or a \
+                 `{}` step's output among its inputs (present: {}) — neither was found",
+                step.id,
+                super::records_gather::RECORDS_GATHER_KIND,
+                if input.is_empty() { "none".to_string() } else { input.keys().cloned().collect::<Vec<_>>().join(", ") }
+            );
+        };
+        let body = gathered.body;
+        Ok(Self { findings: body.findings, mods: body.mods, diff: body.diff, scope: body.scope, attribution, emit })
     }
 }
 
@@ -537,8 +589,8 @@ impl StepKind for DeliverGithubReviewStepKind {
         None
     }
 
-    fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
-        let cfg = DeliverConfig::from_step(step)?;
+    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        let cfg = DeliverConfig::from_step(step, input)?;
         let outcome =
             render_github_review(&cfg.findings, &cfg.mods, &cfg.diff, &cfg.scope, cfg.attribution.as_deref());
         let payload = serde_json::to_string(&outcome).context("serializing the deliver outcome")?;
@@ -571,7 +623,8 @@ mod tests {
     fn finding(key: &str, file: &str, line: u32, evidence: &str, why: &str, form: Option<&str>) -> FindingRecord {
         let mut context = json!({});
         if let Some(f) = form {
-            context = json!({ "form": f });
+            // (#2310 P4c-2b fix) `confirm`, not `form` — see `delivery_form`'s own doc.
+            context = json!({ "confirm": f });
         }
         FindingRecord {
             key: key.to_string(),
@@ -612,6 +665,8 @@ mod tests {
                 mission_id: None,
                 phase_id: None,
                 step_id: None,
+                gate: None,
+                gate_skipped_reason: None,
                 schema_version: crate::mods::MOD_SCHEMA_VERSION.to_string(),
                 extras: Default::default(),
             },

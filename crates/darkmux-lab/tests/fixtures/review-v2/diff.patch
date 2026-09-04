@@ -1,0 +1,64 @@
+diff --git a/src/retry.ts b/src/retry.ts
+--- a/src/retry.ts
++++ b/src/retry.ts
+@@ -1,11 +1,11 @@
+-// (#2310 P4c-2b fixture) existing-solution: a hand-rolled retry helper.
++// (#2310 P4c-2b fixture) existing-solution: a hand-rolled retry-with-backoff
++// helper, the classic "this already exists somewhere" catch.
+ export function retryWithBackoff(fn: () => Promise<void>, attempts: number) {
+   let delay = 100;
+   for (let i = 0; i < attempts; i++) {
+     try {
+       return fn();
+     } catch (e) {
+       delay = delay * 2;
+     }
+   }
+ }
+diff --git a/src/status.ts b/src/status.ts
+--- a/src/status.ts
++++ b/src/status.ts
+@@ -1,3 +1,6 @@
+ // (#2310 P4c-2b fixture) union-vs-enum: a new string-literal union that
+ // overlaps the existing `LogLevel` enum in types.ts.
++export type Level = "debug" | "info" | "warn" | "error";
++
++export function describe(level: Level): string {
++  return `level=${level}`;
++}
+diff --git a/src/shared.ts b/src/shared.ts
+--- a/src/shared.ts
++++ b/src/shared.ts
+@@ -1,4 +1,7 @@
+ // (#2310 P4c-2b fixture) shared-symbol-callers: a shared, exported
+ // function whose signature changed — three callers live elsewhere in the
+ // tree (not part of the diff; what a real `search` step would enumerate).
+-export function clamp(value: number, min: number, max: number): number {
++export function clamp(value: number, min: number, max: number, strict: boolean): number {
+   if (value < min) return min;
+   if (value > max) return max;
+   return value;
+ }
+diff --git a/src/billing.ts b/src/billing.ts
+--- a/src/billing.ts
++++ b/src/billing.ts
+@@ -1,6 +1,7 @@
+ // (#2310 P4c-2b fixture) swallowed-error, reused from crawl (confirm=mod).
+ export function computeTotal(items: number[]) {
+   try {
+     return items.reduce((a, b) => a + b, 0);
+   } catch (e) {
++    // swallowed on purpose, for the fixture
+   }
+ }
+diff --git a/src/auth.ts b/src/auth.ts
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -1,3 +1,6 @@
+ // (#2310 P4c-2b fixture) unnamed-predicate, reused from crawl (confirm=mod).
+ export function checkAccess(user: { role: string; active: boolean }, resource: { owner: string; shared: boolean }) {
++  if ((user.role === "admin" && user.active) || (resource.shared && resource.owner === user.role)) {
++    return true;
++  }
+   return false;
+ }

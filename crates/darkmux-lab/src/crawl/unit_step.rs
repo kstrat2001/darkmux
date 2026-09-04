@@ -640,6 +640,7 @@ fn readback_findings(
     out_dir: &Path,
     into: &Path,
     model: Option<&str>,
+    session_id: &str,
 ) -> (usize, Vec<FindingRef>) {
     let findings_path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
     let Ok(body) = std::fs::read_to_string(&findings_path) else {
@@ -652,13 +653,12 @@ fn readback_findings(
     // or not the observations can be addressed. The crawl mints its own
     // session ids, so this is a backstop, not an expected path — and it is
     // loud.
-    let addressable = darkmux_crew::findings::is_safe_dispatch_segment(&ctx.session_id);
+    let addressable = darkmux_crew::findings::is_safe_dispatch_segment(session_id);
     if !addressable {
         eprintln!(
             "{}",
             darkmux_types::style::warn(&format!(
-                "crawl.unit: session id `{}` is not a finding-store segment — this unit's findings are counted but not addressable",
-                ctx.session_id
+                "crawl.unit: session id `{session_id}` is not a finding-store segment — this unit's findings are counted but not addressable"
             ))
         );
     }
@@ -692,12 +692,12 @@ fn readback_findings(
             if let Some(u) = unmatched {
                 obj.insert("rule_unmatched_pattern".to_string(), json!(u));
             }
-            obj.insert("session_id".to_string(), json!(ctx.session_id));
+            obj.insert("session_id".to_string(), json!(session_id));
             if let Some(m) = model {
                 obj.insert("model".to_string(), json!(m));
             }
             if addressable {
-                let key = format!("{}/{seq}", ctx.session_id);
+                let key = format!("{session_id}/{seq}");
                 refs.push(FindingRef {
                     id: key.replace('/', "-"),
                     key,
@@ -769,6 +769,19 @@ pub struct UnitStepConfig {
     /// content is read at dispatch time and rendered into the unit's
     /// message — see `build_message`'s `intent` parameter.
     pub intent_file: Option<PathBuf>,
+    /// (#2310 P4c-2b) How many times to dispatch this unit — the measured
+    /// k-draw recall technique DESIGN.md's "Units" section ports from the
+    /// retired funnel ("A draws-per-unit knob, off by default"). `1`
+    /// (the default) is BYTE-IDENTICAL to every pre-#2310-P4c-2b behavior:
+    /// one dispatch, `ctx.session_id` unchanged, `host_out` unchanged — see
+    /// `run`'s own doc on why draw 0 alone is never renamed. `>1` draws
+    /// each get their OWN session id (`<session>-d<n>`, `n` starting at 2)
+    /// and their own `out/`/readback paths — the finding store addresses a
+    /// finding by `<dispatch session>/<seq>`, so two draws sharing one
+    /// session id would silently collide (`findings::materialize` is
+    /// write-once; the second draw's real findings would be reported
+    /// `AlreadyPresent` and lost).
+    pub draws: usize,
 }
 
 impl UnitStepConfig {
@@ -810,7 +823,28 @@ impl UnitStepConfig {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .map(PathBuf::from);
-        Ok(Self { plan, unit, rule, no_progress_turns, timeout_seconds, intent_file })
+        // (#2310 P4c-2b) String-or-number, leniently — the same parse
+        // `crawl::plan::parse_sizing_and_no_fetch` uses, for the same
+        // reason: a `--param draws=3` reaches step config as a JSON
+        // string, never a number.
+        let draws = match step.config.get("draws") {
+            None => 1,
+            Some(serde_json::Value::Null) => 1,
+            Some(v) => {
+                let n = v
+                    .as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "step `{}`: `{CRAWL_UNIT_KIND}` config.draws must be a positive integer, got {v}",
+                            step.id
+                        )
+                    })?;
+                anyhow::ensure!(n >= 1, "step `{}`: `{CRAWL_UNIT_KIND}` config.draws must be >= 1, got {n}", step.id);
+                usize::try_from(n).context("draws does not fit usize")?
+            }
+        };
+        Ok(Self { plan, unit, rule, no_progress_turns, timeout_seconds, intent_file, draws })
     }
 }
 
@@ -1041,142 +1075,218 @@ impl StepKind for CrawlUnitStepKind {
         // described as reusable.
         let role_id = task.role_id.clone().unwrap_or_else(|| "crawler".to_string());
         let seat = resolve_crawler_seat(&role_id);
-        let started = std::time::Instant::now();
-        let opts = DispatchOpts {
-            brief_refs: Vec::new(),
-            role_id: role_id.clone(),
-            message,
-            session_id: Some(ctx.session_id.clone()),
-            timeout_seconds: cfg.timeout_seconds.unwrap_or(600),
-            skip_preflight: false,
-            json: true,
-            workdir: Some(ctx.tree_root.clone()),
-            phase_id: Some(task.phase_id.clone()),
-            machine: None,
-            wait: true,
-            compaction: CompactionDispatchArgs::default(),
-            profile_name: None,
-            config_path: None,
-            force_container: false,
-            max_completion_tokens: None,
-            image: None,
-            model_base_url_override: None,
-            step_id: Some(step.id.clone()),
-            system_prompt_override: None,
-            workspace_read_only: true,
-            host_out: Some(host_out.clone()),
-            // (#2301) Per-unit resume is the scheduler's step-output reuse
-            // now, not this kind's own parameter — see the issue.
-            resume_from: None,
-            max_turns_override: Some(default_unit_max_turns(unit)),
-            // Provenance the runtime cannot know — merged by the host
-            // tailer under `payload.context` on every record this unit's
-            // dispatch produces.
-            record_context: Some(json!({
-                "workspace": ctx.workspace,
-                "source": ctx.source,
-                "sha": ctx.sha,
-                "rule": single_rule(&ctx.rule_ids),
-                "rules": ctx.rule_ids,
-                // (#2310 P4c review round 2, item (g) — stated precisely
-                // for the PR: `crawl.json`'s DISPATCHED MESSAGE
-                // (`build_message`'s own output) is byte-identical to
-                // before this packet for every `mod`-confirm rule — which
-                // is all four of crawl's own built-ins — since
-                // `pattern_block`'s confirm-form appendix renders nothing
-                // for `ConfirmForm::Mod`. The one thing that DOES change
-                // for every crawl unit, `mod`-confirm included, is this
-                // flow record's `context` blob: it gains exactly ONE new
-                // key, `confirm`, host-stamped here (never model-supplied
-                // — see `pattern_block`'s own doc for why the confirmation
-                // form rides in `context.confirm` rather than a
-                // `create_finding` tool argument). No other `context` key
-                // changes shape or value.
-                "confirm": single_confirm(&rules_by_id, &ctx.rule_ids),
-                "unit": ctx.unit_id,
-                "model": seat.model.clone(),
-                "locality": seat.locality,
-                "profile": seat.profile_name.clone(),
-            })),
-        };
 
-        let outcome = (self.dispatch)(opts);
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let (mut result, wall_ms, prompt_tokens, completion_tokens, model, detections, rest_ms, host) =
-            match &outcome {
-                Err(_) => ("error".to_string(), elapsed_ms, 0, 0, None, None, 0, None),
-                Ok(res) => interpret_dispatch_result(&ctx.unit_id, res),
+        // (#2310 P4c-2b) `draws` dispatches this SAME unit `cfg.draws`
+        // times — DESIGN.md "Units... A draws-per-unit knob, off by
+        // default, ports the measured k-draw recall technique from the
+        // funnel." Draw 0 uses `ctx.session_id`/`host_out` UNCHANGED from
+        // every pre-#2310-P4c-2b run (so `draws: 1`, the default, is
+        // byte-identical); draw `n` (n>=1) gets its own session id
+        // (`<session>-d<n+1>`) and its own `out-d<n+1>/` — see
+        // `UnitStepConfig::draws`'s own doc for why they cannot share one.
+        // A draw that does not converge (result != "stop"/budget-exhausted)
+        // aborts the WHOLE step immediately, same as a single-draw run
+        // always has — later draws are simply never attempted.
+        let mut total_wall_ms = 0u64;
+        let mut total_prompt_tokens = 0u64;
+        let mut total_completion_tokens = 0u64;
+        let mut total_findings = 0u64;
+        let mut total_rejected = 0u64;
+        let mut all_finding_refs: Vec<FindingRef> = Vec::new();
+        let mut last_result = String::new();
+        let mut last_model: Option<String> = None;
+        let mut last_detections = None;
+        let mut last_rest_ms = 0u64;
+        let mut last_host = None;
+
+        for draw in 0..cfg.draws {
+            let (draw_session_id, draw_host_out) = if draw == 0 {
+                (ctx.session_id.clone(), host_out.clone())
+            } else {
+                (format!("{}-d{}", ctx.session_id, draw + 1), unit_dir.join(format!("out-d{}", draw + 1)))
+            };
+            let started = std::time::Instant::now();
+            let opts = DispatchOpts {
+                brief_refs: Vec::new(),
+                role_id: role_id.clone(),
+                message: message.clone(),
+                session_id: Some(draw_session_id.clone()),
+                timeout_seconds: cfg.timeout_seconds.unwrap_or(600),
+                skip_preflight: false,
+                json: true,
+                workdir: Some(ctx.tree_root.clone()),
+                phase_id: Some(task.phase_id.clone()),
+                machine: None,
+                wait: true,
+                compaction: CompactionDispatchArgs::default(),
+                profile_name: None,
+                config_path: None,
+                force_container: false,
+                max_completion_tokens: None,
+                image: None,
+                model_base_url_override: None,
+                step_id: Some(step.id.clone()),
+                system_prompt_override: None,
+                workspace_read_only: true,
+                host_out: Some(draw_host_out.clone()),
+                // (#2301) Per-unit resume is the scheduler's step-output reuse
+                // now, not this kind's own parameter — see the issue.
+                resume_from: None,
+                max_turns_override: Some(default_unit_max_turns(unit)),
+                // Provenance the runtime cannot know — merged by the host
+                // tailer under `payload.context` on every record this unit's
+                // dispatch produces.
+                record_context: Some(json!({
+                    "workspace": ctx.workspace,
+                    "source": ctx.source,
+                    "sha": ctx.sha,
+                    "rule": single_rule(&ctx.rule_ids),
+                    "rules": ctx.rule_ids,
+                    // (#2310 P4c review round 2, item (g) — stated precisely
+                    // for the PR: `crawl.json`'s DISPATCHED MESSAGE
+                    // (`build_message`'s own output) is byte-identical to
+                    // before this packet for every `mod`-confirm rule — which
+                    // is all four of crawl's own built-ins — since
+                    // `pattern_block`'s confirm-form appendix renders nothing
+                    // for `ConfirmForm::Mod`. The one thing that DOES change
+                    // for every crawl unit, `mod`-confirm included, is this
+                    // flow record's `context` blob: it gains exactly ONE new
+                    // key, `confirm`, host-stamped here (never model-supplied
+                    // — see `pattern_block`'s own doc for why the confirmation
+                    // form rides in `context.confirm` rather than a
+                    // `create_finding` tool argument). No other `context` key
+                    // changes shape or value.
+                    "confirm": single_confirm(&rules_by_id, &ctx.rule_ids),
+                    "unit": ctx.unit_id,
+                    "model": seat.model.clone(),
+                    "locality": seat.locality,
+                    "profile": seat.profile_name.clone(),
+                })),
             };
 
-        // (#2193) No-progress bound — only over a dispatch that actually
-        // ran and reported a clean `"stop"`. Never overrides an already-
-        // `error`/`timeout` label: those are more specific failure shapes.
-        let out_dir = outcome.as_ref().ok().and_then(|r| r.out_dir.clone());
-        if result == "stop" {
-            if let Some(d) = &out_dir {
-                if unit_hit_no_progress_bound(d, cfg.no_progress_turns) {
-                    result = UNIT_BUDGET_EXHAUSTED.to_string();
+            let outcome = (self.dispatch)(opts);
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let (mut result, wall_ms, prompt_tokens, completion_tokens, model, detections, rest_ms, host) =
+                match &outcome {
+                    Err(_) => ("error".to_string(), elapsed_ms, 0, 0, None, None, 0, None),
+                    Ok(res) => interpret_dispatch_result(&ctx.unit_id, res),
+                };
+
+            // (#2193) No-progress bound — only over a dispatch that actually
+            // ran and reported a clean `"stop"`. Never overrides an already-
+            // `error`/`timeout` label: those are more specific failure shapes.
+            let out_dir = outcome.as_ref().ok().and_then(|r| r.out_dir.clone());
+            if result == "stop" {
+                if let Some(d) = &out_dir {
+                    if unit_hit_no_progress_bound(d, cfg.no_progress_turns) {
+                        result = UNIT_BUDGET_EXHAUSTED.to_string();
+                    }
                 }
+            }
+
+            let exclusions = out_dir.as_deref().map(count_rejected_create_findings).unwrap_or(0);
+            // (#2302) ONE read of `findings.jsonl` yields both the count and
+            // the keys.
+            let readback_into = if draw == 0 {
+                run_dir.join(format!("{}.findings.jsonl", ctx.unit_id))
+            } else {
+                run_dir.join(format!("{}.findings.jsonl.d{}", ctx.unit_id, draw + 1))
+            };
+            let (findings, finding_refs) = match &out_dir {
+                Some(d) => readback_findings(&ctx, d, &readback_into, model.as_deref(), &draw_session_id),
+                None => (0, Vec::new()),
+            };
+
+            total_wall_ms += wall_ms;
+            total_prompt_tokens += prompt_tokens;
+            total_completion_tokens += completion_tokens;
+            total_findings += findings as u64;
+            total_rejected += exclusions as u64;
+            all_finding_refs.extend(finding_refs);
+            last_result = result.clone();
+            last_model = model.clone();
+            last_detections = detections;
+            last_rest_ms = rest_ms;
+            last_host = host;
+
+            // A unit that did not converge fails its STEP: the run's
+            // outcome must not read clean when a unit errored. A
+            // budget-exhausted unit is a BOUND, not a failure, and
+            // completes (the summary counts it in its own bucket) — the
+            // same distinction the retired launcher drew between
+            // `units_errored` and `units_budget_exhausted`. A later draw
+            // is never attempted once an earlier one fails this way.
+            if result != "stop" && result != UNIT_BUDGET_EXHAUSTED {
+                let detail = match &outcome {
+                    Err(e) => format!("{e:#}"),
+                    Ok(_) => format!("dispatch ended `{result}`"),
+                };
+                let partial = UnitOutcome {
+                    schema_version: UNIT_OUTCOME_SCHEMA_VERSION.to_string(),
+                    unit: ctx.unit_id.clone(),
+                    rule: single_rule_id(&ctx.rule_ids),
+                    source: ctx.source.clone(),
+                    result: result.clone(),
+                    findings: total_findings,
+                    findings_rejected: total_rejected,
+                    wall_ms: total_wall_ms,
+                    prompt_tokens: total_prompt_tokens,
+                    completion_tokens: total_completion_tokens,
+                    model: last_model.clone(),
+                    out_dir: host_out.display().to_string(),
+                    rules: ctx.rule_ids.clone(),
+                    workspace: ctx.workspace.clone(),
+                    sha: ctx.sha.clone(),
+                    rest_ms: last_rest_ms,
+                    reason: None,
+                    detections: last_detections.clone(),
+                    host: last_host.clone(),
+                    finding_refs: dedup_finding_refs(all_finding_refs),
+                };
+                return Err(anyhow!(
+                    "`{CRAWL_UNIT_KIND}`: unit `{}` ended `{result}` on draw {} of {} — {detail} (outcome: {})",
+                    ctx.unit_id,
+                    draw + 1,
+                    cfg.draws,
+                    serde_json::to_string(&partial).unwrap_or_default()
+                ));
             }
         }
 
-        let exclusions = out_dir.as_deref().map(count_rejected_create_findings).unwrap_or(0);
-        // (#2302) ONE read of `findings.jsonl` yields both the count and
-        // the keys.
-        let (findings, finding_refs) = match &out_dir {
-            Some(d) => readback_findings(
-                &ctx,
-                d,
-                &run_dir.join(format!("{}.findings.jsonl", ctx.unit_id)),
-                model.as_deref(),
-            ),
-            None => (0, Vec::new()),
-        };
+        // (#2310 P4c-2b) Dedup ACROSS draws before this becomes the
+        // step's own output — a create-mods phase grows one coder task
+        // PER `finding_refs` entry (`crawl.summary`'s own `finding_refs`
+        // union), so an undeduped multi-draw unit would dispatch a coder
+        // twice at the "same" finding two draws independently observed.
+        let finding_refs = dedup_finding_refs(all_finding_refs);
 
         let outcome_record = UnitOutcome {
             schema_version: UNIT_OUTCOME_SCHEMA_VERSION.to_string(),
             unit: ctx.unit_id.clone(),
             rule: single_rule_id(&ctx.rule_ids),
             source: ctx.source.clone(),
-            result: result.clone(),
-            findings: findings as u64,
-            findings_rejected: exclusions as u64,
-            wall_ms,
-            prompt_tokens,
-            completion_tokens,
-            model: model.clone(),
+            result: last_result,
+            findings: total_findings,
+            findings_rejected: total_rejected,
+            wall_ms: total_wall_ms,
+            prompt_tokens: total_prompt_tokens,
+            completion_tokens: total_completion_tokens,
+            model: last_model,
             out_dir: host_out.display().to_string(),
             rules: ctx.rule_ids.clone(),
             workspace: ctx.workspace.clone(),
             sha: ctx.sha.clone(),
-            rest_ms,
+            rest_ms: last_rest_ms,
             // A row this kind produced itself always has its numbers; only
             // the summary's errored rows carry a reason.
             reason: None,
             // Present only when the dispatch actually produced them — an
             // omitted key reads as "never sampled", a null as "sampled
             // zero".
-            detections,
-            host,
+            detections: last_detections,
+            host: last_host,
             finding_refs,
         };
-
-        // A unit that did not converge fails its STEP: the run's outcome
-        // must not read clean when a unit errored. A budget-exhausted unit
-        // is a BOUND, not a failure, and completes (the summary counts it
-        // in its own bucket) — the same distinction the retired launcher
-        // drew between `units_errored` and `units_budget_exhausted`.
-        if result != "stop" && result != UNIT_BUDGET_EXHAUSTED {
-            let detail = match &outcome {
-                Err(e) => format!("{e:#}"),
-                Ok(_) => format!("dispatch ended `{result}`"),
-            };
-            return Err(anyhow!(
-                "`{CRAWL_UNIT_KIND}`: unit `{}` ended `{result}` — {detail} (outcome: {})",
-                ctx.unit_id,
-                serde_json::to_string(&outcome_record).unwrap_or_default()
-            ));
-        }
 
         Ok(StepOutcome {
             output: darkmux_crew::step_output::Output::wrap(
@@ -1188,6 +1298,28 @@ impl StepKind for CrawlUnitStepKind {
             flow_records: Vec::new(),
         })
     }
+}
+
+/// (#2310 P4c-2b) Dedup [`FindingRef`]s across a unit's draws — DESIGN.md
+/// "A draws-per-unit knob... ports the measured k-draw recall technique
+/// from the funnel", and the funnel's own dedup key is what two draws
+/// independently observing the SAME underlying issue share: the rule and
+/// the exact window (`rule`, `file`, `line`) — NEVER the store `key`
+/// (`<dispatch session>/<seq>`), which is unique per draw by construction
+/// and so could never collide. First occurrence (draw order) wins; a
+/// finding whose `file`/`line` is absent (a rare, non-windowed report)
+/// dedups on `(rule, None, None)`, which still merges two IDENTICAL
+/// windowless reports of the same rule rather than doubling them.
+fn dedup_finding_refs(refs: Vec<FindingRef>) -> Vec<FindingRef> {
+    let mut seen: std::collections::BTreeSet<(String, Option<String>, Option<u64>)> = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(refs.len());
+    for r in refs {
+        let finding_key = (r.rule.clone(), r.file.clone(), r.line);
+        if seen.insert(finding_key) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 // ── the `crawl.summary` step kind ────────────────────────────────────────

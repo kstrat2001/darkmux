@@ -173,6 +173,14 @@ pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
     // validates its graph without an unknown-kind warning and so the graph
     // is constructible the day the literal launcher retires (#2301).
     darkmux_lab::crawl::plan_step::register_crawl_kinds(&registry).context("registering crawl step kinds")?;
+    // (#2310 P4c-2b) `review-v2.json`'s `deliver` phase — gather this run's
+    // own finding/mod records, render a GitHub review payload. Neither is
+    // wired into `StepKindRegistry::with_builtins()`'s always-on set (see
+    // each kind's own module doc for why).
+    crew::step_kinds::register_records_gather_kind(&registry).context("registering records.gather")?;
+    crew::step_kinds::register_deliver_kind(&registry).context("registering deliver.github_review")?;
+    // (#2310 P4c-2b) `review-v2.json`'s `create-mod` task's `gate-step`.
+    crew::step_kinds::register_mods_gate_kind(&registry).context("registering mods.gate")?;
     Ok(registry)
 }
 

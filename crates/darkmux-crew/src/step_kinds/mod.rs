@@ -43,7 +43,14 @@ mod builtins;
 /// into `StepKindRegistry::with_builtins()`'s always-on five. See the
 /// module's own doc for the full reasoning.
 mod deliver_github_review;
+/// `mods.gate` (#2310 P4c-2b) — Tier 1, physically its own file for the
+/// same monolith-avoidance reason `deliver_github_review` states for
+/// itself. See that module's own doc.
+mod mods_gate;
 pub mod patterns;
+/// `records.gather` (#2310 P4c-2b) — Tier 1, physically its own file, same
+/// reason. See that module's own doc.
+mod records_gather;
 mod registry;
 mod types;
 
@@ -72,6 +79,11 @@ pub use builtins::MAP_BUDGET_SKIP_ERROR;
 pub use deliver_github_review::{
     register_deliver_kind, render_github_review, DeliverGithubReviewStepKind, DeliverOutcome,
     DeliverScope, GatedMod, GithubReviewComment, GithubReviewPayload, DELIVER_GITHUB_REVIEW_KIND,
+};
+pub use mods_gate::{register_mods_gate_kind, ModsGateStepKind, MODS_GATE_KIND};
+pub use records_gather::{
+    register_records_gather_kind, GatherOutput, RecordsGatherStepKind, RECORDS_GATHER_KIND,
+    RECORDS_GATHER_OUTPUT_KIND,
 };
 pub use registry::StepKindRegistry;
 pub use types::{

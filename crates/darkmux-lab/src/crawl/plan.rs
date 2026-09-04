@@ -2227,6 +2227,63 @@ line two
         assert_eq!(files, vec!["f.ts"], "the .py file must be filtered out by the rule's own applies_to: {files:?}");
     }
 
+    /// (#2310 P4c-2b) `plan_diff_rule_still_honors_the_rules_own_applies_to_glob`
+    /// above proves the populated-`applies_to` branch of `FilteredDiffSource`
+    /// (line ~1090, `glob::applies(self.applies_to, self.exclude, ...)`)
+    /// honors `applies_to` — but every file it plants is either admitted by
+    /// BOTH `applies_to` and `exclude`, or excluded from `applies_to`
+    /// entirely (`f.py`), so `exclude` itself is unproven on THIS branch: a
+    /// mutation dropping `self.exclude` from that call (leaving only
+    /// `glob::applies(self.applies_to, &[], ...)`) would still pass every
+    /// existing test — `plan_diff_rule_honors_exclude_even_when_applies_to_is_empty`
+    /// only exercises the OTHER (empty-`applies_to`) branch. This plants a
+    /// file that matches `applies_to` (`**/*.ts`) AND `exclude`
+    /// (`**/tests/**`) at once, on a rule with a real, non-empty
+    /// `applies_to` — `swallowed-error`, same rule the sibling test above
+    /// uses.
+    #[test]
+    fn plan_diff_rule_honors_exclude_on_the_populated_applies_to_branch_too() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(dir.path().join("src/f.ts"), "  } catch (e) {\n  }\n").unwrap();
+        fs::write(dir.path().join("tests/f.ts"), "  } catch (e) {\n  }\n").unwrap();
+        let diff_text = [
+            "diff --git a/src/f.ts b/src/f.ts",
+            "--- a/src/f.ts",
+            "+++ b/src/f.ts",
+            "@@ -1,2 +1,2 @@",
+            "   } catch (e) {",
+            "   }",
+            "diff --git a/tests/f.ts b/tests/f.ts",
+            "--- a/tests/f.ts",
+            "+++ b/tests/f.ts",
+            "@@ -1,2 +1,2 @@",
+            "   } catch (e) {",
+            "   }",
+        ]
+        .join("\n")
+            + "\n";
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"b".repeat(40))], Vec::new());
+        let (rules, _) = darkmux_crew::rules::load_all(None);
+        let rule = rules["swallowed-error"].clone();
+        assert!(!rule.applies_to.is_empty(), "the rule this test relies on must still declare applies_to");
+        assert!(
+            rule.exclude.iter().any(|p| p.contains("tests")),
+            "the rule this test relies on must still exclude a tests/ path"
+        );
+
+        let plan = plan_diff_rule(&materialized, &rule, &diff_text, PlanParams::default()).unwrap();
+        let files: Vec<&str> =
+            plan.units.iter().flat_map(|u| if let Unit::Site { sites, .. } = u { sites.iter().map(|s| s.file.as_str()).collect() } else { vec![] }).collect();
+        assert_eq!(
+            files,
+            vec!["src/f.ts"],
+            "tests/f.ts matches applies_to but must still be filtered out by exclude, even on the \
+             populated-applies_to branch: {files:?}"
+        );
+    }
+
     /// (#2310 P4c review round 2, MUST FIX 1 — proven) `FilteredDiffSource`
     /// used to short-circuit `if applies_to.is_empty() { return all }`,
     /// dropping `exclude` entirely for any rule with no `applies_to` glob
@@ -2993,5 +3050,299 @@ line two
             })
             .collect();
         assert_eq!(files_hit, vec!["real.ts"], "{files_hit:?}");
+    }
+
+    // ─── #2310 P4c-2b item 5: review-v2 fixture + harness ──────────────
+
+    /// Scopes `DARKMUX_HOME` for one test and restores the prior value —
+    /// same pattern `crawl::unit_step_tests::HomeGuard` uses.
+    struct ReviewV2HomeGuard(Option<String>);
+    impl ReviewV2HomeGuard {
+        fn set(p: &Path) -> Self {
+            let prior = std::env::var("DARKMUX_HOME").ok();
+            std::env::set_var("DARKMUX_HOME", p);
+            Self(prior)
+        }
+    }
+    impl Drop for ReviewV2HomeGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+    }
+
+    fn review_v2_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/review-v2")
+    }
+
+    fn review_v2_diff_text() -> String {
+        fs::read_to_string(review_v2_fixture_dir().join("diff.patch")).unwrap()
+    }
+
+    /// (#2310 P4c-2b item 5) `review-v2`'s own fixture + harness: five
+    /// rules PLAN for real over the checked-in fixture tree + diff (the
+    /// two rules review-v2 reuses from crawl, `swallowed-error`/
+    /// `unnamed-predicate` — DESIGN.md's confirm=`mod` pair — plus the
+    /// three P4c-2b names explicitly: `existing-solution` (confirm=
+    /// `question`), `union-vs-enum` and `shared-symbol-callers` (both
+    /// confirm=`search`)); then, with STUB finding/mod producers (no
+    /// model, no container — the same discipline `deliver_github_review`'s
+    /// own golden test uses), one finding per rule feeds `records.gather`
+    /// → `deliver.github_review` (the SAME same-task-predecessor `input`
+    /// wiring `review-v2.json`'s `deliver` phase uses) and the rendered
+    /// payload is compared byte-for-byte against a committed golden.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn review_v2_fixture_plans_every_rule_and_delivers_one_comment_per_form() {
+        use darkmux_crew::step_kinds::StepKind as _;
+        let home = TempDir::new().unwrap();
+        let _g = ReviewV2HomeGuard::set(home.path());
+        const MISSION: &str = "review-v2-2310-fixture";
+        const PHASE: &str = "review-v2-2310-fixture-deliver";
+        darkmux_crew::lifecycle::save_phase(&darkmux_crew::types::Phase {
+            id: PHASE.into(),
+            mission_id: MISSION.into(),
+            description: String::new(),
+            display_name: None,
+            status: darkmux_crew::types::PhaseStatus::Running,
+            created_ts: 1,
+            started_ts: None,
+            completed_ts: None,
+            abandoned_ts: None,
+            task_ids: vec!["deliver".into()],
+        })
+        .unwrap();
+
+        // ── plan every rule for real, over the fixture ─────────────────
+        let tree = review_v2_fixture_dir().join("tree");
+        let diff_text = review_v2_diff_text();
+        let materialized = materialized_for(vec![diff_source_at(&tree, "app", &"f".repeat(40))], Vec::new());
+        let (rules, _) = darkmux_crew::rules::load_all(None);
+        for rule_id in ["existing-solution", "union-vs-enum", "shared-symbol-callers", "swallowed-error", "unnamed-predicate"] {
+            let rule = rules.get(rule_id).unwrap_or_else(|| panic!("rule {rule_id} must be registered"));
+            let plan = plan_diff_rule(&materialized, rule, &diff_text, PlanParams::default())
+                .unwrap_or_else(|e| panic!("planning {rule_id}: {e:#}"));
+            assert!(
+                !plan.units.is_empty(),
+                "rule {rule_id} must plan at least one site over the fixture diff — the mechanical prefilter/window step found nothing"
+            );
+            // Written to disk in the SAME envelope + path `plan.sites`
+            // writes for a real launch (`<missions_dir>/<mission>/plan/
+            // <rule>.json`) — `records.gather`'s own `plan_totals` reads
+            // this to compute `scope.rules_run`/`hunks_covered`.
+            let wrapped = darkmux_crew::step_output::Output::wrap(
+                crate::crawl::plan_step::CRAWL_PLAN_OUTPUT_KIND,
+                plan,
+                darkmux_crew::step_output::Producer::of(MISSION, "plan-task", "plan-step"),
+            );
+            let plan_path =
+                darkmux_crew::loader::missions_dir().join(MISSION).join("plan").join(format!("{rule_id}.json"));
+            crate::crawl::plan_step::write_plan(&plan_path, &wrapped).unwrap();
+        }
+
+        // ── stub finding + mod producers — one finding per rule, one per delivery form ──
+        let findings_root = darkmux_crew::findings::findings_dir();
+        let mods_root = darkmux_crew::mods::mods_dir();
+        let mk_finding = |dispatch: &str, seq: u64, rule: &str, confirm: Option<&str>, file: &str, line: u32, evidence: &str, why: &str| {
+            let mut context = serde_json::json!({ "rule": rule });
+            if let Some(c) = confirm {
+                context["confirm"] = serde_json::json!(c);
+            }
+            let rec = darkmux_crew::findings::build_record(
+                dispatch,
+                seq,
+                "2026-09-05T00:00:00Z".to_string(),
+                "create_finding",
+                darkmux_crew::findings::Proposer { handle: "reviewer".into(), model: "test".into(), machine_id: None },
+                darkmux_crew::findings::Scope { mission_id: Some(MISSION.into()), phase_id: Some(PHASE.into()), step_id: None },
+                Some(context),
+                serde_json::json!({ "file": file, "line": line, "pattern": rule, "evidence": evidence, "why": why }),
+            );
+            darkmux_crew::findings::materialize(&findings_root, &rec).unwrap();
+            rec.key
+        };
+
+        // swallowed-error (confirm=mod) — a GATE-PASSED, in-diff unified-diff
+        // mod, so it renders as an inline suggestion.
+        let se_key = mk_finding(
+            "sess-fix",
+            1,
+            "swallowed-error",
+            None,
+            "src/billing.ts",
+            5,
+            "} catch (e) {",
+            "the catch block swallows the error",
+        );
+        // unnamed-predicate (confirm=mod), gate-FAILED — a double-check bullet.
+        let up_key = mk_finding(
+            "sess-fix",
+            2,
+            "unnamed-predicate",
+            None,
+            "src/auth.ts",
+            3,
+            "if ((user.role === \"admin\" ...",
+            "the condition is hard to read at a glance",
+        );
+        // existing-solution (confirm=question) — a question bullet.
+        let es_key = mk_finding(
+            "sess-fix",
+            3,
+            "existing-solution",
+            Some("question"),
+            "src/retry.ts",
+            3,
+            "export function retryWithBackoff",
+            "did you check for an existing retry helper",
+        );
+        // union-vs-enum (confirm=search) — a search bullet. The search
+        // form's rendered bullet reads `evidence` (the candidates found),
+        // never `why` — see `render_github_review`'s `DeliveryForm::Search`
+        // arm.
+        let uve_key = mk_finding(
+            "sess-fix",
+            4,
+            "union-vs-enum",
+            Some("search"),
+            "src/status.ts",
+            3,
+            "LogLevel in types.ts overlaps this new union",
+            "a new string-literal union may duplicate an existing enum",
+        );
+        // shared-symbol-callers (confirm=search) — a second search bullet.
+        let ssc_key = mk_finding(
+            "sess-fix",
+            5,
+            "shared-symbol-callers",
+            Some("search"),
+            "src/shared.ts",
+            4,
+            "3 callers found: caller_a.ts, caller_b.ts, caller_c.ts",
+            "a shared function's signature changed",
+        );
+
+        const CLAMP_KIT: &str = "diff --git a/src/billing.ts b/src/billing.ts\n--- a/src/billing.ts\n+++ b/src/billing.ts\n@@ -5,1 +5,1 @@\n-  } catch (e) {\n+  } catch (e) {\n+    console.error(e);\n";
+        let mk_mod = |key: &str, for_key: &str, kit: &str, kit_kind: Option<&str>, gate: Option<bool>| {
+            let rec = darkmux_crew::mods::ModRecord {
+                key: key.to_string(),
+                ts: "2026-09-05T00:00:01Z".to_string(),
+                by: "coder".to_string(),
+                r#for: vec![for_key.to_string()],
+                kit: Some(kit.to_string()),
+                kit_looks_json: false,
+                kit_kind: kit_kind.map(str::to_string),
+                attachments: Vec::new(),
+                context: darkmux_crew::mods::ModContext {
+                    findings: vec![darkmux_crew::mods::ForFinding {
+                        key: for_key.to_string(),
+                        mission_id: Some(MISSION.into()),
+                        context: None,
+                        emitted: None,
+                        missing: false,
+                    }],
+                },
+                warnings: Vec::new(),
+                mission_id: Some(MISSION.into()),
+                phase_id: Some(PHASE.into()),
+                step_id: None,
+                gate: None,
+                gate_skipped_reason: None,
+                schema_version: darkmux_crew::mods::MOD_SCHEMA_VERSION.to_string(),
+                extras: Default::default(),
+            };
+            darkmux_crew::mods::materialize(&mods_root, &rec).unwrap();
+            if let Some(passed) = gate {
+                darkmux_crew::mods::record_gate(
+                    &mods_root,
+                    key,
+                    Some(darkmux_crew::mods::GateOutcome { passed, command: "true".into(), exit_code: Some(if passed { 0 } else { 1 }) }),
+                    None,
+                )
+                .unwrap();
+            }
+        };
+        mk_mod("mod-se", &se_key, CLAMP_KIT, Some("unified-diff"), Some(true));
+        mk_mod("mod-up", &up_key, "a proposed fix nobody sees", None, Some(false));
+
+        // ── records.gather then deliver.github_review, same two-step-task wiring `review-v2.json` uses ──
+        let gather_step = darkmux_crew::types::Step {
+            id: "records-gather-step".into(),
+            task_id: "deliver".into(),
+            kind: darkmux_crew::step_kinds::RECORDS_GATHER_KIND.into(),
+            gate: None,
+            status: darkmux_crew::types::NodeStatus::Planned,
+            config: serde_json::json!({ "diff_file": review_v2_fixture_dir().join("diff.patch").to_string_lossy() }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "deliver".into(),
+            phase_id: PHASE.into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["records-gather-step".into(), "deliver-step".into()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+            run_on: darkmux_crew::types::default_run_on(),
+        };
+        let gather_out =
+            darkmux_crew::step_kinds::RecordsGatherStepKind.run(&gather_step, &task, &std::collections::BTreeMap::new()).unwrap();
+        let mut input = std::collections::BTreeMap::new();
+        input.insert("records-gather-step".to_string(), gather_out.output);
+
+        let emit_path = home.path().join("review-payload.json");
+        let deliver_step = darkmux_crew::types::Step {
+            id: "deliver-step".into(),
+            task_id: "deliver".into(),
+            kind: darkmux_crew::step_kinds::DELIVER_GITHUB_REVIEW_KIND.into(),
+            gate: None,
+            status: darkmux_crew::types::NodeStatus::Planned,
+            config: serde_json::json!({
+                "emit": emit_path.to_string_lossy(),
+                "attribution": "darkmux review-v2 — advisory, not a merge gate."
+            }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        darkmux_crew::step_kinds::DeliverGithubReviewStepKind.run(&deliver_step, &task, &input).unwrap();
+        let payload: darkmux_crew::step_kinds::DeliverOutcome =
+            serde_json::from_str(&fs::read_to_string(&emit_path).unwrap()).unwrap();
+        assert_eq!(payload.mode, "review");
+        let review = payload.review.clone().unwrap();
+
+        // one comment per delivery form, plus the scope line naming every rule run
+        assert_eq!(review.comments.len(), 1, "exactly one in-diff suggestion (swallowed-error's gated mod): {review:?}");
+        assert!(review.body.contains("review ran: 5 rule(s)"), "{}", review.body);
+        assert!(review.body.contains(&up_key), "gate-failed unnamed-predicate mod renders as a double-check: {}", review.body);
+        assert!(review.body.contains(&es_key), "existing-solution renders as a question: {}", review.body);
+        assert!(review.body.contains("did you check for an existing retry helper"));
+        assert!(review.body.contains(&uve_key), "union-vs-enum renders as a search bullet: {}", review.body);
+        assert!(review.body.contains(&ssc_key), "shared-symbol-callers renders as a search bullet: {}", review.body);
+        assert!(review.body.contains("3 callers found"));
+
+        let actual = serde_json::to_string_pretty(&payload).unwrap();
+        let golden_path = review_v2_fixture_dir().join("golden-payload.json");
+        if std::env::var("DARKMUX_REVIEW_V2_GOLDEN_UPDATE").is_ok() {
+            fs::write(&golden_path, format!("{actual}\n")).unwrap();
+        } else {
+            let expected = fs::read_to_string(&golden_path).unwrap_or_else(|_| {
+                panic!("read {} — run with DARKMUX_REVIEW_V2_GOLDEN_UPDATE=1 to generate it", golden_path.display())
+            });
+            assert_eq!(
+                actual.trim_end(),
+                expected.trim_end(),
+                "the rendered payload drifted from the committed golden at {}",
+                golden_path.display()
+            );
+        }
     }
 }
