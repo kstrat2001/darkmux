@@ -123,7 +123,7 @@ pub struct FindingRef {
     /// The ONE rule id this finding was recorded under.
     pub rule: String,
     /// The materialized workspace root the unit was dispatched against —
-    /// the same directory `crawl.unit` mounts, so a follow-on step can
+    /// the same directory `crawl.unit` mounts, so a create-mods step can
     /// name it as its `workdir` and see the very tree the finding cites.
     pub tree_root: String,
 }
@@ -545,7 +545,7 @@ fn readback_findings(
     };
     // (#2302) A key's dispatch half becomes a path segment under the
     // finding store, so a session id that could escape it produces NO refs
-    // at all rather than an unresolvable key a follow-on would refuse on.
+    // at all rather than an unresolvable key a create-mods step would refuse on.
     // The COUNT is unaffected: the unit observed what it observed, whether
     // or not the observations can be addressed. The crawl mints its own
     // session ids, so this is a backstop, not an expected path — and it is
@@ -1068,7 +1068,7 @@ pub struct CrawlSummary {
     #[serde(default)]
     pub units: Vec<UnitOutcome>,
     /// (#2302) Every finding this run recorded, named by store key — the
-    /// union over [`Self::units`] in unit order, and the array a follow-on
+    /// union over [`Self::units`] in unit order, and the array a create-mods phase
     /// phase GROWS one task from (`grow: { from: "summary", items:
     /// "finding_refs" }`). `findings` above stays the COUNT under the name
     /// the retired launcher's close payload used; this is the roster.

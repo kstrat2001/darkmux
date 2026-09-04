@@ -232,7 +232,7 @@ def blob: (.payload.emitted
 darkmux mod list [--for &lt;finding&gt;] [--mission &lt;id&gt;] [--json]
 darkmux mod show &lt;key&gt;</code></pre>
     <p><code>darkmux dispatch &lt;role&gt; --finding &lt;key&gt; --mod &lt;key&gt;</code> (both repeatable) appends those stored records to the brief verbatim; a mod's attached files are mounted read-only at <code>/darkmux-mods/&lt;key&gt;/attachments/</code>.</p>
-    <p><strong>Follow-on steps, off by default.</strong> <code>crawl.json</code> declares a fourth phase whose one task grows a <code>coder</code> dispatch per finding, each handed that finding's record and asked to record its change with <code>create_mod</code>. Copy the config to <code>~/.darkmux/mission-configs/crawl.json</code> and set <code>"enabled": true</code> on that task to turn it on; a key naming no stored record refuses the step rather than dispatching blind.</p>
+    <p><strong>Create mods, off by default.</strong> <code>crawl.json</code> declares a fourth phase whose one task grows a <code>coder</code> dispatch per finding, each handed that finding's record and asked to record its change with <code>create_mod</code>. Copy the config to <code>~/.darkmux/mission-configs/crawl.json</code> and set <code>"enabled": true</code> on that task to turn it on; a key naming no stored record refuses the step rather than dispatching blind.</p>
     <p>Both stores relocate with <code>DARKMUX_FINDINGS_DIR</code> / <code>DARKMUX_MODS_DIR</code>; see <a href="https://github.com/kstrat2001/darkmux/blob/main/docs/ENVIRONMENT.md">ENVIRONMENT.md</a>.</p>
   </div>
 </section>

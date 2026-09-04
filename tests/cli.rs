@@ -4049,11 +4049,11 @@ fn crawl_dry_run_prints_the_graph_the_launch_would_mint() {
     for want in ["Plan", "Crawl", "Summarize", "crawl.plan", "crawl.unit", "crawl.summary"] {
         assert!(stdout.contains(want), "dry run never mentioned `{want}`:\n{stdout}");
     }
-    // (#2302) The follow-on phase ships OFF, so it is PRUNED at mint and
+    // (#2302) The create-mods phase ships OFF, so it is PRUNED at mint and
     // the default graph ends at Summarize — never drawn gray.
     assert!(
-        !stdout.contains("Follow-on"),
-        "the follow-on task is `enabled: false`, so its phase is pruned:\n{stdout}"
+        !stdout.contains("Create mods"),
+        "the create-mod task is `enabled: false`, so its phase is pruned:\n{stdout}"
     );
     assert!(
         stdout.trim_end().ends_with("[crawl.summary]"),
@@ -4063,11 +4063,11 @@ fn crawl_dry_run_prints_the_graph_the_launch_would_mint() {
     assert!(!workdir.path().join("missions").exists(), "a dry run mints nothing");
 }
 
-/// (#2302) The same document with the follow-on task turned ON — a
+/// (#2302) The same document with the create-mod task turned ON — a
 /// user-tier copy of `crawl.json`, which is exactly how an operator enables
 /// it — shows the template in the graph it would mint.
 #[test]
-fn crawl_dry_run_shows_the_follow_on_template_when_a_user_tier_copy_enables_it() {
+fn crawl_dry_run_shows_the_create_mod_template_when_a_user_tier_copy_enables_it() {
     let workdir = TempDir::new().unwrap();
     let app = workdir.path().join("app");
     let lib = workdir.path().join("lib");
@@ -4082,9 +4082,9 @@ fn crawl_dry_run_shows_the_follow_on_template_when_a_user_tier_copy_enables_it()
     ))
     .expect("the built-in crawl config parses");
     let phases = doc["phases"].as_array_mut().unwrap();
-    let follow_on = phases.last_mut().expect("the follow-on phase");
-    assert_eq!(follow_on["id"], serde_json::json!("follow-on"));
-    follow_on["tasks"][0]["enabled"] = serde_json::json!(true);
+    let create_mods = phases.last_mut().expect("the create-mods phase");
+    assert_eq!(create_mods["id"], serde_json::json!("create-mods"));
+    create_mods["tasks"][0]["enabled"] = serde_json::json!(true);
     let config_dir = workdir.path().join("mission-configs");
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(config_dir.join("crawl.json"), doc.to_string()).unwrap();
@@ -4092,7 +4092,7 @@ fn crawl_dry_run_shows_the_follow_on_template_when_a_user_tier_copy_enables_it()
     let out = crawl_dry_run(&workdir, &spec_path, &[]);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Follow-on"), "the enabled phase is in the graph:\n{stdout}");
+    assert!(stdout.contains("Create mods"), "the enabled phase is in the graph:\n{stdout}");
     assert!(stdout.contains("dispatch.internal"), "and its step is a coder dispatch:\n{stdout}");
 }
 
@@ -4219,10 +4219,10 @@ fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {
 }
 
 /// (#2302) `mission config show crawl --json` says which tasks the mint
-/// would prune. The follow-on ships OFF; every other task in the document
+/// would prune. The create-mod task ships OFF; every other task in the document
 /// declares no gate at all and runs.
 #[test]
-fn mission_config_show_names_the_follow_on_task_as_disabled() {
+fn mission_config_show_names_the_create_mod_task_as_disabled() {
     let home = TempDir::new().unwrap();
     let out = Command::cargo_bin("darkmux")
         .unwrap()
@@ -4234,12 +4234,12 @@ fn mission_config_show_names_the_follow_on_task_as_disabled() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("--json is JSON");
     let phases = v["phases"].as_array().expect("phases");
-    let follow_on = phases.last().expect("the follow-on phase");
-    assert_eq!(follow_on["id"], serde_json::json!("follow-on"));
+    let create_mods = phases.last().expect("the create-mods phase");
+    assert_eq!(create_mods["id"], serde_json::json!("create-mods"));
     assert_eq!(
-        follow_on["tasks"][0]["enabled"],
+        create_mods["tasks"][0]["enabled"],
         serde_json::json!(false),
-        "the gate is VISIBLE, not inferred from the description: {follow_on}"
+        "the gate is VISIBLE, not inferred from the description: {create_mods}"
     );
     for phase in &phases[..phases.len() - 1] {
         for task in phase["tasks"].as_array().unwrap() {
@@ -4261,7 +4261,7 @@ fn mission_config_show_names_the_follow_on_task_as_disabled() {
 /// refuses a key that addresses no stored record, and it refuses BEFORE any
 /// model or container work, so the refusal is both the proof that the
 /// substituted ref reached `dispatch.internal` and the proof of the
-/// readiness guard the follow-on phase leans on — with no docker, no model
+/// readiness guard the create-mods phase leans on — with no docker, no model
 /// and no dispatch anywhere in this test.
 #[test]
 #[serial_test::serial]
