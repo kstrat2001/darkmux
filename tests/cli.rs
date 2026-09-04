@@ -5396,12 +5396,15 @@ fn review_v2_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
 /// adds actually MINTS and RUNS to completion end to end through the real
 /// CLI, and that the `--param emit=<path>` this packet wires reaches
 /// `deliver.github_review`'s config and gets a real file written to it. A
-/// stub dispatch produces no real findings, so the payload's own `mode` is
-/// legitimately `"noop"` here — this test is about the WIRING (the phase
-/// existing, running, and writing its file), not about model behavior;
+/// stub dispatch produces no real findings AND makes the grown unit step
+/// end `Error` (`/usr/bin/true`'s trivial reply isn't the JSON envelope
+/// the runtime expects), so the payload's own `mode` is `"degraded"`
+/// (#2310 P4c-2b PR #2357 review MUST FIX D) — this test is about the
+/// WIRING (the phase existing, running, and writing its file) and about
+/// the mode being HONEST about the error, not about model behavior;
 /// `crates/darkmux-lab/src/crawl/plan.rs`'s own
 /// `review_v2_fixture_plans_every_rule_and_delivers_one_comment_per_form`
-/// unit test is what proves the RENDER with real (stubbed) records.
+/// unit test is what proves the full RENDER with real (stubbed) records.
 #[test]
 fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     let workdir = TempDir::new().unwrap();
@@ -5505,9 +5508,98 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     assert!(emit_path.exists(), "deliver.github_review must have written its emit file:\n{combined}");
     let payload: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&emit_path).unwrap()).expect("the emit file is valid DeliverOutcome JSON");
+    // (#2310 P4c-2b PR #2357 review MUST FIX D, fixed here per the
+    // review's own instruction: "fix the CLI test that accepts noop ||
+    // review to assert the exact mode per scenario") `DARKMUX_LMS_BIN=
+    // /usr/bin/true` stubs the unit's dispatch to a trivial, non-JSON
+    // reply, so the grown `unit-swallowed-error` step ends `Error` — a
+    // run with zero findings AND a real error is `"degraded"`, never the
+    // `"noop"` a clean run gets. The scope line names the errored unit.
+    assert_eq!(payload["mode"], serde_json::json!("degraded"), "{payload}");
+    let body = payload["review"]["body"].as_str().unwrap();
+    assert!(body.contains("Errored:") && body.contains("unit-swallowed-error"), "{payload}");
+}
+
+/// (#2310 P4c-2b PR #2357 review MUST FIX C, the reviewer's own live
+/// probe reproduced) A `workspace` naming a source path that does not
+/// exist makes the `plan-swallowed-error` STEP itself end `Error` (the
+/// materialize fails before any hunk is ever read) — before this fix,
+/// `src/mission_launch.rs::grow_phase` `bail!`ed the WHOLE launch the
+/// moment `unit-swallowed-error`'s grow tried to read that errored plan
+/// step's output, so `summarize`/`create-mods`/`deliver` never even
+/// minted and no `emit` file was ever written: "an errored run renders
+/// nothing", the exact defect DESIGN.md's own retirement finding names.
+/// After the fix: `unit-swallowed-error` grows ZERO copies (not an
+/// abort), the phase loop continues, and `deliver` — `run_on:
+/// ["complete","error"]`, no `depends_on` at all (naming a grow TEMPLATE
+/// in `depends_on` is refused at validation) — runs regardless, off
+/// phase-ordering alone (the same mechanism `crawl.json`'s `summarize`
+/// phase already relies on). Its scope line names the failed rule via
+/// `not_attempted`, and `mode` is `"degraded"` (MUST FIX D) since the
+/// plan step itself errored.
+#[test]
+fn review_v2_real_launch_survives_a_plan_phase_error_and_still_delivers() {
+    let workdir = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    // Deliberately a path that does not exist — `workspace_spec::
+    // materialize` fails on it, so `plan-swallowed-error-step` (a STATIC,
+    // always-minted task — not a grow template) ends `Error`.
+    let missing_source = workdir.path().join("does-not-exist");
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(
+        &spec_path,
+        serde_json::json!({
+            "name": "review-v2-plan-error-launch",
+            "sources": [{"id": "app", "path": missing_source.to_string_lossy(), "ref": "main"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // A diff naming the same (nonexistent) source — `plan.sites` reads
+    // `diff_file` before it ever needs the tree, but `materialize` runs
+    // first and is what actually fails.
+    let diff_path = workdir.path().join("d.diff");
+    fs::write(
+        &diff_path,
+        "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,2 +1,3 @@\n function f() {\n+  g();\n }\n",
+    )
+    .unwrap();
+    let emit_path = workdir.path().join("review-payload.json");
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "mission",
+            "launch",
+            "review-v2",
+            "--param",
+            &format!("workspace={}", spec_path.display()),
+            "--param",
+            &format!("diff_file={}", diff_path.display()),
+            "--param",
+            "rules=swallowed-error",
+            "--param",
+            &format!("emit={}", emit_path.display()),
+        ])
+        .output()
+        .expect("mission launch review-v2 runs");
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    // MUST FIX C's own claim: the launch does NOT abort — `deliver` still
+    // mints and runs, and the emit file still exists.
     assert!(
-        payload["mode"] == serde_json::json!("noop") || payload["mode"] == serde_json::json!("review"),
-        "{payload}"
+        emit_path.exists(),
+        "the deliver phase must still run and write its emit file even though the plan step errored:\n{combined}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&emit_path).unwrap()).expect("the emit file is valid DeliverOutcome JSON");
+    assert_eq!(payload["mode"], serde_json::json!("degraded"), "{payload}");
+    let body = payload["review"]["body"].as_str().unwrap();
+    assert!(
+        body.contains("Not attempted:") && body.contains("swallowed-error"),
+        "the scope line must name the rule whose plan step failed: {payload}"
     );
 }
 

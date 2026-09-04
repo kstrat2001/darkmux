@@ -147,20 +147,36 @@ pub struct ModContext {
 /// is a moment too.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GateOutcome {
-    /// `true` — the command exited `0`. `false` — anything else (nonzero
-    /// exit, or the process could not even be spawned; see
-    /// [`Self::exit_code`]).
+    /// `true` — the mod's kit applied AND the command exited `0` against
+    /// the PATCHED checkout. `false` — the kit failed to apply (see
+    /// [`Self::applied`]/[`Self::reason`]), or the command ran against the
+    /// patched checkout and exited nonzero. A run that could not even be
+    /// ATTEMPTED (a missing workdir, an unspawnable command) is never
+    /// represented by this type at all — that is `ModRecord::
+    /// gate_skipped_reason`'s job (a genuine infrastructure failure is a
+    /// SKIP, never a false "the mod's change is bad" answer).
     pub passed: bool,
     /// The command that ran, verbatim, so a gated mod is self-describing —
     /// a reader never has to go find `review-v2.json`'s own `test_command`
     /// input to know what confirmed (or failed to confirm) this mod.
     pub command: String,
-    /// The process's own exit code, when it ran to completion. `None`
-    /// when the command could not be spawned at all (a missing
-    /// interpreter, an unreadable `workdir`) — that failure still sets
-    /// `passed: false`, but there is no exit code to report.
+    /// The process's own exit code, when the command actually ran to
+    /// completion against a patched checkout. `None` when it never ran at
+    /// all — the kit failed to apply, so there was nothing to test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// (#2310 P4c-2b PR #2357 review MUST FIX A) Whether the mod's kit was
+    /// actually applied to a scratch checkout before `command` ran —
+    /// `false` means `command` never ran (the kit didn't apply); `true`
+    /// means it did, and `passed` reflects the command's own exit. `None`
+    /// only for pre-fix records (additive field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<bool>,
+    /// A human-readable reason for `passed: false` when the failure isn't
+    /// simply "the command exited nonzero" — e.g. `"kit did not apply"`.
+    /// `None` for an ordinary command-exit outcome (pass OR fail).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One mod, as stored at `<mods dir>/<key>/mod.json`.
@@ -1514,6 +1530,107 @@ mod tests {
             rec.key = bad.to_string();
             assert!(materialize(tmp.path(), &rec).is_err(), "must be refused: {bad:?}");
         }
+    }
+
+    fn a_gateable_mod(key: &str) -> ModRecord {
+        ModRecord {
+            key: key.to_string(),
+            ts: "2026-09-05T00:00:00Z".into(),
+            by: "coder".into(),
+            r#for: vec![],
+            kit: Some("k".into()),
+            kit_looks_json: false,
+            kit_kind: None,
+            attachments: vec![],
+            context: ModContext::default(),
+            warnings: Vec::new(),
+            mission_id: None,
+            phase_id: None,
+            step_id: None,
+            gate: None,
+            gate_skipped_reason: None,
+            schema_version: MOD_SCHEMA_VERSION.into(),
+            extras: serde_json::Map::new(),
+        }
+    }
+
+    /// (#2310 P4c-2b PR #2357 review item G) `record_gate`'s own direct
+    /// test — every existing coverage of it was indirect, through
+    /// `mods_gate`'s step-level tests.
+    #[test]
+    fn record_gate_writes_the_outcome_onto_an_existing_mod() {
+        let tmp = TempDir::new().unwrap();
+        materialize(tmp.path(), &a_gateable_mod("mod-g1")).unwrap();
+
+        let res = record_gate(
+            tmp.path(),
+            "mod-g1",
+            Some(GateOutcome { passed: true, command: "cargo test".into(), exit_code: Some(0), applied: Some(true), reason: None }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(res, Materialized::Created);
+
+        let rec = load_at(tmp.path(), "mod-g1").unwrap().unwrap();
+        assert!(rec.gate.as_ref().unwrap().passed);
+        assert_eq!(rec.gate.as_ref().unwrap().command, "cargo test");
+        assert!(rec.gate_skipped_reason.is_none());
+    }
+
+    /// (#2310 P4c-2b PR #2357 review item G) A SECOND write to an
+    /// already-gated mod changes nothing and reports `AlreadyPresent` —
+    /// the record's own write-once-per-gate discipline, tested directly
+    /// rather than only through `mods_gate`'s "already gated" step test
+    /// (which proves the STEP skips the spawn, not that `record_gate`
+    /// itself refuses to overwrite).
+    #[test]
+    fn record_gate_a_second_write_is_a_no_op_reporting_already_present() {
+        let tmp = TempDir::new().unwrap();
+        materialize(tmp.path(), &a_gateable_mod("mod-g2")).unwrap();
+
+        record_gate(
+            tmp.path(),
+            "mod-g2",
+            Some(GateOutcome { passed: true, command: "first".into(), exit_code: Some(0), applied: Some(true), reason: None }),
+            None,
+        )
+        .unwrap();
+
+        let second = record_gate(
+            tmp.path(),
+            "mod-g2",
+            Some(GateOutcome { passed: false, command: "second".into(), exit_code: Some(1), applied: Some(true), reason: None }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(second, Materialized::AlreadyPresent, "a gated mod must never be re-gated");
+
+        let rec = load_at(tmp.path(), "mod-g2").unwrap().unwrap();
+        assert_eq!(rec.gate.as_ref().unwrap().command, "first", "the FIRST gate result survives, never overwritten");
+    }
+
+    /// (#2310 P4c-2b PR #2357 review item G) The same no-op discipline
+    /// when the first write was a SKIP (`gate_skipped_reason`, not a real
+    /// `GateOutcome`) — a second call naming a real outcome must not
+    /// promote a skip into a pass/fail behind the reader's back.
+    #[test]
+    fn record_gate_a_skip_is_also_write_once() {
+        let tmp = TempDir::new().unwrap();
+        materialize(tmp.path(), &a_gateable_mod("mod-g3")).unwrap();
+
+        record_gate(tmp.path(), "mod-g3", None, Some("no test_command configured")).unwrap();
+        let second = record_gate(
+            tmp.path(),
+            "mod-g3",
+            Some(GateOutcome { passed: true, command: "late".into(), exit_code: Some(0), applied: Some(true), reason: None }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(second, Materialized::AlreadyPresent);
+
+        let rec = load_at(tmp.path(), "mod-g3").unwrap().unwrap();
+        assert!(rec.gate.is_none(), "the original skip must survive: {rec:?}");
+        assert_eq!(rec.gate_skipped_reason.as_deref(), Some("no test_command configured"));
     }
 
     #[test]

@@ -1709,13 +1709,39 @@ fn grow_phase(
             )
         })?;
         if last_step.status != crew::types::NodeStatus::Complete {
-            bail!(
- "mission launch: task `{}` grows from `{}`, whose last step `{last_step_id}` ended {:?}, not Complete \
-  — nothing was produced to grow from",
-                task_cfg.id,
-                spec.from,
-                last_step.status
+            // (#2310 P4c-2b PR #2357 review MUST FIX C, proven live) A
+            // producer that ended `Error`/`Abandoned` used to `bail!` the
+            // WHOLE launch here — before this fix, every later phase
+            // (summarize, create-mods, and #2310 P4c-2b's own `deliver`)
+            // was never even attempted, which is exactly the "an errored
+            // run renders nothing" defect this arc exists to end
+            // (DESIGN.md's own retirement finding). Grow ZERO copies from
+            // this template instead — the SAME "grew nothing" shape a
+            // plan that legitimately produced zero items already takes
+            // (`event.minted.is_empty()`, printed below) — and CONTINUE
+            // to the next `task_cfg`/phase, carrying the producer's own
+            // status+step id as the batch's reason so a later `deliver`
+            // task's scope line can name what was never attempted
+            // (`records.gather`'s own not-Complete plan-step scan).
+            let reason = format!(
+                "task `{}` grows from `{}`, whose last step `{last_step_id}` ended {:?}, not Complete — \
+                 growing zero copies from this template",
+                task_cfg.id, spec.from, last_step.status
             );
+            eprintln!("{}", style::warn(&format!("mission launch: {reason}")));
+            out.push((
+                crew::mission_config::grow::Grown {
+                    phase: real_phase_id.to_string(),
+                    task_template: task_cfg.id.clone(),
+                    from: spec.from.clone(),
+                    source: String::new(),
+                    items: 0,
+                    minted: Vec::new(),
+                },
+                Vec::new(),
+                BTreeMap::new(),
+            ));
+            continue;
         }
         let from_output = last_step
             .output

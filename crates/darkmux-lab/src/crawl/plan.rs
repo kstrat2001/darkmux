@@ -3258,7 +3258,7 @@ line two
                 darkmux_crew::mods::record_gate(
                     &mods_root,
                     key,
-                    Some(darkmux_crew::mods::GateOutcome { passed, command: "true".into(), exit_code: Some(if passed { 0 } else { 1 }) }),
+                    Some(darkmux_crew::mods::GateOutcome { passed, command: "true".into(), exit_code: Some(if passed { 0 } else { 1 }), applied: Some(true), reason: None }),
                     None,
                 )
                 .unwrap();

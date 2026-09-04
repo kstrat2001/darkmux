@@ -23,18 +23,23 @@
 //! writes one typed envelope. No model dispatch, no per-mission control
 //! flow of its own.
 //!
-//! **Scope summary, honestly bounded.** `rules_run` and `hunks_covered`
-//! come from every `plan/<rule>.json` this mission wrote under
-//! `<missions_dir>/<mission-id>/plan/` — read as loosely-typed JSON
-//! (`serde_json::Value`), never through `darkmux-lab`'s own `Plan` struct,
-//! for the same crate-boundary reason. `hunks_total` comes from parsing
-//! the diff itself with the shared `crate::diff::parse_diff` (the same
-//! parser `deliver_github_review` uses). `refused` counts mods whose gate
-//! is known to have failed (`gate_passed == Some(false)`) — the one
-//! "refused" signal this crate can see without a `darkmux-lab` dependency;
-//! a `crawl.unit`'s own `findings_rejected` count (a runtime-boundary
-//! rejection, before a finding is ever stored) is invisible here by the
-//! same crate-boundary rule, and is not counted.
+//! **Scope summary, honestly bounded.** `rules_run` comes from every
+//! `plan/<rule>.json` this mission wrote under `<missions_dir>/
+//! <mission-id>/plan/`; `hunks_covered` is the count of DISTINCT `(file,
+//! site start)` windows those plans found, capped at `hunks_total` (#2310
+//! P4c-2b PR #2357 review CONSIDER E — summing `totals.units` ACROSS
+//! rules used to double-count the same hunk once per rule that planned
+//! it). `hunks_total` comes from parsing the diff itself with the shared
+//! `crate::diff::parse_diff`. `refused` is the RUNTIME-BOUNDARY rejection
+//! count (#2310 P4c-2b PR #2357 review CONSIDER F) — `crawl.unit`'s own
+//! `findings_rejected`, summed off this mission's Step records
+//! (`scan_unit_and_plan_steps`, read as loose JSON — never `darkmux-lab`'s
+//! typed `UnitOutcome`, same crate-boundary reason) — NEVER a gate-failed
+//! mod (that renders as a double-check thread, DESIGN.md's own
+//! vocabulary; counting it as "refused" too would double-book one fact
+//! under two names). `not_attempted`/`errored` (#2310 P4c-2b PR #2357
+//! review MUST FIX C/D) come from the SAME scan: a rule whose plan step
+//! never reached `Complete`, or a unit that errored/was abandoned.
 
 use crate::findings::{self, FindingRecord};
 use crate::mods;
@@ -98,7 +103,7 @@ impl StepKind for RecordsGatherStepKind {
                 .with_context(|| format!("step `{}`: `{RECORDS_GATHER_KIND}` reading config.diff_file {p}", step.id))?,
             _ => String::new(),
         };
-        let not_attempted: Vec<String> = step
+        let mut not_attempted: Vec<String> = step
             .config
             .get("not_attempted")
             .and_then(|v| v.as_array())
@@ -121,12 +126,33 @@ impl StepKind for RecordsGatherStepKind {
             })
             .collect();
 
-        let refused = mods.iter().filter(|m| m.gate_passed == Some(false)).count();
-        let (rules_run, hunks_covered) = plan_totals(&mission_id);
-        let hunks_total: usize =
-            crate::diff::parse_diff(&diff).iter().map(|(_, hunks)| hunks.len()).sum();
+        let hunks_total: usize = crate::diff::parse_diff(&diff).iter().map(|(_, hunks)| hunks.len()).sum();
+        let (rules_run, hunks_covered) = plan_totals(&mission_id, hunks_total);
 
-        let scope = DeliverScope { rules_run, hunks_covered, hunks_total, refused, not_attempted };
+        // (#2310 P4c-2b PR #2357 review CONSIDER F, MUST FIX C/D) `refused`
+        // is the RUNTIME-BOUNDARY rejection count (`crawl.unit`'s own
+        // `findings_rejected` — a `create_finding` call the runtime itself
+        // rejected, before a finding ever became a stored record), never
+        // a gate-failed mod (that is a DOUBLE-CHECK thread, DESIGN.md's
+        // own vocabulary — `render_github_review`'s `DeliveryForm::Mod`
+        // arm already renders it as one; counting it as "refused" too
+        // would double-book the same fact under two names).
+        // `not_attempted`/`errored` come from this mission's own
+        // plan/unit step records — a rule whose plan step errored, or a
+        // unit that never converged, both surface here (MUST FIX C/D).
+        let scan = scan_unit_and_plan_steps(&mission_id);
+        not_attempted.extend(scan.not_attempted);
+        not_attempted.sort();
+        not_attempted.dedup();
+
+        let scope = DeliverScope {
+            rules_run,
+            hunks_covered,
+            hunks_total,
+            refused: scan.findings_rejected,
+            not_attempted,
+            errored: scan.errored,
+        };
         let out = GatherOutput {
             schema_version: GATHER_OUTPUT_SCHEMA_VERSION.to_string(),
             findings,
@@ -165,18 +191,29 @@ fn mission_id_for(task: &Task) -> Result<String> {
 /// `(rules_run, hunks_covered)` from every `plan/<rule>.json` this mission
 /// wrote — the rule id from the filename stem (a plan task that was pruned
 /// or never minted writes no file, so the file set alone answers "which
-/// plan tasks minted"), `hunks_covered` from that plan's own recorded
-/// `totals.units` (read as loose JSON — see this module's own doc on why
-/// not the typed `Plan`). A directory that doesn't exist (no plan phase
-/// ran) yields `(vec![], 0)`, not an error — a descriptive summary, same
+/// plan tasks minted"). A directory that doesn't exist (no plan phase ran)
+/// yields `(vec![], 0)`, not an error — a descriptive summary, same
 /// tolerance `crawl::unit_step::plan_totals` extends to a missing/
 /// unreadable plan file.
-fn plan_totals(mission_id: &str) -> (Vec<String>, usize) {
+///
+/// (#2310 P4c-2b PR #2357 review CONSIDER E, proven nonsensical) Summing
+/// `totals.units` ACROSS rules double(-N)-counted: several rules in
+/// review-v2's own catalog (`existing-solution`/`union-vs-enum`/
+/// `shared-symbol-callers`, all `applies_to: []`, no `prefilter`) plan a
+/// site over EVERY hunk in the diff, not just their own targeted one — so
+/// 5 rules covering the SAME 1-hunk diff summed to "5 covered" against a
+/// diff with exactly 1 hunk, a number bigger than the diff itself. Fixed
+/// here to count DISTINCT `(file, site start line)` windows across every
+/// rule's plan (read as loose JSON — see this module's own doc on why not
+/// the typed `Plan`), capped by never exceeding `hunks_total` (the diff's
+/// own true hunk count, computed separately from `crate::diff::parse_diff`)
+/// — a plan can find fewer windows than the diff has hunks, never more.
+fn plan_totals(mission_id: &str, hunks_total: usize) -> (Vec<String>, usize) {
     let plan_dir = crate::loader::missions_dir().join(mission_id).join("plan");
     let mut rules: Vec<String> = Vec::new();
-    let mut hunks_covered = 0usize;
+    let mut covered: std::collections::BTreeSet<(String, u64)> = std::collections::BTreeSet::new();
     let Ok(entries) = std::fs::read_dir(&plan_dir) else {
-        return (rules, hunks_covered);
+        return (rules, 0);
     };
     let mut paths: Vec<std::path::PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
     paths.sort();
@@ -185,11 +222,97 @@ fn plan_totals(mission_id: &str) -> (Vec<String>, usize) {
         let Ok(raw) = std::fs::read_to_string(path) else { continue };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
         rules.push(stem.to_string());
-        if let Some(units) = value.pointer("/body/totals/units").and_then(|v| v.as_u64()) {
-            hunks_covered += units as usize;
+        let Some(units) = value.pointer("/body/units").and_then(|v| v.as_array()) else { continue };
+        for unit in units {
+            let Some(sites) = unit.get("sites").and_then(|v| v.as_array()) else { continue };
+            for site in sites {
+                let (Some(file), Some(start)) =
+                    (site.get("file").and_then(|v| v.as_str()), site.get("start").and_then(|v| v.as_u64()))
+                else {
+                    continue;
+                };
+                covered.insert((file.to_string(), start));
+            }
         }
     }
-    (rules, hunks_covered)
+    // Capped at `hunks_total`: a plan can find fewer distinct windows than
+    // the diff has hunks (a rule's own `applies_to`/`exclude` narrows it),
+    // never more. `hunks_total == 0` (no `diff_file` given) legitimately
+    // caps coverage at 0 too — nothing to cover without a diff.
+    (rules, covered.len().min(hunks_total))
+}
+
+/// What [`scan_unit_and_plan_steps`] found, scanning this mission's own
+/// `Task`/`Step` records — the same records `crawl.summary` reads for its
+/// OWN totals (`darkmux-lab`'s `summarize_mission`), duplicated in
+/// miniature here because `darkmux-crew` cannot depend on `darkmux-lab`
+/// (this module's own doc).
+#[derive(Debug, Clone, Default)]
+struct StepScan {
+    /// Sum of every `crawl.unit` step's own `findings_rejected` — a
+    /// runtime-boundary rejection (`create_finding` refused before it
+    /// ever became a stored finding), read generically off the step's
+    /// `UnitOutcome`-shaped JSON output (never the typed struct itself —
+    /// same crate-boundary rule `plan_totals` follows for `Plan`).
+    findings_rejected: usize,
+    /// Rule ids whose `plan.sites`/`crawl.plan` step did NOT reach
+    /// `Complete` — never even attempted.
+    not_attempted: Vec<String>,
+    /// Human-readable names of `crawl.unit`/`plan.sites`/`crawl.plan`
+    /// steps that ended `Error`/`Abandoned` this run.
+    errored: Vec<String>,
+}
+
+/// (#2310 P4c-2b PR #2357 review MUST FIX C/D, CONSIDER F) Scan every
+/// `Task`/`Step` this mission recorded (across every phase — the same
+/// per-phase `lifecycle::load_steps_for_phase` walk `crawl::unit_step::
+/// summarize_mission` uses) for `crawl.unit` steps (to total
+/// `findings_rejected`, and to name any that never converged) and
+/// `plan.sites`/`crawl.plan` steps (to name any rule that never finished
+/// planning). An unreadable phase/step list is skipped, not an error — a
+/// mission this step cannot fully inspect still delivers what it CAN see,
+/// the same descriptive-not-refusing posture `plan_totals` takes.
+fn scan_unit_and_plan_steps(mission_id: &str) -> StepScan {
+    let mut scan = StepScan::default();
+    let Ok(phases) = crate::loader::load_phases() else { return scan };
+    for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
+        let Ok(steps) = crate::lifecycle::load_steps_for_phase(mission_id, &phase.id) else { continue };
+        for step in &steps {
+            match step.kind.as_str() {
+                "crawl.unit" => {
+                    if step.status != crate::types::NodeStatus::Complete {
+                        scan.errored.push(format!("unit `{}` ({:?})", step.id, step.status));
+                        continue;
+                    }
+                    let Some(raw) = step.output.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+                        continue;
+                    };
+                    let Ok((doc, _)) = crate::step_output::resolve_output_doc(raw) else { continue };
+                    let rejected = doc
+                        .pointer("/body/findings_rejected")
+                        .or_else(|| doc.get("findings_rejected"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    scan.findings_rejected += rejected as usize;
+                }
+                "plan.sites" | "crawl.plan" => {
+                    if step.status == crate::types::NodeStatus::Complete {
+                        continue;
+                    }
+                    let rule = step
+                        .config
+                        .get("rule")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| step.id.clone());
+                    scan.not_attempted.push(rule);
+                    scan.errored.push(format!("plan `{}` ({:?})", step.id, step.status));
+                }
+                _ => {}
+            }
+        }
+    }
+    scan
 }
 
 /// Register `records.gather` — the same opt-in shape
@@ -367,7 +490,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
-    fn refused_counts_gate_failed_mods_only() {
+    fn gate_failed_mods_are_never_counted_as_refused() {
         let tmp = TempDir::new().unwrap();
         let _home = HomeGuard::set(tmp.path());
         save_phase();
@@ -380,25 +503,92 @@ mod tests {
         crate::mods::record_gate(
             &root,
             "mod-pass",
-            Some(crate::mods::GateOutcome { passed: true, command: "true".into(), exit_code: Some(0) }),
+            Some(crate::mods::GateOutcome { passed: true, command: "true".into(), exit_code: Some(0), applied: Some(true), reason: None }),
             None,
         )
         .unwrap();
         crate::mods::record_gate(
             &root,
             "mod-fail",
-            Some(crate::mods::GateOutcome { passed: false, command: "false".into(), exit_code: Some(1) }),
+            Some(crate::mods::GateOutcome { passed: false, command: "false".into(), exit_code: Some(1), applied: Some(true), reason: None }),
             None,
         )
         .unwrap();
 
         let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
-        assert_eq!(wrapped.body.scope.refused, 1, "{:?}", wrapped.body.scope);
+        // (#2310 P4c-2b PR #2357 review CONSIDER F, proven wrong) A
+        // gate-failed mod is a DOUBLE-CHECK thread (`render_github_review`
+        // already renders it that way), never counted as "refused" —
+        // that field is now the runtime-boundary rejection count only
+        // (`crawl.unit`'s own `findings_rejected`, asserted below), so a
+        // mission with zero unit steps at all reads `refused: 0` even
+        // with a gate-failed mod present.
+        assert_eq!(wrapped.body.scope.refused, 0, "a gate-failed mod is a double-check thread, not a refusal: {:?}", wrapped.body.scope);
         let passed_gate = wrapped.body.mods.iter().find(|m| m.record.key == "mod-pass").unwrap();
         assert_eq!(passed_gate.gate_passed, Some(true));
         let failed_gate = wrapped.body.mods.iter().find(|m| m.record.key == "mod-fail").unwrap();
         assert_eq!(failed_gate.gate_passed, Some(false));
+    }
+
+    /// (#2310 P4c-2b PR #2357 review CONSIDER F, proven) `refused` reads
+    /// off `crawl.unit`'s own `findings_rejected` — this mission's Step
+    /// records, generically as JSON (never `darkmux-lab`'s typed
+    /// `UnitOutcome`).
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn refused_sums_findings_rejected_from_this_missions_unit_steps() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        let unit_output = crate::step_output::Output::wrap(
+            "crawl.unit-outcome",
+            json!({ "schema_version": "1.1", "unit": "u-1", "result": "stop", "findings": 1, "findings_rejected": 3 }),
+            crate::step_output::Producer::of(MISSION, "unit-task", "unit-step-1"),
+        )
+        .to_output_string()
+        .unwrap();
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "unit-step-1".into(),
+                task_id: "unit-task".into(),
+                kind: "crawl.unit".into(),
+                gate: None,
+                status: NodeStatus::Complete,
+                config: json!({}),
+                started_ts: None,
+                completed_ts: None,
+                output: Some(unit_output),
+            },
+        )
+        .unwrap();
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "unit-step-2".into(),
+                task_id: "unit-task-2".into(),
+                kind: "crawl.unit".into(),
+                gate: None,
+                status: NodeStatus::Error,
+                config: json!({}),
+                started_ts: None,
+                completed_ts: None,
+                output: Some("dispatch error".into()),
+            },
+        )
+        .unwrap();
+
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert_eq!(wrapped.body.scope.refused, 3, "{:?}", wrapped.body.scope);
+        assert!(
+            wrapped.body.scope.errored.iter().any(|e| e.contains("unit-step-2")),
+            "the errored unit must be named: {:?}",
+            wrapped.body.scope
+        );
     }
 
     #[test]
@@ -409,11 +599,18 @@ mod tests {
         save_phase();
         let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
+        // (#2310 P4c-2b PR #2357 review CONSIDER E, proven nonsensical)
+        // Realistic plan bodies — `units[].sites[].{file,start}` — three
+        // DISTINCT windows total (one shared: both rules plan a site at
+        // `src/a.ts:2`, which a correct DISTINCT count must not double).
         std::fs::write(
             plan_dir.join("existing-solution.json"),
             serde_json::to_string(&json!({
                 "kind": "crawl.plan",
-                "body": { "totals": { "units": 3 } }
+                "body": { "units": [
+                    {"kind": "site", "sites": [{"file": "src/a.ts", "start": 2}]},
+                    {"kind": "site", "sites": [{"file": "src/b.ts", "start": 5}]}
+                ] }
             }))
             .unwrap(),
         )
@@ -422,16 +619,35 @@ mod tests {
             plan_dir.join("union-vs-enum.json"),
             serde_json::to_string(&json!({
                 "kind": "crawl.plan",
-                "body": { "totals": { "units": 2 } }
+                "body": { "units": [
+                    {"kind": "site", "sites": [{"file": "src/a.ts", "start": 2}]},
+                    {"kind": "site", "sites": [{"file": "src/c.ts", "start": 9}]}
+                ] }
             }))
             .unwrap(),
         )
         .unwrap();
+        // A diff with (at least) 3 hunks so the distinct-window count
+        // isn't capped below what the plans actually found.
+        let diff_path = tmp.path().join("d.diff");
+        std::fs::write(
+            &diff_path,
+            "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,1 +1,2 @@\n foo\n+bar\n\
+             diff --git a/b.ts b/b.ts\n--- a/b.ts\n+++ b/b.ts\n@@ -1,1 +1,2 @@\n baz\n+qux\n\
+             diff --git a/c.ts b/c.ts\n--- a/c.ts\n+++ b/c.ts\n@@ -1,1 +1,2 @@\n quux\n+corge\n",
+        )
+        .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(wrapped.body.scope.rules_run, vec!["existing-solution".to_string(), "union-vs-enum".to_string()]);
-        assert_eq!(wrapped.body.scope.hunks_covered, 5);
+        assert_eq!(
+            wrapped.body.scope.hunks_covered, 3,
+            "3 DISTINCT (file, start) windows across both rules — src/a.ts:2 counted once, not twice: {:?}",
+            wrapped.body.scope
+        );
     }
 
     #[test]

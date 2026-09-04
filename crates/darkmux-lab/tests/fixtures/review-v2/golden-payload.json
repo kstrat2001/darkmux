@@ -2,7 +2,7 @@
   "mode": "review",
   "review": {
     "event": "COMMENT",
-    "body": "### darkmux review\n\nreview ran: 5 rule(s), 5/5 hunks covered, 5 finding(s) considered, 1 refused.\n\n**Worth enumerating (search-confirmed):**\n- `sess-fix/4 (src/status.ts:3)` — LogLevel in types.ts overlaps this new union\n- `sess-fix/5 (src/shared.ts:4)` — 3 callers found: caller_a.ts, caller_b.ts, caller_c.ts\n\n**Questions:**\n- `sess-fix/3 (src/retry.ts:3)` — did you check for an existing retry helper? Candidates: export function retryWithBackoff\n\n**Worth a double check** (not merge-blocking):\n- `sess-fix/2 (src/auth.ts:3)` — the condition is hard to read at a glance _Worth checking: if ((user.role === \"admin\" ..._\n\n_darkmux review-v2 — advisory, not a merge gate._",
+    "body": "### darkmux review\n\nreview ran: 5 rule(s), 5/5 hunks covered, 5 finding(s) considered, 0 refused.\n\n**Worth enumerating (search-confirmed):**\n- `sess-fix/4 (src/status.ts:3)` — LogLevel in types.ts overlaps this new union\n- `sess-fix/5 (src/shared.ts:4)` — 3 callers found: caller_a.ts, caller_b.ts, caller_c.ts\n\n**Questions:**\n- `sess-fix/3 (src/retry.ts:3)` — did you check for an existing retry helper? Candidates: export function retryWithBackoff\n\n**Worth a double check** (not merge-blocking):\n- `sess-fix/2 (src/auth.ts:3)` — the condition is hard to read at a glance _Worth checking: if ((user.role === \"admin\" ..._\n\n_darkmux review-v2 — advisory, not a merge gate._",
     "comments": [
       {
         "path": "src/billing.ts",

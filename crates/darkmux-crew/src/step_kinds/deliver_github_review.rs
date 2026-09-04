@@ -100,6 +100,15 @@ pub struct DeliverScope {
     /// cannot mistake a narrow run for a complete one.
     #[serde(default)]
     pub not_attempted: Vec<String>,
+    /// (#2310 P4c-2b PR #2357 review MUST FIX D) Human-readable names of
+    /// units/plans that ended `Error`/`Abandoned` this run — distinct from
+    /// [`Self::not_attempted`] (which is what NEVER RAN, e.g. a rule whose
+    /// plan step failed) and from [`Self::refused`] (runtime-boundary
+    /// rejections, never a step-level failure). A non-empty list here is
+    /// what tells [`render_github_review`] this run is `"degraded"`, never
+    /// a clean `"noop"`, even when it produced zero findings.
+    #[serde(default)]
+    pub errored: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -135,9 +144,13 @@ pub struct GithubReviewPayload {
 }
 
 /// What [`render_github_review`] returns. `mode` is `"review"` when there
-/// is anything at all to say (findings, or a non-empty scope worth
-/// reporting) and `"noop"` when the run produced literally nothing —
-/// mirrors the review pipeline's own `mode` vocabulary in spirit (a
+/// is anything at all to say (findings, or mods); `"noop"` ONLY for a
+/// genuinely CLEAN run — nothing found AND nothing went wrong
+/// (`scope.errored` empty); `"degraded"` (#2310 P4c-2b PR #2357 review
+/// MUST FIX D) when nothing was found to say but `scope.errored` is
+/// non-empty — an errored/abandoned unit or plan step means this run is
+/// NOT a clean pass, even with zero findings, and must never read as one.
+/// Mirrors the review pipeline's own `mode` vocabulary in spirit (a
 /// distinct outcome, never silently folded into `"review"`) without
 /// depending on its type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -242,7 +255,29 @@ pub fn render_github_review(
         && question_bullets.is_empty()
         && double_check_bullets.is_empty();
     if nothing_to_say {
-        return DeliverOutcome { mode: "noop".to_string(), review: None };
+        if scope.errored.is_empty() {
+            // A genuinely CLEAN run — nothing to say because nothing went
+            // wrong and nothing was found. The only `mode` this applies
+            // to.
+            return DeliverOutcome { mode: "noop".to_string(), review: None };
+        }
+        // (#2310 P4c-2b PR #2357 review MUST FIX D, proven live) Before
+        // this fix, an errored run with zero findings ALSO rendered
+        // `"noop"` — the same "an errored run renders nothing" defect
+        // this arc exists to end, just one layer up from #975's own
+        // finding. A run that had a real error is never a clean noop,
+        // even with nothing to say about findings: the scope line (with
+        // its own `Errored:` section, `scope_line`'s own doc) IS the
+        // payload.
+        let mut body = vec!["### darkmux review".to_string(), String::new(), scope_line(scope, findings.len())];
+        if let Some(a) = attribution.filter(|a| !a.trim().is_empty()) {
+            body.push(String::new());
+            body.push(format!("_{a}_"));
+        }
+        return DeliverOutcome {
+            mode: "degraded".to_string(),
+            review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments: Vec::new() }),
+        };
     }
 
     let mut body = vec!["### darkmux review".to_string(), String::new()];
@@ -292,6 +327,12 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
     );
     if !scope.not_attempted.is_empty() {
         line.push_str(&format!(" Not attempted: {}.", scope.not_attempted.join(", ")));
+    }
+    // (#2310 P4c-2b PR #2357 review MUST FIX D) Named so a `"degraded"`
+    // run's scope line (its whole payload, when there is nothing else to
+    // say) actually names what broke, not just that something did.
+    if !scope.errored.is_empty() {
+        line.push_str(&format!(" Errored: {}.", scope.errored.join(", ")));
     }
     line
 }
@@ -1014,6 +1055,7 @@ mod tests {
             hunks_total: 4,
             refused: 2,
             not_attempted: vec!["architectural review".into()],
+            errored: Vec::new(),
         };
 
         let outcome = render_github_review(&findings, &mods, DIFF, &scope, Some("Advisory, not a merge gate."));
