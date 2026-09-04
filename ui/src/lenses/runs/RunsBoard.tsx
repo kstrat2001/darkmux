@@ -760,7 +760,7 @@ function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boole
  * (finished/live), distinct from `runStatusBadge`'s six-status badge above
  * (#1881 added `unparseable`). */
 function LabBadge({ finished }: { finished: boolean }) {
-  return <WorkStatus status={finished ? "finished" : "live"} label={finished ? "finished" : "● live"} className="labbadge" />;
+  return <WorkStatus status={finished ? "finished" : "live"} label={finished ? "finished" : undefined} className="labbadge" />;
 }
 
 /** viewer.html: `function renderLabRunRow(run)` (the series-view row, reading

@@ -325,7 +325,7 @@ describe("SessionReplay", () => {
 
     const pill = document.querySelector(".session-run__header .pill")?.textContent ?? "";
     const pulseLabel = document.querySelector(".pill[data-live]")?.getAttribute("title") ?? "";
-    expect(pill).toContain("RUNNING");
+    expect(pill).toContain("running"); // the chip's one running word; CSS uppercases it on screen
     // The pulse may say "may be abandoned"; it must NOT claim the run finished.
     expect(pulseLabel).not.toContain("finished");
     expect(document.querySelector(".pill[data-live]")?.getAttribute("data-live")).toBe("stale");
@@ -447,7 +447,8 @@ describe("SessionReplay", () => {
     const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-session-task-list.json"), "utf8"));
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
     renderReplay("task-list");
-    await waitFor(() => expect(screen.getByText(/RUNNING/)).toBeInTheDocument());
+    // The chip is the one element that says the running word; other text may too.
+    await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent).toContain("running"));
     expect(screen.getByText(/FETCH-RENDER/)).toBeInTheDocument();
     expect(screen.getByText(/task-list on/)).toBeInTheDocument();
     expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument();

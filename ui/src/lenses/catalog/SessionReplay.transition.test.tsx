@@ -88,7 +88,7 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
 
     const { again } = renderReplay();
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
-    expect(pillText()).toContain("RUNNING");
+    expect(pillText()).toContain("running");
     expect(wallText()).toContain("so far");
 
     // The dispatch ends and the reconciler drops it from presence.
@@ -155,6 +155,6 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     // ...and the run is still honestly labeled unfinished, because no terminal
     // record says otherwise. Stopping the clock is not the same as claiming a
     // clean close.
-    expect(pillText()).toContain("RUNNING");
+    expect(pillText()).toContain("running");
   });
 });

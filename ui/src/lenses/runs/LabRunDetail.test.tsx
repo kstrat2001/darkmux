@@ -98,7 +98,7 @@ describe("LabRunDetail", () => {
     renderDetail("d1");
     await waitFor(() => expect(screen.getByText("pipeline")).toBeInTheDocument());
     expect(screen.getByText("not started")).toBeInTheDocument();
-    expect(screen.getByText("● live")).toBeInTheDocument();
+    expect(screen.getByText("running")).toBeInTheDocument();
     expect(screen.getByText(/try it yourself/i)).toBeInTheDocument();
     expect(screen.getByText(/darkmux lab eval --funnel/)).toBeInTheDocument();
     expect(screen.getByText(/no events yet/i)).toBeInTheDocument();
@@ -193,7 +193,7 @@ describe("LabRunDetail", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(screen.getByText("● live")).toBeInTheDocument();
+    expect(screen.getByText("running")).toBeInTheDocument();
 
     // Two more failed ticks at the steady cadence — still under threshold.
     await act(async () => {
@@ -204,14 +204,14 @@ describe("LabRunDetail", () => {
     });
     expect(eventsCalls).toBe(3);
     expect(screen.getByText(/daemon unreachable — retrying/i)).toBeInTheDocument();
-    expect(screen.queryByText("● live")).not.toBeInTheDocument();
+    expect(screen.queryByText("running")).not.toBeInTheDocument();
 
     // The next tick succeeds — the state clears.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(LAB_POLL_STEADY_MS);
     });
     expect(eventsCalls).toBe(4);
-    expect(screen.getByText("● live")).toBeInTheDocument();
+    expect(screen.getByText("running")).toBeInTheDocument();
     expect(screen.queryByText(/daemon unreachable/i)).not.toBeInTheDocument();
   });
 

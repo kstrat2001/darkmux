@@ -26,6 +26,17 @@
  */
 import type { LivenessState } from "./LivenessPulse";
 
+/**
+ * THE word a pulsing chip says. (operator, 2026-09-04: a pulsing pill on the
+ * mission view read ACTIVE while the step below it read RUNNING — "is this a
+ * missed inconsistency?") It was: the raw status word was the label, so one
+ * fact wore the scope's own vocabulary — `active` (mission), `running` (step,
+ * run), `● live` (lab run). The kind already unified the LOOK; this unifies
+ * the WORD for the one kind whose chips sit side by side while both pulse.
+ * Terminal words stay raw on purpose: `finalized` / `complete` / `finished`
+ * are different facts at different scopes, and none of them pulse.
+ */
+export const RUNNING_WORD = "running";
 export type WorkStatusKind = "running" | "done" | "error" | "stopped" | "idle";
 
 const KIND: Record<string, WorkStatusKind> = {
@@ -62,7 +73,8 @@ export function WorkStatus({
 }: {
   /** The raw status word from the data (`active`, `running`, `complete`, …). */
   status: string | undefined;
-  /** Override the visible text (the run detail passes its pre-uppercased label). */
+  /** Override the visible text of a NON-running chip (a terminal's scope-specific
+   *  word). A running chip always says `RUNNING_WORD`; the override is ignored. */
   label?: string;
   /** Liveness of the thing behind a `running` chip; drives the pulse's play state. */
   live?: LivenessState;
@@ -74,7 +86,7 @@ export function WorkStatus({
   const cls = ["wstatus", `is-${kind}`, `s-${raw}`, className].filter(Boolean).join(" ");
   return (
     <span className={cls} data-live={kind === "running" ? (live ?? "beating") : undefined} title={title}>
-      {label ?? raw}
+      {kind === "running" ? RUNNING_WORD : (label ?? raw)}
     </span>
   );
 }
