@@ -806,7 +806,6 @@ impl StepKind for CrawlUnitStepKind {
     /// model the dispatch will actually use. A registry that cannot resolve
     /// yields `None` (one stderr warning per unit) and the units fall back to
     /// the remote queue; the dispatch then surfaces the real error itself.
-
     fn residency(
         &self,
         step: &Step,
