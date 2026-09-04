@@ -1,7 +1,7 @@
 {
   "id": "review-v2",
   "name": "Review (v2, on the crawl's building blocks)",
-  "description": "(#2310 P4c, discovery — NOT the frozen `review` id) A code review built as a SECOND mission config on the crawl's shared blocks (#2301/#2310), never as a fork of it: `plan-<rule>` mints one `plan.sites` task per rule with `source: \"diff\"` (the DIFF-scoped strategy on the same plan_sites pattern `crawl.plan`'s tree walk uses — see plan_sites_step.rs); `unit-<rule>` GROWS one `crawl.unit` dispatch per planned site, `role_id: \"reviewer\"` (the SAME step kind crawl.json's `unit-<rule>` phase uses, generalized in this packet to read the Task's own role rather than a hardcoded `crawler`); `create-mods` reuses crawl's create-mod pattern verbatim over this run's own findings. DELIBERATELY INCOMPLETE (#2310 P4c scope note): this document has NO `deliver` phase yet — `deliver.github_review` (P4b, `step_kinds/deliver_github_review.rs`) needs its `findings`/`mods` config fields populated from this run's OWN stores, and no step kind that gathers a mission's findings/mods into that shape exists yet. A run of this config today ends at `create-mods`; wiring `deliver` is the next packet's first job, not swallowed silently here. Crawl never learns what a PR is (DESIGN.md): this document names no crawl id, and `crawl.json` is untouched by this packet.",
+  "description": "(#2310 P4c/P4c-2, NOT the frozen `review` id) A code review built as a SECOND mission config on the crawl's shared blocks (#2301/#2310), never as a fork of it: `plan-<rule>` mints one `plan.sites` task per rule with `source: \"diff\"` (the DIFF-scoped strategy on the same plan_sites pattern `crawl.plan`'s tree walk uses — see plan_sites_step.rs); `unit-<rule>` GROWS one `crawl.unit` dispatch per planned site, `role_id: \"reviewer\"` (the SAME step kind crawl.json's `unit-<rule>` phase uses, generalized in this packet to read the Task's own role rather than a hardcoded `crawler`); `create-mods` reuses crawl's create-mod pattern (plus its own `gate-step`, #2310 P4c-2b) over this run's own findings; `deliver` (#2310 P4c-2b) gathers this run's own finding/mod stores and renders a GitHub review payload. Crawl never learns what a PR is (DESIGN.md): this document names no crawl id, and `crawl.json` is untouched by this packet.",
   "schema_version": "3.4",
   "inputs": [
     {
@@ -43,22 +43,32 @@
     },
     {
       "name": "envelope_out",
-      "description": "Mirrors the frozen `review` config's input. Not yet consumed — no `deliver` phase exists in this document to write it (see this document's own `description`).",
+      "description": "Mirrors the frozen `review` config's input. Still NOT consumed (#2310 P4c-2b): `deliver.github_review` writes the rendered `{mode, review}` payload only (via `emit`), never a separate full envelope file — there is no envelope shape in this document's own pipeline for this to name.",
       "required": false
     },
     {
       "name": "emit",
-      "description": "Mirrors the frozen `review` config's input. Not yet consumed, same reason as `envelope_out`.",
+      "description": "Path to write the rendered `{mode, review}` payload the `deliver` phase's `deliver-step` produces. `-` (or omitted) writes to stdout, matching the frozen `review` config's own `emit` contract.",
+      "required": false
+    },
+    {
+      "name": "attribution",
+      "description": "Attribution text for the posted footer, threaded to the `deliver` phase's `deliver-step` — mirrors the frozen `review` config's own `attribution` input. Absent means no footer line (`deliver.github_review`'s own default), NOT the frozen config's envelope-derived default — this document has no member-record envelope to derive one from.",
       "required": false
     },
     {
       "name": "test_command",
-      "description": "The gate command `create-mods` runs against a proposed mod before counting it confirmed (#2310 P4c — DESIGN.md \"the changed files name the test targets\"). No convention-derived default exists yet in this document; leaving it unset means create-mods runs with no gate (every mod is recorded, none is verified) — see the `create-mod` task's own description.",
+      "description": "The gate command `create-mods` runs against a proposed mod before counting it confirmed (#2310 P4c — DESIGN.md \"the changed files name the test targets\"). Wired (#2310 P4c-2b): the `create-mod` task's `gate-step` (`mods.gate`) runs this command in `{{item.tree_root}}` against every mod naming the finding the task addresses, and records `gate_passed`/`gate_skipped_reason` on each. Leaving it unset means every mod is recorded `gate_skipped_reason: \"no test_command configured\"`, never gate-verified.",
       "required": false
     },
     {
       "name": "rules",
       "description": "Comma-separated rule ids to review with, same selection mechanism as `crawl.json`'s own `rules` input — a `plan-<rule>` task whose rule is not named is pruned at mint with reason `not_selected`. Absent means every enabled plan task this document declares.",
+      "required": false
+    },
+    {
+      "name": "draws",
+      "description": "How many times to dispatch each planned unit (#2310 P4c-2b — DESIGN.md \"a draws-per-unit knob, off by default, ports the measured k-draw recall technique from the funnel\"). Absent means 1 (`crawl.unit`'s own default) — one dispatch per unit, unchanged from before this input existed. `finding_refs` dedup on `(rule, file, line)` across a unit's own draws before `create-mods` grows from them, so a duplicate observation across draws never mints two coder tasks for the same window.",
       "required": false
     },
     {
@@ -127,13 +137,13 @@
       "display_name": "Review",
       "description": "One dispatch per planned unit, `role_id: \"reviewer\"` — the SAME `crawl.unit` kind `crawl.json`'s own `crawl` phase uses, dispatching a different role because #2310 P4c made the role a Task property the kind reads rather than a hardcoded `\"crawler\"`.",
       "tasks": [
-        {"id": "unit-intent-vs-diff", "display_name": "Review: Intent vs diff", "description": "One task per unit `plan-intent-vs-diff` produced.", "role_id": "reviewer", "depends_on": ["plan-intent-vs-diff"], "grow": {"from": "plan-intent-vs-diff", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "intent-vs-diff", "intent_file": "{{intent_file}}"}}, "steps": [{"id": "unit-intent-vs-diff-step", "kind": "crawl.unit", "config": {}}]},
-        {"id": "unit-existing-solution", "display_name": "Review: Existing solution", "description": "One task per unit `plan-existing-solution` produced.", "role_id": "reviewer", "depends_on": ["plan-existing-solution"], "grow": {"from": "plan-existing-solution", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "existing-solution", "intent_file": "{{intent_file}}"}}, "steps": [{"id": "unit-existing-solution-step", "kind": "crawl.unit", "config": {}}]},
-        {"id": "unit-shared-symbol-callers", "display_name": "Review: Shared symbol callers", "description": "One task per unit `plan-shared-symbol-callers` produced.", "role_id": "reviewer", "depends_on": ["plan-shared-symbol-callers"], "grow": {"from": "plan-shared-symbol-callers", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "shared-symbol-callers", "intent_file": "{{intent_file}}"}}, "steps": [{"id": "unit-shared-symbol-callers-step", "kind": "crawl.unit", "config": {}}]},
-        {"id": "unit-union-vs-enum", "display_name": "Review: Union vs enum", "description": "One task per unit `plan-union-vs-enum` produced.", "role_id": "reviewer", "depends_on": ["plan-union-vs-enum"], "grow": {"from": "plan-union-vs-enum", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "union-vs-enum", "intent_file": "{{intent_file}}"}}, "steps": [{"id": "unit-union-vs-enum-step", "kind": "crawl.unit", "config": {}}]},
-        {"id": "unit-test-gap", "display_name": "Review: Test gap", "description": "One task per unit `plan-test-gap` produced.", "role_id": "reviewer", "depends_on": ["plan-test-gap"], "grow": {"from": "plan-test-gap", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "test-gap", "intent_file": "{{intent_file}}"}}, "steps": [{"id": "unit-test-gap-step", "kind": "crawl.unit", "config": {}}]},
-        {"id": "unit-swallowed-error", "display_name": "Review: Swallowed errors", "description": "One task per unit `plan-swallowed-error` produced.", "role_id": "reviewer", "depends_on": ["plan-swallowed-error"], "grow": {"from": "plan-swallowed-error", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "swallowed-error", "intent_file": "{{intent_file}}"}}, "steps": [{"id": "unit-swallowed-error-step", "kind": "crawl.unit", "config": {}}]},
-        {"id": "unit-unnamed-predicate", "display_name": "Review: Unnamed predicates", "description": "One task per unit `plan-unnamed-predicate` produced.", "role_id": "reviewer", "depends_on": ["plan-unnamed-predicate"], "grow": {"from": "plan-unnamed-predicate", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "unnamed-predicate", "intent_file": "{{intent_file}}"}}, "steps": [{"id": "unit-unnamed-predicate-step", "kind": "crawl.unit", "config": {}}]}
+        {"id": "unit-intent-vs-diff", "display_name": "Review: Intent vs diff", "description": "One task per unit `plan-intent-vs-diff` produced.", "role_id": "reviewer", "depends_on": ["plan-intent-vs-diff"], "grow": {"from": "plan-intent-vs-diff", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "intent-vs-diff", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-intent-vs-diff-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-existing-solution", "display_name": "Review: Existing solution", "description": "One task per unit `plan-existing-solution` produced.", "role_id": "reviewer", "depends_on": ["plan-existing-solution"], "grow": {"from": "plan-existing-solution", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "existing-solution", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-existing-solution-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-shared-symbol-callers", "display_name": "Review: Shared symbol callers", "description": "One task per unit `plan-shared-symbol-callers` produced.", "role_id": "reviewer", "depends_on": ["plan-shared-symbol-callers"], "grow": {"from": "plan-shared-symbol-callers", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "shared-symbol-callers", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-shared-symbol-callers-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-union-vs-enum", "display_name": "Review: Union vs enum", "description": "One task per unit `plan-union-vs-enum` produced.", "role_id": "reviewer", "depends_on": ["plan-union-vs-enum"], "grow": {"from": "plan-union-vs-enum", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "union-vs-enum", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-union-vs-enum-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-test-gap", "display_name": "Review: Test gap", "description": "One task per unit `plan-test-gap` produced.", "role_id": "reviewer", "depends_on": ["plan-test-gap"], "grow": {"from": "plan-test-gap", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "test-gap", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-test-gap-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-swallowed-error", "display_name": "Review: Swallowed errors", "description": "One task per unit `plan-swallowed-error` produced.", "role_id": "reviewer", "depends_on": ["plan-swallowed-error"], "grow": {"from": "plan-swallowed-error", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "swallowed-error", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-swallowed-error-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-unnamed-predicate", "display_name": "Review: Unnamed predicates", "description": "One task per unit `plan-unnamed-predicate` produced.", "role_id": "reviewer", "depends_on": ["plan-unnamed-predicate"], "grow": {"from": "plan-unnamed-predicate", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "unnamed-predicate", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-unnamed-predicate-step", "kind": "crawl.unit", "config": {}}]}
       ]
     },
     {
@@ -152,7 +162,7 @@
     {
       "id": "create-mods",
       "display_name": "Create mods",
-      "description": "Reuses crawl's create-mods phase VERBATIM (DESIGN.md \"Review reuses the create-mods phase\") — the create-mod task shape below is byte-identical to `crawl.json`'s own, except the gate: `crawl.json`'s never runs tests (findings are proposals over a read-only tree, no test target implied); a review's mod SHOULD run the changed files' own test target before it counts as confirmed (DESIGN.md \"the changed files name the test targets, which is what makes confirmation cheap enough to do per finding\") — NOT WIRED in this packet (#2310 P4c scope note): `test_command` is a documented input above but no step here actually runs it, so every mod in this document is recorded, none is gate-verified. Wiring the gate is create-mods' own follow-up, tracked alongside the `deliver` phase gap this document's own `description` names.",
+      "description": "Reuses crawl's create-mods `create-mod-step` verbatim (DESIGN.md \"Review reuses the create-mods phase\") — that step's shape is byte-identical to `crawl.json`'s own. `crawl.json`'s create-mods never runs tests (findings are proposals over a read-only tree, no test target implied); a review's mod SHOULD run the changed files' own test target before it counts as confirmed (DESIGN.md \"the changed files name the test targets, which is what makes confirmation cheap enough to do per finding\") — the ONE way this task's shape diverges from crawl's: a second step, `gate-step` (`mods.gate`, #2310 P4c-2b), runs `test_command` (when the launch set one) against `{{item.tree_root}}` and records `gate_passed`/`gate_skipped_reason` on every mod naming this task's finding.",
       "tasks": [
         {
           "id": "create-mod",
@@ -167,10 +177,32 @@
             "config": {
               "workdir": "{{item.tree_root}}",
               "brief_refs": [{"kind": "finding", "key": "{{item.key}}"}],
-              "message": "A finding recorded earlier in this run is appended below. Your job is to PROPOSE the change that finding describes, as a mod. The workspace you have been given is the tree the finding was observed in, mounted read-only: you cannot edit it, and you are not meant to.\n\n1. Read the file the finding names, around the line it names.\n2. If the finding does not hold against what you read, record nothing and say why.\n3. Otherwise write the smallest change that resolves it as a unified diff against the file as it is, and call `create_mod` with: `kit` = one sentence saying what to apply and the exact diff; `for` = the finding's key exactly as the block below spells it.\n\nDo not run tests, and do not touch anything the finding does not name. The mod is your product; someone else integrates it."
+              "message": "A finding recorded earlier in this run is appended below. Your job is to PROPOSE the change that finding describes, as a mod. The workspace you have been given is the tree the finding was observed in, mounted read-only: you cannot edit it, and you are not meant to.\n\n1. Read the file the finding names, around the line it names.\n2. If the finding does not hold against what you read, record nothing and say why.\n3. Otherwise write the smallest change that resolves it as a unified diff against the file as it is, and call `create_mod` with: `kit` = one sentence saying what to apply and the exact diff; `for` = the finding's key exactly as the block below spells it.\n\nDo not run tests, and do not touch anything the finding does not name. The mod is your product; someone else integrates it.",
+              "for_key": "{{item.key}}",
+              "test_command": "{{test_command}}"
             }
           },
-          "steps": [{"id": "create-mod-step", "kind": "dispatch.internal", "config": {}}]
+          "steps": [
+            {"id": "create-mod-step", "kind": "dispatch.internal", "config": {}},
+            {"id": "gate-step", "kind": "mods.gate", "config": {}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "deliver",
+      "display_name": "Deliver",
+      "description": "#2310 P4c-2b closes the gap the `create-mods` phase's own description names: `records.gather` reads THIS mission's own finding/mod stores (scoped by mission id — the way `finding list --mission`/`mod list --mission` resolve it) plus `diff_file`, into the typed shape `deliver.github_review` renders. Two steps of ONE task, `records-gather-step` then `deliver-step` — the SAME same-task-predecessor `Step.output` -> `input` wiring (`scheduler::gather_inputs`) every other multi-step task in this codebase uses, never a new mechanism. `run_on: [\"complete\",\"error\"]` on the task documents the intent DESIGN.md's own retirement finding names (\"an errored run rendered nothing... None were in a step\") — an errored `create-mods` phase must not silence delivery; this task declares no `depends_on` at all (an edge naming `create-mod`, a grow TEMPLATE, is refused at validation — see `mission_config::interpret`'s own doc), so ordering comes from `create-mods` being an earlier PHASE in this document, the same phase-ordering `crawl.json`'s `summarize` phase relies on to see every grown `crawl.unit`'s results with no `depends_on` of its own.",
+      "tasks": [
+        {
+          "id": "deliver",
+          "display_name": "Deliver: gather this run's records and render a GitHub review",
+          "description": "Gather then deliver — see this phase's own description.",
+          "run_on": ["complete", "error"],
+          "steps": [
+            {"id": "records-gather-step", "kind": "records.gather", "config": {"diff_file": "{{diff_file}}"}},
+            {"id": "deliver-step", "kind": "deliver.github_review", "config": {"emit": "{{emit}}", "attribution": "{{attribution}}"}}
+          ]
         }
       ]
     }

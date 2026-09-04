@@ -164,7 +164,15 @@ pub fn list(for_key: Option<&str>, mission: Option<&str>, json: bool) -> Result<
             0 => String::new(),
             n => format!("  {n} attachment(s)"),
         };
-        println!("{}  {}  {}  [{for_bit}]{attach}\n    {}", m.key, m.ts, m.by, preview(m.kit.as_deref()));
+        // (#2310 P4c-2b neighbor check) A compact gate indicator, same
+        // discipline `mod show`'s own `gate` line follows.
+        let gate = match (&m.gate, &m.gate_skipped_reason) {
+            (Some(g), _) if g.passed => "  [gate: pass]".to_string(),
+            (Some(_), _) => "  [gate: fail]".to_string(),
+            (None, Some(_)) => "  [gate: skipped]".to_string(),
+            (None, None) => String::new(),
+        };
+        println!("{}  {}  {}  [{for_bit}]{attach}{gate}\n    {}", m.key, m.ts, m.by, preview(m.kit.as_deref()));
     }
     println!("\n{} mod(s) in {}", rows.len(), root.display());
     Ok(0)
@@ -196,6 +204,21 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     println!("recorded  {}", rec.ts);
     println!("by        {}", rec.by);
     println!("kind      {}", rec.kit_kind.as_deref().unwrap_or("(untyped)"));
+    // (#2310 P4c-2b neighbor check) `mods.gate` is the one write path
+    // besides `mod create`/the runtime `create_mod` tool that mutates a
+    // stored mod — `mod show --json` already surfaces it for free (the
+    // whole record serializes), but the plain-text rendering did not name
+    // it at all, which would have made a gated mod look identical to a
+    // never-gated one here.
+    println!(
+        "gate      {}",
+        match (&rec.gate, &rec.gate_skipped_reason) {
+            (Some(g), _) if g.passed => format!("passed ({})", g.command),
+            (Some(g), _) => format!("failed ({})", g.command),
+            (None, Some(reason)) => format!("skipped — {reason}"),
+            (None, None) => "(not yet gated)".to_string(),
+        }
+    );
     if rec.r#for.is_empty() {
         println!("for       (none)");
     } else {

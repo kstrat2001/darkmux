@@ -31,9 +31,15 @@ blake3 = "1.5"
 rusqlite = { version = "0.31", features = ["bundled"] }
 # (#2301) Optional, off by default — see the `ts-export` feature below.
 ts-rs = { version = "10", optional = true }
+# (#2310 P4c-2b PR #2357 review MUST FIX A) `mods.gate`'s scratch checkout
+# for applying a mod's kit before its gate command runs — moved from
+# dev-only here, same precedent `darkmux-serve` already sets (its own
+# `[dependencies]` `tempfile`) for a crate that needs scratch dirs at
+# runtime, not only in tests. No new transitive surface: already in the
+# lockfile at this version via every other workspace member.
+tempfile = "3.10"
 
 [dev-dependencies]
-tempfile = "3.10"
 serial_test = "3.1"
 # (#1698 Packet B) In-process HTTP mock server for
 # `tests/mock_single_shot_proof.rs` — the SAME crate + version `runtime/`'s

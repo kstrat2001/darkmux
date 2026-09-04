@@ -222,6 +222,95 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     assert_eq!(first["rule"], serde_json::json!("unnamed-predicate"));
 }
 
+/// (#2310 P4c-2b) `config.draws: 2` dispatches the same unit TWICE —
+/// proven by a stub dispatcher that counts its own calls and stamps a
+/// distinct session id per call — and the resulting `finding_refs` dedup
+/// duplicate `(rule, file, line)` keys down to one entry even though the
+/// STORE keeps both underlying findings (`findings` stays the raw total).
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn draws_dispatches_the_unit_n_times_and_dedups_matching_finding_refs() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    // Two SEPARATE out dirs, each seeded with ONE finding at the SAME
+    // (file, line) — the shape two draws independently re-observing the
+    // same real issue would produce.
+    let draw1_dir = TempDir::new().unwrap();
+    let draw2_dir = TempDir::new().unwrap();
+    let out1 = seeded_out_dir(draw1_dir.path(), 1, 0);
+    let out2 = seeded_out_dir(draw2_dir.path(), 1, 0);
+
+    let calls: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = calls.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+        let n = {
+            let mut c = captured.lock().unwrap();
+            c.push(opts.session_id.clone());
+            c.len()
+        };
+        let out = if n == 1 { out1.clone() } else { out2.clone() };
+        ok_result(envelope("stop", 50, 10, 1_000), out)
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate", "draws": 2
+    }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+
+    let seen = calls.lock().unwrap();
+    assert_eq!(seen.len(), 2, "draws: 2 must dispatch exactly twice");
+    assert_ne!(
+        seen[0], seen[1],
+        "two draws must never share a session id — the finding store addresses by <session>/<seq>"
+    );
+    assert_eq!(seen[0].as_deref(), Some(format!("crawl-{MISSION}-u-0001").as_str()), "draw 0 is unchanged");
+
+    assert_eq!(parsed.findings, 2, "the RAW total across both draws — every finding the store holds");
+    assert_eq!(
+        parsed.finding_refs.len(),
+        1,
+        "both draws reported the same (rule, file, line) — dedup collapses them to one: {:?}",
+        parsed.finding_refs
+    );
+    assert_eq!(parsed.wall_ms, 2_000, "wall_ms sums across draws");
+    assert_eq!(parsed.prompt_tokens, 100);
+}
+
+/// (#2310 P4c-2b) `draws` absent (the default) must dispatch exactly ONCE
+/// — a mutation-kill against a `for draw in 0..cfg.draws` off-by-one, and
+/// the explicit statement of the byte-identical-to-before-P4c-2b claim
+/// this packet's own module doc makes.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn draws_defaults_to_exactly_one_dispatch() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 1, 0);
+
+    let calls: Arc<std::sync::Mutex<usize>> = Arc::new(std::sync::Mutex::new(0));
+    let captured = calls.clone();
+    let out_for_dispatch = out.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_opts: DispatchOpts| {
+        *captured.lock().unwrap() += 1;
+        ok_result(envelope("stop", 50, 10, 1_000), out_for_dispatch.clone())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    assert_eq!(*calls.lock().unwrap(), 1);
+}
+
 /// (#2310 P4c mutation-kill) `CrawlUnitStepKind` used to hardcode
 /// `role_id: "crawler".to_string()` regardless of what the owning Task
 /// declared — DESIGN.md's "Units. Already generic" claim was true in
@@ -758,6 +847,41 @@ fn the_summary_reads_the_runs_own_plan_files_for_what_was_planned() {
     assert_eq!(s.est_tokens, 400);
     assert_eq!(s.workspace, "fixture-ws");
     assert_eq!(s.sources[0].id, "app");
+    assert!(s.plans_errored.is_empty(), "a clean plan step names nothing errored: {:?}", s.plans_errored);
+}
+
+/// (#2310 P4c-2b PR #2357 round-2 review item 5) `crawl.json` shares
+/// `src/mission_launch.rs::grow_phase` with `review-v2.json` — since that
+/// function now grows zero units from an errored plan step's rule rather
+/// than aborting the whole launch (MUST FIX C), a crawl run reaches
+/// `summarize` with a silently smaller `units_in_plan` unless the summary
+/// NAMES the rule whose `crawl.plan` step failed. Proven here directly
+/// against `summarize_mission`, independent of the launcher.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn the_summary_names_the_rule_whose_plan_step_errored() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    darkmux_crew::lifecycle::save_step(
+        MISSION,
+        PHASE,
+        &Step {
+            id: "plan-swallowed-error-step".into(),
+            task_id: "plan-swallowed-error".into(),
+            kind: crate::crawl::plan_step::CRAWL_PLAN_KIND.into(),
+            gate: None,
+            status: NodeStatus::Error,
+            config: serde_json::json!({ "rule": "swallowed-error" }),
+            started_ts: None,
+            completed_ts: None,
+            output: Some("workspace_spec::materialize failed: no such source".into()),
+        },
+    )
+    .unwrap();
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.plans_errored, vec!["swallowed-error".to_string()], "{:?}", s.plans_errored);
 }
 
 // ── the kinds through the REAL scheduler (#2301 review) ──────────────────

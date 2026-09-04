@@ -43,7 +43,7 @@ use crate::mods::ModRecord;
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{Port, StepKind, StepOutcome};
 use crate::types::{Step, Task};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -100,6 +100,15 @@ pub struct DeliverScope {
     /// cannot mistake a narrow run for a complete one.
     #[serde(default)]
     pub not_attempted: Vec<String>,
+    /// (#2310 P4c-2b PR #2357 review MUST FIX D) Human-readable names of
+    /// units/plans that ended `Error`/`Abandoned` this run — distinct from
+    /// [`Self::not_attempted`] (which is what NEVER RAN, e.g. a rule whose
+    /// plan step failed) and from [`Self::refused`] (runtime-boundary
+    /// rejections, never a step-level failure). A non-empty list here is
+    /// what tells [`render_github_review`] this run is `"degraded"`, never
+    /// a clean `"noop"`, even when it produced zero findings.
+    #[serde(default)]
+    pub errored: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -135,9 +144,13 @@ pub struct GithubReviewPayload {
 }
 
 /// What [`render_github_review`] returns. `mode` is `"review"` when there
-/// is anything at all to say (findings, or a non-empty scope worth
-/// reporting) and `"noop"` when the run produced literally nothing —
-/// mirrors the review pipeline's own `mode` vocabulary in spirit (a
+/// is anything at all to say (findings, or mods); `"noop"` ONLY for a
+/// genuinely CLEAN run — nothing found AND nothing went wrong
+/// (`scope.errored` empty); `"degraded"` (#2310 P4c-2b PR #2357 review
+/// MUST FIX D) when nothing was found to say but `scope.errored` is
+/// non-empty — an errored/abandoned unit or plan step means this run is
+/// NOT a clean pass, even with zero findings, and must never read as one.
+/// Mirrors the review pipeline's own `mode` vocabulary in spirit (a
 /// distinct outcome, never silently folded into `"review"`) without
 /// depending on its type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -242,7 +255,29 @@ pub fn render_github_review(
         && question_bullets.is_empty()
         && double_check_bullets.is_empty();
     if nothing_to_say {
-        return DeliverOutcome { mode: "noop".to_string(), review: None };
+        if scope.errored.is_empty() {
+            // A genuinely CLEAN run — nothing to say because nothing went
+            // wrong and nothing was found. The only `mode` this applies
+            // to.
+            return DeliverOutcome { mode: "noop".to_string(), review: None };
+        }
+        // (#2310 P4c-2b PR #2357 review MUST FIX D, proven live) Before
+        // this fix, an errored run with zero findings ALSO rendered
+        // `"noop"` — the same "an errored run renders nothing" defect
+        // this arc exists to end, just one layer up from #975's own
+        // finding. A run that had a real error is never a clean noop,
+        // even with nothing to say about findings: the scope line (with
+        // its own `Errored:` section, `scope_line`'s own doc) IS the
+        // payload.
+        let mut body = vec!["### darkmux review".to_string(), String::new(), scope_line(scope, findings.len())];
+        if let Some(a) = attribution.filter(|a| !a.trim().is_empty()) {
+            body.push(String::new());
+            body.push(format!("_{a}_"));
+        }
+        return DeliverOutcome {
+            mode: "degraded".to_string(),
+            review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments: Vec::new() }),
+        };
     }
 
     let mut body = vec!["### darkmux review".to_string(), String::new()];
@@ -292,6 +327,12 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
     );
     if !scope.not_attempted.is_empty() {
         line.push_str(&format!(" Not attempted: {}.", scope.not_attempted.join(", ")));
+    }
+    // (#2310 P4c-2b PR #2357 review MUST FIX D) Named so a `"degraded"`
+    // run's scope line (its whole payload, when there is nothing else to
+    // say) actually names what broke, not just that something did.
+    if !scope.errored.is_empty() {
+        line.push_str(&format!(" Errored: {}.", scope.errored.join(", ")));
     }
     line
 }
@@ -388,8 +429,20 @@ enum DeliveryForm {
     Question,
 }
 
+/// (#2310 P4c-2b fix) Reads `context.confirm` — the SAME key
+/// `crawl::unit_step::run` host-stamps on every real finding's
+/// `record_context` (`"confirm": single_confirm(&rules_by_id, &ctx.
+/// rule_ids)`, itself copied straight from a `Rule`'s own `confirm` field:
+/// `templates/builtin/rules/*.json`'s `"confirm": "mod"|"search"|
+/// "question"`). This function used to read `context.get("form")` — a key
+/// NOTHING in the codebase ever stamped (P4b wrote this module before P4c
+/// decided the crawl unit's own stamped key name), so every real finding
+/// silently rendered as `DeliveryForm::Mod` regardless of its rule's
+/// declared confirm form until #2310 P4c-2b's own end-to-end wiring
+/// surfaced the mismatch. `deliver_github_review`'s OWN tests below
+/// updated to the real key in the same fix.
 fn delivery_form(finding: &FindingRecord) -> DeliveryForm {
-    match finding.context.get("form").and_then(|v| v.as_str()) {
+    match finding.context.get("confirm").and_then(|v| v.as_str()) {
         Some("search") => DeliveryForm::Search,
         Some("question") => DeliveryForm::Question,
         _ => DeliveryForm::Mod,
@@ -469,16 +522,23 @@ fn diff_touched_lines(diff_text: &str) -> BTreeMap<String, BTreeSet<u32>> {
 /// `Step.config` shape: `{"findings": [FindingRecord...], "mods":
 /// [GatedMod...], "diff": "<unified diff text>", "scope": DeliverScope,
 /// "attribution": "<optional string>", "emit": "<path, or \"-\"/absent
-/// for stdout>"}`. Every field but `findings`/`mods`/`diff` is optional.
+/// for stdout>"}`. Every field but `findings`/`mods`/`diff` is optional —
+/// EXCEPT that `findings`/`mods`/`diff`/`scope` may ALSO be supplied as a
+/// group by a same-task predecessor step's output instead of embedded
+/// literally (see [`DeliverConfig::from_step`]'s second branch below).
+///
 /// Reads its inputs from `Step.config` directly rather than through typed
-/// graph ports (#2301's `Output<T>` envelope convention): no producer for
-/// "findings as one bulk typed value" exists anywhere in the codebase
-/// today (a finding is read from the finding STORE by key, per
-/// `crawl.summary`'s own "the same one read of the dispatch's
-/// findings.jsonl" pattern, DESIGN.md's record table) — inventing four
-/// speculative port kinds nothing will ever produce is worse than the
-/// config-embedded shape a future caller (#2310 P4c) can trivially swap
-/// for a store read once that caller exists.
+/// graph ports (#2301's `Output<T>` envelope convention) for the ORIGINAL
+/// three fields — no producer for "findings as one bulk typed value"
+/// existed when this module was written (a finding is read from the
+/// finding STORE by key, per `crawl.summary`'s own "the same one read of
+/// the dispatch's findings.jsonl" pattern, DESIGN.md's record table) —
+/// inventing four speculative port kinds nothing would ever produce was
+/// worse than the config-embedded shape. #2310 P4c-2b is the future caller
+/// that module doc predicted: `records.gather` (`step_kinds::
+/// records_gather`) IS that store read, and this struct now accepts its
+/// output too, over the SAME `Data`-port `Step.output` -> `gather_inputs`
+/// wiring `Port`'s own doc describes — never a NEW mechanism.
 struct DeliverConfig {
     findings: Vec<FindingRecord>,
     mods: Vec<GatedMod>,
@@ -489,29 +549,62 @@ struct DeliverConfig {
 }
 
 impl DeliverConfig {
-    fn from_step(step: &Step) -> Result<Self> {
-        let field = |key: &str| -> Result<serde_json::Value> {
-            step.config
-                .get(key)
-                .cloned()
-                .ok_or_else(|| anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.{key}", step.id))
-        };
-        let findings: Vec<FindingRecord> = serde_json::from_value(field("findings")?)
-            .with_context(|| format!("step `{}`: config.findings", step.id))?;
-        let mods: Vec<GatedMod> =
-            serde_json::from_value(field("mods")?).with_context(|| format!("step `{}`: config.mods", step.id))?;
-        let diff = field("diff")?
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("step `{}`: config.diff must be a string", step.id))?;
-        let scope: DeliverScope = match step.config.get("scope") {
-            Some(v) => serde_json::from_value(v.clone())
-                .with_context(|| format!("step `{}`: config.scope", step.id))?,
-            None => DeliverScope::default(),
-        };
+    /// `input` is the step's own `gather_inputs` map (unused by every
+    /// existing caller — every current test embeds `findings`/`mods`/
+    /// `diff` literally in `step.config`, which this function still
+    /// prefers outright when present, so NOTHING about their behavior
+    /// changes). When `config.findings` is absent, this looks instead for
+    /// a [`super::records_gather::GatherOutput`] envelope among `input`'s
+    /// values — the shape a `records.gather` step run as this step's
+    /// immediately-previous SAME-TASK step produces (`scheduler::
+    /// gather_inputs`'s documented same-task-predecessor entry, keyed by
+    /// that step's own id) — and pulls `findings`/`mods`/`diff`/`scope`
+    /// from it as a group. `attribution`/`emit` are launch-time strings,
+    /// never data, and always come from `step.config` either way.
+    fn from_step(step: &Step, input: &BTreeMap<String, String>) -> Result<Self> {
         let attribution = step.config.get("attribution").and_then(|v| v.as_str()).map(str::to_string);
         let emit = step.config.get("emit").and_then(|v| v.as_str()).map(PathBuf::from);
-        Ok(Self { findings, mods, diff, scope, attribution, emit })
+
+        if step.config.get("findings").is_some() {
+            let field = |key: &str| -> Result<serde_json::Value> {
+                step.config.get(key).cloned().ok_or_else(|| {
+                    anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.{key}", step.id)
+                })
+            };
+            let findings: Vec<FindingRecord> = serde_json::from_value(field("findings")?)
+                .with_context(|| format!("step `{}`: config.findings", step.id))?;
+            let mods: Vec<GatedMod> = serde_json::from_value(field("mods")?)
+                .with_context(|| format!("step `{}`: config.mods", step.id))?;
+            let diff = field("diff")?
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("step `{}`: config.diff must be a string", step.id))?;
+            let scope: DeliverScope = match step.config.get("scope") {
+                Some(v) => serde_json::from_value(v.clone())
+                    .with_context(|| format!("step `{}`: config.scope", step.id))?,
+                None => DeliverScope::default(),
+            };
+            return Ok(Self { findings, mods, diff, scope, attribution, emit });
+        }
+
+        let gathered = input.values().find_map(|raw| {
+            crate::step_output::Output::<super::records_gather::GatherOutput>::read(
+                raw,
+                super::records_gather::RECORDS_GATHER_OUTPUT_KIND,
+            )
+            .ok()
+        });
+        let Some(gathered) = gathered else {
+            bail!(
+                "step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.findings (embedded) or a \
+                 `{}` step's output among its inputs (present: {}) — neither was found",
+                step.id,
+                super::records_gather::RECORDS_GATHER_KIND,
+                if input.is_empty() { "none".to_string() } else { input.keys().cloned().collect::<Vec<_>>().join(", ") }
+            );
+        };
+        let body = gathered.body;
+        Ok(Self { findings: body.findings, mods: body.mods, diff: body.diff, scope: body.scope, attribution, emit })
     }
 }
 
@@ -537,8 +630,8 @@ impl StepKind for DeliverGithubReviewStepKind {
         None
     }
 
-    fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
-        let cfg = DeliverConfig::from_step(step)?;
+    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        let cfg = DeliverConfig::from_step(step, input)?;
         let outcome =
             render_github_review(&cfg.findings, &cfg.mods, &cfg.diff, &cfg.scope, cfg.attribution.as_deref());
         let payload = serde_json::to_string(&outcome).context("serializing the deliver outcome")?;
@@ -571,7 +664,8 @@ mod tests {
     fn finding(key: &str, file: &str, line: u32, evidence: &str, why: &str, form: Option<&str>) -> FindingRecord {
         let mut context = json!({});
         if let Some(f) = form {
-            context = json!({ "form": f });
+            // (#2310 P4c-2b fix) `confirm`, not `form` — see `delivery_form`'s own doc.
+            context = json!({ "confirm": f });
         }
         FindingRecord {
             key: key.to_string(),
@@ -612,6 +706,8 @@ mod tests {
                 mission_id: None,
                 phase_id: None,
                 step_id: None,
+                gate: None,
+                gate_skipped_reason: None,
                 schema_version: crate::mods::MOD_SCHEMA_VERSION.to_string(),
                 extras: Default::default(),
             },
@@ -829,6 +925,24 @@ mod tests {
         assert!(out.review.is_none());
     }
 
+    /// (#2310 P4c-2b PR #2357 round-2 review item 4) A UNIT-level pin on
+    /// `render_github_review` itself — before this test, only the two
+    /// real-launch CLI tests exercised the `noop`/`degraded` branch,
+    /// neither of which calls this function directly. Zero findings/mods
+    /// but a non-empty `scope.errored` must render `mode: "degraded"`
+    /// with a review body carrying the scope line (never `"noop"`, never
+    /// `review: None`).
+    #[test]
+    fn an_errored_scope_with_nothing_to_say_is_degraded_not_noop() {
+        let scope = DeliverScope { errored: vec!["unit `x` (Error)".to_string()], ..Default::default() };
+        let out = render_github_review(&[], &[], DIFF, &scope, None);
+        assert_eq!(out.mode, "degraded", "{out:?}");
+        let review = out.review.expect("a degraded outcome still carries a review payload (the scope line)");
+        assert!(review.comments.is_empty(), "{review:?}");
+        assert!(review.body.contains("review ran:"), "the scope line must be present: {}", review.body);
+        assert!(review.body.contains("Errored: unit `x` (Error)."), "{}", review.body);
+    }
+
     #[test]
     fn line_touched_mutation_kill_a_context_line_counts_same_as_an_added_line() {
         // (#2310 P4b self-QA) The suggestion-vs-patch branch hinges on
@@ -959,6 +1073,7 @@ mod tests {
             hunks_total: 4,
             refused: 2,
             not_attempted: vec!["architectural review".into()],
+            errored: Vec::new(),
         };
 
         let outcome = render_github_review(&findings, &mods, DIFF, &scope, Some("Advisory, not a merge gate."));
