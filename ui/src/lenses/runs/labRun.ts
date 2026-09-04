@@ -17,6 +17,7 @@
  * without depending on a stylesheet this port is free to change.
  */
 
+import { RUNNING_WORD } from "../../components/WorkStatus";
 import { shortModel } from "../lab/labSeries";
 import type { LabFunnelEnvelope, LabRunEvent, LabScoresDoc } from "../../types/handwritten";
 
@@ -196,5 +197,7 @@ export function labCliHint(env: LabFunnelEnvelope | null, scores: LabScoresDoc |
  * once `finished`, same reasoning as `labFeedStatusSuffix` above. */
 export function labBadgeText(finished: boolean, unreachable: boolean = false): string {
   if (!finished && unreachable) return "⚠ daemon unreachable — retrying";
-  return finished ? "finished" : "● live";
+  // A live lab run is a running chip, and a running chip has ONE word (see
+  // `RUNNING_WORD`) — the legacy `● live` was the lab series' private spelling.
+  return finished ? "finished" : RUNNING_WORD;
 }

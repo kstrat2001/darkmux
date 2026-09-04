@@ -215,7 +215,7 @@ describe("labCliHint", () => {
 describe("labBadgeText", () => {
   it("names finished vs live", () => {
     expect(labBadgeText(true)).toBe("finished");
-    expect(labBadgeText(false)).toBe("● live");
+    expect(labBadgeText(false)).toBe("running");
   });
 
   it("names the daemon-unreachable state only while live, never overriding finished", () => {
