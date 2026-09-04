@@ -44,7 +44,7 @@ use crate::crawl::plan::{Plan, ReadFileEntry, Site, Unit};
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, DispatchResult};
 use darkmux_crew::rules::{self, Rule};
-use darkmux_crew::step_kinds::{Port, StepKind, StepKindRegistry, StepOutcome};
+use darkmux_crew::step_kinds::{Port, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::types::{Step, Task};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -794,6 +794,27 @@ impl StepKind for CrawlUnitStepKind {
         &PORTS
     }
 
+    /// (#2321) Declare where the unit will run, in the terms the scheduler's
+    /// wave packer reads. A kind that stays silent here is queued as a REMOTE
+    /// job under `remote_cap` (1 on the launch path), which is how sibling
+    /// units of one plan ran strictly one at a time on an already-resident
+    /// model — 3× the wall-clock of the same three units wave-packed. The
+    /// dispatch below always runs the `crawler` role with no explicit profile
+    /// (`profile_name: None`), which the dispatch resolves as `role_profiles.
+    /// crawler` first, `default_profile` second — and `resolve_local_placement`
+    /// now resolves the very same way (#2329 review), so the wave leases the
+    /// model the dispatch will actually use. A registry that cannot resolve
+    /// yields `None` (one stderr warning per unit) and the units fall back to
+    /// the remote queue; the dispatch then surfaces the real error itself.
+    fn residency(
+        &self,
+        step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<darkmux_crew::step_kinds::Placement> {
+        darkmux_crew::step_kinds::resolve_local_placement("crawler", None, None, &format!("step:{}", step.id))
+    }
     fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let cfg = UnitStepConfig::from_step(step)?;
         let mission_id = mission_id_for(task)?;

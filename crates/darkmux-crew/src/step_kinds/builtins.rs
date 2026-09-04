@@ -151,15 +151,59 @@ fn resolve_local_placement_inner(
     config_path: Option<&str>,
     seat: &str,
 ) -> std::result::Result<darkmux_gestalt::Placement, PlacementMiss> {
+    // (#2329 review) The dispatch resolves an unnamed profile through the
+    // machine-local `role_profiles` map FIRST (`dispatch_internal::
+    // resolve_role_aware_profile`, #1547) and `default_profile` only as the
+    // fallback. This placement used to read `default_profile` alone, so a
+    // bound role (`role_profiles.coder = coder-qwen38` on a registry whose
+    // default is `balanced`) had its wave load and lease model A while every
+    // dispatch loaded model B — lived on 2026-09-04: a five-coder wave leased
+    // turboquant and each coder then loaded qwen3.8 itself. Same map, same
+    // precedence, read live like the dispatch does (test builds see an empty
+    // map by construction, #811 — the pure core below takes it as a value).
+    let mapped = if profile_name.is_none() {
+        darkmux_types::config_access::role_profile(role_id)
+    } else {
+        None
+    };
+    resolve_local_placement_inner_with(role_id, profile_name, mapped, config_path, seat)
+}
+
+/// Pure core of [`resolve_local_placement_inner`]: the `role_profiles`
+/// binding arrives as a value so a test can drive the mapped arm.
+fn resolve_local_placement_inner_with(
+    role_id: &str,
+    profile_name: Option<&str>,
+    mapped: Option<String>,
+    config_path: Option<&str>,
+    seat: &str,
+) -> std::result::Result<darkmux_gestalt::Placement, PlacementMiss> {
     use crate::select::select_model;
     use PlacementMiss::ResolutionFailed;
 
     let loaded = darkmux_profiles::profiles::load_registry(config_path)
         .map_err(|e| ResolutionFailed(format!("profile registry: {e}")))?;
-    let (_active_name, profile) = loaded
-        .registry
-        .resolve_active(profile_name)
-        .ok_or_else(|| ResolutionFailed("no active profile".to_string()))?;
+    let profile = match (profile_name, mapped) {
+        // An explicit name wins (falling back to `default_profile` when this
+        // machine does not define it — the machine-agnostic-caller case
+        // `resolve_active` exists for).
+        (Some(_), _) | (None, None) => {
+            loaded
+                .registry
+                .resolve_active(profile_name)
+                .ok_or_else(|| ResolutionFailed("no active profile".to_string()))?
+                .1
+        }
+        // The `role_profiles` binding — loud when it names a profile the
+        // registry does not define, never a silent fallback (contract 7),
+        // exactly as the dispatch resolves it.
+        (None, Some(mapped)) => {
+            let binding = darkmux_profiles::profiles::RoleBinding::Mapped(mapped);
+            darkmux_profiles::profiles::resolve_role_profile_with(role_id, &binding, &loaded.registry)
+                .map_err(|e| ResolutionFailed(format!("{e:#}")))?
+                .profile
+        }
+    };
 
     let roles = crate::loader::load_roles().map_err(|e| ResolutionFailed(format!("loading roles: {e}")))?;
     let role = roles
@@ -3973,5 +4017,41 @@ mod tests {
                 kind.id()
             );
         }
+    }
+
+    /// (#2329 review) The placement must resolve the profile exactly as the
+    /// dispatch will: explicit name > `role_profiles` binding > default.
+    /// Before, the binding was skipped, so a bound role's wave leased one
+    /// model while its dispatch loaded another.
+    #[test]
+    fn placement_honors_the_role_profiles_binding_exactly_like_the_dispatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = dir.path().join("profiles.json");
+        std::fs::write(
+            &reg,
+            serde_json::json!({
+                "default_profile": "p",
+                "profiles": {
+                    "p": {"models": [{"id": "m-default", "n_ctx": 4096, "role": "primary"}]},
+                    "q": {"models": [{"id": "m-mapped", "n_ctx": 8192, "role": "primary"}]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = reg.to_str().unwrap();
+        let pick = |name: Option<&str>, mapped: Option<&str>| {
+            resolve_local_placement_inner_with("coder", name, mapped.map(str::to_string), Some(cfg), "step:s")
+                .map(|p| p.model_key)
+                .map_err(|e| match e {
+                    PlacementMiss::Remote => "remote".to_string(),
+                    PlacementMiss::ResolutionFailed(r) => r,
+                })
+        };
+        assert_eq!(pick(None, None), Ok("m-default".into()), "unbound → default_profile");
+        assert_eq!(pick(None, Some("q")), Ok("m-mapped".into()), "the role_profiles binding wins over the default");
+        assert_eq!(pick(Some("p"), Some("q")), Ok("m-default".into()), "an explicit profile wins over the binding");
+        let err = pick(None, Some("nope")).unwrap_err();
+        assert!(err.contains("nope"), "a binding to an undefined profile is a loud error naming it, never a silent fallback: {err}");
     }
 }
