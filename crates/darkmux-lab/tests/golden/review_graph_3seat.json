@@ -14,6 +14,82 @@
       "status": "planned",
       "task_id": "review-bundle-task"
     },
+    "review-context-step": {
+      "config": {
+        "case_id": "case-1",
+        "diff_file": "/nonexistent-test-diff-golden",
+        "intent_body": "",
+        "intent_title": "",
+        "staffing": {
+          "judge": {
+            "k": 1,
+            "max_tokens": null,
+            "name": "fast",
+            "passes": 2,
+            "pm": {
+              "capabilities": {},
+              "id": "judge-model",
+              "n_ctx": 32000
+            },
+            "provenance": null,
+            "role_id": null,
+            "selector": null
+          },
+          "probes": [
+            {
+              "k": 1,
+              "max_tokens": null,
+              "name": "phigh",
+              "passes": 2,
+              "pm": {
+                "capabilities": {},
+                "id": "probe-model-a",
+                "n_ctx": 32000
+              },
+              "provenance": null,
+              "role_id": "review-probe-high",
+              "selector": null
+            },
+            {
+              "k": 1,
+              "max_tokens": null,
+              "name": "pmid",
+              "passes": 2,
+              "pm": {
+                "capabilities": {},
+                "id": "probe-model-b",
+                "n_ctx": 32000
+              },
+              "provenance": null,
+              "role_id": "review-probe-mid",
+              "selector": null
+            },
+            {
+              "k": 1,
+              "max_tokens": null,
+              "name": "plow",
+              "passes": 2,
+              "pm": {
+                "capabilities": {},
+                "id": "probe-model-c",
+                "n_ctx": 32000
+              },
+              "provenance": null,
+              "role_id": "review-probe-low",
+              "selector": null
+            }
+          ],
+          "request_changes": false,
+          "verify": null,
+          "warnings": []
+        },
+        "timeout_seconds": 30
+      },
+      "id": "review-context-step",
+      "kind": "review.context",
+      "status": "planned",
+      "task_id": "review-context-task"
+    },
     "review-dedup-step": {
       "config": {
         "probe_specs": [
@@ -197,6 +273,18 @@
   "tasks": [
     {
       "depends_on": [],
+      "description": "(#2310 P1) resolve the review's shared context (diff/intent/prompts/staffing) as the pipeline's first typed step output — review-bundle-task depends on it",
+      "display_name": "Context",
+      "id": "review-context-task",
+      "phase_id": "pr-review-golden-investigate",
+      "step_ids": [
+        "review-context-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "review-context-task"
+      ],
       "description": "resolve review bundles from the diff",
       "display_name": "Bundle",
       "id": "review-bundle-task",
@@ -213,11 +301,14 @@
       "display_name": "Probe high",
       "id": "review-probe-high-task",
       "phase_id": "pr-review-golden-investigate",
+      "reads": [
+        "review-context-task"
+      ],
+      "role_id": "review-probe-high",
       "step_ids": [
         "review-probe-high-render-step",
         "review-probe-high-step"
-      ],
-      "role_id": "review-probe-high"
+      ]
     },
     {
       "depends_on": [
@@ -227,11 +318,14 @@
       "display_name": "Probe mid",
       "id": "review-probe-mid-task",
       "phase_id": "pr-review-golden-investigate",
+      "reads": [
+        "review-context-task"
+      ],
+      "role_id": "review-probe-mid",
       "step_ids": [
         "review-probe-mid-render-step",
         "review-probe-mid-step"
-      ],
-      "role_id": "review-probe-mid"
+      ]
     },
     {
       "depends_on": [
@@ -241,11 +335,14 @@
       "display_name": "Probe low",
       "id": "review-probe-low-task",
       "phase_id": "pr-review-golden-investigate",
+      "reads": [
+        "review-context-task"
+      ],
+      "role_id": "review-probe-low",
       "step_ids": [
         "review-probe-low-render-step",
         "review-probe-low-step"
-      ],
-      "role_id": "review-probe-low"
+      ]
     },
     {
       "depends_on": [
@@ -257,6 +354,9 @@
       "display_name": "Dedup",
       "id": "review-dedup-task",
       "phase_id": "pr-review-golden-investigate",
+      "reads": [
+        "review-context-task"
+      ],
       "step_ids": [
         "review-dedup-step"
       ]
@@ -267,12 +367,13 @@
       "display_name": "Judge",
       "id": "review-judge-task",
       "phase_id": "pr-review-golden-adjudicate",
-      "step_ids": [
-        "review-judge-step"
+      "reads": [
+        "review-dedup-task",
+        "review-context-task"
       ],
       "role_id": "review-judge",
-      "reads": [
-        "review-dedup-task"
+      "step_ids": [
+        "review-judge-step"
       ]
     },
     {
@@ -281,13 +382,14 @@
       "display_name": "Verify",
       "id": "review-verify-task",
       "phase_id": "pr-review-golden-report",
+      "reads": [
+        "review-judge-task",
+        "review-context-task"
+      ],
+      "role_id": "review-verify",
       "step_ids": [
         "review-verify-render-step",
         "review-verify-step"
-      ],
-      "role_id": "review-verify",
-      "reads": [
-        "review-judge-task"
       ]
     },
     {
@@ -298,12 +400,13 @@
       "display_name": "Synthesis",
       "id": "review-synthesis-task",
       "phase_id": "pr-review-golden-report",
-      "step_ids": [
-        "review-synthesis-step"
-      ],
       "reads": [
         "review-dedup-task",
-        "review-judge-task"
+        "review-judge-task",
+        "review-context-task"
+      ],
+      "step_ids": [
+        "review-synthesis-step"
       ]
     }
   ]

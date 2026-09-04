@@ -3762,6 +3762,9 @@ use super::bundle::{
     build_bundles, external_bundles, is_plugin_decline, slice_code, slice_code_probe, BundleSet,
     BundleSkipReport, FileSource, SkipReason, SkippedFile,
 };
+// (#2310 P1) `ReviewContext` — the typed `review.context` step-output body;
+// see `ReviewContextStepKind`'s doc and `review_context`'s module doc.
+use super::review_context::{self, ReviewContext};
 use std::path::{Path, PathBuf};
 
 // ─── #1530 Packets 0/1/3a: run-scoped ArtifactBus artifact names ──────────
@@ -3923,6 +3926,32 @@ fn make_review_warnings_artifact() -> Arc<dyn Any + Send + Sync> {
 /// up via `ctx.artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)`
 /// instead of reading `self.ctx` — same `&ReviewStepContext` shape at every
 /// read site, only the SOURCE of the `Arc` changed.
+/// (#2310 P1 fix) The FIVE test-only escape hatches
+/// [`ReviewContextStepKind::run_streaming`] applies after its own real
+/// `resolve_review_context` call — moved OFF `review.context`'s step
+/// CONFIG (operator-reachable: a user-tier `~/.darkmux/mission-configs/
+/// review.json` could otherwise set `judge_system` here and replace the
+/// FROZEN judge prompt, #1256 — "frozen means one hash, not one
+/// intention") and ONTO this bus-only seam object instead, alongside
+/// [`ReviewStepContext::chat_override`]/[`ReviewStepContext::
+/// bundle_override`]. `None` at every production call site — the
+/// launcher (`src/mission_launch_review.rs`), `review_bench.rs`, and
+/// `review_context_from_input`'s downstream-kind reconstruction all
+/// leave this at its `Default` (all-`None`); only in-process test code
+/// that seeds the `ArtifactBus` directly (never reachable from a config
+/// file) sets a field here. `ReviewContextStepKind::run_streaming`
+/// applies each `Some` field over the value it just resolved for real,
+/// exactly the same "after real resolution" application order the
+/// retired config keys used.
+#[derive(Clone, Default)]
+pub struct ReviewContextTestOverrides {
+    pub probe_system: Option<String>,
+    pub judge_system: Option<String>,
+    pub verify_system: Option<String>,
+    pub remote_max_tokens_per_execution: Option<u64>,
+    pub judge_exhaustion_strict: Option<bool>,
+}
+
 #[derive(Clone, Default)]
 pub struct ReviewStepContext {
     pub case_id: String,
@@ -3938,6 +3967,23 @@ pub struct ReviewStepContext {
     pub intent_title: String,
     pub intent_body: String,
     pub diff: String,
+    /// (#2310 P1 review finding I4) The diff's ORIGINAL on-disk path, when
+    /// the caller has one — set only by a caller with a real backing file
+    /// (`src/mission_launch_review.rs`'s CLI-provided `--param diff_file`,
+    /// `review_bench.rs`'s own temp diff file). `build_review_graph_from_
+    /// config` stamps THIS path onto `review-context-step`'s config when
+    /// present, instead of the already-resolved `diff` TEXT above — the
+    /// step reads the file back itself, once, at run time
+    /// (`ReviewContextStepConfig`/`resolve_review_context` already accept
+    /// either shape). Only the PERSISTED `Step.config` shrinks: `diff`
+    /// stays populated here (and on the typed `ReviewContext` output every
+    /// downstream kind reads) either way. `None` — every hermetic test
+    /// fixture in this crate, which resolves `diff` from an in-process
+    /// string with nothing on disk to point at — falls back to stamping
+    /// the text directly, unchanged from before this field existed.
+    pub diff_file: Option<PathBuf>,
+    /// Same shape, for `intent_file` — see [`Self::diff_file`]'s own doc.
+    pub intent_file: Option<PathBuf>,
     pub probe_system: String,
     /// (#1530 follow-on, Packet A1) Per-PROBE-ROLE resolved system prompt —
     /// `role_id` (`"review-probe-high"`/`-mid`/`-low`) -> that role's OWN
@@ -4041,6 +4087,11 @@ pub struct ReviewStepContext {
     /// (`FleetFlowEmitter`, `src/mission_launch_review.rs`) — this field
     /// covers the other, structurally-separate gap.
     pub mission_id: Option<String>,
+    /// (#2310 P1 fix) See [`ReviewContextTestOverrides`]'s own doc — the
+    /// five `review.context` step-config test seams, relocated here so
+    /// they're reachable only by code that seeds this bus artifact
+    /// in-process, never by a `review.json` config key.
+    pub context_test_overrides: ReviewContextTestOverrides,
 }
 
 /// The production dispatch primitive every review step kind below calls —
@@ -4084,6 +4135,372 @@ fn dispatch_chat(ctx: &ReviewStepContext, call: &ChatCall) -> Result<SingleShotR
     }?;
     emit_review_token_telemetry(&ctx.case_id, ctx.mission_id.as_deref(), call.model, &reply);
     Ok(reply)
+}
+
+// ── the `review.context` step kind (#2310 P1) ────────────────────────────
+
+/// The step KIND id — registered under this string in
+/// [`register_review_kinds`]. Same literal as
+/// [`review_context::REVIEW_CONTEXT_OUTPUT_KIND`] (the step produces
+/// exactly one thing, same convention `crawl.plan`'s `CRAWL_PLAN_KIND`/
+/// `CRAWL_PLAN_OUTPUT_KIND` pair uses) — deliberately NOT the same
+/// constant as [`REVIEW_CONTEXT_ARTIFACT`] above, which is a DIFFERENT
+/// namespace (an `ArtifactBus` key, not a step kind id or a `Port` label),
+/// even though it happens to carry the identical string today.
+const REVIEW_CONTEXT_KIND: &str = "review.context";
+
+/// (#2310 P1) Config the `review.context` step reads — the RAW inputs, not
+/// resolved data: `build_review_graph_from_config` stamps this from
+/// exactly the values `src/mission_launch_review.rs` used to resolve
+/// inline (`bundle_spec.diff_file`, `ctx.case_id`, `ctx.timeout_seconds`,
+/// the resolved seat staffing) plus one leniency: `intent_file` (a path,
+/// read by THIS step — the shape a fresh `mission launch review` config's
+/// `--param intent_file` names) and `intent_body` (the text directly, when
+/// a caller has already resolved it — the shape `build_review_graph_from_
+/// config` stamps, since the builder stamps `intent_file` when the launcher retained
+/// a path and `intent_body` only when it did not) are both accepted; `intent_body`
+/// wins when both are present (config leniency, #1269 — never a hot-path
+/// panic over which shape a caller chose).
+struct ReviewContextStepConfig {
+    /// One of `diff_file`/`diff` is required — same leniency shape as
+    /// intent (see this struct's own doc): `build_review_graph_from_config`
+    /// stamps `diff_file` (the path) on the production launch path, and `diff` inline only when the caller has no file (a hand-built graph already read `diff_file` into
+    /// text before this point, same as `ctx.intent_body` — re-reading the
+    /// file a second time here would be wasted I/O), while a hand-built
+    /// graph (a `plan_out`-style test, or a config authored by hand) can
+    /// still name a real `diff_file` for the step to read itself.
+    diff_file: Option<PathBuf>,
+    diff: Option<String>,
+    intent_file: Option<PathBuf>,
+    intent_body: Option<String>,
+    intent_title: String,
+    case_id: String,
+    timeout_seconds: u32,
+    staffing: ResolvedReviewRoles,
+    /// Test/hand-built-graph escape hatch, mirroring `crawl.plan`'s own
+    /// `plan_out` — see that kind's `PlanStepConfig::from_step` doc. `None`
+    /// on every production path, which resolves
+    /// `<missions>/<mission-id>/context/context.json` through the task's
+    /// phase record instead (`default_context_path`, below).
+    context_out: Option<PathBuf>,
+    // (#2310 P1 fix) The five `*_override` test escape hatches that used to
+    // live here were REMOVED — `review.json` step config is operator-
+    // reachable (a user-tier config could set `judge_system_override` and
+    // replace the FROZEN judge prompt, #1256), so a test seam has no
+    // business being a config key. `ReviewContextStepConfig::from_step`
+    // below no longer reads these five keys at all — present or absent in
+    // a hand-authored config, they're silently ignored (`step.config` is a
+    // raw JSON blob with no schema/unknown-key validation to refuse them
+    // by name; see `run_streaming`'s own doc for where the equivalent
+    // seam lives now). See [`ReviewContextTestOverrides`]'s doc for the
+    // bus-only replacement.
+}
+
+impl ReviewContextStepConfig {
+    fn from_step(step: &Step) -> Result<Self> {
+        let diff_file = step.config.get("diff_file").and_then(|v| v.as_str()).map(PathBuf::from);
+        let diff = step.config.get("diff").and_then(|v| v.as_str()).map(String::from);
+        if diff_file.is_none() && diff.is_none() {
+            bail!(
+                "step `{}`: `{REVIEW_CONTEXT_KIND}` requires config.diff_file or config.diff",
+                step.id
+            );
+        }
+        let intent_file = step.config.get("intent_file").and_then(|v| v.as_str()).map(PathBuf::from);
+        let intent_body = step.config.get("intent_body").and_then(|v| v.as_str()).map(String::from);
+        let intent_title =
+            step.config.get("intent_title").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let case_id = step
+            .config
+            .get("case_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from)
+            .ok_or_else(|| anyhow!("step `{}`: `{REVIEW_CONTEXT_KIND}` requires config.case_id", step.id))?;
+        let timeout_seconds = step
+            .config
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(REVIEW_CONTEXT_DEFAULT_TIMEOUT_SECONDS);
+        let staffing_val = step.config.get("staffing").ok_or_else(|| {
+            anyhow!("step `{}`: `{REVIEW_CONTEXT_KIND}` requires config.staffing", step.id)
+        })?;
+        let staffing: ResolvedReviewRoles = serde_json::from_value(staffing_val.clone()).with_context(|| {
+            format!("step `{}`: `{REVIEW_CONTEXT_KIND}` config.staffing is not a valid staffing document", step.id)
+        })?;
+        let context_out = step.config.get("context_out").and_then(|v| v.as_str()).map(PathBuf::from);
+        Ok(Self {
+            diff_file,
+            diff,
+            intent_file,
+            intent_body,
+            intent_title,
+            case_id,
+            timeout_seconds,
+            staffing,
+            context_out,
+        })
+    }
+}
+
+/// The same 3600s floor `src/mission_launch_review.rs::REVIEW_DEFAULT_TIMEOUT_SECONDS`
+/// names — duplicated rather than shared across the `src/`↔`darkmux-lab`
+/// crate boundary (`darkmux-lab` cannot depend on the CLI's own `src/`).
+/// Only a DEFAULT: the launcher always stamps `config.timeout_seconds`
+/// explicitly, so this is reached only by a hand-built graph/test that
+/// omits it.
+const REVIEW_CONTEXT_DEFAULT_TIMEOUT_SECONDS: u32 = 3600;
+
+/// `<missions>/<mission-id>/context/context.json`, the mission being the
+/// one that owns the step's task's phase — same shape and the same "a
+/// phase record that cannot be found is a refusal, not a guess" rule
+/// `crawl::plan_step::default_plan_path` uses. Reached only when a
+/// review.context step is built WITHOUT going through
+/// `build_review_graph_from_config` (which always stamps `context_out`
+/// itself — see that function's own doc).
+fn default_context_path(phases: &[darkmux_crew::types::Phase], task: &Task) -> Result<PathBuf> {
+    let phase = phases.iter().find(|p| p.id == task.phase_id).ok_or_else(|| {
+        anyhow!(
+            "`{REVIEW_CONTEXT_KIND}`: task `{}` names phase `{}`, which has no record — pass \
+             config.context_out to write the context elsewhere",
+            task.id,
+            task.phase_id
+        )
+    })?;
+    Ok(darkmux_crew::loader::missions_dir().join(&phase.mission_id).join("context").join("context.json"))
+}
+
+/// Resolve [`ReviewContext`] from raw inputs — the ONE function both
+/// [`ReviewContextStepKind::run`] and `src/mission_launch_review.rs` call,
+/// so the launcher no longer hand-assembles these fields itself (#2310
+/// P1). Reads `diff_file` (required) and `intent_file` (optional; empty
+/// body when absent, matching the launcher's own pre-#2310 fallback),
+/// resolves the three system prompts via `darkmux_crew::loader::
+/// role_prompt` plus each staffed probe seat's own per-role prompt, and
+/// resolves `remote_max_tokens_per_execution`/`judge_exhaustion_strict` via
+/// `darkmux_types::config_access` — EXACTLY what the launcher used to do
+/// inline before this packet (frozen model-facing text, #1256: same
+/// functions, same call sites, just relocated).
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_review_context(
+    case_id: &str,
+    staffing: &ResolvedReviewRoles,
+    diff_file: Option<&Path>,
+    // (#2310 P1) Wins over `diff_file` when both are given — see
+    // `ReviewContextStepConfig`'s own doc for why both shapes exist.
+    diff_override: Option<&str>,
+    intent_file: Option<&Path>,
+    // (#2310 P1) Wins over `intent_file` when both are given — see
+    // `ReviewContextStepConfig`'s own doc for why both shapes exist.
+    intent_body_override: Option<&str>,
+    intent_title: &str,
+    timeout_seconds: u32,
+) -> Result<ReviewContext> {
+    let diff = match (diff_override, diff_file) {
+        (Some(text), _) => text.to_string(),
+        (None, Some(p)) => {
+            std::fs::read_to_string(p).with_context(|| format!("reading diff_file {}", p.display()))?
+        }
+        (None, None) => bail!("`{REVIEW_CONTEXT_KIND}`: neither a diff nor a diff_file was given"),
+    };
+    let intent_body = match (intent_body_override, intent_file) {
+        (Some(text), _) => text.to_string(),
+        (None, Some(p)) => {
+            std::fs::read_to_string(p).with_context(|| format!("reading intent_file {}", p.display()))?
+        }
+        (None, None) => String::new(),
+    };
+    let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
+        anyhow!(
+            "darkmux: role \"review-probe\" has no system prompt — reinstall darkmux or check \
+             <crew_root>/roles/review-probe.md"
+        )
+    })?;
+    let judge_system = darkmux_crew::loader::role_prompt("review-judge").ok_or_else(|| {
+        anyhow!(
+            "darkmux: role \"review-judge\" has no system prompt — reinstall darkmux or check \
+             <crew_root>/roles/review-judge.md"
+        )
+    })?;
+    let verify_system = darkmux_crew::loader::role_prompt("review-verify").ok_or_else(|| {
+        anyhow!(
+            "darkmux: role \"review-verify\" has no system prompt — reinstall darkmux or check \
+             <crew_root>/roles/review-verify.md"
+        )
+    })?;
+    let mut probe_role_prompts: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for seat in &staffing.probes {
+        if let Some(role_id) = &seat.role_id {
+            let prompt = darkmux_crew::loader::role_prompt(role_id).unwrap_or_else(|| probe_system.clone());
+            probe_role_prompts.insert(role_id.clone(), prompt);
+        }
+    }
+    let remote_max_tokens_per_execution = darkmux_types::config_access::remote_max_tokens_per_execution();
+    let judge_exhaustion_strict = darkmux_types::config_access::review_judge_fail_on_any_skip();
+    Ok(ReviewContext {
+        schema_version: review_context::REVIEW_CONTEXT_SCHEMA_VERSION.to_string(),
+        case_id: case_id.to_string(),
+        roles: staffing.clone(),
+        intent_title: intent_title.to_string(),
+        intent_body,
+        diff,
+        probe_system,
+        probe_role_prompts,
+        judge_system,
+        verify_system,
+        remote_max_tokens_per_execution,
+        judge_exhaustion_strict,
+        timeout_seconds,
+    })
+}
+
+fn write_review_context(path: &Path, wrapped: &darkmux_crew::step_output::Output<ReviewContext>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(wrapped)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("moving the context into place at {}", path.display()))?;
+    Ok(())
+}
+
+/// (#2310 P1) The review pipeline's shared context, resolved once as the
+/// FIRST task of the investigate phase and written as a real, hashed
+/// `Output<ReviewContext>` — every downstream review task now formally
+/// `depends_on`/`reads` this step, and every review kind reads the DATA
+/// half through the typed output (`review_context_from_input`) rather than
+/// the bus — see `review_context`'s module doc for the full design.
+pub struct ReviewContextStepKind;
+
+impl StepKind for ReviewContextStepKind {
+    fn id(&self) -> &'static str {
+        REVIEW_CONTEXT_KIND
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Review context"
+    }
+
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND)];
+        &PORTS
+    }
+
+    /// (#2310 P1 fix) This kind's own five test overrides now live on the
+    /// run-scoped `ArtifactBus` (`REVIEW_CONTEXT_ARTIFACT`), not on
+    /// `Step.config` — see [`ReviewContextTestOverrides`]'s doc. Declared
+    /// here (a consumer, mirroring `ReviewBundleStepKind::requires()`'s own
+    /// reasoning for `REVIEW_ENVELOPE_ARTIFACT`) even though some other
+    /// kind present in every shipped graph already `provides()` the same
+    /// artifact for the scheduler's pre-scan — this keeps the declaration
+    /// honest for a hand-built graph that names only this kind.
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact)];
+        &PORTS
+    }
+
+    /// (#2310 P1 fix) `run` stays fully self-contained — no bus access, so
+    /// it applies NO overrides (equivalent to `ReviewContextTestOverrides::
+    /// default()`, all-`None`), matching production behavior exactly. Kept
+    /// working (not a panic, unlike `ReviewBundleStepKind::run`) because,
+    /// unlike every other review kind, `review.context` has existing tests
+    /// that call `.run()` directly with no `StepRunCtx` at all
+    /// (`review_conformance.rs`'s golden + missing-diff tests) — this path
+    /// is what they exercise, and it needs no seam since it never bypasses
+    /// real I/O the way bundling/dispatch do.
+    fn run(&self, step: &Step, task: &Task, _input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        run_review_context_step(step, task, &ReviewContextTestOverrides::default())
+    }
+
+    /// (#2310 P1 fix) The scheduler's real entry point — reads the five
+    /// test-only overrides off the bus-seeded `ReviewStepContext`
+    /// (`ReviewContextTestOverrides` — see that struct's own doc) instead
+    /// of `Step.config`. `None` on every production path (the launcher/
+    /// bench never populate it); only in-process test code that seeds the
+    /// `ArtifactBus` directly sets a field here, so this stays unreachable
+    /// from a `review.json` config file.
+    fn run_streaming(
+        &self,
+        step: &Step,
+        task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let seam_ctx = run_ctx
+            .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
+            .expect("run_review_graph seeds the context artifact before the graph runs");
+        run_review_context_step(step, task, &seam_ctx.context_test_overrides)
+    }
+}
+
+/// (#2310 P1 fix) The shared resolve-then-write body both [`ReviewContextStepKind::run`]
+/// (no overrides — the ctx-free path direct callers/tests use) and
+/// [`ReviewContextStepKind::run_streaming`] (overrides from the bus seam)
+/// call — extracted so the override-application step happens in exactly
+/// ONE place regardless of which entry point ran.
+fn run_review_context_step(step: &Step, task: &Task, overrides: &ReviewContextTestOverrides) -> Result<StepOutcome> {
+    let cfg = ReviewContextStepConfig::from_step(step)?;
+    // (trivial, #2310 P1 review) `load_phases()` used to be called up to
+    // TWICE per invocation — once (conditionally) inside `default_context_
+    // path`, once (always) for `mission_id` below. Read once, thread the
+    // result to both uses; each keeps its own original error-handling
+    // shape (`default_context_path`'s branch still propagates a load
+    // failure loudly, `mission_id`'s still swallows one via `.ok()`).
+    let phases = darkmux_crew::loader::load_phases();
+    let out_path = match &cfg.context_out {
+        Some(p) => p.clone(),
+        None => default_context_path(
+            phases
+                .as_ref()
+                .map_err(|e| anyhow!("{e:#}"))
+                .context("loading phase records to locate the run")?,
+            task,
+        )?,
+    };
+    let mut context = resolve_review_context(
+        &cfg.case_id,
+        &cfg.staffing,
+        cfg.diff_file.as_deref(),
+        cfg.diff.as_deref(),
+        cfg.intent_file.as_deref(),
+        cfg.intent_body.as_deref(),
+        &cfg.intent_title,
+        cfg.timeout_seconds,
+    )
+    .with_context(|| format!("`{REVIEW_CONTEXT_KIND}`: step `{}` resolving the review context", step.id))?;
+    if let Some(s) = &overrides.probe_system {
+        context.probe_system = s.clone();
+    }
+    if let Some(s) = &overrides.judge_system {
+        context.judge_system = s.clone();
+    }
+    if let Some(s) = &overrides.verify_system {
+        context.verify_system = s.clone();
+    }
+    if let Some(v) = overrides.remote_max_tokens_per_execution {
+        context.remote_max_tokens_per_execution = v;
+    }
+    if let Some(v) = overrides.judge_exhaustion_strict {
+        context.judge_exhaustion_strict = v;
+    }
+
+    let mission_id = phases
+        .as_ref()
+        .ok()
+        .and_then(|ps| ps.iter().find(|p| p.id == task.phase_id).map(|p| p.mission_id.clone()))
+        .unwrap_or_default();
+    let wrapped = darkmux_crew::step_output::Output::wrap(
+        review_context::REVIEW_CONTEXT_OUTPUT_KIND,
+        context,
+        darkmux_crew::step_output::Producer::of(&mission_id, &task.id, &step.id),
+    );
+    write_review_context(&out_path, &wrapped)?;
+    Ok(StepOutcome {
+        output: darkmux_crew::step_output::ref_output_string(&out_path),
+        flow_records: Vec::new(),
+    })
 }
 
 /// (#1361) Emit a `telemetry.tokens` record for one review dispatch call —
@@ -4324,6 +4741,81 @@ fn file_source_from_step_config(config: &serde_json::Value) -> Result<FileSource
     }
 }
 
+/// (#2310 P1) Build this run's [`ReviewStepContext`] for a review kind that
+/// consumes the typed `review.context` step output — used by EVERY review
+/// kind below (`review.bundle`/`review.probe-render`/`review.dedup`/
+/// `review.judge`/`review.verify-render`/`review.synthesis`), the finished
+/// migration this packet's own scope note in `review_context`'s module doc
+/// used to say was NOT done for five of the six.
+///
+/// The DATA half comes from `input["review-context-task"]` — this task's
+/// own `depends_on`/`reads` edge onto `review-context-task`, which every
+/// review task in the shipped `review.json` now declares. The two test
+/// seams (`chat_override`/`bundle_override`) plus `mission_id` still come
+/// off the run-scoped `ArtifactBus` (`REVIEW_CONTEXT_ARTIFACT`) — see
+/// `ReviewContext`'s module doc for why they stay there (a closure cannot
+/// serialize, and `mission_id` is the RUN's identity, not review data).
+///
+/// An unwired edge — `input` has no `review-context-task` entry — is a
+/// CONFIG ERROR, not leniency: this fails loudly by name rather than
+/// silently falling back to the bus-seeded `ReviewStepContext` whole (the
+/// pre-migration mechanism this packet retires). Contract 7 ("config
+/// leniency") is about REGISTRY reads tolerating an unknown field, not
+/// about a graph silently accepting a missing edge its own step kind
+/// requires — a `review.json` that omits the edge is malformed, and the
+/// fix is to add it, not to paper over it with a second code path.
+fn review_context_from_input(
+    kind_id: &str,
+    step_id: &str,
+    input: &std::collections::BTreeMap<String, String>,
+    seam: &ReviewStepContext,
+) -> Result<ReviewStepContext> {
+    let context_output = input.get("review-context-task").ok_or_else(|| {
+        anyhow!(
+            "`{kind_id}`: step `{step_id}`'s task must `depends_on`/`reads` \
+             `review-context-task` — no typed review context was handed to this step. A \
+             review mission config whose task omits that edge is malformed; add it rather \
+             than expecting this step to fall back to a stale context (#2310)."
+        )
+    })?;
+    let review_context = darkmux_crew::step_output::Output::<ReviewContext>::read(
+        context_output,
+        review_context::REVIEW_CONTEXT_OUTPUT_KIND,
+    )
+    .with_context(|| format!("`{kind_id}`: step `{step_id}` reading the review-context-task output"))?
+    .body;
+    Ok(ReviewStepContext {
+        case_id: review_context.case_id,
+        roles: review_context.roles,
+        intent_title: review_context.intent_title,
+        intent_body: review_context.intent_body,
+        diff: review_context.diff,
+        // (#2310 P1 review finding I4) `ReviewContext` (the typed output)
+        // carries only resolved TEXT — no downstream review kind ever
+        // reads a path off this reconstruction, only `ctx.diff`/`ctx.
+        // intent_body` (see e.g. `ReviewBundleStepKind::run_streaming`,
+        // `ReviewDedupStepKind::run_streaming`) — so `None` here is
+        // correct, not a gap.
+        diff_file: None,
+        intent_file: None,
+        probe_system: review_context.probe_system,
+        probe_role_prompts: review_context.probe_role_prompts,
+        judge_system: review_context.judge_system,
+        verify_system: review_context.verify_system,
+        remote_max_tokens_per_execution: review_context.remote_max_tokens_per_execution,
+        judge_exhaustion_strict: review_context.judge_exhaustion_strict,
+        timeout_seconds: review_context.timeout_seconds,
+        chat_override: seam.chat_override.clone(),
+        bundle_override: seam.bundle_override.clone(),
+        mission_id: seam.mission_id.clone(),
+        // (#2310 P1 fix) Downstream kinds never read this seam — only
+        // `ReviewContextStepKind` itself applies it, before this
+        // reconstruction even runs — so a fresh default here is correct,
+        // not a gap.
+        context_test_overrides: ReviewContextTestOverrides::default(),
+    })
+}
+
 /// Phase "investigate", step 1: resolves the review's bundle set AT RUN
 /// TIME — the pipeline's own earliest data-producing step (#1530: "no graph
 /// does data-producing work before graph execution — every graph runs the
@@ -4397,8 +4889,16 @@ impl StepKind for ReviewBundleStepKind {
     /// scheduler's pre-scan runs across every step kind present in the
     /// graph before ANY wave (review-dedup-task is always present), so this
     /// is materialized before `review-bundle-step`'s wave runs regardless.
+    /// (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND` is new here —
+    /// this task now formally `depends_on: ["review-context-task"]`
+    /// (`review.json`) — every review kind reads `ReviewContext` through
+    /// the typed graph output (`Output::read`, via `review_context_from_
+    /// input`) rather than the bus; see that function's own doc.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact)];
+        const PORTS: [Port; 2] = [
+            Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
+            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
+        ];
         &PORTS
     }
 
@@ -4413,12 +4913,19 @@ impl StepKind for ReviewBundleStepKind {
         &self,
         step: &Step,
         _task: &Task,
-        _input: &std::collections::BTreeMap<String, String>,
+        input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        let ctx = run_ctx
+        // (#2310 P1) The two test seams (`chat_override`/`bundle_override`)
+        // plus `mission_id` (this pipeline's OWN identity, not review
+        // DATA — see `ReviewContext`'s module doc for why it stays off
+        // that struct) still come off the bus; the DATA half comes from the
+        // graph-wired typed output — see `review_context_from_input`'s doc.
+        let seam_ctx = run_ctx
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
+        let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
+        let ctx = &ctx;
 
         // (#1530) The REAL work — resolve the diff source, run the bundler,
         // slice the code per seat — all UNCHANGED from what
@@ -4579,19 +5086,24 @@ impl StepKind for ReviewProbeRenderStepKind {
         "Probe prompts"
     }
 
-    /// `requires()` only — this kind consumes `REVIEW_CONTEXT_ARTIFACT` (for
-    /// `ctx.probe_system`/`ctx.probe_role_prompts`) and, since #1530,
-    /// `REVIEW_BUNDLES_ARTIFACT` (the bundle set, published by
+    /// `requires()` only — this kind consumes `REVIEW_CONTEXT_ARTIFACT` (the
+    /// `chat_override`/`bundle_override`/`mission_id` seam only — the typed
+    /// `review-context-task` output, declared below, carries `probe_system`/
+    /// `probe_role_prompts`; see `review_context_from_input`'s doc) and,
+    /// since #1530, `REVIEW_BUNDLES_ARTIFACT` (the bundle set, published by
     /// `ReviewBundleStepKind::run_streaming` — this task depends directly on
     /// `review-bundle-task`, so it's always populated by the time this runs)
     /// but produces none of the three shared accumulators; `ReviewDedupStepKind::
     /// provides()`'s doc explains why a downstream consumer declares
     /// `requires()` rather than re-`provides()`ing an artifact another kind
-    /// already does.
+    /// already does. (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND`
+    /// is new here — this task now formally `reads: ["review-context-task"]`
+    /// (`review.json`).
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 2] = [
+        const PORTS: [Port; 3] = [
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
             Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
+            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
     }
@@ -4625,12 +5137,13 @@ impl StepKind for ReviewProbeRenderStepKind {
         &self,
         step: &Step,
         task: &Task,
-        _input: &std::collections::BTreeMap<String, String>,
+        input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        let ctx = run_ctx
+        let seam_ctx = run_ctx
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
+        let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
 
         // Stamped by `build_review_graph_from_config`'s probe loop at build
         // time — this seat's bundle selector (absent/null when the seat
@@ -5114,10 +5627,14 @@ impl StepKind for ReviewDedupStepKind {
     /// declaration lives there instead. (#1541) Also `requires()`s
     /// `REVIEW_PROBE_SELECTION_ARTIFACT` — `ReviewProbeRenderStepKind::
     /// provides()`'s doc explains why the PRODUCER declares that one.
+    /// (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND` is new here —
+    /// this task now formally `reads: ["review-context-task"]`
+    /// (`review.json`) for `ctx.diff` (`dedup_flags`'s anchor matching).
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 2] = [
+        const PORTS: [Port; 3] = [
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
             Port::artifact(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact),
+            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
     }
@@ -5136,9 +5653,10 @@ impl StepKind for ReviewDedupStepKind {
         input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        let ctx = run_ctx
+        let seam_ctx = run_ctx
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
+        let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
         let env = run_ctx
             .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
             .expect("run_review_graph seeds the envelope artifact before the graph runs");
@@ -5280,8 +5798,11 @@ impl StepKind for ReviewJudgeStepKind {
     /// invoked for a `requires()` port (only `provides()` ports are scanned
     /// — see `scheduler::run_step_graph`'s pre-scan doc); it's supplied only
     /// to satisfy `Port::artifact`'s constructor signature.
+    /// (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND` is new here —
+    /// this task now formally `reads: ["review-dedup-task",
+    /// "review-context-task"]` (`review.json`).
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 5] = [
+        const PORTS: [Port; 6] = [
             Port::data("deduped-flags"),
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
             Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
@@ -5291,6 +5812,7 @@ impl StepKind for ReviewJudgeStepKind {
             // dedup + the probe tasks) on `review-bundle-task`, so it's
             // always populated by the time this kind's wave runs.
             Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
+            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
     }
@@ -5314,9 +5836,10 @@ impl StepKind for ReviewJudgeStepKind {
         input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        let ctx = run_ctx
+        let seam_ctx = run_ctx
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
+        let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
         let env = run_ctx
             .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
             .expect("run_review_graph seeds the envelope artifact before the graph runs");
@@ -5324,7 +5847,30 @@ impl StepKind for ReviewJudgeStepKind {
             .artifact::<StdMutex<Vec<MemberRecord>>>(REVIEW_MEMBERS_ARTIFACT)
             .expect("run_review_graph seeds the members artifact before the graph runs");
 
-        let dedup_output = input.values().next().cloned().unwrap_or_default();
+        // (#2310 P1) Explicit key, not `.values().next()` — this task's
+        // `input` now also carries `review-context-task`'s output (added so
+        // this kind can read the typed context above), and `BTreeMap`
+        // iteration order is alphabetical, not insertion order: "review-
+        // context-task" < "review-dedup-task", so `.values().next()` would
+        // silently hand this the WRONG entry the moment a second key
+        // existed. Named by the real dependency task id `gather_inputs`
+        // keys this entry with (#1341).
+        //
+        // (#2310 P1 review finding I2) A MISSING key (the edge itself
+        // renamed or dropped) is a loud config error, not a silent empty
+        // docket — `.unwrap_or_default()` used to make a renamed/dropped
+        // `review-dedup-task` `reads` edge indistinguishable from "dedup
+        // genuinely produced zero flags", which judges a silently EMPTY
+        // docket into a clean review with zero findings. A key that IS
+        // present but empty (dedup really did produce nothing) still falls
+        // through to `Vec::new()` below — that's real, not a config bug.
+        let dedup_output = input.get("review-dedup-task").cloned().ok_or_else(|| {
+            anyhow!(
+                "step `{}`: `{}` needs its task to `reads` `review-dedup-task` (the dedup output)",
+                step.id,
+                self.id()
+            )
+        })?;
         let deduped: Vec<ProbeFlag> = if dedup_output.is_empty() {
             Vec::new()
         } else {
@@ -5710,8 +6256,11 @@ impl StepKind for ReviewVerifyRenderStepKind {
     /// `ReviewDedupStepKind::provides()`'s/`ReviewBundleStepKind::
     /// provides()`'s artifacts declares `requires()` rather than
     /// re-`provides()`ing them.
+    /// (#2310 P1) `review_context::REVIEW_CONTEXT_OUTPUT_KIND` is new here —
+    /// this task now formally `reads: ["review-judge-task",
+    /// "review-context-task"]` (`review.json`).
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 4] = [
+        const PORTS: [Port; 5] = [
             Port::data("judged-flags"),
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
             Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
@@ -5719,6 +6268,7 @@ impl StepKind for ReviewVerifyRenderStepKind {
             // `review-verify-task` depends on `review-judge-task`, which
             // itself depends (transitively) on `review-bundle-task`.
             Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
+            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
     }
@@ -5742,14 +6292,33 @@ impl StepKind for ReviewVerifyRenderStepKind {
         input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        let ctx = run_ctx
+        let seam_ctx = run_ctx
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
+        let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
         let env = run_ctx
             .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
             .expect("run_review_graph seeds the envelope artifact before the graph runs");
 
-        let judge_output = input.values().next().cloned().unwrap_or_default();
+        // (#2310 P1) Explicit key, not `.values().next()` — same
+        // alphabetical-iteration hazard as `ReviewJudgeStepKind`'s own fix
+        // (see that kind's doc comment): "review-context-task" now shares
+        // this `input` map with "review-judge-task".
+        //
+        // (#2310 P1 review finding I2) A MISSING key is a loud config error
+        // — see `ReviewJudgeStepKind::run_streaming`'s identical fix for
+        // `review-dedup-task`, same reasoning: a renamed/dropped
+        // `review-judge-task` `reads` edge must not read as "judge produced
+        // zero confirmed flags" (a clean, silent, zero-finding review). A
+        // present-but-empty key (judge really did confirm nothing) still
+        // falls through to `Vec::new()` below.
+        let judge_output = input.get("review-judge-task").cloned().ok_or_else(|| {
+            anyhow!(
+                "step `{}`: `{}` needs its task to `reads` `review-judge-task` (the judge output)",
+                step.id,
+                self.id()
+            )
+        })?;
         let judged: Vec<JudgedFlag> = if judge_output.is_empty() {
             Vec::new()
         } else {
@@ -5777,7 +6346,21 @@ impl StepKind for ReviewVerifyRenderStepKind {
             None
         };
 
-        let prompts: Vec<String> = if skip_reason.is_some() {
+        // (#2310 P1 review finding I1) Each item is a `{system, item}`
+        // object — `dispatch.map`'s per-item override (`item_system_and_
+        // payload`, `darkmux-crew`'s `builtins.rs`) — carrying THIS run's
+        // typed `ctx.verify_system` (resolved above via `review_context_
+        // from_input`, which applies every test override) rather than
+        // relying on `build_review_graph_from_config`'s build-time stamp on
+        // `review-verify-step`'s own `config.system`. The two used to be
+        // able to disagree: the map step's `system` was frozen at BUILD
+        // time from the LAUNCHER's own `ReviewStepContext`, so a
+        // `ReviewContextTestOverrides.verify_system` (or, in principle, any
+        // future per-run persona resolution) never reached the actual
+        // dispatch. Every item in the docket shares the SAME persona (one
+        // verify seat, one system prompt) — the per-item shape is used
+        // uniformly here, not because verify's persona varies by finding.
+        let prompts: Vec<serde_json::Value> = if skip_reason.is_some() {
             Vec::new()
         } else {
             // (#1530) The bundle set — published by `review-bundle-task`'s
@@ -5795,7 +6378,9 @@ impl StepKind for ReviewVerifyRenderStepKind {
                     let bundle = bundles.iter().find(|b| b.id == j.flag.bundle_id);
                     let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
                     let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
-                    verify_prompt(&ctx.intent_title, &ctx.intent_body, code, facts, &j.flag.charge_text)
+                    let prompt =
+                        verify_prompt(&ctx.intent_title, &ctx.intent_body, code, facts, &j.flag.charge_text);
+                    json!({ "system": ctx.verify_system, "item": prompt })
                 })
                 .collect()
         };
@@ -6056,15 +6641,19 @@ impl StepKind for ReviewSynthesisStepKind {
     }
 
     /// (#1530 Packets 1/3a) `requires()` only — see `ReviewJudgeStepKind::
-    /// requires()`'s doc.
+    /// requires()`'s doc. (#2310 P1) `review_context::
+    /// REVIEW_CONTEXT_OUTPUT_KIND` is new here — this task now formally
+    /// `reads: ["review-dedup-task", "review-judge-task",
+    /// "review-context-task"]` (`review.json`).
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 6] = [
+        const PORTS: [Port; 7] = [
             Port::data("deduped-flags"),
             Port::data("judged-flags"),
             Port::data("verify-results"),
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
             Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
             Port::artifact(REVIEW_MEMBERS_ARTIFACT, make_review_members_artifact),
+            Port::data(review_context::REVIEW_CONTEXT_OUTPUT_KIND),
         ];
         &PORTS
     }
@@ -6088,9 +6677,10 @@ impl StepKind for ReviewSynthesisStepKind {
         input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        let ctx = run_ctx
+        let seam_ctx = run_ctx
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
+        let ctx = review_context_from_input(self.id(), &step.id, input, &seam_ctx)?;
         // (named `shared_env`, not `env` — the function body below rebinds
         // `env` to an owned, cloned-out `ReviewEnvelope` value partway
         // through; this handle is what that clone gets written BACK onto.)
@@ -6322,6 +6912,10 @@ pub struct BuiltReviewGraph {
 /// pins this literal table against the real `StepKind::display_name()`
 /// implementations so the two can't silently drift apart.
 pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
+    // (#2310 P1) The pipeline's new first step.
+    if kind == "review.context" {
+        return Some("Review context");
+    }
     if kind == "review.bundle" {
         return Some("Bundle");
     }
@@ -6383,6 +6977,10 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
 /// errors loud on a duplicate id, so a double-call surfaces immediately
 /// rather than silently overwriting.
 pub fn register_review_kinds(registry: &StepKindRegistry) -> Result<()> {
+    // (#2310 P1) The pipeline's new EARLIEST step — no legacy alias (new as
+    // of this packet, not a renamed `funnel.*` kind).
+    registry.register(Arc::new(ReviewContextStepKind)).context("registering review.context")?;
+
     let bundle_kind = Arc::new(ReviewBundleStepKind);
     registry.register(bundle_kind.clone()).context("registering review.bundle")?;
     // (#1349) Legacy alias — a `Step.kind` persisted before the funnel->review
@@ -6715,6 +7313,74 @@ pub fn build_review_graph_from_config(
     let registry = StepKindRegistry::with_builtins();
     register_review_kinds(&registry).context("registering review step kinds")?;
 
+    // (#2310 P1) Stamp `review-context-step`'s config from the SAME raw
+    // inputs the launcher used to resolve `ReviewStepContext` by hand
+    // before this packet — `ctx` here is that already-resolved value (the
+    // launcher's own call into `resolve_review_context`, unchanged shape),
+    // so this is a re-serialization of data the caller already had, not
+    // new resolution work; the STEP re-derives it independently at run
+    // time from these same raw pieces (`resolve_review_context` — the one
+    // function both call).
+    //
+    // (#2310 P1 review finding I4) `diff_file`/`intent_file` (the ORIGINAL
+    // on-disk paths, when `ctx` carries one — see `ReviewStepContext::
+    // diff_file`'s own doc) win over `diff`/`intent_body` (the already-
+    // resolved TEXT) below: `save_step` persists `Step.config` at every
+    // transition, so a whole diff riding this stamp got written to the
+    // mission record at least three times per review. A caller with no
+    // backing file (every hermetic test in this crate) still falls back to
+    // the text, unchanged from before this fix.
+    //
+    // (#2310 P1 review finding I3, corrected) `if let`, not `.expect(...)`
+    // — unlike `review-bundle-step` (required by every review.json since
+    // long before this packet), a hand-built `MissionConfig` predating
+    // this packet (this crate's own `review_tests.rs` builds several) can
+    // still declare no `review-context-step` at all — the graph BUILDS
+    // either way; only RUNNING it exposes the gap. There is no fallback
+    // for that anymore: the first review step whose task `depends_on`/
+    // `reads` `review-context-task` (every real review kind — see
+    // `review_context_from_input`'s own doc) fails loudly BY NAME the
+    // moment it runs, naming the missing edge — never a silent reach for
+    // some retired bus-seeded `ReviewStepContext` whole. Pre-1.0, no
+    // compat shim: fix the config (add the task/edge, or delete a stale
+    // user-tier copy to fall back to the built-in), don't paper over the
+    // gap here.
+    if let Some(context_step) = steps.get_mut("review-context-step") {
+        let mut context_config = json!({
+            "intent_title": ctx.intent_title,
+            "case_id": ctx.case_id,
+            "timeout_seconds": ctx.timeout_seconds,
+            "staffing": serde_json::to_value(&ctx.roles).context("serializing resolved review staffing")?,
+        });
+        match &ctx.diff_file {
+            Some(p) => context_config["diff_file"] = json!(p.display().to_string()),
+            None => context_config["diff"] = json!(ctx.diff),
+        }
+        match &ctx.intent_file {
+            Some(p) => context_config["intent_file"] = json!(p.display().to_string()),
+            None => context_config["intent_body"] = json!(ctx.intent_body),
+        }
+        // (#2310 P1, corrected) `context_out` is deliberately NOT stamped
+        // here — this function only SERIALIZES config, it never touches
+        // disk (graph BUILDING must be pure; only a step's own `run` may
+        // write). Leaving it unset means `ReviewContextStepKind::run` falls
+        // through to `default_context_path`, which resolves `<missions>/
+        // <mission-id>/context/context.json` from the task's OWN phase
+        // record at RUN time — the exact `plan_out`/`default_plan_path`
+        // pattern `crawl.plan` already uses (see that kind's own doc), and
+        // `crawl.json`'s own graph never stamps `plan_out` either, for the
+        // identical reason. A hand-built graph/test that never mints a
+        // Mission/Phase (this crate's own `review_tests.rs`, or
+        // `review_conformance.rs`'s hermetic scenarios) uses
+        // `ReviewContextStepConfig::context_out` as its own explicit escape
+        // hatch instead — same shape as `crawl.plan`'s tests using
+        // `plan_out` — rather than this function inventing a second,
+        // non-production default path (an OS-temp-dir stamp with its own
+        // process-counter uniquifier) that no other review kind's config
+        // needed and that only existed to paper over graph-building tests
+        // that never run the step at all.
+        context_step.config = context_config;
+    }
     // (#1530) Stamp `review-bundle-step`'s config from the caller's already-
     // resolved `bundle_spec` — see [`BundleBuildSpec`]'s own doc for why
     // this is DATA the launcher/bench caller already had, not new work.
@@ -6897,6 +7563,18 @@ pub fn build_review_graph_from_config(
     // so only the dispatch parameters are stamped here. No verify seat ⇒
     // config stays null: the render step emits an empty collection and the
     // map short-circuits before any config key is required.
+    //
+    // (#2310 P1 review finding I1) `"system"` stays `""` — same as the
+    // probe map step just above (`"system": ""`, stamped a few dozen lines
+    // up) — never `ctx.verify_system`. `ctx` here is the LAUNCHER's own
+    // BUILD-TIME `ReviewStepContext`, frozen before the typed `review.
+    // context` step (and every test override it applies) ever runs;
+    // stamping it here bypassed that typed context entirely. The real
+    // persona now rides PER-ITEM instead — `ReviewVerifyRenderStepKind::
+    // run_streaming` reads `ctx.verify_system` off the RUN-TIME typed
+    // output and wraps every item as `{"system": ..., "item": ...}` (see
+    // that kind's own doc, and `dispatch.map`'s `item_system_and_payload`
+    // in `darkmux-crew`), which this map step now honors per item.
     if let Some(vstaff) = &verify {
         let identifier = seat_identifier(&vstaff.pm);
         let endpoint = seat_endpoint(&vstaff.pm);
@@ -6906,7 +7584,7 @@ pub fn build_review_graph_from_config(
             .expect("interpreted \"review\" graph must have a review-verify-step");
         let mut config = json!({
             "model": identifier,
-            "system": ctx.verify_system,
+            "system": "",
             "user_template": "{item}",
             "temperature": JUDGE_TEMPERATURE,
             "max_tokens": max_tokens,

@@ -141,10 +141,25 @@
       "description": "resolve review bundles from the diff, probe every explicit probe task, dedup",
       "tasks": [
         {
+          "id": "review-context-task",
+          "display_name": "Context",
+          "description": "(#2310 P1) resolve the review's shared context (diff/intent/prompts/staffing) as the pipeline's first typed step output — review-bundle-task depends on it",
+          "depends_on": [],
+          "steps": [
+            {
+              "id": "review-context-step",
+              "kind": "review.context",
+              "config": null
+            }
+          ]
+        },
+        {
           "id": "review-bundle-task",
           "display_name": "Bundle",
           "description": "resolve review bundles from the diff",
-          "depends_on": [],
+          "depends_on": [
+            "review-context-task"
+          ],
           "steps": [
             {
               "id": "review-bundle-step",
@@ -160,6 +175,9 @@
           "role_id": "review-probe-high",
           "depends_on": [
             "review-bundle-task"
+          ],
+          "reads": [
+            "review-context-task"
           ],
           "steps": [
             {
@@ -185,6 +203,9 @@
           "depends_on": [
             "review-bundle-task"
           ],
+          "reads": [
+            "review-context-task"
+          ],
           "steps": [
             {
               "id": "review-probe-mid-render-step",
@@ -205,6 +226,9 @@
           "role_id": "review-probe-low",
           "depends_on": [
             "review-bundle-task"
+          ],
+          "reads": [
+            "review-context-task"
           ],
           "steps": [
             {
@@ -227,6 +251,9 @@
             "review-probe-high-task",
             "review-probe-mid-task",
             "review-probe-low-task"
+          ],
+          "reads": [
+            "review-context-task"
           ],
           "steps": [
             {
@@ -258,7 +285,8 @@
             }
           ],
           "reads": [
-            "review-dedup-task"
+            "review-dedup-task",
+            "review-context-task"
           ]
         }
       ]
@@ -290,7 +318,8 @@
             "the render step consumes the judge task's output and emits one frozen verify_prompt per CONFIRMED finding (byte parity with the #1256 golden by construction); build_review_graph stamps the map step's dispatch config (model/system/max_tokens/bucket_budget/...) only when a verify seat is staffed. The verify-APPLY boundary (state machine, member accounting, budget row) lives in the synthesis step."
           ],
           "reads": [
-            "review-judge-task"
+            "review-judge-task",
+            "review-context-task"
           ]
         },
         {
@@ -309,7 +338,8 @@
           ],
           "reads": [
             "review-dedup-task",
-            "review-judge-task"
+            "review-judge-task",
+            "review-context-task"
           ]
         }
       ]

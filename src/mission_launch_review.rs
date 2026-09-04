@@ -1061,8 +1061,18 @@ fn run_dispatch(
         diff_file: diff_file.to_path_buf(),
     };
 
-    let intent = match path_input(collected, "intent_file") {
-        Some(p) => std::fs::read_to_string(&p).with_context(|| format!("reading intent_file {}", p.display()))?,
+    // (#2310 P1 review finding I4) The path is kept (not just the text) so
+    // `ReviewStepContext::intent_file` below can hand it to `build_review_
+    // graph_from_config`, which stamps the PATH onto `review-context-step`'s
+    // config instead of the whole intent TEXT — the same shrink as
+    // `diff_file` a few lines up. Reading it into `intent` here too is not
+    // a second I/O pass for this graph path specifically: the same text is
+    // also needed by the separate `--charges-file` re-judge side path
+    // (`ReviewInputs::intent_body`, below), which never touches the graph
+    // or `review-context-step` at all.
+    let intent_file_path = path_input(collected, "intent_file");
+    let intent = match &intent_file_path {
+        Some(p) => std::fs::read_to_string(p).with_context(|| format!("reading intent_file {}", p.display()))?,
         None => String::new(),
     };
 
@@ -1110,50 +1120,40 @@ fn run_dispatch(
         dispatch_start_extra["endpoint"] = json!(label);
     }
 
-    let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
-        anyhow!(
-            "darkmux: role \"review-probe\" has no system prompt — reinstall darkmux or check \
-             <crew_root>/roles/review-probe.md"
-        )
-    })?;
-    let judge_system = darkmux_crew::loader::role_prompt("review-judge").ok_or_else(|| {
-        anyhow!(
-            "darkmux: role \"review-judge\" has no system prompt — reinstall darkmux or check \
-             <crew_root>/roles/review-judge.md"
-        )
-    })?;
-    let verify_system = darkmux_crew::loader::role_prompt("review-verify").ok_or_else(|| {
-        anyhow!(
-            "darkmux: role \"review-verify\" has no system prompt — reinstall darkmux or check \
-             <crew_root>/roles/review-verify.md"
-        )
-    })?;
-
-    // (#1530 follow-on) Per-seat probe prompt resolution: each staffed
-    // probe role resolves its OWN `role_prompt()` (`review-probe-high.md`/
-    // `-mid`/`-low`), falling back to the shared `probe_system` above when
-    // a seat's specific role has no `.md` of its own. Editing a per-seat
-    // `.md` was previously a SILENT no-op (only the single shared
-    // `probe_system` above was ever dispatched) — this map is what makes
-    // that edit take effect. A no-op by default: the three shipped
-    // per-seat `.md` files are byte-copies of `review-probe.md` today.
-    let mut probe_role_prompts: BTreeMap<String, String> = BTreeMap::new();
-    for seat in &crew.probes {
-        if let Some(role_id) = &seat.role_id {
-            let prompt = darkmux_crew::loader::role_prompt(role_id).unwrap_or_else(|| probe_system.clone());
-            probe_role_prompts.insert(role_id.clone(), prompt);
-        }
-    }
+    // (#2310 P1) ONE call resolves the three system prompts (`role_prompt`),
+    // the per-seat probe prompts, and the two `config_access` budget knobs
+    // — exactly what used to be five separate inline blocks here. The SAME
+    // function is what `review.context`'s step kind calls at run time (see
+    // its own doc); this launcher call is the build-time twin
+    // `build_review_graph_from_config` needs `ReviewStepContext` ready for
+    // (residency/prompt/budget stamping onto probe/judge/verify step
+    // configs) — `diff_override`/`intent_body_override` pass the text this
+    // function ALREADY read (`diff_text`/`intent`, above) through rather
+    // than re-reading either file a second time.
+    let review_ctx = darkmux_lab::lab::review::resolve_review_context(
+        &case,
+        &crew,
+        None,
+        Some(diff_text),
+        None,
+        Some(&intent),
+        "",
+        timeout_seconds,
+    )?;
+    let probe_system = review_ctx.probe_system.clone();
+    let judge_system = review_ctx.judge_system.clone();
+    let verify_system = review_ctx.verify_system.clone();
+    let remote_max_tokens_per_execution = review_ctx.remote_max_tokens_per_execution;
+    // (#1876/#1877) The judge stage's remote-budget exhaustion policy —
+    // resolved once inside `resolve_review_context`, same as the token
+    // budget above, and passed through to both the `--charges-file`
+    // (`ReviewInputs`) and the graph (`ReviewStepContext`) launch shapes
+    // below.
+    let judge_exhaustion_strict = review_ctx.judge_exhaustion_strict;
 
     let case_id_for_bookends = case.clone();
     let crew_name_for_bookends = crew.distinct_profile_names();
     let model_for_bookends = crew_model_summary(&crew);
-    let remote_max_tokens_per_execution = darkmux_types::config_access::remote_max_tokens_per_execution();
-    // (#1876/#1877) The judge stage's remote-budget exhaustion policy —
-    // resolved once here, same as the token budget above, and passed
-    // through to both the `--charges-file` (`ReviewInputs`) and the graph
-    // (`ReviewStepContext`) launch shapes below.
-    let judge_exhaustion_strict = darkmux_types::config_access::review_judge_fail_on_any_skip();
 
     // (#1641) `mission_id` starts unset — `--charges-file` never mints a
     // Mission, so it stays `None` on that path. The real-launch branch
@@ -1278,8 +1278,15 @@ fn run_dispatch(
             intent_title: String::new(),
             intent_body: intent,
             diff: diff_text.to_string(),
+            // (#2310 P1 review finding I4) The real CLI-provided paths —
+            // `build_review_graph_from_config` prefers these over the TEXT
+            // above when stamping `review-context-step`'s config, so the
+            // diff/intent no longer ride `Step.config` (persisted at every
+            // transition by `save_step`) in full.
+            diff_file: Some(diff_file.to_path_buf()),
+            intent_file: intent_file_path.clone(),
             probe_system,
-            probe_role_prompts,
+            probe_role_prompts: review_ctx.probe_role_prompts.clone(),
             judge_system,
             verify_system,
             remote_max_tokens_per_execution,
@@ -1293,6 +1300,9 @@ fn run_dispatch(
             bundle_override: None,
             // (#1641) See `ReviewStepContext::mission_id`'s doc.
             mission_id: Some(mission_id.clone()),
+            // (#2310 P1 fix) The real launch path never overrides
+            // `review.context`'s resolution — it resolves for real.
+            context_test_overrides: Default::default(),
         });
 
         // (#1417) Resolve the phase ids and build the review graph BEFORE

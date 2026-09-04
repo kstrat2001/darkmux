@@ -1168,9 +1168,22 @@ fn run_funnel_case(
         // no Mission is ever minted for it, so `None` here matches the
         // `--charges-file` path's own honest `None`.
         mission_id: None,
+        // (#2310 P1 review finding I4) Bench already writes the diff to a
+        // real temp file (`diff_path`, above — the external bundler needs
+        // one) — hand its path to `review-context-step` too, instead of
+        // stamping the whole diff TEXT into `Step.config` a second time.
+        // No `intent_file` equivalent exists on the bench harness's own
+        // `Case`/`CaseLabel` data model (`intent_title`/`intent_body` are
+        // already plain strings, no backing file) — `None` there stays
+        // correct.
+        diff_file: Some(diff_path.clone()),
+        intent_file: None,
+        // (#2310 P1 fix) Bench never overrides `review.context`'s
+        // resolution — it resolves for real, the same as production.
+        context_test_overrides: Default::default(),
     });
 
-    let graph = review::build_review_graph(
+    let mut graph = review::build_review_graph(
         step_ctx.clone(),
         &bundle_spec,
         judge.clone(),
@@ -1182,6 +1195,29 @@ fn run_funnel_case(
         darkmux_types::config_access::review_judge_concurrency(),
     )
     .with_context(|| format!("building review graph for case {}", c.id))?;
+    // (#2310 P1) `review.context`'s production default (`default_context_
+    // path`) resolves the mission that owns the step's phase — but a bench
+    // run mints no real Mission (lab-vs-fleet boundary, same reasoning as
+    // `mission_id: None` a few lines above), so that lookup has nothing to
+    // find here. Stamp an explicit `context_out` under the OS temp dir
+    // instead — the same "harmless scratch, not user state" scoping
+    // `write_temp_diff` already uses for this bench harness's diff file.
+    // (minor, #2310 P1 review) Hoisted out of the `if let` below (not
+    // reused elsewhere in that block) so it's still in scope for cleanup
+    // after the run — same shape as `diff_path`'s own hoist, and the same
+    // leak class: unlike `diff_path`, this file used to have NO removal at
+    // all.
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let context_out = std::env::temp_dir().join(format!(
+        "darkmux-review-bench-{}-{}-{ts}-context.json",
+        c.id,
+        std::process::id()
+    ));
+    if let Some(context_step) = graph.steps.get_mut("review-context-step") {
+        let mut cfg = context_step.config.clone();
+        cfg["context_out"] = serde_json::json!(context_out.display().to_string());
+        context_step.config = cfg;
+    }
     let fingerprint_val = review::fingerprint(&judge_identifier, &step_ctx.judge_system);
     let staffing_snapshot =
         review::staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
@@ -1204,6 +1240,11 @@ fn run_funnel_case(
     // until the run is over — and happens on the error path too, before the
     // `?`, so a failed case doesn't leak a temp diff per retry.
     let _ = fs::remove_file(&diff_path);
+    // (minor, #2310 P1 review) The context step's own temp output — same
+    // "cleanup after the run, error path included" shape as `diff_path`
+    // above. This one used to be a straight leak: `write_temp_diff`'s
+    // file was always removed, but nothing ever removed this one.
+    let _ = fs::remove_file(&context_out);
     let (mut env, steps) = graph_run.with_context(|| format!("running review graph for case {}", c.id))?;
 
     // (#1530) BUNDLING FAILURE IS STILL A LOUD PER-CASE ERROR.
