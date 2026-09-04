@@ -44,7 +44,7 @@ use crate::crawl::plan::{Plan, ReadFileEntry, Site, Unit};
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, DispatchResult};
 use darkmux_crew::rules::{self, Rule};
-use darkmux_crew::step_kinds::{Port, StepKind, StepKindRegistry, StepOutcome};
+use darkmux_crew::step_kinds::{Port, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::types::{Step, Task};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -792,6 +792,25 @@ impl StepKind for CrawlUnitStepKind {
     fn provides(&self) -> &'static [Port] {
         const PORTS: [Port; 1] = [Port::data(UNIT_OUTCOME_KIND)];
         &PORTS
+    }
+
+    /// (#2321) Declare where the unit will run, in the terms the scheduler's
+    /// wave packer reads. A kind that stays silent here is queued as a REMOTE
+    /// job under `remote_cap` (1 on the launch path), which is how sibling
+    /// units of one plan ran strictly one at a time on an already-resident
+    /// model — 3× the wall-clock of the same three units wave-packed. The
+    /// dispatch below always runs the `crawler` role on the registry's
+    /// role-aware profile (`profile_name: None`, see `resolve_crawler_seat`),
+    /// so that is the placement declared; a registry that cannot resolve it
+    /// yields `None`, and the dispatch then surfaces the real error itself.
+    fn residency(
+        &self,
+        step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<darkmux_crew::step_kinds::Placement> {
+        darkmux_crew::step_kinds::resolve_local_placement("crawler", None, None, &format!("step:{}", step.id))
     }
 
     fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {

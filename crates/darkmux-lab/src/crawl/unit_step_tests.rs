@@ -655,34 +655,6 @@ fn the_summary_reads_the_runs_own_plan_files_for_what_was_planned() {
 // step's output; no unit test produced that shape). This runs the real
 // graph.
 
-/// A `ModelHost` that is never expected to be used: these kinds declare no
-/// model, so a call here means the scheduler took a residency path this
-/// graph should not have.
-struct UnusedHost;
-impl darkmux_gestalt::ModelHost for UnusedHost {
-    fn list_resident(&mut self) -> std::result::Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError> {
-        Ok(vec![])
-    }
-    fn list_catalog(&mut self) -> std::result::Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError> {
-        Ok(vec![])
-    }
-    fn load(
-        &mut self,
-        model_key: &str,
-        _identifier: &str,
-        _min_ctx: u32,
-        _deadline: darkmux_gestalt::Deadline,
-    ) -> std::result::Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
-        Err(darkmux_gestalt::HostError::UnknownModel { model_key: model_key.to_string() })
-    }
-    fn unload(
-        &mut self,
-        _target: &darkmux_gestalt::plan::OwnedTarget,
-        _deadline: darkmux_gestalt::Deadline,
-    ) -> std::result::Result<(), darkmux_gestalt::HostError> {
-        Ok(())
-    }
-}
 
 fn graph_task(id: &str, step_id: &str, depends_on: &[&str]) -> Task {
     Task {
@@ -722,6 +694,21 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
     // code turned into a refused summary and an empty close payload.
     let home = TempDir::new().unwrap();
     let _g = HomeGuard::set(home.path());
+    // (#2321) The units DECLARE their residency now, so this graph takes the
+    // scheduler's real wave path: a fixture registry names the model, and the
+    // mock host already has it resident — both units pack into ONE wave with
+    // no load, which is the whole point of declaring.
+    let registry_path = home.path().join("profiles.json");
+    let _p = ProfilesGuard::set(&registry_path);
+    fs::write(
+        &registry_path,
+        serde_json::json!({
+            "default_profile": "p",
+            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
@@ -776,7 +763,9 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
     .collect();
     let tasks_by_id: BTreeMap<String, Task> = tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
 
-    let host_factory = || -> Box<dyn darkmux_gestalt::ModelHost> { Box::new(UnusedHost) };
+    let resident_host = || darkmux_gestalt::mock::MockHost::new().resident("darkmux:m-local", "m-local", 8192, Some(1 << 30));
+    let facts = resident_host().facts(Default::default(), Default::default());
+    let host_factory = || -> Box<dyn darkmux_gestalt::ModelHost> { Box::new(resident_host()) };
     let est = darkmux_gestalt::FixedEstimator(Default::default());
 
     // One `run_step_graph` call per phase, in order — what
@@ -786,7 +775,7 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
             steps,
             &tasks_by_id,
             &registry,
-            &darkmux_gestalt::Facts::default(),
+            &facts,
             &est,
             1,
             &host_factory,
@@ -1040,4 +1029,57 @@ fn an_unaddressable_session_id_yields_no_refs_but_still_counts_the_findings() {
     );
     assert_eq!(body.findings, 2, "the unit observed two findings, addressable or not");
     assert!(body.finding_refs.is_empty(), "and named none of them: {:?}", body.finding_refs);
+}
+
+/// Points `DARKMUX_PROFILES` at a registry written for one test and restores
+/// the prior value, so the placement resolves from the fixture, never from
+/// the operator's registry (`load_registry(None)` reads the documented
+/// override first, and the real `~/.darkmux/profiles.json` otherwise).
+struct ProfilesGuard(Option<String>);
+impl ProfilesGuard {
+    fn set(p: &Path) -> Self {
+        let prior = std::env::var("DARKMUX_PROFILES").ok();
+        std::env::set_var("DARKMUX_PROFILES", p);
+        Self(prior)
+    }
+}
+impl Drop for ProfilesGuard {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+            None => std::env::remove_var("DARKMUX_PROFILES"),
+        }
+    }
+}
+
+/// (#2321) The scheduler wave-packs only the steps that DECLARE a residency;
+/// a kind that stays silent is queued as a remote job under `remote_cap`
+/// (1 on the launch path), so sibling units ran strictly one at a time —
+/// measured 3× on a three-unit crawl whose model was already resident. The
+/// unit dispatches the `crawler` role locally; its residency must say so,
+/// in the same terms `dispatch.internal` uses (`step:<id>` seat).
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME + DARKMUX_PROFILES, process-globals
+fn a_unit_declares_the_crawler_seats_residency_so_siblings_wave_pack() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    let registry = home.path().join("profiles.json");
+    let _p = ProfilesGuard::set(&registry);
+    fs::write(
+        &registry,
+        serde_json::json!({
+            "default_profile": "p",
+            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("residency never dispatches"))));
+    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
+    let placement = kind
+        .residency(&unit_step(serde_json::json!({})), &unit_task(), &BTreeMap::new(), &ctx)
+        .expect("a local crawler dispatch declares where it will run");
+    assert_eq!(placement.model_key, "m-local");
+    assert_eq!(placement.min_ctx, 8192);
+    assert_eq!(placement.seat, "step:unit-step");
 }
