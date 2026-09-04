@@ -946,7 +946,7 @@ impl plan_sites::SiteSource for DiffSource<'_> {
         for (rel, expected) in &self.by_file {
             if !self.files.all.iter().any(|f| f == rel) {
                 self.skipped.push(SkippedEntry {
-                    reason: "the diff names this file but the checked-out tree does not have it                              — wrong sha, or a rename the diff doesn't show?"
+                    reason: "the diff names this file but the checked-out tree does not have it — wrong sha, or a rename the diff doesn't show?"
                         .to_string(),
                     file: rel.clone(),
                     source: Some(self.source_id.to_string()),
@@ -961,7 +961,7 @@ impl plan_sites::SiteSource for DiffSource<'_> {
             if let Some((line_no, _)) = mismatch {
                 self.skipped.push(SkippedEntry {
                     reason: format!(
-                        "the checked-out tree disagrees with the diff at line {line_no}                          — this looks like the wrong checkout (a different sha than the diff was cut against)"
+                        "the checked-out tree disagrees with the diff at line {line_no} — this looks like the wrong checkout (a different sha than the diff was cut against)"
                     ),
                     file: rel.clone(),
                     source: Some(self.source_id.to_string()),
@@ -1929,7 +1929,7 @@ line two
     /// **Non-trivial by design** (review finding: the original fixture had
     /// one unit, one site, two merged hits — not enough to pin either
     /// sizing cap). Two files, four non-overlapping hits, `max_sites_per_
-    /// unit: 2` + `max_est_tokens_per_unit: 200`: `orders.ts`'s two SMALL
+    /// unit: 2` + `max_est_tokens_per_unit: 300`: `orders.ts`'s two SMALL
     /// hits (28 tokens each) pack into one unit under both caps; `util.ts`'s
     /// first BIG hit (160 tokens) starts a new unit because adding it to
     /// the first would exceed the SITES cap (3 > 2) — pinning that cap
@@ -1953,7 +1953,7 @@ line two
         let sources = vec![resolved("app", &fixture_dir)];
         let materialized = materialized_for(sources, Vec::new());
         let rules = vec![site_rule()];
-        let params = PlanParams { max_sites_per_unit: 2, max_est_tokens_per_unit: 200 };
+        let params = PlanParams { max_sites_per_unit: 2, max_est_tokens_per_unit: 300 };
 
         let plan = plan_with_params(&materialized, &rules, params).unwrap();
         let mut actual_value = serde_json::to_value(&plan).unwrap();

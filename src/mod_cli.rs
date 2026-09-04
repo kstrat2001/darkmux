@@ -195,6 +195,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     println!("mod       {}", rec.key);
     println!("recorded  {}", rec.ts);
     println!("by        {}", rec.by);
+    println!("kind      {}", rec.kit_kind.as_deref().unwrap_or("(untyped)"));
     if rec.r#for.is_empty() {
         println!("for       (none)");
     } else {

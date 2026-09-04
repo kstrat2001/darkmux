@@ -1,6 +1,6 @@
 {
   "params": {
-    "max_est_tokens_per_unit": 200,
+    "max_est_tokens_per_unit": 300,
     "max_sites_per_unit": 2
   },
   "planned_at": "<redacted: timestamp>",

@@ -326,14 +326,14 @@ fn render_gated_mod(
 ) {
     let kit = m.record.kit.as_deref().unwrap_or("");
     if m.record.kit_kind.as_deref() != Some("unified-diff") {
-        mod_bullets.push(fenced_patch_bullet(window, kit));
+        mod_bullets.push(fenced_patch_bullet(window, kit, "the kit is not a typed unified diff, so it cannot be a suggestion"));
         return;
     }
     let hunks = crate::diff::parse_diff(kit);
     if hunks.is_empty() {
         // Declared unified-diff but nothing parsed — an unparseable kit.
         // Never guess at intent; render it opaque, same as any other kind.
-        mod_bullets.push(fenced_patch_bullet(window, kit));
+        mod_bullets.push(fenced_patch_bullet(window, kit, "the kit did not parse as a unified diff"));
         return;
     }
     for (path, file_hunks) in &hunks {
@@ -343,7 +343,7 @@ fn render_gated_mod(
                 // REPLACEMENT suggestion against — GitHub suggestions
                 // replace an existing line range; they cannot insert
                 // between two lines with no line of their own.
-                mod_bullets.push(fenced_hunk_bullet(window, path, h));
+                mod_bullets.push(fenced_hunk_bullet(window, path, h, "a pure insertion has no lines to replace"));
                 continue;
             }
             let old_start = h.old_start;
@@ -358,19 +358,25 @@ fn render_gated_mod(
                     body: format!("```suggestion\n{}\n```", h.new_block.join("\n")),
                 });
             } else {
-                mod_bullets.push(fenced_hunk_bullet(window, path, h));
+                mod_bullets.push(fenced_hunk_bullet(window, path, h, "the hunk sits outside the diff's lines"));
             }
         }
     }
 }
 
-fn fenced_patch_bullet(window: &FindingWindow, kit: &str) -> String {
-    format!("- `{}` — proposed change (outside the diff's lines):\n\n```\n{kit}\n```", window.display())
+fn fenced_patch_bullet(window: &FindingWindow, kit: &str, reason: &str) -> String {
+    format!("- `{}` — proposed change ({reason}):\n\n```\n{kit}\n```", window.display())
 }
 
-fn fenced_hunk_bullet(window: &FindingWindow, path: &str, h: &crate::diff::Hunk) -> String {
+fn fenced_hunk_bullet(window: &FindingWindow, path: &str, h: &crate::diff::Hunk, reason: &str) -> String {
+    let old_len = h.old_block.len() as u32;
+    let span = if old_len == 0 {
+        format!("inserts after line {} of `{path}`", h.old_start)
+    } else {
+        format!("replaces lines {}–{} of `{path}`", h.old_start, h.old_start + old_len - 1)
+    };
     format!(
-        "- `{}` — proposed change to `{path}` (outside the diff's lines):\n\n```\n{}\n```",
+        "- `{}` — proposed change, {span} ({reason}):\n\n```\n{}\n```",
         window.display(),
         h.new_block.join("\n")
     )
