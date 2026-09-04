@@ -1061,8 +1061,18 @@ fn run_dispatch(
         diff_file: diff_file.to_path_buf(),
     };
 
-    let intent = match path_input(collected, "intent_file") {
-        Some(p) => std::fs::read_to_string(&p).with_context(|| format!("reading intent_file {}", p.display()))?,
+    // (#2310 P1 review finding I4) The path is kept (not just the text) so
+    // `ReviewStepContext::intent_file` below can hand it to `build_review_
+    // graph_from_config`, which stamps the PATH onto `review-context-step`'s
+    // config instead of the whole intent TEXT — the same shrink as
+    // `diff_file` a few lines up. Reading it into `intent` here too is not
+    // a second I/O pass for this graph path specifically: the same text is
+    // also needed by the separate `--charges-file` re-judge side path
+    // (`ReviewInputs::intent_body`, below), which never touches the graph
+    // or `review-context-step` at all.
+    let intent_file_path = path_input(collected, "intent_file");
+    let intent = match &intent_file_path {
+        Some(p) => std::fs::read_to_string(p).with_context(|| format!("reading intent_file {}", p.display()))?,
         None => String::new(),
     };
 
@@ -1268,6 +1278,13 @@ fn run_dispatch(
             intent_title: String::new(),
             intent_body: intent,
             diff: diff_text.to_string(),
+            // (#2310 P1 review finding I4) The real CLI-provided paths —
+            // `build_review_graph_from_config` prefers these over the TEXT
+            // above when stamping `review-context-step`'s config, so the
+            // diff/intent no longer ride `Step.config` (persisted at every
+            // transition by `save_step`) in full.
+            diff_file: Some(diff_file.to_path_buf()),
+            intent_file: intent_file_path.clone(),
             probe_system,
             probe_role_prompts: review_ctx.probe_role_prompts.clone(),
             judge_system,

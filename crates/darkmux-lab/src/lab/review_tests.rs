@@ -3622,6 +3622,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             // resolves the SAME fixture text every mock `chat_override`
             // here is tuned against (see `ReviewContextTestOverrides`'s
             // doc).
+            diff_file: None,
+            intent_file: None,
             context_test_overrides: ReviewContextTestOverrides {
                 probe_system: Some("probe prior".to_string()),
                 judge_system: Some("judge persona".to_string()),
@@ -3918,6 +3920,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             // doc. Callers that flip `judge_exhaustion_strict` via
             // `Arc::get_mut` after construction flip this override's copy
             // too (see the two call sites that do).
+            diff_file: None,
+            intent_file: None,
             context_test_overrides: ReviewContextTestOverrides {
                 probe_system: Some("probe prior".to_string()),
                 judge_system: Some("judge persona".to_string()),
@@ -4835,7 +4839,17 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
         let judge = staffing("fast", "judge-model", 1);
-        let ctx = step_ctx(&crew, vec![]);
+        let mut ctx = step_ctx(&crew, vec![]);
+        // (#2310 P1 review finding I4) A real caller with a backing diff
+        // FILE (`mission_launch_review.rs`, `review_bench.rs`) stamps that
+        // path onto `review-context-step`'s config instead of the whole
+        // diff TEXT — pin that shape here too (this is a STRUCTURE-only
+        // test; nothing ever reads this path back, so it need not exist on
+        // disk, only be deterministic for the golden compare). `ctx` is
+        // freshly minted above (sole `Arc` owner, not yet cloned), so
+        // `get_mut` is available.
+        Arc::get_mut(&mut ctx).expect("sole owner before build_review_graph clones it").diff_file =
+            Some(PathBuf::from("/nonexistent-test-diff-golden"));
 
         let graph = build_review_graph(
             ctx,
@@ -6717,6 +6731,250 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         );
     }
 
+    /// (#2310 P1 review finding I1, mutation/red-proof) The verify seat's
+    /// system prompt must come from the RUN-TIME typed `ReviewContext`
+    /// (which `ReviewVerifyRenderStepKind::run_streaming` reads via
+    /// `review_context_from_input`, and now threads to the `dispatch.map`
+    /// step per-item) — never from the launcher's own BUILD-TIME
+    /// `ReviewStepContext.verify_system`, which `build_review_graph_from_
+    /// config` used to stamp directly onto the map step's `system` config,
+    /// bypassing every override the typed `review.context` step applies.
+    ///
+    /// Deliberately sets the two to DIFFERENT strings: `step_ctx`/
+    /// `step_ctx_with_chat`'s shared fixture always sets `ctx.verify_system`
+    /// and `context_test_overrides.verify_system` to the SAME text, which
+    /// is exactly why this bug shipped invisibly — `graph_verify_stage_
+    /// verified_refuted_uncertain_state_machine`'s own `assert_eq!(call.
+    /// system, "verify persona", ...)` could not have caught it. Red
+    /// before the fix: `call.system` was the STALE build-time string.
+    #[test]
+    fn graph_verify_seat_system_prompt_comes_from_the_typed_context_not_the_launchers_stale_stamp()
+    {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![graph_staffing("frontier", "verify-model", 1)]),
+        ]);
+        let bundles = vec![bundle_input("a.ts")];
+        let seen_verify_system: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen = seen_verify_system.clone();
+        let ctx = Arc::new(ReviewStepContext {
+            case_id: "case-1".to_string(),
+            roles: crew,
+            intent_title: String::new(),
+            intent_body: String::new(),
+            diff: DIFF.to_string(),
+            diff_file: None,
+            intent_file: None,
+            probe_system: "probe prior".to_string(),
+            probe_role_prompts: BTreeMap::new(),
+            judge_system: "judge persona".to_string(),
+            // The launcher's OWN build-time value — deliberately STALE, to
+            // prove it never reaches the dispatch.
+            verify_system: "STALE BUILD-TIME PERSONA".to_string(),
+            remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
+            timeout_seconds: 30,
+            chat_override: Some(Arc::new(move |call: &ChatCall| {
+                if call.model == "darkmux:verify-model" {
+                    seen.lock().unwrap().push(call.system.to_string());
+                    Ok(reply(VERIFIED_JSON))
+                } else if call.model == "darkmux:judge-model" {
+                    Ok(reply(CONFIRM_JSON))
+                } else {
+                    Ok(reply("a real defect"))
+                }
+            })),
+            bundle_override: Some(Arc::new(move || Ok(bundles.clone()))),
+            mission_id: None,
+            context_test_overrides: ReviewContextTestOverrides {
+                probe_system: Some("probe prior".to_string()),
+                judge_system: Some("judge persona".to_string()),
+                // The RUN-TIME override — the value the typed
+                // `review.context` step actually resolves and writes,
+                // which every downstream review kind reads through
+                // `review_context_from_input`.
+                verify_system: Some("VERIFY OVERRIDE".to_string()),
+                remote_max_tokens_per_execution: Some(500_000),
+                judge_exhaustion_strict: Some(false),
+            },
+        });
+        let mut emitter = RecordingEmitter::new();
+        run_graph(&ctx, &mut emitter).expect("graph run completes");
+
+        let seen = seen_verify_system.lock().unwrap();
+        assert!(!seen.is_empty(), "the verify seat must dispatch at least once");
+        for system in seen.iter() {
+            assert_eq!(
+                system, "VERIFY OVERRIDE",
+                "the verify dispatch's system prompt must come from the typed review context \
+                 resolved at run time, not the launcher's stale build-time stamp"
+            );
+        }
+    }
+
+    /// (#2310 P1 review finding I2, mutation/red-proof) A `review-judge-task`
+    /// whose `reads` no longer names `review-dedup-task` (a user-tier
+    /// `review.json` that renamed the dedup task, or dropped the edge by a
+    /// hand-edit mistake) must fail LOUDLY, by name — never silently judge
+    /// an EMPTY docket into a clean, zero-finding review. Simulates the
+    /// hand-edit by stripping the edge from the already-built graph's own
+    /// task list (the same effect a malformed `review.json` would have)
+    /// rather than authoring a whole second mission-config fixture.
+    #[test]
+    fn graph_judge_task_missing_dedup_read_edge_fails_loudly_not_a_silent_empty_docket() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        // The probe stage still runs (it has no dependency on the mutated
+        // edge, and runs BEFORE judge in every wave order) — only the
+        // JUDGE model must never actually dispatch, since its own step
+        // fails before it gets that far.
+        let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), |call: &ChatCall| {
+            assert_ne!(
+                call.model, "darkmux:judge-model",
+                "the judge step must fail before ever reaching a model call"
+            );
+            Ok(reply("a real defect"))
+        });
+        let judge = ctx.roles.judge.clone();
+        let probes = ctx.roles.probes.clone();
+        let mut graph = build_review_graph(
+            ctx.clone(),
+            &dummy_bundle_spec(),
+            judge.clone(),
+            None,
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        graph
+            .tasks
+            .iter_mut()
+            .find(|t| t.id == "review-judge-task")
+            .expect("review-judge-task exists")
+            .reads
+            .retain(|id| id != "review-dedup-task");
+        let context_out_dir = tempfile::tempdir().expect("tempdir for review-context-step's output");
+        stamp_context_step_for_test(&mut graph.steps, &ctx, context_out_dir.path());
+
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, None, ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
+        let mut emitter = RecordingEmitter::new();
+        let (env, steps) = run_review_graph(
+            &ctx,
+            &crew_name,
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut emitter,
+            &mut |_step| {},
+        )
+        .expect("graph run completes (a loud PER-STEP error, not a hard Err)");
+
+        let judge_step = &steps["review-judge-step"];
+        assert_eq!(
+            judge_step.status,
+            NodeStatus::Error,
+            "the judge step must error, never silently complete over an empty docket"
+        );
+        let out = judge_step.output.as_deref().unwrap_or("");
+        assert!(
+            out.contains("review-dedup-task") && out.contains("reads"),
+            "the judge step's own error must name the missing `reads` edge: {out:?}"
+        );
+        assert!(
+            env.degenerate.is_some(),
+            "a judge step that never ran must not finalize as a clean review: {:?}",
+            env.degenerate
+        );
+    }
+
+    /// (#2310 P1 review finding I2, mutation/red-proof) The verify-render
+    /// sibling of the judge test above — a `review-verify-task` whose
+    /// `reads` no longer names `review-judge-task` must fail loudly rather
+    /// than silently rendering zero verify prompts (indistinguishable from
+    /// "judge confirmed nothing").
+    #[test]
+    fn graph_verify_render_missing_judge_read_edge_fails_loudly_not_a_silent_empty_docket() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![graph_staffing("frontier", "verify-model", 1)]),
+        ]);
+        let ctx = step_ctx_with_chat(&crew, vec![bundle_input("a.ts")], |call: &ChatCall| {
+            assert_ne!(call.model, "darkmux:verify-model", "verify must never dispatch on this path");
+            if call.model == "darkmux:judge-model" {
+                Ok(reply(CONFIRM_JSON))
+            } else {
+                Ok(reply("a real defect"))
+            }
+        });
+        let judge = ctx.roles.judge.clone();
+        let verify = ctx.roles.verify.clone();
+        let probes = ctx.roles.probes.clone();
+        let mut graph = build_review_graph(
+            ctx.clone(),
+            &dummy_bundle_spec(),
+            judge.clone(),
+            verify.clone(),
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        graph
+            .tasks
+            .iter_mut()
+            .find(|t| t.id == "review-verify-task")
+            .expect("review-verify-task exists")
+            .reads
+            .retain(|id| id != "review-judge-task");
+        let context_out_dir = tempfile::tempdir().expect("tempdir for review-context-step's output");
+        stamp_context_step_for_test(&mut graph.steps, &ctx, context_out_dir.path());
+
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
+        let mut emitter = RecordingEmitter::new();
+        let (env, steps) = run_review_graph(
+            &ctx,
+            &crew_name,
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut emitter,
+            &mut |_step| {},
+        )
+        .expect("graph run completes (a loud PER-STEP error, not a hard Err)");
+
+        let render_step = &steps["review-verify-render-step"];
+        assert_eq!(
+            render_step.status,
+            NodeStatus::Error,
+            "the verify-render step must error, never silently complete over an empty docket"
+        );
+        let out = render_step.output.as_deref().unwrap_or("");
+        assert!(
+            out.contains("review-judge-task") && out.contains("reads"),
+            "the verify-render step's own error must name the missing `reads` edge: {out:?}"
+        );
+        assert!(
+            env.degenerate.is_some(),
+            "a verify-render step that never ran must not finalize as a clean review: {:?}",
+            env.degenerate
+        );
+    }
+
     /// Was `crew_without_verify_seat_is_unchanged`.
     #[test]
     fn graph_crew_without_verify_seat_is_unchanged() {
@@ -7312,7 +7570,18 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
         use darkmux_crew::step_kinds::StepKind as _;
         let out = kind.run_streaming(&step, &task, &input, &run_ctx).expect("render completes");
-        let prompts: Vec<String> = serde_json::from_str(&out.output).expect("collection parses");
+        // (#2310 P1 review finding I1) Each item is now a `{system, item}`
+        // object — `dispatch.map`'s per-item override shape — not a bare
+        // string; see `ReviewVerifyRenderStepKind::run_streaming`'s own doc.
+        let items: Vec<serde_json::Value> = serde_json::from_str(&out.output).expect("collection parses");
+        let prompts: Vec<String> = items
+            .iter()
+            .map(|v| v.get("item").and_then(|s| s.as_str()).expect("every item carries \"item\"").to_string())
+            .collect();
+        assert!(
+            items.iter().all(|v| v.get("system").and_then(|s| s.as_str()) == Some(ctx.verify_system.as_str())),
+            "every item must carry the run's verify persona as its own \"system\": {items:?}"
+        );
 
         // Direct calls to the SAME #1256-frozen assembler, in confirmed
         // order — byte equality, never "similar".
@@ -7929,6 +8198,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: None,
             bundle_override: None,
             mission_id: None,
+            diff_file: None,
+            intent_file: None,
             context_test_overrides: Default::default(),
         });
         let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
@@ -8037,6 +8308,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: None,
             bundle_override: None,
             mission_id: None,
+            diff_file: None,
+            intent_file: None,
             context_test_overrides: Default::default(),
         });
         let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
@@ -8218,6 +8491,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: None,
             bundle_override: None,
             mission_id: None,
+            diff_file: None,
+            intent_file: None,
             context_test_overrides: Default::default(),
         });
         let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
@@ -8327,6 +8602,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: None,
             bundle_override: None,
             mission_id: None,
+            diff_file: None,
+            intent_file: None,
             context_test_overrides: Default::default(),
         });
         let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
@@ -8468,6 +8745,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             })),
             bundle_override: None,
             mission_id: Some("mission-token-test".to_string()),
+            diff_file: None,
+            intent_file: None,
             context_test_overrides: Default::default(),
         };
         let call = ChatCall {

@@ -396,6 +396,8 @@ fn step_ctx(
         // off this bus seam, not step config — mirror the three fixture
         // prompts + two budget knobs above so a full `run_review_graph` run
         // resolves the SAME text `chat_fn` discriminates on.
+        diff_file: None,
+        intent_file: None,
         context_test_overrides: ReviewContextTestOverrides {
             probe_system: Some("You are the review-conformance PROBE seat.".to_string()),
             judge_system: Some("You are the review-conformance JUDGE seat.".to_string()),
@@ -664,6 +666,8 @@ fn review_bundle_step_runs_the_real_bundler_over_a_worktree() {
         // prompts above so this hermetic scenario's `chat_fn` (which
         // discriminates by system-prompt/bundle-content substring) still
         // sees the fixture text it was written against.
+        diff_file: None,
+        intent_file: None,
         context_test_overrides: ReviewContextTestOverrides {
             probe_system: Some("You are the review-conformance PROBE seat.".to_string()),
             judge_system: Some("You are the review-conformance JUDGE seat.".to_string()),

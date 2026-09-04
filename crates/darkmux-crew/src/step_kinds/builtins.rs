@@ -885,6 +885,30 @@ fn map_item_text(v: &serde_json::Value) -> String {
     }
 }
 
+/// (#2310 P1 review finding I1) An item MAY be a `{"system": <string>,
+/// "item": <value>}` object — an OPTIONAL per-item persona override, for a
+/// caller whose collection is minted at RUN TIME from data the step-level
+/// `config.system` (fixed at BUILD time) cannot see. Zero domain knowledge
+/// added: this is still config-driven (the SHAPE of an item, not what it
+/// means), matching this kind's Tier 1 classification — see its own doc.
+/// Everything else (a bare string, a number, any other object — including
+/// one that happens to carry only ONE of the two keys) is the plain item as
+/// before: no override, and the whole value substitutes via
+/// [`map_item_text`] under the step's own `config.system`.
+///
+/// Returns `(system_override, payload)` — `payload` is the `"item"` field
+/// when both keys are present, else the item unchanged (so the two never
+/// disagree about which shape won).
+fn item_system_and_payload(item: &serde_json::Value) -> (Option<&str>, &serde_json::Value) {
+    match item.as_object() {
+        Some(obj) if obj.contains_key("system") && obj.contains_key("item") => (
+            obj.get("system").and_then(|v| v.as_str()),
+            obj.get("item").expect("just checked contains_key"),
+        ),
+        _ => (None, item),
+    }
+}
+
 /// Resolve a `dispatch.map` step's collection. Precedence: an explicit
 /// `config.collection` JSON array wins; otherwise the collection is a RUNTIME
 /// INPUT — the dependency output named by `config.collection_input`, or (when
@@ -995,6 +1019,14 @@ fn resolve_map_collection(
 /// dialect), `n_ctx`/`identifier` (residency hints — see [`Self::residency`]),
 /// `retry_on_empty` (u32, default 0 — see below), `retry_on_error` (u32,
 /// default 0 — see below).
+///
+/// **Per-item `system` override (#2310 P1 review finding I1).** An item MAY
+/// be a `{"system": <string>, "item": <value>}` object instead of a plain
+/// value — that item's dispatch uses ITS OWN `system`, not `config.system`,
+/// while the OTHER items in the same collection keep using the step's own
+/// (unaffected). For a caller whose collection is minted at RUN TIME (a
+/// render step's `Step.output`) from a persona the BUILD-TIME `config.system`
+/// stamp cannot see. See [`item_system_and_payload`]'s own doc.
 ///
 /// **`retry_on_empty` (#1442, the generic port of the probe stage's
 /// retry-on-empty loop).** Default `0` (off) — a call whose trimmed content
@@ -1398,14 +1430,20 @@ impl DispatchMapStepKind {
             step.config.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
         let mut results: Vec<MapItemResult> = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
-            let user = user_template.replace("{item}", &map_item_text(item));
+            // (#2310 P1 review finding I1) A `{system, item}` override wins
+            // for THIS item's dispatch; every other item shape keeps using
+            // the step's own `config.system` unchanged — see
+            // `item_system_and_payload`'s own doc.
+            let (item_system_override, payload) = item_system_and_payload(item);
+            let item_system = item_system_override.unwrap_or(system);
+            let user = user_template.replace("{item}", &map_item_text(payload));
             let res = match &endpoint {
                 Some(ep) => map_hosted_item(
-                    index, &bucket, ep, model, system, &user, max_tokens, timeout_seconds,
+                    index, &bucket, ep, model, item_system, &user, max_tokens, timeout_seconds,
                     retry_on_empty, retry_on_error, ovr,
                 ),
                 None => map_local_item(
-                    index, model, system, &user, temperature, max_tokens, timeout_seconds,
+                    index, model, item_system, &user, temperature, max_tokens, timeout_seconds,
                     retry_on_empty, retry_on_error, ovr,
                 ),
             };
@@ -2449,6 +2487,39 @@ mod tests {
         assert_eq!(map_item_text(&json!("hello")), "hello");
         assert_eq!(map_item_text(&json!({ "id": "b1" })), r#"{"id":"b1"}"#);
         assert_eq!(map_item_text(&json!(42)), "42");
+    }
+
+    /// (#2310 P1 review finding I1) A `{system, item}` object is the ONLY
+    /// shape that overrides the step's `system` — every other item shape
+    /// (a bare string, a plain object, an object carrying only ONE of the
+    /// two keys) is unaffected and is substituted whole via
+    /// [`map_item_text`], exactly as before this field existed.
+    #[test]
+    fn item_system_and_payload_only_overrides_for_the_full_system_and_item_shape() {
+        let full = json!({ "system": "OVERRIDE", "item": "hello" });
+        let (system, payload) = item_system_and_payload(&full);
+        assert_eq!(system, Some("OVERRIDE"));
+        assert_eq!(payload, &json!("hello"));
+
+        let plain_string = json!("plain string");
+        let (system, payload) = item_system_and_payload(&plain_string);
+        assert_eq!(system, None);
+        assert_eq!(payload, &plain_string);
+
+        let unrelated_object = json!({ "id": "b1" });
+        let (system, payload) = item_system_and_payload(&unrelated_object);
+        assert_eq!(system, None, "an unrelated object is not mistaken for the override shape");
+        assert_eq!(payload, &unrelated_object);
+
+        let system_only = json!({ "system": "lonely" });
+        let (system, payload) = item_system_and_payload(&system_only);
+        assert_eq!(system, None, "a \"system\" key with no \"item\" sibling is not an override");
+        assert_eq!(payload, &system_only);
+
+        let item_only = json!({ "item": "lonely" });
+        let (system, payload) = item_system_and_payload(&item_only);
+        assert_eq!(system, None, "an \"item\" key with no \"system\" sibling is not an override");
+        assert_eq!(payload, &item_only);
     }
 
     #[test]

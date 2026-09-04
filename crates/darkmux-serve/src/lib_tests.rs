@@ -4801,26 +4801,38 @@
         let nodes = json["nodes"].as_array().unwrap();
         let count_kind = |kind: &str| nodes.iter().filter(|n| n["kind"] == kind).count();
         assert_eq!(count_kind("phase"), 3, "{nodes:?}");
-        // (#1512) Three EXPLICIT one-role probe tasks, statically declared
-        // — bundle + 3 probe maps + dedup + judge + verify + synthesis.
-        assert_eq!(count_kind("task"), 8, "expected bundle+3 probe maps+dedup+judge+verify+synthesis: {nodes:?}");
+        // (#1512, #2310 P1) Three EXPLICIT one-role probe tasks, statically
+        // declared — context + bundle + 3 probe maps + dedup + judge +
+        // verify + synthesis. `review-context-task` (#2310 P1) is the
+        // pipeline's first task now — it resolves the review's shared
+        // context as a real typed step output, and every other review task
+        // formally `reads` it.
+        assert_eq!(
+            count_kind("task"),
+            9,
+            "expected context+bundle+3 probe maps+dedup+judge+verify+synthesis: {nodes:?}"
+        );
         // (#1401) No separate "step" node kind anymore — every task's
-        // steps render as rows on ITS OWN node instead. Sum the `steps`
-        // array lengths across every task node: 9 (#1442 — the verify task
-        // is two sequential rows now: the frozen-prompt render, then the
-        // dispatch.map), no longer a separate node per step.
+        // steps render as rows on ITS OWN node instead.
         assert_eq!(count_kind("step"), 0, "steps are rows now, not nodes (#1401): {nodes:?}");
         let total_step_rows: usize = nodes
             .iter()
             .filter(|n| n["kind"] == "task")
             .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
             .sum();
-        // (#1530) Each of the three probe tasks and the verify task carries
-        // TWO rows (a bespoke render step + the generic `dispatch.map`), so
-        // 8 tasks yield 12 step rows.
-        assert_eq!(total_step_rows, 12, "probe + verify tasks carry two rows each (render + map): {nodes:?}");
-        assert_eq!(tasks.len(), 8);
-        assert_eq!(steps.len(), 12);
+        // (#1530, #2310 P1) Each of the three probe tasks and the verify
+        // task carries TWO rows (a bespoke render step + the generic
+        // `dispatch.map`); every other task (context, bundle, dedup, judge,
+        // synthesis) carries ONE. 9 tasks: context(1) + bundle(1) +
+        // 3×probe(2) + dedup(1) + judge(1) + verify(2) + synthesis(1) = 13
+        // step rows.
+        assert_eq!(
+            total_step_rows,
+            13,
+            "context/bundle/dedup/judge/synthesis carry one row each, probe + verify carry two: {nodes:?}"
+        );
+        assert_eq!(tasks.len(), 9);
+        assert_eq!(steps.len(), 13);
 
         // (#1402) Every row's label resolves through the real StepKind
         // display-name fallback chain — the probe/verify dispatch rows are
@@ -4833,9 +4845,16 @@
             .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
             .filter_map(|row| row["label"].as_str().map(String::from))
             .collect();
-        for expected in
-            ["Bundle", "Dispatch (map)", "Dedup", "Judge", "Probe prompts", "Verify prompts", "Synthesis"]
-        {
+        for expected in [
+            "Review context",
+            "Bundle",
+            "Dispatch (map)",
+            "Dedup",
+            "Judge",
+            "Probe prompts",
+            "Verify prompts",
+            "Synthesis",
+        ] {
             assert!(
                 all_labels.iter().any(|l| l == expected),
                 "expected a \"{expected}\" row label among {all_labels:?}"

@@ -3967,6 +3967,23 @@ pub struct ReviewStepContext {
     pub intent_title: String,
     pub intent_body: String,
     pub diff: String,
+    /// (#2310 P1 review finding I4) The diff's ORIGINAL on-disk path, when
+    /// the caller has one — set only by a caller with a real backing file
+    /// (`src/mission_launch_review.rs`'s CLI-provided `--param diff_file`,
+    /// `review_bench.rs`'s own temp diff file). `build_review_graph_from_
+    /// config` stamps THIS path onto `review-context-step`'s config when
+    /// present, instead of the already-resolved `diff` TEXT above — the
+    /// step reads the file back itself, once, at run time
+    /// (`ReviewContextStepConfig`/`resolve_review_context` already accept
+    /// either shape). Only the PERSISTED `Step.config` shrinks: `diff`
+    /// stays populated here (and on the typed `ReviewContext` output every
+    /// downstream kind reads) either way. `None` — every hermetic test
+    /// fixture in this crate, which resolves `diff` from an in-process
+    /// string with nothing on disk to point at — falls back to stamping
+    /// the text directly, unchanged from before this field existed.
+    pub diff_file: Option<PathBuf>,
+    /// Same shape, for `intent_file` — see [`Self::diff_file`]'s own doc.
+    pub intent_file: Option<PathBuf>,
     pub probe_system: String,
     /// (#1530 follow-on, Packet A1) Per-PROBE-ROLE resolved system prompt —
     /// `role_id` (`"review-probe-high"`/`-mid`/`-low`) -> that role's OWN
@@ -4242,8 +4259,7 @@ const REVIEW_CONTEXT_DEFAULT_TIMEOUT_SECONDS: u32 = 3600;
 /// review.context step is built WITHOUT going through
 /// `build_review_graph_from_config` (which always stamps `context_out`
 /// itself — see that function's own doc).
-fn default_context_path(task: &Task) -> Result<PathBuf> {
-    let phases = darkmux_crew::loader::load_phases().context("loading phase records to locate the run")?;
+fn default_context_path(phases: &[darkmux_crew::types::Phase], task: &Task) -> Result<PathBuf> {
     let phase = phases.iter().find(|p| p.id == task.phase_id).ok_or_else(|| {
         anyhow!(
             "`{REVIEW_CONTEXT_KIND}`: task `{}` names phase `{}`, which has no record — pass \
@@ -4426,9 +4442,22 @@ impl StepKind for ReviewContextStepKind {
 /// ONE place regardless of which entry point ran.
 fn run_review_context_step(step: &Step, task: &Task, overrides: &ReviewContextTestOverrides) -> Result<StepOutcome> {
     let cfg = ReviewContextStepConfig::from_step(step)?;
+    // (trivial, #2310 P1 review) `load_phases()` used to be called up to
+    // TWICE per invocation — once (conditionally) inside `default_context_
+    // path`, once (always) for `mission_id` below. Read once, thread the
+    // result to both uses; each keeps its own original error-handling
+    // shape (`default_context_path`'s branch still propagates a load
+    // failure loudly, `mission_id`'s still swallows one via `.ok()`).
+    let phases = darkmux_crew::loader::load_phases();
     let out_path = match &cfg.context_out {
         Some(p) => p.clone(),
-        None => default_context_path(task)?,
+        None => default_context_path(
+            phases
+                .as_ref()
+                .map_err(|e| anyhow!("{e:#}"))
+                .context("loading phase records to locate the run")?,
+            task,
+        )?,
     };
     let mut context = resolve_review_context(
         &cfg.case_id,
@@ -4457,7 +4486,8 @@ fn run_review_context_step(step: &Step, task: &Task, overrides: &ReviewContextTe
         context.judge_exhaustion_strict = v;
     }
 
-    let mission_id = darkmux_crew::loader::load_phases()
+    let mission_id = phases
+        .as_ref()
         .ok()
         .and_then(|ps| ps.iter().find(|p| p.id == task.phase_id).map(|p| p.mission_id.clone()))
         .unwrap_or_default();
@@ -4760,6 +4790,14 @@ fn review_context_from_input(
         intent_title: review_context.intent_title,
         intent_body: review_context.intent_body,
         diff: review_context.diff,
+        // (#2310 P1 review finding I4) `ReviewContext` (the typed output)
+        // carries only resolved TEXT — no downstream review kind ever
+        // reads a path off this reconstruction, only `ctx.diff`/`ctx.
+        // intent_body` (see e.g. `ReviewBundleStepKind::run_streaming`,
+        // `ReviewDedupStepKind::run_streaming`) — so `None` here is
+        // correct, not a gap.
+        diff_file: None,
+        intent_file: None,
         probe_system: review_context.probe_system,
         probe_role_prompts: review_context.probe_role_prompts,
         judge_system: review_context.judge_system,
@@ -5817,7 +5855,22 @@ impl StepKind for ReviewJudgeStepKind {
         // silently hand this the WRONG entry the moment a second key
         // existed. Named by the real dependency task id `gather_inputs`
         // keys this entry with (#1341).
-        let dedup_output = input.get("review-dedup-task").cloned().unwrap_or_default();
+        //
+        // (#2310 P1 review finding I2) A MISSING key (the edge itself
+        // renamed or dropped) is a loud config error, not a silent empty
+        // docket — `.unwrap_or_default()` used to make a renamed/dropped
+        // `review-dedup-task` `reads` edge indistinguishable from "dedup
+        // genuinely produced zero flags", which judges a silently EMPTY
+        // docket into a clean review with zero findings. A key that IS
+        // present but empty (dedup really did produce nothing) still falls
+        // through to `Vec::new()` below — that's real, not a config bug.
+        let dedup_output = input.get("review-dedup-task").cloned().ok_or_else(|| {
+            anyhow!(
+                "step `{}`: `{}` needs its task to `reads` `review-dedup-task` (the dedup output)",
+                step.id,
+                self.id()
+            )
+        })?;
         let deduped: Vec<ProbeFlag> = if dedup_output.is_empty() {
             Vec::new()
         } else {
@@ -6251,7 +6304,21 @@ impl StepKind for ReviewVerifyRenderStepKind {
         // alphabetical-iteration hazard as `ReviewJudgeStepKind`'s own fix
         // (see that kind's doc comment): "review-context-task" now shares
         // this `input` map with "review-judge-task".
-        let judge_output = input.get("review-judge-task").cloned().unwrap_or_default();
+        //
+        // (#2310 P1 review finding I2) A MISSING key is a loud config error
+        // — see `ReviewJudgeStepKind::run_streaming`'s identical fix for
+        // `review-dedup-task`, same reasoning: a renamed/dropped
+        // `review-judge-task` `reads` edge must not read as "judge produced
+        // zero confirmed flags" (a clean, silent, zero-finding review). A
+        // present-but-empty key (judge really did confirm nothing) still
+        // falls through to `Vec::new()` below.
+        let judge_output = input.get("review-judge-task").cloned().ok_or_else(|| {
+            anyhow!(
+                "step `{}`: `{}` needs its task to `reads` `review-judge-task` (the judge output)",
+                step.id,
+                self.id()
+            )
+        })?;
         let judged: Vec<JudgedFlag> = if judge_output.is_empty() {
             Vec::new()
         } else {
@@ -6279,7 +6346,21 @@ impl StepKind for ReviewVerifyRenderStepKind {
             None
         };
 
-        let prompts: Vec<String> = if skip_reason.is_some() {
+        // (#2310 P1 review finding I1) Each item is a `{system, item}`
+        // object — `dispatch.map`'s per-item override (`item_system_and_
+        // payload`, `darkmux-crew`'s `builtins.rs`) — carrying THIS run's
+        // typed `ctx.verify_system` (resolved above via `review_context_
+        // from_input`, which applies every test override) rather than
+        // relying on `build_review_graph_from_config`'s build-time stamp on
+        // `review-verify-step`'s own `config.system`. The two used to be
+        // able to disagree: the map step's `system` was frozen at BUILD
+        // time from the LAUNCHER's own `ReviewStepContext`, so a
+        // `ReviewContextTestOverrides.verify_system` (or, in principle, any
+        // future per-run persona resolution) never reached the actual
+        // dispatch. Every item in the docket shares the SAME persona (one
+        // verify seat, one system prompt) — the per-item shape is used
+        // uniformly here, not because verify's persona varies by finding.
+        let prompts: Vec<serde_json::Value> = if skip_reason.is_some() {
             Vec::new()
         } else {
             // (#1530) The bundle set — published by `review-bundle-task`'s
@@ -6297,7 +6378,9 @@ impl StepKind for ReviewVerifyRenderStepKind {
                     let bundle = bundles.iter().find(|b| b.id == j.flag.bundle_id);
                     let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
                     let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
-                    verify_prompt(&ctx.intent_title, &ctx.intent_body, code, facts, &j.flag.charge_text)
+                    let prompt =
+                        verify_prompt(&ctx.intent_title, &ctx.intent_body, code, facts, &j.flag.charge_text);
+                    json!({ "system": ctx.verify_system, "item": prompt })
                 })
                 .collect()
         };
@@ -7237,50 +7320,66 @@ pub fn build_review_graph_from_config(
     // so this is a re-serialization of data the caller already had, not
     // new resolution work; the STEP re-derives it independently at run
     // time from these same raw pieces (`resolve_review_context` — the one
-    // function both call). `diff`/`intent_body` (not `diff_file`/
-    // `intent_file`) are what's stamped here because `ctx.diff`/
-    // `ctx.intent_body` are already-resolved TEXT by this point — the
-    // launcher doesn't retain either source path this far down the
-    // pipeline, and re-reading `diff_file` a second time here would be
-    // wasted I/O (see `ReviewContextStepConfig`'s doc for why both shapes
-    // are accepted).
-    // (#2310 P1) `if let`, not `.expect(...)` — unlike `review-bundle-step`
-    // (required by every review.json since long before this packet), a
-    // hand-built `MissionConfig` predating this packet (this crate's own
-    // `review_tests.rs` builds several; a user-tier
-    // `~/.darkmux/mission-configs/review-lean.json` could too) declares no
-    // `review-context-step` at all, and that is a VALID document — see
-    // `ReviewBundleStepKind::run_streaming`'s own fallback for the
-    // consuming half of this same leniency (contract 7).
+    // function both call).
+    //
+    // (#2310 P1 review finding I4) `diff_file`/`intent_file` (the ORIGINAL
+    // on-disk paths, when `ctx` carries one — see `ReviewStepContext::
+    // diff_file`'s own doc) win over `diff`/`intent_body` (the already-
+    // resolved TEXT) below: `save_step` persists `Step.config` at every
+    // transition, so a whole diff riding this stamp got written to the
+    // mission record at least three times per review. A caller with no
+    // backing file (every hermetic test in this crate) still falls back to
+    // the text, unchanged from before this fix.
+    //
+    // (#2310 P1 review finding I3, corrected) `if let`, not `.expect(...)`
+    // — unlike `review-bundle-step` (required by every review.json since
+    // long before this packet), a hand-built `MissionConfig` predating
+    // this packet (this crate's own `review_tests.rs` builds several) can
+    // still declare no `review-context-step` at all — the graph BUILDS
+    // either way; only RUNNING it exposes the gap. There is no fallback
+    // for that anymore: the first review step whose task `depends_on`/
+    // `reads` `review-context-task` (every real review kind — see
+    // `review_context_from_input`'s own doc) fails loudly BY NAME the
+    // moment it runs, naming the missing edge — never a silent reach for
+    // some retired bus-seeded `ReviewStepContext` whole. Pre-1.0, no
+    // compat shim: fix the config (add the task/edge, or delete a stale
+    // user-tier copy to fall back to the built-in), don't paper over the
+    // gap here.
     if let Some(context_step) = steps.get_mut("review-context-step") {
-        context_step.config = json!({
-            "diff": ctx.diff,
-            "intent_body": ctx.intent_body,
+        let mut context_config = json!({
             "intent_title": ctx.intent_title,
             "case_id": ctx.case_id,
             "timeout_seconds": ctx.timeout_seconds,
             "staffing": serde_json::to_value(&ctx.roles).context("serializing resolved review staffing")?,
-            // (#2310 P1, corrected) `context_out` is deliberately NOT
-            // stamped here — this function only SERIALIZES config, it never
-            // touches disk (graph BUILDING must be pure; only a step's own
-            // `run` may write). Leaving it unset means `ReviewContextStepKind
-            // ::run` falls through to `default_context_path`, which resolves
-            // `<missions>/<mission-id>/context/context.json` from the task's
-            // OWN phase record at RUN time — the exact `plan_out`/
-            // `default_plan_path` pattern `crawl.plan` already uses (see
-            // that kind's own doc), and `crawl.json`'s own graph never
-            // stamps `plan_out` either, for the identical reason. A hand-
-            // built graph/test that never mints a Mission/Phase (this
-            // crate's own `review_tests.rs`, or `review_conformance.rs`'s
-            // hermetic scenarios) uses `ReviewContextStepConfig::context_out`
-            // as its own explicit escape hatch instead — same shape as
-            // `crawl.plan`'s tests using `plan_out` — rather than this
-            // function inventing a second, non-production default path
-            // (an OS-temp-dir stamp with its own process-counter
-            // uniquifier) that no other review kind's config needed and
-            // that only existed to paper over graph-building tests that
-            // never run the step at all.
         });
+        match &ctx.diff_file {
+            Some(p) => context_config["diff_file"] = json!(p.display().to_string()),
+            None => context_config["diff"] = json!(ctx.diff),
+        }
+        match &ctx.intent_file {
+            Some(p) => context_config["intent_file"] = json!(p.display().to_string()),
+            None => context_config["intent_body"] = json!(ctx.intent_body),
+        }
+        // (#2310 P1, corrected) `context_out` is deliberately NOT stamped
+        // here — this function only SERIALIZES config, it never touches
+        // disk (graph BUILDING must be pure; only a step's own `run` may
+        // write). Leaving it unset means `ReviewContextStepKind::run` falls
+        // through to `default_context_path`, which resolves `<missions>/
+        // <mission-id>/context/context.json` from the task's OWN phase
+        // record at RUN time — the exact `plan_out`/`default_plan_path`
+        // pattern `crawl.plan` already uses (see that kind's own doc), and
+        // `crawl.json`'s own graph never stamps `plan_out` either, for the
+        // identical reason. A hand-built graph/test that never mints a
+        // Mission/Phase (this crate's own `review_tests.rs`, or
+        // `review_conformance.rs`'s hermetic scenarios) uses
+        // `ReviewContextStepConfig::context_out` as its own explicit escape
+        // hatch instead — same shape as `crawl.plan`'s tests using
+        // `plan_out` — rather than this function inventing a second,
+        // non-production default path (an OS-temp-dir stamp with its own
+        // process-counter uniquifier) that no other review kind's config
+        // needed and that only existed to paper over graph-building tests
+        // that never run the step at all.
+        context_step.config = context_config;
     }
     // (#1530) Stamp `review-bundle-step`'s config from the caller's already-
     // resolved `bundle_spec` — see [`BundleBuildSpec`]'s own doc for why
@@ -7464,6 +7563,18 @@ pub fn build_review_graph_from_config(
     // so only the dispatch parameters are stamped here. No verify seat ⇒
     // config stays null: the render step emits an empty collection and the
     // map short-circuits before any config key is required.
+    //
+    // (#2310 P1 review finding I1) `"system"` stays `""` — same as the
+    // probe map step just above (`"system": ""`, stamped a few dozen lines
+    // up) — never `ctx.verify_system`. `ctx` here is the LAUNCHER's own
+    // BUILD-TIME `ReviewStepContext`, frozen before the typed `review.
+    // context` step (and every test override it applies) ever runs;
+    // stamping it here bypassed that typed context entirely. The real
+    // persona now rides PER-ITEM instead — `ReviewVerifyRenderStepKind::
+    // run_streaming` reads `ctx.verify_system` off the RUN-TIME typed
+    // output and wraps every item as `{"system": ..., "item": ...}` (see
+    // that kind's own doc, and `dispatch.map`'s `item_system_and_payload`
+    // in `darkmux-crew`), which this map step now honors per item.
     if let Some(vstaff) = &verify {
         let identifier = seat_identifier(&vstaff.pm);
         let endpoint = seat_endpoint(&vstaff.pm);
@@ -7473,7 +7584,7 @@ pub fn build_review_graph_from_config(
             .expect("interpreted \"review\" graph must have a review-verify-step");
         let mut config = json!({
             "model": identifier,
-            "system": ctx.verify_system,
+            "system": "",
             "user_template": "{item}",
             "temperature": JUDGE_TEMPERATURE,
             "max_tokens": max_tokens,

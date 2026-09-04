@@ -17,7 +17,7 @@
     "review-context-step": {
       "config": {
         "case_id": "case-1",
-        "diff": "--- a/billing.ts\n+++ b/billing.ts\n@@ -1,3 +1,4 @@\n context line\n+const end = start.plus(30)\n+const total = base * rate\n more context\n",
+        "diff_file": "/nonexistent-test-diff-golden",
         "intent_body": "",
         "intent_title": "",
         "staffing": {
