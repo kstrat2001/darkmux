@@ -1443,6 +1443,42 @@ describe("App", () => {
     expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_067)} · ${clkhm(runEndMs)}`);
   });
 
+  // (#2347 review, MUST FIX (b)) Leaving an AT-REST dispatch view for the
+  // day view: sA's own end falls WELL INSIDE the day's own range and is not
+  // equal to the day's own tMax, so the old preserve-or-snap effect's
+  // in-range branch fired and wrongly left the day view SCRUBBED at the
+  // run's own end — cutting the fleet hero, the runs board, and the event
+  // log to that instant instead of showing the whole day. In the static
+  // demo this is "tap a run row, tap Runs".
+  it("(#2347 MUST FIX) leaving an at-rest dispatch view for the day view is NOT left scrubbed at the run's own end", async () => {
+    const meta = mockDayWithGap();
+    window.location.hash = "#dispatch=s-narrow";
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".session-run__header .pill")).toBeTruthy());
+      // Sanity: the dispatch view itself is at rest before leaving it —
+      // confirms this test exercises "leaving an AT-REST view", not a
+      // scrubbed one (a scrubbed one already worked before this fix).
+      expect(screen.getByRole("slider")).toHaveValue("100");
+
+      await act(async () => {
+        window.location.hash = "#lens=runs";
+        window.dispatchEvent(new HashChangeEvent("hashchange"));
+      });
+      await screen.findByRole("group", { name: "playback transport" });
+
+      const dayEndMs = Date.parse("2026-08-07T20:43:00.000Z");
+      // Pinned at the DAY's own end, not left scrubbed at the run's own
+      // (much earlier) end — both the clock text and the slider's own
+      // position (100, the same "pinned at end" the day view starts at)
+      // prove it, not just one or the other.
+      await waitFor(() => expect(screen.getByTestId("scrubber-clock").textContent).toBe(clkhm(dayEndMs)));
+      expect(screen.getByRole("slider")).toHaveValue("100");
+    } finally {
+      meta.remove();
+    }
+  });
+
   it("(#2071) play advances the playhead from the shell's transport and stops at the end", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const meta = mockStaticDay();

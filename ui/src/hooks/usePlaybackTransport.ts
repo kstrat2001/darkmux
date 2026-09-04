@@ -216,14 +216,40 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
   // instant before the range changed, not the value this same render
   // already recomputed against the NEW tMax.
   //
+  // (#2347 review, MUST FIX) `prev.playheadT` alone (the RESOLVED playhead,
+  // `t ?? tMax`) cannot tell "at rest, pinned at the end" from "scrubbed to
+  // exactly the end" — both read the same absolute number. That ambiguity
+  // broke two real cases the SAME way: (a) the same focus's own tMax
+  // GROWING while at rest (a live run without a terminal yet gets its
+  // `dispatch complete` appended by the #2011 grace-window poll in
+  // `useRouteRecords.ts`) — the old playhead (the OLD tMax) is still inside
+  // the new, bigger range and below the new tMax, so the in-range branch
+  // preserved it as a literal number instead of following the new end, and
+  // the transport flipped to scrubbed and froze; (b) leaving an at-rest
+  // dispatch view for the day view — the run's own end sits well inside the
+  // day's much wider range, so the same in-range branch fired and left the
+  // day view scrubbed at the run's own (much earlier) end, cutting the
+  // fleet hero, the runs board, and the event log to that instant.
+  //
+  // `atRest` (`t === null` at the time `prevRef` was captured) resolves the
+  // ambiguity directly: it is TRUE exactly when nothing has been scrubbed
+  // yet, independent of what number the resolved playhead happened to read.
+  // When the prior render was at rest, ANY range change (grow, shrink,
+  // focus switch) keeps it at rest — `setT(null)`, which re-pins to
+  // whatever `tMax` resolves to THIS render — before the in-range check
+  // ever runs. Only a GENUINELY scrubbed prior position (`atRest: false`)
+  // goes through the preserve-or-snap-by-value logic below.
+  //
   // Guarded on `prev.dayIdentity === dayIdentity`: when the day ALSO
   // changed in this render, the reset effect above owns it — this one
   // no-ops rather than fighting it over which `setT` wins.
-  const prevRef = useRef<{ dayIdentity: string; playheadT: number } | null>(null);
+  const prevRef = useRef<{ dayIdentity: string; focusKey: string; playheadT: number; atRest: boolean } | null>(null);
   useEffect(() => {
     const prev = prevRef.current;
     if (prev && prev.dayIdentity === dayIdentity) {
-      if (prev.playheadT >= tMin && prev.playheadT <= tMax) {
+      if (prev.atRest) {
+        setT(null);
+      } else if (prev.playheadT >= tMin && prev.playheadT <= tMax) {
         setT(prev.playheadT >= tMax ? null : prev.playheadT);
       } else {
         setT(null);
@@ -232,7 +258,7 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusKey, tMin, tMax]);
   useEffect(() => {
-    prevRef.current = { dayIdentity, playheadT };
+    prevRef.current = { dayIdentity, focusKey, playheadT, atRest: t === null };
   });
 
   // Keyed on the day (`dayIdentity`), not on the records array: a daemon

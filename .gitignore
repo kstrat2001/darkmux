@@ -73,7 +73,7 @@ tests/flatsat/.gallery/
 # copied to the COMMITTED `crates/darkmux-serve/assets/next.html` by
 # `bun run build`'s `copy-artifact` step; `dist/` itself is scratch.
 # `src/types/generated/` IS committed (ts-rs output; see ui/README.md).
-ui/node_modules/
+ui/node_modules
 ui/dist/
 ui/test-results/
 ui/playwright-report/

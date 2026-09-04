@@ -287,4 +287,82 @@ describe("usePlaybackTransport", () => {
       expect(result.current.scrubbed).toBe(false);
     });
   });
+
+  // (#2347 review, MUST FIX) The preserve-or-snap effect compared
+  // `prev.playheadT` (the RESOLVED playhead, `t ?? tMax`) alone, which
+  // cannot tell "at rest, pinned at the end" from "scrubbed to exactly the
+  // end" — both read the same absolute number. Two proven failures follow
+  // from that ambiguity, both fixed by also carrying `atRest` (`t === null`)
+  // in `prevRef` and short-circuiting to `setT(null)` whenever the PRIOR
+  // render was at rest, before the in-range check ever runs.
+  describe("preserve-or-snap must not freeze an at-rest playhead (#2347 MUST FIX)", () => {
+    it("(a) the SAME focus's own tMax growing while at rest follows the new end, never freezes scrubbed at the old one", () => {
+      // Mirrors the reviewer's exact probe: a live run with no terminal yet
+      // (tMax = its last telemetry record), at rest. A poll appends
+      // `dispatch complete` (#2011's grace-window poll in
+      // `useRouteRecords.ts`) — same focus id, only the records (and so the
+      // range) change.
+      const start = { ts: "2026-09-04T00:11:48.000Z", action: "dispatch start", session_id: "s-narrow" } as unknown as FlowRecord;
+      const reasoning = { ts: "2026-09-04T01:00:00.000Z", action: "dispatch.reasoning", session_id: "s-narrow" } as unknown as FlowRecord;
+      const complete = { ts: "2026-09-04T02:06:37.000Z", action: "dispatch complete", session_id: "s-narrow" } as unknown as FlowRecord;
+      const { result, rerender } = renderHook(
+        ({ records }: { records: FlowRecord[] }) => usePlaybackTransport(MIXED_DAY, { kind: "dispatch", sessionId: "s-narrow", records }),
+        { initialProps: { records: [start, reasoning] } },
+      );
+      expect(result.current.scrubbed).toBe(false);
+      expect(result.current.t).toBe(Date.parse("2026-09-04T01:00:00.000Z"));
+
+      rerender({ records: [start, reasoning, complete] });
+
+      // Still at rest, now pinned at the NEW (grown) end — not frozen,
+      // scrubbed, at the old one.
+      expect(result.current.scrubbed).toBe(false);
+      expect(result.current.t).toBe(Date.parse("2026-09-04T02:06:37.000Z"));
+    });
+
+    it("(b) leaving an at-rest dispatch focus for the day focus is NOT left scrubbed at the run's own end", () => {
+      // The reviewer's second proven failure, at the hook level: sA's own
+      // end (08:30) falls WELL INSIDE the day's own range (07:00-20:43) —
+      // and is not equal to the day's own tMax — so the OLD in-range
+      // "preserve the absolute value" branch fires and wrongly leaves the
+      // day view scrubbed at 08:30 instead of pinned at the day's own end.
+      // This is the general form of (a): "at rest" must survive ANY range
+      // change (grow, shrink, or a focus switch to something wider), not
+      // just the specific growing-tMax shape (a) exercises.
+      const { result, rerender } = renderHook(
+        ({ focus }) => usePlaybackTransport(MIXED_DAY, focus),
+        { initialProps: { focus: { kind: "dispatch" as const, sessionId: "sA", records: sARecords } } },
+      );
+      expect(result.current.scrubbed).toBe(false);
+      expect(result.current.t).toBe(Date.parse("2026-08-07T08:30:00.000Z")); // sA's own end
+
+      rerender({ focus: { kind: "day" } as unknown as { kind: "dispatch"; sessionId: string; records: FlowRecord[] } });
+
+      expect(result.current.scrubbed).toBe(false);
+      expect(result.current.t).toBe(Date.parse("2026-08-07T20:43:00.000Z")); // the DAY's own end, not sA's stale one
+    });
+  });
+
+  // (#2347 review, TEST GAP) No prior focus test ever pressed play — a
+  // mutation of the play interval's own ceiling (the `Math.min(..., tMax)`
+  // clamp) to something day-scoped instead of focus-scoped left every
+  // existing hook test green. This presses play on a focus strictly
+  // narrower than the day (sA: 08:00-08:30, inside a day ending 20:43) and
+  // asserts playback stops at the FOCUS's own end, not the day's later one.
+  it("(#2347 TEST GAP) play on a dispatch focus stops at the FOCUS's own tMax, never the day's later end", () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => usePlaybackTransport(MIXED_DAY, { kind: "dispatch", sessionId: "sA", records: sARecords }));
+    act(() => result.current.togglePlay());
+    expect(result.current.playing).toBe(true);
+    act(() => {
+      // Far more wall-clock than sA's own 30-minute span needs at the
+      // default 1h/s (0.5s would already finish it) — if the ceiling were
+      // ever day-scoped instead of focus-scoped, this would still be
+      // mid-flight toward 20:43 rather than stopped.
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(result.current.playing).toBe(false);
+    expect(result.current.t).toBe(result.current.tMax);
+    expect(result.current.t).toBe(Date.parse("2026-08-07T08:30:00.000Z"));
+  });
 });
