@@ -27,6 +27,16 @@ pub struct Hunk {
     /// The hunk's starting line number in the NEW file (1-indexed), from
     /// the `@@ -a,b +c,d @@` header's `+c`.
     pub new_start: u32,
+    /// The hunk's starting line number in the OLD file (1-indexed), from
+    /// the same header's `-a` (#2310 P4b review, M-B). Not needed by the
+    /// bundler (every existing caller anchors off the NEW side only) —
+    /// added for `deliver_github_review`'s suggestion-block anchoring: a
+    /// mod's kit is itself a unified diff whose OLD side names the lines
+    /// it replaces in the file's CURRENT state, which is the SAME
+    /// coordinate space the PR diff's NEW side already occupies (the file
+    /// as the PR leaves it). Additive — every existing reader of `Hunk`
+    /// that never looks at this field is unaffected.
+    pub old_start: u32,
     /// Every line number (1-indexed, in the NEW file) touched by this
     /// hunk — added lines AND unchanged context lines (matches the
     /// reference: context lines advance `new_ln` and land in
@@ -88,10 +98,11 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
             cur = None;
             continue;
         }
-        if let Some(start) = parse_hunk_header(ln) {
+        if let Some((old_start, start)) = parse_hunk_header(ln) {
             flush(&mut files, &path, &mut cur);
             cur = Some(Hunk {
                 new_start: start,
+                old_start,
                 ..Default::default()
             });
             new_ln = start;
@@ -128,13 +139,19 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
     files
 }
 
-/// Parse `@@ -a[,b] +c[,d] @@...` and return `c` (the new-file start
-/// line), or `None` if `ln` isn't a hunk header. Hand-rolled equivalent
-/// of `re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", ln)`.
-fn parse_hunk_header(ln: &str) -> Option<u32> {
+/// Parse `@@ -a[,b] +c[,d] @@...` and return `(a, c)` — the OLD-file and
+/// NEW-file start lines — or `None` if `ln` isn't a hunk header.
+/// Hand-rolled equivalent of `re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", ln)`.
+///
+/// (#2310 P4b review, M-B) Returns BOTH sides now (used to return only
+/// `c`) — `Hunk::old_start` needs `a` too. Every existing call site reads
+/// `.1` for what used to be the whole return value, so nothing downstream
+/// of the new-side number changed.
+fn parse_hunk_header(ln: &str) -> Option<(u32, u32)> {
     let rest = ln.strip_prefix("@@ -")?;
-    // Skip the `-a[,b]` side entirely — we only need the `+c` number.
     let space = rest.find(' ')?;
+    let minus_digits = rest[..space].split(',').next()?;
+    let old_start: u32 = minus_digits.parse().ok()?;
     let after_minus = &rest[space + 1..];
     let plus_digits = after_minus.strip_prefix('+')?;
     let end = plus_digits
@@ -151,7 +168,8 @@ fn parse_hunk_header(ln: &str) -> Option<u32> {
     if !(tail.starts_with(',') || tail.starts_with(' ')) {
         return None;
     }
-    plus_digits[..end].parse::<u32>().ok()
+    let new_start: u32 = plus_digits[..end].parse().ok()?;
+    Some((old_start, new_start))
 }
 
 #[cfg(test)]
@@ -184,6 +202,7 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         let h = &hunks[0];
         assert_eq!(h.new_start, 1);
+        assert_eq!(h.old_start, 1, "(#2310 P4b) the OLD-side start line, from the header's `-a`");
         assert_eq!(h.added, vec!["new line", "added line"]);
         assert_eq!(h.removed, vec!["old line"]);
         // new_lines: line one(1), new line(2), added line(3), line four(4)

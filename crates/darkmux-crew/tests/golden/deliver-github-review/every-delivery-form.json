@@ -2,11 +2,12 @@
   "mode": "review",
   "review": {
     "event": "COMMENT",
-    "body": "### darkmux review\n\nreview ran: 2 rule(s), 3/4 hunks covered, 6 finding(s) considered, 2 refused. Not attempted: architectural review.\n\n**Proposed changes outside the diff:**\n- `sess-a/2 (src/other.ts:5)` — proposed change (outside the diff's lines):\n\n```\nthe patch text\n```\n\n**Worth enumerating (search-confirmed):**\n- `sess-a/5 (src/mw.ts:10)` — 14 endpoints use this middleware\n\n**Questions:**\n- `sess-a/6 (src/x.ts:1)` — did you check whether the repo already has this? Candidates: Status enum, Kind enum\n\n**Worth a double check** (not merge-blocking):\n- `sess-a/3 (src/a.ts:2)` — might duplicate an existing helper _Worth checking: the cited line_\n- `sess-a/4 (src/a.ts:2)` — a gate-failed claim _Worth checking: ev_\n\n_Advisory, not a merge gate._",
+    "body": "### darkmux review\n\nreview ran: 2 rule(s), 3/4 hunks covered, 7 finding(s) considered, 2 refused. Not attempted: architectural review.\n\n**Proposed changes outside the diff:**\n- `sess-a/2 (src/other.ts:5)` — proposed change (outside the diff's lines):\n\n```\nthe patch text\n```\n\n**Worth enumerating (search-confirmed):**\n- `sess-a/5 (src/mw.ts:10)` — 14 endpoints use this middleware\n\n**Questions:**\n- `sess-a/6 (src/x.ts:1)` — did you check whether the repo already has this? Candidates: Status enum, Kind enum\n\n**Worth a double check** (not merge-blocking):\n- `sess-a/3 (src/a.ts:2)` — might duplicate an existing helper _Worth checking: the cited line_\n- `sess-a/4 (src/a.ts:2)` — a gate-failed claim _Worth checking: ev_\n- `sess-a/7 (src/a.ts:2)` — a mod exists but nothing ever gated it _Worth checking: ev_\n\n_Advisory, not a merge gate._",
     "comments": [
       {
         "path": "src/a.ts",
         "line": 2,
+        "side": "RIGHT",
         "body": "```suggestion\n  const x = clamp(1);\n```"
       }
     ]

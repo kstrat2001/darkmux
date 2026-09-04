@@ -433,6 +433,15 @@ pub(crate) enum ModCmd {
         /// `--attach` is required.
         #[arg(long)]
         kit: Option<String>,
+        /// (#2310 P4b) An optional, proposer-declared hint at the kit's
+        /// shape — `unified-diff` is the one a consumer recognizes today
+        /// (`darkmux mission launch review`'s delivery kind renders a
+        /// unified-diff kit as an inline GitHub suggestion when it lands
+        /// inside the PR's own diff; anything else, or no hint at all,
+        /// renders as an opaque fenced patch). Never validated — darkmux
+        /// still never opens the kit.
+        #[arg(long = "kit-kind")]
+        kit_kind: Option<String>,
         /// A file to copy into the mod's own `attachments/`. Repeatable.
         #[arg(long)]
         attach: Vec<std::path::PathBuf>,

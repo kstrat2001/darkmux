@@ -105,7 +105,20 @@ pub struct DeliverScope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GithubReviewComment {
     pub path: String,
+    /// The comment's END line (GitHub's own convention — `line` is always
+    /// the range's end, whether or not `start_line` is present).
     pub line: u32,
+    /// (#2310 P4b review, M-B) Present only for a MULTI-line suggestion —
+    /// a single-line one carries `line` alone, matching GitHub's own API
+    /// (a `start_line` equal to `line` is rejected as redundant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    /// `"RIGHT"` for every comment this kind emits (anchored to the PR's
+    /// new/current side) — matching `review_render.rs`'s existing anchors
+    /// (`{"side": "RIGHT", ...}`) even though this module has no
+    /// dependency on that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
     pub body: String,
 }
 
@@ -192,22 +205,21 @@ pub fn render_github_review(
                 ));
             }
             DeliveryForm::Mod => {
-                let gated = mods.iter().find(|m| m.record.r#for.iter().any(|k| k == &finding.key));
+                // (#2310 P4b review, CONSIDER) Prefer a GATE-PASSED mod
+                // over an earlier gate-failed one naming the same
+                // finding: without this, a coder's second (successful)
+                // attempt at a finding could lose to its own first
+                // failed one just because it landed later in `mods`.
+                // Falls back to the first match at all (any gate state)
+                // so the double-check branch below still has something
+                // to describe when nothing passed.
+                let matches: Vec<&GatedMod> =
+                    mods.iter().filter(|m| m.record.r#for.iter().any(|k| k == &finding.key)).collect();
+                let gated =
+                    matches.iter().find(|m| m.gate_passed == Some(true)).copied().or_else(|| matches.first().copied());
                 match gated {
                     Some(m) if m.gate_passed == Some(true) => {
-                        let kit = m.record.kit.as_deref().unwrap_or("");
-                        if window.file.as_deref().is_some_and(|f| line_touched(&touched, f, window.line)) {
-                            comments.push(GithubReviewComment {
-                                path: window.file.clone().unwrap_or_default(),
-                                line: window.line.unwrap_or(1),
-                                body: format!("```suggestion\n{kit}\n```"),
-                            });
-                        } else {
-                            mod_bullets.push(format!(
-                                "- `{}` — proposed change (outside the diff's lines):\n\n```\n{kit}\n```",
-                                window.display()
-                            ));
-                        }
+                        render_gated_mod(m, &window, &touched, &mut comments, &mut mod_bullets);
                     }
                     _ => {
                         double_check_bullets.push(format!(
@@ -282,6 +294,86 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
         line.push_str(&format!(" Not attempted: {}.", scope.not_attempted.join(", ")));
     }
     line
+}
+
+/// (#2310 P4b review, M-B) A gate-passed mod's kit becomes either inline
+/// GitHub suggestion(s) or a fenced-patch body bullet — NEVER a
+/// suggestion for an opaque kit. DESIGN.md: "darkmux never opens a kit".
+/// Pasting an opaque kit verbatim into a ```suggestion block was the bug
+/// this function fixes: the common kit shape is itself a unified diff, so
+/// "Commit suggestion" would have replaced the anchored line with raw
+/// `+++`/`@@` text, and a multi-line kit collapsed to a single-line
+/// suggestion (no `start_line`) that duplicated the lines below it.
+///
+/// Only a mod whose proposer explicitly declared `kit_kind:
+/// "unified-diff"` gets parsed — through the SAME shared
+/// `crate::diff::parse_diff` this crate and `darkmux-lab`'s bundler both
+/// use, never a second parser (see that module's own doc) — and only a
+/// HUNK whose OLD range sits ENTIRELY inside the PR diff's own touched
+/// lines becomes a suggestion (a kit's OLD side names the lines it
+/// replaces in the file's CURRENT state, which is the same coordinate
+/// space the PR diff's NEW side already occupies). Every other case —
+/// `kit_kind` unset or not `"unified-diff"`, an unparseable kit, a
+/// pure-insertion hunk with no OLD range to anchor a replacement against,
+/// or a hunk outside the PR diff — falls back to the opaque fenced-patch
+/// bullet this branch has always rendered.
+fn render_gated_mod(
+    m: &GatedMod,
+    window: &FindingWindow,
+    touched: &BTreeMap<String, BTreeSet<u32>>,
+    comments: &mut Vec<GithubReviewComment>,
+    mod_bullets: &mut Vec<String>,
+) {
+    let kit = m.record.kit.as_deref().unwrap_or("");
+    if m.record.kit_kind.as_deref() != Some("unified-diff") {
+        mod_bullets.push(fenced_patch_bullet(window, kit));
+        return;
+    }
+    let hunks = crate::diff::parse_diff(kit);
+    if hunks.is_empty() {
+        // Declared unified-diff but nothing parsed — an unparseable kit.
+        // Never guess at intent; render it opaque, same as any other kind.
+        mod_bullets.push(fenced_patch_bullet(window, kit));
+        return;
+    }
+    for (path, file_hunks) in &hunks {
+        for h in file_hunks {
+            if h.old_block.is_empty() {
+                // A pure-insertion hunk has no OLD range to anchor a
+                // REPLACEMENT suggestion against — GitHub suggestions
+                // replace an existing line range; they cannot insert
+                // between two lines with no line of their own.
+                mod_bullets.push(fenced_hunk_bullet(window, path, h));
+                continue;
+            }
+            let old_start = h.old_start;
+            let old_end = old_start + h.old_block.len() as u32 - 1;
+            let inside = (old_start..=old_end).all(|l| line_touched(touched, path, Some(l)));
+            if inside {
+                comments.push(GithubReviewComment {
+                    path: path.clone(),
+                    line: old_end,
+                    start_line: if old_start != old_end { Some(old_start) } else { None },
+                    side: Some("RIGHT".to_string()),
+                    body: format!("```suggestion\n{}\n```", h.new_block.join("\n")),
+                });
+            } else {
+                mod_bullets.push(fenced_hunk_bullet(window, path, h));
+            }
+        }
+    }
+}
+
+fn fenced_patch_bullet(window: &FindingWindow, kit: &str) -> String {
+    format!("- `{}` — proposed change (outside the diff's lines):\n\n```\n{kit}\n```", window.display())
+}
+
+fn fenced_hunk_bullet(window: &FindingWindow, path: &str, h: &crate::diff::Hunk) -> String {
+    format!(
+        "- `{}` — proposed change to `{path}` (outside the diff's lines):\n\n```\n{}\n```",
+        window.display(),
+        h.new_block.join("\n")
+    )
 }
 
 enum DeliveryForm {
@@ -493,6 +585,12 @@ mod tests {
     }
 
     fn gated_mod(for_key: &str, kit: &str, gate_passed: Option<bool>) -> GatedMod {
+        gated_mod_kind(for_key, kit, None, gate_passed)
+    }
+
+    /// (#2310 P4b review, M-B) Same as [`gated_mod`], with an explicit
+    /// `kit_kind` — used by the unified-diff suggestion tests.
+    fn gated_mod_kind(for_key: &str, kit: &str, kit_kind: Option<&str>, gate_passed: Option<bool>) -> GatedMod {
         GatedMod {
             record: ModRecord {
                 key: "mod-1-abcdef".to_string(),
@@ -501,6 +599,7 @@ mod tests {
                 r#for: vec![for_key.to_string()],
                 kit: Some(kit.to_string()),
                 kit_looks_json: false,
+                kit_kind: kit_kind.map(str::to_string),
                 attachments: Vec::new(),
                 context: Default::default(),
                 warnings: Vec::new(),
@@ -518,17 +617,119 @@ mod tests {
 
     #[test]
     fn a_gated_mod_inside_the_diff_becomes_a_suggestion_comment() {
+        // (#2310 P4b review, M-B) The kit is a REAL unified diff, declared
+        // as such via `kit_kind: "unified-diff"` — an opaque prose kit
+        // (the pre-fix shape of this test) must NEVER become a suggestion;
+        // see `an_opaque_kit_is_never_pasted_into_a_suggestion_block`
+        // below for that proof.
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
         let findings = vec![finding("s/1", "src/a.ts", 2, "const x = 1;", "reimplements a helper", None)];
-        let mods = vec![gated_mod("s/1", "  const x = clamp(1);", Some(true))];
+        let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
         let scope = DeliverScope { rules_run: vec!["r1".into()], hunks_covered: 1, hunks_total: 1, ..Default::default() };
         let out = render_github_review(&findings, &mods, DIFF, &scope, None);
         assert_eq!(out.mode, "review");
         let review = out.review.unwrap();
         assert_eq!(review.comments.len(), 1, "{review:?}");
         assert_eq!(review.comments[0].path, "src/a.ts");
-        assert_eq!(review.comments[0].line, 2);
+        assert_eq!(review.comments[0].line, 2, "the hunk's old-range END line");
+        assert_eq!(review.comments[0].start_line, None, "a single-line range carries no start_line");
+        assert_eq!(review.comments[0].side.as_deref(), Some("RIGHT"));
         assert!(review.comments[0].body.starts_with("```suggestion\n"), "{}", review.comments[0].body);
         assert!(review.comments[0].body.contains("clamp(1)"));
+    }
+
+    #[test]
+    fn an_opaque_kit_is_never_pasted_into_a_suggestion_block() {
+        // (#2310 P4b review, M-B — the bug this fix removes) The EXACT
+        // same kit text and the EXACT same in-diff finding as the test
+        // above, but with no `kit_kind` at all — must render as a fenced
+        // patch bullet, never a suggestion, even though the text alone
+        // looks like it could be pasted in. This is the regression the
+        // review flagged: an opaque kit (the common shape is itself a
+        // unified diff) pasted verbatim into a suggestion block would let
+        // "Commit suggestion" replace the anchored line with raw
+        // `+++`/`@@` diff syntax.
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        let findings = vec![finding("s/1", "src/a.ts", 2, "const x = 1;", "reimplements a helper", None)];
+        let mods = vec![gated_mod("s/1", KIT, Some(true))];
+        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert!(review.comments.is_empty(), "an undeclared kit kind must never become an inline suggestion: {review:?}");
+        assert!(review.body.contains("@@ -2,1 +2,1 @@"), "the raw diff syntax lands in the fenced bullet, untouched");
+    }
+
+    #[test]
+    fn a_unified_diff_kit_hunk_outside_the_pr_diff_falls_back_to_a_fenced_bullet() {
+        // (#2310 P4b review, M-B) `kit_kind: "unified-diff"` AND a real
+        // parseable hunk, but the hunk's old-range (line 99) is nowhere
+        // in `DIFF`'s touched lines (1-3) — must NOT become a suggestion.
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -99,1 +99,1 @@\n-old\n+new\n";
+        let findings = vec![finding("s/1", "src/a.ts", 99, "old", "unrelated to the PR's own hunk", None)];
+        let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
+        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert!(review.comments.is_empty(), "{review:?}");
+        assert!(review.body.contains("new"), "the hunk's own new-side text lands in the fenced bullet");
+    }
+
+    #[test]
+    fn a_unified_diff_kit_that_fails_to_parse_falls_back_to_a_fenced_bullet() {
+        // (#2310 P4b review, M-B) `kit_kind: "unified-diff"` but the text
+        // is not actually a diff — `parse_diff` yields zero hunks, so
+        // this must never guess; opaque fallback, same as any other kind.
+        let findings = vec![finding("s/1", "src/a.ts", 2, "const x = 1;", "not really a diff", None)];
+        let mods = vec![gated_mod_kind("s/1", "this is not a unified diff at all", Some("unified-diff"), Some(true))];
+        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert!(review.comments.is_empty());
+        assert!(review.body.contains("this is not a unified diff at all"));
+    }
+
+    #[test]
+    fn a_never_gated_mod_gate_passed_none_becomes_a_worth_a_double_check_thread() {
+        // (#2310 P4b review, M-A — proven-vacuous MUST FIX) No prior
+        // fixture ever planted `gate_passed: None`, so a mutation from
+        // `== Some(true)` to `!= Some(false)` slipped past every existing
+        // test (`None != Some(false)` is ALSO true). This test plants
+        // exactly that shape and asserts the double-check outcome; see
+        // the mutation self-check in this packet's own report for the
+        // red-prove against the `!= Some(false)` mutation.
+        let findings = vec![finding("s/9", "src/a.ts", 2, "ev", "a mod exists but nothing ever gated it", None)];
+        let mods = vec![gated_mod("s/9", "some proposed kit text", None)];
+        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert!(review.comments.is_empty(), "never-gated must not become a suggestion: {review:?}");
+        assert!(review.body.contains("Worth a double check"));
+        assert!(review.body.contains("s/9"));
+        assert!(
+            !review.body.contains("some proposed kit text"),
+            "a never-gated mod's kit must not render at all, only the finding's own claim/evidence"
+        );
+    }
+
+    #[test]
+    fn a_gate_passed_mod_wins_over_an_earlier_gate_failed_mod_for_the_same_finding() {
+        // (#2310 P4b review, CONSIDER) Two mods name the same finding, the
+        // gate-failed one listed FIRST — the gate-passed one (declared
+        // second) must still win, proving the lookup isn't a bare
+        // first-match `.find()`.
+        let findings = vec![finding("s/10", "src/a.ts", 2, "const x = 1;", "reimplements a helper", None)];
+        let mods = vec![
+            gated_mod("s/10", "an earlier failed attempt", Some(false)),
+            gated_mod_kind(
+                "s/10",
+                "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n",
+                Some("unified-diff"),
+                Some(true),
+            ),
+        ];
+        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "the gate-passed mod renders, not a double-check: {review:?}");
+        assert!(!review.body.contains("an earlier failed attempt"));
     }
 
     #[test]
@@ -714,6 +915,8 @@ mod tests {
     /// then review the diff before committing.
     #[test]
     fn golden_rendered_payload_covers_every_delivery_form() {
+        const CLAMP_KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
         let findings = vec![
             finding("sess-a/1", "src/a.ts", 2, "const x = 1;", "reimplements clamp()", None),
             finding("sess-a/2", "src/other.ts", 5, "irrelevant", "unrelated change", None),
@@ -728,11 +931,21 @@ mod tests {
                 "did you check whether the repo already has this",
                 Some("question"),
             ),
+            // (#2310 P4b review, M-A) A never-gated mod — `gate_passed:
+            // None` — planted so this golden isn't vacuous against the
+            // `== Some(true)` -> `!= Some(false)` mutation (see the
+            // packet report's mutation self-check).
+            finding("sess-a/7", "src/a.ts", 2, "ev", "a mod exists but nothing ever gated it", None),
         ];
         let mods = vec![
-            gated_mod("sess-a/1", "  const x = clamp(1);", Some(true)),
+            // (#2310 P4b review, M-B) A REAL unified-diff kit, declared
+            // via `kit_kind`, whose hunk sits inside the PR diff's own
+            // touched lines — the one case that renders an inline
+            // suggestion.
+            gated_mod_kind("sess-a/1", CLAMP_KIT, Some("unified-diff"), Some(true)),
             gated_mod("sess-a/2", "the patch text", Some(true)),
             gated_mod("sess-a/4", "kit text nobody sees", Some(false)),
+            gated_mod("sess-a/7", "never-gated kit text nobody sees either", None),
         ];
         let scope = DeliverScope {
             rules_run: vec!["unnamed-predicate".into(), "existing-solution".into()],
@@ -771,23 +984,30 @@ mod tests {
         assert_eq!(outcome.mode, "review");
         let review = outcome.review.unwrap();
         assert_eq!(review.comments.len(), 1, "exactly one in-diff suggestion");
+        assert_eq!(review.comments[0].side.as_deref(), Some("RIGHT"));
         assert!(review.body.contains("the patch text"), "mod-outside-diff");
         assert!(review.body.contains("might duplicate"), "no-mod double-check");
         assert!(review.body.contains("a gate-failed claim"), "gate-failed double-check");
+        assert!(review.body.contains("a mod exists but nothing ever gated it"), "never-gated double-check");
         assert!(!review.body.contains("kit text nobody sees"), "a gate-failed mod's kit never renders");
+        assert!(!review.body.contains("never-gated kit text"), "a never-gated mod's kit never renders");
         assert!(review.body.contains("14 endpoints"), "search form");
         assert!(review.body.contains("Status enum, Kind enum"), "question form");
         assert!(review.body.contains("2 refused"));
         assert!(review.body.contains("Not attempted: architectural review."));
     }
 
-    /// (#2310 P4b self-QA — neighbor check) `emit: "-"` writes EXACTLY one
-    /// line to stdout and nothing else, the "stdout purity" the harness
-    /// relies on (`review_render::emit_rendered`'s own `Some(p) if p ==
-    /// Path::new("-")` convention, reimplemented here independently — see
-    /// this module's doc for why it cannot depend on that one).
+    /// (#2310 P4b review, CONSIDER — renamed to what it actually asserts)
+    /// `emit: "-"` resolves to the SAME `Path::new("-")` convention
+    /// `review_render::emit_rendered` uses (reimplemented independently —
+    /// see this module's doc for why it cannot depend on that one) and the
+    /// step reports `"-"` as its own output marker rather than a file
+    /// path. This does NOT capture actual stdout bytes (`println!` isn't
+    /// trivially interceptable from a plain `#[test]`) — it proves the
+    /// DESTINATION decision, not the byte-for-byte "one JSON line and
+    /// nothing else" purity claim the old name implied.
     #[test]
-    fn emit_dash_writes_exactly_one_json_line_to_stdout() {
+    fn emit_dash_step_output_names_stdout_not_a_path() {
         let step = Step {
             id: "deliver-step".into(),
             task_id: "deliver-task".into(),

@@ -1,7 +1,7 @@
 {
   "params": {
-    "max_est_tokens_per_unit": 16000,
-    "max_sites_per_unit": 40
+    "max_est_tokens_per_unit": 200,
+    "max_sites_per_unit": 2
   },
   "planned_at": "<redacted: timestamp>",
   "rules": [
@@ -21,15 +21,15 @@
   "totals": {
     "by_rule": {
       "swallowed-error": {
-        "est_tokens": 56,
-        "sites": 1,
-        "units": 1
+        "est_tokens": 377,
+        "sites": 4,
+        "units": 3
       }
     },
     "edges": [],
-    "est_tokens": 56,
+    "est_tokens": 377,
     "skipped": [],
-    "units": 1
+    "units": 3
   },
   "units": [
     {
@@ -39,14 +39,58 @@
       "rule": "swallowed-error",
       "sites": [
         {
-          "end": 15,
+          "end": 9,
           "file": "src/orders.ts",
           "hits": [
-            4,
-            11
+            4
           ],
           "line": 4,
           "start": 1
+        },
+        {
+          "end": 20,
+          "file": "src/orders.ts",
+          "hits": [
+            16
+          ],
+          "line": 16,
+          "start": 11
+        }
+      ],
+      "source": "app"
+    },
+    {
+      "est_tokens": 160,
+      "id": "u-0002",
+      "kind": "site",
+      "rule": "swallowed-error",
+      "sites": [
+        {
+          "end": 14,
+          "file": "src/util.ts",
+          "hits": [
+            9
+          ],
+          "line": 9,
+          "start": 4
+        }
+      ],
+      "source": "app"
+    },
+    {
+      "est_tokens": 161,
+      "id": "u-0003",
+      "kind": "site",
+      "rule": "swallowed-error",
+      "sites": [
+        {
+          "end": 36,
+          "file": "src/util.ts",
+          "hits": [
+            31
+          ],
+          "line": 31,
+          "start": 26
         }
       ],
       "source": "app"
