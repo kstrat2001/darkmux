@@ -5,6 +5,8 @@
   "title": "A failure is caught or discarded and nothing records that it happened",
   "applies_to": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.mjs", "**/*.cjs"],
   "exclude": ["**/node_modules/**", "**/dist/**", "**/build/**", "**/coverage/**", "**/*.d.ts", "**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/tests/**", "**/e2e/**"],
+  "scope": ["tree", "diff"],
+  "confirm": "mod",
   "prefilter": ["\\bcatch\\s*(\\(|\\{)", "\\.catch\\s*\\(", "^\\s*void\\s+[A-Za-z_$][\\w$.]*\\s*\\("],
   "window": 30,
   "match": "The site is a `catch` clause, a `.catch(...)` handler, or a `void somePromise()` statement, AND the failure that reaches it is neither rethrown, nor returned as an error value the caller checks, nor logged, nor counted, nor recorded anywhere the surrounding lines show. The operation looks like it succeeded to everything downstream.",

@@ -1,0 +1,16 @@
+{
+  "_comment": "(#2310 P4c) Diff-only rule: no prefilter (every hunk line is a candidate — DESIGN.md \"Hunks are natural windows\"), no `applies_to` (any file type the diff touches). Delivered as a question: the diff carries its own intent (a PR body or intent file), and this rule asks whether the hunk plainly does what that intent says.",
+  "id": "intent-vs-diff",
+  "kind": "site",
+  "title": "The hunk does not plainly do what the stated intent says it does",
+  "scope": ["diff"],
+  "confirm": "question",
+  "applies_to": [],
+  "exclude": [],
+  "window": 20,
+  "match": "The intent you were given for this change (a PR body or an intent file, provided alongside your window) describes a specific behavior, fix, or outcome, AND this hunk's actual change — what it adds, removes, or alters — does not plainly accomplish that. The gap must be visible in the hunk itself, not a guess about code you cannot see.",
+  "no_match": "The intent is vague enough that almost any change would satisfy it (a TODO, a general 'cleanup'). The hunk is scaffolding, tests, or docs that support the stated intent rather than implementing it directly. No intent text was provided for this dispatch at all — there is nothing to compare against.",
+  "evidence": "The hunk's changed line that most clearly diverges from the intent, copied verbatim. `line` is where it appears.",
+  "why_hint": "Quote the relevant sentence of the intent, quote the line that diverges, and state the gap in one sentence. This is a question for the author, not a claim you are certain of.",
+  "compare": "Does this hunk's change plainly accomplish what the stated intent describes? Answer yes, no, or partly, and say what — if anything — the hunk does instead."
+}

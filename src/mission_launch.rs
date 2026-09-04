@@ -550,6 +550,23 @@ pub fn launch(
         precheck_coder_phase_inputs(config, &collected)?;
     }
 
+    // (#2310 P4c review round 2, item (f)) `review-v2.json` accepts
+    // `bundler` for CLI-surface parity with the frozen `review` config
+    // (whose funnel bundler-plugin path this document never touches — its
+    // planner reads `diff_file` directly) but does nothing with it. A
+    // param an operator carried over from a `review` launch line would
+    // otherwise disappear silently; this is BEFORE the `--dry-run`
+    // short-circuit below so the signal is visible on the free path too,
+    // not only on a real (costly) launch.
+    if config.id == "review-v2" && collected.contains_key("bundler") {
+        eprintln!(
+            "{}",
+            darkmux_types::style::warn(
+                "bundler is ignored by review-v2; the external bundler belongs to the funnel"
+            )
+        );
+    }
+
     // (#1959) `--dry-run`: everything above this point (config load,
     // command-allowlist gate, semantic validation, panel-args injection,
     // coder-phase input precheck) has already run — a dry run surfaces the

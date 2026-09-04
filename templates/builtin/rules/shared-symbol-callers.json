@@ -1,0 +1,19 @@
+{
+  "_comment": "(#2310 P4c) DESIGN.md's \"the review-side neighbor check\": a change to a shared symbol is correct in intent, but which callers use it and do they still work? `search` has empty `patterns` because the term IS the changed symbol's own name, only known once the model reads the hunk — `note` carries the instruction instead. Delivered as a search: a list of every caller found, for the author to confirm each.",
+  "id": "shared-symbol-callers",
+  "kind": "site",
+  "title": "A shared function or type's signature or behavior changed",
+  "scope": ["diff"],
+  "confirm": "search",
+  "applies_to": [],
+  "exclude": ["**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/tests/**"],
+  "window": 20,
+  "match": "This hunk changes the signature (parameters, return type), the default behavior, or the observable contract of a function, method, or type that is exported or otherwise visible outside its own file — a change a caller elsewhere in the tree could be relying on.",
+  "no_match": "The changed symbol is private to its own file/module and provably has no outside callers. The change is purely additive (a new optional parameter with a default, a new method) with no change to existing call shapes. Test code.",
+  "evidence": "The changed symbol's declaration line, copied verbatim. `line` is where it appears.",
+  "why_hint": "Name the symbol and what changed about it (signature, return shape, default, or behavior), then say how many callers your search found and whether each still looks correct against the new shape.",
+  "search": {
+    "patterns": [],
+    "note": "Search the tree for every use of the symbol's own name (the exact identifier this hunk changed) outside the file it is declared in. For each hit, note the file and line."
+  }
+}

@@ -17,6 +17,34 @@
 //! is a WARNING naming the file, never a crash (config leniency —
 //! validation is loud only at the point a rule id is actually resolved for
 //! use).
+//!
+//! **Rules are the shared block between a crawl and a review** (#2310 P4c —
+//! DESIGN.md "A rule is a procedure, because a small seat has no
+//! intuition"): the main difference between the two missions is managing a
+//! CORPUS versus a FOCUSED CHANGE SET, and a rule authored for one runs
+//! unchanged in the other when its [`scope`](Rule::scope) allows. Two
+//! fields carry that: `scope` (`["tree"]`, `["diff"]`, or both — a
+//! crawl-only prefilter rule, a diff-only intent rule, or a rule that runs
+//! either way; default both, so every pre-#2310-P4c rule keeps applying
+//! everywhere it always did) and `confirm` (`"mod"` | `"search"` |
+//! `"question"` — which of the three ways a review's finding gets
+//! confirmed: a gated patch, an enumerated list of instances the model
+//! searched for, or a question with candidates attached; default `"mod"`,
+//! matching every rule this project shipped before this field existed).
+//! `search`/`compare` are the optional recipe/question a `"search"`-
+//! or `"question"`-confirmed rule declares — see [`SearchRecipe`] and
+//! [`Rule::compare`].
+//!
+//! **Deliberately NOT named `applies_to`** even though DESIGN.md and the
+//! P4 brief both use that word for this concept: `Rule::applies_to`
+//! already exists, and already means something else entirely (the file
+//! globs a `site`/`read` rule matches). Reusing the name for a second,
+//! unrelated meaning on the same struct would be exactly the kind of
+//! silent field collision this project's `#[serde(flatten)] extras`
+//! leniency exists to catch loudly, not something to introduce on
+//! purpose — so the tree/diff concept is named `scope` here instead. Any
+//! reader who came from the brief expecting `applies_to: ["tree","diff"]`
+//! should read `scope` in its place.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -60,6 +88,33 @@ const EMBEDDED_RULES: &[(&str, &str)] = &[
             "/../../templates/builtin/rules/unnamed-predicate.json"
         )),
     ),
+    // (#2310 P4c) The review rules catalog v1 — diff-scoped
+    // (`scope: ["diff"]`), each with its own `confirm` form. See
+    // DESIGN.md "A rule is a procedure" and the P4-brief-draft.md
+    // 2026-09-04 sections for the design behind each.
+    (
+        "intent-vs-diff",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/rules/intent-vs-diff.json")),
+    ),
+    (
+        "existing-solution",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/rules/existing-solution.json")),
+    ),
+    (
+        "shared-symbol-callers",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../templates/builtin/rules/shared-symbol-callers.json"
+        )),
+    ),
+    (
+        "union-vs-enum",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/rules/union-vs-enum.json")),
+    ),
+    (
+        "test-gap",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/rules/test-gap.json")),
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +128,69 @@ pub enum RuleKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeRuleConfig {
     pub ecosystem: String,
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+/// (#2310 P4c) Which mission shape a rule is willing to run under. A
+/// tree-only rule (e.g. a crawl-only prefilter that scans a whole
+/// checkout) sets `["tree"]`; a diff-only rule (e.g. `intent-vs-diff`,
+/// which has no meaning without a before/after) sets `["diff"]`; a rule
+/// that works either way (most of the crawl's four built-ins, and most of
+/// the review catalog's `swallowed-error`/`unnamed-predicate` reuse) sets
+/// both or omits the field, since `Rule::scope_or_default` treats an
+/// absent/empty `scope` as "everywhere" — the default every rule shipped
+/// before this field existed already had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleScope {
+    Tree,
+    Diff,
+}
+
+/// (#2310 P4c) Which of the three ways a review confirms a finding this
+/// rule uses — DESIGN.md "Confirmation is a mod, a search, or a question":
+/// `Mod` (the default, and every rule this project shipped before this
+/// field existed) means the finding is confirmed by producing a patch that
+/// passes its gate; `Search` means the rule declares a `search` recipe the
+/// unit runs verbatim over the whole tree and delivers the instance list;
+/// `Question` means the rule declares a `compare` question delivered with
+/// candidates attached, honest about being unconfirmed. A small seat has
+/// no intuition for which form applies — the rule file carries the
+/// decision as data so the model never has to guess it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmForm {
+    #[default]
+    Mod,
+    Search,
+    Question,
+}
+
+/// (#2310 P4c) The `search` recipe a `confirm: "search"` rule declares —
+/// DESIGN.md "a recipe the unit runs verbatim (grep and symbol search for
+/// the same verbs and nouns, existing enums with overlapping members, the
+/// package manifest for a known library)". Deliberately a thin, literal
+/// shape (a list of patterns the unit's `search` tool runs one at a time,
+/// each over the tree at `path`) rather than anything clever: the point is
+/// that the unit executes a mechanical recipe, not that it reasons about
+/// what to search for. Lenient on read — every field optional, unknown
+/// keys ride in `extras` — same posture as [`Rule`] itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchRecipe {
+    /// Literal substrings the unit's `search` tool runs, one call per
+    /// pattern, verbatim — not compiled or interpreted here.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// Where to run the recipe, relative to the tree root. Absent means
+    /// the whole tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A short note on what the results mean, injected into the unit's
+    /// prompt alongside the pattern list — e.g. "each hit is a caller;
+    /// list every one you find, do not stop at the first."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
@@ -112,6 +230,31 @@ pub struct Rule {
     pub evidence: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why_hint: Option<String>,
+    /// (#2310 P4c) Which mission shape(s) this rule runs under — see
+    /// [`RuleScope`]. Empty (the wire default, and every pre-#2310-P4c
+    /// rule) means "both" — read it through [`Rule::scope_or_default`],
+    /// never this field directly, so an absent `scope` and an explicit
+    /// `["tree","diff"]` are indistinguishable to every caller.
+    #[serde(default)]
+    pub scope: Vec<RuleScope>,
+    /// (#2310 P4c) Which of the three confirmation forms this rule uses —
+    /// see [`ConfirmForm`]. Defaults to `Mod`, matching every rule this
+    /// project shipped before this field existed.
+    #[serde(default)]
+    pub confirm: ConfirmForm,
+    /// (#2310 P4c) The recipe a `confirm: "search"` rule runs. `None` on
+    /// every other rule; a `confirm: "search"` rule with no `search`
+    /// block is a thin-rule warning (see `warn_on_thin_rules`) — it will
+    /// never enumerate anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchRecipe>,
+    /// (#2310 P4c) The bounded, single-inference question a
+    /// `confirm: "question"` rule asks — DESIGN.md "the only inference,
+    /// bounded". `None` on every other rule; a `confirm: "question"` rule
+    /// with no `compare` question is a thin-rule warning, same reasoning
+    /// as `search` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare: Option<String>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
@@ -125,6 +268,27 @@ impl Rule {
     }
     pub fn window_or_default(&self) -> usize {
         self.window.unwrap_or(DEFAULT_WINDOW)
+    }
+    /// (#2310 P4c) An empty `scope` (the wire default) reads as "both" —
+    /// the only place this rule's callers should ever ask "does this rule
+    /// apply here", so an absent `scope` and an explicit
+    /// `["tree","diff"]` behave identically everywhere, not just at parse
+    /// time.
+    pub fn scope_or_default(&self) -> &[RuleScope] {
+        const BOTH: [RuleScope; 2] = [RuleScope::Tree, RuleScope::Diff];
+        if self.scope.is_empty() {
+            &BOTH
+        } else {
+            &self.scope
+        }
+    }
+    /// Whether this rule is willing to run under `scope` (a single mission
+    /// shape — `RuleScope::Tree` for a crawl, `RuleScope::Diff` for a
+    /// review). The planner side of #2310 P4c filters a launch's resolved
+    /// rule set through this before ever building a plan step for a rule
+    /// scope doesn't admit.
+    pub fn applies_to_scope(&self, scope: RuleScope) -> bool {
+        self.scope_or_default().contains(&scope)
     }
 }
 
@@ -272,24 +436,76 @@ fn merge_json_object_shallow(base: serde_json::Value, patch: serde_json::Value) 
 /// `site`/`read` rule has an empty `applies_to` (it will never match any
 /// file) or a `site` rule has an empty `prefilter` (the crawl planner's
 /// `collect_site_units` early-returns with zero units for exactly this
-/// case, silently before this fix — #1959 finding 2). Runs only over the
-/// rules a manifest actually RESOLVED for use — not every rule sitting in
-/// the registry — so an unrelated user-authored rule id never generates
-/// noise for a manifest that doesn't reference it.
+/// case, silently before this fix — #1959 finding 2), or (#2310 P4c) a
+/// `confirm: "search"` rule declares no `search` recipe (it will never
+/// enumerate anything) or a `confirm: "question"` rule declares no
+/// `compare` question (it has nothing to ask). Runs only over the rules a
+/// manifest actually RESOLVED for use — not every rule sitting in the
+/// registry — so an unrelated user-authored rule id never generates noise
+/// for a manifest that doesn't reference it. This is `doctor`'s surface
+/// for an invalid rule too: `darkmux doctor` calls `resolve` (or
+/// `load_all` — see `darkmux-doctor`'s own rules check) over every rule id
+/// a mission config's `rules` input can name and folds these warnings into
+/// its report, so a thin or malformed rule is visible before a launch ever
+/// tries to plan against it.
+/// (#2310 P4c review round 2, MUST FIX 2) The ONE place every "this rule
+/// is thin/inert" check lives — `warn_on_thin_rules` (below, over a
+/// manifest's resolved subset) and `darkmux-doctor`'s `build_rules_check`
+/// (over the WHOLE registry) both call this per-rule function rather than
+/// each carrying its own copy of the same four checks, which is exactly
+/// how the two drifted before this extraction: P4c's own first pass added
+/// the `confirm`/`search`/`compare` checks to `warn_on_thin_rules` and had
+/// to remember to ALSO add them to doctor's separate copy — a repeat of
+/// #1959 finding 2's own lesson, one packet later, in this same file.
+///
+/// The `applies_to`/`prefilter` checks below assume a TREE walk, where an
+/// empty `applies_to`/`prefilter` really does mean "matches nothing" —
+/// `SourceFiles::matching`/`collect_site_units`'s own early return. A rule
+/// scoped to `["diff"]` only reads the OPPOSITE way under
+/// `plan_diff_rule`/`FilteredDiffSource`: empty `applies_to` means "every
+/// file the diff touches", and empty `prefilter` means "every hunk line
+/// is a candidate" (DESIGN.md "Hunks are natural windows. No prefilter is
+/// needed"). Firing these checks on a diff-only rule would call CORRECT,
+/// deliberate config "thin" — gated on `applies_to_scope(RuleScope::Tree)`
+/// below. That gate is airtight, not just conventional, now that
+/// `plan_step::plan_one_rule`/`plan::plan_diff_rule` (#2310 P4c review
+/// round 2, MUST FIX 2) both REFUSE to plan a rule outside its declared
+/// scope — a diff-only rule genuinely cannot reach the tree planner any
+/// more, so "this warning assumes tree scope" is a fact this function can
+/// rely on, not a convention a caller could silently violate.
+pub fn thin_rule_warnings(rule: &Rule) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let tree_scoped = rule.applies_to_scope(RuleScope::Tree);
+    if tree_scoped && matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
+        warnings.push(format!(
+            "rule '{}' has an empty `applies_to` — it will never match any file",
+            rule.id
+        ));
+    }
+    if tree_scoped && rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
+        warnings.push(format!(
+            "rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
+            rule.id
+        ));
+    }
+    if rule.confirm == ConfirmForm::Search && rule.search.is_none() {
+        warnings.push(format!(
+            "rule '{}' declares `confirm: \"search\"` but has no `search` recipe — it will never enumerate anything",
+            rule.id
+        ));
+    }
+    if rule.confirm == ConfirmForm::Question && rule.compare.is_none() {
+        warnings.push(format!(
+            "rule '{}' declares `confirm: \"question\"` but has no `compare` question — it has nothing to ask",
+            rule.id
+        ));
+    }
+    warnings
+}
+
 fn warn_on_thin_rules(resolved: &[Rule], warnings: &mut Vec<String>) {
     for rule in resolved {
-        if matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
-            warnings.push(format!(
-                "rule '{}' has an empty `applies_to` — it will never match any file",
-                rule.id
-            ));
-        }
-        if rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
-            warnings.push(format!(
-                "rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
-                rule.id
-            ));
-        }
+        warnings.extend(thin_rule_warnings(rule));
     }
 }
 
@@ -346,7 +562,8 @@ mod tests {
     fn embedded_rules_all_parse() {
         let (map, warnings) = load_all(None);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(map.len(), 4, "{:?}", map.keys().collect::<Vec<_>>());
+        // (#2310 P4c) 4 crawl rules + 5 review-catalog rules.
+        assert_eq!(map.len(), 9, "{:?}", map.keys().collect::<Vec<_>>());
         assert_eq!(map["swallowed-error"].kind, RuleKind::Site);
         assert_eq!(map["doc-contradicts-code"].kind, RuleKind::Read);
         assert_eq!(map["stale-consumer"].kind, RuleKind::Edge);
@@ -508,8 +725,8 @@ mod tests {
         fs::write(dir.path().join("broken.json"), "{ not json").unwrap();
 
         let (map, warnings) = load_all(Some(dir.path()));
-        // Embedded rules are still all present.
-        assert_eq!(map.len(), 4);
+        // Embedded rules are still all present (#2310 P4c: 9, was 4).
+        assert_eq!(map.len(), 9);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("broken.json"), "{warnings:?}");
     }
@@ -552,6 +769,31 @@ mod tests {
         );
     }
 
+    /// (#2310 P4c review round 2, SHOULD FIX (a)) A `scope: ["diff"]`
+    /// `site` rule with an empty `applies_to`/`prefilter` is DELIBERATE
+    /// config (DESIGN.md "Hunks are natural windows") and must produce NO
+    /// thin-rule warning at all through `resolve()` — the manifest-scoped
+    /// path `warn_on_thin_rules` (via `thin_rule_warnings`) serves,
+    /// exactly mirroring `resolve_warns_on_empty_applies_to_and_empty_site_
+    /// prefilter` above but for the diff-only case that check's own
+    /// `tree_scoped` gate exists to exempt.
+    #[test]
+    fn resolve_does_not_warn_on_an_empty_applies_to_or_prefilter_for_a_diff_only_rule() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("diff-only-thin.json"),
+            serde_json::json!({"id": "diff-only-thin", "kind": "site", "scope": ["diff"]}).to_string(),
+        )
+        .unwrap();
+
+        let (rules, warnings) = resolve(&["diff-only-thin".to_string()], Some(dir.path())).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(
+            warnings.is_empty(),
+            "a diff-only rule's empty applies_to/prefilter is deliberate, not thin: {warnings:?}"
+        );
+    }
+
     #[test]
     fn user_tier_adds_a_new_rule_id() {
         let dir = TempDir::new().unwrap();
@@ -565,5 +807,173 @@ mod tests {
         let (rules, _) = resolve(&["custom-rule".to_string()], Some(dir.path())).unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].kind, RuleKind::Read);
+    }
+
+    // --- #2310 P4c: scope / confirm / search / compare ---
+
+    #[test]
+    fn an_absent_scope_reads_as_both_tree_and_diff() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("no-scope.json"),
+            serde_json::json!({"id": "no-scope", "kind": "site"}).to_string(),
+        )
+        .unwrap();
+        let (rules, _) = resolve(&["no-scope".to_string()], Some(dir.path())).unwrap();
+        assert_eq!(rules[0].scope, Vec::<RuleScope>::new(), "the wire field itself stays empty");
+        assert_eq!(rules[0].scope_or_default(), &[RuleScope::Tree, RuleScope::Diff]);
+        assert!(rules[0].applies_to_scope(RuleScope::Tree));
+        assert!(rules[0].applies_to_scope(RuleScope::Diff));
+    }
+
+    #[test]
+    fn an_explicit_single_element_scope_excludes_the_other() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("diff-only.json"),
+            serde_json::json!({"id": "diff-only", "kind": "site", "scope": ["diff"]}).to_string(),
+        )
+        .unwrap();
+        let (rules, _) = resolve(&["diff-only".to_string()], Some(dir.path())).unwrap();
+        assert!(!rules[0].applies_to_scope(RuleScope::Tree));
+        assert!(rules[0].applies_to_scope(RuleScope::Diff));
+    }
+
+    #[test]
+    fn an_absent_confirm_defaults_to_mod() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("no-confirm.json"),
+            serde_json::json!({
+                "id": "no-confirm", "kind": "site", "applies_to": ["**/*.rs"], "prefilter": ["x"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (rules, warnings) = resolve(&["no-confirm".to_string()], Some(dir.path())).unwrap();
+        assert_eq!(rules[0].confirm, ConfirmForm::Mod);
+        assert!(
+            !warnings.iter().any(|w| w.contains("no-confirm")),
+            "a mod-confirm rule with no search/compare gets no thin-rule warning \
+             (`applies_to`/`prefilter` are populated so those unrelated thin-rule checks stay \
+             quiet too): {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_confirm_value_fails_to_parse_loudly() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("bad-confirm.json"),
+            serde_json::json!({"id": "bad-confirm", "kind": "site", "confirm": "vibes"}).to_string(),
+        )
+        .unwrap();
+        let (map, warnings) = load_all(Some(dir.path()));
+        assert!(!map.contains_key("bad-confirm"), "{map:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("bad-confirm") && w.contains("failed to parse")),
+            "an invalid confirm value is a loud, named warning, not a silent default: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn search_confirm_with_no_recipe_warns_and_question_confirm_with_no_compare_warns() {
+        // (#2310 P4c review round 2, SHOULD FIX (b) — proven half-vacuous)
+        // The rule id `thin-search` itself contains the substring
+        // "search", so `w.contains("thin-search") && w.contains("search")`
+        // was satisfied by ANY warning naming this rule — including the
+        // unrelated "empty `applies_to`" warning this rule (declaring no
+        // `applies_to`/`prefilter`) also triggers. The original assertion
+        // could pass even if the search-recipe-specific check never fired
+        // at all. Fixed two ways: `applies_to`/`prefilter` are populated
+        // so the unrelated thin-rule checks stay quiet (same fix already
+        // applied to `an_absent_confirm_defaults_to_mod` and
+        // `a_search_recipe_and_a_compare_question_round_trip` above), and
+        // the assertion checks for "recipe" — a word that appears ONLY in
+        // the search-confirm-specific warning text, never in the rule id
+        // or any other warning here.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("thin-search.json"),
+            serde_json::json!({
+                "id": "thin-search", "kind": "site", "confirm": "search",
+                "applies_to": ["**/*.rs"], "prefilter": ["x"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("thin-question.json"),
+            serde_json::json!({
+                "id": "thin-question", "kind": "site", "confirm": "question",
+                "applies_to": ["**/*.rs"], "prefilter": ["x"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (_, warnings) = resolve(
+            &["thin-search".to_string(), "thin-question".to_string()],
+            Some(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "with applies_to/prefilter populated, only the confirm-specific checks should fire: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("thin-search") && w.contains("recipe")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("thin-question") && w.contains("compare")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_search_recipe_and_a_compare_question_round_trip() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("full-search.json"),
+            serde_json::json!({
+                "id": "full-search",
+                "kind": "site",
+                "confirm": "search",
+                "search": {"patterns": ["fn helper_name"], "note": "list every caller"},
+                "applies_to": ["**/*.rs"],
+                "prefilter": ["helper_name"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (rules, warnings) = resolve(&["full-search".to_string()], Some(dir.path())).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("full-search")),
+            "a search rule with a recipe gets no thin-rule warning: {warnings:?}"
+        );
+        let recipe = rules[0].search.as_ref().expect("search recipe present");
+        assert_eq!(recipe.patterns, vec!["fn helper_name".to_string()]);
+        assert_eq!(recipe.note.as_deref(), Some("list every caller"));
+    }
+
+    /// (#2310 P4c) The four crawl rules gained `scope`/`confirm` with no
+    /// behavior change: every embedded rule still parses, and the two
+    /// site-shaped rules the review catalog reuses (`swallowed-error`,
+    /// `unnamed-predicate`) declare both scopes so a diff-scoped review can
+    /// select them; the read/edge-shaped rules stay tree-only, since
+    /// neither a whole-file read pass nor an npm-range edge check has a
+    /// diff-scoped meaning.
+    #[test]
+    fn the_four_crawl_rules_gained_scope_and_confirm_with_no_behavior_change() {
+        let (map, warnings) = load_all(None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(map["swallowed-error"].applies_to_scope(RuleScope::Diff));
+        assert!(map["unnamed-predicate"].applies_to_scope(RuleScope::Diff));
+        assert!(!map["doc-contradicts-code"].applies_to_scope(RuleScope::Diff));
+        assert!(!map["stale-consumer"].applies_to_scope(RuleScope::Diff));
+        for id in ["swallowed-error", "unnamed-predicate", "doc-contradicts-code", "stale-consumer"] {
+            assert_eq!(map[id].confirm, ConfirmForm::Mod, "{id}");
+        }
     }
 }

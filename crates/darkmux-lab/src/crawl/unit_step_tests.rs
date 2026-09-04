@@ -222,6 +222,92 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     assert_eq!(first["rule"], serde_json::json!("unnamed-predicate"));
 }
 
+/// (#2310 P4c mutation-kill) `CrawlUnitStepKind` used to hardcode
+/// `role_id: "crawler".to_string()` regardless of what the owning Task
+/// declared — DESIGN.md's "Units. Already generic" claim was true in
+/// prose only. A Task whose `role_id` is `"reviewer"` must now dispatch
+/// AS `"reviewer"`, and the finding's `context.confirm` (host-stamped,
+/// not model-supplied — see `pattern_block`'s doc) must name the rule's
+/// own `confirm` form so a downstream reader can tell a search-confirmed
+/// finding from a mod-confirmed one without re-resolving the registry.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_task_naming_a_different_role_dispatches_as_that_role_and_stamps_its_confirm_form() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "swallowed-error", "u-0001", &"b".repeat(40));
+    let out = seeded_out_dir(ws.path(), 1, 0);
+
+    let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let out_for_dispatch = out.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+        *captured.lock().unwrap() = Some(opts);
+        ok_result(envelope("stop", 50, 10, 2_000), out_for_dispatch.clone())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "swallowed-error"
+    }));
+    let mut task = unit_task();
+    task.role_id = Some("reviewer".to_string());
+    kind.run(&step, &task, &BTreeMap::new()).unwrap();
+
+    let opts = seen.lock().unwrap().take().unwrap();
+    assert_eq!(opts.role_id, "reviewer", "the Task's own role_id, not the hardcoded default");
+    let ctx = opts.record_context.expect("provenance the runtime cannot know");
+    assert_eq!(
+        ctx["confirm"],
+        serde_json::json!("mod"),
+        "swallowed-error's built-in confirm form, stamped from the resolved rule: {ctx}"
+    );
+}
+
+/// (#2310 P4c review round 2, item (e) — proven) `intent_file` was an
+/// input `review-v2.json` declares and NOTHING reads — `intent-vs-diff`'s
+/// own `match`/`compare` prose talks about "the intent you were given for
+/// this change (a PR body or intent file, provided alongside your
+/// window)", which was a lie: no intent text ever reached the dispatch,
+/// so the rule was structurally inert regardless of what any seat did.
+/// `config.intent_file`, when present, must land in the unit's dispatched
+/// message.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn an_intent_file_in_config_lands_in_the_dispatched_message() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "intent-vs-diff", "u-0001", &"c".repeat(40));
+    let out = seeded_out_dir(ws.path(), 0, 0);
+    let intent_file = ws.path().join("intent.txt");
+    const INTENT_MARKER: &str = "PR-INTENT-MARKER: fix the off-by-one in the pagination cursor";
+    fs::write(&intent_file, INTENT_MARKER).unwrap();
+
+    let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let out_for_dispatch = out.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+        *captured.lock().unwrap() = Some(opts);
+        ok_result(envelope("stop", 50, 10, 2_000), out_for_dispatch.clone())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "intent-vs-diff",
+        "intent_file": intent_file.to_string_lossy()
+    }));
+    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+
+    let opts = seen.lock().unwrap().take().unwrap();
+    assert!(
+        opts.message.contains(INTENT_MARKER),
+        "the dispatched message must carry the intent file's text: {}",
+        opts.message
+    );
+}
+
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
 fn max_turns_is_a_bound_not_a_failure_and_the_step_still_completes() {
@@ -1131,4 +1217,161 @@ fn a_unit_declares_the_crawler_seats_residency_so_siblings_wave_pack() {
     assert_eq!(placement.model_key, "m-local");
     assert_eq!(placement.min_ctx, 8192);
     assert_eq!(placement.seat, "step:unit-step");
+}
+
+/// (#2310 P4c review round 2, SHOULD FIX (c) — proven, premise corrected)
+/// `residency()` used to hardcode `"crawler"` regardless of the owning
+/// Task's `role_id`, the same bug the dispatch-side fix
+/// (`a_task_naming_a_different_role_dispatches_as_that_role_and_stamps_
+/// its_confirm_form`, above) proved for `run()`.
+///
+/// **Why this test does NOT use `config.json`'s `role_profiles` map to
+/// distinguish roles by MODEL** (the first version of this test tried
+/// exactly that and failed on a false premise, caught by actually running
+/// it before trusting the design): `darkmux_types::config_access::
+/// config()` is `EMPTY_CONFIG` by construction in every test build of this
+/// crate (`test-support` feature, #811 — see that function's own doc,
+/// and `resolve_local_placement_inner`'s "test builds see an empty map by
+/// construction"). A `role_profiles` mapping written to disk in a test is
+/// silently never read, so `resolve_role_profile` always falls through to
+/// `default_profile` for EVERY role id — proving nothing about which role
+/// string `residency()` actually passed through.
+///
+/// What DOES observably depend on `role_id`, with no config() involved: the
+/// ROLE MANIFEST lookup inside `resolve_local_placement_inner_with`
+/// (`crate::loader::load_roles().find(|r| r.id == role_id)`), which errors
+/// — and `residency()` then returns `None` — when no role by that name is
+/// registered. A Task naming a role the registry has no manifest for must
+/// fail to resolve; a hardcoded `"crawler"` (which DOES exist) would
+/// instead silently resolve crawler's own placement, masking the bug. That
+/// is the actual mutation-kill: hardcode `"crawler"` back in and this test
+/// goes from `None` to `Some(..)`.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME + DARKMUX_PROFILES, process-globals
+fn residency_resolves_the_tasks_own_role_not_a_hardcoded_crawler() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    let registry = home.path().join("profiles.json");
+    let _p = ProfilesGuard::set(&registry);
+    fs::write(
+        &registry,
+        serde_json::json!({
+            "default_profile": "p",
+            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("residency never dispatches"))));
+    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
+
+    // Sanity leg: the Task's role IS a registered role (unchanged from the
+    // hardcoded-crawler test above, just spelled through the Task now) —
+    // resolution succeeds.
+    let mut task = unit_task();
+    task.role_id = Some("crawler".to_string());
+    assert!(
+        kind.residency(&unit_step(serde_json::json!({})), &task, &BTreeMap::new(), &ctx).is_some(),
+        "a Task declaring a real, registered role must resolve"
+    );
+
+    // The actual proof: a role no manifest exists for must FAIL to
+    // resolve — which is only possible if `residency()` is reading this
+    // Task's own `role_id` rather than substituting a hardcoded, always-
+    // valid `"crawler"`.
+    task.role_id = Some("no-such-role-in-the-registry".to_string());
+    let placement = kind.residency(&unit_step(serde_json::json!({})), &task, &BTreeMap::new(), &ctx);
+    assert!(
+        placement.is_none(),
+        "a Task naming a role the registry has no manifest for must not silently resolve as if \
+         it were \"crawler\": {placement:?}"
+    );
+}
+
+/// (#2310 P4c) `pattern_block`'s confirm-form appendix, all three shapes.
+fn base_rule(id: &str, confirm: darkmux_crew::rules::ConfirmForm) -> darkmux_crew::rules::Rule {
+    darkmux_crew::rules::Rule {
+        id: id.to_string(),
+        kind: darkmux_crew::rules::RuleKind::Site,
+        title: None,
+        applies_to: vec![],
+        exclude: vec![],
+        prefilter: vec![],
+        window: None,
+        chunk_tokens: None,
+        edge: None,
+        matches: None,
+        no_match: None,
+        evidence: None,
+        why_hint: None,
+        scope: vec![],
+        confirm,
+        search: None,
+        compare: None,
+        extras: Default::default(),
+    }
+}
+
+#[test]
+fn pattern_block_mod_confirm_appends_nothing() {
+    let rule = base_rule("r", darkmux_crew::rules::ConfirmForm::Mod);
+    let block = pattern_block(&rule);
+    assert!(!block.contains("search"), "{block}");
+    assert!(!block.contains("QUESTION"), "{block}");
+}
+
+#[test]
+fn pattern_block_search_confirm_with_fixed_patterns_names_them() {
+    let mut rule = base_rule("r", darkmux_crew::rules::ConfirmForm::Search);
+    rule.search = Some(darkmux_crew::rules::SearchRecipe {
+        patterns: vec!["fooBar(".to_string()],
+        path: None,
+        note: Some("every caller".to_string()),
+        extras: Default::default(),
+    });
+    let block = pattern_block(&rule);
+    assert!(block.contains("\"fooBar(\""), "{block}");
+    assert!(block.contains("every caller"), "{block}");
+    assert!(block.contains("SEARCHING"), "{block}");
+}
+
+#[test]
+fn pattern_block_search_confirm_with_no_fixed_patterns_still_reads_as_one_instruction() {
+    let mut rule = base_rule("r", darkmux_crew::rules::ConfirmForm::Search);
+    rule.search = Some(darkmux_crew::rules::SearchRecipe {
+        patterns: vec![],
+        path: None,
+        note: Some("search for the same verbs/nouns as the new routine's name".to_string()),
+        extras: Default::default(),
+    });
+    let block = pattern_block(&rule);
+    assert!(
+        !block.contains("patterns over the tree (not just the window you were given): ."),
+        "an empty pattern list must not render as a dangling, punctuated empty list: {block}"
+    );
+    assert!(block.contains("same verbs/nouns"), "{block}");
+}
+
+#[test]
+fn pattern_block_question_confirm_renders_the_compare_question_and_an_optional_search_first() {
+    let mut rule = base_rule("r", darkmux_crew::rules::ConfirmForm::Question);
+    rule.compare = Some("does an existing helper do this already?".to_string());
+    let block = pattern_block(&rule);
+    assert!(block.contains("QUESTION"), "{block}");
+    assert!(block.contains("does an existing helper do this already?"), "{block}");
+    assert!(!block.contains("SEARCHING"), "a question-only rule with no search block gets no search instruction: {block}");
+
+    rule.search = Some(darkmux_crew::rules::SearchRecipe {
+        patterns: vec![],
+        path: None,
+        note: Some("look for a similar helper".to_string()),
+        extras: Default::default(),
+    });
+    let block = pattern_block(&rule);
+    assert!(block.contains("look for a similar helper"), "{block}");
+    assert!(
+        block.find("look for a similar helper").unwrap() < block.find("QUESTION").unwrap(),
+        "the search instruction must precede the question instruction: {block}"
+    );
 }

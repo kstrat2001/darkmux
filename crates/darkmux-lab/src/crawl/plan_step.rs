@@ -14,6 +14,20 @@
 //! module rather than in `darkmux-crew`'s shared `step_kinds/` because no
 //! second mission plans. Promote when one does.
 //!
+//! (#2310 P4c) A second mission plans now — `review-v2.json` uses
+//! `plan_sites_step::PLAN_SITES_KIND` (`"plan.sites"`, this file's
+//! sibling), whose `"source": "tree"` config literally calls this
+//! module's own [`plan_one_rule`], so `crawl.plan`'s tree-source behavior
+//! stays byte-identical (the crawl-plan golden is untouched by this
+//! packet). This kind is deliberately NOT retired or renamed here — the
+//! brief this packet implements says so explicitly, and P4d is where
+//! `crawl.plan` becomes `plan.sites`'s tree-source alias for real (or
+//! retires) once the crawl side of the consolidation is decided. Until
+//! then, `crawl.plan` is the kind `crawl.json` names; `plan.sites` is the
+//! kind `review-v2.json` names; both produce the same `Plan` content
+//! (`CRAWL_PLAN_OUTPUT_KIND`), so `crawl.unit` reads either without
+//! modification.
+//!
 //! Step config:
 //!
 //! ```json
@@ -141,11 +155,32 @@ impl PlanStepConfig {
 
 /// Plan ONE rule against the spec's workspace. Refuses an unknown rule
 /// naming the known ones (the rules module's own message).
+///
+/// (#2310 P4c review round 2, MUST FIX 2) Also refuses a rule that does
+/// not declare TREE scope — `Rule::scope` was, before this, enforced by
+/// nothing: a diff-only rule (`test-gap`, part of the review catalog)
+/// could be silently planned by a tree walk, producing a plan the rule's
+/// own `match`/`no_match` prose was never written against (every
+/// diff-only rule's prose talks about "this hunk", not "this file"). This
+/// is the tree-side twin of `plan::plan_diff_rule`'s own `RuleKind::Site`
+/// refusal just below — same shape, same reasoning, the OTHER half of
+/// what makes `Rule::scope_or_default`'s doc ("read it through this,
+/// never the field directly") actually true rather than aspirational.
 pub fn plan_one_rule(cfg: &PlanStepConfig) -> Result<Plan> {
     let (rules_vec, warnings) = rules::resolve_default(std::slice::from_ref(&cfg.rule))?;
     // Load warnings cover every rule file; this step speaks only for its own.
     for w in warnings.iter().filter(|w| w.contains(&cfg.rule)) {
         eprintln!("[darkmux] warning: crawl.plan: {w}");
+    }
+    for rule in &rules_vec {
+        if !rule.applies_to_scope(rules::RuleScope::Tree) {
+            let scope = serde_json::to_string(rule.scope_or_default()).unwrap_or_default();
+            bail!(
+                "rule '{}' declares scope {scope} — a rule with no `tree` scope cannot be planned \
+                 by a tree walk (`crawl.plan` / `plan.sites`'s `\"source\": \"tree\"`)",
+                rule.id
+            );
+        }
     }
     let (spec, spec_warnings) = WorkspaceSpec::load(&cfg.workspace)
         .with_context(|| format!("loading workspace spec {}", cfg.workspace.display()))?;
@@ -179,14 +214,22 @@ pub fn default_plan_path(task: &Task, rule: &str) -> Result<PathBuf> {
 
 /// The mission a task belongs to, or an empty string — provenance never
 /// fails a step that is otherwise fine.
-fn mission_id_of(task: &Task) -> String {
+///
+/// `pub(crate)` (#2310 P4c, was module-private): `plan_sites_step`'s
+/// `"plan.sites"` diff-source path writes the SAME `Output<Plan>` wrapper
+/// shape this module's `crawl.plan` writes, and reuses this helper rather
+/// than re-deriving it — one place "which mission does this task belong
+/// to" is answered, not two.
+pub(crate) fn mission_id_of(task: &Task) -> String {
     darkmux_crew::loader::load_phases()
         .ok()
         .and_then(|ps| ps.iter().find(|p| p.id == task.phase_id).map(|p| p.mission_id.clone()))
         .unwrap_or_default()
 }
 
-fn write_plan(path: &Path, the_plan: &darkmux_crew::step_output::Output<Plan>) -> Result<()> {
+/// `pub(crate)` (#2310 P4c, was module-private) — same reasoning as
+/// `mission_id_of` above.
+pub(crate) fn write_plan(path: &Path, the_plan: &darkmux_crew::step_output::Output<Plan>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -204,6 +247,13 @@ fn write_plan(path: &Path, the_plan: &darkmux_crew::step_output::Output<Plan>) -
 pub fn register_crawl_kinds(registry: &StepKindRegistry) -> Result<()> {
     registry.register(Arc::new(CrawlPlanStepKind)).context("registering crawl.plan")?;
     crate::crawl::unit_step::register(registry)?;
+    // (#2310 P4c) `plan.sites` — review-v2.json's planner. Registered
+    // alongside the crawl kinds (not a separate top-level call in
+    // `all_step_kinds`) so one call still gives a launcher every kind
+    // either config declares, matching this function's own existing
+    // reasoning ("Registered here so `mission config show crawl`
+    // validates its graph...").
+    crate::crawl::plan_sites_step::register(registry)?;
     Ok(())
 }
 
@@ -340,6 +390,29 @@ mod tests {
         assert!(!out.exists(), "a refused plan writes nothing");
         let msg = format!("{err:#}");
         assert!(msg.contains("no-such-rule") && msg.contains("unnamed-predicate"), "{msg}");
+    }
+
+    /// (#2310 P4c review round 2, MUST FIX 2 — proven) `Rule::scope` was
+    /// enforced by NOTHING: a rule declaring `scope: ["diff"]` only
+    /// (`test-gap`, part of the review catalog) could still be planned by
+    /// the TREE walk with no error at all, silently producing a plan a
+    /// diff-scoped rule's own prose was never written for. `plan_one_rule`
+    /// must refuse a rule that does not declare tree scope, naming the
+    /// rule and its declared scope.
+    #[test]
+    fn plan_one_rule_refuses_a_rule_with_no_tree_scope() {
+        let source = git_repo_with(&[("src/a.ts", UNNAMED)]);
+        let root = TempDir::new().unwrap();
+        let spec = spec_file(root.path(), source.path());
+        let out = root.path().join("plan.json");
+        let step = step_with(serde_json::json!({
+            "rule": "test-gap", "workspace": spec.to_string_lossy(), "plan_out": out.to_string_lossy()
+        }));
+        let err = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new()).unwrap_err();
+        assert!(!out.exists(), "a refused plan writes nothing");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("test-gap"), "{msg}");
+        assert!(msg.contains("diff"), "the message must name the rule's actual declared scope: {msg}");
     }
 
     #[test]

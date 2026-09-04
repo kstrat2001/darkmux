@@ -1,0 +1,19 @@
+{
+  "_comment": "(#2310 P4c) DESIGN.md's second neighbor-check example: a new string-union type is introduced, does an enum with overlapping members already exist? `search` again has empty `patterns` (the union's own member literals are the search terms, known only from the hunk) — `note` carries the instruction. Delivered as a search: a list of candidate existing enums/unions for the author to confirm against.",
+  "id": "union-vs-enum",
+  "kind": "site",
+  "title": "A new string-literal union or enum-like set may duplicate an existing one",
+  "scope": ["diff"],
+  "confirm": "search",
+  "applies_to": [],
+  "exclude": ["**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/tests/**"],
+  "window": 15,
+  "match": "This hunk introduces a new type made of several string literals (a TypeScript string-literal union, a Rust/Python/Go enum, or a hand-rolled set of string constants meant to be used as a closed set) whose members read as a domain concept — a status, a kind, a mode — rather than a one-off local detail.",
+  "no_match": "The literals are a one-off (a single default value, a format string) with no closed-set meaning. The new type is provably the FIRST and only representation of this concept in the tree. Test code.",
+  "evidence": "The new type's declaration line, copied verbatim. `line` is where it appears.",
+  "why_hint": "Name the new type's members, then name every existing enum/union your search found whose members overlap, with how many members overlap for each.",
+  "search": {
+    "patterns": [],
+    "note": "Search the tree for an existing enum, union type, or set of string constants whose members overlap the new type's own members — search for a few of the new type's own literal values, and for words like \"enum\"/\"Status\"/\"Kind\"/\"Mode\" near the domain concept the new type names."
+  }
+}

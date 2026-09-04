@@ -21,6 +21,11 @@ mod semver;
 
 pub mod plan_step;
 
+/// (#2310 P4c) The generic `plan.sites` step kind — `source: "tree"|"diff"`
+/// in config. See `plan_sites_step.rs`'s module doc for the tree/diff
+/// split and why `crawl.plan` (`plan_step.rs`) is untouched.
+pub mod plan_sites_step;
+
 /// (#2301) The crawl's DISPATCH half — `crawl.unit` + `crawl.summary`.
 /// With these, `crawl.json` IS the crawl: the literal-routed launcher
 /// (`src/crawl_launch.rs`, deleted in #2301) is retired.

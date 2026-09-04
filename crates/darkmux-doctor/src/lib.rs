@@ -2845,24 +2845,15 @@ fn check_rules_registry() -> Check {
 }
 
 fn build_rules_check(user_dir: Option<&std::path::Path>) -> Check {
-    use darkmux_crew::rules::RuleKind;
-
     let (embedded_only, _) = darkmux_crew::rules::load_all(None);
     let (map, mut warnings) = darkmux_crew::rules::load_all(user_dir);
 
+    // (#2310 P4c review round 2, MUST FIX 2) Was a hand-duplicated copy of
+    // `crew::rules::warn_on_thin_rules`'s own four checks — the exact
+    // drift `crew::rules::thin_rule_warnings`'s own doc names as the
+    // reason it exists. Both call sites now share ONE definition.
     for rule in map.values() {
-        if matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
-            warnings.push(format!(
-                "rule '{}' has an empty `applies_to` — it will never match any file",
-                rule.id
-            ));
-        }
-        if rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
-            warnings.push(format!(
-                "rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
-                rule.id
-            ));
-        }
+        warnings.extend(darkmux_crew::rules::thin_rule_warnings(rule));
     }
 
     let user_file_count = user_dir
@@ -9357,5 +9348,50 @@ mod tests {
         assert!(check.message.contains("thin-site"), "{}", check.message);
         assert!(check.message.contains("applies_to"), "{}", check.message);
         assert!(check.message.contains("prefilter"), "{}", check.message);
+    }
+
+    /// (#2310 P4c) A `confirm: "search"` rule with no `search` recipe and a
+    /// `confirm: "question"` rule with no `compare` question both surface
+    /// through `darkmux doctor` — over the WHOLE registry, not just a
+    /// manifest's resolved subset (same reasoning `rules_check_warns_on_
+    /// empty_applies_to_and_site_with_no_prefilter` above already
+    /// establishes for the pre-existing thin checks).
+    #[test]
+    fn rules_check_warns_on_a_search_rule_with_no_recipe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("thin-search.json"),
+            serde_json::json!({
+                "id": "thin-search", "kind": "site", "confirm": "search",
+                "applies_to": ["**/*.rs"], "prefilter": ["x"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let check = build_rules_check(Some(tmp.path()));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("thin-search"), "{}", check.message);
+        assert!(check.message.contains("search"), "{}", check.message);
+    }
+
+    /// (#2310 P4c) An invalid `confirm` value (not `mod`/`search`/
+    /// `question`) never reaches the thin-rule loop at all — it fails
+    /// `Rule::Deserialize` first, and `load_all` folds that parse failure
+    /// into the SAME warnings vector this check reports, so it still
+    /// surfaces here, named, without a second code path.
+    #[test]
+    fn rules_check_warns_on_an_unrecognized_confirm_value() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("bad-confirm.json"),
+            serde_json::json!({"id": "bad-confirm", "kind": "site", "confirm": "shrug"}).to_string(),
+        )
+        .unwrap();
+
+        let check = build_rules_check(Some(tmp.path()));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("bad-confirm"), "{}", check.message);
+        assert!(check.message.contains("failed to parse"), "{}", check.message);
     }
 }

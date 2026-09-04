@@ -1,0 +1,26 @@
+{
+  "id": "reviewer",
+  "role_family": "specialist",
+  "description": "Reviews one unit of a code change against a set of named rules, each carrying its own confirmation procedure (a gated patch, a tree-wide search, or a bounded question). Reads code and searches the tree; proposes changes as mods but never edits directly. The rules and the window arrive in the dispatch message.",
+  "skills": [
+    "code-reviewing"
+  ],
+  "tool_palette": {
+    "allow": [
+      "read",
+      "exec",
+      "create_finding",
+      "create_mod"
+    ],
+    "deny": [
+      "edit",
+      "write",
+      "process"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation",
+  "feedback_templates": {
+    "cycle_suspected": "[darkmux-runtime] You've called `{tool_name}` {count} times in {window_size} turns with the same arguments. You are re-reading ground you have already covered. Move to the next pattern in your window, or stop and report your coverage."
+  },
+  "_comment": "(#2310 P4c) Shares crawler.json's tool_palette shape (`read` resolves to BOTH the `read` and `search` runtime tools — see `dispatch_internal.rs`'s palette-category table) plus `create_mod`, which a review unit needs and a crawl unit does not: a rule's `confirm: \"mod\"` form is closed by producing a patch, not only by naming a finding."
+}
