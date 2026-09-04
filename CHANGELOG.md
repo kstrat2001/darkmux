@@ -12,6 +12,141 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.6.0] - 2026-09-04
+
+The crawl is a mission, and its output is records you can pick up.
+
+This release closes a loop that opened in 3.4.0. A crawl is no longer a launcher
+with a hard-wired pipeline: it is `crawl.json`, a mission config whose steps
+you enable or disable, whose plan is one step per rule, whose units grow from
+each plan at the phase boundary, and whose findings can grow one coder step
+each in a **create-mods** phase — plan → crawl → create mods. Every hand-off
+between steps is a **typed output** with a hash and a producer, and a finding
+or a mod can be pulled into any dispatch's brief by key. The first real run on
+the generic path shipped this release's own pre-ship test: a comment-shrink
+rule over one crate, three units, fourteen findings, twelve mods and two
+justified refusals, with nothing but a JSON rule and a JSON config copy on
+the operator's side. The rest is what that run surfaced: units that ran one at
+a time, a wave that leased one model while its dispatches loaded another, a
+pulsing chip that said three different words, and a mission header rebuilt
+from a UX review.
+
+### Added
+
+- **Findings and mods are records** ([#2288](https://github.com/kstrat2001/darkmux/pull/2288), [#2290](https://github.com/kstrat2001/darkmux/pull/2290), [#2293](https://github.com/kstrat2001/darkmux/pull/2293), closes [#2265](https://github.com/kstrat2001/darkmux/issues/2265)).
+  `create_finding` (renamed from `report_finding`) writes a finding under
+  `~/.darkmux/findings/<dispatch>/<seq>/`; a mod is a kit (instructions plus
+  data, opaque to darkmux) with its own minted key and `for:` provenance to one
+  or more findings, written by the palette-granted runtime tool `create_mod`.
+  `finding list|show|sync` and `mod list|show|create` read and write the
+  stores.
+
+- **Brief refs** ([#2295](https://github.com/kstrat2001/darkmux/pull/2295), [#2296](https://github.com/kstrat2001/darkmux/pull/2296)). `dispatch --finding <key>` / `--mod <key>`
+  append the stored record to the brief; the same `brief_refs` field on a
+  `dispatch.internal` step config does it inside any mission graph. Mod
+  attachments mount read-only into the container. The ref resolves in ONE
+  place, the step kind, so the CLI and the graph cannot drift (FLOW 1.36.0).
+
+- **`enabled` on phases, tasks and steps** ([#2299](https://github.com/kstrat2001/darkmux/pull/2299), mission config 3.1).
+  A disabled step never exists in the run: pruned when the run is minted, with
+  the reason in the config snapshot and `graph-report.json`, and counted by
+  `mission status` ("4 of 12 steps minted, 8 left out by config"). No gray
+  state, no CLI override — edit the JSON before you run and the snapshot keeps
+  it.
+
+- **Grow** ([#2307](https://github.com/kstrat2001/darkmux/pull/2307), [#2300](https://github.com/kstrat2001/darkmux/issues/2300), mission config 3.2, FLOW 1.38.0). A task
+  template with `grow: {from, items, id, config}` mints one copy per item of
+  an earlier step's output at the phase boundary. Grown tasks carry
+  `grown_from`; a `mission.grow` record says what grew from what.
+
+- **Crawl as a mission** ([#2298](https://github.com/kstrat2001/darkmux/pull/2298), [#2313](https://github.com/kstrat2001/darkmux/pull/2313), [#2301](https://github.com/kstrat2001/darkmux/issues/2301), epic [#2297](https://github.com/kstrat2001/darkmux/issues/2297)).
+  `crawl.plan` plans one rule per task and outputs the plan; `crawl.unit` and
+  `crawl.summary` run and roll up the units grown from it; `rules=` selects
+  plan tasks. Every hand-off is a typed `Output<T>` envelope (kind, blake3 hash,
+  producer with machine id) exported to the viewer's TypeScript types
+  (FLOW 1.39.0). The literal launcher (`src/crawl_launch.rs`) is deleted.
+
+- **The create-mods phase** ([#2302](https://github.com/kstrat2001/darkmux/pull/2302), [#2326](https://github.com/kstrat2001/darkmux/pull/2326), off by default). The summary
+  names its findings; the `create-mods` phase in `crawl.json` grows one coder
+  step per finding with the finding in its brief. The coder proposes a mod
+  against a read-only tree; it does not edit. Integration is a later phase.
+
+- **Mission header, rebuilt** ([#2332](https://github.com/kstrat2001/darkmux/pull/2332)). On a narrow lens: the mission name
+  with the shared status chip pinned right, a dim sub-line (start time, elapsed
+  or final duration, the short hash, host gpu/cpu only while running), and the
+  cost row — the token total, any cloud share in parentheses, the full split in
+  a tooltip — with the renderer toggle, map, and a help glyph for the legend.
+  On a wide lens, one row. Layout follows the lens's own width, not the
+  window's. The refresh button, the turn count and the inline legend are gone.
+  Tap the name for the full id.
+
+- Docs: the crawl, findings and mods guide ([#2292](https://github.com/kstrat2001/darkmux/pull/2292)); `mission config show`
+  reports each task's `enabled`; the `read` tool numbers its output so the
+  model stops counting lines ([#2283](https://github.com/kstrat2001/darkmux/pull/2283), [#2267](https://github.com/kstrat2001/darkmux/issues/2267)).
+
+### Changed
+
+- `darkmux mission launch crawl` is the generic launcher. Dropped inputs:
+  `source`/`rule` one-shot (use a one-source spec file), `plan`/`plan_out`
+  (the plan is always written under the run), `units`/`limit`, `resume`. Kept:
+  `workspace`, `rules`, `max_sites_per_unit`, `max_est_tokens_per_unit`,
+  `no_fetch`, `dry_run` ([#2313](https://github.com/kstrat2001/darkmux/pull/2313)).
+
+- `mission start` on a config-launched run carries `graph` (declared vs
+  minted); `mission close` promotes the last phase's last step's JSON body on
+  any config (FLOW 1.37.0–1.39.0).
+
+- The header owns liveness and the chip owns the word ([#2278](https://github.com/kstrat2001/darkmux/pull/2278), [#2279](https://github.com/kstrat2001/darkmux/pull/2279), [#2314](https://github.com/kstrat2001/darkmux/pull/2314), [#2322](https://github.com/kstrat2001/darkmux/pull/2322), [#2330](https://github.com/kstrat2001/darkmux/pull/2330)).
+  One LIVE badge on every live page, meaning the record stream is connected; a
+  running mission shows it, a closed one names its day, and the chip beside it
+  says TODAY, never RESULT. A running unit of work says RUNNING at every scope
+  — mission, phase, task, step, run, lab run — where it used to say ACTIVE,
+  RUNNING or "● live" depending on where you looked. Terminal words keep their
+  scope's meaning. LIVE and RUNNING are different facts and stay separate.
+
+- One liveness beat ([#2328](https://github.com/kstrat2001/darkmux/pull/2328)). Three pulse keyframes at two cadences
+  collapsed into one, defined once and used by every running indicator; the
+  RUNNING pill no longer shrinks 22% on every beat.
+
+- Six unnamed compound predicates in the viewer got names — the crawl's own
+  findings, applied ([#2285](https://github.com/kstrat2001/darkmux/pull/2285)).
+
+### Fixed
+
+- **Sibling crawl units ran one at a time** on an already-resident model
+  ([#2329](https://github.com/kstrat2001/darkmux/pull/2329), closes [#2321](https://github.com/kstrat2001/darkmux/issues/2321)). The unit step kind declared no residency, so
+  the scheduler queued it as a remote job under a cap of one. It declares the
+  crawler seat like every other local step now, and the units wave-pack:
+  fourteen coders in one wave in about ten minutes where five had taken two
+  hours.
+
+- **A wave could lease one model while its dispatches loaded another**
+  ([#2329](https://github.com/kstrat2001/darkmux/pull/2329)). The placement resolver read `default_profile` alone; the dispatch
+  read `role_profiles.<role>` first. Same chain now, in the shared helper, so
+  `dispatch.internal` and the coder phase are covered too.
+
+- Sibling dispatches in one wave raced the model load: each read the model as
+  absent and issued `lms load`; LMStudio admitted one and refused the rest. The
+  preflight is serialized across check-and-load, and a refusal naming an
+  already-resident identifier re-probes and reuses it ([#2320](https://github.com/kstrat2001/darkmux/pull/2320), [#2318](https://github.com/kstrat2001/darkmux/issues/2318)).
+
+- A crawl unit that errored no longer fails the whole summary; it is counted
+  as errored with its reason ([#2313](https://github.com/kstrat2001/darkmux/pull/2313)).
+
+- An accepted `report_finding` over 512 chars was rejected downstream: the
+  emission now rides the record whole ([#2275](https://github.com/kstrat2001/darkmux/pull/2275), [#2272](https://github.com/kstrat2001/darkmux/issues/2272)). A
+  palette-named tool outside the general catalog was unreachable since #2182
+  ([#2271](https://github.com/kstrat2001/darkmux/pull/2271)).
+
+- Viewer: a config-minted step dispatched with no phase, so its run view could
+  not be reached from the graph ([#2324](https://github.com/kstrat2001/darkmux/pull/2324), [#2323](https://github.com/kstrat2001/darkmux/issues/2323)); the desktop mission
+  graph went blank a second after load — React Flow dropped every node's
+  measured size on each controlled update ([#2327](https://github.com/kstrat2001/darkmux/pull/2327), [#2325](https://github.com/kstrat2001/darkmux/issues/2325)); task cards
+  sized from content, collapsed rows keep the name readable, the task timer is
+  the task's span ([#2277](https://github.com/kstrat2001/darkmux/pull/2277), [#2282](https://github.com/kstrat2001/darkmux/pull/2282), [#2104](https://github.com/kstrat2001/darkmux/issues/2104), [#2269](https://github.com/kstrat2001/darkmux/issues/2269), [#2280](https://github.com/kstrat2001/darkmux/issues/2280)).
+
+[3.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.6.0
+
 ## [3.5.0] - 2026-09-02
 
 An unattended run stops lying to you.
