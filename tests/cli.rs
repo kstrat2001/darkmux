@@ -573,6 +573,57 @@ fn mission_config_show_review_names_every_phase_and_flags_unconstructible_kinds(
     }
 }
 
+/// (#2310 P4c-2 review item 3 — proven) `mission config show review-v2`
+/// must render its `bundler` input's `ignored`/`ignored_reason` — both in
+/// `--json` (typed fields, always present) and in the text form (`(optional,
+/// ignored: <reason>)`), so an operator sees the same signal launch-time
+/// gives without having to launch first.
+#[test]
+fn mission_config_show_review_v2_renders_the_ignored_bundler_input() {
+    let tmp = TempDir::new().unwrap();
+    let json_out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args(["mission", "config", "show", "review-v2", "--json"])
+        .output()
+        .expect("mission config show review-v2 --json runs");
+    assert!(json_out.status.success(), "stderr: {}", String::from_utf8_lossy(&json_out.stderr));
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&json_out.stdout)).expect("valid JSON");
+    let bundler = v["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == serde_json::json!("bundler"))
+        .expect("the bundler input is listed");
+    assert_eq!(bundler["ignored"], serde_json::json!(true), "{bundler}");
+    let reason = bundler["ignored_reason"].as_str().expect("a reason string");
+    assert!(!reason.is_empty(), "{bundler}");
+
+    let text_out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args(["mission", "config", "show", "review-v2"])
+        .output()
+        .expect("mission config show review-v2 runs");
+    assert!(text_out.status.success(), "stderr: {}", String::from_utf8_lossy(&text_out.stderr));
+    let text = String::from_utf8_lossy(&text_out.stdout);
+    assert!(
+        text.contains(&format!("bundler (optional, ignored: {reason})")),
+        "text output must render the ignored form:\n{text}"
+    );
+
+    // A LIVE (non-ignored) input on the same config must NOT get the
+    // ignored suffix.
+    assert!(
+        text.contains("workspace (required)\n") || text.contains("workspace (required,"),
+        "a live input keeps the plain form:\n{text}"
+    );
+    assert!(
+        !text.contains("workspace (required, ignored"),
+        "a live input must never render an ignored suffix:\n{text}"
+    );
+}
+
 #[test]
 fn mission_config_show_unknown_id_exits_nonzero_with_hint() {
     let tmp = TempDir::new().unwrap();
@@ -4970,6 +5021,153 @@ fn an_ignored_input_flag_warns_on_any_config_never_by_id() {
     );
 }
 
+// ─── (#2310 P4c-2 review MUST FIX) placeholder typos refused before
+// minting, on both --dry-run and a real (stubbed) launch ─────────────────
+
+/// No `missions/` dir at all, OR one with zero entries — either is "nothing
+/// minted".
+fn assert_nothing_minted(home: &TempDir) {
+    let missions = home.path().join("missions");
+    if !missions.exists() {
+        return;
+    }
+    let entries: Vec<_> = fs::read_dir(&missions).unwrap().filter_map(|e| e.ok()).collect();
+    assert!(entries.is_empty(), "expected nothing minted, found: {entries:?}");
+}
+
+fn write_synthetic_static_typo_config(home: &TempDir) {
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("synthetic-static-typo.json"),
+        serde_json::json!({
+            "id": "synthetic-static-typo",
+            "name": "Synthetic static-typo test",
+            "schema_version": "3.4",
+            "inputs": [{"name": "workspace", "required": true}],
+            "phases": [{"id": "p", "tasks": [{
+                "id": "t",
+                "steps": [{"id": "t-step", "kind": "procedural.noop", "config": {"note": "{{workspac}}"}}]
+            }]}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn write_synthetic_grow_typo_config(home: &TempDir) {
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("synthetic-grow-typo.json"),
+        serde_json::json!({
+            "id": "synthetic-grow-typo",
+            "name": "Synthetic grow-typo test",
+            "schema_version": "3.4",
+            "inputs": [{"name": "workspace", "required": true}, {"name": "intent_file", "required": false}],
+            "phases": [
+                {"id": "produce", "tasks": [{
+                    "id": "producer",
+                    "steps": [{"id": "producer-step", "kind": "procedural.noop", "config": {}}]
+                }]},
+                {"id": "consume", "tasks": [{
+                    "id": "consumer",
+                    "depends_on": ["producer"],
+                    "grow": {"from": "producer", "items": "units", "id": "{{item.id}}",
+                             "config": {"intent_file": "{{intent_fle}}"}},
+                    "steps": [{"id": "consumer-step", "kind": "procedural.noop", "config": {}}]
+                }]}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// A STATIC step's typo, `--dry-run`. Before the MUST FIX, `--dry-run`
+/// never called `interpret` at all and exited 0 regardless.
+#[test]
+fn a_static_placeholder_typo_is_refused_on_dry_run() {
+    let home = TempDir::new().unwrap();
+    write_synthetic_static_typo_config(&home);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .args(["mission", "launch", "synthetic-static-typo", "--dry-run"])
+        .output()
+        .expect("mission launch synthetic-static-typo --dry-run runs");
+    assert!(!out.status.success(), "a typo'd placeholder must refuse the dry run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("workspac") && stderr.contains("t-step"), "{stderr}");
+    assert_nothing_minted(&home);
+}
+
+/// The SAME static typo, a REAL launch (stubbed before dispatch — the
+/// config dispatches nothing regardless, `procedural.noop`). Before the
+/// MUST FIX, `interpret` refused this, but only AFTER the mission
+/// directory (mission.json, phase records) was already written.
+#[test]
+fn a_static_placeholder_typo_is_refused_before_any_mint_on_a_real_launch() {
+    let home = TempDir::new().unwrap();
+    write_synthetic_static_typo_config(&home);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "synthetic-static-typo"])
+        .output()
+        .expect("mission launch synthetic-static-typo runs");
+    assert!(!out.status.success(), "a typo'd placeholder must refuse the real launch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("workspac") && stderr.contains("t-step"), "{stderr}");
+    assert_nothing_minted(&home);
+}
+
+/// A `grow.config` typo, `--dry-run`.
+#[test]
+fn a_grow_config_placeholder_typo_is_refused_on_dry_run() {
+    let home = TempDir::new().unwrap();
+    write_synthetic_grow_typo_config(&home);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .args([
+            "mission",
+            "launch",
+            "synthetic-grow-typo",
+            "--dry-run",
+            "--param",
+            "workspace=/tmp/ws.json",
+        ])
+        .output()
+        .expect("mission launch synthetic-grow-typo --dry-run runs");
+    assert!(!out.status.success(), "a typo'd grow.config placeholder must refuse the dry run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("intent_fle") && stderr.contains("grow.config"), "{stderr}");
+    assert_nothing_minted(&home);
+}
+
+/// The SAME `grow.config` typo, a REAL launch. Before the MUST FIX, this
+/// typo was refused only AFTER the ENTIRE `produce` phase had already run
+/// for real (a real `producer-step` dispatch), at the `consume` phase's
+/// growth boundary — abandoning a mission that had already done real work.
+#[test]
+fn a_grow_config_placeholder_typo_is_refused_before_any_mint_on_a_real_launch() {
+    let home = TempDir::new().unwrap();
+    write_synthetic_grow_typo_config(&home);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "synthetic-grow-typo", "--param", "workspace=/tmp/ws.json"])
+        .output()
+        .expect("mission launch synthetic-grow-typo runs");
+    assert!(!out.status.success(), "a typo'd grow.config placeholder must refuse the real launch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("intent_fle") && stderr.contains("grow.config"), "{stderr}");
+    assert_nothing_minted(&home);
+}
+
 /// (#2310 P4c-2 item 0 — the P4c-1 BLOCKER, proven) A REAL (non-dry-run)
 /// `review-v2` launch — stubbed before dispatch via `DARKMUX_LMS_BIN=/usr/
 /// bin/true`, so this proves MINTING, not model behavior — must leave no
@@ -5138,12 +5336,15 @@ fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {
             "id": "crawl-e2e",
             "name": "Crawl E2E",
             "schema_version": "3.2",
-            "inputs": [{"name": "workspace", "required": true}],
+            "inputs": [
+                {"name": "workspace", "required": true},
+                {"name": "no_fetch", "required": false}
+            ],
             "phases": [
                 {"id": "plan", "tasks": [{
                     "id": "plan-swallowed-error",
                     "steps": [{"id": "plan-swallowed-error-step", "kind": "crawl.plan",
-                               "config": {"rule": "swallowed-error", "workspace": "{{workspace}}"}}]
+                               "config": {"rule": "swallowed-error", "workspace": "{{workspace}}", "no_fetch": "{{no_fetch}}"}}]
                 }]},
                 {"id": "units", "tasks": [{
                     "id": "unit",
@@ -5200,6 +5401,26 @@ fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {
     assert_eq!(grown[0]["items"].as_u64().unwrap() as usize, units.len());
     assert_eq!(grown[0]["minted"].as_array().unwrap().len(), units.len(), "one task per unit");
     assert_eq!(grown[0]["from"], serde_json::json!("plan-swallowed-error"));
+
+    // (#2310 P4c-2 review item 6 — proven) `--param no_fetch=true` must
+    // actually REACH the step now that this config declares it and wires
+    // it via `{{no_fetch}}` — before this fix the param was a silent
+    // no-op (undeclared, unreferenced), a regression the old
+    // `crawl_plan_step_overrides` masked by injecting it unconditionally.
+    let plan_step_path = fs::read_dir(mission_dir.join("steps"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().ends_with("-plan"))
+        .expect("a plan phase dir under steps/")
+        .join(format!("{}-plan-swallowed-error-step.json", mission_dir.file_name().unwrap().to_string_lossy()));
+    let plan_step: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_step_path).unwrap()).unwrap();
+    assert_eq!(
+        plan_step["config"]["no_fetch"],
+        serde_json::json!("true"),
+        "the declared `{{{{no_fetch}}}}` placeholder must resolve to the real param: {plan_step}"
+    );
 }
 
 /// (#2302) `mission config show crawl --json` says which tasks the mint

@@ -173,24 +173,15 @@ impl SitesStepConfig {
         };
         let rule = str_field("rule")?;
         let workspace = PathBuf::from(str_field("workspace")?);
-        let mut params = PlanParams::default();
-        if let Some(sizing) = step.config.get("sizing") {
-            for (key, slot) in [
-                ("max_sites_per_unit", &mut params.max_sites_per_unit),
-                ("max_est_tokens_per_unit", &mut params.max_est_tokens_per_unit),
-            ] {
-                if let Some(v) = sizing.get(key) {
-                    let n = v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                        anyhow!(
-                            "step `{}`: `{PLAN_SITES_KIND}` config.sizing.{key} must be a positive integer, got {v}",
-                            step.id
-                        )
-                    })?;
-                    *slot = usize::try_from(n).context("sizing value does not fit usize")?;
-                }
-            }
-        }
-        let fetch = !step.config.get("no_fetch").and_then(|v| v.as_bool()).unwrap_or(false);
+        // (#2310 P4c-2 review MUST-do 1) Shared with `plan_step.rs` so the
+        // two `plan.*` kinds cannot silently drift back apart on
+        // CLI-string leniency — this kind still parsed `sizing`/`no_fetch`
+        // STRICTLY (`as_u64`/`as_bool`) after item 0 shipped item 0's
+        // generic substitution, which always carries a `--param`-sourced
+        // value through as a JSON string; the strict parse silently
+        // dropped every such override for `review-v2.json`'s own
+        // `plan.sites` steps.
+        let (params, fetch) = plan::parse_sizing_and_no_fetch(&step.config, &step.id, PLAN_SITES_KIND)?;
         let plan_out = step.config.get("plan_out").and_then(|v| v.as_str()).map(PathBuf::from);
         let source = match step.config.get("source").and_then(|v| v.as_str()) {
             None | Some("tree") => Source::Tree,
@@ -297,6 +288,24 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(cfg.source, Source::Tree);
+    }
+
+    /// (#2310 P4c-2 review MUST-do 1 — proven) This kind used to parse
+    /// `sizing`/`no_fetch` STRICTLY (`as_u64`/`as_bool`) even after item 0
+    /// made `--param`-sourced values reach here as JSON strings — silently
+    /// dropping every such override. Now shared with `plan_step.rs` via
+    /// `plan::parse_sizing_and_no_fetch`.
+    #[test]
+    fn sizing_and_no_fetch_parse_leniently_from_cli_param_strings() {
+        let cfg = SitesStepConfig::from_step(&step(serde_json::json!({
+            "rule": "swallowed-error", "workspace": "/tmp/ws.json",
+            "sizing": {"max_sites_per_unit": "7", "max_est_tokens_per_unit": "1200"},
+            "no_fetch": "true"
+        })))
+        .unwrap();
+        assert_eq!(cfg.params.max_sites_per_unit, 7);
+        assert_eq!(cfg.params.max_est_tokens_per_unit, 1200);
+        assert!(!cfg.fetch, "`no_fetch: \"true\"` (a string) must be honored, not silently ignored");
     }
 
     #[test]

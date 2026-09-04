@@ -572,12 +572,35 @@ pub fn launch(
         }
     }
 
+    // (#2310 P4c-2 review MUST FIX) Every `{{name}}` placeholder in the
+    // document's static graph (every step's `config` AND every task's
+    // `grow.config`) must name a declared input or grow's own namespace
+    // (`item.*`/`from.output`) — BEFORE the `--dry-run` short-circuit
+    // below and before ANYTHING mints. Without this: a static-step typo
+    // used to mint the mission directory before `interpret` failed on it;
+    // a `grow.config` typo used to run an ENTIRE real phase (dispatch and
+    // all) before dying at the next phase's boundary; and `--dry-run`
+    // caught neither, since it never calls `interpret` at all.
+    //
+    // MEASURED redundant-by-design with the `config.validate(&known_kinds)`
+    // gate above (line ~423, which ALSO surfaces this as an Error finding
+    // now — the review asked for both, and `validate` alone already runs
+    // before `--dry-run`, so a mutation test that deleted this exact line
+    // still found every regression test below green). Kept explicit
+    // anyway: a reader of THIS function shouldn't have to trust that
+    // `validate`'s Error-finding set happens to include placeholders, and
+    // a future `validate` call site elsewhere (`darkmux doctor`,
+    // `mission config show`) that does NOT bail on Error findings must not
+    // become a silent way to skip this specific refusal for a real launch.
+    mission_config::check_placeholders_declared(config)?;
+
     // (#1959) `--dry-run`: everything above this point (config load,
     // command-allowlist gate, semantic validation, panel-args injection,
-    // coder-phase input precheck) has already run — a dry run surfaces the
-    // SAME loud failures a real launch would. From here, mint NOTHING,
-    // emit NO flow records, dispatch NOTHING: print the resolved inputs
-    // and the task/step graph, then return.
+    // coder-phase input precheck, the placeholder check just above) has
+    // already run — a dry run surfaces the SAME loud failures a real
+    // launch would. From here, mint NOTHING, emit NO flow records,
+    // dispatch NOTHING: print the resolved inputs and the task/step
+    // graph, then return.
     if bool_param(&collected, "dry_run") {
         print_dry_run_graph(config, &collected);
         return Ok(0);

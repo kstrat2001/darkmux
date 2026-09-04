@@ -43,6 +43,14 @@
 //! `rule` and `workspace` are required. Without `plan_out` the plan is
 //! written under the run: `<missions>/<mission-id>/plan/<rule>.json`, the
 //! mission being the one that owns the step's task's phase.
+//!
+//! (#2310 P4c-2 item 0/review item 6) A launcher no longer injects
+//! `sizing`/`no_fetch` into this step's config on its own — a mission
+//! config's OWN document must declare the input AND reference
+//! `{{max_sites_per_unit}}`/`{{max_est_tokens_per_unit}}`/`{{no_fetch}}`
+//! (as `crawl.json` does) for an operator's `--param` to reach here; an
+//! undeclared or unreferenced `--param` is now inert, not silently
+//! applied to every `crawl.plan` step in the document.
 
 use crate::crawl::plan::{self, Plan, PlanParams};
 use anyhow::{anyhow, bail, Context, Result};
@@ -130,46 +138,10 @@ impl PlanStepConfig {
         };
         let rule = str_field("rule")?;
         let workspace = PathBuf::from(str_field("workspace")?);
-        let mut params = PlanParams::default();
-        if let Some(sizing) = step.config.get("sizing") {
-            for (key, slot) in [
-                ("max_sites_per_unit", &mut params.max_sites_per_unit),
-                ("max_est_tokens_per_unit", &mut params.max_est_tokens_per_unit),
-            ] {
-                // (#2310 P4c-2 item 0) `sizing.<key>` reaches this step
-                // through `mission_config::substitute_step_config`'s
-                // generic `{{<input-id>}}` substitution now, which carries
-                // a `--param`-sourced value through verbatim as the JSON
-                // STRING the CLI layer always collects it as (an `--input`
-                // file can still supply a real number). Lenient-on-read
-                // (contract 7): parse either shape, the same convention
-                // `bool_param` already applies to every other CLI-sourced
-                // knob. An unset knob is ABSENT here (item 0's key-omission
-                // rule), not an empty string, so this loop still only sees
-                // the keys the operator actually set.
-                if let Some(v) = sizing.get(key) {
-                    let n = v
-                        .as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
-                        .filter(|n| *n > 0)
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "step `{}`: `{CRAWL_PLAN_KIND}` config.sizing.{key} must be a positive integer, got {v}",
-                                step.id
-                            )
-                        })?;
-                    *slot = usize::try_from(n).context("sizing value does not fit usize")?;
-                }
-            }
-        }
-        let no_fetch = match step.config.get("no_fetch") {
-            Some(serde_json::Value::Bool(b)) => *b,
-            Some(serde_json::Value::String(s)) => {
-                matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
-            }
-            _ => false,
-        };
-        let fetch = !no_fetch;
+        // (#2310 P4c-2 review MUST-do 1) Shared with `plan_sites_step.rs`
+        // so the two `plan.*` kinds cannot silently drift back apart on
+        // CLI-string leniency the way they did before this review.
+        let (params, fetch) = plan::parse_sizing_and_no_fetch(&step.config, &step.id, CRAWL_PLAN_KIND)?;
         let plan_out = step.config.get("plan_out").and_then(|v| v.as_str()).map(PathBuf::from);
         Ok(Self { rule, workspace, params, fetch, plan_out })
     }

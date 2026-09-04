@@ -80,6 +80,61 @@ impl Default for PlanParams {
     }
 }
 
+/// (#2310 P4c-2 review MUST-do 1) Shared `sizing.*`/`no_fetch` step-config
+/// parsing for BOTH `crawl.plan` (`plan_step.rs`) and `plan.sites`
+/// (`plan_sites_step.rs`). Lenient-on-read (contract 7): a `--param`
+/// value always arrives at the launcher as a JSON STRING (the CLI
+/// layer's convention), and `mission_config::substitute_step_config`'s
+/// generic `{{<input-id>}}` substitution (#2310 P4c-2 item 0) carries
+/// that string through verbatim into a step's config — a parser that
+/// only accepted `as_u64`/`as_bool` would silently DROP every
+/// CLI-sourced override the moment a document declares the placeholder
+/// (exactly what `plan_sites_step.rs` still did until this review caught
+/// it: `crawl.plan` was fixed in item 0's own packet, `plan.sites` was
+/// not, and the two silently drifted apart). ONE helper, called by both
+/// kinds, so a THIRD `plan.*` kind inherits the lenient parse for free
+/// instead of re-deriving it.
+///
+/// Returns `(params, fetch)` — `params` defaults to `PlanParams::default()`
+/// when `sizing` is absent or partial (an omitted key, per item 0's
+/// key-omission rule for an unset optional input, keeps that one
+/// default); `fetch` is `true` (the historical default) unless `no_fetch`
+/// resolves truthy.
+pub fn parse_sizing_and_no_fetch(
+    config: &serde_json::Value,
+    step_id: &str,
+    kind: &str,
+) -> Result<(PlanParams, bool)> {
+    let mut params = PlanParams::default();
+    if let Some(sizing) = config.get("sizing") {
+        for (key, slot) in [
+            ("max_sites_per_unit", &mut params.max_sites_per_unit),
+            ("max_est_tokens_per_unit", &mut params.max_est_tokens_per_unit),
+        ] {
+            if let Some(v) = sizing.get(key) {
+                let n = v
+                    .as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "step `{step_id}`: `{kind}` config.sizing.{key} must be a positive integer, got {v}"
+                        )
+                    })?;
+                *slot = usize::try_from(n).context("sizing value does not fit usize")?;
+            }
+        }
+    }
+    let no_fetch = match config.get("no_fetch") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+        }
+        _ => false,
+    };
+    Ok((params, !no_fetch))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]

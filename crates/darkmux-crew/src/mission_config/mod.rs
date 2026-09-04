@@ -42,7 +42,7 @@ pub mod prune;
 pub mod load;
 
 pub use grow::{grow_task, items_from_artifact, GrownFrom};
-pub use inputs::{find_unsubstituted_braces, substitute_step_config};
+pub use inputs::{check_placeholders_declared, find_unsubstituted_braces, substitute_step_config, undeclared_placeholders};
 pub use interpret::{interpret, LaunchParams, TaskOverride};
 pub use load::{has_non_user_fallback, list_ids, load, LoadedMissionConfig, MissionConfigSource};
 
@@ -1292,6 +1292,57 @@ impl MissionConfig {
                          on the task itself, or on its owning phase) — a disabled task is pruned at \
                          mint and never produces a `Step.output`, so it has nothing to promote as \
                          the close payload. Enable the task, or name a different one"
+                    ),
+                });
+            }
+        }
+
+        // (#2310 P4c-2 review MUST FIX) Every undeclared placeholder in the
+        // static graph — the SAME check `mission_launch.rs::launch` runs
+        // before minting, surfaced here too so `mission config show` and
+        // `darkmux doctor` catch a typo without a launch attempt.
+        for (where_, name) in inputs::undeclared_placeholders(self) {
+            findings.push(ValidationFinding {
+                severity: FindingSeverity::Error,
+                path: "inputs".to_string(),
+                message: format!(
+                    "{where_} names placeholder `{{{{{name}}}}}`, which is not a declared input of \
+                     this mission config{}",
+                    inputs::grow_namespace_hint(&name)
+                ),
+            });
+        }
+
+        // (#2310 P4c-2 review item 4) `ignored: true` combined with
+        // `required: true` on the SAME input is a contradiction the
+        // launcher would enforce oppositely at the same time: `required`
+        // blocks the launch until the operator supplies it, `ignored`
+        // exists specifically to tell the operator supplying it does
+        // NOTHING. An operator cannot win. `ignored: true` with no
+        // `ignored_reason` is a lesser smell (the warning still fires, just
+        // with a generic "it has no effect" fallback) — Warning, not Error.
+        for input in &self.inputs {
+            if input.ignored == Some(true) && input.required == Some(true) {
+                findings.push(ValidationFinding {
+                    severity: FindingSeverity::Error,
+                    path: format!("inputs[{}]", input.name),
+                    message: format!(
+                        "input \"{}\" declares BOTH `ignored: true` and `required: true` — \
+                         `required` blocks the launch until the operator supplies it, `ignored` \
+                         says supplying it does nothing; a config cannot ask for both",
+                        input.name
+                    ),
+                });
+            }
+            if input.ignored == Some(true) && input.ignored_reason.is_none() {
+                findings.push(ValidationFinding {
+                    severity: FindingSeverity::Warning,
+                    path: format!("inputs[{}]", input.name),
+                    message: format!(
+                        "input \"{}\" declares `ignored: true` with no `ignored_reason` — the \
+                         operator-facing warning falls back to a generic \"it has no effect on \
+                         this config\" instead of naming why",
+                        input.name
                     ),
                 });
             }
@@ -2548,6 +2599,107 @@ mod tests {
             .filter(|f| f.severity == FindingSeverity::Error)
             .map(|f| format!("{}: {}", f.path, f.message))
             .collect()
+    }
+
+    fn grow_warnings(config: &MissionConfig) -> Vec<String> {
+        config
+            .validate(&["procedural.shell", "procedural.noop"])
+            .into_iter()
+            .filter(|f| f.severity == FindingSeverity::Warning)
+            .map(|f| format!("{}: {}", f.path, f.message))
+            .collect()
+    }
+
+    fn input_named(name: &str) -> MissionInput {
+        MissionInput {
+            name: name.to_string(),
+            description: None,
+            required: None,
+            ignored: None,
+            ignored_reason: None,
+            extras: BTreeMap::new(),
+        }
+    }
+
+    // ── (#2310 P4c-2 review MUST FIX) undeclared placeholders ──────────
+
+    #[test]
+    fn a_static_step_typo_is_a_validate_error() {
+        let mut s = step("s", "procedural.noop");
+        s.config = serde_json::json!({"intent_file": "{{intent_fle}}"});
+        let cfg = doc(vec![phase("p1", vec![task("t", &[], vec![s])])]);
+        let errs = grow_errors(&cfg);
+        assert!(errs.iter().any(|e| e.contains("step `s`") && e.contains("intent_fle")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_grow_config_typo_is_a_validate_error() {
+        let mut t = task("t", &[], vec![step("s", "procedural.noop")]);
+        t.grow = Some(GrowSpec {
+            from: "other".to_string(),
+            items: "units".to_string(),
+            id: "{{item.id}}".to_string(),
+            config: serde_json::json!({"intent_file": "{{intent_fle}}"}),
+            extras: BTreeMap::new(),
+        });
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let errs = grow_errors(&cfg);
+        assert!(
+            errs.iter().any(|e| e.contains("grow.config") && e.contains("intent_fle")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_from_dot_typo_is_a_validate_error_naming_the_grow_namespace() {
+        let mut t = task("t", &[], vec![step("s", "procedural.noop")]);
+        t.grow = Some(GrowSpec {
+            from: "other".to_string(),
+            items: "units".to_string(),
+            id: "{{item.id}}".to_string(),
+            config: serde_json::json!({"plan": "{{from.typo}}"}),
+            extras: BTreeMap::new(),
+        });
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let errs = grow_errors(&cfg);
+        assert!(errs.iter().any(|e| e.contains("from.output")), "{errs:?}");
+    }
+
+    // ── (#2310 P4c-2 review item 4) ignored + required interaction ─────
+
+    #[test]
+    fn ignored_true_with_required_true_is_a_validate_error() {
+        let cfg = MissionConfig {
+            inputs: vec![MissionInput { required: Some(true), ignored: Some(true), ..input_named("x") }],
+            ..doc(vec![])
+        };
+        let errs = grow_errors(&cfg);
+        assert!(errs.iter().any(|e| e.contains('x') && e.contains("ignored") && e.contains("required")), "{errs:?}");
+    }
+
+    #[test]
+    fn ignored_true_without_a_reason_is_a_validate_warning_not_an_error() {
+        let cfg = MissionConfig {
+            inputs: vec![MissionInput { ignored: Some(true), ..input_named("x") }],
+            ..doc(vec![])
+        };
+        assert!(grow_errors(&cfg).is_empty(), "no reason is a smell, not a hard error");
+        let warns = grow_warnings(&cfg);
+        assert!(warns.iter().any(|w| w.contains('x') && w.contains("ignored_reason")), "{warns:?}");
+    }
+
+    #[test]
+    fn ignored_true_with_a_reason_is_clean() {
+        let cfg = MissionConfig {
+            inputs: vec![MissionInput {
+                ignored: Some(true),
+                ignored_reason: Some("kept for parity".to_string()),
+                ..input_named("x")
+            }],
+            ..doc(vec![])
+        };
+        assert!(grow_errors(&cfg).is_empty());
+        assert!(grow_warnings(&cfg).iter().all(|w| !w.contains("ignored_reason")), "{:?}", grow_warnings(&cfg));
     }
 
     #[test]

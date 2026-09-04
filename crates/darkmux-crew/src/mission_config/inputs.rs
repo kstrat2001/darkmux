@@ -15,20 +15,38 @@
 //!
 //! **Absent optional inputs.** A placeholder naming a declared-but-not-
 //! collected input (an optional input the operator left unset) is not an
-//! error: a WHOLE-value placeholder (`"workspace": "{{workspace}}"`, the
-//! value is exactly one placeholder and nothing else) has its KEY OMITTED
-//! from the containing object entirely, so a consumer's `step.config.
-//! get("no_fetch")` sees "not present" — identical to what it saw before
-//! the document ever declared the placeholder. An EMBEDDED placeholder
-//! (part of a larger string) substitutes the empty string instead, since
-//! there is no key to omit.
+//! error ONLY in the whole-value shape: `"workspace": "{{workspace}}"`
+//! (the value is exactly one placeholder and nothing else) has its KEY
+//! OMITTED from the containing object entirely, so a consumer's
+//! `step.config.get("no_fetch")` sees "not present" — identical to what it
+//! saw before the document ever declared the placeholder. An EMBEDDED
+//! placeholder (part of a larger string, e.g. `"/tmp/{{x}}/b"`) is
+//! REFUSED instead when `x` is uncollected (#2310 P4c-2 review item 2) —
+//! there is no key to omit, and silently rendering the empty string would
+//! have produced `"/tmp//b"`, a silently shortened path a step kind reads
+//! as a real value with no signal anything was missing. The same
+//! reasoning applies inside an ARRAY: a whole-value placeholder element
+//! that names an uncollected input is DROPPED from the array (never a
+//! `null` element) — omission, the same rule the object case uses, just
+//! applied to list membership instead of a map key.
 //!
 //! **Unknown placeholders are refused.** A placeholder naming anything
 //! other than a declared input is a document bug: minting must not proceed
 //! with a literal `{{...}}` a step kind would silently mis-parse (or, worse,
 //! silently accept as a literal string). [`substitute_step_config`] errors
-//! loudly, naming the step and the placeholder, before anything mints.
+//! loudly, naming the step and the placeholder, before anything mints —
+//! and (#2310 P4c-2 review MUST FIX) [`check_placeholders_declared`] runs
+//! the SAME check over the whole static document (every step's `config`
+//! AND every task's `grow.config`) BEFORE any of that minting starts, so a
+//! typo is refused before the mission directory exists and before a
+//! `grow`-templated phase's real dispatch work ever runs. Without it,
+//! `interpret`'s own per-step check alone caught a static typo only AFTER
+//! the mission was already partially minted on disk, and a `grow.config`
+//! typo only after the ENTIRE producing phase had already run for real
+//! (dispatches and all) — and `--dry-run` caught neither, since it never
+//! calls `interpret` at all.
 
+use super::MissionConfig;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,8 +65,9 @@ pub fn substitute_step_config(
     Ok(substitute_value(config, declared, collected, what)?.unwrap_or(Value::Null))
 }
 
-/// `Ok(None)` means "omit the containing object key" — only ever produced
-/// by a whole-value placeholder naming a declared-but-uncollected input.
+/// `Ok(None)` means "omit the containing object key / drop this array
+/// element" — only ever produced by a whole-value placeholder naming a
+/// declared-but-uncollected input.
 fn substitute_value(
     value: &Value,
     declared: &BTreeSet<String>,
@@ -67,9 +86,16 @@ fn substitute_value(
             }
         }
         Value::Array(items) => {
+            // (#2310 P4c-2 review item 2) A whole-placeholder element
+            // naming an uncollected input is DROPPED, never inserted as
+            // `null` — the same "absent means not there" rule the object
+            // branch below applies to a key, applied here to list
+            // membership instead.
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(substitute_value(item, declared, collected, what)?.unwrap_or(Value::Null));
+                if let Some(substituted) = substitute_value(item, declared, collected, what)? {
+                    out.push(substituted);
+                }
             }
             Ok(Some(Value::Array(out)))
         }
@@ -89,10 +115,14 @@ fn substitute_value(
     }
 }
 
-/// Every `{{...}}` occurrence in `s`, substituted from `collected` (empty
-/// string for a declared-but-uncollected input — there is no key here to
-/// omit). Mirrors `grow.rs::render`'s scan loop; the placeholder namespace
-/// here is bare declared-input names rather than `item.*`/`from.output`.
+/// Every `{{...}}` occurrence in `s`. Mirrors `grow.rs::render`'s scan
+/// loop; the placeholder namespace here is bare declared-input names
+/// rather than `item.*`/`from.output`. (#2310 P4c-2 review item 2) A
+/// declared-but-uncollected input reached EMBEDDED (part of a larger
+/// string) is a loud refusal, not a silent empty-string render — there is
+/// no key to omit here the way the whole-value case has, and rendering
+/// empty would silently shorten whatever string this placeholder sits
+/// inside (a path, most likely).
 fn render_embedded(
     s: &str,
     declared: &BTreeSet<String>,
@@ -109,8 +139,15 @@ fn render_embedded(
             .with_context(|| format!("{what}: has an unclosed `{{{{` placeholder: `{s}`"))?;
         let name = after[..close].trim();
         check_declared(name, declared, what)?;
-        if let Some(v) = collected.get(name) {
-            out.push_str(&scalar_to_string(v));
+        match collected.get(name) {
+            Some(v) => out.push_str(&scalar_to_string(v)),
+            None => bail!(
+                "{what}: names embedded placeholder `{{{{{name}}}}}` inside `{s}`, but input \
+                 `{name}` is not set for this launch — an EMBEDDED placeholder cannot omit part \
+                 of a string (rendering empty would silently shorten it); only a WHOLE-value \
+                 placeholder (the field's entire value is `{{{{{name}}}}}` and nothing else) can \
+                 be omitted. Supply `{name}`, or move the placeholder to its own field"
+            ),
         }
         rest = &after[close + 2..];
     }
@@ -138,7 +175,8 @@ fn check_declared(name: &str, declared: &BTreeSet<String>, what: &str) -> Result
     if !declared.contains(name) {
         bail!(
             "{what}: names placeholder `{{{{{name}}}}}`, which is not a declared input of this \
-             mission config — declared inputs: {}",
+             mission config{} — declared inputs: {}",
+            grow_namespace_hint(name),
             if declared.is_empty() {
                 "none".to_string()
             } else {
@@ -147,6 +185,31 @@ fn check_declared(name: &str, declared: &BTreeSet<String>, what: &str) -> Result
         );
     }
     Ok(())
+}
+
+/// (#2310 P4c-2 review item 5) A placeholder that SURVIVED `grow.rs`'s own
+/// pass verbatim (item 0's design: `grow::render` only recognizes
+/// `item.*`/`from.output` and passes anything else through unresolved for
+/// THIS module to resolve or refuse) but still starts with `item.` or
+/// `from.` is very likely a mistyped grow-namespace reference
+/// (`{{from.typo}}` meaning `{{from.output}}`), not a genuinely missing
+/// launch input — "declared inputs: workspace, diff_file, ..." is a
+/// misleading answer to that mistake. Named separately so the message
+/// points at the actual namespace instead. Empty string for anything that
+/// isn't grow-namespace-shaped.
+pub(crate) fn grow_namespace_hint(name: &str) -> &'static str {
+    if name == "from.output" {
+        // Exact match already resolves inside grow.rs and never reaches
+        // here — kept out of the two arms below so this function's
+        // contract stays "only for a MISTYPED grow reference".
+        ""
+    } else if name.starts_with("from.") {
+        " (this looks like a mistyped grow namespace: the only producer-output placeholder is `{{from.output}}`, valid only inside a `grow.config` template)"
+    } else if name.starts_with("item.") {
+        " (this looks like a mistyped grow namespace: `{{item.<field>}}` is valid only inside a `grow.config` template, never in a static step's config)"
+    } else {
+        ""
+    }
 }
 
 /// Every literal `{{` still present in `value` — a real launch must leave
@@ -170,9 +233,119 @@ pub fn find_unsubstituted_braces(value: &Value, path: &str, out: &mut Vec<String
     }
 }
 
+/// (#2310 P4c-2 review MUST FIX) Every `{{name}}` occurrence in the
+/// document's STATIC graph — every step's `config` AND every task's
+/// `grow.config` (the two places [`substitute_step_config`] ever runs) —
+/// that names neither grow's own namespace (`item.*`/`from.output`, valid
+/// only inside a `grow.config` template and resolved by `grow.rs`, never
+/// by this module) nor a name in `config.inputs`. One entry per bad
+/// occurrence: `(location, placeholder_name)`. A `grow.id` template string
+/// (e.g. `"{{item.id}}"`) is NOT scanned — it is exclusively `item.*`/
+/// `from.output` by convention and by [`super::GrowSpec`]'s own contract,
+/// so there is nothing this check would ever catch there; scoping to
+/// `config` keeps this function's job identical to what actually mints.
+pub fn undeclared_placeholders(config: &MissionConfig) -> Vec<(String, String)> {
+    let declared: BTreeSet<String> = config.inputs.iter().map(|i| i.name.clone()).collect();
+    let mut out = Vec::new();
+    for phase in &config.phases {
+        for task in &phase.tasks {
+            for step in &task.steps {
+                collect_undeclared(&step.config, &declared, &format!("step `{}`", step.id), &mut out);
+            }
+            if let Some(grow) = &task.grow {
+                collect_undeclared(
+                    &grow.config,
+                    &declared,
+                    &format!("task `{}`'s grow.config", task.id),
+                    &mut out,
+                );
+            }
+        }
+    }
+    out
+}
+
+fn collect_undeclared(value: &Value, declared: &BTreeSet<String>, where_: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(s) => {
+            for name in placeholder_names(s) {
+                if name.starts_with("item.") || name == "from.output" {
+                    continue;
+                }
+                if !declared.contains(&name) {
+                    out.push((where_.to_string(), name));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_undeclared(v, declared, where_, out);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                collect_undeclared(v, declared, where_, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every well-formed `{{...}}` name in `s`, in order. An unclosed `{{` is
+/// silently not reported here — [`substitute_step_config`]/`grow.rs`'s own
+/// scan is what refuses a malformed placeholder at mint; this function's
+/// job is only to name what a WELL-FORMED but undeclared one would say.
+fn placeholder_names(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        match after.find("}}") {
+            Some(close) => {
+                out.push(after[..close].trim().to_string());
+                rest = &after[close + 2..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// (#2310 P4c-2 review MUST FIX) Refuses (loud `Err`, naming every
+/// offending step/template and placeholder) if [`undeclared_placeholders`]
+/// finds anything in `config`'s static graph. The caller
+/// (`mission_launch.rs::launch`) runs this BEFORE the `--dry-run`
+/// short-circuit and before anything mints, closing the two gaps this
+/// review found: a static-step typo used to mint the mission directory
+/// before failing inside `interpret`; a `grow.config` typo used to run an
+/// entire real phase (dispatch and all) before dying at the NEXT phase's
+/// boundary inside `interpret_grown`; and `--dry-run` caught neither,
+/// since the dry-run path never calls `interpret` at all.
+pub fn check_placeholders_declared(config: &MissionConfig) -> Result<()> {
+    let bad = undeclared_placeholders(config);
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let declared: Vec<&str> = config.inputs.iter().map(|i| i.name.as_str()).collect();
+    let lines: Vec<String> = bad
+        .iter()
+        .map(|(where_, name)| {
+            format!("  {where_} names placeholder `{{{{{name}}}}}`{}", grow_namespace_hint(name))
+        })
+        .collect();
+    bail!(
+        "mission config \"{}\" has {} undeclared placeholder occurrence(s), refused before minting:\n{}\ndeclared inputs: {}",
+        config.id,
+        bad.len(),
+        lines.join("\n"),
+        if declared.is_empty() { "none".to_string() } else { declared.join(", ") }
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mission_config::{GrowSpec, PhaseConfig, StepConfig, TaskConfig};
     use serde_json::json;
 
     fn declared(names: &[&str]) -> BTreeSet<String> {
@@ -197,13 +370,40 @@ mod tests {
         assert_eq!(out, json!({"rule": "x"}), "the key is gone, not an empty string");
     }
 
+    /// (#2310 P4c-2 review item 2 — proven) Was
+    /// `an_embedded_placeholder_renders_empty_string_when_uncollected`: an
+    /// uncollected input reached embedded now REFUSES instead of silently
+    /// shortening the string.
     #[test]
-    fn an_embedded_placeholder_renders_empty_string_when_uncollected() {
+    fn an_embedded_placeholder_is_refused_when_uncollected() {
         let collected = BTreeMap::new();
+        let cfg = json!({"note": "plan={{workspace}} done"});
+        let err = substitute_step_config(&cfg, &declared(&["workspace"]), &collected, "step `s`")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("workspace"), "{err}");
+        assert!(err.contains("embedded"), "{err}");
+    }
+
+    #[test]
+    fn an_embedded_placeholder_still_substitutes_when_collected() {
+        let mut collected = BTreeMap::new();
+        collected.insert("workspace".to_string(), json!("ws"));
         let cfg = json!({"note": "plan={{workspace}} done"});
         let out =
             substitute_step_config(&cfg, &declared(&["workspace"]), &collected, "step `s`").unwrap();
-        assert_eq!(out, json!({"note": "plan= done"}));
+        assert_eq!(out, json!({"note": "plan=ws done"}));
+    }
+
+    /// (#2310 P4c-2 review item 2 — proven) An uncollected whole-placeholder
+    /// ARRAY element is DROPPED, never a `null` entry.
+    #[test]
+    fn an_uncollected_whole_placeholder_array_element_is_dropped_not_null() {
+        let mut collected = BTreeMap::new();
+        collected.insert("a".to_string(), json!("A"));
+        let cfg = json!({"list": ["{{a}}", "{{b}}", "x"]});
+        let out = substitute_step_config(&cfg, &declared(&["a", "b"]), &collected, "step `s`").unwrap();
+        assert_eq!(out, json!({"list": ["A", "x"]}), "no null in the middle");
     }
 
     #[test]
@@ -216,6 +416,33 @@ mod tests {
         assert!(err.contains("plan-step"), "{err}");
         assert!(err.contains("bogus"), "{err}");
         assert!(err.contains("workspace"), "{err}");
+    }
+
+    /// (#2310 P4c-2 review item 5 — proven) A `{{from.typo}}` that
+    /// survives `grow.rs`'s own pass verbatim must NOT be told "declared
+    /// inputs: workspace, diff_file" (misleading) — it must be told it
+    /// looks like a mistyped grow namespace.
+    #[test]
+    fn a_from_dot_typo_names_the_grow_namespace_not_the_declared_inputs() {
+        let collected = BTreeMap::new();
+        let cfg = json!({"plan": "{{from.typo}}"});
+        let err = substitute_step_config(&cfg, &declared(&["workspace"]), &collected, "step `unit-step`")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("from.typo"), "{err}");
+        assert!(err.contains("from.output"), "{err}");
+        assert!(err.contains("grow"), "{err}");
+    }
+
+    #[test]
+    fn an_item_dot_typo_in_a_static_step_names_the_grow_namespace() {
+        let collected = BTreeMap::new();
+        let cfg = json!({"plan": "{{item.rule}}"});
+        let err = substitute_step_config(&cfg, &declared(&["workspace"]), &collected, "step `plan-step`")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("item.rule"), "{err}");
+        assert!(err.contains("grow.config"), "{err}");
     }
 
     #[test]
@@ -235,5 +462,129 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found[0].contains("config.a.b"), "{}", found[0]);
         assert!(found[0].contains("oops"), "{}", found[0]);
+    }
+
+    // ─── check_placeholders_declared (MUST FIX) ──────────────────────
+
+    fn minimal_config(phases: Vec<PhaseConfig>) -> MissionConfig {
+        MissionConfig {
+            id: "test-config".to_string(),
+            name: "Test".to_string(),
+            description: None,
+            schema_version: None,
+            inputs: vec![crate::mission_config::MissionInput {
+                name: "workspace".to_string(),
+                description: None,
+                required: Some(true),
+                ignored: None,
+                ignored_reason: None,
+                extras: BTreeMap::new(),
+            }],
+            phases,
+            outcome_from: None,
+            panel: None,
+            cmd: None,
+            extras: BTreeMap::new(),
+        }
+    }
+
+    fn step(id: &str, kind: &str, config: Value) -> StepConfig {
+        StepConfig { id: id.to_string(), kind: kind.to_string(), enabled: None, config, gate: None, extras: BTreeMap::new() }
+    }
+
+    fn task(id: &str, steps: Vec<StepConfig>) -> TaskConfig {
+        TaskConfig {
+            id: id.to_string(),
+            enabled: None,
+            description: None,
+            display_name: None,
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            run_on: None,
+            steps,
+            grow: None,
+            extras: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_clean_document_passes_the_placeholder_check() {
+        let cfg = minimal_config(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![task("t", vec![step("s", "k", json!({"workspace": "{{workspace}}"}))])],
+            extras: BTreeMap::new(),
+        }]);
+        assert!(check_placeholders_declared(&cfg).is_ok());
+    }
+
+    /// (#2310 P4c-2 review MUST FIX — proven) A STATIC step's typo is
+    /// refused by `check_placeholders_declared` alone, with no `interpret`
+    /// call and no mission ever minted.
+    #[test]
+    fn a_static_step_typo_is_refused_naming_the_step_and_placeholder() {
+        let cfg = minimal_config(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![task("t", vec![step("s", "k", json!({"intent_file": "{{intent_fle}}"}))])],
+            extras: BTreeMap::new(),
+        }]);
+        let err = check_placeholders_declared(&cfg).unwrap_err().to_string();
+        assert!(err.contains("step `s`"), "{err}");
+        assert!(err.contains("intent_fle"), "{err}");
+    }
+
+    /// (#2310 P4c-2 review MUST FIX — proven) A `grow.config` typo is
+    /// refused the SAME way, without needing the producing phase to run
+    /// first.
+    #[test]
+    fn a_grow_config_typo_is_refused_before_any_phase_runs() {
+        let mut t = task("t", vec![step("s", "k", json!({}))]);
+        t.grow = Some(GrowSpec {
+            from: "other".to_string(),
+            items: "units".to_string(),
+            id: "{{item.id}}".to_string(),
+            config: json!({"intent_file": "{{intent_fle}}"}),
+            extras: BTreeMap::new(),
+        });
+        let cfg = minimal_config(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![t],
+            extras: BTreeMap::new(),
+        }]);
+        let err = check_placeholders_declared(&cfg).unwrap_err().to_string();
+        assert!(err.contains("grow.config"), "{err}");
+        assert!(err.contains("intent_fle"), "{err}");
+    }
+
+    /// A well-formed `item.*`/`from.output` reference inside `grow.config`
+    /// is grow's own namespace, never refused here.
+    #[test]
+    fn grow_namespace_placeholders_in_grow_config_are_never_flagged() {
+        let mut t = task("t", vec![step("s", "k", json!({}))]);
+        t.grow = Some(GrowSpec {
+            from: "other".to_string(),
+            items: "units".to_string(),
+            id: "{{item.id}}".to_string(),
+            config: json!({"plan": "{{from.output}}", "unit": "{{item.id}}"}),
+            extras: BTreeMap::new(),
+        });
+        let cfg = minimal_config(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![t],
+            extras: BTreeMap::new(),
+        }]);
+        assert!(check_placeholders_declared(&cfg).is_ok());
     }
 }
