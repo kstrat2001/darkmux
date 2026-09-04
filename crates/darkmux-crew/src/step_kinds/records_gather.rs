@@ -591,52 +591,51 @@ mod tests {
         );
     }
 
+    /// Write a `plan/<rule>.json` whose `units[].sites` list is exactly
+    /// `sites` — `(file, start)` pairs.
+    fn write_plan_sites(plan_dir: &std::path::Path, rule: &str, sites: &[(&str, u64)]) {
+        let units: Vec<serde_json::Value> = sites
+            .iter()
+            .map(|(file, start)| json!({"kind": "site", "sites": [{"file": file, "start": start}]}))
+            .collect();
+        std::fs::write(
+            plan_dir.join(format!("{rule}.json")),
+            serde_json::to_string(&json!({ "kind": "crawl.plan", "body": { "units": units } })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn diff_with_n_hunks(path: &std::path::Path, files: &[&str]) {
+        let mut text = String::new();
+        for f in files {
+            text.push_str(&format!(
+                "diff --git a/{f} b/{f}\n--- a/{f}\n+++ b/{f}\n@@ -1,1 +1,2 @@\n foo\n+bar\n"
+            ));
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// (#2310 P4c-2b PR #2357 round-2 review item 1, proven vacuous) The
+    /// PRIOR version of this test used a fixture where `sum(sites)` and
+    /// `distinct(sites)` both landed at the SAME capped value (3), so
+    /// reverting the DISTINCT count back to a per-rule SUM (the exact
+    /// CONSIDER E regression) left this test green. Rebuilt so the two
+    /// answers actually diverge: 4 hunks in the diff, 3 DISTINCT windows
+    /// (`src/a.ts:2` shared by both rules), 5 sites total summed across
+    /// rules (3 + 2) — a sum-based count would read `min(5, 4) = 4`; the
+    /// correct distinct count is `3`. Mutation-killed below.
     #[test]
     #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
-    fn rules_run_and_hunks_covered_come_from_this_missions_plan_files() {
+    fn hunks_covered_counts_distinct_windows_not_the_sum_across_rules() {
         let tmp = TempDir::new().unwrap();
         let _home = HomeGuard::set(tmp.path());
         save_phase();
         let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
-        // (#2310 P4c-2b PR #2357 review CONSIDER E, proven nonsensical)
-        // Realistic plan bodies — `units[].sites[].{file,start}` — three
-        // DISTINCT windows total (one shared: both rules plan a site at
-        // `src/a.ts:2`, which a correct DISTINCT count must not double).
-        std::fs::write(
-            plan_dir.join("existing-solution.json"),
-            serde_json::to_string(&json!({
-                "kind": "crawl.plan",
-                "body": { "units": [
-                    {"kind": "site", "sites": [{"file": "src/a.ts", "start": 2}]},
-                    {"kind": "site", "sites": [{"file": "src/b.ts", "start": 5}]}
-                ] }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            plan_dir.join("union-vs-enum.json"),
-            serde_json::to_string(&json!({
-                "kind": "crawl.plan",
-                "body": { "units": [
-                    {"kind": "site", "sites": [{"file": "src/a.ts", "start": 2}]},
-                    {"kind": "site", "sites": [{"file": "src/c.ts", "start": 9}]}
-                ] }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        // A diff with (at least) 3 hunks so the distinct-window count
-        // isn't capped below what the plans actually found.
+        write_plan_sites(&plan_dir, "existing-solution", &[("src/a.ts", 2), ("src/b.ts", 5), ("src/c.ts", 9)]);
+        write_plan_sites(&plan_dir, "union-vs-enum", &[("src/a.ts", 2), ("src/b.ts", 5)]);
         let diff_path = tmp.path().join("d.diff");
-        std::fs::write(
-            &diff_path,
-            "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,1 +1,2 @@\n foo\n+bar\n\
-             diff --git a/b.ts b/b.ts\n--- a/b.ts\n+++ b/b.ts\n@@ -1,1 +1,2 @@\n baz\n+qux\n\
-             diff --git a/c.ts b/c.ts\n--- a/c.ts\n+++ b/c.ts\n@@ -1,1 +1,2 @@\n quux\n+corge\n",
-        )
-        .unwrap();
+        diff_with_n_hunks(&diff_path, &["a.ts", "b.ts", "c.ts", "d.ts"]);
 
         let out = RecordsGatherStepKind
             .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
@@ -645,7 +644,35 @@ mod tests {
         assert_eq!(wrapped.body.scope.rules_run, vec!["existing-solution".to_string(), "union-vs-enum".to_string()]);
         assert_eq!(
             wrapped.body.scope.hunks_covered, 3,
-            "3 DISTINCT (file, start) windows across both rules — src/a.ts:2 counted once, not twice: {:?}",
+            "3 DISTINCT (file, start) windows across both rules (5 sites summed, 4 hunks total) — a SUM-based \
+             count would wrongly read 4: {:?}",
+            wrapped.body.scope
+        );
+    }
+
+    /// (#2310 P4c-2b PR #2357 round-2 review item 1) The companion case:
+    /// plans find MORE distinct windows than the diff actually has hunks
+    /// (3 distinct windows, only 2 hunks in the diff) — the cap must win.
+    /// Mutation-killed below (deleting `.min(hunks_total)` reads 3, not 2).
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn hunks_covered_is_capped_when_plans_find_more_windows_than_the_diff_has_hunks() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        write_plan_sites(&plan_dir, "existing-solution", &[("src/a.ts", 2), ("src/b.ts", 5), ("src/c.ts", 9)]);
+        let diff_path = tmp.path().join("d.diff");
+        diff_with_n_hunks(&diff_path, &["a.ts", "b.ts"]);
+
+        let out = RecordsGatherStepKind
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert_eq!(
+            wrapped.body.scope.hunks_covered, 2,
+            "3 distinct windows found but the diff only has 2 hunks — the cap must win: {:?}",
             wrapped.body.scope
         );
     }

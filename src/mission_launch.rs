@@ -1204,6 +1204,12 @@ pub fn launch(
 
         // Growth first: a template's copies must exist before this phase's
         // tasks are handed to the scheduler.
+        // (#2310 P4c-2b PR #2357 round-2 review item 3) Set when ANY
+        // template in THIS phase grew zero copies because its producer
+        // errored — decides whether the `!phase_has_work` branch below
+        // closes the phase `Complete` (nothing failed, a plan just found
+        // nothing) or `Abandoned` (something upstream genuinely failed).
+        let mut phase_producer_errored = false;
         match grow_phase(
             phase,
             &real_phase_id,
@@ -1215,8 +1221,18 @@ pub fn launch(
             &collected,
         ) {
             Ok(grown) => {
-                for (event, grown_tasks, grown_steps) in grown {
-                    if event.minted.is_empty() {
+                for (event, grown_tasks, grown_steps, producer_error) in grown {
+                    if let Some(pe) = &producer_error {
+                        phase_producer_errored = true;
+                        println!(
+                            "  {}",
+                            style::warn(&format!(
+                                "graph: `{}` grew ZERO copies from `{}` — producer step `{}` ended \
+                                 {:?}, not Complete (producer_errored)",
+                                event.task_template, event.from, pe.step_id, pe.status
+                            ))
+                        );
+                    } else if event.minted.is_empty() {
                         // A plan that planned nothing is a real outcome,
                         // not a failure: the phase simply has no work.
                         println!(
@@ -1250,7 +1266,17 @@ pub fn launch(
                         "items": event.items,
                         "minted": event.minted,
                     });
-                    if event.minted.is_empty() {
+                    // (#2310 P4c-2b PR #2357 round-2 review item 3) A
+                    // producer that ERRORED gets its OWN reason, distinct
+                    // from a producer that legitimately found zero items —
+                    // `grew_nothing` used to cover BOTH, which read as
+                    // "nothing failed" on a run where something genuinely
+                    // did.
+                    if let Some(pe) = &producer_error {
+                        payload["reason"] = serde_json::json!("producer_errored");
+                        payload["producer_step"] = serde_json::json!(pe.step_id);
+                        payload["producer_status"] = serde_json::json!(format!("{:?}", pe.status));
+                    } else if event.minted.is_empty() {
                         payload["reason"] = serde_json::json!("grew_nothing");
                     }
                     bookend.emit_now(mission_bookend_record(
@@ -1332,12 +1358,19 @@ pub fn launch(
             // document is a different thing (the operator works it by
             // hand) and keeps its existing behavior untouched.
             if phase.tasks.iter().any(|t| t.grow.is_some()) {
-                complete_grown_nothing_phase(
+                // (#2310 P4c-2b PR #2357 round-2 review item 3) A phase
+                // whose grow template(s) all found zero items closes
+                // `Complete` (nothing failed); a phase where AT LEAST ONE
+                // template grew zero because its producer ERRORED closes
+                // `Abandoned` instead — the board must not say "nothing
+                // failed" about a phase that never even got to run.
+                close_grown_nothing_phase(
                     &mission_id,
                     &real_phase_id,
                     &phase_order,
                     &mut started_phases,
                     &mut closed_phases,
+                    phase_producer_errored,
                 );
             }
             // Nothing to run in this phase — skip the scheduler setup
@@ -1653,10 +1686,25 @@ pub fn launch(
 /// a panic and never a quiet zero: the producer never ran, produced no
 /// output, named a path that isn't there, or wrote something that isn't
 /// the JSON shape the template asked for.
+/// (#2310 P4c-2b PR #2357 round-2 review item 3) A grow template that grew
+/// ZERO copies because its `grow.from` producer step ended `Error`/
+/// `Abandoned` — DISTINCT from a template that legitimately grew zero
+/// copies because its producer found zero items to grow from (e.g. a plan
+/// that matched nothing). Naming this separately is what lets the
+/// `mission.grow` record's `reason` say `producer_errored` (never the
+/// misleading `grew_nothing`) and lets the phase close `Abandoned` (never
+/// `Complete`) — the board and the record both saying what happened,
+/// instead of both saying "nothing failed" about a failure.
+struct ProducerError {
+    step_id: String,
+    status: crew::types::NodeStatus,
+}
+
 type GrowthBatch = (
     crew::mission_config::grow::Grown,
     Vec<crew::types::Task>,
     BTreeMap<String, crew::types::Step>,
+    Option<ProducerError>,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -1740,6 +1788,7 @@ fn grow_phase(
                 },
                 Vec::new(),
                 BTreeMap::new(),
+                Some(ProducerError { step_id: last_step_id.clone(), status: last_step.status }),
             ));
             continue;
         }
@@ -1811,6 +1860,7 @@ fn grow_phase(
             },
             grown_tasks,
             grown_steps,
+            None,
         ));
     }
     Ok(out)
@@ -1854,41 +1904,60 @@ fn append_phase_task_ids(mission_id: &str, phase_id: &str, ids: &[String]) {
     write_phase_task_ids(mission_id, phase_id, merged);
 }
 
-/// (#2300) Explicitly open and close a phase whose `grow` template grew
-/// zero tasks, so its record reads `complete` rather than being swept to
-/// `abandoned` by the #1504 finalize backstop.
+/// (#2300; extended #2310 P4c-2b PR #2357 round-2 review item 3) Explicitly
+/// open and close a phase whose `grow` template(s) grew zero tasks, so its
+/// record reads `Complete`/`Abandoned` honestly rather than being swept to
+/// `Abandoned` (unconditionally, with a reconcile warning) by the #1504
+/// finalize backstop.
 ///
 /// A phase with no steps is invisible to `lazy_start_phase_for_step` and
 /// `lazy_close_prior_phases` — both are driven by a step transition — so
-/// without this the phase sits `Planned` all run and finalize reconciles it
-/// to `Abandoned` with a warning. Nothing failed, though: the plan planned
-/// nothing, which is a real and legitimate outcome (the `grew_nothing`
-/// reason on the `mission.grow` record says exactly that). Closing the
-/// prior phases first keeps the strictly-linear phase model (#1341) intact:
-/// reaching this phase is still the evidence that the ones before it are
-/// over, exactly as a first step transition would have been.
-fn complete_grown_nothing_phase(
+/// without this the phase sits `Planned` all run. Two distinct outcomes
+/// this now tells apart:
+/// - `producer_errored: false` — every template's producer legitimately
+///   found zero items (a plan that matched nothing). Nothing failed;
+///   closes `Complete`, same as before this review round.
+///   (the `grew_nothing` reason on the `mission.grow` record says exactly
+///   that).
+/// - `producer_errored: true` — AT LEAST ONE template's producer ended
+///   `Error`/`Abandoned` (the `producer_errored` reason on that template's
+///   own `mission.grow` record names the failed step). This phase never
+///   got to run its real work; closing it `Complete` would say "nothing
+///   failed" about a phase where something genuinely did. Closes
+///   `Abandoned` instead.
+///
+/// Closing the prior phases first keeps the strictly-linear phase model
+/// (#1341) intact: reaching this phase is still the evidence that the ones
+/// before it are over, exactly as a first step transition would have been.
+fn close_grown_nothing_phase(
     mission_id: &str,
     real_phase_id: &str,
     phase_order: &[String],
     started: &mut std::collections::HashSet<String>,
     closed: &mut std::collections::HashSet<String>,
+    producer_errored: bool,
 ) {
     if !started.insert(real_phase_id.to_string()) {
         return;
     }
     lazy_close_prior_phases(mission_id, phase_order, real_phase_id, closed);
-    let result = crew::lifecycle::phase_start(real_phase_id)
-        .and_then(|_| crew::lifecycle::phase_complete(real_phase_id));
+    let result = crew::lifecycle::phase_start(real_phase_id).and_then(|_| {
+        if producer_errored {
+            crew::lifecycle::phase_abandon(real_phase_id)
+        } else {
+            crew::lifecycle::phase_complete(real_phase_id)
+        }
+    });
     match result {
         Ok(_) => {
             closed.insert(real_phase_id.to_string());
         }
         Err(e) => {
+            let verb = if producer_errored { "abandoning" } else { "completing" };
             eprintln!(
                 "{}",
                 style::dim(&format!(
-                    "mission launch: completing empty phase `{real_phase_id}` failed: {e:#} — \
+                    "mission launch: {verb} empty phase `{real_phase_id}` failed: {e:#} — \
                      continuing; the whole-mission terminal reconciles phase state."
                 ))
             );

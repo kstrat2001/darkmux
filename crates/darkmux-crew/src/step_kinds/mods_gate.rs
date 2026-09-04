@@ -194,7 +194,7 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
         Ok(d) => d,
         Err(reason) => return (None, Some(reason)),
     };
-    let scratch = match tempfile::TempDir::new() {
+    let scratch = match new_scratch_dir() {
         Ok(t) => t,
         Err(e) => return (None, Some(format!("could not create a scratch dir: {e}"))),
     };
@@ -207,11 +207,40 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
         return (None, Some(format!("could not write the mod's kit to a scratch file: {e}")));
     }
 
+    let not_applied = || {
+        (
+            Some(GateOutcome {
+                passed: false,
+                command: command.to_string(),
+                exit_code: None,
+                applied: Some(false),
+                reason: Some("kit did not apply".to_string()),
+            }),
+            None,
+        )
+    };
+
+    // (#2310 P4c-2b PR #2357 round-2 review item 2, proven live) Without
+    // `GIT_CEILING_DIRECTORIES`, `git apply` run from `scratch_checkout`
+    // walks UP looking for a `.git` — if the scratch dir happens to sit
+    // under an AMBIENT git repo (a real risk: `tempfile::TempDir::new()`
+    // uses `$TMPDIR`, which is not always outside every repo on disk),
+    // git resolves the patch against that ambient repo's root instead of
+    // `scratch_checkout`, and `git apply`/`--check` reports SUCCESS while
+    // touching nothing in the checkout at all — reproduced manually: the
+    // exact same patch, same cwd, differs ONLY in this env var, and only
+    // the ceiling'd run actually changes the file. Bounding repo discovery
+    // AT `scratch.path()` (one level above the checkout, where nothing
+    // this kind ever writes a `.git`) means `git` finds no repo at all —
+    // exactly the "operate as a raw patch tool" mode this kind needs.
+    let ceiling = scratch.path().to_string_lossy().to_string();
+
     // `git apply --check` first — a dry run that never touches the
     // checkout, so a kit that fails to apply is detected before anything
     // is mutated.
     let check = std::process::Command::new("git")
         .current_dir(&scratch_checkout)
+        .env("GIT_CEILING_DIRECTORIES", &ceiling)
         .args(["apply", "--check", &patch_path.to_string_lossy()])
         .output();
     let applied_cleanly = match check {
@@ -222,19 +251,21 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
         // (#2310 P4c-2b PR #2357 review MUST FIX A) A kit that does not
         // apply is DATA about the mod, not an infrastructure failure —
         // `passed: false`, `applied: false`, never a skip.
-        return (
-            Some(GateOutcome {
-                passed: false,
-                command: command.to_string(),
-                exit_code: None,
-                applied: Some(false),
-                reason: Some("kit did not apply".to_string()),
-            }),
-            None,
-        );
+        return not_applied();
     }
+
+    // (#2310 P4c-2b PR #2357 round-2 review item 2) A fingerprint BEFORE
+    // the real apply — the backstop for the same failure mode even when
+    // `GIT_CEILING_DIRECTORIES` alone doesn't catch it (a future git
+    // version, a different ambient-repo shape): `git apply` reporting
+    // exit 0 is not proof the checkout changed; comparing the tree itself
+    // is.
+    let Ok(before) = tree_fingerprint(&scratch_checkout) else {
+        return (None, Some("could not fingerprint the scratch checkout before applying".to_string()));
+    };
     let apply = std::process::Command::new("git")
         .current_dir(&scratch_checkout)
+        .env("GIT_CEILING_DIRECTORIES", &ceiling)
         .args(["apply", &patch_path.to_string_lossy()])
         .output();
     match apply {
@@ -243,18 +274,27 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
         // a race on the scratch dir, a disk error) — same "kit did not
         // apply" data outcome, not a skip: the reviewer asked for the
         // kit's OWN applicability to be the signal, and this IS that.
-        Ok(_) | Err(_) => {
-            return (
-                Some(GateOutcome {
-                    passed: false,
-                    command: command.to_string(),
-                    exit_code: None,
-                    applied: Some(false),
-                    reason: Some("kit did not apply".to_string()),
-                }),
-                None,
-            )
-        }
+        Ok(_) | Err(_) => return not_applied(),
+    }
+    let Ok(after) = tree_fingerprint(&scratch_checkout) else {
+        return (None, Some("could not fingerprint the scratch checkout after applying".to_string()));
+    };
+    if before == after {
+        // (#2310 P4c-2b PR #2357 round-2 review item 2, proven live) The
+        // exact reproduction: `git apply` exited 0 but the tree it
+        // reported applying to is byte-identical to before. Never a
+        // false `applied: true` — this IS "the kit did not apply",
+        // stated with the precise reason a reader can act on.
+        return (
+            Some(GateOutcome {
+                passed: false,
+                command: command.to_string(),
+                exit_code: None,
+                applied: Some(false),
+                reason: Some("apply reported success but changed nothing".to_string()),
+            }),
+            None,
+        );
     }
 
     // (#2310 P4c-2b PR #2357 review MUST FIX B) `test_command` runs
@@ -276,6 +316,31 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
             None,
         ),
         Err(e) => (None, Some(format!("could not run the gate command in {}: {e}", scratch_checkout.display()))),
+    }
+}
+
+// (#2310 P4c-2b PR #2357 round-2 review item 2 self-QA) A THREAD-LOCAL
+// test-only override for where the scratch dir lands — never a process
+// env var (`$TMPDIR`). `cargo test`'s default harness spawns a dedicated
+// OS thread per `#[test]` fn, so a thread-local is scoped to exactly the
+// calling test with zero risk of leaking into a CONCURRENT, unrelated
+// test — which mutating `$TMPDIR` (process-global) does NOT give you:
+// the first version of the ambient-git-repo test below did exactly that
+// and intermittently broke `workspace_spec::materialize`'s own git tests
+// running in parallel, since only `#[serial_test::serial]`-tagged tests
+// serialize against EACH OTHER, never against untagged ones.
+thread_local! {
+    static SCRATCH_BASE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Create the scratch dir `gate_one_mod` copies a source checkout into —
+/// under the test-only per-thread override when one is set, `$TMPDIR`
+/// (`tempfile::TempDir::new()`'s own default) otherwise.
+fn new_scratch_dir() -> std::io::Result<tempfile::TempDir> {
+    let base = SCRATCH_BASE_OVERRIDE.with(|cell| cell.borrow().clone());
+    match base {
+        Some(dir) => tempfile::Builder::new().prefix("darkmux-gate-").tempdir_in(dir),
+        None => tempfile::TempDir::new(),
     }
 }
 
@@ -326,6 +391,41 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         // Symlinks: skipped, not followed — a scratch copy used once for
         // one gate run has no need of them, and following one could walk
         // outside `src`.
+    }
+    Ok(())
+}
+
+/// A content fingerprint of a directory tree — every regular file's
+/// path (relative to `dir`) plus its bytes, hashed together in a
+/// deterministic (sorted-path) order. (#2310 P4c-2b PR #2357 round-2
+/// review item 2) The backstop against `git apply` reporting success
+/// while changing nothing: comparing this before/after the real apply is
+/// what actually proves the checkout changed, independent of the
+/// process's own exit code.
+fn tree_fingerprint(dir: &Path) -> std::io::Result<blake3::Hash> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files(dir, &mut files)?;
+    files.sort();
+    let mut hasher = blake3::Hasher::new();
+    for path in files {
+        let rel = path.strip_prefix(dir).unwrap_or(&path);
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&std::fs::read(&path)?);
+        hasher.update(b"\0");
+    }
+    Ok(hasher.finalize())
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_files(&entry.path(), out)?;
+        } else if file_type.is_file() {
+            out.push(entry.path());
+        }
     }
     Ok(())
 }
@@ -640,6 +740,77 @@ mod tests {
         let rec = mods::load_at(mods_dir.path(), "mod-nowd").unwrap().unwrap();
         assert!(rec.gate.is_none(), "a missing workdir must never fabricate a passed:false outcome: {rec:?}");
         assert!(rec.gate_skipped_reason.as_deref().unwrap().contains("does not exist"), "{rec:?}");
+    }
+
+    /// Scopes the thread-local `SCRATCH_BASE_OVERRIDE` (never `$TMPDIR` —
+    /// see that thread-local's own doc for why a process env var would
+    /// race an UNRELATED, concurrently-running test) so a test can force
+    /// `gate_one_mod`'s scratch dir to be created inside a throwaway git
+    /// repo. Safe without any `#[serial_test::serial]` at all: each
+    /// `#[test]` fn gets its own OS thread from `cargo test`'s default
+    /// harness, so this thread-local can never leak into another test.
+    struct ScratchBaseGuard;
+    impl ScratchBaseGuard {
+        fn set(p: &std::path::Path) -> Self {
+            SCRATCH_BASE_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(p.to_path_buf()));
+            Self
+        }
+    }
+    impl Drop for ScratchBaseGuard {
+        fn drop(&mut self) {
+            SCRATCH_BASE_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    /// (#2310 P4c-2b PR #2357 round-2 review item 2, proven live) Manual
+    /// repro: the SAME `git apply <patch>` invocation, same cwd, run once
+    /// with no env override and once with `GIT_CEILING_DIRECTORIES` set —
+    /// both exit 0, but ONLY the ceiling'd run actually changes the file.
+    /// Without `GIT_CEILING_DIRECTORIES` (and now the fingerprint
+    /// backstop), a scratch checkout nested inside an ambient git repo
+    /// (a REAL risk: `tempfile::TempDir::new()` uses `$TMPDIR`, not
+    /// guaranteed to sit outside every repo on disk) would report
+    /// `applied: true` while the checkout was never actually patched —
+    /// the exact false-positive this test forces by pointing the scratch
+    /// dir's base at a throwaway `git init`'d directory.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_MODS_DIR, a process-global
+    fn a_scratch_dir_inside_an_ambient_git_repo_still_gates_on_a_real_change() {
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+
+        let ambient_repo = TempDir::new().unwrap();
+        let init = std::process::Command::new("git").current_dir(ambient_repo.path()).args(["init", "-q"]).output();
+        if init.as_ref().map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("skipping: `git init` unavailable in this environment");
+            return;
+        }
+        // Force `gate_one_mod`'s own scratch dir to be created INSIDE the
+        // ambient repo for this test only (thread-local — see the guard's
+        // own doc for why this is safe against concurrent tests).
+        let _scratch_base_guard = ScratchBaseGuard::set(ambient_repo.path());
+
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        let kit = one_line_kit("wrong", "right");
+        mods::materialize(mods_dir.path(), &a_mod_kit("mod-ambient", "sess-a/9", &kit, Some("unified-diff"))).unwrap();
+
+        ModsGateStepKind
+            .run(
+                &step(json!({
+                    "for_key": "sess-a/9",
+                    "test_command": "grep -q right answer.txt",
+                    "workdir": tree_root.to_string_lossy(),
+                })),
+                &task(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        let rec = mods::load_at(mods_dir.path(), "mod-ambient").unwrap().unwrap();
+        let gate = rec.gate.as_ref().unwrap_or_else(|| panic!("expected a real gate outcome: {rec:?}"));
+        assert!(gate.passed, "the checkout must have been genuinely patched and tested: {gate:?}");
+        assert_eq!(gate.applied, Some(true));
+        assert!(gate.reason.is_none(), "{gate:?}");
     }
 
     #[test]

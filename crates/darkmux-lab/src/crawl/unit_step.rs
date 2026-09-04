@@ -1417,6 +1417,18 @@ pub struct CrawlSummary {
     /// the retired launcher's close payload used; this is the roster.
     #[serde(default)]
     pub finding_refs: Vec<FindingRef>,
+    /// (#2310 P4c-2b PR #2357 round-2 review item 5) Rule ids (falling
+    /// back to the step id when a rule can't be named) whose `crawl.plan`
+    /// step did NOT reach `Complete` this run. `crawl.json` shares
+    /// `src/mission_launch.rs::grow_phase` with `review-v2.json`: since
+    /// that function stopped `bail!`ing the whole launch on an errored
+    /// grow producer (#2310 P4c-2b MUST FIX C) and instead grows zero
+    /// units from the affected rule, a crawl whose plan step failed now
+    /// reaches `summarize` with a SILENTLY smaller `units_in_plan` and no
+    /// way to tell "the rule matched nothing" from "the rule's plan
+    /// step crashed". This field is that distinction, named.
+    #[serde(default)]
+    pub plans_errored: Vec<String>,
 }
 
 /// The source identity a summary reports — id + the sha it was cut at.
@@ -1431,7 +1443,7 @@ pub struct PlanSourceRef {
 }
 
 /// [`CrawlSummary`]'s own schema version.
-pub const CRAWL_SUMMARY_SCHEMA_VERSION: &str = "1.1";
+pub const CRAWL_SUMMARY_SCHEMA_VERSION: &str = "1.2";
 
 /// Build the crawl's run totals from what this mission's `crawl.unit`
 /// steps recorded, plus what its `plan/` directory planned.
@@ -1447,10 +1459,26 @@ pub const CRAWL_SUMMARY_SCHEMA_VERSION: &str = "1.1";
 pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
     let run_dir = darkmux_crew::loader::missions_dir().join(mission_id);
     let mut rows: Vec<UnitOutcome> = Vec::new();
+    // (#2310 P4c-2b PR #2357 round-2 review item 5) Every `crawl.plan`
+    // step that did NOT reach `Complete` — see `CrawlSummary::
+    // plans_errored`'s own doc for why this is named separately from
+    // "units_in_plan" silently shrinking.
+    let mut plans_errored: Vec<String> = Vec::new();
 
     let phases = darkmux_crew::loader::load_phases().context("loading phase records to find the run's units")?;
     for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
         let Ok(steps) = darkmux_crew::lifecycle::load_steps_for_phase(mission_id, &phase.id) else { continue };
+        for step in steps.iter().filter(|s| s.kind == crate::crawl::plan_step::CRAWL_PLAN_KIND) {
+            if step.status != darkmux_crew::types::NodeStatus::Complete {
+                let rule = step
+                    .config
+                    .get("rule")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| step.id.clone());
+                plans_errored.push(rule);
+            }
+        }
         for step in steps.iter().filter(|s| s.kind == CRAWL_UNIT_KIND) {
             // (#2301 review, MUST FIX) Branch on STATUS, not on whether an
             // output is present. The scheduler writes a failing kind's own
@@ -1533,6 +1561,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         sources,
         finding_refs: rows.iter().flat_map(|r| r.finding_refs.iter().cloned()).collect(),
         units: rows,
+        plans_errored,
     })
 }
 

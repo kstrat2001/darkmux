@@ -5541,6 +5541,7 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
 fn review_v2_real_launch_survives_a_plan_phase_error_and_still_delivers() {
     let workdir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
     // Deliberately a path that does not exist — `workspace_spec::
     // materialize` fails on it, so `plan-swallowed-error-step` (a STATIC,
     // always-minted task — not a grow template) ends `Error`.
@@ -5569,6 +5570,7 @@ fn review_v2_real_launch_survives_a_plan_phase_error_and_still_delivers() {
     let out = Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args([
             "mission",
@@ -5600,6 +5602,32 @@ fn review_v2_real_launch_survives_a_plan_phase_error_and_still_delivers() {
     assert!(
         body.contains("Not attempted:") && body.contains("swallowed-error"),
         "the scope line must name the rule whose plan step failed: {payload}"
+    );
+
+    // (#2310 P4c-2b PR #2357 round-2 review item 3) The `review` phase
+    // owns `unit-swallowed-error`'s grow template, whose producer
+    // (`plan-swallowed-error`) errored — the phase must close `Abandoned`,
+    // never `Complete` ("nothing failed" would be a lie here), and the
+    // `mission.grow` record for that template must carry the DISTINCT
+    // `producer_errored` reason, never the legit-zero `grew_nothing`.
+    let mission_dir = one_mission_dir(&home);
+    let mission_id = mission_dir.file_name().unwrap().to_string_lossy().to_string();
+    let review_phase = phase_record(&mission_dir, &format!("{mission_id}-review"));
+    assert_eq!(
+        review_phase["status"],
+        serde_json::json!("abandoned"),
+        "a phase whose grow producer errored must close Abandoned, not Complete: {review_phase}"
+    );
+
+    let grow_records: Vec<serde_json::Value> = flow_actions(&flows)
+        .into_iter()
+        .filter(|r| r["action"] == serde_json::json!("mission.grow") && r["payload"]["task_template"] == serde_json::json!("unit-swallowed-error"))
+        .collect();
+    assert!(!grow_records.is_empty(), "no mission.grow record for unit-swallowed-error's template");
+    assert!(
+        grow_records.iter().any(|r| r["payload"]["reason"] == serde_json::json!("producer_errored")
+            && r["payload"]["producer_step"].as_str().is_some_and(|s| s.contains("plan-swallowed-error"))),
+        "expected a producer_errored mission.grow record naming the plan step: {grow_records:?}"
     );
 }
 

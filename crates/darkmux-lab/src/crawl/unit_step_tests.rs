@@ -847,6 +847,41 @@ fn the_summary_reads_the_runs_own_plan_files_for_what_was_planned() {
     assert_eq!(s.est_tokens, 400);
     assert_eq!(s.workspace, "fixture-ws");
     assert_eq!(s.sources[0].id, "app");
+    assert!(s.plans_errored.is_empty(), "a clean plan step names nothing errored: {:?}", s.plans_errored);
+}
+
+/// (#2310 P4c-2b PR #2357 round-2 review item 5) `crawl.json` shares
+/// `src/mission_launch.rs::grow_phase` with `review-v2.json` — since that
+/// function now grows zero units from an errored plan step's rule rather
+/// than aborting the whole launch (MUST FIX C), a crawl run reaches
+/// `summarize` with a silently smaller `units_in_plan` unless the summary
+/// NAMES the rule whose `crawl.plan` step failed. Proven here directly
+/// against `summarize_mission`, independent of the launcher.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn the_summary_names_the_rule_whose_plan_step_errored() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    darkmux_crew::lifecycle::save_step(
+        MISSION,
+        PHASE,
+        &Step {
+            id: "plan-swallowed-error-step".into(),
+            task_id: "plan-swallowed-error".into(),
+            kind: crate::crawl::plan_step::CRAWL_PLAN_KIND.into(),
+            gate: None,
+            status: NodeStatus::Error,
+            config: serde_json::json!({ "rule": "swallowed-error" }),
+            started_ts: None,
+            completed_ts: None,
+            output: Some("workspace_spec::materialize failed: no such source".into()),
+        },
+    )
+    .unwrap();
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.plans_errored, vec!["swallowed-error".to_string()], "{:?}", s.plans_errored);
 }
 
 // ── the kinds through the REAL scheduler (#2301 review) ──────────────────

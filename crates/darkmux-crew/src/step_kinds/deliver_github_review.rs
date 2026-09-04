@@ -925,6 +925,24 @@ mod tests {
         assert!(out.review.is_none());
     }
 
+    /// (#2310 P4c-2b PR #2357 round-2 review item 4) A UNIT-level pin on
+    /// `render_github_review` itself — before this test, only the two
+    /// real-launch CLI tests exercised the `noop`/`degraded` branch,
+    /// neither of which calls this function directly. Zero findings/mods
+    /// but a non-empty `scope.errored` must render `mode: "degraded"`
+    /// with a review body carrying the scope line (never `"noop"`, never
+    /// `review: None`).
+    #[test]
+    fn an_errored_scope_with_nothing_to_say_is_degraded_not_noop() {
+        let scope = DeliverScope { errored: vec!["unit `x` (Error)".to_string()], ..Default::default() };
+        let out = render_github_review(&[], &[], DIFF, &scope, None);
+        assert_eq!(out.mode, "degraded", "{out:?}");
+        let review = out.review.expect("a degraded outcome still carries a review payload (the scope line)");
+        assert!(review.comments.is_empty(), "{review:?}");
+        assert!(review.body.contains("review ran:"), "the scope line must be present: {}", review.body);
+        assert!(review.body.contains("Errored: unit `x` (Error)."), "{}", review.body);
+    }
+
     #[test]
     fn line_touched_mutation_kill_a_context_line_counts_same_as_an_added_line() {
         // (#2310 P4b self-QA) The suggestion-vs-patch branch hinges on
