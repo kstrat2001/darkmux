@@ -30,11 +30,17 @@ const PREVIEW_CHARS: usize = 100;
 /// Every call mints a NEW key. Idempotence is deliberately not a goal: two
 /// agents proposing for one finding at different times are two mods, and a
 /// finding-derived key would have made the second overwrite the first.
+#[allow(clippy::too_many_arguments)]
 pub fn create(
     by: &str,
     for_keys: &[String],
     kit_source: Option<&str>,
     attachments: &[PathBuf],
+    // (#2310 P4b review, M-B) `--kit-kind` — an optional, proposer-declared
+    // hint at the kit's shape (`"unified-diff"` is the one a consumer
+    // recognizes today). Threaded straight through to `ModRecord::
+    // kit_kind`, unvalidated — see that field's own doc.
+    kit_kind: Option<&str>,
     json: bool,
 ) -> Result<i32> {
     let root = config_access::mods_dir();
@@ -61,6 +67,7 @@ pub fn create(
         for_keys,
         kit.as_deref(),
         attachments,
+        kit_kind,
     )?;
 
     let path = mods::record_path_at(&root, &rec.key);
@@ -188,6 +195,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     println!("mod       {}", rec.key);
     println!("recorded  {}", rec.ts);
     println!("by        {}", rec.by);
+    println!("kind      {}", rec.kit_kind.as_deref().unwrap_or("(untyped)"));
     if rec.r#for.is_empty() {
         println!("for       (none)");
     } else {

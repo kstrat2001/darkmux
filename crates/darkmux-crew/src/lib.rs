@@ -17,6 +17,11 @@
 // Packet 2's `run_step_graph` scheduler is the intended first consumer.
 pub mod brief_refs;
 pub mod concurrent_dispatch;
+/// Unified-diff parsing (#2310 P4b) — moved down from `darkmux-lab`'s
+/// `bundle::diff` so both the lab bundler and this crate's own
+/// `deliver_github_review` step kind share ONE parser instead of two. See
+/// this module's own doc.
+pub mod diff;
 // (#849 / #1426) The persisted adjudication corrections — darkmux's second
 // memory kind. Read-only by construction: the review path records them as flow
 // notes, so there is nothing to author here. Shared by the coder-brief

@@ -7,6 +7,7 @@
 
 use darkmux_crew::workspace_spec::{glob, Materialized, MaterializedSource};
 use darkmux_crew::rules::{Rule, RuleKind};
+use darkmux_crew::step_kinds::patterns::plan_sites;
 use crate::crawl::semver::{prerelease_tag, range_admits};
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -703,6 +704,41 @@ fn compute_totals(
     }
 }
 
+/// A [`plan_sites::SiteSource`] over a workspace tree walk: every line of
+/// every file the rule's `applies_to`/`exclude` admits is a candidate
+/// (#2310 P4b) — exactly what `collect_site_units` tested inline before
+/// this existed. Borrows the SAME `SourceFiles` cache + `skipped` ledger
+/// every other rule pass over this source shares, so a file two rules both
+/// match is still read from disk only once.
+struct TreeSource<'a> {
+    rule: &'a Rule,
+    files: &'a mut SourceFiles,
+    skipped: &'a mut Vec<SkippedEntry>,
+    source_id: &'a str,
+}
+
+impl plan_sites::SiteSource for TreeSource<'_> {
+    fn files(&mut self) -> Result<Vec<plan_sites::SiteSourceFile>> {
+        let matching = self.files.matching(&self.rule.applies_to, &self.rule.exclude);
+        let mut out = Vec::with_capacity(matching.len());
+        for rel in matching {
+            let Some(content) = self.files.get(&rel, self.skipped, self.source_id) else { continue };
+            let total = content.lines().count();
+            out.push(plan_sites::SiteSourceFile { file: rel, content, candidates: (1..=total).collect() });
+        }
+        Ok(out)
+    }
+}
+
+/// `site`-kind rules: rules × source → windows → units, delegated to the
+/// Tier 2 pattern (#2310 P4b, `crates/darkmux-crew/src/step_kinds/
+/// patterns/plan_sites.rs`) via [`TreeSource`] — every candidate line is
+/// the whole file, so this is exactly `collect_site_units`'s pre-#2310-P4b
+/// behavior, byte-identical (see `crawl_plan_golden.rs`): `max_span_lines:
+/// None` means a merged span is never split, and the early return on an
+/// empty prefilter (never even reads a file) is preserved here rather than
+/// pushed into the pattern, which has no opinion on what "empty" means for
+/// a caller it doesn't know.
 fn collect_site_units(
     rule: &Rule,
     source: &MaterializedSource,
@@ -719,58 +755,224 @@ fn collect_site_units(
         .iter()
         .map(|p| Regex::new(p).with_context(|| format!("compiling prefilter for rule '{}': {p}", rule.id)))
         .collect::<Result<_>>()?;
-    let window = rule.window_or_default();
-    let matching = files.matching(&rule.applies_to, &rule.exclude);
-
-    let mut batch: Vec<(Site, usize)> = Vec::new();
-    for rel in matching {
-        let Some(text) = files.get(&rel, skipped, &source.id) else { continue };
-        let lines: Vec<&str> = text.lines().collect();
-        let total = lines.len();
-        let mut hits = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if regexes.iter().any(|re| re.is_match(line)) {
-                hits.push(i + 1);
-            }
-        }
-        if hits.is_empty() {
-            continue;
-        }
-        for (s, e, first, hit_list) in merge_windows(&hits, window, total) {
-            let tokens = estimate_tokens(&window_text(&lines, s, e));
-            batch.push((Site { file: rel.clone(), line: first, start: s, end: e, hits: hit_list }, tokens));
-        }
-    }
-
-    let mut out = Vec::new();
-    let mut cur_sites: Vec<Site> = Vec::new();
-    let mut cur_tokens = 0usize;
-    for (site, tok) in batch {
-        let would_exceed_count = cur_sites.len() + 1 > params.max_sites_per_unit;
-        let would_exceed_tokens = !cur_sites.is_empty() && cur_tokens + tok > params.max_est_tokens_per_unit;
-        if !cur_sites.is_empty() && (would_exceed_count || would_exceed_tokens) {
-            out.push(Unit::Site {
-                id: next_unit_id(unit_seq),
-                rule: rule.id.clone(),
-                source: source.id.clone(),
-                sites: std::mem::take(&mut cur_sites),
-                est_tokens: cur_tokens,
-            });
-            cur_tokens = 0;
-        }
-        cur_sites.push(site);
-        cur_tokens += tok;
-    }
-    if !cur_sites.is_empty() {
-        out.push(Unit::Site {
+    let mut tree_source = TreeSource { rule, files, skipped, source_id: &source.id };
+    let planned = plan_sites::plan_site_units(
+        &mut tree_source,
+        &|line| regexes.iter().any(|re| re.is_match(line)),
+        &plan_sites::SiteUnitParams {
+            window: rule.window_or_default(),
+            max_sites_per_unit: params.max_sites_per_unit,
+            max_est_tokens_per_unit: params.max_est_tokens_per_unit,
+            max_span_lines: None,
+        },
+        &estimate_tokens,
+    )?;
+    Ok(planned
+        .into_iter()
+        .map(|u| Unit::Site {
             id: next_unit_id(unit_seq),
             rule: rule.id.clone(),
             source: source.id.clone(),
-            sites: cur_sites,
-            est_tokens: cur_tokens,
-        });
+            sites: u
+                .sites
+                .into_iter()
+                .map(|s| Site { file: s.file, line: s.line, start: s.start, end: s.end, hits: s.hits })
+                .collect(),
+            est_tokens: u.est_tokens,
+        })
+        .collect())
+}
+
+/// The default cap on one diff-derived merged span's width, in lines
+/// (#2310 P4b) — see `plan_sites`'s `SiteUnitParams::max_span_lines` doc
+/// for why a diff needs a cap a tree walk never did: a rule declaring
+/// `prefilter: none` (DESIGN.md "A rule is a procedure") makes every line
+/// of a hunk a hit, so without a cap the whole hunk always merges into one
+/// unbounded site. `2 * DEFAULT_WINDOW + 1` (61 lines) mirrors the width a
+/// single prefilter hit would get from `Rule::window_or_default()` at its
+/// own default — the same "how much should one site show" intuition,
+/// applied to a hunk instead of a hit. A rule's own `window` scaling this
+/// cap per-rule (the way it scales everything else about a site's width)
+/// is a review plan step's job — #2310 P4c, not built here; this constant
+/// is what that step's `plan_sites::SiteUnitParams::max_span_lines` reads
+/// until it does.
+///
+/// `#[allow(dead_code)]`: exercised by this module's own `diff_source_*`
+/// tests (see `crates/darkmux-lab/tests`'s clippy run under `cargo test`,
+/// where `cfg(test)` roots it) but has no NON-test caller yet — #2310 P4c
+/// is that caller. Same reasoning on [`DiffSource`] below.
+#[allow(dead_code)]
+const DEFAULT_DIFF_SPAN_CAP: usize = 2 * darkmux_crew::rules::DEFAULT_WINDOW + 1;
+
+/// A [`plan_sites::SiteSource`] over a unified diff's hunks (#2310 P4b) —
+/// every line a hunk touches (added AND context, matching
+/// `bundle::diff::Hunk::new_lines`) is a candidate, mirroring
+/// `TreeSource`'s "every line of the file" for a tree walk. See DESIGN.md
+/// "Code review as a second config on the crawl's building blocks":
+/// "Hunks are natural windows. No prefilter is needed to find sites; every
+/// hunk is a bounded site of the right size for a small seat."
+///
+/// Reads file CONTENT through the same `SourceFiles` cache `TreeSource`
+/// does — DESIGN.md: "The tree is the confirmation surface" — the diff
+/// says WHERE to look; the checked-out tree (at the diff's own head) says
+/// what a window actually contains, including context beyond the hunk. A
+/// caller therefore still needs a materialized workspace at the diff's
+/// `head_sha`, not just the diff text.
+///
+/// `sha`/`ref` are deliberately NOT this struct's concern: DESIGN.md says
+/// those "come from the launch inputs `head_sha`/`github` or the diff
+/// file's own header" — that resolution belongs to whatever builds the
+/// `MaterializedSource`/`PlanSource` a review plan step passes in, same as
+/// `TreeSource` never resolves its own `sha` either (`resolved()` in this
+/// module's own tests, or `workspace_spec::materialize` for a real run).
+///
+/// Not yet wired into `plan()`/`plan_with_params` — no caller exists until
+/// a review plan step is built (#2310 P4c). Usable standalone today (see
+/// this module's `diff_source` tests), and is exactly what that future
+/// step will construct.
+///
+/// `#[allow(dead_code)]`: exercised by this module's own `diff_source_*`
+/// tests (`cfg(test)` roots it there) but has no non-test caller yet — see
+/// [`DEFAULT_DIFF_SPAN_CAP`]'s doc for the same note.
+#[allow(dead_code)]
+struct DiffSource<'a> {
+    files: &'a mut SourceFiles,
+    skipped: &'a mut Vec<SkippedEntry>,
+    source_id: &'a str,
+    /// path -> {new-side line number -> the diff's OWN expected text at
+    /// that line} — the union of every hunk's `new_lines`/`new_block` for
+    /// that path, zipped by position (`new_block[i]` is the content of
+    /// line `new_start + i`; both are built from the SAME sequential walk
+    /// over context+added lines in `parse_diff`, so the correlation holds
+    /// without `Hunk` needing to store it explicitly). The expected TEXT
+    /// is what makes the M-C consistency check below possible — not just
+    /// candidate line numbers, but what the diff itself says those lines
+    /// should read.
+    by_file: BTreeMap<String, BTreeMap<u32, String>>,
+    /// Files this source's tree has that the diff never mentions AT ALL —
+    /// counted like `Materialized.out_of_scope` (#1959): a number, never
+    /// a list.
+    out_of_scope: usize,
+    /// (#2310 P4b review, CONSIDER) Files the diff mentions (its own
+    /// `diff --git a/<old> b/<new>` header) but produced NO hunks for — a
+    /// pure rename or a binary file, neither of which `bundle::diff::
+    /// parse_diff` sees (it reacts only to `+++`/`@@` lines, and neither
+    /// shape has either). Counted separately from `out_of_scope`: the diff
+    /// DID touch these, there is simply nothing to plan a site from.
+    diff_entries_without_hunks: usize,
+}
+
+#[allow(dead_code)]
+impl<'a> DiffSource<'a> {
+    /// Parses `diff_text` once at construction (`bundle::diff::parse_diff`
+    /// — the SAME unified-diff parser the review bundler already uses, not
+    /// a second one) and computes `out_of_scope` against `files.all` (the
+    /// tree's own already-spec-filtered file list) up front, so both are
+    /// cheap reads afterward rather than re-derived per call.
+    fn new(files: &'a mut SourceFiles, skipped: &'a mut Vec<SkippedEntry>, source_id: &'a str, diff_text: &str) -> Self {
+        let parsed = crate::lab::bundle::diff::parse_diff(diff_text);
+        let mut by_file: BTreeMap<String, BTreeMap<u32, String>> = BTreeMap::new();
+        for (path, hunks) in &parsed {
+            let entry = by_file.entry(path.clone()).or_default();
+            for h in hunks {
+                // `new_block[i]` is line `new_start + i` — both are built
+                // from the same sequential context/added walk in
+                // `parse_diff`, so this zip is exact, not an assumption
+                // about hunk shape.
+                for (offset, text) in h.new_block.iter().enumerate() {
+                    entry.insert(h.new_start + offset as u32, text.clone());
+                }
+            }
+        }
+        let mentioned = diff_git_header_paths(diff_text);
+        let out_of_scope =
+            files.all.iter().filter(|f| !by_file.contains_key(f.as_str()) && !mentioned.contains(f.as_str())).count();
+        let diff_entries_without_hunks =
+            files.all.iter().filter(|f| !by_file.contains_key(f.as_str()) && mentioned.contains(f.as_str())).count();
+        Self { files, skipped, source_id, by_file, out_of_scope, diff_entries_without_hunks }
     }
-    Ok(out)
+
+    /// Files this source's tree has that the diff never MENTIONS at all —
+    /// counted, never enumerated (#1959's own `Materialized.out_of_scope`
+    /// rule, applied here to "not in the diff" instead of "spec-excluded").
+    /// A future review plan step reads this to populate `PlanSource.
+    /// out_of_scope` the same way `plan()` already does for
+    /// `materialized.out_of_scope`.
+    fn out_of_scope(&self) -> usize {
+        self.out_of_scope
+    }
+
+    /// (#2310 P4b review, CONSIDER) Files the diff mentions with no hunks
+    /// (a pure rename, a binary file) — see the field's own doc for why
+    /// these are not `out_of_scope`.
+    fn diff_entries_without_hunks(&self) -> usize {
+        self.diff_entries_without_hunks
+    }
+}
+
+/// Every path a unified diff mentions via its own `diff --git a/<old>
+/// b/<new>` header, whether or not it produced any hunks (#2310 P4b
+/// review, CONSIDER) — see [`DiffSource`]'s `diff_entries_without_hunks`
+/// field doc. Kept local to this module rather than folded into the
+/// shared `crate::diff` parser: no existing `bundle::diff` consumer needs
+/// "which paths a diff mentions with no hunks", only this accounting does.
+fn diff_git_header_paths(diff_text: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for ln in diff_text.lines() {
+        if let Some(rest) = ln.strip_prefix("diff --git a/") {
+            if let Some(idx) = rest.find(" b/") {
+                out.insert(rest[idx + 3..].to_string());
+            }
+        }
+    }
+    out
+}
+
+impl plan_sites::SiteSource for DiffSource<'_> {
+    /// (#2310 P4b review, M-C) `DiffSource` reads WHERE from the diff and
+    /// WHAT from the tree — two independent sources that can disagree
+    /// (the wrong sha checked out, a stale mirror, the diff cut against a
+    /// branch the tree isn't on). Silently trusting the diff's line
+    /// numbers against whatever the tree happens to hold would plan sites
+    /// with a window that doesn't match the code it claims to show. Every
+    /// file gets its tree content checked against the diff's OWN recorded
+    /// text at each of that hunk's new-side lines before it's ever
+    /// windowed; the first disagreement (or a diff path the tree doesn't
+    /// have at all) becomes a `SkippedEntry` naming the file and the line,
+    /// and that file contributes NO candidates — loud, not silently
+    /// dropped.
+    fn files(&mut self) -> Result<Vec<plan_sites::SiteSourceFile>> {
+        let mut out = Vec::with_capacity(self.by_file.len());
+        for (rel, expected) in &self.by_file {
+            if !self.files.all.iter().any(|f| f == rel) {
+                self.skipped.push(SkippedEntry {
+                    reason: "the diff names this file but the checked-out tree does not have it — wrong sha, or a rename the diff doesn't show?"
+                        .to_string(),
+                    file: rel.clone(),
+                    source: Some(self.source_id.to_string()),
+                });
+                continue;
+            }
+            let Some(content) = self.files.get(rel, self.skipped, self.source_id) else { continue };
+            let lines: Vec<&str> = content.lines().collect();
+            let mismatch = expected.iter().find(|(&line_no, text)| {
+                lines.get(line_no as usize - 1).copied() != Some(text.as_str())
+            });
+            if let Some((line_no, _)) = mismatch {
+                self.skipped.push(SkippedEntry {
+                    reason: format!(
+                        "the checked-out tree disagrees with the diff at line {line_no} — this looks like the wrong checkout (a different sha than the diff was cut against)"
+                    ),
+                    file: rel.clone(),
+                    source: Some(self.source_id.to_string()),
+                });
+                continue;
+            }
+            let candidates: Vec<usize> = expected.keys().map(|&n| n as usize).collect();
+            out.push(plan_sites::SiteSourceFile { file: rel.clone(), content, candidates });
+        }
+        Ok(out)
+    }
 }
 
 fn collect_read_units(
@@ -1438,6 +1640,218 @@ mod tests {
         assert_eq!(sites.len(), 5);
     }
 
+    /// (#2310 P4b) The review-conformance diff fixture's post-image
+    /// content, reconstructed by hand from `tests/fixtures/
+    /// review-conformance/diff.patch`'s own `+`/context lines — DiffSource
+    /// reads through the checked-out TREE (DESIGN.md: "the tree is the
+    /// confirmation surface"), so a test needs the tree at the diff's
+    /// head, not just the diff text. `docs/setup.md` and `src/config.ts`
+    /// are also touched by the fixture diff; `src/untouched.ts` is not —
+    /// the file `out_of_scope` must count.
+    fn diff_fixture_tree(dir: &Path) {
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("docs")).unwrap();
+        fs::write(
+            dir.join("src/billing.ts"),
+            "function computeTotal(start) {\n  const end = start.plus(30)\n  return end\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/auth.ts"),
+            "function checkAccess(user) {\n  if (user.role = \"admin\") {\n    return true\n  }\n",
+        )
+        .unwrap();
+        fs::write(dir.join("docs/setup.md"), "# Setup\nA new heading appears here\nmore docs\n").unwrap();
+        fs::write(
+            dir.join("src/config.ts"),
+            "function loadPort(env) {\n  const port = env.PORT + 1\n  return port\n}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("src/untouched.ts"), "export const x = 1;\n").unwrap();
+    }
+
+    fn diff_fixture_text() -> String {
+        fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/review-conformance/diff.patch"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn diff_source_yields_exactly_the_diffs_hunks_as_candidates_with_correct_line_ranges() {
+        let dir = TempDir::new().unwrap();
+        diff_fixture_tree(dir.path());
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
+        let diff_text = diff_fixture_text();
+        let mut source = DiffSource::new(&mut files, &mut skipped, "app", &diff_text);
+
+        let mut got = plan_sites::SiteSource::files(&mut source).unwrap();
+        got.sort_by(|a, b| a.file.cmp(&b.file));
+        let names: Vec<&str> = got.iter().map(|f| f.file.as_str()).collect();
+        assert_eq!(names, vec!["docs/setup.md", "src/auth.ts", "src/billing.ts", "src/config.ts"], "{names:?}");
+        // 4 files, exactly what the diff touched — `src/untouched.ts` never
+        // appears, whether or not it exists in the tree.
+        assert_eq!(got.len(), 4);
+
+        let billing = got.iter().find(|f| f.file == "src/billing.ts").unwrap();
+        assert_eq!(billing.candidates, vec![1, 2, 3, 4], "context + added lines, the whole hunk's span");
+        let setup = got.iter().find(|f| f.file == "docs/setup.md").unwrap();
+        assert_eq!(setup.candidates, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn diff_source_counts_a_file_the_diff_never_touched_as_out_of_scope() {
+        let dir = TempDir::new().unwrap();
+        diff_fixture_tree(dir.path());
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
+        let diff_text = diff_fixture_text();
+        let source = DiffSource::new(&mut files, &mut skipped, "app", &diff_text);
+        // Exactly one file in the tree (`src/untouched.ts`) is absent from
+        // the diff's 4 touched paths — never enumerated, only counted.
+        assert_eq!(source.out_of_scope(), 1);
+    }
+
+    #[test]
+    fn diff_source_skips_a_file_whose_tree_content_disagrees_with_the_diff() {
+        // (#2310 P4b review, M-C MUST FIX) `DiffSource` reads WHERE from
+        // the diff and WHAT from the tree — a tree checked out at the
+        // WRONG sha (here: one line SHORTER than the hunk expects, so its
+        // line 3 doesn't exist at all) must be refused loudly, not
+        // silently planned against a window that doesn't match the code
+        // it claims to show.
+        let dir = TempDir::new().unwrap();
+        // The tree is missing "line three" — one line short of what the
+        // diff's hunk (new-side lines 1-3) expects.
+        std::fs::write(dir.path().join("x.ts"), "line one
+line two
+").unwrap();
+        let diff_text = [
+            "diff --git a/x.ts b/x.ts",
+            "--- a/x.ts",
+            "+++ b/x.ts",
+            "@@ -1,2 +1,3 @@",
+            " line one",
+            "+line two",
+            " line three",
+            "",
+        ]
+        .join("
+");
+
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
+        let mut source = DiffSource::new(&mut files, &mut skipped, "app", &diff_text);
+        let out = plan_sites::SiteSource::files(&mut source).unwrap();
+        assert!(out.is_empty(), "a disagreeing file contributes NO candidates, got {} files", out.len());
+        assert_eq!(skipped.len(), 1, "the disagreement is COUNTED, not silently dropped: {skipped:?}");
+        assert_eq!(skipped[0].file, "x.ts");
+        assert!(skipped[0].reason.contains('3'), "names the first mismatching line: {}", skipped[0].reason);
+    }
+
+    #[test]
+    fn diff_source_counts_a_pure_rename_separately_from_out_of_scope() {
+        // (#2310 P4b review, CONSIDER) A pure rename (or a binary file)
+        // has a `diff --git` header and NO hunks at all — `parse_diff`
+        // never sees it (it reacts only to `+++`/`@@`). It must not be
+        // miscounted as `out_of_scope` (the diff DID mention it), but it
+        // also isn't a normal touched file (nothing to plan a site from).
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("new_name.ts"), "export const x = 1;
+").unwrap();
+        std::fs::write(dir.path().join("untouched.ts"), "export const y = 1;
+").unwrap();
+        let diff_text = [
+            "diff --git a/old_name.ts b/new_name.ts",
+            "similarity index 100%",
+            "rename from old_name.ts",
+            "rename to new_name.ts",
+            "",
+        ]
+        .join("
+");
+
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
+        let source = DiffSource::new(&mut files, &mut skipped, "app", &diff_text);
+        assert_eq!(source.diff_entries_without_hunks(), 1, "the rename target, counted separately");
+        assert_eq!(source.out_of_scope(), 1, "only `untouched.ts` — the diff never mentions it at all");
+    }
+
+    #[test]
+    fn diff_source_with_a_prefilter_windows_a_hit_inside_a_hunk_like_a_tree_walk_hit() {
+        // (#2310 P4b) A review rule that DOES declare a prefilter runs it
+        // over the hunk's candidate lines exactly like `TreeSource` runs
+        // one over a file's lines — same `plan_sites::plan_site_units`
+        // call, same window/merge behavior, only the candidate SET differs.
+        let dir = TempDir::new().unwrap();
+        diff_fixture_tree(dir.path());
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
+        let diff_text = diff_fixture_text();
+        let mut source = DiffSource::new(&mut files, &mut skipped, "app", &diff_text);
+
+        let is_hit = |line: &str| line.contains("role");
+        let out = plan_sites::plan_site_units(
+            &mut source,
+            &is_hit,
+            &plan_sites::SiteUnitParams {
+                window: 1,
+                max_sites_per_unit: 40,
+                max_est_tokens_per_unit: 16_000,
+                max_span_lines: Some(DEFAULT_DIFF_SPAN_CAP),
+            },
+            &estimate_tokens,
+        )
+        .unwrap();
+        let sites: Vec<&plan_sites::PlannedSite> = out.iter().flat_map(|u| u.sites.iter()).collect();
+        assert_eq!(sites.len(), 1, "only auth.ts's line 2 matches 'role': {sites:?}");
+        assert_eq!(sites[0].file, "src/auth.ts");
+        assert_eq!((sites[0].start, sites[0].end, sites[0].line), (1, 3, 2), "windowed +/-1 around the hit");
+    }
+
+    #[test]
+    fn diff_source_with_no_prefilter_makes_every_hunk_a_site_and_a_hunk_longer_than_the_cap_splits() {
+        // (#2310 P4b, DESIGN.md "Rules may declare prefilter: none so every
+        // hunk is a site... a hunk with more lines than the window becomes
+        // several sites") — a synthetic diff with one 12-line hunk in one
+        // file, capped at 4 lines, must split into 3 sites (4, 4, 4) and
+        // must NOT lose or duplicate a single line across the split.
+        let dir = TempDir::new().unwrap();
+        let mut post_image = Vec::new();
+        for n in 1..=12 {
+            post_image.push(format!("line{n}"));
+        }
+        fs::write(dir.path().join("wide.ts"), post_image.join("\n") + "\n").unwrap();
+
+        let mut diff = vec!["diff --git a/wide.ts b/wide.ts".to_string(), "--- a/wide.ts".to_string(), "+++ b/wide.ts".to_string(), "@@ -1,12 +1,12 @@".to_string()];
+        for n in 1..=12 {
+            diff.push(format!(" line{n}"));
+        }
+        let diff_text = diff.join("\n") + "\n";
+
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
+        let mut source = DiffSource::new(&mut files, &mut skipped, "app", &diff_text);
+
+        let out = plan_sites::plan_site_units(
+            &mut source,
+            &|_| true,
+            &plan_sites::SiteUnitParams { window: 0, max_sites_per_unit: 40, max_est_tokens_per_unit: 1_000_000, max_span_lines: Some(4) },
+            &estimate_tokens,
+        )
+        .unwrap();
+        let sites: Vec<&plan_sites::PlannedSite> = out.iter().flat_map(|u| u.sites.iter()).collect();
+        assert_eq!(sites.len(), 3, "12 lines / cap 4 = 3 sites: {sites:?}");
+        assert_eq!((sites[0].start, sites[0].end), (1, 4));
+        assert_eq!((sites[1].start, sites[1].end), (5, 8));
+        assert_eq!((sites[2].start, sites[2].end), (9, 12));
+        let mut every_hit: Vec<usize> = sites.iter().flat_map(|s| s.hits.clone()).collect();
+        every_hit.sort_unstable();
+        assert_eq!(every_hit, (1..=12).collect::<Vec<_>>(), "no line lost or duplicated across the split");
+    }
+
     #[test]
     fn plan_with_default_params_matches_plan_byte_identical() {
         // (#2190) The key regression: `plan()` (no override) must produce
@@ -1459,6 +1873,131 @@ mod tests {
         let units2 = serde_json::to_value(&out2.units).unwrap();
         assert_eq!(units1, units2);
         assert_eq!(serde_json::to_value(&out1.totals).unwrap(), serde_json::to_value(&out2.totals).unwrap());
+    }
+
+    /// (#2310 P4b review, CI MUST FIX) Rebuild a `serde_json::Value` with
+    /// every object's keys inserted in SORTED order, recursively. Two
+    /// reasons this exists rather than just comparing `Value == Value`
+    /// directly (which is ALREADY order-independent — `serde_json::Map`'s
+    /// `PartialEq`, whether it's a `BTreeMap` or an `IndexMap` under the
+    /// `preserve_order` feature, compares by content, not order):
+    ///
+    /// 1. This IS still used for the comparison below, defensively, so the
+    ///    assertion never depends on which map type is compiled in.
+    /// 2. It is what makes the WRITTEN golden file byte-stable regardless
+    ///    of which feature set generated it. `cargo llvm-cov --workspace`
+    ///    (CI's coverage job) unifies features across the workspace,
+    ///    which turns serde_json's `preserve_order` on for darkmux-lab
+    ///    (`agent-client-protocol` enables it elsewhere in the tree) —
+    ///    `cargo test -p darkmux-lab` alone does not. Before this fix,
+    ///    `serde_json::to_string_pretty` on the raw `Plan` value emitted
+    ///    keys in STRUCT-DECLARATION order under `preserve_order` and
+    ///    ALPHABETICAL order without it (`serde_json::Map` defaults to a
+    ///    `BTreeMap`), so the committed golden (written locally, without
+    ///    the feature) read as drifted under CI's workspace build even
+    ///    though nothing about the plan's CONTENT had changed. Same root
+    ///    cause `step_output::body_hash`'s own canonicalizer exists to
+    ///    fix (see that function's doc) — this is the same problem
+    ///    surfacing in a second place.
+    fn canonicalize(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort_unstable();
+                let mut out = serde_json::Map::new();
+                for k in keys {
+                    out.insert(k.clone(), canonicalize(&map[k]));
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(canonicalize).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// (#2310 P4b review) The golden the brief requires: `TreeSource`'s
+    /// plan output for a committed fixture tree must not drift when
+    /// `collect_site_units` starts delegating to the Tier 2
+    /// `plan_sites::plan_site_units` pattern. `sources[].tree` (an absolute
+    /// path — differs per checkout) and `planned_at` (a timestamp) are the
+    /// only two fields redacted before comparison; `sha` is already fixed
+    /// by the `resolved()` test helper, so nothing else about the plan's
+    /// content is test-environment-only.
+    ///
+    /// **Non-trivial by design** (review finding: the original fixture had
+    /// one unit, one site, two merged hits — not enough to pin either
+    /// sizing cap). Two files, four non-overlapping hits, `max_sites_per_
+    /// unit: 2` + `max_est_tokens_per_unit: 300`: `orders.ts`'s two SMALL
+    /// hits (28 tokens each) pack into one unit under both caps; `util.ts`'s
+    /// first BIG hit (160 tokens) starts a new unit because adding it to
+    /// the first would exceed the SITES cap (3 > 2) — pinning that cap
+    /// independently of tokens; its second BIG hit (161 tokens) starts a
+    /// THIRD unit because 160+161 exceeds the TOKENS cap (321 > 200) while
+    /// the sites count alone (2) would still be allowed — pinning the
+    /// tokens cap independently of site count. Three units from one rule
+    /// is the proof neither cap is a no-op.
+    ///
+    /// To regenerate after a deliberate behavior change:
+    /// `DARKMUX_CRAWL_PLAN_GOLDEN_UPDATE=1 cargo test -p darkmux-lab --lib
+    /// crawl::plan::tests::golden_tree_source_plan_matches_committed_fixture`
+    /// then review the diff before committing. Verified under BOTH
+    /// `cargo test -p darkmux-lab --lib` and `cargo test --workspace --lib`
+    /// (the latter is what CI's coverage job effectively exercises,
+    /// feature-unification-wise) — see this module's own review notes.
+    #[test]
+    fn golden_tree_source_plan_matches_committed_fixture() {
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crawl-plan-golden");
+        let sources = vec![resolved("app", &fixture_dir)];
+        let materialized = materialized_for(sources, Vec::new());
+        let rules = vec![site_rule()];
+        let params = PlanParams { max_sites_per_unit: 2, max_est_tokens_per_unit: 300 };
+
+        let plan = plan_with_params(&materialized, &rules, params).unwrap();
+        let mut actual_value = serde_json::to_value(&plan).unwrap();
+        actual_value["planned_at"] = serde_json::json!("<redacted: timestamp>");
+        actual_value["sources"][0]["tree"] = serde_json::json!("<redacted: absolute checkout path>");
+        let actual_canonical = canonicalize(&actual_value);
+        let actual = serde_json::to_string_pretty(&actual_canonical).unwrap();
+
+        let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/crawl-plan-golden/tree-source-site-rule.json");
+        if std::env::var("DARKMUX_CRAWL_PLAN_GOLDEN_UPDATE").is_ok() {
+            fs::create_dir_all(golden_path.parent().unwrap()).unwrap();
+            fs::write(&golden_path, format!("{actual}\n")).unwrap();
+            return;
+        }
+        let expected = fs::read_to_string(&golden_path).unwrap_or_else(|_| {
+            panic!(
+                "read {} — run with DARKMUX_CRAWL_PLAN_GOLDEN_UPDATE=1 to generate it",
+                golden_path.display()
+            )
+        });
+        // (#2310 P4b review, CI MUST FIX) Compare as `serde_json::Value`
+        // (semantic, order-independent equality), never as strings —
+        // `preserve_order` on vs off changes what `to_string_pretty` on a
+        // NON-canonicalized value would print, but never changes what this
+        // parses back into. Parsing `expected` fresh (rather than trusting
+        // its own on-disk key order) makes the assertion prove the CONTENT
+        // matches regardless of which feature set wrote either side.
+        let expected_value: serde_json::Value = serde_json::from_str(&expected)
+            .unwrap_or_else(|e| panic!("golden at {} is not valid JSON: {e}", golden_path.display()));
+        assert_eq!(
+            actual_canonical,
+            canonicalize(&expected_value),
+            "TreeSource's plan output drifted from the committed golden at {}.\n\
+             If this drift is an intended behavior change, regenerate with:\n\
+             DARKMUX_CRAWL_PLAN_GOLDEN_UPDATE=1 cargo test -p darkmux-lab --lib \
+             crawl::plan::tests::golden_tree_source_plan_matches_committed_fixture\n\
+             then review the diff before committing.",
+            golden_path.display()
+        );
+        // Sanity: the fixture must actually exercise both sizing caps, or
+        // a broken fixture could pass this golden vacuously (review
+        // finding: the original fixture had exactly one unit).
+        assert_eq!(plan.units.len(), 3, "expected the sites-cap split AND the tokens-cap split to both fire: {:?}", plan.units.iter().map(|u| u.id()).collect::<Vec<_>>());
     }
 
     #[test]

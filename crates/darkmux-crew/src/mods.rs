@@ -166,6 +166,23 @@ pub struct ModRecord {
     /// bytes either way.
     #[serde(default)]
     pub kit_looks_json: bool,
+    /// (#2310 P4b review, M-B) An OPTIONAL, PROPOSER-DECLARED hint at the
+    /// kit's shape — `"unified-diff"` today, nothing else recognized yet.
+    /// Still opaque by contract (darkmux never opens a kit): this is not a
+    /// parse, and `mods::create`/`create_mod` write it verbatim from
+    /// whatever the proposer names, unvalidated. It exists so a CONSUMER
+    /// that DOES choose to interpret a kit (`deliver_github_review`'s
+    /// suggestion-block rendering) has an explicit, proposer-opted-in
+    /// signal to key on, rather than sniffing the kit text itself — an
+    /// opaque kit pasted verbatim into a GitHub suggestion block corrupts
+    /// the PR the moment its shape isn't literally "the replacement text
+    /// for one anchored line" (a unified diff's `+++`/`@@` lines are not
+    /// that, and a multi-line kit silently duplicates the lines below the
+    /// anchor). `None` (the default — every kit before this field existed,
+    /// and any kit whose proposer didn't opt in) means "render as an
+    /// opaque fenced patch, never a suggestion." Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit_kind: Option<String>,
     /// Basenames of the files under this mod's `attachments/`.
     #[serde(default)]
     pub attachments: Vec<String>,
@@ -473,6 +490,7 @@ pub fn materialize(root: &Path, record: &ModRecord) -> Result<Materialized> {
 /// **Idempotence is not a goal.** Every call mints a new key: two agents
 /// proposing for one finding at different times are two mods, and that is the
 /// point.
+#[allow(clippy::too_many_arguments)]
 pub fn create(
     root: &Path,
     findings_root: &Path,
@@ -480,6 +498,11 @@ pub fn create(
     for_keys: &[String],
     kit: Option<&str>,
     attachments: &[PathBuf],
+    // (#2310 P4b review, M-B) Proposer-declared, opaque hint at the kit's
+    // shape — threaded straight to `ModRecord::kit_kind`, unvalidated
+    // (see that field's own doc). `None` from every caller that predates
+    // this parameter.
+    kit_kind: Option<&str>,
 ) -> Result<ModRecord> {
     anyhow::ensure!(!by.trim().is_empty(), "a mod needs a proposer: pass --by <actor>");
     // A mod with neither instructions nor data is not a kit. Refused here
@@ -524,6 +547,7 @@ pub fn create(
         // The bytes that came in, unchanged. No parse, no re-serialize.
         kit: kit.map(str::to_string),
         kit_looks_json: kit.is_some_and(kit_looks_json),
+        kit_kind: kit_kind.map(str::to_string),
         attachments: names.clone(),
         context: finding_context(findings_root, &for_keys)?,
         warnings: Vec::new(),
@@ -693,6 +717,10 @@ pub fn create_from_emission(
         // The bytes that came in, unchanged. No parse, no re-serialize.
         kit: Some(kit.to_string()),
         kit_looks_json: kit_looks_json(kit),
+        // (#2310 P4b review) `create_mod` (the runtime producer) is left
+        // unchanged by this packet — no kit-kind signal from a dispatch
+        // yet, so this producer always writes `None`.
+        kit_kind: None,
         attachments: names.clone(),
         context: finding_context(findings_root, &for_keys)?,
         warnings,
@@ -969,7 +997,7 @@ mod tests {
 
         // Two shapes a JSON round trip destroys, plus the exact whitespace.
         let hostile = "{\n  \"a\": 1,\n  \"a\": 2,\n  \"big\": 12345678901234567890123\n}\n";
-        let rec = create(&mods, &finds, "kain", &[], Some(hostile), &[]).unwrap();
+        let rec = create(&mods, &finds, "kain", &[], Some(hostile), &[], None).unwrap();
         assert_eq!(rec.kit.as_deref(), Some(hostile), "the kit is the bytes that came in");
         assert!(rec.kit_looks_json, "a reader HINT — not a parse, and not a promise");
         let back = load_at(&mods, &rec.key).unwrap().unwrap();
@@ -977,12 +1005,12 @@ mod tests {
 
         // Prose stays prose, with its own whitespace.
         let prose = "rename the predicate, then add a test\n";
-        let rec = create(&mods, &finds, "kain", &[], Some(prose), &[]).unwrap();
+        let rec = create(&mods, &finds, "kain", &[], Some(prose), &[], None).unwrap();
         assert_eq!(rec.kit.as_deref(), Some(prose));
         assert!(!rec.kit_looks_json);
 
         // A kit that is literally the text `null` is that text — not a null.
-        let rec = create(&mods, &finds, "kain", &[], Some("null"), &[]).unwrap();
+        let rec = create(&mods, &finds, "kain", &[], Some("null"), &[], None).unwrap();
         assert_eq!(rec.kit.as_deref(), Some("null"));
         let raw = std::fs::read_to_string(record_path_at(&mods, &rec.key)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -997,8 +1025,8 @@ mod tests {
         store_finding(&finds, "sess-a", 1, Some("crawl-1"));
         let for_keys = vec!["sess-a/1".to_string()];
 
-        let one = create(&mods, &finds, "sonnet", &for_keys, Some("change the code"), &[]).unwrap();
-        let two = create(&mods, &finds, "kain", &for_keys, Some("add a comment"), &[]).unwrap();
+        let one = create(&mods, &finds, "sonnet", &for_keys, Some("change the code"), &[], None).unwrap();
+        let two = create(&mods, &finds, "kain", &for_keys, Some("add a comment"), &[], None).unwrap();
 
         assert_ne!(one.key, two.key, "the second must NOT overwrite the first");
         assert!(record_path_at(&mods, &one.key).exists());
@@ -1020,6 +1048,7 @@ mod tests {
             &["sess-a/1".to_string(), "sess-z/9".to_string()],
             Some("kit"),
             &[],
+            None,
         )
         .unwrap();
 
@@ -1067,6 +1096,7 @@ mod tests {
             &[],
             None,
             &[src.join("a/patch.diff"), src.join("b/shot.png")],
+            None,
         )
         .unwrap();
         assert_eq!(rec.attachments, vec!["patch.diff", "shot.png"]);
@@ -1085,6 +1115,7 @@ mod tests {
             &[],
             None,
             &[src.join("a/patch.diff"), src.join("b/patch.diff")],
+            None,
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("patch.diff"), "the error names it: {err:#}");
@@ -1116,6 +1147,7 @@ mod tests {
             &[],
             Some("kit"),
             &[src.join("ok.diff"), unreadable.clone()],
+            None,
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("unreadable.bin"), "the error names it: {err:#}");
@@ -1142,7 +1174,7 @@ mod tests {
         let finds = tmp.path().join("findings");
         store_finding(&finds, "sess-a", 1, Some("crawl-1"));
 
-        let rec = create(&mods, &finds, "kain", &["sess-a/01".into()], Some("k"), &[]).unwrap();
+        let rec = create(&mods, &finds, "kain", &["sess-a/01".into()], Some("k"), &[], None).unwrap();
         assert_eq!(rec.r#for, vec!["sess-a/1"], "stored in canonical form");
         assert_eq!(rec.context.findings[0].key, "sess-a/1");
         assert!(!rec.context.findings[0].missing, "it resolved to the real finding");
@@ -1168,7 +1200,7 @@ mod tests {
         // A key that can address no finding is refused LOUDLY at create time,
         // rather than stored as a link that nothing can ever follow.
         for bad in ["no-slash", "sess-a/notanumber", "../x/1", "/1"] {
-            let err = create(&mods, &finds, "kain", &[bad.to_string()], Some("k"), &[]).unwrap_err();
+            let err = create(&mods, &finds, "kain", &[bad.to_string()], Some("k"), &[], None).unwrap_err();
             assert!(
                 format!("{err:#}").contains("finding key"),
                 "the error names the shape for {bad:?}: {err:#}"
@@ -1188,7 +1220,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join(".env.example"), b"KEY=value\n").unwrap();
 
-        let rec = create(&mods, &finds, "kain", &[], None, &[src.join(".env.example")]).unwrap();
+        let rec = create(&mods, &finds, "kain", &[], None, &[src.join(".env.example")], None).unwrap();
         assert_eq!(rec.attachments, vec![".env.example"]);
         assert_eq!(
             std::fs::read(attachments_dir_at(&mods, &rec.key).join(".env.example")).unwrap(),
@@ -1209,7 +1241,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mods = tmp.path().join("mods");
         let finds = tmp.path().join("findings");
-        let good = create(&mods, &finds, "kain", &[], Some("k"), &[]).unwrap();
+        let good = create(&mods, &finds, "kain", &[], Some("k"), &[], None).unwrap();
 
         std::fs::create_dir_all(mods.join("mod-liar")).unwrap();
         std::fs::write(
@@ -1236,8 +1268,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mods = tmp.path().join("mods");
         let finds = tmp.path().join("findings");
-        assert!(create(&mods, &finds, "kain", &[], None, &[]).is_err());
-        assert!(create(&mods, &finds, "  ", &[], Some("kit"), &[]).is_err(), "a mod names its proposer");
+        assert!(create(&mods, &finds, "kain", &[], None, &[], None).is_err());
+        assert!(create(&mods, &finds, "  ", &[], Some("kit"), &[], None).is_err(), "a mod names its proposer");
         assert!(!mods.exists(), "a refusal writes nothing at all");
     }
 
@@ -1251,6 +1283,7 @@ mod tests {
             r#for: vec![],
             kit: Some("k".into()),
             kit_looks_json: false,
+            kit_kind: None,
             attachments: vec![],
             context: ModContext::default(),
             warnings: Vec::new(),
@@ -1285,6 +1318,7 @@ mod tests {
             r#for: vec![],
             kit: Some("k".into()),
             kit_looks_json: false,
+            kit_kind: None,
             attachments: vec![],
             context: ModContext::default(),
             warnings: Vec::new(),
@@ -1316,10 +1350,10 @@ mod tests {
         store_finding(&finds, "sess-a", 1, Some("crawl-1"));
         store_finding(&finds, "sess-b", 2, Some("crawl-2"));
 
-        let a1 = create(&mods, &finds, "sonnet", &["sess-a/1".into()], Some("x"), &[]).unwrap();
-        let a2 = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("y"), &[]).unwrap();
-        let b = create(&mods, &finds, "kain", &["sess-b/2".into()], Some("z"), &[]).unwrap();
-        let none = create(&mods, &finds, "kain", &[], Some("standalone"), &[]).unwrap();
+        let a1 = create(&mods, &finds, "sonnet", &["sess-a/1".into()], Some("x"), &[], None).unwrap();
+        let a2 = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("y"), &[], None).unwrap();
+        let b = create(&mods, &finds, "kain", &["sess-b/2".into()], Some("z"), &[], None).unwrap();
+        let none = create(&mods, &finds, "kain", &[], Some("standalone"), &[], None).unwrap();
 
         let all = load_all_at(&mods).unwrap();
         let keys: Vec<&str> = mods_for(&all, "sess-a/1").iter().map(|m| m.key.as_str()).collect();

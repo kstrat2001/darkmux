@@ -1,150 +1,24 @@
-//! Unified-diff parsing — a straight port of the Python reference's
-//! `parse_diff` (`bundler.py`, Phase A). Splits a multi-file unified diff
-//! into per-file hunks, each carrying the added/removed/old/new line sets
-//! the scanner and fact-builders need.
+//! Unified-diff parsing — re-exports the canonical parser (#2310 P4b move).
 //!
-//! No `regex` crate (workspace dep discipline) — the two line shapes this
-//! parses (`+++ b/<path>` and `@@ -a,b +c,d @@`) are simple enough for
-//! hand-rolled prefix/token parsing.
+//! **Moved to `darkmux-crew`'s `diff` module.** `deliver_github_review`
+//! (a darkmux-crew step kind) needed the SAME parser this bundler already
+//! had, and darkmux-lab depends on darkmux-crew (never the reverse) — so
+//! the parser lives there now and this module re-exports it, keeping every
+//! existing call site in this crate (`bundle::source`, `bundle::mod`)
+//! untouched. See `darkmux_crew::diff`'s own module doc for the full
+//! reasoning and the incident that prompted the move.
+//!
+//! The tests below stay here deliberately (not deleted, not moved) — they
+//! exercise THIS re-export, i.e. that `darkmux-lab`'s own import path still
+//! resolves to working behavior. `darkmux_crew::diff`'s own module carries
+//! its own copy of this coverage beside the real implementation.
 
-use std::collections::BTreeSet;
-
-/// One `@@ ... @@` hunk within a file's diff.
-#[derive(Debug, Clone, Default)]
-pub struct Hunk {
-    /// The hunk's starting line number in the NEW file (1-indexed), from
-    /// the `@@ -a,b +c,d @@` header's `+c`.
-    pub new_start: u32,
-    /// Every line number (1-indexed, in the NEW file) touched by this
-    /// hunk — added lines AND unchanged context lines (matches the
-    /// reference: context lines advance `new_ln` and land in
-    /// `new_lines` too, since a changed function can be located via a
-    /// context line inside it just as well as an added one). Do NOT
-    /// narrow this to "actually changed" lines — locating the enclosing
-    /// function is exactly the case that needs context lines included.
-    /// For "was this specific line actually added" (as opposed to merely
-    /// present in the hunk's span), see `added_lines` below.
-    pub new_lines: BTreeSet<u32>,
-    /// Subset of `new_lines`: just the line numbers that were actually
-    /// ADDED (`+` prefix) — no context lines (#1605 follow-up, QA
-    /// finding). `new_lines` deliberately mixes added and context so a
-    /// changed function can be located via either; a caller that needs to
-    /// know whether a specific line was really touched by the diff (e.g.
-    /// deciding whether an unenclosed line is real changed code worth
-    /// bundling, vs. unchanged context that merely fell inside a hunk's
-    /// span) wants this set instead.
-    pub added_line_numbers: BTreeSet<u32>,
-    /// Every line of the pre-image within this hunk's span: removed
-    /// lines AND unchanged context lines, in order.
-    pub old_block: Vec<String>,
-    /// Every line of the post-image within this hunk's span: added
-    /// lines AND unchanged context lines, in order.
-    pub new_block: Vec<String>,
-    /// Just the added lines (`+` prefix), in order.
-    pub added: Vec<String>,
-    /// Just the removed lines (`-` prefix), in order.
-    pub removed: Vec<String>,
-}
-
-/// Split a unified multi-file diff into per-file hunks. Returns
-/// `(path, hunks)` pairs in first-appearance order (mirrors Python's
-/// `dict.setdefault` insertion-order semantics, which the reference
-/// relies on for deterministic bundle ordering).
-pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
-    let mut files: Vec<(String, Vec<Hunk>)> = Vec::new();
-    let mut path: Option<String> = None;
-    let mut cur: Option<Hunk> = None;
-    let mut new_ln: u32 = 0;
-
-    fn flush(files: &mut Vec<(String, Vec<Hunk>)>, path: &Option<String>, cur: &mut Option<Hunk>) {
-        if let (Some(h), Some(p)) = (cur.take(), path) {
-            match files.iter_mut().find(|(fp, _)| fp == p) {
-                Some(entry) => entry.1.push(h),
-                None => files.push((p.clone(), vec![h])),
-            }
-        }
-    }
-
-    for ln in diff_text.lines() {
-        if let Some(rest) = ln.strip_prefix("+++ b/") {
-            flush(&mut files, &path, &mut cur);
-            path = if rest == "/dev/null" {
-                None
-            } else {
-                Some(rest.to_string())
-            };
-            cur = None;
-            continue;
-        }
-        if let Some(start) = parse_hunk_header(ln) {
-            flush(&mut files, &path, &mut cur);
-            cur = Some(Hunk {
-                new_start: start,
-                ..Default::default()
-            });
-            new_ln = start;
-            continue;
-        }
-        if cur.is_none() || path.is_none() {
-            continue;
-        }
-        if ln.starts_with('+') && !ln.starts_with("+++") {
-            let content = &ln[1..];
-            let h = cur.as_mut().unwrap();
-            h.added.push(content.to_string());
-            h.new_block.push(content.to_string());
-            h.new_lines.insert(new_ln);
-            h.added_line_numbers.insert(new_ln);
-            new_ln += 1;
-        } else if ln.starts_with('-') && !ln.starts_with("---") {
-            let content = &ln[1..];
-            let h = cur.as_mut().unwrap();
-            h.removed.push(content.to_string());
-            h.old_block.push(content.to_string());
-        } else if let Some(content) = ln.strip_prefix(' ') {
-            let h = cur.as_mut().unwrap();
-            h.old_block.push(content.to_string());
-            h.new_block.push(content.to_string());
-            h.new_lines.insert(new_ln);
-            new_ln += 1;
-        }
-        // Other lines (e.g. `\ No newline at end of file`, the `---
-        // a/<path>` line, `diff --git` headers) carry no line-content
-        // signal — ignored, matching the reference.
-    }
-    flush(&mut files, &path, &mut cur);
-    files
-}
-
-/// Parse `@@ -a[,b] +c[,d] @@...` and return `c` (the new-file start
-/// line), or `None` if `ln` isn't a hunk header. Hand-rolled equivalent
-/// of `re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", ln)`.
-fn parse_hunk_header(ln: &str) -> Option<u32> {
-    let rest = ln.strip_prefix("@@ -")?;
-    // Skip the `-a[,b]` side entirely — we only need the `+c` number.
-    let space = rest.find(' ')?;
-    let after_minus = &rest[space + 1..];
-    let plus_digits = after_minus.strip_prefix('+')?;
-    let end = plus_digits
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(plus_digits.len());
-    if end == 0 {
-        return None;
-    }
-    // The char right after the digit run must be `,` (a `+c,d` count) or
-    // ` ` (bare `+c`) followed eventually by ` @@` — anything else means
-    // this wasn't really a hunk header (defensive; real diffs won't hit
-    // this branch).
-    let tail = &plus_digits[end..];
-    if !(tail.starts_with(',') || tail.starts_with(' ')) {
-        return None;
-    }
-    plus_digits[..end].parse::<u32>().ok()
-}
+pub use darkmux_crew::diff::{parse_diff, Hunk};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn parses_single_file_single_hunk() {
