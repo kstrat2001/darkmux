@@ -297,9 +297,33 @@ body {
    or connection health — so it says "live" a second time rather than adding
    information. An arrival-driven pulse would genuinely signal a stream going
    quiet; that is new behavior, not a port, and is left as its own call. */
-@keyframes lpulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+/* THE liveness beat — defined once, used by every running indicator (header
+   badge dot, RUNNING pill, mission-lens running dots/rings/meters) through
+   `animation: var(--beat)`. (operator, 2026-09-04: "tone down the scale
+   effect ... make sure it's defined once and used every place") Three
+   keyframes had grown for one concept, at two cadences (1.6s and 1.1s), and
+   the pill's copy shrank 22% — tuned for a 6px dot, it read as the pill
+   jumping. Opacity carries the beat; the scale is a 3% breath. Reduced
+   motion turns the beat off HERE, for every user at once; a site that needs a
+   static distinction on top (the pill's hollow state) keeps its own rule. */
+@keyframes beat {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.97);
+  }
+}
+:root {
+  --beat: beat 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --beat: none;
+  }
 }
 
 #modebadge.pb.live {
@@ -3007,12 +3031,9 @@ body {
 /* (#238, ported) Reduced-motion drops the pulse. Live stays distinguishable
    WITHOUT motion — the badge keeps its color, the ● glyph and the word. */
 #modebadge.pb.live .pbdot {
-  animation: lpulse 1.6s ease-in-out infinite;
+  animation: var(--beat);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  #modebadge.pb.live .pbdot { animation: none; }
-}
 
 /* ── Machine lens (Tuesday-list item 1) ─────────────────────────────────────
    All twelve of this lens's class names existed in the TSX and matched
@@ -4183,7 +4204,7 @@ body {
    restarted, which would stutter at whatever cadence records happen to arrive
    at and read as a fault rather than as health. */
 .wstatus[data-live] {
-  animation: pulse-beat 1.6s ease-in-out infinite;
+  animation: var(--beat);
   animation-play-state: paused;
 }
 .wstatus[data-live="beating"] {
@@ -4199,24 +4220,8 @@ body {
 .wstatus[data-live="stale"] {
   opacity: 0.62;
 }
-@keyframes pulse-beat {
-  0%,
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.45;
-    transform: scale(0.78);
-  }
-}
 /* A pulsing dot is decoration for anyone who has asked motion to stop. The
    state stays legible: filled = beating, hollow = quiet. */
-@media (prefers-reduced-motion: reduce) {
-  .wstatus[data-live] {
-    animation: none;
-  }
-}
 
 /* (#1973) SIGNALS. The block was an undifferentiated grey dump: every entry
    prefixed `⚠`, no times, no grouping, and severity — which the emitter has
@@ -4739,15 +4744,6 @@ body {
   letter-spacing: 0.08em;
 }
 
-@keyframes ml-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.5;
-  }
-}
 
 .missionlens .mmeter {
   display: inline-flex;
@@ -4946,7 +4942,7 @@ body {
   height: 6px;
   border-radius: 50%;
   background: var(--ml-run);
-  animation: ml-pulse 1.1s ease-in-out infinite;
+  animation: var(--beat);
 }
 .missionlens .mnode.s-complete {
   border-color: var(--good);
@@ -5097,7 +5093,7 @@ body {
 }
 .missionlens .steprow.s-running .sring {
   border-color: var(--ml-run);
-  animation: ml-pulse 1.1s ease-in-out infinite;
+  animation: var(--beat);
 }
 .missionlens .steprow.s-complete .sring {
   border-color: var(--good);
@@ -5185,7 +5181,7 @@ body {
   height: 6px;
   border-radius: 50%;
   background: var(--ml-run);
-  animation: ml-pulse 1.1s ease-in-out infinite;
+  animation: var(--beat);
 }
 .missionlens .mnode .steprow {
   padding-left: 30px;
@@ -5322,7 +5318,7 @@ body {
 }
 .missionlens .tlphase.s-running .tlph-dot {
   background: var(--ml-run);
-  animation: ml-pulse 1.1s ease-in-out infinite;
+  animation: var(--beat);
 }
 .missionlens .tlphase.s-complete .tlph-dot {
   background: var(--good);
@@ -5397,7 +5393,7 @@ body {
 }
 .missionlens .tltask.s-running .tlt-dot {
   background: var(--ml-run);
-  animation: ml-pulse 1.1s ease-in-out infinite;
+  animation: var(--beat);
 }
 .missionlens .tltask.s-running .tlt-name {
   color: var(--ml-run);
