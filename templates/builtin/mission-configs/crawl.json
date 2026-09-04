@@ -51,7 +51,12 @@
               "kind": "crawl.plan",
               "config": {
                 "rule": "unnamed-predicate",
-                "workspace": "{{workspace}}"
+                "workspace": "{{workspace}}",
+                "sizing": {
+                  "max_sites_per_unit": "{{max_sites_per_unit}}",
+                  "max_est_tokens_per_unit": "{{max_est_tokens_per_unit}}"
+                },
+                "no_fetch": "{{no_fetch}}"
               }
             }
           ]
@@ -66,7 +71,12 @@
               "kind": "crawl.plan",
               "config": {
                 "rule": "swallowed-error",
-                "workspace": "{{workspace}}"
+                "workspace": "{{workspace}}",
+                "sizing": {
+                  "max_sites_per_unit": "{{max_sites_per_unit}}",
+                  "max_est_tokens_per_unit": "{{max_est_tokens_per_unit}}"
+                },
+                "no_fetch": "{{no_fetch}}"
               }
             }
           ]
@@ -81,7 +91,12 @@
               "kind": "crawl.plan",
               "config": {
                 "rule": "doc-contradicts-code",
-                "workspace": "{{workspace}}"
+                "workspace": "{{workspace}}",
+                "sizing": {
+                  "max_sites_per_unit": "{{max_sites_per_unit}}",
+                  "max_est_tokens_per_unit": "{{max_est_tokens_per_unit}}"
+                },
+                "no_fetch": "{{no_fetch}}"
               }
             }
           ]
@@ -96,7 +111,12 @@
               "kind": "crawl.plan",
               "config": {
                 "rule": "stale-consumer",
-                "workspace": "{{workspace}}"
+                "workspace": "{{workspace}}",
+                "sizing": {
+                  "max_sites_per_unit": "{{max_sites_per_unit}}",
+                  "max_est_tokens_per_unit": "{{max_est_tokens_per_unit}}"
+                },
+                "no_fetch": "{{no_fetch}}"
               }
             }
           ]

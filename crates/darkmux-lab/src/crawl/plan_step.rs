@@ -136,18 +136,40 @@ impl PlanStepConfig {
                 ("max_sites_per_unit", &mut params.max_sites_per_unit),
                 ("max_est_tokens_per_unit", &mut params.max_est_tokens_per_unit),
             ] {
+                // (#2310 P4c-2 item 0) `sizing.<key>` reaches this step
+                // through `mission_config::substitute_step_config`'s
+                // generic `{{<input-id>}}` substitution now, which carries
+                // a `--param`-sourced value through verbatim as the JSON
+                // STRING the CLI layer always collects it as (an `--input`
+                // file can still supply a real number). Lenient-on-read
+                // (contract 7): parse either shape, the same convention
+                // `bool_param` already applies to every other CLI-sourced
+                // knob. An unset knob is ABSENT here (item 0's key-omission
+                // rule), not an empty string, so this loop still only sees
+                // the keys the operator actually set.
                 if let Some(v) = sizing.get(key) {
-                    let n = v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                        anyhow!(
-                            "step `{}`: `{CRAWL_PLAN_KIND}` config.sizing.{key} must be a positive integer, got {v}",
-                            step.id
-                        )
-                    })?;
+                    let n = v
+                        .as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "step `{}`: `{CRAWL_PLAN_KIND}` config.sizing.{key} must be a positive integer, got {v}",
+                                step.id
+                            )
+                        })?;
                     *slot = usize::try_from(n).context("sizing value does not fit usize")?;
                 }
             }
         }
-        let fetch = !step.config.get("no_fetch").and_then(|v| v.as_bool()).unwrap_or(false);
+        let no_fetch = match step.config.get("no_fetch") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => {
+                matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+            }
+            _ => false,
+        };
+        let fetch = !no_fetch;
         let plan_out = step.config.get("plan_out").and_then(|v| v.as_str()).map(PathBuf::from);
         Ok(Self { rule, workspace, params, fetch, plan_out })
     }
@@ -428,6 +450,46 @@ mod tests {
         }));
         let err = PlanStepConfig::from_step(&step).unwrap_err();
         assert!(format!("{err}").contains("positive integer"), "{err}");
+    }
+
+    /// (#2310 P4c-2 item 0) `sizing.*`/`no_fetch` now reach this step
+    /// through `mission_config::substitute_step_config`'s generic
+    /// `{{<input-id>}}` substitution, which carries a `--param`-sourced
+    /// value through as the JSON STRING the CLI always collects it as —
+    /// `crawl.json`'s own `sizing`/`no_fetch` placeholders substitute to
+    /// exactly this shape on a real `--param max_sites_per_unit=7 --param
+    /// no_fetch=true` launch. Lenient-on-read: string-or-typed, same as
+    /// `bool_param` at the CLI layer.
+    #[test]
+    fn sizing_and_no_fetch_parse_leniently_from_cli_param_strings() {
+        let step = step_with(serde_json::json!({
+            "rule": "unnamed-predicate", "workspace": "/x.json",
+            "sizing": {"max_sites_per_unit": "7", "max_est_tokens_per_unit": "1200"},
+            "no_fetch": "true"
+        }));
+        let cfg = PlanStepConfig::from_step(&step).unwrap();
+        assert_eq!(cfg.params.max_sites_per_unit, 7);
+        assert_eq!(cfg.params.max_est_tokens_per_unit, 1200);
+        assert!(!cfg.fetch, "`no_fetch: \"true\"` (a string) must be honored, not silently ignored");
+
+        let step = step_with(serde_json::json!({
+            "rule": "unnamed-predicate", "workspace": "/x.json", "no_fetch": "false"
+        }));
+        assert!(PlanStepConfig::from_step(&step).unwrap().fetch, "a string \"false\" must not fetch=false");
+    }
+
+    /// (#2310 P4c-2 item 0) A `sizing`/`no_fetch` key the generic
+    /// substitution OMITTED (the operator left the input unset) must
+    /// behave exactly as if the document never declared the placeholder —
+    /// the built-in defaults, not an error.
+    #[test]
+    fn an_absent_sizing_or_no_fetch_key_keeps_the_defaults() {
+        let step = step_with(serde_json::json!({
+            "rule": "unnamed-predicate", "workspace": "/x.json", "sizing": {}
+        }));
+        let cfg = PlanStepConfig::from_step(&step).unwrap();
+        assert_eq!(cfg.params.max_sites_per_unit, PlanParams::default().max_sites_per_unit);
+        assert!(cfg.fetch, "no `no_fetch` key at all must default to fetching");
     }
 
     #[test]

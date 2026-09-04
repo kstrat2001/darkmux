@@ -36,11 +36,13 @@
 //! config.json files are untouched).
 
 pub mod grow;
+pub mod inputs;
 pub mod interpret;
 pub mod prune;
 pub mod load;
 
 pub use grow::{grow_task, items_from_artifact, GrownFrom};
+pub use inputs::{find_unsubstituted_braces, substitute_step_config};
 pub use interpret::{interpret, LaunchParams, TaskOverride};
 pub use load::{has_non_user_fallback, list_ids, load, LoadedMissionConfig, MissionConfigSource};
 
@@ -467,6 +469,25 @@ pub struct MissionInput {
     /// here as the intended semantic for Packet 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
+    /// (#2310 P4c-2 item 4) `true` when this input is accepted for
+    /// CLI-surface parity with another config but has NO EFFECT here —
+    /// e.g. `review-v2.json`'s `bundler`, accepted so an operator carrying
+    /// a param line over from the frozen `review` config gets a signal
+    /// instead of a silent no-op. The generic launcher warns (naming
+    /// [`Self::ignored_reason`]) when the operator supplies an ignored
+    /// input, on the `--dry-run` path too, before anything mints. Absent
+    /// or `false` means the input is live. STRUCTURAL: any config may
+    /// declare this on any input; the launcher's check never matches on a
+    /// config id (replaces the old `config.id == "review-v2"` special
+    /// case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored: Option<bool>,
+    /// Why this input is ignored — rendered into the warning. Unenforced
+    /// at parse time (a missing reason on an `ignored: true` input is a
+    /// doc smell, not a load-bearing break); `darkmux doctor`/`validate`
+    /// is where that could be surfaced if it ever needs to be loud.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_reason: Option<String>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }

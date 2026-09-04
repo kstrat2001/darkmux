@@ -550,21 +550,26 @@ pub fn launch(
         precheck_coder_phase_inputs(config, &collected)?;
     }
 
-    // (#2310 P4c review round 2, item (f)) `review-v2.json` accepts
-    // `bundler` for CLI-surface parity with the frozen `review` config
-    // (whose funnel bundler-plugin path this document never touches — its
-    // planner reads `diff_file` directly) but does nothing with it. A
-    // param an operator carried over from a `review` launch line would
-    // otherwise disappear silently; this is BEFORE the `--dry-run`
-    // short-circuit below so the signal is visible on the free path too,
-    // not only on a real (costly) launch.
-    if config.id == "review-v2" && collected.contains_key("bundler") {
-        eprintln!(
-            "{}",
-            darkmux_types::style::warn(
-                "bundler is ignored by review-v2; the external bundler belongs to the funnel"
-            )
-        );
+    // (#2310 P4c-2 item 4) An input the document declares `"ignored":
+    // true` on (`review-v2.json`'s `bundler`, accepted for CLI-surface
+    // parity with the frozen `review` config's launch line but never
+    // consumed by review-v2's own planner) gets a named warning when the
+    // operator supplies it — STRUCTURAL, any config on any input, never
+    // keyed on a config id (replaces the old `config.id == "review-v2"`
+    // special case). BEFORE the `--dry-run` short-circuit below so the
+    // signal is visible on the free path too, not only on a real (costly)
+    // launch.
+    for input in &config.inputs {
+        if input.ignored == Some(true) && collected.contains_key(&input.name) {
+            let reason = input.ignored_reason.as_deref().unwrap_or("it has no effect on this config");
+            eprintln!(
+                "{}",
+                darkmux_types::style::warn(&format!(
+                    "input `{}` is ignored by \"{config_id}\" — {reason}",
+                    input.name
+                ))
+            );
+        }
     }
 
     // (#1959) `--dry-run`: everything above this point (config load,
@@ -691,6 +696,12 @@ pub fn launch(
     }
 
     let params = build_launch_params(config, &real_phase_ids, &collected);
+    // (#2310 P4c-2 item 0) The document's own declared-input vocabulary —
+    // threaded into every grown copy's config the same way `interpret`
+    // threads it into the statically-declared graph via `params.
+    // input_values` (below).
+    let declared_inputs: std::collections::BTreeSet<String> =
+        config.inputs.iter().map(|i| i.name.clone()).collect();
     // (#2300) `tasks`/`all_steps` are the STATICALLY DECLARED graph — every
     // task the document mints up front. A task declaring `grow` is a
     // template and is deliberately absent from both: its copies are minted
@@ -1157,6 +1168,8 @@ pub fn launch(
             &tasks_by_id,
             &steps,
             all_known,
+            &declared_inputs,
+            &collected,
         ) {
             Ok(grown) => {
                 for (event, grown_tasks, grown_steps) in grown {
@@ -1603,6 +1616,7 @@ type GrowthBatch = (
     BTreeMap<String, crew::types::Step>,
 );
 
+#[allow(clippy::too_many_arguments)]
 fn grow_phase(
     phase: &mission_config::PhaseConfig,
     real_phase_id: &str,
@@ -1610,6 +1624,8 @@ fn grow_phase(
     tasks_by_id: &BTreeMap<String, crew::types::Task>,
     steps: &BTreeMap<String, crew::types::Step>,
     all_known: &[&str],
+    declared_inputs: &std::collections::BTreeSet<String>,
+    collected: &BTreeMap<String, serde_json::Value>,
 ) -> Result<Vec<GrowthBatch>> {
     let mut out: Vec<GrowthBatch> = Vec::new();
     for task_cfg in &phase.tasks {
@@ -1696,6 +1712,8 @@ fn grow_phase(
             &phase.id,
             real_phase_id,
             real_task_ids,
+            declared_inputs,
+            collected,
         )
         .with_context(|| format!("mission launch: interpreting grown copies of `{}`", task_cfg.id))?;
 
@@ -2220,6 +2238,7 @@ fn run_summary_payload(
                 phase_ids: real_phase_ids.clone(),
                 task_overrides: BTreeMap::new(),
                 step_config_overrides: BTreeMap::new(),
+                input_values: BTreeMap::new(),
             };
             let real_ids = mission_config::interpret::real_task_ids(config, &params);
             let real_id = match real_ids.get(doc_task_id) {
@@ -2340,56 +2359,16 @@ fn rule_selection(
     Some(csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
 }
 
-/// (#2301) The crawl's plan steps take their workspace + sizing knobs from
-/// `--param`, not from the document (which carries a `{{workspace}}`
-/// placeholder no interpreter substitutes). `step_config_overrides`
-/// REPLACES a step's whole config, so each override is the document's own
-/// config with the resolved values written over it — never a bare fragment
-/// that would drop the step's `rule`.
-fn crawl_plan_step_overrides(
-    config: &MissionConfig,
-    collected: &BTreeMap<String, serde_json::Value>,
-) -> BTreeMap<String, serde_json::Value> {
-    let mut out = BTreeMap::new();
-    let Some(workspace) = collected.get("workspace").and_then(|v| v.as_str()) else {
-        return out;
-    };
-    let mut sizing = serde_json::Map::new();
-    for key in ["max_sites_per_unit", "max_est_tokens_per_unit"] {
-        if let Some(n) = collected.get(key).and_then(param_as_u64) {
-            sizing.insert(key.to_string(), serde_json::json!(n));
-        }
-    }
-    let no_fetch = bool_param(collected, "no_fetch");
-    for step in config
-        .phases
-        .iter()
-        .flat_map(|p| p.tasks.iter())
-        .flat_map(|t| t.steps.iter())
-        .filter(|s| s.kind == darkmux_lab::crawl::plan_step::CRAWL_PLAN_KIND)
-    {
-        let mut cfg = step.config.clone();
-        if !cfg.is_object() {
-            cfg = serde_json::json!({});
-        }
-        let obj = cfg.as_object_mut().expect("just forced to an object");
-        obj.insert("workspace".to_string(), serde_json::json!(workspace));
-        if !sizing.is_empty() {
-            obj.insert("sizing".to_string(), serde_json::Value::Object(sizing.clone()));
-        }
-        if no_fetch {
-            obj.insert("no_fetch".to_string(), serde_json::json!(true));
-        }
-        out.insert(step.id.clone(), cfg);
-    }
-    out
-}
-
-/// A `--param` integer: the CLI collects params as strings, so a number
-/// may arrive either typed or quoted.
-fn param_as_u64(v: &serde_json::Value) -> Option<u64> {
-    v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
-}
+// (#2310 P4c-2 item 0) `crawl_plan_step_overrides` + `param_as_u64`, which
+// used to hand-substitute `{{workspace}}` and inject `sizing`/`no_fetch`
+// into every `crawl.plan` step, are RETIRED — `mission_config::interpret`
+// now substitutes every declared `{{<input-id>}}` placeholder generically
+// (see `LaunchParams::input_values`), and `crawl.json`'s `plan-<rule>-step`
+// configs carry `sizing`/`no_fetch` placeholders of their own so those
+// knobs still reach `crawl.plan` (`PlanStepConfig::from_step` now parses
+// them leniently — string-or-typed — the same convention `bool_param`/the
+// CLI param layer already uses, since a `--param` value always arrives as
+// a JSON string).
 
 fn build_launch_params(
     config: &MissionConfig,
@@ -2432,7 +2411,15 @@ fn build_launch_params(
     LaunchParams {
         phase_ids: real_phase_ids.clone(),
         task_overrides,
-        step_config_overrides: crawl_plan_step_overrides(config, collected),
+        // (#2310 P4c-2 item 0) The old `crawl_plan_step_overrides` (deleted)
+        // only ever substituted `{{workspace}}`, and only into `crawl.plan`
+        // steps — `review-v2.json`'s `plan.sites` steps never got their
+        // `{{workspace}}`/`{{diff_file}}`/etc placeholders resolved on a
+        // real launch (P4c-1's BLOCKER). `mission_config::interpret` now
+        // substitutes every declared input generically, from
+        // `input_values` below.
+        step_config_overrides: BTreeMap::new(),
+        input_values: collected.clone(),
     }
 }
 
@@ -5230,6 +5217,8 @@ mod tests {
             name: name.to_string(),
             description: None,
             required,
+            ignored: None,
+            ignored_reason: None,
             extras: BTreeMap::new(),
         };
         let cfg = MissionConfig {

@@ -4771,6 +4771,7 @@
             phase_ids: std::collections::BTreeMap::new(),
             task_overrides: std::collections::BTreeMap::new(),
             step_config_overrides: std::collections::BTreeMap::new(),
+            input_values: std::collections::BTreeMap::new(),
         };
         let (tasks, steps, _warnings) = darkmux_crew::mission_config::interpret(&loaded.config, &params)
             .expect("interpret succeeds against the embedded review config");

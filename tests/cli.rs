@@ -4902,6 +4902,210 @@ fn review_v2_dry_run_warns_when_bundler_is_passed() {
     );
 }
 
+/// (#2310 P4c-2 item 4 — proven structurally) A SYNTHETIC config (not
+/// `review-v2`, not any name the launcher's source recognizes) proves the
+/// `"ignored": true` input-declaration flag is honored by ANY config, not
+/// detected by matching `config.id`. Both legs: an ignored input supplied
+/// warns naming the input and reason; a LIVE (non-ignored) input supplied
+/// never warns, even on the same launch.
+#[test]
+fn an_ignored_input_flag_warns_on_any_config_never_by_id() {
+    let home = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("synthetic-ignored-test.json"),
+        serde_json::json!({
+            "id": "synthetic-ignored-test",
+            "name": "Synthetic ignored-input test",
+            "schema_version": "3.4",
+            "inputs": [
+                {"name": "legacy_flag", "required": false, "ignored": true, "ignored_reason": "kept for CLI parity only, never read"},
+                {"name": "live_flag", "required": false}
+            ],
+            "phases": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let with_ignored = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .args([
+            "mission",
+            "launch",
+            "synthetic-ignored-test",
+            "--dry-run",
+            "--param",
+            "legacy_flag=anything",
+        ])
+        .output()
+        .expect("mission launch synthetic-ignored-test --dry-run runs");
+    assert!(with_ignored.status.success(), "stderr: {}", String::from_utf8_lossy(&with_ignored.stderr));
+    let stderr = String::from_utf8_lossy(&with_ignored.stderr);
+    assert!(
+        stderr.contains("legacy_flag") && stderr.contains("ignored") && stderr.contains("never read"),
+        "an ignored input supplied must warn, naming the input and its reason: {stderr}"
+    );
+
+    let with_live = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .args([
+            "mission",
+            "launch",
+            "synthetic-ignored-test",
+            "--dry-run",
+            "--param",
+            "live_flag=anything",
+        ])
+        .output()
+        .expect("mission launch synthetic-ignored-test --dry-run runs");
+    assert!(with_live.status.success(), "stderr: {}", String::from_utf8_lossy(&with_live.stderr));
+    let live_stderr = String::from_utf8_lossy(&with_live.stderr);
+    assert!(
+        !live_stderr.contains("ignored"),
+        "a LIVE (non-ignored) input must never warn: {live_stderr}"
+    );
+}
+
+/// (#2310 P4c-2 item 0 — the P4c-1 BLOCKER, proven) A REAL (non-dry-run)
+/// `review-v2` launch — stubbed before dispatch via `DARKMUX_LMS_BIN=/usr/
+/// bin/true`, so this proves MINTING, not model behavior — must leave no
+/// literal `{{` in ANY minted step's config, in both the statically
+/// declared `plan-<rule>-step`s (`{{workspace}}`/`{{diff_file}}`) and the
+/// GROWN `unit-<rule>-step`s (`{{intent_file}}`, wired into `grow.config`
+/// by this same packet). Before this packet, `crawl_plan_step_overrides`
+/// only ever substituted `{{workspace}}`, and only for `kind ==
+/// "crawl.plan"` — `review-v2.json`'s `plan.sites` steps got NO
+/// substitution on a real launch, so this is the fix's own regression
+/// test, not incidental coverage.
+#[test]
+fn review_v2_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
+    let workdir = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    write_app_repo(&app, "^1.0.0");
+    // A real `git diff` between the empty tree and the fully-populated
+    // `write_app_repo` state — the tree materializes at HEAD (the "after"
+    // state), and the diff's added lines are exactly that content, so
+    // `DiffSource`'s tree-agreement check passes and the bare
+    // `catch (e) { }` in `src/x.ts` is a genuine `swallowed-error` hit.
+    let empty_tree = std::process::Command::new("git")
+        .current_dir(&app)
+        .args(["hash-object", "-t", "tree", "/dev/null"])
+        .output()
+        .unwrap();
+    let empty_tree_sha = String::from_utf8_lossy(&empty_tree.stdout).trim().to_string();
+    let diff_out = std::process::Command::new("git")
+        .current_dir(&app)
+        .args(["diff", &empty_tree_sha, "HEAD"])
+        .output()
+        .unwrap();
+    assert!(diff_out.status.success(), "{}", String::from_utf8_lossy(&diff_out.stderr));
+    let diff_text = String::from_utf8_lossy(&diff_out.stdout).to_string();
+    assert!(
+        diff_text.contains("catch (e) { }"),
+        "the fixture's bare (swallowed) catch must appear in the diff: {diff_text}"
+    );
+
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(
+        &spec_path,
+        serde_json::json!({
+            "name": "review-v2-real-launch",
+            "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let diff_path = workdir.path().join("d.diff");
+    fs::write(&diff_path, &diff_text).unwrap();
+    let intent_path = workdir.path().join("intent.md");
+    fs::write(&intent_path, "Fix the swallowed catch in src/x.ts.").unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "mission",
+            "launch",
+            "review-v2",
+            "--param",
+            &format!("workspace={}", spec_path.display()),
+            "--param",
+            &format!("diff_file={}", diff_path.display()),
+            "--param",
+            "rules=swallowed-error",
+            "--param",
+            &format!("intent_file={}", intent_path.display()),
+        ])
+        .output()
+        .expect("mission launch review-v2 runs");
+    let combined =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let mission_dir = one_mission_dir(&home);
+    let steps_dir = mission_dir.join("steps");
+    assert!(steps_dir.exists(), "no steps/ dir was written:\n{combined}");
+
+    let mut all_configs: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut saw_plan_step = false;
+    let mut saw_grown_unit_step = false;
+    for phase_entry in fs::read_dir(&steps_dir).unwrap() {
+        let phase_dir = phase_entry.unwrap().path();
+        if !phase_dir.is_dir() {
+            continue;
+        }
+        for step_entry in fs::read_dir(&phase_dir).unwrap() {
+            let path = step_entry.unwrap().path();
+            let step: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            // Keyed on `kind`, not `id` — the id carries the composed real
+            // PHASE id as its prefix (`substitute_id`), not the document's
+            // bare `plan-`/`unit-` prefix.
+            if step["kind"] == serde_json::json!("plan.sites") {
+                saw_plan_step = true;
+                assert_eq!(
+                    step["config"]["workspace"],
+                    serde_json::json!(spec_path.to_string_lossy()),
+                    "the plan step's `{{{{workspace}}}}` must resolve to the real path: {step}"
+                );
+                assert_eq!(
+                    step["config"]["diff_file"],
+                    serde_json::json!(diff_path.to_string_lossy()),
+                    "the plan step's `{{{{diff_file}}}}` must resolve to the real path: {step}"
+                );
+                assert!(
+                    step["config"].get("head_sha").is_none(),
+                    "an unset optional input's placeholder key must be OMITTED, not an empty string: {step}"
+                );
+            }
+            if step["kind"] == serde_json::json!("crawl.unit") && step["config"].get("grown_from").is_some() {
+                saw_grown_unit_step = true;
+                assert_eq!(
+                    step["config"]["intent_file"],
+                    serde_json::json!(intent_path.to_string_lossy()),
+                    "a GROWN unit step's `{{{{intent_file}}}}` must resolve too, not just static tasks: {step}"
+                );
+            }
+            all_configs.push((path.to_string_lossy().to_string(), step["config"].clone()));
+        }
+    }
+    assert!(saw_plan_step, "no `plan-*` step was minted:\n{combined}");
+    assert!(
+        saw_grown_unit_step,
+        "the fixture's bare catch must have grown at least one `unit-swallowed-error-*` step:\n{combined}"
+    );
+
+    let mut braces: Vec<String> = Vec::new();
+    for (path, config) in &all_configs {
+        darkmux_crew::mission_config::find_unsubstituted_braces(config, path, &mut braces);
+    }
+    assert!(braces.is_empty(), "literal `{{{{` survived minting:\n{}", braces.join("\n"));
+}
+
 
 #[test]
 fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {

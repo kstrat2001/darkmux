@@ -228,6 +228,18 @@ fn merge_grown_config(
 /// is NOT special-cased here — this returns a `String` because a task id
 /// suffix is one. [`render_value`] is what preserves an item's number or
 /// bool as a JSON number or bool.
+///
+/// (#2310 P4c-2 item 0) A placeholder in NEITHER namespace is left VERBATIM
+/// in the output, not refused — `grow.config` may carry a launch's own
+/// declared-input placeholder (`review-v2.json`'s `unit-<rule>` tasks grow
+/// `"intent_file": "{{intent_file}}"` into every unit's config), which this
+/// function knows nothing about and has no `collected` map to resolve. The
+/// literal text survives into the grown step's config for
+/// `interpret_grown`'s OWN substitution pass
+/// (`mission_config::substitute_step_config`) to resolve — which is also
+/// where an actually-unrecognized placeholder (not `item.*`, not
+/// `from.output`, not a declared input) gets refused, just with that
+/// pass's own vocabulary in the error rather than this one's.
 fn render(template: &str, item: &serde_json::Value, from_output: &str, what: &str) -> Result<String> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -244,10 +256,11 @@ fn render(template: &str, item: &serde_json::Value, from_output: &str, what: &st
             // namespace: a producing step has exactly one output, and it
             // is the path the items were read from.
             None if key == "from.output" => out.push_str(from_output),
-            None => bail!(
-                "grow: {what} names placeholder `{{{{{key}}}}}` — the placeholder namespaces are \
-                 `item.<field>` and `from.output`"
-            ),
+            None => {
+                out.push_str("{{");
+                out.push_str(key);
+                out.push_str("}}");
+            }
         }
         rest = &after[close + 2..];
     }
@@ -469,13 +482,20 @@ mod tests {
         assert_eq!(cfg["note"], json!(format!("plan={PLAN_PATH} unit=u-1")));
     }
 
+    /// (#2310 P4c-2 item 0) A placeholder outside grow's OWN namespace
+    /// (`item.*`/`from.output`) is no longer refused HERE — it survives
+    /// verbatim into the grown config, for `interpret_grown`'s later
+    /// declared-input substitution pass to resolve or refuse (see this
+    /// function's own doc, and `mission_config::inputs` for that pass's
+    /// own refusal test).
     #[test]
-    fn an_unknown_placeholder_namespace_names_both_legal_ones() {
+    fn an_unknown_placeholder_namespace_survives_verbatim_for_a_later_pass() {
         let mut spec = spec();
-        spec.config = json!({ "plan": "{{from.path}}" });
+        spec.config = json!({ "plan": "{{from.path}}", "note": "x={{from.path}} y" });
         let items = vec![json!({"id": "u-1", "rule": "r-a"})];
-        let err = grow_task(&template(), &spec, &items, PLAN_PATH).unwrap_err().to_string();
-        assert!(err.contains("from.path"), "{err}");
-        assert!(err.contains("item.<field>") && err.contains("from.output"), "{err}");
+        let grown = grow_task(&template(), &spec, &items, PLAN_PATH).unwrap();
+        let cfg = &grown.tasks[0].steps[0].config;
+        assert_eq!(cfg["plan"], json!("{{from.path}}"), "left verbatim, not resolved or refused");
+        assert_eq!(cfg["note"], json!("x={{from.path}} y"));
     }
 }

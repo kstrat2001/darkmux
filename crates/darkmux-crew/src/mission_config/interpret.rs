@@ -49,7 +49,7 @@
 use super::{MissionConfig, StepConfig};
 use crate::types::{NodeStatus, Step, Task};
 use anyhow::{bail, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Per-task overrides a launcher supplies at interpretation time, keyed by
@@ -94,6 +94,15 @@ pub struct LaunchParams {
     /// decision for why the static JSON value is a documented default
     /// only, never load-bearing at launch).
     pub step_config_overrides: BTreeMap<String, serde_json::Value>,
+    /// (#2310 P4c-2 item 0) Every input the launch actually collected
+    /// (`--input`/`--param`), keyed by name — the values [`super::
+    /// substitute_step_config`] resolves `{{<input-id>}}` placeholders
+    /// from. Applied AFTER `step_config_overrides` (a launcher's explicit
+    /// override wins outright), to every step's config in the document AND
+    /// to every grown copy's config (see `interpret_grown`). Replaces the
+    /// old `crawl_plan_step_overrides`, which only ever substituted
+    /// `{{workspace}}` and only for `crawl.plan` steps.
+    pub input_values: BTreeMap<String, serde_json::Value>,
 }
 
 /// What [`interpret`] returns: the real `Vec<Task>` (document order) +
@@ -113,6 +122,7 @@ pub type InterpretedGraph = (Vec<Task>, BTreeMap<String, Step>, Vec<String>);
 /// See the module doc and [`InterpretedGraph`].
 pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<InterpretedGraph> {
     check_params_reference_the_document(config, params)?;
+    let declared: BTreeSet<String> = config.inputs.iter().map(|i| i.name.clone()).collect();
 
     let mut tasks: Vec<Task> = Vec::new();
     let mut steps: BTreeMap<String, Step> = BTreeMap::new();
@@ -143,12 +153,13 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
             for step_cfg in &task_cfg.steps {
                 let real_step_id = substitute_id(&step_cfg.id, &phase.id, &real_phase_id);
                 step_ids.push(real_step_id.clone());
+                let config = step_config_for(step_cfg, params, &declared)?;
                 push_step(
                     &mut steps,
                     &real_step_id,
                     &real_task_id,
                     &step_cfg.kind,
-                    step_config_for(step_cfg, params),
+                    config,
                     step_cfg.gate.clone(),
                 )?;
             }
@@ -261,11 +272,23 @@ pub fn real_task_ids(
 /// The same id rules apply as everywhere else: the placeholder-prefix
 /// substitution runs over both task and step ids, and duplicate rendered
 /// ids are refused rather than silently collapsing.
+///
+/// (#2310 P4c-2 item 0) `declared`/`collected` are the SAME pair
+/// [`interpret`] substitutes the statically-declared graph's step configs
+/// from — a grown copy's config already had its `{{item.<field>}}`/
+/// `{{from.output}}` placeholders resolved by `grow_task` before it reaches
+/// here (growth is a separate, earlier substitution pass over a different
+/// namespace), so what's left to resolve is exactly the declared-input
+/// placeholders a grow template's static keys may also carry (e.g.
+/// `review-v2.json`'s `unit-<rule>` tasks wiring `{{intent_file}}` into
+/// every grown unit's config).
 pub fn interpret_grown(
     grown: &[super::TaskConfig],
     doc_phase_id: &str,
     real_phase_id: &str,
     real_ids: &BTreeMap<String, Vec<String>>,
+    declared: &BTreeSet<String>,
+    collected: &BTreeMap<String, serde_json::Value>,
 ) -> Result<(Vec<Task>, BTreeMap<String, Step>)> {
     let mut tasks: Vec<Task> = Vec::new();
     let mut steps: BTreeMap<String, Step> = BTreeMap::new();
@@ -275,12 +298,18 @@ pub fn interpret_grown(
         for step_cfg in &task_cfg.steps {
             let real_step_id = substitute_id(&step_cfg.id, doc_phase_id, real_phase_id);
             step_ids.push(real_step_id.clone());
+            let config = super::substitute_step_config(
+                &step_cfg.config,
+                declared,
+                collected,
+                &format!("step `{real_step_id}`"),
+            )?;
             push_step(
                 &mut steps,
                 &real_step_id,
                 &real_task_id,
                 &step_cfg.kind,
-                step_cfg.config.clone(),
+                config,
                 step_cfg.gate.clone(),
             )?;
         }
@@ -401,12 +430,21 @@ fn substitute_id(id: &str, doc_phase_id: &str, real_phase_id: &str) -> String {
     }
 }
 
-fn step_config_for(step_cfg: &StepConfig, params: &LaunchParams) -> serde_json::Value {
-    params
-        .step_config_overrides
-        .get(&step_cfg.id)
-        .cloned()
-        .unwrap_or_else(|| step_cfg.config.clone())
+/// (#2310 P4c-2 item 0) A launcher's explicit `step_config_overrides` entry
+/// (e.g. the review launcher's judge concurrency) REPLACES the document's
+/// config outright and is never itself re-substituted — it's already a
+/// resolved value, not a template. Otherwise, the document's own config
+/// runs through [`super::substitute_step_config`] against every input the
+/// launch collected.
+fn step_config_for(
+    step_cfg: &StepConfig,
+    params: &LaunchParams,
+    declared: &BTreeSet<String>,
+) -> Result<serde_json::Value> {
+    if let Some(overridden) = params.step_config_overrides.get(&step_cfg.id) {
+        return Ok(overridden.clone());
+    }
+    super::substitute_step_config(&step_cfg.config, declared, &params.input_values, &format!("step `{}`", step_cfg.id))
 }
 
 #[allow(clippy::too_many_arguments)]

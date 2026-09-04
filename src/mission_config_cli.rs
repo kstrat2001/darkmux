@@ -1449,12 +1449,16 @@ mod tests {
                 name: "review-judge".to_string(),
                 description: None,
                 required: Some(false),
+                ignored: None,
+                ignored_reason: None,
                 extras: Default::default(),
             },
             MissionInput {
                 name: "diff_file".to_string(),
                 description: None,
                 required: Some(true),
+                ignored: None,
+                ignored_reason: None,
                 extras: Default::default(),
             },
         ];
