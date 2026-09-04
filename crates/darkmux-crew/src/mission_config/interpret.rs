@@ -208,6 +208,30 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
         }
     }
 
+    // (#2341) A step id may never equal a task id: a later step's `input`
+
+    // keys the task's reads/depends_on by TASK id and its predecessor by STEP
+
+    // id in one map, and the predecessor would silently win the collision.
+
+    // Shipped configs avoid it by convention (`-task`/`-step` suffixes); a
+
+    // hand-built one is refused here, loudly, rather than at run time.
+
+    for step_id in steps.keys() {
+
+        if tasks.iter().any(|t| &t.id == step_id) {
+
+            bail!(
+            "interpreted graph: step id `{step_id}` equals a task id; a later step's inputs key reads by task id and the predecessor by step id, so the two would collide (#2341). Rename one of them"
+        ); rename one of them"
+
+            );
+
+        }
+
+    }
+
     Ok((tasks, steps, warnings))
 }
 
@@ -823,4 +847,26 @@ mod tests {
     // longer reachable via `expand`'s no-placeholder case; there is no
     // OTHER known way to trigger a same-document-id collision today, so no
     // replacement test was added for it in isolation.
+
+    /// (#2341 review) A step id that equals a task id would collide in a
+    /// later step's `input` map — reads are keyed by TASK id, the chained
+    /// predecessor by STEP id — and the predecessor would silently win.
+    /// Refuse the document instead.
+    #[test]
+    fn a_step_id_equal_to_a_task_id_is_refused() {
+        let cfg = doc(vec![phase(
+            "p",
+            vec![
+                task("a", &[], None, vec![step("a-step", "procedural.noop", serde_json::json!({}))]),
+                task("multi", &["a"], None, vec![
+                    step("a", "procedural.noop", serde_json::json!({})),
+                    step("multi-2", "procedural.noop", serde_json::json!({})),
+                ]),
+            ],
+        )]);
+        let err = interpret(&cfg, &LaunchParams::default()).expect_err("a step id equal to a task id must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("step id `a`") && msg.contains("task id"), "{msg}");
+    }
+
 }

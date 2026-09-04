@@ -2648,6 +2648,20 @@ mod tests {
         );
     }
 
+    /// (#2341 review) An explicit `collection_input` on a NON-first step still
+    /// wins over the predecessor preference — the operator's word beats the
+    /// default.
+    #[test]
+    fn resolve_map_collection_non_first_step_explicit_collection_input_beats_predecessor() {
+        let task = task_with_step_ids(&["render-step", "m1"]);
+        let s = map_step(json!({ "collection_input": "some-read-task" }));
+        let mut input = BTreeMap::new();
+        input.insert("render-step".to_string(), r#"["from-predecessor"]"#.to_string());
+        input.insert("some-read-task".to_string(), r#"["from-explicit"]"#.to_string());
+        let out = resolve_map_collection(&s, &task, &input).unwrap();
+        assert_eq!(out, vec![json!("from-explicit")]);
+    }
+
     #[test]
     fn resolve_map_collection_first_step_two_inputs_still_bails_loud() {
         // (#2310 P2a) The predecessor preference applies ONLY to a non-first

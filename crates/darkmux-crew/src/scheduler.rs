@@ -264,6 +264,10 @@ fn step_is_ready(
 /// implicit single-dependency collection fallback) must instead prefer a
 /// known predecessor-step key when present — see
 /// `step_kinds::builtins::resolve_map_collection`.
+/// The map is a `BTreeMap`, so consumers that iterate every input (the
+/// `dispatch.internal` prompt blocks, `procedural.shell` env vars) see them in
+/// KEY order — a later step's predecessor entry sorts among the task-id
+/// entries by its step id, not last.
 pub fn gather_inputs(
     step: &Step,
     task: &Task,
