@@ -35,6 +35,11 @@ import type { LivenessState } from "./LivenessPulse";
  * the WORD for the one kind whose chips sit side by side while both pulse.
  * Terminal words stay raw on purpose: `finalized` / `complete` / `finished`
  * are different facts at different scopes, and none of them pulse.
+ *
+ * NOT this word, and not this component: the masthead's `● LIVE` badge
+ * (`LiveStatusBadge`) says the record STREAM is connected. A page can be live
+ * with nothing running, and a run can be running while the stream reconnects.
+ * (operator, 2026-09-04: "live is a separate idea from a running job.")
  */
 export const RUNNING_WORD = "running";
 export type WorkStatusKind = "running" | "done" | "error" | "stopped" | "idle";
