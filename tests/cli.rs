@@ -2811,6 +2811,185 @@ fn pr_review_run_document_stamped_attribution_survives_the_launcher_merge() {
         stdout.contains("custom-doc-attribution-marker"),
         "the document's own stamped attribution must survive the launcher's config merge: {stdout}"
     );
+
+    // (#2345 CONSIDER-3, round 2) The (#1311/I2) synthesis/done liveness
+    // bracket fires on the CLEAN path too (`review-report-step` actually
+    // ran here, never the fallback) — pin the ordering here as well, not
+    // just on the errored-graph variant.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_in_order(&stderr, &["process-start", "synthesis", "done"], "stderr");
+}
+
+/// (#2345 CONSIDER-1, round 2) The errored-run FALLBACK used to honor a
+/// merged `attribution` but still pass the raw launch-only `emit`/
+/// `envelope_out` — so a document-stamped `emit: <file>` was written by a
+/// CLEAN run (the step reads its own merged config) but silently dumped to
+/// STDOUT by an errored run (the fallback ignored the merge for those two
+/// fields). Forces the fallback via the same hermetic bogus-`--bundler`
+/// error the C1 test uses, over a document that stamps a fixed `emit` file
+/// path on `review-report-step` with NO `--param emit=` of its own —
+/// exactly the pairing CONSIDER-1 named.
+#[test]
+fn pr_review_run_errored_graph_honors_the_documents_stamped_emit_path_in_the_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let profiles = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles,
+        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
+    )
+    .unwrap();
+
+    let builtin_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates/builtin/mission-configs/review.json");
+    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&builtin_path).unwrap()).unwrap();
+    doc["id"] = serde_json::json!("review-emit-fallback-test");
+    let report_phase = doc["phases"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["id"] == "report")
+        .expect("review.json declares a report phase");
+    let report_task = report_phase["tasks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|t| t["id"] == "review-report-task")
+        .expect("review.json declares review-report-task");
+    let report_step = report_task["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == "review-report-step")
+        .expect("review.json declares review-report-step");
+    let stamped_emit_path = tmp.path().join("stamped-emit.json");
+    report_step["config"] = serde_json::json!({ "emit": stamped_emit_path.display().to_string() });
+
+    let config_dir = tmp.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("review-emit-fallback-test.json"), serde_json::to_string(&doc).unwrap()).unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args([
+            "mission",
+            "launch",
+            "review-emit-fallback-test",
+            "--param",
+            &format!("worktree={}", tmp.path().to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("profiles={}", profiles.to_str().unwrap()),
+            "--param",
+            "bundler=/definitely/not/a/real/darkmux-bundler-xyz",
+            // Deliberately NO --param emit= — the document's own stamped
+            // path is the only thing naming a destination.
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "with no --param emit=, the document's own stamped path must receive the payload, not stdout: {stdout}"
+    );
+    let written = fs::read_to_string(&stamped_emit_path).unwrap_or_else(|e| {
+        panic!(
+            "expected the document-stamped emit path to receive the fallback's rendered payload: {e}"
+        )
+    });
+    let v: serde_json::Value = serde_json::from_str(&written).expect("stamped emit file holds valid JSON");
+    assert_eq!(v["mode"], "degraded", "an errored graph run must still render as degraded, not silence");
+}
+
+/// (#2345 CONSIDER-3, round 2) `effective_attribution` (the fallback's own
+/// read of the merged report-step config) is DEAD CODE on the CLEAN path —
+/// `pr_review_run_document_stamped_attribution_survives_the_launcher_merge`
+/// exercises the step's own direct read of `step.config`, never this
+/// launcher-side variable, so a mutation to `effective_attribution`'s own
+/// computation left that test green. This forces the FALLBACK (the same
+/// hermetic bogus-`--bundler` error C1/CONSIDER-1 use) over a document
+/// that stamps a fixed `attribution`, with no `--param attribution=` of
+/// its own — the only path that actually reads `effective_attribution`.
+#[test]
+fn pr_review_run_errored_graph_honors_the_documents_stamped_attribution_in_the_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let profiles = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles,
+        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
+    )
+    .unwrap();
+
+    let builtin_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates/builtin/mission-configs/review.json");
+    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&builtin_path).unwrap()).unwrap();
+    doc["id"] = serde_json::json!("review-attrib-fallback-test");
+    let report_phase = doc["phases"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["id"] == "report")
+        .expect("review.json declares a report phase");
+    let report_task = report_phase["tasks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|t| t["id"] == "review-report-task")
+        .expect("review.json declares review-report-task");
+    let report_step = report_task["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == "review-report-step")
+        .expect("review.json declares review-report-step");
+    report_step["config"] = serde_json::json!({ "attribution": "custom-fallback-attribution-marker" });
+
+    let config_dir = tmp.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("review-attrib-fallback-test.json"), serde_json::to_string(&doc).unwrap()).unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args([
+            "mission",
+            "launch",
+            "review-attrib-fallback-test",
+            "--param",
+            &format!("worktree={}", tmp.path().to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("profiles={}", profiles.to_str().unwrap()),
+            "--param",
+            "bundler=/definitely/not/a/real/darkmux-bundler-xyz",
+            "--param",
+            "emit=-",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("custom-fallback-attribution-marker"),
+        "the document's own stamped attribution must survive the FALLBACK's config merge too: {stdout}"
+    );
 }
 
 // ─── #2124: SIGTERM mid-probe leaves a terminal record + no orphaned curl ──
@@ -3944,6 +4123,71 @@ fn pr_review_run_malformed_charges_file_errors_loudly() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("charges_file"), "{stderr}");
     assert!(stderr.contains("flag list"), "{stderr}");
+}
+
+/// (#2345 MUST FIX, round 2) `--charges-file` mints NO graph — before this
+/// fix, nothing ever rendered this path's envelope: `launch`'s own tail
+/// used to render + emit unconditionally after every `run_dispatch`
+/// (pre-#2310 P3); P3 moved the render into `review-report-step`, a step
+/// this path never reaches (it mints no Mission and runs no graph at all).
+/// Production symptom: `darkmux mission launch review --param
+/// charges_file=<flags> --param emit=-` exited 0 with EMPTY stdout. An
+/// EMPTY flags array makes `run_judge_only` short-circuit before any
+/// dispatch (`env.degenerate = Some("--charges-file carried zero
+/// flags")`), so this needs no LMStudio; an empty diff/worktree keeps the
+/// eager pre-dispatch bundling pass hermetic too (the built-in bundler
+/// yields zero bundles for an empty diff, no `--bundler` subprocess
+/// needed).
+#[test]
+fn pr_review_run_charges_file_renders_a_payload_to_stdout() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("empty.diff");
+    fs::write(&diff_path, "").unwrap();
+    let profiles_path = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
+    )
+    .unwrap();
+    let charges_path = tmp.path().join("charges.json");
+    fs::write(&charges_path, "[]").unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args([
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("worktree={}", tmp.path().to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("profiles={}", profiles_path.to_str().unwrap()),
+            "--param",
+            &format!("charges_file={}", charges_path.to_str().unwrap()),
+            "--param",
+            "emit=-",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("stdout was not JSON — the charges_file path rendered nothing ({e}): {stdout}")
+    });
+    assert!(v["mode"].is_string(), "expected a rendered {{mode, review, comment}} payload: {stdout}");
+
+    // Bonus: the (#2345 I2-style) synthesis/done liveness bracket applies
+    // to this path too now, not just the graph path.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_in_order(&stderr, &["synthesis", "done"], "stderr");
 }
 
 /// `mission_launch_review::launch`'s `from_envelope` ignored-input warning

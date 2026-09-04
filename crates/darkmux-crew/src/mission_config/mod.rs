@@ -827,12 +827,22 @@ impl MissionConfig {
         // possible: the producer's phase must have already run.
         let mut phase_index_of_task: BTreeMap<&str, usize> = BTreeMap::new();
         let mut grow_templates: BTreeSet<&str> = BTreeSet::new();
+        // (#2345 CONSIDER-2, round 2) A task this document itself prunes at
+        // mint time (`enabled: false` on the task, or on its owning phase —
+        // `prune.rs`'s own two checks) is never minted either, same as a
+        // `grow` template — it just has a different REASON for never
+        // producing a `Step.output`. Tracked alongside `grow_templates` so
+        // `outcome_from` can refuse naming either kind below.
+        let mut disabled_tasks: BTreeSet<&str> = BTreeSet::new();
         for (pi, phase) in self.phases.iter().enumerate() {
             for task in &phase.tasks {
                 all_task_ids.insert(task.id.as_str());
                 phase_index_of_task.entry(task.id.as_str()).or_insert(pi);
                 if task.grow.is_some() {
                     grow_templates.insert(task.id.as_str());
+                }
+                if !task.is_enabled() || !phase.is_enabled() {
+                    disabled_tasks.insert(task.id.as_str());
                 }
             }
         }
@@ -1152,6 +1162,26 @@ impl MissionConfig {
                          TEMPLATE is never itself minted (it stamps zero-or-more real copies at its \
                          phase boundary instead), so it has no `Step.output` of its own to promote \
                          as the close payload"
+                    ),
+                });
+            } else if disabled_tasks.contains(outcome_from.as_str()) {
+                // (#2345 CONSIDER-2, round 2) `all_task_ids` (checked above)
+                // includes `enabled: false` tasks — they are real DECLARED
+                // tasks, just pruned at mint (`prune.rs`), so the "unknown
+                // task id" branch above never catches this. Without this
+                // check, `outcome_from` naming a disabled task passed
+                // `validate` cleanly and only failed at CLOSE time, silently
+                // (`run_summary_payload` returning `Ok(None)` reads
+                // identically to "the task hasn't produced output yet" —
+                // see that function's own doc, widened in the same packet).
+                findings.push(ValidationFinding {
+                    severity: FindingSeverity::Error,
+                    path: "outcome_from".to_string(),
+                    message: format!(
+                        "outcome_from names \"{outcome_from}\", which is disabled (`enabled: false` \
+                         on the task itself, or on its owning phase) — a disabled task is pruned at \
+                         mint and never produces a `Step.output`, so it has nothing to promote as \
+                         the close payload. Enable the task, or name a different one"
                     ),
                 });
             }
@@ -2439,6 +2469,55 @@ mod tests {
             errs.iter().any(|e| e.starts_with("outcome_from:") && e.contains("TEMPLATE")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn outcome_from_naming_a_disabled_task_is_an_error() {
+        // (#2345 CONSIDER-2, round 2) A disabled task is a REAL declared
+        // task (`all_task_ids` contains it, so the "unknown task id" branch
+        // never fires) but is pruned at mint (`prune.rs`) and so never
+        // produces a `Step.output` — same failure CLASS as a grow template,
+        // different reason.
+        let mut cfg = doc(vec![phase("p1", vec![task("t", &[], vec![step("s", "procedural.noop")])])]);
+        cfg.phases[0].tasks[0].enabled = Some(false);
+        cfg.outcome_from = Some("t".into());
+        let errs = grow_errors(&cfg);
+        assert!(
+            errs.iter().any(|e| e.starts_with("outcome_from:") && e.contains("disabled")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn outcome_from_naming_a_task_under_a_disabled_phase_is_an_error() {
+        // The TASK's own `enabled` is absent (defaults true) — it is the
+        // owning PHASE that is disabled, `prune.rs`'s other check. Same
+        // "never minted" outcome, so `outcome_from` must refuse it too.
+        let mut cfg = doc(vec![phase("p1", vec![task("t", &[], vec![step("s", "procedural.noop")])])]);
+        cfg.phases[0].enabled = Some(false);
+        cfg.outcome_from = Some("t".into());
+        let errs = grow_errors(&cfg);
+        assert!(
+            errs.iter().any(|e| e.starts_with("outcome_from:") && e.contains("disabled")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn outcome_from_naming_an_enabled_task_in_a_document_with_other_disabled_tasks_validates_clean() {
+        // Sanity: `disabled_tasks` must not over-match — a document with
+        // ONE disabled task elsewhere must not block `outcome_from` naming
+        // a DIFFERENT, enabled one.
+        let mut cfg = doc(vec![phase(
+            "p1",
+            vec![
+                task("live", &[], vec![step("s1", "procedural.noop")]),
+                task("dead", &[], vec![step("s2", "procedural.noop")]),
+            ],
+        )]);
+        cfg.phases[0].tasks[1].enabled = Some(false);
+        cfg.outcome_from = Some("live".into());
+        assert!(grow_errors(&cfg).is_empty(), "{:?}", grow_errors(&cfg));
     }
 
     #[test]

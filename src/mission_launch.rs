@@ -2168,12 +2168,25 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
 /// (a `grow`-templated task, never itself minted) — is a loud, named `Err`:
 /// a config author who explicitly names a task deserves the mistake surfaced
 /// at launch, not a close payload silently drawn from the wrong step (see
-/// [`MissionConfig::outcome_from`]'s own doc). A task that DOES exist in the
-/// document but was pruned dynamically THIS run (`enabled: false`, a claim/
-/// prune boundary like review's own probe-task pruning) is a different,
-/// legitimate runtime shape — not a config mistake — so that case falls
-/// through to `Ok(None)` exactly like every other "nothing to promote" path
-/// below, never an error.
+/// [`MissionConfig::outcome_from`]'s own doc).
+///
+/// (#2345 CONSIDER-2, round 2) **A disabled `outcome_from` target is ALSO a
+/// loud `Err` here, not `Ok(None)`.** This function's own earlier revision
+/// treated a task pruned dynamically (`enabled: false` on the task or its
+/// phase) as "a legitimate runtime shape, not a config mistake" — that was
+/// wrong: `real_task_ids` (called below) does NOT check `enabled` at all,
+/// so a disabled task's real id still resolves cleanly, `tasks.iter()
+/// .find(...)` then finds nothing (the task was pruned before minting), and
+/// the whole call silently fell through to `Ok(None)` — a null close
+/// payload with no explanation anywhere. `MissionConfig::validate` now
+/// refuses this at validate/launch time (the primary defense — the mistake
+/// never reaches a real run), so reaching this branch here means either a
+/// caller skipped `validate` or a document was hand-edited after launch;
+/// either way this is the BACKSTOP, and a backstop that stays silent isn't
+/// one. The `None` (positional-default) branch is UNCHANGED — a config
+/// that never sets `outcome_from` still silently gets `Ok(None)` for every
+/// other "nothing to promote" reason (no last step, incomplete, non-object
+/// output), because there is no operator-named task to have failed.
 fn run_summary_payload(
     config: &MissionConfig,
     real_phase_ids: &BTreeMap<String, String>,
@@ -2208,7 +2221,24 @@ fn run_summary_payload(
                 ),
                 Some(ids) => &ids[0],
             };
-            tasks.iter().find(|t| &t.id == real_id)
+            let found = tasks.iter().find(|t| &t.id == real_id);
+            if found.is_none() {
+                // (#2345 CONSIDER-2) `real_task_ids` resolved a real id
+                // (this is NOT the "unknown task id" case above), but no
+                // minted `Task` carries it — the declared task exists in
+                // the document but was pruned before minting (disabled, on
+                // itself or its phase). `MissionConfig::validate` refuses
+                // this before a mission ever mints; this is the backstop
+                // for whatever reaches it anyway.
+                bail!(
+                    "mission config \"{}\" declares outcome_from \"{doc_task_id}\", but no minted \
+                     task carries that id — it is declared in `phases` but was never minted this \
+                     run (most likely `enabled: false` on the task or its owning phase). Enable \
+                     the task, or name a different one (#2345 CONSIDER-2)",
+                    config.id
+                );
+            }
+            found
         }
         None => {
             let real_phase_id = config.phases.last().and_then(|p| real_phase_ids.get(&p.id));
@@ -3610,6 +3640,68 @@ mod tests {
             .expect_err("an outcome_from naming a task this config never declares must error, not silently promote nothing");
         let msg = format!("{err:#}");
         assert!(msg.contains("no-such-task"), "{msg}");
+        assert!(msg.contains("outcome_from"), "{msg}");
+    }
+
+    /// (#2345 CONSIDER-2, round 2) Simulates a disabled `outcome_from`
+    /// target reaching this function's BACKSTOP anyway (`MissionConfig::
+    /// validate` now refuses this earlier — see that fn's own `outcome_from`
+    /// checks — this test exercises the defense-in-depth layer, not the
+    /// primary one). The CONFIG still declares the task (`enabled: false`,
+    /// pruned before minting), so `real_task_ids` resolves a real id for
+    /// it, but no `Task` in the minted `tasks` slice carries that id —
+    /// exactly what a real pruned mint produces. Before this fix this fell
+    /// through to a silent `Ok(None)`.
+    #[test]
+    fn outcome_from_naming_a_task_absent_from_the_minted_tasks_is_a_loud_error() {
+        let cfg_json = serde_json::json!({
+            "id": "m", "name": "M", "schema_version": "3.3", "inputs": [],
+            "outcome_from": "disabled-task",
+            "phases": [{"id": "p", "tasks": [
+                {"id": "disabled-task", "enabled": false, "steps": [
+                    {"id": "disabled-step", "kind": "dispatch.internal", "config": {}}
+                ]},
+                {"id": "live-task", "steps": [
+                    {"id": "live-step", "kind": "dispatch.internal", "config": {}}
+                ]}
+            ]}]
+        });
+        let cfg: mission_config::MissionConfig = serde_json::from_value(cfg_json).unwrap();
+        let real_phase_ids: BTreeMap<String, String> = [("p".to_string(), "m-1-p".to_string())].into();
+        // Only "live-task" was actually minted — "disabled-task" was pruned
+        // before this point, matching real mint behavior (`prune.rs`).
+        let tasks = vec![crew::types::Task {
+            id: "live-task".into(),
+            phase_id: "m-1-p".into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["live-step".into()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        }];
+        let step = Step {
+            id: "live-step".into(),
+            task_id: "live-task".into(),
+            kind: "dispatch.internal".into(),
+            gate: None,
+            status: crew::types::NodeStatus::Complete,
+            config: serde_json::json!({}),
+            started_ts: None,
+            completed_ts: None,
+            output: Some(r#"{"from":"live"}"#.to_string()),
+        };
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into();
+
+        let err = run_summary_payload(&cfg, &real_phase_ids, &tasks, &steps).expect_err(
+            "a disabled outcome_from target reaching this backstop must error loudly, never \
+             silently promote None",
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("disabled-task"), "{msg}");
         assert!(msg.contains("outcome_from"), "{msg}");
     }
 

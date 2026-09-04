@@ -1275,7 +1275,7 @@ fn run_dispatch(
             .with_context(|| format!("reading charges_file {}", charges_path.display()))?;
         let flags: Vec<ProbeFlag> = serde_json::from_str(&raw)
             .with_context(|| format!("parsing charges_file {} as a flag list", charges_path.display()))?;
-        with_dispatch_bookends(
+        let charges_result = with_dispatch_bookends(
             &mut emitter,
             &case_id_for_bookends,
             &crew_name_for_bookends,
@@ -1287,7 +1287,39 @@ fn run_dispatch(
             None,
             dispatch_start_extra,
             move |emitter| run_judge_only(flags, &inputs, &mut chat, &mut cycler, emitter),
-        )
+        );
+        // (#2345 MUST FIX, round 2) `--charges-file` mints NO graph at all —
+        // there is no `review-report-step` to render this run's envelope,
+        // ever. On `origin/main` (pre-#2310 P3) `launch`'s own tail rendered
+        // + emitted UNCONDITIONALLY after every `run_dispatch` return, which
+        // covered this path too; #2310 P3 moved that render into the graph
+        // step and this path was never given an equivalent, so a
+        // `--charges-file` re-judge has produced NO stdout output (exit 0,
+        // empty stdout) since that packet shipped — `launch`'s `None` branch
+        // (below, `run_dispatch(...)?; Ok(0)`) discards `run_dispatch`'s
+        // returned envelope entirely. Render it right here instead, through
+        // the SAME shared helper the graph path uses, using the raw launch
+        // inputs (`collected`) directly — there is no interpreted graph step
+        // whose config a document could have stamped on this path, so
+        // there is nothing to merge (unlike the graph path's `review-
+        // report-step`, see #2345 I3/CONSIDER-1).
+        if let Ok(env) = &charges_result {
+            liveness("synthesis");
+            if let Err(e) = render_and_emit_review(
+                env,
+                diff_text,
+                str_input(collected, "attribution"),
+                path_input(collected, "emit").as_deref(),
+                path_input(collected, "envelope_out").as_deref(),
+            ) {
+                eprintln!(
+                    "{}",
+                    style::error(&format!("✗ review: charges_file render/emit failed: {e:#}"))
+                );
+            }
+            liveness("done");
+        }
+        charges_result
     } else {
         // (#1512, #1513 review) `crew` is already the validated, resolved
         // shape — no separate crew-validation step.
@@ -1447,11 +1479,20 @@ fn run_dispatch(
         let launch_emit_path = path_input(collected, "emit");
         let launch_envelope_out_path = path_input(collected, "envelope_out");
         let launch_attribution = str_input(collected, "attribution").map(str::to_string);
-        // (#2345 I3) The attribution the fallback render below must use is
-        // the EFFECTIVE one after the merge — launch value if supplied, else
-        // whatever the document stamped on the report step — so the fallback
-        // and the step render the same attribution.
+        // (#2345 I3, widened round 2 CONSIDER-1) The `emit`/`envelope_out`/
+        // `attribution` the fallback render below must use are the
+        // EFFECTIVE ones after the merge — launch value if supplied, else
+        // whatever the document stamped on the report step — so the
+        // fallback and the step render to the SAME destination with the
+        // SAME attribution. Before this widening only `attribution` was
+        // read back from the merged `cfg`; `emit`/`envelope_out` still fell
+        // through to the raw launch-only values, so a document-stamped
+        // `emit: <file>` was honored by a clean run (the step reads its own
+        // merged config) but silently dumped to stdout by an errored run
+        // (the fallback ignored the merge for those two fields).
         let mut effective_attribution = launch_attribution.clone();
+        let mut effective_emit_path = launch_emit_path.clone();
+        let mut effective_envelope_out_path = launch_envelope_out_path.clone();
         if let Some(report_step) = graph.steps.get_mut("review-report-step") {
             // (#2345 I3) MERGE into whatever `report_step.config` already
             // carries — the shipped `review.json` stamps `null` here, but a
@@ -1477,6 +1518,8 @@ fn run_dispatch(
                 cfg.insert("attribution".to_string(), serde_json::json!(a));
             }
             effective_attribution = cfg.get("attribution").and_then(|v| v.as_str()).map(str::to_string);
+            effective_emit_path = cfg.get("emit").and_then(|v| v.as_str()).map(PathBuf::from);
+            effective_envelope_out_path = cfg.get("envelope_out").and_then(|v| v.as_str()).map(PathBuf::from);
             report_step.config = serde_json::Value::Object(cfg);
         }
 
@@ -1731,8 +1774,8 @@ fn run_dispatch(
                                 &env,
                                 &ctx.diff,
                                 effective_attribution.as_deref(),
-                                launch_emit_path.as_deref(),
-                                launch_envelope_out_path.as_deref(),
+                                effective_emit_path.as_deref(),
+                                effective_envelope_out_path.as_deref(),
                             ) {
                                 eprintln!(
                                     "{}",
