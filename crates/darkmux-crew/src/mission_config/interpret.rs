@@ -209,29 +209,18 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
     }
 
     // (#2341) A step id may never equal a task id: a later step's `input`
-
     // keys the task's reads/depends_on by TASK id and its predecessor by STEP
-
     // id in one map, and the predecessor would silently win the collision.
-
     // Shipped configs avoid it by convention (`-task`/`-step` suffixes); a
-
     // hand-built one is refused here, loudly, rather than at run time.
-
     for step_id in steps.keys() {
-
         if tasks.iter().any(|t| &t.id == step_id) {
-
             bail!(
-            "interpreted graph: step id `{step_id}` equals a task id; a later step's inputs key reads by task id and the predecessor by step id, so the two would collide (#2341). Rename one of them"
-        ); rename one of them"
-
+                "interpreted graph: step id `{step_id}` equals a task id; a later step's inputs key reads by task id \
+                 and the predecessor by step id, so the two would collide (#2341) - rename one of them"
             );
-
         }
-
     }
-
     Ok((tasks, steps, warnings))
 }
 
