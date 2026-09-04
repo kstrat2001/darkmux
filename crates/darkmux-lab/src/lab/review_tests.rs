@@ -5567,46 +5567,6 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// offsets for chunks after the first exactly under this permutation
     /// (both flags of chunk 2 computed index 2), making output
     /// completion-order; `chunk_start + offset` pins docket order.
-    #[test]
-    fn zz_probe_verify_seam_and_context_step_records() {
-        let crew = crew_with(vec![
-            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
-            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
-        ]);
-        let verified_json = "```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"confirmed on the code\", \"note_for_author\": \"real\"}\n```";
-        let systems: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-        let systems_rec = systems.clone();
-        let mut ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), move |call: &ChatCall| {
-            systems_rec.lock().unwrap().push(call.system.clone());
-            if call.system == "probe prior" {
-                Ok(reply("a real defect `const end = start.plus(30)`"))
-            } else if call.system == "verify persona" || call.system == "HIJACKED VERIFY" {
-                Ok(reply(verified_json))
-            } else {
-                Ok(reply(CONFIRM_JSON))
-            }
-        });
-        Arc::get_mut(&mut ctx).unwrap().roles.verify = Some(staffing("fast", "verify-model", 1));
-        Arc::get_mut(&mut ctx).unwrap().context_test_overrides.verify_system = Some("HIJACKED VERIFY".to_string());
-        let judge = ctx.roles.judge.clone();
-        let verify = ctx.roles.verify.clone();
-        let probes = ctx.roles.probes.clone();
-        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
-        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
-        let crew_name = ctx.roles.distinct_profile_names();
-        let mut graph = build_review_graph(ctx.clone(), &dummy_bundle_spec(), judge, verify, &probes, "investigate", "adjudicate", "report", 1).expect("builds");
-        let dir = tempfile::tempdir().unwrap();
-        stamp_context_step_for_test(&mut graph.steps, &ctx, dir.path());
-        let mut em = RecordingEmitter::new();
-        let (env, steps) = run_review_graph(&ctx, &crew_name, ExecMode::Sequential, fingerprint_val, staffing_snap, graph, &mut em, &mut |_s| {}).expect("runs");
-        let written = std::fs::read_to_string(dir.path().join("context.json")).unwrap();
-        let ctx_json: serde_json::Value = serde_json::from_str(&written).unwrap();
-        let verify_cfg_system = steps["review-verify-step"].config.get("system").cloned();
-        let ctx_records: Vec<String> = em.records.iter().map(|r| serde_json::to_string(r).unwrap()).filter(|j| j.contains("review-context-step")).map(|j| j.chars().take(220).collect()).collect();
-        let dispatch_starts = em.records.iter().filter(|r| r.action == "dispatch.start").count();
-        panic!("\nSYSTEMS_SEEN={:?}\nCONTEXT_JSON_verify_system={:?}\nVERIFY_STEP_CONFIG_system={:?}\nENV confirmed={} judged={} verify_rulings={:?}\nCONTEXT_STEP_RECORDS({})={:#?}\nDISPATCH_START_TOTAL={}\n",
-            systems.lock().unwrap(), ctx_json["body"]["verify_system"], verify_cfg_system, env.confirmed, env.judged.len(), env.judged.iter().map(|j| j.verify.as_ref().map(|v| v.ruling.clone())).collect::<Vec<_>>(), ctx_records.len(), ctx_records, dispatch_starts);
-    }
 
     #[test]
     fn judge_indices_are_deterministic_under_permuted_completion_order() {
