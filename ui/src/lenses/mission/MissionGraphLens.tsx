@@ -417,6 +417,7 @@ export function MissionGraphLens({
   // (CSS), so this button only ever shows where the popover is the only way
   // to reach the legend.
   const [legendOpen, setLegendOpen] = useState(false);
+  const [showFullId, setShowFullId] = useState(false);
   const toggleTask = (id: string) => setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
   const toggleMinimap = () =>
     setMinimapOn((prev) => {
@@ -550,7 +551,12 @@ export function MissionGraphLens({
     graph &&
     graph.nodes.some((n) => n.status === "running" || (n.steps || []).some((s) => s.status === "running"))
   );
-  const now = useNow(anyRunning);
+  // (#2332 review) `active` is a mission's status from mint to finalize —
+  // including every sign-off gate, where no step is running. The header's
+  // elapsed clock must tick for the MISSION, so the clock follows the mission
+  // status as well as the steps.
+  const missionRunning = !!graph && workStatusKind(normalizeMissionStatus(graph.mission_status)) === "running";
+  const now = useNow(anyRunning || missionRunning);
   const proc = useProcReadout(flowTailQuery.data);
 
   // Needs `now` (elapsed time for a still-running step) — computed here,
@@ -653,30 +659,39 @@ export function MissionGraphLens({
   const useTimeline = timelineActive(viewMode, isMobile);
   const tot = missionTotals(metrics);
   const status = normalizeMissionStatus(graph.mission_status);
-  const running = workStatusKind(status) === "running";
+  const running = missionRunning;
   const idParts = splitMissionId(graph.mission_id);
   const span = missionSpan(metrics);
   // (#2332) The first-second facts: when it started and how long it ran.
   // Start = earliest step start, else the id's own epoch; elapsed while
   // running, final duration once it is not.
   const startMs = span.start || idParts.epoch || 0;
-  const endMs = running ? now : span.end || span.start;
-  const elapsed = startMs && endMs && endMs >= startMs ? fmtElapsed(endMs - startMs) : null;
-  const copyId = () => {
+  // A closed mission whose steps never emitted a terminal record (a
+  // SIGKILLed host, then `mission abort`) has no known end: show nothing
+  // rather than "ran 0:00".
+  const endMs = running ? now : span.end;
+  const elapsed = startMs && endMs && endMs > startMs ? fmtElapsed(endMs - startMs) : null;
+  // The Clipboard API exists only in a secure context, and the phone over
+  // the tailnet is plain http — so the tap ALWAYS does something visible
+  // (toggles the full id into the name slot) and copies when it can. A real
+  // <button>, so the keyboard reaches it too.
+  const onNameTap = () => {
+    setShowFullId((v) => !v);
     void navigator.clipboard?.writeText(graph.mission_id).catch(() => {});
   };
   return (
     <div className="missionlens">
-      {/* (#2332) Two rows on a phone, one on a wide lens, never a third —
-          the layout is keyed on the lens's own width (container query), not
-          the window's. Row 1: identity + state. Row 2: cost + controls.
-          Nothing changes rows with content length: the NAME ellipsizes, the
-          numbers and controls never move. */}
+      {/* (#2332) On a narrow lens: the identity row (name + chip), a dim
+          sub-line (when, how long, which), and the cost row (tokens +
+          controls); on a wide lens they flow into ONE row. The layout is
+          keyed on the lens's own width (container query), not the window's,
+          and nothing changes rows with content length: the NAME ellipsizes,
+          the numbers and controls never move. */}
       <div className="top missionlens__top">
         <div className="mhead-id">
-          <span className="midname" title={graph.mission_id} data-mission-id={graph.mission_id} onClick={copyId}>
-            {idParts.name}
-          </span>
+          <button type="button" className="midname" title={graph.mission_id} data-mission-id={graph.mission_id} onClick={onNameTap}>
+            {showFullId ? graph.mission_id : idParts.name}
+          </button>
           <WorkStatus status={status} className="mstatus" />
         </div>
         <div className="msub">

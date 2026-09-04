@@ -4746,6 +4746,11 @@ body {
   min-width: 0;
 }
 .missionlens .midname {
+  /* a <button>: reset the chrome, keep the text */
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: left;
   font: 700 calc(15px * var(--fs-scale)) / 1.2 var(--font-mono);
   color: var(--fg);
   white-space: nowrap;

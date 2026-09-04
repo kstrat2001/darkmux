@@ -522,3 +522,66 @@ describe("no lens-local liveness pill", () => {
   });
 });
 
+// (#2332 review) The header's sub-line and meter, pinned — the first cut
+// shipped an elapsed clock that froze whenever no step was running and a
+// "ran 0:00" for a mission with no terminal record; nothing here was red.
+describe("mission header sub-line and meter (#2332)", () => {
+  const MINTED = "crawl-x-1788484173-b562e3";
+  const minted = (status: string): MissionGraph => ({ ...GRAPH, mission_id: MINTED, mission_status: status });
+  const sub = () => document.querySelector(".missionlens .msub")?.textContent ?? "";
+
+  it("shows the id's name and keeps the full id on the element; the hash rides the sub-line", async () => {
+    mockFetch({ graph: minted("finalized") });
+    renderLens(MINTED);
+    await waitFor(() => expect(document.querySelector(".midname")?.textContent).toBe("crawl-x"));
+    expect(document.querySelector(".midname")?.getAttribute("data-mission-id")).toBe(MINTED);
+    expect(sub()).toContain("b562e3");
+  });
+
+  it("started HH:MM falls back to the id's epoch when no record has started anything", async () => {
+    mockFetch({ graph: minted("finalized") });
+    renderLens(MINTED);
+    await waitFor(() => expect(document.querySelector(".midname")).not.toBeNull());
+    expect(sub()).toMatch(/started \d\d:\d\d/);
+  });
+
+  it("elapsed keeps ticking on an ACTIVE mission even when no step is running (a sign-off gate)", async () => {
+    mockFetch({ graph: minted("active") });
+    renderLens(MINTED);
+    await waitFor(() => expect(sub()).toContain("elapsed"));
+    const before = sub();
+    await new Promise((r) => setTimeout(r, 2300));
+    expect(sub(), "the clock must move while the mission is active").not.toBe(before);
+  });
+
+  it("a finalized mission with a start but no terminal record shows NO duration, not 'ran 0:00'", async () => {
+    mockFetch({
+      graph: minted("finalized"),
+      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "dispatch.start", handle: "a-step", mission_id: MINTED, payload: { step_id: "a-step" } }],
+    });
+    renderLens(MINTED);
+    await waitFor(() => expect(sub()).toContain("started"));
+    expect(sub()).not.toContain("ran");
+  });
+
+  it("the meter shows the cloud share only when there is one; the split lives in the tooltip", async () => {
+    mockFetch({
+      graph: minted("finalized"),
+      flowMissionRecords: [
+        { ts: "2026-08-19T00:00:01Z", action: "dispatch.start", handle: "a-step", mission_id: MINTED, payload: { step_id: "a-step" } },
+        { ts: "2026-08-19T00:00:02Z", action: "dispatch.complete", handle: "a-step", mission_id: MINTED, payload: { step_id: "a-step", total_turns: 1, total_tokens: 5000, endpoint: "https://cloud.example" } },
+      ],
+    });
+    renderLens(MINTED);
+    await waitFor(() => expect(document.querySelector(".mmeter")?.textContent).toContain("(5.0k cloud)"));
+    expect(document.querySelector(".mmeter")?.getAttribute("title")).toContain("5.0k cloud");
+  });
+
+  it("tapping the name reveals the full id when the clipboard is unavailable (plain-http phone over the tailnet)", async () => {
+    mockFetch({ graph: minted("finalized") });
+    renderLens(MINTED);
+    await waitFor(() => expect(document.querySelector(".midname")?.textContent).toBe("crawl-x"));
+    fireEvent.click(document.querySelector(".midname")!);
+    expect(document.querySelector(".midname")?.textContent).toBe(MINTED);
+  });
+});
