@@ -47,7 +47,8 @@ test('at mobile width, .legend is hidden but .legbtn is a real replacement affor
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   await gotoMobileMission(page);
 
-  await expect(page.locator('.missionlens .legend')).not.toBeVisible();
+  // (#2332) The inline dot row is gone at every width; the glyph button is the legend.
+  await expect(page.locator('.missionlens .legend')).toHaveCount(0);
   const legbtn = page.locator('.missionlens .legbtn');
   await expect(legbtn).toBeVisible();
   await expect(legbtn).toHaveText(/legend/i);

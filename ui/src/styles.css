@@ -4722,57 +4722,102 @@ body {
   min-height: 0;
   flex: 1 1 auto;
 }
+.missionlens {
+  /* (#2332) The header keys its layout on the LENS's width, not the window's
+     — a tablet's 408px lens column was being told it was an 820px screen. */
+  container-type: inline-size;
+}
 .missionlens .top {
   flex: 0 0 auto;
   display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 10px 16px;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 16px 12px;
   border-bottom: 1px solid var(--border);
   background: var(--ml-bg2);
-  flex-wrap: wrap;
-  row-gap: 6px;
-  /* (#1868) Positioning context for `.legendpop`, anchored to this row's
-     own bottom edge — see that rule's own doc. */
   position: relative;
 }
+/* (#2332) Row 1: identity + state. The name is the ONE thing allowed to
+   ellipsize; the chip is pinned right and never moves. */
+.missionlens .mhead-id {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
 .missionlens .midname {
-  font: 600 calc(13px * var(--fs-scale)) var(--font-mono);
+  /* a <button>: reset the chrome, keep the text */
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  font: 700 calc(15px * var(--fs-scale)) / 1.2 var(--font-mono);
   color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  cursor: copy;
 }
 .missionlens .mstatus {
   letter-spacing: 0.08em;
+  margin-left: auto;
+  flex: none;
 }
-
-
+/* The dim sub-line: when it started, how long, which one (the hash), and —
+   only while running — the host's off-model corroboration (`.mproc`). Items
+   are separated by a middle dot; the line truncates from the right, so the
+   host readout goes first when room runs out. */
+.missionlens .msub {
+  display: flex;
+  align-items: baseline;
+  gap: 0;
+  font: calc(11px * var(--fs-scale)) / 1.3 var(--font-mono);
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.missionlens .msub > * + *::before {
+  content: "·";
+  margin: 0 6px;
+  color: var(--dim);
+}
+.missionlens .msub .mhash {
+  letter-spacing: 0.02em;
+}
+/* Row 2: cost + controls. The controls are one `flex: none` group so they
+   can never split across rows; the meter ellipsizes before they move. */
+.missionlens .mhead-meter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
 .missionlens .mmeter {
   display: inline-flex;
   align-items: baseline;
   gap: 6px;
-  font: calc(11px * var(--fs-scale))/1 var(--font-mono);
+  font: calc(12px * var(--fs-scale)) / 1 var(--font-mono);
   color: var(--dim);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .missionlens .mmeter b {
   color: var(--accent);
   font-weight: 700;
 }
 .missionlens .mmeter .cloud {
-  color: var(--warn);
+  color: var(--fg);
 }
-.missionlens .mmeter .unknown {
-  color: var(--dim);
-  font-style: italic;
-}
-/* (#1868, #1483) Header host-activity readout — cpu/gpu from
-   telemetry.process, the OFF-model corroboration that the box is actually
-   working (host kernel counters, zero model dispatches — observability
-   doctrine). */
 .missionlens .mproc {
   display: inline-flex;
   align-items: baseline;
   gap: 8px;
-  font: calc(11px * var(--fs-scale)) var(--font-mono);
+  font: inherit;
   color: var(--dim);
   white-space: nowrap;
 }
@@ -4783,18 +4828,32 @@ body {
 .missionlens .mproc .hot {
   color: var(--ml-run);
 }
-.missionlens .evbtn {
-  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
+.missionlens .mctl {
+  margin-left: auto;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.missionlens .evbtn,
+.missionlens .legbtn {
+  font: 600 calc(10px * var(--fs-scale)) / 1 var(--font-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--dim);
   border: 1px solid var(--border);
   border-radius: 5px;
-  padding: 5px 9px;
+  padding: 0 10px;
+  min-height: 36px;
+  min-width: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: none;
   cursor: pointer;
 }
-.missionlens .evbtn:hover {
+.missionlens .evbtn:hover,
+.missionlens .legbtn:hover {
   color: var(--fg);
   border-color: var(--accent-dim);
 }
@@ -4802,42 +4861,10 @@ body {
   color: var(--accent);
   border-color: var(--accent);
 }
-.missionlens .legend {
-  margin-left: auto;
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  font: calc(11px * var(--fs-scale)) var(--font-mono);
-  color: var(--dim);
-}
-.missionlens .legend .dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  margin-right: 5px;
-  vertical-align: middle;
-}
-/* (#1868) `.legbtn` — the mobile stand-in for `.legend` (mission-graph.html:
-   299-302,379-381,432,448). Shares `.evbtn`'s appearance; hidden above the
-   ~700px breakpoint, where the inline dots already show. `.legendpop` is
-   its tap-to-open popover, anchored to the bottom of `.top` — the ONLY
-   status-legend affordance a phone has once `.legend` hides below. */
-.missionlens .legbtn {
-  display: none;
-  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--dim);
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 5px 9px;
-  background: none;
-  cursor: pointer;
-}
-.missionlens .legbtn:hover {
-  color: var(--fg);
-  border-color: var(--accent-dim);
+/* (#1868 → #2332) The status legend is a help glyph at every width, opening
+   `.legendpop`; the inline dot row is gone. */
+.missionlens .legbtn svg {
+  display: block;
 }
 .missionlens .legendpop {
   position: absolute;
@@ -4864,6 +4891,28 @@ body {
   border-radius: 50%;
   margin-right: 5px;
   vertical-align: middle;
+}
+/* One row once the lens itself is wide: identity, sub-line and cost flow
+   left to right; the controls stay pinned right. */
+@container (min-width: 900px) {
+  .missionlens .top {
+    flex-direction: row;
+    align-items: center;
+    gap: 14px;
+  }
+  .missionlens .mhead-id {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  .missionlens .mstatus {
+    margin-left: 10px;
+  }
+  .missionlens .msub {
+    flex: 0 1 auto;
+  }
+  .missionlens .mhead-meter {
+    flex: 1 1 auto;
+  }
 }
 .missionlens .body {
   flex: 1 1 auto;
@@ -5499,13 +5548,11 @@ body {
   .missionlens .top {
     padding: 7px 10px;
   }
-  .missionlens .legend {
-    display: none;
-  }
-  /* (#1868) `.legend`'s tap-to-open stand-in — only shown below this
-     breakpoint, mirroring mission-graph.html's own rule exactly. */
+  /* (#2332) Phone tap targets meet the codebase's own 44px floor. */
+  .missionlens .evbtn,
   .missionlens .legbtn {
-    display: inline-flex;
+    min-height: 44px;
+    min-width: 44px;
   }
   .missionlens .body {
     flex-direction: column;
