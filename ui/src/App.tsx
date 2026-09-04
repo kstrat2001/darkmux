@@ -3,7 +3,7 @@ import { useIsMobile } from "./hooks/useIsMobile";
 import { useHashRoute } from "./lib/useHashRoute";
 import { getSource } from "./lib/source";
 import { useDay } from "./hooks/useDay";
-import { usePlaybackTransport } from "./hooks/usePlaybackTransport";
+import { usePlaybackTransport, type PlaybackFocus } from "./hooks/usePlaybackTransport";
 import { Scrubber } from "./lenses/catalog/Scrubber";
 import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
 import { FleetLens } from "./lenses/fleet/FleetLens";
@@ -28,7 +28,7 @@ import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
-import { T, asRecordArray, earliestRecordDate, firstRecordDate, localMachineUid, missionReplayDate, nameOf, todayUTC } from "./lib/flow";
+import { T, asRecordArray, earliestRecordDate, firstRecordDate, isDispatchTerminal, localMachineUid, missionReplayDate, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
@@ -106,6 +106,34 @@ import type { Route } from "./lib/route";
  *   `writeHash`, not through this route-keyed effect (see that file's own
  *   doc for why).
  */
+// (#2346) A stable empty array — avoids handing `usePlaybackTransport` a
+// fresh `[]` reference on every render for a route kind that has no focus
+// records of its own (harmless either way, since that hook's own memo keys
+// off a length+last-ts signature rather than array identity, but there is
+// no reason to allocate one per render when nothing needs it).
+const EMPTY_FLOW_RECORDS: FlowRecord[] = [];
+
+/** (#2346) The LATEST terminal record's own `wall_ms` payload — the SAME
+ * field the run detail's own WALL CLOCK tile reads (`sessionRun.ts`'s
+ * `recordedWallMs`) — or `null` when there is no terminal yet (a live run)
+ * or it carries no such field (an archived record, or a `session.end`
+ * close-edge with `payload: None`). One producer for both readouts: a flow
+ * record's own `ts` is second-precision, but `wall_ms` is the runtime's own
+ * sub-second measured duration, so recomputing "elapsed" from bookend
+ * timestamps instead can disagree with the run detail's WALL CLOCK by up to
+ * a second — small next to the bug this feature fixes (hours), but still
+ * two clocks describing the same run differently, which is exactly what
+ * this whole feature exists to stop doing. */
+function terminalWallMs(records: FlowRecord[]): number | null {
+  for (let i = records.length - 1; i >= 0; i--) {
+    if (isDispatchTerminal(records[i].action)) {
+      const wallMs = records[i].payload?.wall_ms;
+      return typeof wallMs === "number" && Number.isFinite(wallMs) ? wallMs : null;
+    }
+  }
+  return null;
+}
+
 export function App() {
   const route = useHashRoute();
   const nowMs = Date.now();
@@ -191,13 +219,64 @@ export function App() {
   }, [route, source.kind, routeRecords.records, routeRecords.historical, missionRecordsQuery.data]);
   const day = useDay(replayDate);
   const dayRecords = day.records;
-  const transport = usePlaybackTransport(dayRecords);
+  // (#2346, redesigned after a live-render finding) The transport's own
+  // FOCUS: a dispatch/mission route narrows `tMin`/`tMax` to that thing's
+  // own span (its first record to its last), not the whole loaded day.
+  //
+  // The focus carries its OWN records — `routeRecords.records` (the
+  // dispatch's own `/flow-session/<id>` fetch, already resolved above) and
+  // `missionRecordsQuery.data` (the mission's own `/flow-mission/<id>`
+  // fetch, also already resolved above) — rather than being derived by
+  // filtering `dayRecords`. The first cut of this fix DID filter
+  // `dayRecords`, and it passed every test because every test fixture's day
+  // happened to contain the open session. A real daemon's `/flow/<date>` is
+  // a CAPPED, TIME-WINDOWED slice (10,002 records, sliding), and a
+  // long-running dispatch that started hours before the window's current
+  // floor has ZERO records inside it — `dayRecords`-filtering silently
+  // found nothing and fell back to the whole-day range, reproducing the
+  // exact bug this exists to fix. Measured live against the operator's own
+  // run (#2346): `dispatch start` 00:11:48Z / `dispatch complete` 02:06:37Z,
+  // wholly outside the loaded window's 02:43Z–04:48Z floor at the time.
+  //
+  // For a mission on a daemon, `missionRecordsQuery.data` is the source; a
+  // static build never enables that query, so it falls back to filtering
+  // `dayRecords` by `mission_id` — reasonable there since a static build
+  // loads its one committed file whole (no windowing to lose records to),
+  // and mission focus has no visible UI effect today regardless (see
+  // `transportShown` below).
+  const dispatchFocusRecords = route.kind === "dispatch" ? routeRecords.records : EMPTY_FLOW_RECORDS;
+  const missionFocusRecords =
+    route.kind === "mission"
+      ? missionRecordsQuery.data?.ok
+        ? asRecordArray(missionRecordsQuery.data.data)
+        : (dayRecords ?? []).filter((r) => r.mission_id === route.missionId)
+      : EMPTY_FLOW_RECORDS;
+  // A fresh object literal every render is fine: `usePlaybackTransport`
+  // keys its own range memoization on the primitive `kind`+id plus a cheap
+  // records signature, never on this object's (or its `.records` array's)
+  // own identity (see that hook's own doc).
+  const playbackFocus: PlaybackFocus =
+    route.kind === "dispatch"
+      ? { kind: "dispatch", sessionId: route.dispatchId, records: dispatchFocusRecords }
+      : route.kind === "mission"
+        ? { kind: "mission", missionId: route.missionId, records: missionFocusRecords }
+        : { kind: "day" };
+  const transport = usePlaybackTransport(dayRecords, playbackFocus);
   // (#2071 review) Show the transport only where something on screen
   // answers it. The mission lens takes no playhead — its own events fold
   // is always the full historical set, never scoped to a scrubbed time
   // (see `eventLogRecords`'s own mission branch above) — so play/pause
   // there would move nothing.
   const transportShown = transport.active && route.kind !== "mission";
+  // (#2346) At rest (unscrubbed, playhead pinned at the focus's own end),
+  // a dispatch's elapsed readout prefers the terminal record's own
+  // `wall_ms` — see `terminalWallMs`'s own doc for why that beats
+  // recomputing from bookend timestamps. While actively scrubbed away from
+  // the end, `wall_ms` is the run's EVENTUAL total, not a function of
+  // where the playhead currently sits, so `t - tMin` is what's meaningful
+  // there — the readout only prefers `wall_ms` at rest.
+  const isFocusAtRest = !(transport.scrubbed && transport.t < transport.tMax);
+  const dispatchTerminalWallMs = playbackFocus.kind === "dispatch" && isFocusAtRest ? terminalWallMs(playbackFocus.records) : null;
   // Lenses and the log scope to the playhead only once it has MOVED
   // (`transport.scrubbed`): at rest the playhead is the loaded day's end,
   // which can sit before the end of a run that crossed midnight, and the
@@ -563,6 +642,14 @@ export function App() {
             t={transport.t}
             tMin={transport.tMin}
             tMax={transport.tMax}
+            // (#2346) Day focus: elapsed-since-the-day's-first-record is
+            // meaningless, so no elapsed segment — the clock names only the
+            // time of day, matching a mission route too (never reaches here
+            // today: `transportShown` excludes it above). Otherwise prefer
+            // the terminal record's own `wall_ms` at rest (`dispatchTerminalWallMs`'s
+            // own doc), falling back to `t - tMin` — the same value it
+            // always used, and the only meaningful one mid-scrub.
+            elapsedMs={playbackFocus.kind === "day" ? null : (dispatchTerminalWallMs ?? transport.t - transport.tMin)}
             playing={transport.playing}
             speed={transport.speed}
             onScrub={transport.scrub}
