@@ -36,8 +36,8 @@ import type { LivenessState } from "./LivenessPulse";
  * Terminal words stay raw on purpose: `finalized` / `complete` / `finished`
  * are different facts at different scopes, and none of them pulse.
  *
- * NOT this word, and not this component: the masthead's `● LIVE` badge
- * (`LiveStatusBadge`) says the record STREAM is connected. A page can be live
+ * NOT this word, and not this component: the masthead's own pill dot
+ * (`Masthead.tsx`'s `pillLabel`, #2412) says the record STREAM is connected. A page can be live
  * with nothing running, and a run can be running while the stream reconnects.
  * (operator, 2026-09-04: "live is a separate idea from a running job.")
  */

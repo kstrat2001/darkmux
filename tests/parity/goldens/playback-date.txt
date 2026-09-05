@@ -1,6 +1,6 @@
 === topbar ===
 darkmux
-2026-08-07
+▣ 2026-08-07
 home
 guide
 articles

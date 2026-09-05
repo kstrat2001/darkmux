@@ -70,8 +70,8 @@ describe("Masthead", () => {
 
   it("shows the refresh control on a live route when the stream has dropped", () => {
     // Was "on a live route" unconditionally. The control now appears only
-    // while the stream is NOT live — beside a `● LIVE` badge it contradicts
-    // itself, and there is nothing to refresh.
+    // while the stream is NOT live — beside a pill reading `● LIVE` it
+    // contradicts itself, and there is nothing to refresh.
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     renderMasthead({ kind: "fleet" }, "reconnecting");
     expect(screen.getByTitle("Refetch now")).toBeInTheDocument();
@@ -184,28 +184,27 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     vi.unstubAllGlobals();
   });
 
-  it("a daemon dispatch/mission page reads TODAY (the live word) until the shell knows its day, then the date — the LIVE badge while unknown, no badge once known, never a playback badge", () => {
+  it("a daemon dispatch page reads LIVE (the live word) until the shell knows its day, then names that day — the pill is the ONE indicator, never a separate badge (#2412)", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const unknown = renderMasthead({ kind: "dispatch", dispatchId: "s1" } as never);
-    expect(unknown.container.querySelector(".catalog-toggle")?.textContent).toBe("TODAY");
     // (header owns liveness, 2026-09-03) Day unknown ⇒ the subject is still
-    // running ⇒ this is a live page ⇒ the same header badge as every lens.
-    expect(unknown.container.querySelector("#modebadge")?.textContent).toMatch(/live/i);
+    // running ⇒ this is a live page ⇒ the pill's own dot carries it.
+    expect(unknown.container.querySelector(".catalog-toggle")?.textContent).toContain("LIVE");
+    expect(unknown.container.querySelector("#modebadge")).toBeNull();
     unknown.unmount();
+    // A closed mission names ITSELF (operator, in #2412: "pill shows the
+    // mission id"), not the day it happened to close on.
     const known = renderMasthead({ kind: "mission", missionId: "m1", stepId: null } as never, "live", "2026-08-07");
-    expect(known.container.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07");
-    // (operator, 2026-09-01) No mode badge on either route: redundant on a
-    // dispatch (the transport states the mode) and false on a mission (which
-    // has no playback at all — that lives in the drill-in detail view).
+    expect(known.container.querySelector(".catalog-toggle")?.textContent).toBe("▣ m1");
     expect(known.container.querySelector("#modebadge")).toBeNull();
     vi.unstubAllGlobals();
   });
 
-  it("a daemon playback of TODAY names the day, not TODAY — that word belongs to the live view", () => {
+  it("a daemon playback of today's date still NAMES the day, never LIVE — that word belongs to the live view", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const today = new Date().toISOString().slice(0, 10);
     const { container } = renderMasthead({ kind: "playback", date: today } as never);
-    expect(container.querySelector(".catalog-toggle")?.textContent).toBe(today);
+    expect(container.querySelector(".catalog-toggle")?.textContent).toBe(`▣ ${today}`);
     vi.unstubAllGlobals();
   });
 
@@ -219,11 +218,11 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     // date resolution, which is a separate concern this file doesn't own.
     const { container } = renderMasthead({ kind: "fleet" });
     expect(screen.queryByRole("button", { name: /browse history/i })).not.toBeInTheDocument();
-    // The same VISIBLE text a live page would show for "today" still
-    // appears — this is a suppression of the AFFORDANCE, not the text.
+    // The same VISIBLE text a live page would show still appears — this is
+    // a suppression of the AFFORDANCE, not the text.
     const badge = container.querySelector(".masthead__srcbadge");
     expect(badge).toBeTruthy();
-    expect(badge?.textContent).toBe("TODAY");
+    expect(badge?.textContent).toBe("LIVE");
     vi.unstubAllGlobals();
   });
 
@@ -239,17 +238,87 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     vi.unstubAllGlobals();
   });
 });
-// (header owns liveness, operator 2026-09-03) The live badge is GLOBAL chrome:
-// it renders on every daemon-backed route, the mission and dispatch pages
-// included — no lens paints its own.
-describe("live badge on every daemon-backed route", () => {
+// (header owns liveness, operator 2026-09-03) Liveness is GLOBAL chrome: the
+// pill's own dot carries it on every daemon-backed route, the mission and
+// dispatch pages included — no lens paints its own, and there is no second
+// element (#2412 retired the separate `#modebadge`).
+describe("live pill on every daemon-backed route (#2412)", () => {
   it("renders on the mission route", () => {
     const { container } = renderMasthead({ kind: "mission", missionId: "m1", stepId: null } as Route, "live");
-    expect(container.querySelector("#modebadge")?.textContent).toMatch(/live/i);
+    expect(container.querySelector(".catalog-toggle")?.textContent).toMatch(/live/i);
+    expect(container.querySelector("#modebadge")).toBeNull();
   });
   it("renders on the dispatch route, and reflects a dropped stream", () => {
     const { container } = renderMasthead({ kind: "dispatch", dispatchId: "d1" } as Route, "reconnecting");
-    expect(container.querySelector("#modebadge")?.textContent).toMatch(/reconnecting/i);
+    expect(container.querySelector(".catalog-toggle")?.textContent).toMatch(/live/i);
+    expect(container.querySelector("#modebadge")).toBeNull();
+  });
+});
+
+/**
+ * (#2412) Test-first: the failing-for-the-predicted-reason cases below were
+ * run RED against the pre-#2412 tree (a `<LiveStatusBadge>` still mounted,
+ * `pillLabel` not yet written) before the implementation landed — the
+ * `.masthead__pilldot`/`aria-live` assertions had nothing to find, and
+ * `.toContain("LIVE")` failed against the old literal "TODAY". Five states
+ * named in the issue: live+connected, live+reconnecting, mission replay,
+ * date replay, and the old badge's total absence in every one of them.
+ */
+describe("Masthead — the pill is the ONE transport control (#2412)", () => {
+  it("(a) live + connected: pill reads LIVE, the dot carries the pulse class", () => {
+    const { container } = renderMasthead({ kind: "fleet" } as Route, "live");
+    const toggle = container.querySelector(".catalog-toggle")!;
+    expect(toggle.textContent).toContain("LIVE");
+    const dot = toggle.querySelector(".masthead__pilldot")!;
+    expect(dot.className).toContain("live");
+    expect(dot.className).not.toContain("stale");
+    expect(dot.getAttribute("title")).toBeNull();
+  });
+
+  it("(b) live + reconnecting: the dot carries the reconnecting class, no pulse class, and announces via aria-live", () => {
+    const { container } = renderMasthead({ kind: "fleet" } as Route, "reconnecting");
+    const toggle = container.querySelector(".catalog-toggle")!;
+    expect(toggle.textContent).toContain("LIVE");
+    const dot = toggle.querySelector(".masthead__pilldot")!;
+    expect(dot.className).toContain("stale");
+    expect(dot.className).not.toContain(" live");
+    expect(dot.getAttribute("title")).toBe("reconnecting");
+    const live = toggle.querySelector('[aria-live="polite"]')!;
+    expect(live.textContent).toBe("reconnecting");
+  });
+
+  it("(c) mission replay: the pill shows the mission id and the replay glyph, no dot", () => {
+    const { container } = renderMasthead(
+      { kind: "mission", missionId: "review-1785400940-136e76", stepId: null } as Route,
+      "live",
+      "2026-08-07",
+    );
+    const toggle = container.querySelector(".catalog-toggle")!;
+    expect(toggle.textContent).toBe("▣ review-1785400940-136e76");
+    expect(toggle.querySelector(".masthead__pilldot.live")).toBeNull();
+    expect(toggle.querySelector(".masthead__pilldot.stale")).toBeNull();
+    expect(toggle.querySelector(".masthead__pilldot--replay")?.textContent).toBe("▣");
+  });
+
+  it("(d) date replay: the pill shows the date and the replay glyph", () => {
+    const { container } = renderMasthead({ kind: "playback", date: "2026-08-07" } as Route);
+    const toggle = container.querySelector(".catalog-toggle")!;
+    expect(toggle.textContent).toBe("▣ 2026-08-07");
+    expect(toggle.querySelector(".masthead__pilldot--replay")?.textContent).toBe("▣");
+  });
+
+  it("(e) no element with the old badge's id exists, in any of the four states above", () => {
+    for (const [route, liveStatus, replayDate] of [
+      [{ kind: "fleet" }, "live", null],
+      [{ kind: "fleet" }, "reconnecting", null],
+      [{ kind: "mission", missionId: "m1", stepId: null }, "live", "2026-08-07"],
+      [{ kind: "playback", date: "2026-08-07" }, "live", null],
+    ] as const) {
+      const { container, unmount } = renderMasthead(route as Route, liveStatus, replayDate);
+      expect(container.querySelector("#modebadge")).toBeNull();
+      expect(container.querySelector(".pb")).toBeNull();
+      unmount();
+    }
   });
 });
 

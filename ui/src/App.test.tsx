@@ -351,7 +351,7 @@ describe("App", () => {
   // runs there and the header says so. (It used to be excluded so the lens
   // could own liveness; see `isLiveRoute`.) The replay case — day known,
   // transport shown — is covered below ("names its day in the chip").
-  it("shows the live badge on a dispatch page whose day is not yet known", async () => {
+  it("shows the live pill (#2412: the pill, not a separate badge) on a dispatch page whose day is not yet known", async () => {
     window.location.hash = "#session=abc-123";
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -361,12 +361,13 @@ describe("App", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(container.querySelector(".crumbbar, #stage")).toBeTruthy());
-    await waitFor(() => expect(container.querySelector("#modebadge")).toBeTruthy());
+    await waitFor(() => expect(container.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"));
+    expect(container.querySelector("#modebadge")).toBeNull();
   });
 
-  it("DOES show the live badge on a live route — the inverted case", async () => {
+  it("DOES show the live pill on a live route — the inverted case", async () => {
     // Guards the gate from over-firing: the default fleet view is live, and
-    // silently dropping its badge would be its own dishonesty.
+    // silently dropping its liveness dot would be its own dishonesty.
     window.location.hash = "";
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -375,7 +376,8 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(container.querySelector("#modebadge")).toBeTruthy());
+    await waitFor(() => expect(container.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"));
+    expect(container.querySelector("#modebadge")).toBeNull();
   });
 
   // (Chrome packet) The masthead is now App-level chrome, mounted
@@ -1098,7 +1100,7 @@ describe("App", () => {
     mockDaemonReplay();
     window.location.hash = "#dispatch=s1";
     renderApp();
-    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07"));
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("▣ 2026-08-07"));
     await screen.findByRole("group", { name: "playback transport" });
     expect(document.querySelector("#modebadge")).toBeNull();
   });
@@ -1137,7 +1139,7 @@ describe("App", () => {
     }
   });
 
-  it("a dispatch that is still running is a live view: no date, the LIVE badge, no transport", async () => {
+  it("a dispatch that is still running is a live view: no date, the pill's LIVE dot, no transport", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -1153,42 +1155,44 @@ describe("App", () => {
     window.location.hash = "#dispatch=s-live";
     renderApp();
     await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
-    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("TODAY"));
-    // (header owns liveness, 2026-09-03) Running ⇒ live ⇒ the header badge,
-    // the same one every other live page shows. Never the PLAYBACK badge.
-    await waitFor(() => expect(document.querySelector("#modebadge")?.textContent).toMatch(/live|reconnecting/i));
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"));
+    // (header owns liveness, 2026-09-03; retired to the pill's own dot in
+    // #2412) Running ⇒ live ⇒ the ONE indicator, never a separate badge.
+    expect(document.querySelector("#modebadge")).toBeNull();
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
 
-  it("a daemon mission page that is still RUNNING is live: the badge shows and the chip carries no date", async () => {
+  it("a daemon mission page that is still RUNNING is live: the pill's dot shows and the chip carries no date", async () => {
     // (header owns liveness, operator 2026-09-04: "live would be shown
     // instead of date") The mission below has records from 2026-08-07 but no
-    // terminal record, so it is a live view — the ONE liveness badge shows
-    // and the chip does not name a day. Before this, any mission with
+    // terminal record, so it is a live view — the ONE liveness indicator
+    // shows and the chip does not name a day. Before this, any mission with
     // records read as a recording and the header hid the badge.
     mockDaemonReplay(false);
     window.location.hash = "#mission=m-one";
     renderApp();
-    // Settle first: every page is live before its data arrives, so a badge
-    // read before the mission slice lands proves nothing. Wait for the
-    // mission query to have been answered, then a tick for the memo.
+    // Settle first: every page is live before its data arrives, so a read
+    // before the mission slice lands proves nothing. Wait for the mission
+    // query to have been answered, then a tick for the memo.
     await waitFor(() => expect((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[0]) === "/flow-mission/m-one")).toBe(true));
     await new Promise((r) => setTimeout(r, 50));
-    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("TODAY"));
-    expect(document.querySelector("#modebadge")?.textContent?.toLowerCase()).toContain("live");
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"));
+    expect(document.querySelector("#modebadge")).toBeNull();
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
 
-  it("a daemon mission page names its day in the chip once the mission has CLOSED, with NO playback badge and no transport", async () => {
+  it("a daemon mission page names ITSELF in the pill once the mission has CLOSED (#2412: the mission id, not the date), with no transport", async () => {
     // (operator, 2026-09-01) A mission is an overview, not a scrubbable
-    // recording — playback lives in the drill-in detail view. So the badge
-    // was not merely redundant here, it was FALSE: a `▶` glyph promising a
-    // control this route will never have. The chip carries the mode instead
-    // (a date means recorded; `TODAY` is the live view's word).
+    // recording — playback lives in the drill-in detail view. So a playback
+    // badge here was not merely redundant, it was FALSE: a `▶` glyph
+    // promising a control this route will never have. The pill carries the
+    // mode instead — now via its own replay glyph and the mission's own id
+    // (operator, in #2412: "pill shows the mission id"), not the day it
+    // happened to close on.
     mockDaemonReplay();
     window.location.hash = "#mission=m-one";
     renderApp();
-    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07"));
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("▣ m-one"));
     expect(document.querySelector("#modebadge")).toBeNull();
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
