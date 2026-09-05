@@ -5533,6 +5533,7 @@ fn review_v2_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
 fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     let workdir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
     let app = workdir.path().join("app");
     write_app_repo(&app, "^1.0.0");
     let empty_tree = std::process::Command::new("git")
@@ -5566,6 +5567,7 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     let out = Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args([
             "mission",
@@ -5642,6 +5644,113 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     assert_eq!(payload["mode"], serde_json::json!("degraded"), "{payload}");
     let body = payload["review"]["body"].as_str().unwrap();
     assert!(body.contains("Errored:") && body.contains("unit-swallowed-error"), "{payload}");
+
+    // (#2310 fix-loop C2 / C2-4) `review-v2.json` declares
+    // `outcome_from: "deliver"`, which is what gives the
+    // exit-1-on-delivery-failure rule a production subscriber (the rule is
+    // scoped to an EXPLICIT declaration, never the positional guess).
+    // THIS run is the other side of that pair: the units errored, so the
+    // run is `Degraded` — but the DELIVERY itself succeeded, and a
+    // partially-constrained run that still shipped its review exits 0.
+    // (`review_v2_real_launch_exits_non_zero_when_the_deliver_step_errors`
+    // is the failing half.)
+    assert_eq!(out.status.code(), Some(0), "{combined}");
+    let close = flow_actions(&flows)
+        .into_iter()
+        .find(|r| r["action"] == serde_json::json!("mission close"))
+        .expect("a mission close record");
+    // The close payload is promoted from the OUTCOME task's last step —
+    // `deliver`'s. That step's output is its emit DESTINATION (a path, by
+    // `DeliverGithubReviewStepKind::run`'s own contract, pinned by
+    // `the_step_kind_run_reads_config_and_emits_to_the_named_path`), not
+    // the DeliverOutcome JSON — so there is no JSON object to promote and
+    // the payload is honestly absent. Pinned so that if the kind's output
+    // contract ever changes, this seam is where it surfaces.
+    assert!(
+        close["payload"].is_null(),
+        "a path-valued step output promotes nothing: {close}"
+    );
+    let deliver_output = probe_steps(&mission_dir)
+        .into_iter()
+        .find(|(id, _)| id.contains("deliver") && !id.contains("gather"))
+        .map(|(_, (_, output))| output)
+        .expect("a deliver step");
+    assert_eq!(
+        deliver_output,
+        emit_path.to_string_lossy(),
+        "the deliver step's output is its emit destination"
+    );
+}
+
+/// (#2310 fix-loop C2 / C2-4) The other half of declaring `outcome_from`:
+/// when the DELIVERING task itself errors, the run exits non-zero even
+/// though earlier steps completed. An `emit` path under a directory that
+/// does not exist makes `deliver.github_review`'s own write fail, which is
+/// the narrowest way to fail exactly that step.
+#[test]
+fn review_v2_real_launch_exits_non_zero_when_the_deliver_step_errors() {
+    let workdir = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let missing_source = workdir.path().join("does-not-exist");
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(
+        &spec_path,
+        serde_json::json!({
+            "name": "review-v2-deliver-error",
+            "sources": [{"id": "app", "path": missing_source.to_string_lossy(), "ref": "main"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let diff_path = workdir.path().join("d.diff");
+    fs::write(
+        &diff_path,
+        "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,2 +1,3 @@\n function f() {\n+  g();\n }\n",
+    )
+    .unwrap();
+    // Under a directory that was never created — `fs::write` fails.
+    let emit_path = workdir.path().join("no-such-dir").join("review-payload.json");
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "mission",
+            "launch",
+            "review-v2",
+            "--param",
+            &format!("workspace={}", spec_path.display()),
+            "--param",
+            &format!("diff_file={}", diff_path.display()),
+            "--param",
+            "rules=swallowed-error",
+            "--param",
+            &format!("emit={}", emit_path.display()),
+        ])
+        .output()
+        .expect("mission launch review-v2 runs");
+    let combined =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    assert!(!emit_path.exists(), "precondition: the emit write must have failed\n{combined}");
+    let mission_dir = one_mission_dir(&home);
+    let steps = probe_steps(&mission_dir);
+    let deliver = steps
+        .iter()
+        .find(|(id, _)| id.ends_with("deliver-step-2") || id.contains("deliver-github"))
+        .map(|(id, v)| (id.clone(), v.clone()));
+    assert!(
+        steps.values().any(|(status, _)| status == "error"),
+        "the deliver step must end Error: {steps:#?}\n{combined}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failed DELIVERY must not exit 0 — deliver step: {deliver:?}\n{combined}"
+    );
 }
 
 /// (#2310 P4c-2b PR #2357 review MUST FIX C, the reviewer's own live
@@ -7346,6 +7455,125 @@ fn fail_probe_terminal_mission_has_no_non_terminal_step_and_envelope_matches_dis
     );
 }
 
+/// (#2310 fix-loop C2 / C2-2) The two step-level drift kinds suggest
+/// `darkmux mission finalize <id>` — so that command has to be a REMEDY,
+/// not a no-op. `mission_terminal_*` bails "already Finalized" BEFORE its
+/// #1504 reconcile runs, so on an already-closed mission (which is every
+/// mission these two rules can fire on) the row was permanent: the board
+/// told the operator to run a command that changed nothing, forever.
+///
+/// Builds the exact shape by hand — a `Planned` step persisted under a
+/// Finalized mission's Complete phase, the residue a SIGKILLed run leaves —
+/// then asserts drift fires, `mission finalize` clears it, and the step is
+/// Abandoned on disk with a reason naming why.
+///
+/// This is also the disk→rule wiring pin for `live_steps_for` (C2-3):
+/// mutating it to return an empty map turns this test red.
+#[test]
+fn finalize_reconciles_a_planned_step_under_an_already_terminal_phase() {
+    let (home, flows) = forward_dep_fixture();
+    let launched = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "forward-dep"])
+        .output()
+        .unwrap();
+    assert_eq!(launched.status.code(), Some(0));
+    let (dir, mission_id, mission, phases) = probe_mission_and_phases(&home);
+    assert_eq!(mission["status"], serde_json::json!("finalized"));
+    assert_eq!(phases.get("p1").map(String::as_str), Some("complete"));
+
+    // Seed the residue: one more step, `Planned`, under p1 (Complete).
+    let p1_dir = fs::read_dir(dir.join("steps"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().ends_with("-p1"))
+        .expect("p1 steps dir");
+    let mut seeded: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(p1_dir.join("s-early.json")).unwrap(),
+    )
+    .unwrap();
+    seeded["id"] = serde_json::json!("s-orphan");
+    seeded["status"] = serde_json::json!("planned");
+    seeded["output"] = serde_json::Value::Null;
+    seeded["completed_ts"] = serde_json::Value::Null;
+    fs::write(p1_dir.join("s-orphan.json"), serde_json::to_string(&seeded).unwrap()).unwrap();
+
+    let board = |label: &str| -> serde_json::Value {
+        let out = Command::cargo_bin("darkmux")
+            .unwrap()
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", flows.path())
+            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+            .args(["mission", "status", "--json", "--all"])
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{label}: mission status --json must be JSON: {e}"))
+    };
+
+    let before = board("before");
+    let kinds: Vec<&str> = before["missions"][0]["drift"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["kind"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"phase-terminal-live-step"),
+        "the seeded residue must drift, got {kinds:?} — board: {before}"
+    );
+    let suggest = before["missions"][0]["drift"][0]["suggest"][0]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(suggest.contains("mission finalize"), "got {suggest:?}");
+
+    // Run the command the board itself suggested.
+    let fixed = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "finalize", &mission_id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        fixed.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fixed.stdout),
+        String::from_utf8_lossy(&fixed.stderr)
+    );
+
+    let after_steps = probe_steps(&dir);
+    assert_eq!(
+        after_steps["s-orphan"].0, "abandoned",
+        "the remedy must terminalize the step: {after_steps:#?}"
+    );
+    assert!(
+        after_steps["s-orphan"].1.contains("already terminal"),
+        "the reason must say why it was reconciled, got {:?}",
+        after_steps["s-orphan"].1
+    );
+
+    let after = board("after");
+    let after_kinds: Vec<&str> = after["missions"][0]["drift"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["kind"].as_str())
+        .collect();
+    assert!(
+        after_kinds.is_empty(),
+        "the drift must CLEAR after running its own suggested remedy, got {after_kinds:?} — \
+         board: {after}"
+    );
+}
+
 /// (#2310 fix-loop, S4-4 — NOT this packet) The SIGKILL / hang shape: a
 /// `procedural.shell` step running `sleep` has no deadline and no child
 /// registration today, so SIGTERM/SIGINT do nothing until the command
@@ -7474,6 +7702,108 @@ fn fail_probe_cross_phase_delivery_task_runs_on_an_upstream_error() {
         .filter(|(_, (status, _))| status == "planned" || status == "running")
         .collect();
     assert!(live.is_empty(), "terminal mission still holds non-terminal steps: {live:#?}");
+}
+
+// ─── forward-dependency probe (#2310 fix-loop C2 / C2-1) ───────────────
+//
+// The A/B the post-merge review of #2368 proved. `depends_on` ids are
+// DOCUMENT-WIDE (see `TaskConfig::depends_on`), so a task in phase 1 may
+// legally name a task in phase 2 — the per-phase scheduler split (#2300)
+// runs every pass over the CUMULATIVE maps, so phase 2's pass runs it.
+//
+//   p1  t-early                                (no deps)
+//       t-forward  depends_on ["t-late"]       (a FORWARD edge)
+//   p2  t-late
+//
+// The first cut of the phase-exit sweep abandoned `t-forward` "not
+// started" at p1's exit: declared work dropped, p1 closed Abandoned, exit
+// 0, "0 errored". The whole shape must survive instead.
+fn forward_dep_fixture() -> (TempDir, TempDir) {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "forward-dep",
+        "name": "Forward Dep Probe",
+        "schema_version": "3.4",
+        "phases": [
+          {
+            "id": "p1",
+            "tasks": [
+              { "id": "t-early",
+                "steps": [{ "id": "s-early", "kind": "procedural.shell",
+                            "config": { "command": "echo early-ran" } }] },
+              { "id": "t-forward", "depends_on": ["t-late"],
+                "steps": [{ "id": "s-forward", "kind": "procedural.shell",
+                            "config": { "command": "echo forward-ran" } }] }
+            ]
+          },
+          {
+            "id": "p2",
+            "tasks": [
+              { "id": "t-late",
+                "steps": [{ "id": "s-late", "kind": "procedural.shell",
+                            "config": { "command": "echo late-ran" } }] }
+            ]
+          }
+        ]
+    }"#;
+    fs::write(config_dir.join("forward-dep.json"), config_json).unwrap();
+    (home, flows)
+}
+
+/// A forward `depends_on` still RUNS — and the phase that declared it
+/// closes `Complete`, on disk and in the envelope.
+#[test]
+fn forward_dep_task_runs_in_the_later_phases_pass() {
+    let (home, flows) = forward_dep_fixture();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "forward-dep"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (dir, _mid, mission, phases) = probe_mission_and_phases(&home);
+    let steps = probe_steps(&dir);
+
+    assert_eq!(
+        steps["s-forward"].0, "complete",
+        "a forward `depends_on` must still run\nsteps: {steps:#?}\n{stdout}\n{stderr}"
+    );
+    assert!(
+        steps["s-forward"].1.contains("forward-ran"),
+        "the forward step's own work must actually happen, got {:?}\n{stdout}\n{stderr}",
+        steps["s-forward"].1
+    );
+    for id in ["s-early", "s-late"] {
+        assert_eq!(steps[id].0, "complete", "steps: {steps:#?}");
+    }
+    assert_eq!(steps.len(), 3, "steps: {steps:#?}");
+    assert!(
+        stdout.contains("3 step(s) complete, 0 errored"),
+        "the summary must count all three\n{stdout}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+
+    // The phase that DECLARED the forward edge earned Complete — it is not
+    // "abandoned" for having held a step its own pass could not run.
+    assert_eq!(phases.get("p1").map(String::as_str), Some("complete"), "{phases:#?}");
+    assert_eq!(phases.get("p2").map(String::as_str), Some("complete"), "{phases:#?}");
+    assert_eq!(mission["status"], serde_json::json!("finalized"), "mission: {mission}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("envelope.json")).unwrap()).unwrap();
+    for phase in envelope["phases"].as_array().unwrap() {
+        assert_eq!(
+            phase["outcome"].as_str().map(str::to_ascii_lowercase).as_deref(),
+            Some("complete"),
+            "envelope: {envelope}"
+        );
+    }
 }
 
 /// (#2310 fix-loop C2 / S4-1) The same whole-run invariant on a CLEAN run:

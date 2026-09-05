@@ -320,7 +320,8 @@ fn live_step_drifts(
         out.push(Drift {
             kind: "phase-terminal-live-step",
             detail: format!(
-                "{} step(s) are still Planned/Running under a phase that already reached a                  terminal status: {}",
+                "{} step(s) are still Planned/Running under a phase that already reached a \
+                 terminal status: {}",
                 in_terminal_phase.len(),
                 in_terminal_phase.join(", ")
             ),
@@ -1841,6 +1842,62 @@ mod tests {
         // …and exactly the padding the plain form would have had.
         let visible: String = strip_ansi(&cell);
         assert_eq!(visible, format!("{:<12}", "m1"), "visible width must match the plain cell");
+    }
+
+    /// (#2310 fix-loop C2 / C2-3) The disk→rule wiring itself, pinned
+    /// directly: `live_steps_for` is what turns persisted step records into
+    /// the map `live_step_drifts` judges, and it was unpinned — mutating it
+    /// to return an empty map left the whole suite green while the board
+    /// silently stopped seeing this class of drift. `#[serial]` — mutates
+    /// DARKMUX_HOME, a process-global.
+    #[test]
+    #[serial_test::serial]
+    fn live_steps_for_reads_the_live_steps_of_a_terminal_phase() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+
+        let m = mission("m1", MissionStatus::Finalized);
+        let closed = phase("m1-p1", "m1", PhaseStatus::Complete);
+        let step = |id: &str, status: crew::types::NodeStatus| {
+            let s = crew::types::Step {
+                id: id.to_string(),
+                task_id: format!("{id}-task"),
+                gate: None,
+                kind: "procedural.noop".to_string(),
+                status,
+                config: serde_json::Value::Null,
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            };
+            crew::lifecycle::save_step("m1", "m1-p1", &s).unwrap();
+        };
+        step("s-done", crew::types::NodeStatus::Complete);
+        step("s-planned", crew::types::NodeStatus::Planned);
+        step("s-running", crew::types::NodeStatus::Running);
+
+        let live = live_steps_for(&m, &[&closed]);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        assert_eq!(
+            live.get("m1-p1").cloned(),
+            Some(vec!["s-planned".to_string(), "s-running".to_string()]),
+            "only the NON-terminal steps, and they must actually be read off disk: {live:?}"
+        );
+        // …and the rule this feeds fires on exactly that map.
+        let drifts = live_step_drifts(&m, &[&closed], &live);
+        assert!(
+            drifts.iter().any(|d| d.kind == "phase-terminal-live-step"),
+            "{drifts:?}"
+        );
     }
 
     /// (#1569 packet A) A narrow terminal elides the id for DISPLAY, but the

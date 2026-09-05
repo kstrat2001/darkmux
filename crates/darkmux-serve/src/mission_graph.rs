@@ -948,10 +948,19 @@ fn backfill_step_finals_bounded(
 /// this read-only viewer feature — a possible future improvement if
 /// corrupt single files show up in practice.
 ///
-/// **Mid-run step synthesis:** the three production graph runners persist
-/// Step JSONs only AFTER `run_step_graph` returns (`coder_phase.rs`,
-/// `mission_launch.rs`, `review.rs`) — so a page opened DURING a run sees
-/// tasks whose `step_ids` name steps with no file on disk yet. Rather than
+/// **Mid-run step synthesis:** a page opened DURING a run can see tasks
+/// whose `step_ids` name steps with no file on disk yet. (#2310 fix-loop
+/// C2 / C2-6) This USED to read "the three production graph runners
+/// persist Step JSONs only AFTER `run_step_graph` returns"; that is no
+/// longer true of the generic launcher, which since #2368 persists every
+/// MINTED step, `Planned`, at mint time and then at each transition
+/// (`src/mission_launch.rs` — the only `lifecycle::save_step` caller on a
+/// production path; the coder-phase graph runs through it). The review
+/// driver (`darkmux-lab`'s `review.rs`) takes its `persist` hook from
+/// `src/mission_launch_review.rs`, which writes at TRANSITION only, so a
+/// step of its graph that has not transitioned yet still has no file.
+/// Synthesis therefore still matters — it just no longer describes every
+/// runner. Rather than
 /// omitting those rows (which would leave the SSE layer with no row to
 /// animate — the scheduler's `step start`/`step complete` records key on
 /// step id), every `step_ids` entry with no persisted file gets a

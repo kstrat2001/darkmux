@@ -1016,6 +1016,29 @@ impl MissionConfig {
                                     task.id
                                 ),
                             });
+                        } else if phase_index_of_task.get(dep.as_str()).is_some_and(|d| *d > pi) {
+                            // (#2310 fix-loop C2 / C2-1) A FORWARD edge —
+                            // depending on a task declared in a LATER phase.
+                            // LEGAL, and it works: ids are document-wide and
+                            // every scheduler pass runs over the CUMULATIVE
+                            // maps, so the later phase's own pass runs this
+                            // task. But the declaring phase cannot finish
+                            // within its own pass, which surprises anyone
+                            // reading the document top-to-bottom — and a
+                            // sweep that mistook the shape for dead work
+                            // silently dropped it once already. Warning, not
+                            // Error: pre-1.0 documents may rely on it, and
+                            // refusing a working shape at load time is a
+                            // bigger break than naming it.
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Warning,
+                                path: format!("{task_path}.{relation}"),
+                                message: format!(
+ "task \"{}\" {relation} \"{dep}\", which is declared in a later phase — this task cannot run \
+  in its own phase's pass; it runs once that later phase's pass reaches it",
+                                    task.id
+                                ),
+                            });
                         }
                     }
                 }
@@ -1691,6 +1714,60 @@ mod tests {
         assert!(cfg.is_valid(&["dispatch.internal"]));
     }
 
+    /// (#2310 fix-loop C2 / C2-1) A FORWARD edge — a task depending on one
+    /// declared in a LATER phase — is legal (ids are document-wide, and
+    /// every scheduler pass runs over the cumulative maps, so the later
+    /// phase's pass runs it), but it is surprising enough to name:
+    /// the declaring phase cannot finish within its own pass. Warning,
+    /// never Error — pre-1.0 documents may rely on the shape.
+    #[test]
+    fn forward_depends_on_is_warned_not_refused() {
+        let cfg = doc(vec![
+            phase("p1", vec![task("t-forward", &["t-late"], vec![step("s1", "dispatch.internal")])]),
+            phase("p2", vec![task("t-late", &[], vec![step("s2", "dispatch.internal")])]),
+        ]);
+        let findings = cfg.validate(&["dispatch.internal"]);
+        assert!(
+            findings.iter().any(|f| f.severity == FindingSeverity::Warning
+                && f.message.contains("t-late")
+                && f.message.contains("later phase")),
+            "expected a forward-dependency warning, got {findings:?}"
+        );
+        assert!(cfg.is_valid(&["dispatch.internal"]), "a forward edge must stay LEGAL");
+    }
+
+    /// The same shape through `reads`, which orders execution identically.
+    #[test]
+    fn forward_reads_is_warned_too() {
+        let mut forward = task("t-forward", &[], vec![step("s1", "dispatch.internal")]);
+        forward.reads = vec!["t-late".to_string()];
+        let cfg = doc(vec![
+            phase("p1", vec![forward]),
+            phase("p2", vec![task("t-late", &[], vec![step("s2", "dispatch.internal")])]),
+        ]);
+        let findings = cfg.validate(&["dispatch.internal"]);
+        assert!(
+            findings.iter().any(|f| f.severity == FindingSeverity::Warning
+                && f.path.ends_with(".reads")
+                && f.message.contains("later phase")),
+            "expected a forward-reads warning, got {findings:?}"
+        );
+    }
+
+    /// A BACKWARD edge (the ordinary shape) stays silent — no warning.
+    #[test]
+    fn a_backward_depends_on_warns_about_nothing() {
+        let cfg = doc(vec![
+            phase("p1", vec![task("t1", &[], vec![step("s1", "dispatch.internal")])]),
+            phase("p2", vec![task("t2", &["t1"], vec![step("s2", "dispatch.internal")])]),
+        ]);
+        let findings = cfg.validate(&["dispatch.internal"]);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("later phase")),
+            "got {findings:?}"
+        );
+    }
+
     #[test]
     fn self_referential_depends_on_is_caught() {
         let cfg = doc(vec![phase(
@@ -2038,6 +2115,37 @@ mod tests {
 
     fn known_kinds_refs(known: &[String]) -> Vec<&str> {
         known.iter().map(String::as_str).collect()
+    }
+
+    /// (#2310 fix-loop C2 / C2-4) The built-in that SUBSCRIBES to the
+    /// exit-1-on-delivery-failure rule declares it, and names a real,
+    /// non-`grow`, enabled task — the three shapes `outcome_from`
+    /// validation refuses. `crawl` deliberately declares nothing: its
+    /// `summary` totals a run rather than delivering one.
+    #[test]
+    fn review_v2_builtin_declares_its_delivering_task_and_crawl_does_not() {
+        let cfg = embedded_config("review-v2");
+        assert_eq!(cfg.outcome_from.as_deref(), Some("deliver"));
+        let deliver = cfg
+            .phases
+            .iter()
+            .flat_map(|p| p.tasks.iter())
+            .find(|t| t.id == "deliver")
+            .expect("review-v2 declares a `deliver` task");
+        assert!(deliver.grow.is_none(), "outcome_from may not name a grow template");
+        assert!(deliver.is_enabled(), "outcome_from may not name a disabled task");
+        let known = known_kinds();
+        assert!(
+            cfg.is_valid(&known_kinds_refs(&known)),
+            "{:?}",
+            cfg.validate(&known_kinds_refs(&known))
+        );
+
+        assert_eq!(
+            embedded_config("crawl").outcome_from,
+            None,
+            "an errored crawl SUMMARY is a lost tally, not a review that never shipped"
+        );
     }
 
     #[test]
