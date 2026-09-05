@@ -4,8 +4,11 @@
 //! line sets a consumer needs.
 //!
 //! No `regex` crate (workspace dep discipline) — the two line shapes this
-//! parses (`+++ b/<path>` and `@@ -a,b +c,d @@`) are simple enough for
-//! hand-rolled prefix/token parsing.
+//! parses (`+++ [b/]<path>[\t<timestamp>]` and `@@ -a,b +c,d @@`) are
+//! simple enough for hand-rolled prefix/token parsing. Every unified-diff
+//! dialect a real tool emits is accepted (#2310 fix-loop B1) — see
+//! [`header_path`] for the three verified header shapes and why the
+//! optional `a/`/`b/` prefix is accepted rather than required.
 //!
 //! **Canonical home, moved from `darkmux-lab`'s `bundle::diff` (#2310 P4b).**
 //! `deliver_github_review`'s "is this line inside the diff" check needs the
@@ -88,13 +91,9 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
     }
 
     for ln in diff_text.lines() {
-        if let Some(rest) = ln.strip_prefix("+++ b/") {
+        if let Some(rest) = ln.strip_prefix("+++ ") {
             flush(&mut files, &path, &mut cur);
-            path = if rest == "/dev/null" {
-                None
-            } else {
-                Some(rest.to_string())
-            };
+            path = header_path(rest);
             cur = None;
             continue;
         }
@@ -130,6 +129,22 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
             h.new_block.push(content.to_string());
             h.new_lines.insert(new_ln);
             new_ln += 1;
+        } else if ln.is_empty() || ln == "\r" {
+            // (#2310 fix-loop B2, S3-3) A TRULY empty line inside a hunk
+            // body is a context line whose content is empty. git emits it
+            // as a lone space, but everything that touches a patch on the
+            // way here — editors, copy/paste, trailing-whitespace
+            // strippers, the GitHub API — routinely drops that space.
+            // Skipping such a line left `new_ln` un-advanced, which
+            // shifted the line number of EVERY later line in the hunk and
+            // desynced `old_block`/`new_block` from the file, so a finding
+            // on a real changed line read as outside the diff. Treated as
+            // context with empty content, exactly like ` ` would be.
+            let h = cur.as_mut().unwrap();
+            h.old_block.push(String::new());
+            h.new_block.push(String::new());
+            h.new_lines.insert(new_ln);
+            new_ln += 1;
         }
         // Other lines (e.g. `\ No newline at end of file`, the `---
         // a/<path>` line, `diff --git` headers) carry no line-content
@@ -137,6 +152,49 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
     }
     flush(&mut files, &path, &mut cur);
     files
+}
+
+/// The path a `+++ <rest>` (or `--- <rest>`) header names, or `None` when
+/// it names `/dev/null` (a deleted file) or nothing at all.
+///
+/// (#2310 fix-loop B1, S3-1 — PROVEN live) This used to be a literal
+/// `strip_prefix("+++ b/")`, which recognized ONLY `git diff`'s default
+/// dialect. Three shapes verified against real tool output on 2026-09-05:
+///
+/// ```text
+/// +++ b/src/x.ts                          git diff (default)
+/// +++ src/x.ts                            git diff --no-prefix
+/// +++ src/x.ts\t2026-09-05 08:45:23       diff -u / diff -Naur
+/// ```
+///
+/// A patch in either prefixless dialect parsed to ZERO files, so a
+/// review-v2 run over it completed green with a noop payload — the
+/// operator read "the PR is clean" off a diff that was never parsed. The
+/// `-Naur` shape parsed the tab and timestamp INTO the path, which then
+/// matched no file in the tree (`hunks_total:5, covered:0` → noop).
+///
+/// So: cut at the first tab (the timestamp field), drop a trailing `\r`
+/// (a lone CR — `str::lines` already eats the one in a CRLF pair), then
+/// strip an OPTIONAL `b/`/`a/` prefix.
+///
+/// **The optional prefix is genuinely ambiguous and cannot be resolved
+/// from one line.** A `--no-prefix` diff of a repo whose top-level
+/// directory is literally named `b` yields `+++ b/foo.ts`, which is
+/// indistinguishable from the default dialect's rendering of `foo.ts`.
+/// Accepting the prefix is right for the overwhelmingly common case (git's
+/// default) and for the operator's real one (`--no-prefix`); the `b/`-
+/// directory repo is the sacrificed corner. Preferring the strict
+/// dialect — the previous behavior — sacrifices EVERY prefixless patch
+/// instead, silently, which is the bug being fixed.
+fn header_path(rest: &str) -> Option<String> {
+    let p = rest.split('\t').next().unwrap_or(rest);
+    let p = p.strip_suffix('\r').unwrap_or(p);
+    let p = p.strip_prefix("b/").or_else(|| p.strip_prefix("a/")).unwrap_or(p);
+    if p.is_empty() || p == "/dev/null" {
+        None
+    } else {
+        Some(p.to_string())
+    }
 }
 
 /// Parse `@@ -a[,b] +c[,d] @@...` and return `(a, c)` — the OLD-file and
@@ -237,5 +295,94 @@ mod tests {
         let files = parse_diff(diff);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1.len(), 2);
+    }
+
+    /// (#2310 fix-loop B1, S3-1 — PROVEN live) The parser used to bind a
+    /// file ONLY via a literal `+++ b/` prefix, so a `git diff
+    /// --no-prefix` or a plain `diff -u`/`diff -Naur` patch parsed to ZERO
+    /// files — a review-v2 run over such a diff completed green with a
+    /// noop payload and the operator read that as "the PR is clean". Every
+    /// dialect below is the SAME logical change and must parse to the same
+    /// path, hunk count and line sets.
+    ///
+    /// The four header shapes are transcribed from real tool output
+    /// (`git diff --cached -M`, the same with `--no-prefix`, and BSD
+    /// `diff -Naur`, run 2026-09-05) — not guessed.
+    #[test]
+    fn every_unified_diff_dialect_parses_to_the_same_file_and_lines() {
+        let body = ["@@ -1,3 +1,4 @@", " a", "-b", "+B", "+B2", " c"];
+        let dialects: Vec<(&str, Vec<String>)> = vec![
+            (
+                "git default (a/ b/ prefixes)",
+                vec!["diff --git a/src/x.ts b/src/x.ts".into(), "--- a/src/x.ts".into(), "+++ b/src/x.ts".into()],
+            ),
+            (
+                "git --no-prefix",
+                vec!["diff --git src/x.ts src/x.ts".into(), "--- src/x.ts".into(), "+++ src/x.ts".into()],
+            ),
+            (
+                "diff -Naur (no prefix, tab + timestamp)",
+                vec![
+                    "diff -Naur old/src/x.ts new/src/x.ts".into(),
+                    "--- old/src/x.ts\t2026-09-05 08:45:23".into(),
+                    "+++ src/x.ts\t2026-09-05 08:45:23".into(),
+                ],
+            ),
+            (
+                "git default + tab-and-timestamp suffix",
+                vec!["--- a/src/x.ts\t2026-09-05 08:45:23".into(), "+++ b/src/x.ts\t2026-09-05 08:45:23".into()],
+            ),
+        ];
+        for (label, header) in dialects {
+            let mut lines = header;
+            lines.extend(body.iter().map(|s| s.to_string()));
+            for (sep, sep_label) in [("\n", "LF"), ("\r\n", "CRLF")] {
+                let text = lines.join(sep) + sep;
+                let files = parse_diff(&text);
+                assert_eq!(files.len(), 1, "{label} / {sep_label}: parsed {files:?}");
+                assert_eq!(files[0].0, "src/x.ts", "{label} / {sep_label}");
+                assert_eq!(files[0].1.len(), 1, "{label} / {sep_label}");
+                let h = &files[0].1[0];
+                assert_eq!(h.added, vec!["B", "B2"], "{label} / {sep_label}");
+                assert_eq!(h.removed, vec!["b"], "{label} / {sep_label}");
+                assert_eq!(h.new_start, 1, "{label} / {sep_label}");
+                assert_eq!(h.old_start, 1, "{label} / {sep_label}");
+                assert_eq!(h.new_lines, [1, 2, 3, 4].into_iter().collect::<BTreeSet<u32>>(), "{label} / {sep_label}");
+                assert_eq!(h.added_line_numbers, [2, 3].into_iter().collect::<BTreeSet<u32>>(), "{label} / {sep_label}");
+            }
+        }
+    }
+
+    /// (#2310 fix-loop B1) `/dev/null` must still drop the file in the
+    /// prefixless dialects too — the guard is on the PATH, not on the
+    /// `b/` prefix that used to gate the whole branch.
+    #[test]
+    fn dev_null_target_drops_file_in_every_dialect() {
+        for header in ["+++ /dev/null", "+++ b//dev/null", "+++ /dev/null\t2026-09-05 08:45:23"] {
+            let diff = format!("{header}\n@@ -1,2 +0,0 @@\n-gone\n-gone2\n");
+            assert!(parse_diff(&diff).is_empty(), "{header}");
+        }
+    }
+
+    /// (#2310 fix-loop B2, S3-3) A truly empty line inside a hunk body is
+    /// a CONTEXT line whose content happens to be empty (tools and copy
+    /// paths routinely strip the significant trailing space git emits).
+    /// Dropping it shifted `new_ln` for every later line, which moved the
+    /// old/new blocks and mis-classified findings as outside the diff.
+    #[test]
+    fn a_bare_blank_line_inside_a_hunk_is_context_like_a_space_prefixed_one() {
+        let with_space = ["+++ b/x.ts", "@@ -1,4 +1,5 @@", " a", " ", " c", "+d", " e", ""].join("\n");
+        let bare = ["+++ b/x.ts", "@@ -1,4 +1,5 @@", " a", "", " c", "+d", " e", ""].join("\n");
+        let a = parse_diff(&with_space);
+        let b = parse_diff(&bare);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        let (ha, hb) = (&a[0].1[0], &b[0].1[0]);
+        assert_eq!(hb.new_lines, ha.new_lines, "same line set as the space-prefixed form");
+        assert_eq!(hb.new_lines, [1, 2, 3, 4, 5].into_iter().collect::<BTreeSet<u32>>());
+        assert_eq!(hb.added_line_numbers, [4].into_iter().collect::<BTreeSet<u32>>(), "`+d` is line 4, not line 3");
+        assert_eq!(hb.new_block, ha.new_block);
+        assert_eq!(hb.old_block, ha.old_block);
+        assert_eq!(hb.new_block, vec!["a", "", "c", "d", "e"]);
     }
 }

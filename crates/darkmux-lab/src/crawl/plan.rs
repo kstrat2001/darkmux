@@ -995,10 +995,28 @@ impl<'a> DiffSource<'a> {
 fn diff_git_header_paths(diff_text: &str) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for ln in diff_text.lines() {
-        if let Some(rest) = ln.strip_prefix("diff --git a/") {
-            if let Some(idx) = rest.find(" b/") {
-                out.insert(rest[idx + 3..].to_string());
-            }
+        let Some(rest) = ln.strip_prefix("diff --git ") else { continue };
+        // (#2310 fix-loop B1) The `a/`/`b/` prefixes are a DIALECT, not
+        // part of the path — `git diff --no-prefix` emits `diff --git
+        // <old> <new>`, and reading only the prefixed form dropped every
+        // rename/binary entry in such a diff out of
+        // `diff_entries_without_hunks` and into `out_of_scope`, which
+        // says the opposite thing (the diff never mentioned it).
+        // Same optional-prefix rule `darkmux_crew::diff::header_path`
+        // applies to `+++`/`---`.
+        let new_side = match rest.strip_prefix("a/").and_then(|r| r.find(" b/").map(|i| &r[i + 3..])) {
+            Some(p) => p,
+            // Prefixless: `<old> <new>`. Paths with spaces are ambiguous
+            // in this dialect (git itself quotes them; not handled here,
+            // same as before) — take the last space-separated field,
+            // which is the new side for every unquoted path.
+            None => match rest.rsplit_once(' ') {
+                Some((_, new_side)) => new_side,
+                None => continue,
+            },
+        };
+        if !new_side.is_empty() {
+            out.insert(new_side.to_string());
         }
     }
     out
@@ -1158,6 +1176,27 @@ pub fn plan_diff_rule(materialized: &Materialized, rule: &Rule, diff_text: &str,
     let is_hit = |line: &str| regexes.is_empty() || regexes.iter().any(|re| re.is_match(line));
 
     let mut diff_source = DiffSource::new(&mut files, &mut skipped, &source.id, diff_text);
+    // (#2310 fix-loop B1, S3-1 — PROVEN live) A diff file with content in
+    // it that yields NO files is never a legitimate "nothing to review":
+    // it is a diff this parser could not read, or one whose paths belong
+    // to a different tree than the workspace names. Planning zero units
+    // from it produced a green run with a noop payload, which the
+    // operator reads as "the PR is clean" — indistinguishable from the
+    // rule genuinely finding nothing, the same failure the rule-kind and
+    // rule-scope guards above already refuse. Refuse by name and say what
+    // to check. An EMPTY diff file is left alone: "nothing changed" is a
+    // real, unambiguous input.
+    if !diff_text.trim().is_empty() && diff_source.by_file.is_empty() {
+        anyhow::bail!(
+            "the diff has content but parses to no files — check the diff's dialect and paths. \
+             darkmux reads `+++ <path>` headers with the `a/`/`b/` prefix optional and an \
+             optional trailing tab+timestamp (`git diff`, `git diff --no-prefix`, `diff -u`, \
+             `diff -Naur` all work); a diff of only renames or binary files has no `+++` header \
+             at all and nothing to plan a site from. Planning it would have produced zero units, \
+             which is indistinguishable from rule '{}' finding nothing.",
+            rule.id
+        );
+    }
     // Read both counters BEFORE `plan_site_units` runs its own mutable
     // borrow through `&mut diff_source` for the rest of this function —
     // `DiffSource` holds `&mut skipped` as a field for its whole
@@ -2340,6 +2379,61 @@ line two
         let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"d".repeat(40))], Vec::new());
         let err = plan_diff_rule(&materialized, &read_rule(), "", PlanParams::default()).unwrap_err();
         assert!(err.to_string().contains("site"), "{err}");
+    }
+
+    /// (#2310 fix-loop B1, S3-1 — PROVEN live) A non-empty diff that
+    /// parses to ZERO files is the loudest symptom of a dialect the
+    /// parser can't read (or of a diff whose paths simply don't match the
+    /// workspace). It used to plan zero units and exit green, which the
+    /// operator reads as "the PR is clean" — the exact indistinguishable-
+    /// from-nothing-found failure `plan_diff_rule_refuses_a_non_site_rule`
+    /// above already refuses on the rule side. Refused by name instead,
+    /// with the likely cause stated.
+    ///
+    /// After B1's parser fix a `--no-prefix` diff PARSES, so the fixture
+    /// here is the other door to the same zero-files end state: a real
+    /// rename-only diff, non-empty and legitimately hunk-less.
+    #[test]
+    fn plan_diff_rule_refuses_a_non_empty_diff_that_parses_to_zero_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f.ts"), "export const x = 1;\n").unwrap();
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"f".repeat(40))], Vec::new());
+        let diff_text =
+            ["diff --git a/old.ts b/new.ts", "similarity index 100%", "rename from old.ts", "rename to new.ts", ""].join("\n");
+        let err = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no files"), "names the zero-file outcome: {msg}");
+        assert!(msg.contains("dialect"), "names the likely cause the operator can act on: {msg}");
+    }
+
+    /// (#2310 fix-loop B1) The guard must NOT fire on an empty diff file —
+    /// "nothing changed" is a legitimate, unambiguous input, and the
+    /// message about diff dialects would be actively misleading there.
+    #[test]
+    fn plan_diff_rule_allows_a_genuinely_empty_diff() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f.ts"), "export const x = 1;\n").unwrap();
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"a".repeat(40))], Vec::new());
+        let plan = plan_diff_rule(&materialized, &site_rule(), "  \n\n", PlanParams::default()).unwrap();
+        assert!(plan.units.is_empty(), "{:?}", plan.units);
+    }
+
+    /// (#2310 fix-loop B1) `diff_git_header_paths` read ONLY the
+    /// `diff --git a/<old> b/<new>` form, so under `git diff --no-prefix`
+    /// (`diff --git old new`) a rename/binary entry fell out of
+    /// `diff_entries_without_hunks` and was miscounted as `out_of_scope`
+    /// — the diff DID mention it. Verified shape: `git diff --cached -M
+    /// --no-prefix`, 2026-09-05.
+    #[test]
+    fn diff_git_header_paths_reads_the_no_prefix_form_too() {
+        let prefixed = diff_git_header_paths("diff --git a/src/old.ts b/src/new.ts\n");
+        let bare = diff_git_header_paths("diff --git src/old.ts src/new.ts\n");
+        assert_eq!(prefixed.iter().cloned().collect::<Vec<_>>(), vec!["src/new.ts".to_string()]);
+        assert_eq!(
+            bare.iter().cloned().collect::<Vec<_>>(),
+            vec!["src/new.ts".to_string()],
+            "the NEW side, same as the prefixed form"
+        );
     }
 
     /// (#2310 P4c review round 2, MUST FIX 2 — proven) `Rule::scope` was

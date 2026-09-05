@@ -1954,9 +1954,11 @@ main()
     //    out of this audit's scope) ────────────────────────────────────
     //
     // - Pure rename with NO content change (`rename from`/`rename to`,
-    //   100% similarity, no `+++ b/` line at all) never enters
+    //   100% similarity, no `+++ ` line at all) never enters
     //   `files_considered` — `diff::parse_diff` only recognizes a file via
-    //   its `+++ b/` line. Not executed: there is no content to lose in
+    //   its `+++ ` line (the `a/`/`b/` prefix is optional since #2310
+    //   fix-loop B1; a real `git diff -M` capture on 2026-09-05 confirmed
+    //   a 100%-similarity rename emits NO `+++ ` line in any dialect). Not executed: there is no content to lose in
     //   this case (nothing changed), so it is very unlikely to be a
     //   review-quality gap, just a `files_considered` undercount. Would
     //   need a live `git diff -M` capture to confirm the exact line shape

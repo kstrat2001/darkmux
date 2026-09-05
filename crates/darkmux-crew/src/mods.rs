@@ -489,7 +489,9 @@ pub fn kit_looks_json(text: &str) -> bool {
 /// fenced-patch bullet in practice (`deliver_github_review::
 /// render_gated_mod`'s `hunks.is_empty()` branch) — this function only
 /// changes SELF-DESCRIPTION accuracy, not rendering behavior, for that
-/// case. Deliberately loose either way: a false positive just means a
+/// case. (#2310 fix-loop B1: `+++ <path>` now binds with the `a/`/`b/`
+/// prefix OPTIONAL, so a `--no-prefix` or `diff -u` kit header binds too
+/// — the header still has to be PRESENT for a path to exist at all.) Deliberately loose either way: a false positive just means a
 /// malformed diff renders as a fenced patch once its parse comes back
 /// empty; a false negative is the failure mode worth avoiding.
 pub fn looks_like_unified_diff(kit: &str) -> bool {
