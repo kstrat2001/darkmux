@@ -74,6 +74,20 @@ const SERVED_VIEWER = path.join('crates', 'darkmux-serve', 'assets', 'next.html'
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'filters-default-flow.jsonl'), 'utf8')
   );
 
+  // (#2417 round 3, MF-A) A busy fixture (1101 records: 900 heartbeat + 200
+  // reasoning) whose chip text is LONG once the hidden-count suffix lands
+  // ("50 of 200 events · 900 hidden") — long enough to overflow the phone
+  // drawer's fixed-width head row if the chip does not wrap.
+  const filtersOverflow = viewer.replace(
+    '<head>',
+    '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./filters-overflow-flow.jsonl">'
+  );
+  fs.writeFileSync(path.join(SERVED, 'index-filters-overflow.html'), filtersOverflow);
+  fs.writeFileSync(
+    path.join(SERVED, 'filters-overflow-flow.jsonl'),
+    fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'filters-overflow-flow.jsonl'), 'utf8')
+  );
+
   // (#1607) Savings-hero attribution harness. Three sessions, one per tier:
   // a positively-LOCAL one (bookends, no endpoint), a CLOUD one whose
   // completion names an endpoint and reports spend only as `remote_tokens`

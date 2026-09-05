@@ -89,4 +89,12 @@ test('(U4-1) every lens shows the same committed day in the events column, at re
   // lens is showing does not change how much of it happened.
   const distinct = new Set(Object.values(counts));
   expect([...distinct], `per-lens counts disagreed: ${JSON.stringify(counts)}`).toHaveLength(1);
+
+  // (#2417 round 3, CONSIDER-2) The finder above stays permissive (the
+  // hidden-count segment is optional in its own regex), but on THIS busy
+  // demo fixture the #2416 curated default hides real records, so the
+  // fleet lens's chip is one place that segment must actually be present —
+  // pinning it here catches a future change that silently stops computing
+  // or rendering it, which the permissive finder alone would not.
+  expect(counts.fleet, `fleet lens chip did not name a hidden count: ${counts.fleet}`).toMatch(/ · \d+ hidden$/);
 });

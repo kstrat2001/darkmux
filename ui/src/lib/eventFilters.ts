@@ -1,13 +1,16 @@
 /**
- * The event-log's full facet-filter model — `activityOf()` (viewer.html:
- * 1014-1042), `ACT_ORDER` (viewer.html:1047), and `recompute()`'s facet
- * derivation (viewer.html:1054-1058), plus the port's own `FilterState` /
- * `matchesFilters` that both `EventLogColumn` (the row list + its `#logq`
- * quick search) and `FiltersDialog` (the full checkbox-per-facet modal,
- * viewer.html:857-865) read from — ONE shared implementation rather than
- * `EventLogColumn`'s previous PARTIAL local `activityOf` (see #1640: before
- * this, `.fbtn` only ever drove a fixed "model only" boolean because the
- * full modal — and the facet lists it needs — didn't exist yet).
+ * The event-log's full facet-filter model — `activityOf()`, `ACT_ORDER`, and
+ * `recompute()`'s facet derivation ported line-for-line from the legacy
+ * standalone `viewer.html` (deleted in #1865 once the React port became the
+ * only viewer — the line numbers this doc used to cite no longer resolve
+ * to anything; the mapping itself is what survived, not the file), plus the
+ * port's own `FilterState`/`matchesFilters` that both `EventLogColumn` (the
+ * row list + its `#logq` quick search) and `FiltersDialog` (the full
+ * checkbox-per-facet modal, also ported from `viewer.html`) read from — ONE
+ * shared implementation rather than `EventLogColumn`'s previous PARTIAL
+ * local `activityOf` (see #1640: before this, `.fbtn` only ever drove a
+ * fixed "model only" boolean because the full modal — and the facet lists
+ * it needs — didn't exist yet).
  */
 import type { FlowRecord } from "../types/handwritten";
 import { isPlainObject } from "./guards";

@@ -585,7 +585,15 @@ export function EventLogColumn({
         // it isn't one. The "+" lands right after the number, same
         // placement as the no-search branch, so the two chips read as one
         // consistent convention rather than two different disclosures.
-        `${filtered.length}${serverTruncated ? "+" : ""} match${filtered.length === 1 ? "" : "es"}${capped ? ` · ${LOG_CAP} shown` : ""}`
+        // (#2417 round 3) `hiddenSuffix` composes here too — a search
+        // narrows `filtered` FURTHER on top of whatever the facet picks
+        // already excluded (`matchesFilters` checks both together), so
+        // "12 matches" while the facets are hiding hundreds of records
+        // dropped that context the moment a search began. Same suffix,
+        // same meaning: how many of ALL the records this pane received
+        // are not present in `filtered`, for whatever combination of
+        // reasons.
+        `${filtered.length}${serverTruncated ? "+" : ""} match${filtered.length === 1 ? "" : "es"}${capped ? ` · ${LOG_CAP} shown` : ""}${hiddenSuffix}`
       : "no match"
     // (operator) "newest 50 of 734" -> "50 of 734". The word carried no
     // information the newest-first ordering does not already show, and this

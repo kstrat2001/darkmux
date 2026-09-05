@@ -95,7 +95,9 @@ describe("EventLogColumn", () => {
     const records = [rec({ session_id: "s-alpha" }), rec({ session_id: "s-beta" })];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
-    expect(document.getElementById("qcount")?.textContent).toBe("1 match");
+    // (#2417 round 3) The one non-matching record is also "hidden" by the
+    // active search — same `hiddenSuffix` the no-search chip carries.
+    expect(document.getElementById("qcount")?.textContent).toBe("1 match · 1 hidden");
   });
 
   it("shows a plural match count for more than one match", () => {
@@ -106,7 +108,9 @@ describe("EventLogColumn", () => {
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
-    expect(document.getElementById("qcount")?.textContent).toBe("2 matches");
+    // (#2417 round 3) The one non-matching record is also "hidden" by the
+    // active search — same `hiddenSuffix` the no-search chip carries.
+    expect(document.getElementById("qcount")?.textContent).toBe("2 matches · 1 hidden");
   });
 
   it("appends the LOG_CAP disclosure once the match count exceeds what's shown", () => {
@@ -116,6 +120,23 @@ describe("EventLogColumn", () => {
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
     expect(document.getElementById("qcount")?.textContent).toBe("60 matches · 50 shown");
+  });
+
+  // (#2417 round 3, CONSIDER-1) A live search used to drop the
+  // hidden-by-facets context entirely — "12 matches" gave no sense of how
+  // much a busy stream's curated default was ALSO hiding underneath the
+  // search. Distinct from the LOG_CAP disclosure (`· 50 shown`): this
+  // fixture has a query match count under LOG_CAP, so that segment is
+  // absent and only the hidden-count segment appears.
+  it("appends the hidden-by-filters count to a search match too, not just the no-search chip", () => {
+    const records = [
+      rec({ action: "dispatch.reasoning", session_id: "s-alpha-1" }),
+      rec({ action: "dispatch.reasoning", session_id: "s-alpha-2" }),
+      rec({ action: "dispatch.turn.heartbeat", session_id: "s-alpha-heartbeat" }), // hidden by the #2416 default, even though its id would match the query
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
+    expect(document.getElementById("qcount")?.textContent).toBe("2 matches · 1 hidden");
   });
 
   it("carries the server-truncation marker into a filtered match count too", () => {
@@ -330,11 +351,22 @@ describe("EventLogColumn", () => {
     // that used to fire a mount/every-change persist under the old
     // per-scope keying. It must not write anything: pane B never had an
     // operator gesture of its own.
+    //
+    // (#2417 round 3, MF-B) The tick record carries a BRAND-NEW facet value
+    // (`tier: "edge"` — neither "local" nor "cloud" was ever offered
+    // before) rather than reusing an already-seen one. `absorbNewFacetValues`
+    // returns the SAME `filters` reference when nothing is new (its own
+    // "no spurious re-render" guarantee — see `eventFilters.ts`'s doc), so
+    // a tick that introduces no new value never even reaches the
+    // `setFilters` call inside the reconcile effect: the branch this test
+    // exists to prove doesn't write is never actually exercised. A new
+    // tier forces `absorbNewFacetValues` to return a NEW reference, which
+    // takes the `next !== filters` branch and calls `setFilters` for real.
     rerenderB(
       <EventLogColumn
         scopeLabel="mission m1"
         paneId="b"
-        records={[...records, rec({ ts: "2026-08-08T12:10:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud-2", tier: "cloud" })]}
+        records={[...records, rec({ ts: "2026-08-08T12:10:00.000Z", action: "dispatch.reasoning", session_id: "s-edge", tier: "edge" })]}
         visible={false}
       />,
     );
