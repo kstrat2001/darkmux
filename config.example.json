@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.19",
+  "schema_version": "1.20",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -17,6 +17,7 @@
   "runtime": {
     "inactivity_timeout_seconds": 600,
     "model_load_timeout_seconds": 600,
+    "step_command_timeout_seconds": 600,
     "strict_selection": false,
     "log_level": "info",
     "feedback_injection": true,

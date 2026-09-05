@@ -3412,6 +3412,13 @@ line two
             // writes for a real launch (`<missions_dir>/<mission>/plan/
             // <rule>.json`) — `records.gather`'s own `plan_totals` reads
             // this to compute `scope.rules_run`/`hunks_covered`.
+            // (#2361 item 2) One COMPLETED `crawl.unit` step per planned
+            // unit, in the shape the grown task writes it (`rule` + `unit`
+            // in the step's own config) — `records.gather` counts coverage
+            // from these now, not from the plans alone, because a plan is
+            // an intention and a unit that errored reviewed nothing. A
+            // fixture that skipped them would claim coverage no unit did.
+            let unit_ids: Vec<String> = plan.units.iter().map(|u| u.id().to_string()).collect();
             let wrapped = darkmux_crew::step_output::Output::wrap(
                 crate::crawl::plan_step::CRAWL_PLAN_OUTPUT_KIND,
                 plan,
@@ -3420,13 +3427,34 @@ line two
             let plan_path =
                 darkmux_crew::loader::missions_dir().join(MISSION).join("plan").join(format!("{rule_id}.json"));
             crate::crawl::plan_step::write_plan(&plan_path, &wrapped).unwrap();
+            for unit_id in unit_ids {
+                darkmux_crew::lifecycle::save_step(
+                    MISSION,
+                    PHASE,
+                    &darkmux_crew::types::Step {
+                        id: format!("unit-{rule_id}-{unit_id}-step"),
+                        task_id: format!("unit-{rule_id}-{unit_id}"),
+                        kind: "crawl.unit".into(),
+                        gate: None,
+                        status: darkmux_crew::types::NodeStatus::Complete,
+                        config: serde_json::json!({ "rule": rule_id, "unit": unit_id }),
+                        started_ts: None,
+                        completed_ts: None,
+                        output: None,
+                    },
+                )
+                .unwrap();
+            }
         }
 
         // ── stub finding + mod producers — one finding per rule, one per delivery form ──
         let findings_root = darkmux_crew::findings::findings_dir();
         let mods_root = darkmux_crew::mods::mods_dir();
         let mk_finding = |dispatch: &str, seq: u64, rule: &str, confirm: Option<&str>, file: &str, line: u32, evidence: &str, why: &str| {
-            let mut context = serde_json::json!({ "rule": rule });
+            // (#2361 item 1) `source` is what the crawl launcher stamps on
+            // every unit dispatch's `record_context` — and what lets
+            // `build_record` map a container path back to the repo's.
+            let mut context = serde_json::json!({ "rule": rule, "source": "app" });
             if let Some(c) = confirm {
                 context["confirm"] = serde_json::json!(c);
             }
@@ -3457,12 +3485,17 @@ line two
             "the catch block swallows the error",
         );
         // unnamed-predicate (confirm=mod), gate-FAILED — a double-check bullet.
+        // (#2361 item 1, the live string verbatim) The 2026-09-05 run's
+        // stored finding carried `/workspace/app/src/auth.ts` — the
+        // CONTAINER's view — while the diff and the deliverer speak
+        // `src/auth.ts`. The golden below renders this bullet's path, so
+        // an unmapped emission drifts it visibly.
         let up_key = mk_finding(
             "sess-fix",
             2,
             "unnamed-predicate",
             None,
-            "src/auth.ts",
+            "/workspace/app/src/auth.ts",
             3,
             "if ((user.role === \"admin\" ...",
             "the condition is hard to read at a glance",
@@ -3504,48 +3537,61 @@ line two
             "a shared function's signature changed",
         );
 
-        const CLAMP_KIT: &str = "diff --git a/src/billing.ts b/src/billing.ts\n--- a/src/billing.ts\n+++ b/src/billing.ts\n@@ -5,1 +5,1 @@\n-  } catch (e) {\n+  } catch (e) {\n+    console.error(e);\n";
-        let mk_mod = |key: &str, for_key: &str, kit: &str, kit_kind: Option<&str>, gate: Option<bool>| {
-            let rec = darkmux_crew::mods::ModRecord {
-                key: key.to_string(),
-                ts: "2026-09-05T00:00:01Z".to_string(),
-                by: "coder".to_string(),
-                r#for: vec![for_key.to_string()],
-                kit: Some(kit.to_string()),
-                kit_looks_json: false,
-                kit_kind: kit_kind.map(str::to_string),
-                attachments: Vec::new(),
-                context: darkmux_crew::mods::ModContext {
-                    findings: vec![darkmux_crew::mods::ForFinding {
-                        key: for_key.to_string(),
-                        mission_id: Some(MISSION.into()),
-                        context: None,
-                        emitted: None,
-                        missing: false,
-                    }],
+        // (#2361 item 1, the live shape) The kit comes out of the
+        // container with `a/<source-id>/…` headers — `mods.gate` applies
+        // it inside a copy of the source checkout, where only
+        // `src/billing.ts` exists, and the deliverer anchors a suggestion
+        // by the diff's own path. Unmapped, `git apply` fails ("kit did
+        // not apply") and this suggestion never renders.
+        const CLAMP_KIT: &str = "diff --git a/app/src/billing.ts b/app/src/billing.ts\n--- a/app/src/billing.ts\n+++ b/app/src/billing.ts\n@@ -5,1 +5,1 @@\n-  } catch (e) {\n+  } catch (e) {\n+    console.error(e);\n";
+        // (#2361) Every mod here goes through the REAL emission producer,
+        // so the host boundary that maps a kit's container headers is on
+        // the path this fixture exercises — a hand-built `ModRecord` would
+        // skip exactly the code the live run broke on.
+        // (#2361) Each mod is written by the REAL emission producer —
+        // `create_from_emission`, the same function the dispatch tailer
+        // calls — with the workspace source id the launcher would have
+        // stamped. A hand-built `ModRecord` here would skip the exact host
+        // boundary the live run broke on, so the fixture would prove
+        // nothing about it. The key is minted (not named), which the
+        // golden never renders.
+        let mk_mod = |for_key: &str, kit: &str, gate: Option<bool>| -> String {
+            let rec = darkmux_crew::mods::create_from_emission(
+                &mods_root,
+                &findings_root,
+                "coder (test)",
+                &[for_key.to_string()],
+                kit,
+                &[],
+                darkmux_crew::findings::Scope {
+                    mission_id: Some(MISSION.into()),
+                    phase_id: Some(PHASE.into()),
+                    step_id: None,
                 },
-                warnings: Vec::new(),
-                mission_id: Some(MISSION.into()),
-                phase_id: Some(PHASE.into()),
-                step_id: None,
-                gate: None,
-                gate_skipped_reason: None,
-                schema_version: darkmux_crew::mods::MOD_SCHEMA_VERSION.to_string(),
-                extras: Default::default(),
-            };
-            darkmux_crew::mods::materialize(&mods_root, &rec).unwrap();
+                Some("app"),
+                Vec::new(),
+            )
+            .unwrap();
             if let Some(passed) = gate {
                 darkmux_crew::mods::record_gate(
                     &mods_root,
-                    key,
+                    &rec.key,
                     Some(darkmux_crew::mods::GateOutcome { passed, command: "true".into(), exit_code: Some(if passed { 0 } else { 1 }), applied: Some(true), reason: None }),
                     None,
                 )
                 .unwrap();
             }
+            rec.key
         };
-        mk_mod("mod-se", &se_key, CLAMP_KIT, Some("unified-diff"), Some(true));
-        mk_mod("mod-up", &up_key, "a proposed fix nobody sees", None, Some(false));
+        // The gate-PASSED mod, whose kit arrived in container coordinates:
+        // stored mapped, it anchors a one-click suggestion in the diff.
+        let se_mod = mk_mod(&se_key, CLAMP_KIT, Some(true));
+        assert_eq!(
+            darkmux_crew::mods::load_at(&mods_root, &se_mod).unwrap().unwrap().kit.as_deref(),
+            Some("diff --git a/src/billing.ts b/src/billing.ts\n--- a/src/billing.ts\n+++ b/src/billing.ts\n@@ -5,1 +5,1 @@\n-  } catch (e) {\n+  } catch (e) {\n+    console.error(e);\n"),
+            "the stored kit must be in the repo's coordinates, not the container's"
+        );
+        mk_mod(&up_key, "a proposed fix nobody sees", Some(false));
 
         // ── records.gather then deliver.github_review, same two-step-task wiring `review-v2.json` uses ──
         let gather_step = darkmux_crew::types::Step {

@@ -112,8 +112,22 @@ pub struct FindingRecord {
     /// read inside it, and never adds to it.
     pub context: serde_json::Value,
     /// The model's arguments, verbatim. Opaque: never parsed, never validated,
-    /// never reshaped.
+    /// never reshaped — with ONE named exception, and only when the launcher
+    /// said which source the dispatch ran against: a `file` written in the
+    /// CONTAINER's coordinates (`/workspace/<source-id>/…`) is mapped back to
+    /// the repo-relative path every host-side consumer speaks. See
+    /// [`build_record`] for why that is a host translation rather than an
+    /// interpretation, and [`FindingRecord::source`] for what it records.
     pub emitted: serde_json::Value,
+    /// (#2361) The workspace source id the dispatch's `context` named, when
+    /// it named one — the id whose prefix was mapped off `emitted`'s path.
+    /// Present so nothing is lost by the mapping: the container path is
+    /// `/workspace/<source>/<file>`, reconstructible from these two.
+    /// `None` for any dispatch with no source in its context (a plain
+    /// `darkmux dispatch`), where no mapping happened either. Additive, so
+    /// the schema version does not move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub schema_version: String,
     /// Lenient-on-read overflow, so a newer writer's fields survive a round
     /// trip through an older reader.
@@ -145,7 +159,68 @@ pub fn record_path_at(root: &Path, dispatch: &str, seq: u64) -> PathBuf {
     record_dir_at(root, dispatch, seq).join("finding.json")
 }
 
+/// Strip the container-path prefix off a path a model reported (#2361).
+///
+/// A dispatch sees its workspace at `/workspace/<source-id>/…`; every
+/// host-side consumer of a finding — the diff, `mods.gate`'s scratch
+/// checkout, `deliver.github_review`'s in-diff test — speaks the
+/// repo-relative path. Both container forms map: the absolute one the
+/// unit's own instructions ask for, and the bare `<source-id>/<rel>` a
+/// model produces by copying its scope listing verbatim. Anything else
+/// falls through unchanged — this maps a KNOWN prefix, it never guesses at
+/// a leading path segment.
+///
+/// The one definition, shared: `darkmux_lab::crawl::unit_step`'s readback
+/// of the unit's own local artifact calls this too, so the run-local file
+/// and the store cannot disagree about a path again (they did, live).
+pub fn strip_source_prefix(source_id: &str, raw: &str) -> String {
+    if source_id.is_empty() {
+        return raw.to_string();
+    }
+    if let Some(rel) = raw.strip_prefix(&format!("/workspace/{source_id}/")) {
+        return rel.to_string();
+    }
+    if let Some(rel) = raw.strip_prefix(&format!("{source_id}/")) {
+        return rel.to_string();
+    }
+    raw.to_string()
+}
+
+/// The source id a launcher's `record_context` named, if any.
+pub fn source_id_of(context: Option<&serde_json::Value>) -> Option<String> {
+    context?
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Map a finding emission's `file` out of the container's coordinates and
+/// into the repo's, using the HOST-known source id. Every other field is
+/// untouched, and a non-object emission (or one with no string `file`) is
+/// returned exactly as it came.
+fn map_emitted_paths(source_id: &str, mut emitted: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = emitted.as_object_mut() else { return emitted };
+    let Some(raw) = obj.get("file").and_then(|v| v.as_str()).map(str::to_string) else {
+        return emitted;
+    };
+    let mapped = strip_source_prefix(source_id, &raw);
+    if mapped != raw {
+        obj.insert("file".to_string(), serde_json::Value::from(mapped));
+    }
+    emitted
+}
+
 /// Build a record from the pieces both producers have.
+///
+/// (#2361) This is the HOST BOUNDARY where a container path becomes a repo
+/// path. Both producers — the dispatch tailer and `finding sync`'s replay —
+/// come through here, which is what stopped them disagreeing with the
+/// unit's own local artifact (which had always normalized). The mapping is
+/// keyed on `context.source`, the id the LAUNCHER stamped and the host
+/// therefore knows; nothing is inferred from the path itself, and the id is
+/// recorded on the record so the container path stays reconstructible.
 #[allow(clippy::too_many_arguments)]
 pub fn build_record(
     dispatch: &str,
@@ -157,6 +232,11 @@ pub fn build_record(
     context: Option<serde_json::Value>,
     emitted: serde_json::Value,
 ) -> FindingRecord {
+    let source = source_id_of(context.as_ref());
+    let emitted = match source.as_deref() {
+        Some(id) => map_emitted_paths(id, emitted),
+        None => emitted,
+    };
     FindingRecord {
         key: format!("{dispatch}/{seq}"),
         dispatch: dispatch.to_string(),
@@ -169,6 +249,7 @@ pub fn build_record(
         step_id: scope.step_id,
         context: context.unwrap_or(serde_json::Value::Null),
         emitted,
+        source,
         schema_version: FINDING_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     }
@@ -538,6 +619,78 @@ mod tests {
         assert!(format!("{err:#}").contains("finding sync"), "{err:#}");
         let shape = append_to_brief("fix this", &["nope".to_string()], root).unwrap_err();
         assert!(format!("{shape:#}").contains("<dispatch>/<seq>"), "{shape:#}");
+    }
+
+    /// (#2361, PROVEN live on mission `review-v2-1788566897-9c149e`) The
+    /// stored finding's `emitted.file` was `/workspace/app/src/auth.ts` —
+    /// the CONTAINER's view (`/workspace/<source-id>/…`), while the diff,
+    /// the gate's scratch checkout and `deliver.github_review` all speak
+    /// repo-relative (`src/auth.ts`). Consequence: no finding was ever
+    /// "inside the diff", so a real gate-able finding posted as "worth a
+    /// double check". The unit's own local artifact already normalized;
+    /// the STORE path bypassed it. Both producers (the tailer and `finding
+    /// sync`) build through `build_record`, so the mapping lands here
+    /// once — driven by the HOST-known source id on the launcher's own
+    /// `context`, never by guessing at a leading path segment.
+    #[test]
+    fn a_container_path_in_an_emission_is_mapped_back_to_the_repo_relative_one() {
+        let rec = build_record(
+            "sess-fix",
+            1,
+            "2026-09-05T00:00:00Z".into(),
+            "create_finding",
+            Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
+            Scope::default(),
+            Some(serde_json::json!({"source": "app", "rule": "unnamed-predicate"})),
+            serde_json::json!({"file": "/workspace/app/src/auth.ts", "line": 3, "why": "w"}),
+        );
+        assert_eq!(rec.emitted["file"], "src/auth.ts");
+        // Nothing is lost: the source id the mapping used is on the record.
+        assert_eq!(rec.source.as_deref(), Some("app"));
+        // The bare form a model copies out of its own scope listing maps too.
+        let bare = build_record(
+            "sess-fix",
+            2,
+            "2026-09-05T00:00:00Z".into(),
+            "create_finding",
+            Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
+            Scope::default(),
+            Some(serde_json::json!({"source": "app"})),
+            serde_json::json!({"file": "app/src/auth.ts"}),
+        );
+        assert_eq!(bare.emitted["file"], "src/auth.ts");
+    }
+
+    /// The mapping is driven by the source id and NOTHING else: a context
+    /// with no `source` (a plain `darkmux dispatch`) leaves the emission
+    /// exactly as the model wrote it, and a path that does not carry the
+    /// source prefix is untouched — including one that merely starts with
+    /// `/workspace/`.
+    #[test]
+    fn an_emission_is_untouched_without_a_source_id_or_a_matching_prefix() {
+        let no_source = build_record(
+            "sess-fix",
+            1,
+            "2026-09-05T00:00:00Z".into(),
+            "create_finding",
+            Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
+            Scope::default(),
+            None,
+            serde_json::json!({"file": "/workspace/app/src/auth.ts"}),
+        );
+        assert_eq!(no_source.emitted["file"], "/workspace/app/src/auth.ts");
+        assert_eq!(no_source.source, None);
+        let other_source = build_record(
+            "sess-fix",
+            2,
+            "2026-09-05T00:00:00Z".into(),
+            "create_finding",
+            Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
+            Scope::default(),
+            Some(serde_json::json!({"source": "lib"})),
+            serde_json::json!({"file": "/workspace/app/src/auth.ts"}),
+        );
+        assert_eq!(other_source.emitted["file"], "/workspace/app/src/auth.ts");
     }
 
     /// (#2265) The brief block hands the model the record VERBATIM — the

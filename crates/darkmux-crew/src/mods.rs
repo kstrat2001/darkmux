@@ -258,6 +258,16 @@ pub struct ModRecord {
     pub phase_id: Option<String>,
     #[serde(default)]
     pub step_id: Option<String>,
+    /// (#2361) The workspace source id the proposing dispatch's `context`
+    /// named — the id whose prefix [`strip_kit_source_prefix`] mapped off
+    /// this kit's headers. Present so nothing is lost by the mapping: the
+    /// container path is `/workspace/<source>/<path>`, reconstructible
+    /// from the two. `None` for `mod create` (an external actor's change,
+    /// already in the repo's own coordinates) and for any dispatch with no
+    /// source in its context, neither of which is mapped. Additive, so the
+    /// schema version does not move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// (#2310 P4c-2b) The confirmation gate — DESIGN.md "the changed files
     /// name the test targets, which is what makes confirmation cheap
     /// enough to do per finding": a `test_command` run against this mod's
@@ -684,6 +694,9 @@ pub fn create(
         mission_id: None,
         phase_id: None,
         step_id: None,
+        // (#2361) An external actor's change is already written in the
+        // repo's own coordinates — there is no container to map out of.
+        source: None,
         // (#2310 P4c-2b) `mod create` is a one-shot CLI write, not part of
         // any create-mods gate loop — never gated at create time.
         gate: None,
@@ -795,6 +808,85 @@ pub fn decode_b64(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Map a kit's file headers out of the container's coordinates and into
+/// the repo's, using the HOST-known workspace source id (#2361).
+///
+/// A dispatch sees its workspace at `/workspace/<source-id>/…`, and a model
+/// asked for a unified diff writes the paths it can see: `--- a/<source-id>/
+/// <path>`. `mods.gate` applies the kit inside a copy of the SOURCE
+/// CHECKOUT, and `deliver.github_review` anchors a suggestion by the diff's
+/// own repo-relative path — so a kit in container coordinates applies to
+/// nothing and anchors to nothing. Proven live: every gated mod on mission
+/// `review-v2-1788566897-9c149e` recorded "kit did not apply".
+///
+/// Only the three header forms are touched — `diff --git`, `---`, `+++` —
+/// and only the `<source-id>` prefix (with or without git's `a/`/`b/`
+/// marker, and with or without the `/workspace/` root). The hunk body is
+/// never read: a `-`/`+` line that happens to contain a path is content,
+/// not a header. `/dev/null` is left exactly as it is. A kit already in
+/// repo-relative paths comes back byte-identical, which also makes this
+/// idempotent.
+///
+/// **This is the ONE place a stored kit is not byte-identical to the
+/// emission** — a host translation between two coordinate systems the host
+/// alone knows the mapping for, not an interpretation of the kit. The
+/// source id rides on [`ModRecord::source`] so the original is
+/// reconstructible.
+pub fn strip_kit_source_prefix(source_id: &str, kit: &str) -> String {
+    if source_id.is_empty() {
+        return kit.to_string();
+    }
+    let map_path = |p: &str| -> String {
+        for marker in ["a/", "b/"] {
+            if let Some(rest) = p.strip_prefix(marker) {
+                let mapped = crate::findings::strip_source_prefix(source_id, rest);
+                return format!("{marker}{mapped}");
+            }
+        }
+        crate::findings::strip_source_prefix(source_id, p)
+    };
+    let mut out = String::with_capacity(kit.len());
+    for line in kit.split_inclusive('\n') {
+        let (body, eol) = match line.strip_suffix('\n') {
+            Some(b) => match b.strip_suffix('\r') {
+                Some(b2) => (b2, "\r\n"),
+                None => (b, "\n"),
+            },
+            None => (line, ""),
+        };
+        let mapped = if let Some(rest) = body.strip_prefix("diff --git ") {
+            // Two paths, space-separated. A path with a space in it is not
+            // representable in this header form anyway (git quotes it), and
+            // a quoted one simply falls through unmapped rather than being
+            // corrupted.
+            let parts: Vec<&str> = rest.split(' ').collect();
+            if parts.len() == 2 {
+                format!("diff --git {} {}", map_path(parts[0]), map_path(parts[1]))
+            } else {
+                body.to_string()
+            }
+        } else if let Some(rest) = body.strip_prefix("--- ").or_else(|| body.strip_prefix("+++ ")) {
+            let marker = &body[..4];
+            // A `---`/`+++` header may carry a tab plus timestamp
+            // (`diff -u` output); only the path half is mapped.
+            let (path, tail) = match rest.find('\t') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, ""),
+            };
+            if path == "/dev/null" {
+                body.to_string()
+            } else {
+                format!("{marker}{}{tail}", map_path(path))
+            }
+        } else {
+            body.to_string()
+        };
+        out.push_str(&mapped);
+        out.push_str(eol);
+    }
+    out
+}
+
 /// The mod a DISPATCH proposed, from the runtime's emission.
 ///
 /// The second producer of the same record: `create` is the external actor's
@@ -815,6 +907,10 @@ pub fn create_from_emission(
     kit: &str,
     attachments: &[InlineAttachment],
     scope: crate::findings::Scope,
+    // (#2361) The workspace source id the proposing dispatch's
+    // `record_context` named, when it named one — the prefix mapped off
+    // this kit's headers. `None` leaves the kit byte-identical.
+    source: Option<&str>,
     warnings: Vec<String>,
 ) -> Result<ModRecord> {
     anyhow::ensure!(!by.trim().is_empty(), "a mod needs a proposer");
@@ -823,6 +919,13 @@ pub fn create_from_emission(
     // tool boundary, where the model could read the refusal; this is the
     // backstop, not the message.
     anyhow::ensure!(!kit.trim().is_empty(), "a mod needs a kit: `kit` was empty");
+    // (#2361) The HOST boundary: container coordinates in, repo
+    // coordinates stored. A dispatch with no source in its context is not
+    // mapped at all.
+    let kit = match source {
+        Some(id) => strip_kit_source_prefix(id, kit),
+        None => kit.to_string(),
+    };
     let for_keys = canonical_for_keys(for_keys)?;
 
     let mut names: Vec<String> = Vec::new();
@@ -846,9 +949,12 @@ pub fn create_from_emission(
         ts: darkmux_flow::ts_utc_now(),
         by: by.to_string(),
         r#for: for_keys.clone(),
-        // The bytes that came in, unchanged. No parse, no re-serialize.
+        // The bytes that came in — with the ONE host translation
+        // `strip_kit_source_prefix` documents (#2361): the container's
+        // `/workspace/<source>/…` headers become the repo-relative ones
+        // every consumer of a kit speaks. No parse, no re-serialize.
         kit: Some(kit.to_string()),
-        kit_looks_json: kit_looks_json(kit),
+        kit_looks_json: kit_looks_json(&kit),
         // (#2310 P4c) The runtime producer has no `kit_kind` argument the
         // model can set (the `create_mod` tool takes `for`/`kit`/`attach`
         // only — see `runtime/src/tools/mod.rs`), so this is detected
@@ -856,13 +962,14 @@ pub fn create_from_emission(
         // forever, per `mods.rs`'s own #2310 P4b review note this replaces:
         // a review finding's mod never becomes a GitHub suggestion block
         // without this, no matter how diff-shaped the kit actually is.
-        kit_kind: looks_like_unified_diff(kit).then(|| "unified-diff".to_string()),
+        kit_kind: looks_like_unified_diff(&kit).then(|| "unified-diff".to_string()),
         attachments: names.clone(),
         context: finding_context(findings_root, &for_keys)?,
         warnings,
         mission_id: scope.mission_id,
         phase_id: scope.phase_id,
         step_id: scope.step_id,
+        source: source.map(str::to_string),
         // (#2310 P4c-2b) Gated after the fact, by `mods.gate` — never at
         // creation time (the coder proposing the mod hasn't run any test
         // yet).
@@ -995,6 +1102,7 @@ mod tests {
                 phase_id: Some("p-1".into()),
                 step_id: Some("step-3".into()),
             },
+            None,
             vec!["a part the host could not keep".to_string()],
         )
         .unwrap();
@@ -1096,6 +1204,7 @@ mod tests {
             diff_kit,
             &[],
             findings::Scope::default(),
+            None,
             Vec::new(),
         )
         .unwrap();
@@ -1109,6 +1218,7 @@ mod tests {
             "did you consider using the existing helper at src/util.rs instead?",
             &[],
             findings::Scope::default(),
+            None,
             Vec::new(),
         )
         .unwrap();
@@ -1138,6 +1248,7 @@ mod tests {
                 kit,
                 &attachments,
                 findings::Scope::default(),
+                None,
                 Vec::new(),
             )
             .expect_err("refused");
@@ -1194,6 +1305,83 @@ mod tests {
             serde_json::json!({"file": "a.ts", "line": 4}),
         );
         findings::materialize(root, &rec).unwrap();
+    }
+
+    /// (#2361, PROVEN live on mission `review-v2-1788566897-9c149e`) The
+    /// mod's kit came back with the CONTAINER's headers — `--- a/app/src/
+    /// auth.ts` / `+++ b/app/src/auth.ts`, where `app` is the workspace
+    /// source id — while `mods.gate` applies the kit inside a copy of the
+    /// SOURCE CHECKOUT, whose paths are repo-relative. `git apply` found no
+    /// `app/src/auth.ts` there, so the gate recorded "kit did not apply"
+    /// and a real, gate-able finding posted as "worth a double check".
+    /// Mapped at the host boundary from the source id the launcher
+    /// stamped — never guessed from the path.
+    #[test]
+    fn a_kit_written_in_container_paths_is_mapped_to_repo_relative_headers() {
+        let kit = "diff --git a/app/src/auth.ts b/app/src/auth.ts\n\
+                   --- a/app/src/auth.ts\n\
+                   +++ b/app/src/auth.ts\n\
+                   @@ -3,1 +3,1 @@\n\
+                   -  if ((user.role === \"admin\"))\n\
+                   +  if (isAdmin(user))\n";
+        let mapped = strip_kit_source_prefix("app", kit);
+        assert!(mapped.contains("diff --git a/src/auth.ts b/src/auth.ts"), "{mapped}");
+        assert!(mapped.contains("--- a/src/auth.ts"), "{mapped}");
+        assert!(mapped.contains("+++ b/src/auth.ts"), "{mapped}");
+        // Only the headers move: the body is byte-for-byte what the model wrote.
+        assert!(mapped.contains("-  if ((user.role === \"admin\"))"), "{mapped}");
+        assert!(mapped.contains("+  if (isAdmin(user))"), "{mapped}");
+        assert!(!mapped.contains("app/src/auth.ts"), "no container path survives: {mapped}");
+    }
+
+    /// The absolute container form maps too, `/dev/null` (a new file) is
+    /// left alone, and a kit already written in repo-relative paths comes
+    /// back unchanged — so mapping twice is the same as mapping once.
+    #[test]
+    fn kit_mapping_handles_the_absolute_form_dev_null_and_is_idempotent() {
+        let abs = "--- /workspace/app/src/auth.ts\n+++ /workspace/app/src/auth.ts\n";
+        assert_eq!(strip_kit_source_prefix("app", abs), "--- src/auth.ts\n+++ src/auth.ts\n");
+
+        let new_file = "--- /dev/null\n+++ b/app/src/new.ts\n";
+        assert_eq!(strip_kit_source_prefix("app", new_file), "--- /dev/null\n+++ b/src/new.ts\n");
+
+        let already = "--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(strip_kit_source_prefix("app", already), already);
+        assert_eq!(
+            strip_kit_source_prefix("app", &strip_kit_source_prefix("app", new_file)),
+            strip_kit_source_prefix("app", new_file),
+            "mapping is idempotent"
+        );
+        // No source id: nothing is touched.
+        let container = "--- a/app/src/auth.ts\n";
+        assert_eq!(strip_kit_source_prefix("", container), container);
+    }
+
+    /// The whole boundary, through the record: an emission whose kit is in
+    /// container paths is STORED repo-relative, and the source id that made
+    /// the mapping possible is on the record so nothing is lost.
+    #[test]
+    fn a_mod_from_an_emission_stores_the_mapped_kit_and_names_its_source() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("mods");
+        let findings_root = tmp.path().join("findings");
+        store_finding(&findings_root, "sess-c", 1, None);
+        let kit = "--- a/app/src/auth.ts\n+++ b/app/src/auth.ts\n@@ -1 +1 @@\n-a\n+b\n";
+        let rec = create_from_emission(
+            &root,
+            &findings_root,
+            "coder (m)",
+            &["sess-c/1".to_string()],
+            kit,
+            &[],
+            findings::Scope::default(),
+            Some("app"),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(rec.kit.as_deref(), Some("--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -1 +1 @@\n-a\n+b\n"));
+        assert_eq!(rec.source.as_deref(), Some("app"));
+        assert_eq!(rec.kit_kind.as_deref(), Some("unified-diff"), "still detected as a diff: {rec:?}");
     }
 
     #[test]
@@ -1519,6 +1707,7 @@ mod tests {
             mission_id: None,
             phase_id: None,
             step_id: None,
+            source: None,
             gate: None,
             gate_skipped_reason: None,
             schema_version: MOD_SCHEMA_VERSION.into(),
@@ -1551,6 +1740,7 @@ mod tests {
             mission_id: None,
             phase_id: None,
             step_id: None,
+            source: None,
             gate: None,
             gate_skipped_reason: None,
             schema_version: MOD_SCHEMA_VERSION.into(),
@@ -1657,6 +1847,7 @@ mod tests {
             mission_id: None,
             phase_id: None,
             step_id: None,
+            source: None,
             gate: None,
             gate_skipped_reason: None,
             schema_version: MOD_SCHEMA_VERSION.into(),

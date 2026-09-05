@@ -134,7 +134,15 @@ use std::path::Path;
 //           of the contract. Neither is written by `init` (a literal
 //           would be wrong: absent is a real behavior), same carve-out as
 //           `runtime.max_turns`.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.19";
+//   1.20 (#2361, swarm S4-4): additive `runtime.step_command_timeout_
+//           seconds` — the bound on ONE operator-supplied shell command a
+//           step runs (`mods.gate`'s `test_command`, `procedural.shell`),
+//           written VISIBLY by `init` at its 600s default like its
+//           `model_load_timeout_seconds` sibling, because unlike a cap
+//           whose absence is a real behavior this one always has a value.
+//           `Option<u64>`, lenient-on-read: an older binary ignores it and
+//           runs unbounded, exactly as it did before.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.20";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -297,6 +305,14 @@ pub struct RuntimeBehaviorConfig {
     /// expiry and surfaces a typed timeout naming the phase — a wrong model
     /// id can no longer hang a dispatch until the workflow's outer kill.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub model_load_timeout_seconds: Option<u64>,
+    /// (#2310/#2361, swarm finding S4-4) Bound on ONE operator-supplied
+    /// shell command a step runs — `mods.gate`'s `test_command` and
+    /// `procedural.shell`'s `command`. The child is spawned in its own
+    /// process group, polled, and killed (the whole group) at expiry, so a
+    /// hung suite can no longer pin a mission open with no way to interrupt
+    /// it. Sibling of `model_load_timeout_seconds`, which bounds a host
+    /// model load the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub step_command_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens: Option<u32>,
     /// (#1221) Per-CALL completion-token cap (reasoning + content of one
@@ -999,6 +1015,7 @@ impl DarkmuxConfig {
             runtime: Some(RuntimeBehaviorConfig {
                 inactivity_timeout_seconds: Some(600),
                 model_load_timeout_seconds: Some(600),
+                step_command_timeout_seconds: Some(600),
                 max_turns: None,
                 max_tokens: None,
                 max_tokens_per_call: None,

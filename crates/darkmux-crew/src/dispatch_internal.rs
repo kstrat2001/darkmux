@@ -6867,6 +6867,13 @@ impl TailerState {
                 phase_id: self.phase_id.clone(),
                 step_id: self.step_id.clone(),
             },
+            // (#2361) The HOST-known workspace source id, off the SAME
+            // launcher `context` the finding record's own mapping reads:
+            // the kit left the container in `/workspace/<source>/…`
+            // coordinates, and `mods.gate` applies it inside a copy of the
+            // source checkout, whose paths are repo-relative. A dispatch
+            // whose launcher named no source is not mapped at all.
+            crate::findings::source_id_of(self.record_context.as_ref()).as_deref(),
             warnings,
         ) {
             eprintln!("[darkmux] warning: could not write mod: {e:#}");
