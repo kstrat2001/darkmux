@@ -8,7 +8,6 @@ import {
   PHASE_LABEL_W,
   BAND_PAD,
   drawnEdges,
-  fmtElapsed,
   fmtModel,
   fmtTok,
   foldFlowRecords,
@@ -461,12 +460,6 @@ describe("formatting helpers", () => {
     expect(tsToMs("2026-08-19T00:00:00Z")).toBe(Date.parse("2026-08-19T00:00:00Z"));
     expect(tsToMs(undefined)).toBe(0);
     expect(tsToMs("not a date")).toBe(0);
-  });
-
-  it("fmtElapsed renders m:ss, and h:mm:ss past an hour", () => {
-    expect(fmtElapsed(0)).toBe("0:00");
-    expect(fmtElapsed(65_000)).toBe("1:05");
-    expect(fmtElapsed(3_661_000)).toBe("1:01:01");
   });
 
   it("hhmmss renders a local HH:MM:SS clock, empty for an unparseable ts", () => {

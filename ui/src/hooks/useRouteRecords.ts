@@ -100,8 +100,24 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
   // daemon that is not there for `/flow-session/<id>` (a 404 on every
   // dispatch-row tap of the demo). The file already carries every session
   // its `demo-runs.json` lists; there is nothing to fetch.
+  // (U4-1) …and EVERY OTHER route on a static build reads it too, not just
+  // those two. Measured on the served demo: `#lens=fleet` showed "50 of 6092
+  // events" at rest while `#lens=runs`/`machine`/`console` showed "0 EVENTS"
+  // on the same load — and rewinding made the count appear, so the records
+  // had been there all along. The asymmetry was accidental: on a static build
+  // `#lens=fleet` resolves to the PLAYBACK route (`route.ts`'s static branch),
+  // which took the branch below; an explicitly-named lens kept its own route
+  // kind and fell through to `flowWindow.data`, which is empty by
+  // construction on a daemon-less build (`useFlowWindow`'s queries are
+  // `enabled: daemonBacked`). So three of the four lenses reported an empty
+  // day for a day the page had fully loaded.
+  //
+  // One rule now, the same one `useDay` already follows: a static build has
+  // ONE committed file and it is the answer on EVERY route (sliced per
+  // session on a dispatch route, whole otherwise). Costs no extra request —
+  // `useDay`'s static query is one shared, `staleTime: Infinity` download.
   const source = getSource();
-  const flowSrc = route.kind === "playback" || route.kind === "dispatch" ? source.flow : null;
+  const flowSrc = source.kind === "static" ? source.flow : null;
   // (#2086) The loaded day comes from ONE hook now; on a static build this
   // is the committed file (any route), on a daemon playback `/flow/<date>`.
   const day = useDay(route.kind === "playback" ? route.date : null);

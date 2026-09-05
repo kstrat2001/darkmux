@@ -54,7 +54,7 @@
  *   reads the `flowTail` cache slot that mount writes. The header badge is
  *   the liveness indicator; this lens paints no pill.
  */
-import { clkhm } from "../../lib/format";
+import { clkhm, fmtElapsed } from "../../lib/format";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
@@ -78,7 +78,6 @@ import {
   type MetricsMap,
   type MissionGraph,
   type StepHeaderField,
-  fmtElapsed,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import type { FlowRecord } from "../../types/handwritten";

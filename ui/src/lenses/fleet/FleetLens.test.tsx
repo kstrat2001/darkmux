@@ -183,6 +183,45 @@ describe("FleetLens", () => {
     expect(tile.querySelector(".savnum")!.textContent).toBe("0");
   });
 
+  /** (U5-1) The gap the `historical` test below could not see: `App.tsx`
+   * renders `<FleetLens />` with NO props, so `historical` sits at its
+   * default `false` and the three live-only endpoints fired on the STATIC
+   * demo — measured on the served build, `#lens=fleet` produced 404s for
+   * `/fleet/machines/live`, `/fleet/sessions/live` and `/machine/specs`
+   * plus their console errors. The prop describes the CALLER's intent (a
+   * replay); only the BUILD can answer "is there a daemon at all" — the
+   * #1801 rule `MachineLens`/`useFlowWindow`/`route.ts::isLiveRoute`
+   * already follow. Rendered here exactly as `App.tsx` renders it: propless. */
+  it("(U5-1) on a static build the propless FleetLens App renders never calls a live-only endpoint", async () => {
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-flow-src";
+    meta.content = "./demo-flow.jsonl";
+    document.head.appendChild(meta);
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        seen.push(String(url));
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    try {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={queryClient}>
+          <FleetLens />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(document.querySelector(".savrow")).not.toBeNull());
+      // Give every gated query a chance to fire before asserting none did
+      // (a real timer — `vi.useFakeTimers` above fakes `Date` only).
+      await new Promise((r) => setTimeout(r, 50));
+      expect(seen.filter((p) => p === "/fleet/machines/live" || p === "/fleet/sessions/live" || p === "/machine/specs")).toEqual([]);
+    } finally {
+      document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
+    }
+  });
+
   it("(#2067) on a static build the card's hardware line comes from the committed fleet snapshot, never from a daemon route", async () => {
     for (const [name, content] of [
       ["darkmux-flow-src", "./demo-flow.jsonl"],

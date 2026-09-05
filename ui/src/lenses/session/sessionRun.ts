@@ -42,11 +42,19 @@
  * `nowMs` here is the MAX ts across the fetched records, not wall-clock.
  * Verified against the golden: the session's own `frozen_clock_ms` capture
  * timestamp is HOURS after the session's last record — using it instead of
- * `tMax` would NOT reproduce "1071:54 so far".
+ * `tMax` would NOT reproduce "17:51:54 so far".
+ *
+ * (U3-7/U5-2) That golden line READ "1071:54 so far" until this packet —
+ * legacy's `fmt()` had no hour rollover, and this corpus's run is 17h51m.
+ * The golden was rebaselined by hand (`tests/parity/README.md`: a golden
+ * change is a spec change, made on purpose in a reviewed diff) because the
+ * legacy rendering is the defect: 1071 minutes is not a duration a reader
+ * can hold. Sub-hour values are byte-identical to legacy, so no other
+ * golden moves — asserted directly in `lib/format.test.ts`.
  */
 
 import { T, dispatchErrored, dispatchKilled, statusLabel, computeTMax } from "../../lib/flow";
-import { fmtDuration, clk, fmtC } from "../../lib/format";
+import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 
@@ -423,7 +431,9 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
         ? T(close.ts) - startTs
         : NaN;
 
-  const wallBase = done ? fmtDuration(runWallMs) : `${fmtDuration(nowMs - startTs)} so far`;
+  // (U3-7/U5-2) `fmtElapsed`, not the retired `fmtDuration`: a dispatch
+  // that runs past an hour used to read "75:23" here.
+  const wallBase = done ? fmtElapsed(runWallMs) : `${fmtElapsed(nowMs - startTs)} so far`;
   const exitCode = (c?.payload as DispatchCompletePayload | undefined)?.exit_code;
   const wallLoud =
     done && c && dispatchErrored(c)
@@ -457,7 +467,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // one quantity, so they read from one source — deriving it twice is how
   // they end up disagreeing by a second at a rounding boundary. The two
   // CLOCK stamps stay record-derived: they are timestamps, not a duration.
-  const briefTiming = `${clk(startTs)}${done ? ` → ${clk(T(close!.ts))} (${fmtDuration(runWallMs)})` : " · running"}`;
+  const briefTiming = `${clk(startTs)}${done ? ` → ${clk(T(close!.ts))} (${fmtElapsed(runWallMs)})` : " · running"}`;
   const RUNTIME_LABEL: Record<string, string> = {
     internal: "internal container",
     direct: "direct client (hosted · no container)",

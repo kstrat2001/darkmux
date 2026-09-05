@@ -228,7 +228,12 @@ function SavingsHero({
  */
 function FleetCoverageNotice({ historical = false }: { historical?: boolean }) {
   // A replay has no live coverage to report — see useFleetCoverage's note.
-  const coverage = useFleetCoverage(!historical);
+  // (U5-1) …and a daemon-less build has no coverage endpoint at all. This
+  // hook SHARES `queryKeys.fleetMachinesLive` with `useLiveMachines`, so
+  // leaving it enabled would re-open the very request the lens below just
+  // gated off — one enabled observer of a shared key is enough to make the
+  // poll happen (the trap `FleetLens`'s own `liveMachines` comment records).
+  const coverage = useFleetCoverage(!historical && getSource().kind === "daemon");
   const fleet = coverage?.sources?.fleet;
   if (!fleet || fleet.state === "ok" || fleet.state === "off") return null;
   const stale = fleet.state === "stale";
@@ -309,6 +314,25 @@ export function FleetLens({
 } = {}) {
   const nowMs = Date.now();
   const liveMode = !historical;
+  /** (U5-1) Whether a daemon exists to ASK — a different question from
+   * `liveMode`, which is the caller's intent ("this mount is a replay").
+   * `App.tsx` renders `<FleetLens />` propless, so `historical` defaults to
+   * `false` on the daemon-less static demo too, and the three live-only
+   * endpoints below fired there: measured on the served build, `#lens=fleet`
+   * produced 404s for `/fleet/machines/live`, `/fleet/sessions/live` and
+   * `/machine/specs` plus their console errors. Gating on the BUILD is the
+   * #1801 rule `MachineLens`, `useFlowWindow` and `route.ts::isLiveRoute`
+   * already follow: a daemon-less build is never live, on any lens, whatever
+   * a caller passed.
+   *
+   * Deliberately a SEPARATE constant from `liveMode` rather than folded into
+   * it: `liveMode` also drives DISPLAY (the hero's "last Nh" eyebrow, the
+   * activity-window control, `liveSessionSet`'s live-fallback heuristic), and
+   * those already render correctly on the demo. This changes what is
+   * REQUESTED and nothing else — every one of these three endpoints 404s on
+   * a static build today, so their gated-off results were already the empty
+   * values the consumers below receive. */
+  const livePolling = liveMode && getSource().kind === "daemon";
   const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
 
   const liveWindow = useFlowWindow(nowMs);
@@ -330,8 +354,8 @@ export function FleetLens({
   // exactly such an observer. Gating the fetch AND the consumer is what makes
   // the property true in the composed app rather than only in this lens's own
   // isolated test.
-  const liveMachines = useLiveMachines(liveMode);
-  const liveSessionIds = useLiveSessionIds(liveMode);
+  const liveMachines = useLiveMachines(livePolling);
+  const liveSessionIds = useLiveSessionIds(livePolling);
   // (#2067) A static build cannot poll presence, so its cards' hardware line
   // comes from the committed fleet snapshot instead — spec lookup ONLY;
   // presence at the playhead still derives from the records.
@@ -352,11 +376,11 @@ export function FleetLens({
   // the race at its source — the request never happens — instead of waiting
   // harder for a value that should not be read.
   const specsQuery = useQuery({
-    enabled: liveMode,
+    enabled: livePolling,
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
   });
-  const specs = liveMode && specsQuery.data?.ok ? specsQuery.data.data : null;
+  const specs = livePolling && specsQuery.data?.ok ? specsQuery.data.data : null;
 
 
   // (#1869) The token hero + hybrid note are "as of the playhead" — legacy's

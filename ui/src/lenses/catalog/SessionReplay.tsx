@@ -136,7 +136,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // with a clock-relative assertion.
   // A run with no terminal record is not automatically LIVE. One that died in
   // January has no `dispatch.complete` either, and ticking its counter up to
-  // now would read `1071:54 so far` and climbing — abandonment rendered as
+  // now would read `17:51:54 so far` and climbing — abandonment rendered as
   // liveness. The host watchdog hard-kills a dispatch after
   // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (600s by default), so a run that has
   // emitted nothing for longer than that CANNOT still be running.

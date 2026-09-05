@@ -3,7 +3,7 @@ import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-libra
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
 import { clkhm } from "./lib/format";
-import { fmtElapsed } from "./lenses/mission/graph";
+import { fmtElapsed } from "./lib/format";
 
 /**
  * Regression test for the `useSyncExternalStore` snapshot-stability bug
@@ -956,6 +956,55 @@ describe("App", () => {
   // route per hash string, and a hash parsed while the static meta is present
   // resolves to the playback route; a later test on the same hash would
   // inherit it. In production the build flag never changes at runtime.
+  /** (U4-1) Measured on the served demo: `#lens=fleet` showed "50 of 6092
+   * events" at rest while `#lens=runs`/`machine`/`console` all showed
+   * "0 EVENTS" — and clicking rewind made the count appear, so the records
+   * were loaded the whole time. The mechanism: on a static build `#lens=fleet`
+   * canonicalizes to the PLAYBACK route, whose `useRouteRecords` branch reads
+   * the committed file; every explicitly-named lens keeps its own route kind
+   * and fell through to `flowWindow.data`, which is empty by construction on
+   * a daemon-less build (`useFlowWindow`'s queries are `enabled: daemonBacked`).
+   * The at-rest event set is the same day's file on every static route. */
+  it("(U4-1) a static build's runs lens shows the committed day's events at rest, like fleet does", async () => {
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-flow-src";
+    meta.content = "./demo-flow.jsonl";
+    document.head.appendChild(meta);
+    window.location.hash = "#lens=runs&u4";
+    const jsonl = [
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-08-26T10:01:00.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: { total_tokens: 10 } },
+    ]
+      .map((r) => JSON.stringify(r))
+      .join("\n");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        Promise.resolve(
+          String(url) === "./demo-flow.jsonl"
+            ? new Response(jsonl, { status: 200 })
+            : // The runs/lab-runs fixtures the RUNS lens itself reads — an
+              // object with a `runs` array, not a bare `[]` (which crashes the
+              // board into its error boundary and would leave this test
+              // asserting the log from behind a broken lens).
+              new Response(JSON.stringify({ runs: [] }), { status: 200 }),
+        ),
+      ),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    try {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <App />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
+    } finally {
+      meta.remove();
+      window.location.hash = "";
+    }
+  });
+
   it("(#2072) a static build never says 'waiting for a machine' — there is no daemon to wait for", async () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-flow-src";

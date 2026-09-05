@@ -24,6 +24,7 @@
  * step reducers work the same way).
  */
 import type { FlowRecord } from "../../types/handwritten";
+import { fmtElapsed } from "../../lib/format";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
 
@@ -721,7 +722,9 @@ export function recordInMission(rec: FlowRecord, idx: GraphIndex, missionId: str
   return false;
 }
 
-// ─── formatting (mission-graph.html: fmtTok, fmtModel, hhmmss, fmtElapsed) ──
+// ─── formatting (mission-graph.html: fmtTok, fmtModel, hhmmss) ─────────────
+// (U3-7/U5-2) `fmtElapsed` moved to `lib/format.ts` — one duration
+// formatter for the whole app; see its own doc.
 
 export function fmtTok(n: number | null | undefined): string {
   if (n == null) return "0";
@@ -742,16 +745,6 @@ export function hhmmss(ts: string | number): string {
   if (isNaN(d.getTime())) return "";
   const p = (x: number) => String(x).padStart(2, "0");
   return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
-}
-
-export function fmtElapsed(ms: number): string {
-  const clamped = !ms || ms < 0 ? 0 : ms;
-  const s = Math.floor(clamped / 1000);
-  const m = Math.floor(s / 60);
-  const hr = Math.floor(m / 60);
-  const ss = String(s % 60).padStart(2, "0");
-  if (hr > 0) return hr + ":" + String(m % 60).padStart(2, "0") + ":" + ss;
-  return m + ":" + ss;
 }
 
 // ─── step meter (mission-graph.html: stepStartMs, stepMeterFor,

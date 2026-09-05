@@ -7,7 +7,8 @@
  * legacy page's own "one shared block, two callers" design.
  */
 import type { ReactNode } from "react";
-import { fmtElapsed, fmtModel, fmtTok, stepLead, stepSeat, type GraphStep, type StepMeter } from "./graph";
+import { fmtModel, fmtTok, stepLead, stepSeat, type GraphStep, type StepMeter } from "./graph";
+import { fmtElapsed } from "../../lib/format";
 
 /** `tools` is OPTIONAL here (unlike {@link StepMeter}'s own required field)
  * so this same renderer also takes a task-level {@link

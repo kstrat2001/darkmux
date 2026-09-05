@@ -1,6 +1,6 @@
 import { speedLabel } from "../../hooks/usePlaybackTransport";
 import { clkhm, clkrange } from "../../lib/format";
-import { fmtElapsed } from "../mission/graph";
+import { fmtElapsed } from "../../lib/format";
 
 /**
  * The playback transport — restored from the legacy viewer (#1869;

@@ -95,3 +95,27 @@ test('the follow toggle LOOKS different in each state, not just class-different'
   expect(off.color).not.toBe(on.color);
   expect(off.border).not.toBe(on.border);
 });
+
+// (U2-2) The detail pane's PAYLOAD key column, measured for the same reason
+// as everything else in this file: `.rv__key` was a fixed 116px column with
+// `text-overflow: ellipsis`, set before `--fs-scale: 1.18` (#2002) grew every
+// glyph in the panel — so at 1456 a real field name rendered as
+// "cpu speed lim…", hiding WHICH field a number belongs to. The phone rule
+// below it already stacked label over value; only the desktop rule was left
+// behind. Every unit test stayed green: the class name was always right.
+test('(U2-2) a long payload field name wraps rather than being clipped', async ({ page }) => {
+  await openLog(page);
+  await page.locator('.eventlog__rec').first().click();
+  await expect(page.locator('.rv__key').first()).toBeVisible();
+
+  // The REAL element, its real stylesheet — only the text is substituted, so
+  // this measures the column rather than whatever key this fixture happens
+  // to carry. `cpu speed limit pct` is the name from the finding itself.
+  const clipped = await page.evaluate(() => {
+    const k = document.querySelector('.rv__key');
+    k.textContent = 'cpu speed limit pct';
+    // +1 for sub-pixel rounding; more than that is a real ellipsis.
+    return k.scrollWidth > k.clientWidth + 1;
+  });
+  expect(clipped, 'the payload key column truncated a real field name').toBe(false);
+});
