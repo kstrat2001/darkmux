@@ -47,9 +47,30 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// The record's own schema version. Bumped only when the shape below changes;
-/// readers stay lenient (unknown fields ride in `extras`).
-pub const MOD_SCHEMA_VERSION: &str = "1";
+/// The record's own schema version. Bumped when the shape below GAINS or
+/// changes a field; readers stay lenient in both directions (every added
+/// field is `Option`/`default`, and anything a reader does not know rides
+/// in `extras`), so a version here is a fact a reader may act on, never a
+/// gate it must pass.
+///
+/// **`"1"` → `"2"` (#2310 swarm F / S2-2b).** The rule above said "bumped
+/// when the shape changes" and the shape had changed four times without
+/// one: `kit_kind` (#2310 P4b/P4c), `source` (#2361), `gate` and
+/// `gate_skipped_reason` (#2310 P4c-2b). Each was additive and each doc
+/// comment said "so the schema version does not move" — which is a
+/// different rule than the one the constant declared, and two rules for
+/// one number is how a version stops meaning anything. Resolved in the
+/// direction that keeps the number honest: the shape moved, so the number
+/// moves, and the rule is restated as "gains or changes a field".
+///
+/// The format has no minor slot on purpose — leniency, not the version, is
+/// what makes an old reader work. A `"1"` record still reads: the four
+/// fields above are `Option`/`default`, so a pre-#2310 mod comes back with
+/// `kit_kind: None`, `source: None`, `gate: None`,
+/// `gate_skipped_reason: None`, which is exactly what those absences mean
+/// ("no hint", "already in repo coordinates", "not gated"). Pinned by
+/// `a_schema_version_1_record_still_reads_with_every_added_field_absent`.
+pub const MOD_SCHEMA_VERSION: &str = "2";
 
 /// The runtime tool whose accepted calls become mods. Its finding sibling
 /// needs a LIST (the pre-2026-09-03 `report_finding` is in the append-only
@@ -180,6 +201,27 @@ pub struct GateOutcome {
 }
 
 /// One mod, as stored at `<mods dir>/<key>/mod.json`.
+///
+/// **The stored shape, at [`MOD_SCHEMA_VERSION`] `"2"`** (#2310 swarm F /
+/// S2-2b — the doc used to stop at the `"1"` set, so three surfaces gained
+/// fields nothing here named):
+///
+/// - `key`, `ts`, `by`, `for`, `kit`, `kit_looks_json`, `attachments`,
+///   `context`, `warnings`, `schema_version` — the `"1"` set.
+/// - `mission_id` / `phase_id` / `step_id` — the dispatch that proposed it.
+/// - `kit_kind` — an optional hint at the kit's SHAPE (`"unified-diff"`,
+///   or absent). Still opaque by contract; it exists so a consumer that
+///   chooses to interpret a kit has a signal to key on rather than
+///   sniffing bytes.
+/// - `source` (#2361) — the workspace source id whose `/workspace/<source>/`
+///   prefix was mapped off this kit's headers. Absent when nothing was
+///   mapped.
+/// - `gate` / `gate_skipped_reason` (#2310 P4c-2b) — the confirmation
+///   gate's outcome, or why none ran. Mutually exclusive; `record_gate`
+///   refuses to set both.
+///
+/// Every one of those is `Option`/`default` on read, which is what makes a
+/// `"1"` record still parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModRecord {
     /// The minted key — the address every other surface uses.
@@ -1493,6 +1535,79 @@ mod tests {
         assert_eq!(back.context, rec.context);
         assert_eq!(back.by, "sonnet");
         assert_eq!(back.schema_version, MOD_SCHEMA_VERSION);
+    }
+
+    /// (#2310 swarm F / S2-2b) The leniency the `"1"` → `"2"` bump leans
+    /// on, proven against a record written the way a pre-#2310 producer
+    /// wrote one: `schema_version: "1"` and NONE of the four fields the
+    /// shape has gained since. It must read back whole, with each added
+    /// field absent — because absent is a real value for every one of
+    /// them, not a hole.
+    #[test]
+    fn a_schema_version_1_record_still_reads_with_every_added_field_absent() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let key = "sess-old-01";
+        std::fs::create_dir_all(mods.join(key)).unwrap();
+        // Written by hand, not by `create` — a fixture built from today's
+        // struct would carry today's fields and prove nothing.
+        std::fs::write(
+            mods.join(key).join("mod.json"),
+            r#"{
+              "key": "sess-old-01",
+              "ts": "2026-08-01T00:00:00Z",
+              "by": "sonnet",
+              "for": ["sess-a/1"],
+              "kit": "--- a/x\n+++ b/x\n",
+              "kit_looks_json": false,
+              "attachments": [],
+              "context": { "findings": [] },
+              "schema_version": "1"
+            }"#,
+        )
+        .unwrap();
+
+        let back = load_at(&mods, key).unwrap().expect("a schema `1` record still loads");
+        assert_eq!(back.schema_version, "1", "the record keeps the version it was written at");
+        assert_eq!(back.by, "sonnet");
+        assert_eq!(back.r#for, vec!["sess-a/1"]);
+        assert!(back.kit_kind.is_none(), "no hint");
+        assert!(back.source.is_none(), "already in repo coordinates");
+        assert!(back.gate.is_none(), "never gated");
+        assert!(back.gate_skipped_reason.is_none(), "and no skip was recorded either");
+        assert!(back.mission_id.is_none() && back.phase_id.is_none() && back.step_id.is_none());
+        assert!(back.extras.is_empty(), "nothing in the `1` shape is unknown to this reader");
+    }
+
+    /// (#2310 swarm F / S2-2b) The forward direction: a record from a
+    /// writer NEWER than this binary keeps its unknown fields in `extras`
+    /// rather than failing the whole parse.
+    #[test]
+    fn a_future_schema_record_reads_and_keeps_its_unknown_fields() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let key = "sess-new-01";
+        std::fs::create_dir_all(mods.join(key)).unwrap();
+        std::fs::write(
+            mods.join(key).join("mod.json"),
+            r#"{
+              "key": "sess-new-01",
+              "ts": "2026-09-05T00:00:00Z",
+              "by": "sonnet",
+              "for": [],
+              "kit": "x",
+              "kit_looks_json": false,
+              "attachments": [],
+              "context": { "findings": [] },
+              "a_field_from_schema_3": { "n": 1 },
+              "schema_version": "3"
+            }"#,
+        )
+        .unwrap();
+
+        let back = load_at(&mods, key).unwrap().expect("a newer record still loads");
+        assert_eq!(back.schema_version, "3");
+        assert_eq!(back.extras.get("a_field_from_schema_3"), Some(&serde_json::json!({ "n": 1 })));
     }
 
     #[test]

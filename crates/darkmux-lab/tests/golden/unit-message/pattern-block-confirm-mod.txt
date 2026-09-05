@@ -1,0 +1,12 @@
+<pattern name="swallowed-error">
+Title: A failure is caught or discarded and nothing records that it happened
+
+Report a match when: The site is a `catch` clause, a `.catch(...)` handler, or a `void somePromise()` statement, AND the failure that reaches it is neither rethrown, nor returned as an error value the caller checks, nor logged, nor counted, nor recorded anywhere the surrounding lines show. The operation looks like it succeeded to everything downstream.
+
+Do NOT report when: The handler rethrows or wraps and throws. The handler logs (any logger call, `console.*`, a metrics call, an error reporter). The handler returns or resolves a value that plainly encodes the failure (`null`/`undefined`/`false`/an error object) AND the immediate caller visibly checks it. A comment in the surrounding lines you were given says why ignoring this failure is safe. Test code, generated code, or a `.d.ts`.
+
+What evidence to cite: The `catch`/`.catch`/`void` line, copied verbatim. `line` is where it appears.
+
+How to explain why: Say what operation failed silently and what downstream code assumes about it. Do not speculate past what the surrounding lines you were given show; if the consequence is outside them, say 'consequence not visible in the surrounding lines you were given'.
+</pattern>
+

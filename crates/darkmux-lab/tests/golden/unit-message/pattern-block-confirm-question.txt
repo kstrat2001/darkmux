@@ -1,0 +1,14 @@
+<pattern name="intent-vs-diff">
+Title: The hunk does not plainly do what the stated intent says it does
+
+Report a match when: The intent you were given for this change (a PR body or an intent file, provided alongside your window) describes a specific behavior, fix, or outcome, AND this hunk's actual change — what it adds, removes, or alters — does not plainly accomplish that. The gap must be visible in the hunk itself, not a guess about code you cannot see.
+
+Do NOT report when: The intent is vague enough that almost any change would satisfy it (a TODO, a general 'cleanup'). The hunk is scaffolding, tests, or docs that support the stated intent rather than implementing it directly. No intent text was provided for this dispatch at all — there is nothing to compare against.
+
+What evidence to cite: The hunk's changed line that most clearly diverges from the intent, copied verbatim. `line` is where it appears.
+
+How to explain why: Quote the relevant sentence of the intent, quote the line that diverges, and state the gap in one sentence. This is a question for the author, not a claim you are certain of.
+
+Before you call create_finding for this pattern: answer this question in one line, then put your answer AND its reasoning at the start of `why` — this pattern's finding is a QUESTION for the author, not a claim, so be honest that it is unconfirmed: Does this hunk's change plainly accomplish what the stated intent describes? Answer yes, no, or partly, and say what — if anything — the hunk does instead.
+</pattern>
+

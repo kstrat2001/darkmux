@@ -1309,7 +1309,14 @@ pub fn launch(
                     if let Some(pe) = &producer_error {
                         payload["reason"] = serde_json::json!("producer_errored");
                         payload["producer_step"] = serde_json::json!(pe.step_id);
-                        payload["producer_status"] = serde_json::json!(format!("{:?}", pe.status));
+                        // (#2310 swarm F / S2-2) The STABLE mapping, never
+                        // `format!("{:?}", …)`: a `Debug` rendering on the
+                        // wire couples the stream to a derive no schema
+                        // governs, and disagreed with the same value as
+                        // persisted on the step record (`"Error"` vs
+                        // `"error"`). FLOW_SCHEMA 1.40.0 documents the
+                        // vocabulary; `NodeStatus::as_str` owns it.
+                        payload["producer_status"] = serde_json::json!(pe.status.as_str());
                     } else if event.minted.is_empty() {
                         payload["reason"] = serde_json::json!("grew_nothing");
                     }
@@ -1861,7 +1868,12 @@ fn grow_phase(
                     phase: real_phase_id.to_string(),
                     task_template: task_cfg.id.clone(),
                     from: spec.from.clone(),
-                    source: String::new(),
+                    // (#2310 swarm F / S2-2) ONE meaning in every arm: the
+                    // producing STEP's id. This arm used to write `""` (a
+                    // third meaning alongside "an absolute host path" and
+                    // "the step's own output"), which read as "no source"
+                    // on the one growth that most needed to name one.
+                    source: last_step_id.clone(),
                     items: 0,
                     minted: Vec::new(),
                 },
@@ -1931,9 +1943,20 @@ fn grow_phase(
                 phase: real_phase_id.to_string(),
                 task_template: task_cfg.id.clone(),
                 from: spec.from.clone(),
-                // (#2301) The RESOLVED name, not the raw output string —
-                // a wrapped producer's output is a `{"ref": …}` pointer.
-                source: whence,
+                // (#2310 swarm F / S2-2) The producing STEP's id — one
+                // meaning, on the fleet stream, forever. #2301 put the
+                // RESOLVED artifact name here (`whence`), which is an
+                // ABSOLUTE host path whenever the producer wrote a file
+                // and the prose `"the step's own output"` when it did
+                // not: two more meanings, one of which leaks a host
+                // filesystem layout onto a stream that crosses machines
+                // (contract 3, the lab/fleet boundary). The artifact
+                // itself has not moved — it is this step's own `output`,
+                // readable from the run's own step record — so nothing is
+                // lost by naming the step instead of the path. `whence`
+                // stays the context string for the error paths above,
+                // where it is local and where a full path is the point.
+                source: last_step_id.clone(),
                 items: items.len(),
                 minted: grown_tasks.iter().map(|t| t.id.clone()).collect(),
             },
@@ -3714,10 +3737,40 @@ fn build_envelope(
         .filter(|s| s.status == NodeStatus::Complete)
         .map(|s| s.id.as_str())
         .collect();
+    // (#2310 swarm F, from the C2 post-merge review) Declared work that
+    // never ran. A step the CONFIG asked for and the run did not do — a
+    // cascade off an errored dependency, a `run_on` whose condition could
+    // not be met, a task the phase-exit sweep found unreachable. It is not
+    // an error (nothing failed) and it is emphatically not a success, and
+    // before this it was neither: it fell out of BOTH vectors, so a run
+    // could report `clean` with `0 errored` while its own phase records
+    // read `abandoned`.
+    //
+    // The filter is "not terminal-with-work" rather than
+    // `== NodeStatus::Abandoned` on purpose, and it is the SAME rule
+    // `derive_phase_outcomes` already applies one level up ("any step left
+    // non-terminal → Abandoned"). Two statuses reach the end of a run
+    // meaning the same thing: `Abandoned` (the sweep or the cascade got to
+    // it) and `Planned`/`Running` (nothing did, and the #1504 finalize
+    // backstop will abandon it on disk moments later, AFTER this envelope
+    // is built). Counting only the first left the run-level status
+    // disagreeing with the per-phase outcomes in the same envelope — which
+    // is exactly the drift the C2 invariant test exists to catch, arriving
+    // through the run-level door instead.
+    let never_ran: Vec<&str> = steps
+        .values()
+        .filter(|s| !matches!(s.status, NodeStatus::Complete | NodeStatus::Error))
+        .map(|s| s.id.as_str())
+        .collect();
 
-    let status = if errored.is_empty() {
+    let status = if errored.is_empty() && never_ran.is_empty() {
         MissionOutcomeStatus::Clean
-    } else if completed.is_empty() {
+    } else if completed.is_empty() && !errored.is_empty() {
+        // Nothing completed AND something failed — the run is an Error,
+        // the pre-existing row. A run with no error whose work simply
+        // never happened is Degraded rather than Error on purpose:
+        // nothing failed, so `Error` would name a failure that has no
+        // step to point at.
         MissionOutcomeStatus::Error
     } else {
         MissionOutcomeStatus::Degraded
@@ -3745,12 +3798,25 @@ fn build_envelope(
     let mut envelope = MissionEnvelope::new(mission_id, status, &[]);
     envelope.phases = derive_phase_outcomes(config, real_phase_ids, tasks, steps);
     envelope.reason = reason;
-    if !errored.is_empty() && !completed.is_empty() {
-        envelope.warnings = vec![format!("{} of {} step(s) errored during launch execution", errored.len(), steps.len())];
+    // (#2310 swarm F) One line, counting BOTH ways a declared step failed
+    // to produce work. Emitted whenever either count is non-zero — the
+    // old guard also required a completed step, so a run that errored
+    // everything carried no warning at all.
+    if !errored.is_empty() || !never_ran.is_empty() {
+        envelope.warnings = vec![format!(
+            "{} of {} step(s) errored and {} never ran (abandoned) during launch execution",
+            errored.len(),
+            steps.len(),
+            never_ran.len(),
+        )];
     }
     envelope.payload = serde_json::json!({
         "completed_steps": completed,
         "errored_steps": errored,
+        // Named for what a reader of the mission board sees on disk: every
+        // one of these is `abandoned` by the time the finalize backstop is
+        // done, whether the sweep or the backstop got there.
+        "abandoned_steps": never_ran,
     });
     envelope
 }
@@ -3839,9 +3905,16 @@ fn reconcile_and_finalize_on_error(
 fn print_run_summary(mission_id: &str, steps: &BTreeMap<String, crew::types::Step>) {
     let complete = steps.values().filter(|s| s.status == NodeStatus::Complete).count();
     let errored = steps.values().filter(|s| s.status == NodeStatus::Error).count();
+    // (#2310 swarm F) The summary counts what NEVER RAN too — a run whose
+    // declared steps were abandoned used to print "N complete, 0 errored"
+    // and read as a clean run on the operator's own terminal.
+    let abandoned =
+        steps.values().filter(|s| !matches!(s.status, NodeStatus::Complete | NodeStatus::Error)).count();
     println!(
         "\n{}",
-        style::header(&format!("▶ mission `{mission_id}` finished — {complete} step(s) complete, {errored} errored"))
+        style::header(&format!(
+            "▶ mission `{mission_id}` finished — {complete} step(s) complete, {errored} errored, {abandoned} never ran"
+        ))
     );
     println!("  {}", style::dim(&format!("darkmux mission status   (or) darkmux mission debrief {mission_id}")));
 }

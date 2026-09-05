@@ -1,0 +1,14 @@
+<pattern name="shared-symbol-callers">
+Title: A shared function or type's signature or behavior changed
+
+Report a match when: This hunk changes the signature (parameters, return type), the default behavior, or the observable contract of a function, method, or type that is exported or otherwise visible outside its own file — a change a caller elsewhere in the tree could be relying on.
+
+Do NOT report when: The changed symbol is private to its own file/module and provably has no outside callers. The change is purely additive (a new optional parameter with a default, a new method) with no change to existing call shapes. Test code.
+
+What evidence to cite: The changed symbol's declaration line, copied verbatim. `line` is where it appears.
+
+How to explain why: Name the symbol and what changed about it (signature, return shape, default, or behavior), then say how many callers your search found and whether each still looks correct against the new shape.
+
+Before you call create_finding for this pattern: this pattern is confirmed by SEARCHING, not by reasoning alone. Run the `search` tool over the tree (not just the window you were given). Search the tree for every use of the symbol's own name (the exact identifier this hunk changed) outside the file it is declared in. For each hit, note the file and line. Then, in `why`, list every instance the search returned (file:line for each) before explaining the match — a finding for this pattern with no search results named in `why` is incomplete.
+</pattern>
+

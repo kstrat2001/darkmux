@@ -5862,6 +5862,29 @@ fn review_v2_real_launch_survives_a_plan_phase_error_and_still_delivers() {
             && r["payload"]["producer_step"].as_str().is_some_and(|s| s.contains("plan-swallowed-error"))),
         "expected a producer_errored mission.grow record naming the plan step: {grow_records:?}"
     );
+    // (#2310 swarm F / S2-2) `producer_status` is the STABLE lowercase
+    // `NodeStatus` vocabulary — the same strings a persisted `Step.status`
+    // carries — never a `Debug` rendering (`"Error"`), and `source` is the
+    // producing STEP's id, never an absolute host path on the fleet stream.
+    let errored_grow = grow_records
+        .iter()
+        .find(|r| r["payload"]["reason"] == serde_json::json!("producer_errored"))
+        .expect("a producer_errored mission.grow record");
+    let status = errored_grow["payload"]["producer_status"].as_str().unwrap_or("");
+    assert!(
+        matches!(status, "error" | "abandoned"),
+        "producer_status must be the stable lowercase NodeStatus string, got {status:?}: {errored_grow}"
+    );
+    let source = errored_grow["payload"]["source"].as_str().unwrap_or("");
+    assert_eq!(
+        source,
+        errored_grow["payload"]["producer_step"].as_str().unwrap_or(""),
+        "`source` names the producing step, the same id `producer_step` carries: {errored_grow}"
+    );
+    assert!(
+        !source.is_empty() && !source.starts_with('/'),
+        "`mission.grow.source` must never be an absolute host path (lab/fleet boundary): {errored_grow}"
+    );
 }
 
 #[test]
@@ -7077,10 +7100,17 @@ fn mission_launch_grows_one_task_per_plan_unit_with_provenance() {
     assert_eq!(grown[0]["from"], serde_json::json!("plan-task"));
     assert_eq!(grown[0]["task_template"], serde_json::json!("unit-task"));
     assert_eq!(grown[0]["items"], serde_json::json!(2));
-    // (#2301) `source_path` -> `source`, holding the RESOLVED name: a
-    // wrapped producer's output is a `{"ref": …}` pointer, so the raw
-    // output string stopped being a path.
-    assert_eq!(grown[0]["source"], serde_json::json!(plan_path.display().to_string()));
+    // (#2310 swarm F / S2-2) `source` is the PRODUCING STEP's id — one
+    // meaning on every arm, and never the absolute host path #2301 put
+    // here (this same struct rides the fleet stream as
+    // `mission.grow.source`). `plan_path` is still reachable: it is that
+    // step's own `output`.
+    let grown_source = grown[0]["source"].as_str().expect("`source` is a string");
+    assert!(
+        !grown_source.starts_with('/') && grown_source != plan_path.display().to_string(),
+        "`source` must be a step id, not a host path: {grown_source}"
+    );
+    assert!(grown_source.contains("plan-step"), "`source` names the producing STEP: {grown_source}");
     assert!(grown[0]["source_path"].is_null(), "the old key is renamed, not aliased");
     assert_eq!(grown[0]["minted"].as_array().unwrap().len(), 2);
 
@@ -7324,6 +7354,128 @@ fn probe_mission_and_phases(
         }
     }
     (dir, mission_id, mission, phases)
+}
+
+/// (#2310 swarm F, from the C2 post-merge review) A run whose declared
+/// work was ABANDONED — never ran, and never will — must not read
+/// "clean, 0 errored". `t-forward` sits in p1 and depends FORWARD on
+/// `t-late` in p2 with `run_on: ["error"]`; `t-late` completes, so
+/// `t-forward`'s condition can never be met and the phase-exit sweep
+/// abandons it. Nothing errors, so before this fix `build_envelope`
+/// reported `status: clean`, `errored_steps: []` and a summary line
+/// saying `1 step(s) complete, 0 errored` on a run that silently dropped
+/// half of what the config declared.
+fn forward_edge_fixture() -> (TempDir, TempDir) {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("forward-probe.json"),
+        r#"{
+        "id": "forward-probe",
+        "name": "Forward Probe",
+        "schema_version": "3.4",
+        "phases": [
+          {
+            "id": "p1",
+            "tasks": [{
+              "id": "t-forward",
+              "depends_on": ["t-late"],
+              "run_on": ["error"],
+              "steps": [{ "id": "s-forward", "kind": "procedural.noop", "config": {} }]
+            }]
+          },
+          {
+            "id": "p2",
+            "tasks": [{
+              "id": "t-late",
+              "steps": [{ "id": "s-late", "kind": "procedural.shell",
+                          "config": { "command": "echo late-ran" } }]
+            }]
+          }
+        ]
+    }"#,
+    )
+    .unwrap();
+    (home, flows)
+}
+
+#[test]
+fn an_abandoned_declared_step_makes_the_run_degraded_never_clean() {
+    let (home, flows) = forward_edge_fixture();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "forward-probe"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dir = one_mission_dir(&home);
+    let steps = probe_steps(&dir);
+
+    // Precondition — the fixture must actually produce the shape under
+    // test: one completed step, one ABANDONED step, nothing errored.
+    assert_eq!(steps["s-late"].0, "complete", "steps: {steps:#?}\n{stdout}");
+    assert_eq!(
+        steps["s-forward"].0, "abandoned",
+        "the forward edge's run_on can never be met, so its step must abandon: {steps:#?}\n{stdout}"
+    );
+    assert!(
+        steps.values().all(|(status, _)| status != "error"),
+        "the fixture must contain NO errored step, or it proves nothing: {steps:#?}"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(
+        envelope["status"],
+        serde_json::json!("degraded"),
+        "declared work that never ran is not a clean run: {envelope}"
+    );
+    let abandoned = envelope["payload"]["abandoned_steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the envelope must name its abandoned steps: {envelope}"));
+    assert!(
+        abandoned.iter().any(|v| v.as_str().is_some_and(|s| s.contains("s-forward"))),
+        "the abandoned step must be named: {envelope}"
+    );
+    let warnings = envelope["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings.iter().any(|w| w.as_str().is_some_and(|s| s.contains("never ran"))),
+        "the warning must count the steps that never ran: {envelope}"
+    );
+    assert!(
+        stdout.contains("1 never ran"),
+        "the run summary line must count what never ran, got:\n{stdout}"
+    );
+}
+
+/// The fail probe's own envelope: it abandons three steps (`s-after`,
+/// `s-dep`, `s-chain`) alongside its errored one, and every one of them
+/// must be counted rather than silently dropped from the tally.
+#[test]
+fn fail_probe_envelope_counts_its_abandoned_steps_too() {
+    let (home, flows) = fail_probe_fixture("true");
+    let _ = launch_fail_probe(&home, &flows);
+    let dir = one_mission_dir(&home);
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("envelope.json")).unwrap()).unwrap();
+    let abandoned: Vec<&str> = envelope["payload"]["abandoned_steps"]
+        .as_array()
+        .expect("abandoned_steps")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    for want in ["s-after", "s-dep", "s-chain"] {
+        assert!(
+            abandoned.iter().any(|id| id.contains(want)),
+            "`{want}` abandoned on disk but missing from the envelope: {envelope}"
+        );
+    }
+    assert_eq!(envelope["status"], serde_json::json!("degraded"), "{envelope}");
 }
 
 /// (#2310 fix-loop C1 / S4-2) A later phase's task that declares
