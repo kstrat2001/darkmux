@@ -1373,15 +1373,27 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
 // is the residency room — the `models[]` array, per-model residency, loaded
 // context sizes, every figure derived from an `lms` shell-out. The drawer
 // (desktop dialog and phone Machine tab alike) answers "what is this box
-// doing right now", which is the `load` block: cpu/gpu/mem/thermal/power,
-// sampled by the daemon's own host probe with zero model dispatches.
+// doing right now".
 //
-// Today that separation holds by construction — `useDaemonLoad` returns
-// `resources.load` and nothing else, and `machineStatsContent` never sees
-// `resources.models` at all. This test PINS it, because "by construction"
-// is one convenient `?? resources.models` away from being false, and the
-// failure would be invisible: a model row in the drawer looks like a
-// feature, not a boundary violation.
+// Stated precisely, because the drawer is NOT purely host-probe output and
+// an over-broad claim here would make the pin below read as stronger than it
+// is. What the drawer actually renders:
+//   · `resources.load` — cpu/gpu/mem/thermal/power, sampled by the daemon's
+//     own host probe with zero model dispatches (#1286 constraint 1)
+//   · `/machine/specs` identity — machine name, silicon, OS, total RAM
+//   · ONE lms-derived figure: `specs.ram_free_for_ai_bytes`, the "memory
+//     free for AI" row. It is an AGGREGATE the daemon computes — a single
+//     host-level byte count, naming no model — and it predates #2378. It is
+//     allowed, and it is why this pin bans per-model DATA rather than
+//     "anything an `lms` call ever touched".
+//
+// So the line held here is: no model identifier, no per-model context size,
+// no residency vocabulary. Today that holds by construction — `useDaemonLoad`
+// returns `resources.load` and nothing else, and `machineStatsContent` never
+// sees `resources.models` at all. This test PINS it, because "by
+// construction" is one convenient `?? resources.models` away from being
+// false, and the failure would be invisible: a model row in the drawer looks
+// like a feature, not a boundary violation.
 describe("MachineDrawer — host stats only, never lms-derived model data", () => {
   /** A payload carrying FOUR loaded models alongside the host load block —
    * the shape a real machine with residents actually returns. If the drawer
@@ -1457,6 +1469,39 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
     },
   };
 
+  /** A POPULATED `/machine/specs`, not `null`.
+   *
+   * Passing `specs={null}` made every specs-derived leak invisible to this
+   * pin: the drawer's identity block and its "memory free for AI" row read
+   * from `specs`, not from `resources`, so a future `specs.loaded_models`
+   * borrow would render a model identifier while the pin stayed green. This
+   * fixture therefore carries the two specs fields that DO name models —
+   * `loaded_models[]` and `utility_model` — alongside the one lms-derived
+   * aggregate the drawer is allowed to show (`ram_free_for_ai_bytes`).
+   *
+   * `loaded_models` deliberately reuses the SAME identifiers as
+   * `RESOURCES_WITH_MODELS`, so `FORBIDDEN` catches a leak from either
+   * source without having to know which one it came from. */
+  const SPECS_WITH_MODEL_DATA = {
+    darkmux_version: "3.6.0 (0904feab)",
+    flow_schema_version: "1.33.0",
+    machine_id: "MacBook-Pro",
+    os: "macOS",
+    ram_total_bytes: 137438953472,
+    // The one allowed lms-derived figure: a host-level aggregate naming no
+    // model. Non-null so the assertion below is not vacuous.
+    ram_free_for_ai_bytes: 98784247808,
+    cpu_brand: "Apple M5 Max",
+    loaded_models: [
+      { identifier: "darkmux:qwen3.5-122b-a10b", model: "qwen3.5-122b-a10b", status: "loaded", size: "65 GB", context: 131072 },
+      { identifier: "user:phi-4", model: "phi-4", status: "loaded", size: "9 GB", context: 16384 },
+    ],
+    lms_unreachable: false,
+    utility_model: { id: "qwen3-4b-instruct-2507", loaded: true },
+    redis_url_redacted: null,
+    generated_at_ms: NOW,
+  };
+
   /** The identifiers, model keys and per-model figures that must NOT appear
    * anywhere in the drawer's rendered text. `loaded_ctx` is in here because
    * a context size is the most tempting single field to borrow — it reads
@@ -1498,7 +1543,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
         flowWindow={[]}
         localUid={null}
         liveMachines={new Map()}
-        specs={null}
+        specs={SPECS_WITH_MODEL_DATA}
         liveStatus="live"
         nowMsOverride={NOW}
         isMobileOverride={false}
@@ -1511,6 +1556,12 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
     // every "does not contain" assertion below and the pin would be vacuous.
     const dialog = await screen.findByRole("dialog");
     await waitFor(() => expect(dialog.textContent).toContain("CPU"));
+    // ...and that `specs` reached it too: the identity rows and the ONE
+    // allowed lms-derived aggregate render. Without this, a dropped `specs`
+    // prop would put the pin back to testing `specs={null}` under a
+    // fixture's name.
+    expect(dialog.textContent).toContain("Apple M5 Max");
+    expect(dialog.textContent).toContain("memory free for AI");
     assertNoModelData(dialog.textContent ?? "");
   });
 
@@ -1523,7 +1574,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
         flowWindow={[]}
         localUid={null}
         liveMachines={new Map()}
-        specs={null}
+        specs={SPECS_WITH_MODEL_DATA}
         liveStatus="live"
         nowMsOverride={NOW}
         isMobileOverride={true}
@@ -1537,6 +1588,8 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
       return el as HTMLElement;
     });
     await waitFor(() => expect(panel.textContent).toContain("CPU"));
+    expect(panel.textContent).toContain("Apple M5 Max");
+    expect(panel.textContent).toContain("memory free for AI");
     assertNoModelData(panel.textContent ?? "");
   });
 });

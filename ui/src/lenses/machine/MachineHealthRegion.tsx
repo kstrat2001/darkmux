@@ -458,11 +458,30 @@ function Odometer({ resources }: { resources: MachineResources }) {
  * and starts asking the reader to do arithmetic.
  *
  * Deleted rather than fixed in place. `lib/format.ts`'s `relAgoFrom` is the
- * SAME coarse past-only formatter the fleet strip and the run list already
- * render their ages with (`just now` / `Ns` / `Nm` / `Nh` / `Nd`), and it
- * covers every bucket this region needs — including the seconds bucket the
- * NEW chip lives in. Two relative-time formatters on one page is two answers
- * for one instant waiting to happen. */
+ * coarse past-only formatter (`just now` / `Ns` / `Nm` / `Nh` / `Nd`) this
+ * app's OTHER `relAgoFrom` callers already render their ages with — the
+ * notes dialog, the drawer's last-sample line and the fleet meta line — and
+ * it covers every bucket this region needs, including the seconds bucket the
+ * NEW chip lives in. Reusing it, rather than minting a fourth formatter, is
+ * the point: two relative-time formatters on one page is two answers for one
+ * instant waiting to happen.
+ *
+ * Stated exactly, because an earlier version of this comment said "the same
+ * formatter the fleet strip and the run list already render their ages with"
+ * and the run-list half was simply untrue. This app has THREE age formatters,
+ * one per surface, and no more (pinned by `lib/format.test.ts`'s
+ * "age formatters" count):
+ *   1. `lib/format.ts::relAgoFrom`      — this region, the notes dialog,
+ *                                          the machine drawer, `metaLine`
+ *   2. `lenses/runs/format.ts::runsAgo` — the run list (SECOND-resolution
+ *                                          timestamps, and no "just now"
+ *                                          bucket: a 3s-old run reads "3s
+ *                                          ago", so folding it into
+ *                                          `relAgoFrom` would change what
+ *                                          that list renders)
+ *   3. `components/RecordView.tsx::relTime` — the record panel (parses an
+ *                                          ISO string, returns `null` rather
+ *                                          than text when it cannot) */
 
 function ModelRow({
   row,
@@ -703,12 +722,24 @@ export function MachineHealthRegion({
   // severity, rendered below (an `info` disclosure must not look like a
   // `warn`/`error`).
   const messages = Array.isArray(b.messages) ? b.messages : [];
+  // Two clocks, not one. `nowMs` is the READING browser's; `generated_at_ms`
+  // is the daemon HOST's, and this lens is read off-box over the tailnet by
+  // design (#1286 constraint 2 — the display renders off-machine). A reader
+  // whose clock sits behind the host makes the delta negative, and
+  // `relAgoFrom` renders a negative delta as the empty string: the footer
+  // came out as a bare "snapshot" and the banner as "… — snapshot",
+  // answering nothing at the exact moment the reader asked "is this current?".
+  //
+  // Clamped HERE rather than inside `relAgoFrom`, which is shared with
+  // callers this fix has no measurement for. Skew is unknowable from inside
+  // the browser, so the honest floor is the freshest the reading could be.
+  const ageRef = Math.max(nowMs, b.generated_at_ms);
 
   return (
     <>
       {stale && (
         <div className="mm-stalebanner">
-          {STALE_BANNER_TEXT} — snapshot {relAgoFrom(nowMs, b.generated_at_ms)}
+          {STALE_BANNER_TEXT} — snapshot {relAgoFrom(ageRef, b.generated_at_ms)}
         </div>
       )}
 
@@ -907,7 +938,7 @@ export function MachineHealthRegion({
           A `<details>` rather than a `title` for the same reason the
           odometer's note is a button and not a tooltip: this page is read
           on a phone over the tailnet, where hover does not exist. */}
-      <div className="memfoot">snapshot {relAgoFrom(nowMs, b.generated_at_ms)}</div>
+      <div className="memfoot">snapshot {relAgoFrom(ageRef, b.generated_at_ms)}</div>
       <details className="mm-about">
         <summary>how this was measured</summary>
         <div className="memfoot">{attributionLine(b)}</div>
