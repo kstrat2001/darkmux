@@ -408,7 +408,7 @@ fn draws_dispatches_the_unit_n_times_and_dedups_matching_finding_refs() {
         seen[0], seen[1],
         "two draws must never share a session id — the finding store addresses by <session>/<seq>"
     );
-    assert_eq!(seen[0].as_deref(), Some(format!("crawl-{MISSION}-u-0001").as_str()), "draw 0 is unchanged");
+    assert_eq!(seen[0].as_deref(), Some(format!("crawl-{MISSION}-unnamed-predicate-u-0001").as_str()), "draw 0 is unchanged");
 
     assert_eq!(parsed.findings, 2, "the RAW total across both draws — every finding the store holds");
     assert_eq!(
@@ -1262,7 +1262,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
 
     assert_eq!(body.findings, 2, "the count and the roster come from ONE read");
     assert_eq!(body.finding_refs.len(), 2, "one ref per accepted finding");
-    let session = format!("crawl-{MISSION}-u-0001");
+    let session = format!("crawl-{MISSION}-unnamed-predicate-u-0001");
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
         vec![format!("{session}/1"), format!("{session}/2")],
@@ -1270,7 +1270,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
     );
     assert_eq!(
         body.finding_refs[0].id,
-        format!("crawl-{MISSION}-u-0001-1"),
+        format!("crawl-{MISSION}-unnamed-predicate-u-0001-1"),
         "`/` swapped for `-`: the id becomes a task id suffix"
     );
     assert_eq!(body.finding_refs[0].file.as_deref(), Some("src/a.ts"), "the container prefix is stripped");
@@ -1406,7 +1406,7 @@ fn a_key_keeps_the_runtimes_ordinal_even_when_a_line_does_not_parse() {
         .body;
 
     assert_eq!(body.findings, 2, "only the readable lines are counted");
-    let session = format!("crawl-{MISSION}-u-0001");
+    let session = format!("crawl-{MISSION}-unnamed-predicate-u-0001");
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
         vec![format!("{session}/1"), format!("{session}/3")],
@@ -2010,4 +2010,45 @@ fn two_draws_dedup_only_across_draws_never_within_one() {
         "the window only draw 1 saw must survive: {:?}",
         parsed.finding_refs
     );
+}
+
+/// (#2383) Every rule's plan numbers its own units from `u-0001`, so two
+/// rules' first units in ONE mission must not share a dispatch session id:
+/// the container is named after it (five parallel `docker run`s collided
+/// live — "container name already in use", 5/5 units errored in 4 s) and the
+/// finding store keys records as `<session>/<seq>`. #2360 scoped the unit
+/// DIRECTORY by rule; this pins the session id the same way.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn two_rules_first_units_never_share_a_dispatch_session_id() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws_a = TempDir::new().unwrap();
+    let ws_b = TempDir::new().unwrap();
+    let plan_a = write_plan(ws_a.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let plan_b = write_plan(ws_b.path(), "swallowed-error", "u-0001", &"b".repeat(40));
+    let out_dir = TempDir::new().unwrap();
+    let out = seeded_out_dir(out_dir.path(), 0, 0);
+
+    let calls: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = calls.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+        captured.lock().unwrap().push(opts.session_id.clone());
+        ok_result(envelope("stop", 50, 10, 1_000), out.clone())
+    }));
+    for (plan, rule) in [(&plan_a, "unnamed-predicate"), (&plan_b, "swallowed-error")] {
+        let step = unit_step(serde_json::json!({
+            "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": rule
+        }));
+        kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    }
+    let seen = calls.lock().unwrap();
+    assert_eq!(seen.len(), 2, "one dispatch per unit");
+    assert_ne!(
+        seen[0], seen[1],
+        "two rules' `u-0001` share a mission: same session id = same container name = the live 5/5 collision"
+    );
+    assert_eq!(seen[0].as_deref(), Some(format!("crawl-{MISSION}-unnamed-predicate-u-0001").as_str()));
+    assert_eq!(seen[1].as_deref(), Some(format!("crawl-{MISSION}-swallowed-error-u-0001").as_str()));
 }

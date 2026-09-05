@@ -896,7 +896,11 @@ struct UnitContext {
 
 /// Resolve one unit out of an already-loaded plan: its source's sha and
 /// tree root, and the rule ids it names. Every failure names the unit.
-fn unit_context(the_plan: &Plan, unit: &Unit, mission_id: &str) -> Result<UnitContext> {
+/// `rule_segment` is the same rule-scoped segment the unit's on-disk dir
+/// uses (`unit_rule_dir`, #2360): a per-rule plan numbers its units from
+/// `u-0001`, so the dispatch session id — and with it the container name and
+/// every `<session>/<seq>` finding key — must carry the rule too (#2383).
+fn unit_context(the_plan: &Plan, unit: &Unit, mission_id: &str, rule_segment: &str) -> Result<UnitContext> {
     let source = match unit {
         Unit::Site { source, .. } | Unit::Read { source, .. } | Unit::Edge { source, .. } => source.clone(),
     };
@@ -931,7 +935,7 @@ fn unit_context(the_plan: &Plan, unit: &Unit, mission_id: &str) -> Result<UnitCo
         source,
         sha: ps.sha.clone(),
         rule_ids: unit_rules(unit),
-        session_id: format!("crawl-{mission_id}-{}", unit.id()),
+        session_id: format!("crawl-{mission_id}-{rule_segment}-{}", unit.id()),
         tree_root,
     })
 }
@@ -1105,7 +1109,13 @@ impl StepKind for CrawlUnitStepKind {
                 the_plan.units.len()
             )
         })?;
-        let ctx = unit_context(&the_plan, unit, &mission_id)?;
+        // (#2360, #2383) Resolve the rule segment FIRST: it scopes the unit's
+        // on-disk home AND its dispatch session id — a per-rule plan numbers
+        // its own units from `u-0001`, so two rules routinely grow a unit
+        // named `u-0001` into the SAME mission (see `unit_rule_dir`'s doc for
+        // the live dir collision; #2383 for the container-name one).
+        let rule_dir = unit_rule_dir(cfg.rule.as_deref(), &unit_rules(unit))?;
+        let ctx = unit_context(&the_plan, unit, &mission_id, &rule_dir)?;
         // The step's own `rule` (the grow item's `rule`, when present) must
         // agree with the plan — a silent mismatch would stamp every finding
         // with the wrong rule id, which is the key the tracker dedups on.
@@ -1140,13 +1150,6 @@ impl StepKind for CrawlUnitStepKind {
             }
         });
         let message = build_message(&rules_by_id, unit, intent_text.as_deref())?;
-
-        // (#2360) Namespace this unit's on-disk home by rule FIRST: a
-        // per-rule plan numbers its own units from `u-0001`, so two
-        // different rules routinely grow a unit named `u-0001` into the
-        // SAME mission — see `unit_rule_dir`'s own doc for the live
-        // collision this closes.
-        let rule_dir = unit_rule_dir(cfg.rule.as_deref(), &ctx.rule_ids)?;
 
         // Mint this unit's own out dir BEFORE dispatch (#2153): the dir is
         // then known and recorded even if the dispatch returns `Err` with
