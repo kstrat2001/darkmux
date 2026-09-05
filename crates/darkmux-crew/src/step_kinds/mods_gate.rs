@@ -243,7 +243,12 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
         return (None, Some(format!("could not detach the scratch copy from git: {e}")));
     }
     let patch_path = scratch.path().join("mod.patch");
-    if let Err(e) = std::fs::write(&patch_path, kit) {
+    // (#2387) Terminate the patch. A kit arrives as a JSON string, which
+    // needs no trailing newline and rarely has one; `git apply` reads an
+    // unterminated last hunk line as "corrupt patch" — three of four kits in
+    // the first live review-v2 run failed here byte-for-byte applicable.
+    let kit: std::borrow::Cow<str> = if kit.ends_with('\n') { kit.into() } else { format!("{kit}\n").into() };
+    if let Err(e) = std::fs::write(&patch_path, kit.as_bytes()) {
         return (None, Some(format!("could not write the mod's kit to a scratch file: {e}")));
     }
 
@@ -793,6 +798,43 @@ mod tests {
     /// writes objects into the mirror every other unit in the run is
     /// reading. Asserted against the real thing — a real `git worktree`,
     /// the real HEAD, the real worktree list.
+    /// (#2387, live proof 2026-09-05) Three of four kits the coder wrote ended
+    /// on the last hunk line with NO trailing newline — a JSON string does
+    /// not need one, and a model does not think to add one. `git apply`
+    /// reports that as "corrupt patch at line N" (N = the last line), which
+    /// the gate recorded as "kit did not apply" — for kits that apply
+    /// byte-for-byte once terminated. The gate owns the one place a kit
+    /// reaches `git apply`, so it terminates the file there.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_MODS_DIR, a process-global
+    fn a_kit_without_a_trailing_newline_still_applies() {
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        let kit = one_line_kit("wrong", "right");
+        let unterminated = kit.trim_end_matches('\n').to_string();
+        assert!(!unterminated.ends_with('\n'), "the fixture must exercise the unterminated shape");
+        mods::materialize(mods_dir.path(), &a_mod_kit("mod-nonl", "sess-a/1", &unterminated, Some("unified-diff")))
+            .unwrap();
+
+        ModsGateStepKind
+            .run(
+                &step(json!({
+                    "for_key": "sess-a/1",
+                    "test_command": "grep -q right answer.txt",
+                    "workdir": tree_root.to_string_lossy(),
+                })),
+                &task(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        let rec = mods::load_at(mods_dir.path(), "mod-nonl").unwrap().unwrap();
+        let gate = rec.gate.as_ref().unwrap_or_else(|| panic!("expected a real gate outcome: {rec:?}"));
+        assert_eq!(gate.applied, Some(true), "an unterminated kit must still apply: {gate:?}");
+        assert!(gate.passed, "{gate:?}");
+    }
+
     #[test]
     #[serial_test::serial] // scopes DARKMUX_MODS_DIR, a process-global
     fn a_gate_command_doing_git_writes_cannot_reach_the_shared_mirror() {
