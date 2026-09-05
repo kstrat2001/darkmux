@@ -57,7 +57,7 @@ m1-max-32gb-studio
 
 === catalog ===
 PLAYBACK CATALOG
-● live · today
+● live
 now-ish on present machines
 MISSIONS · NEWEST 50 OF 155
 ▣ acp-ephemeral-pr-ship-1786152707367180000-5

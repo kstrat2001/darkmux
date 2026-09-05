@@ -1,7 +1,7 @@
 // @ts-nocheck
 // Packet 5 acceptance: `/next`'s ported live-tail lens — the SSE flow tail
 // (`useLiveTail.ts`), the reconcile backstop, UTC date-rollover, and the
-// `#modebadge` live/reconnecting honesty (#1480) — against a REAL Chromium
+// the pill's own dot — live/reconnecting honesty (#1480, folded into the masthead pill #2412) — against a REAL Chromium
 // `EventSource`. Run with `bunx playwright test --config
 // next-parity-live.playwright.config.js` (see `package.json`'s
 // `next-parity-live` script). NOT picked up by `playwright.config.js`'s
@@ -172,7 +172,7 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
       expect(nowCount).toBe(before + 1);
     }).toPass({ timeout: 8000, intervals: [100] });
 
-    // Deliberately NOT asserting `#modebadge` here too: with `retry: 50`,
+    // Deliberately NOT asserting the pill's dot here too: with `retry: 50`,
     // the SAME `route.fulfill` that carries the record ALSO closes
     // immediately (point 1 in the module doc) — so the badge is flickering
     // live/reconnecting on a ~50ms cadence at this point BY CONSTRUCTION,
@@ -197,8 +197,8 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
     });
 
     await page.goto("/index.html");
-    await expect(page.locator("#modebadge")).toContainText("reconnecting", { timeout: 15000 });
-    await expect(page.locator("#modebadge")).toHaveClass(/\bstale\b/);
+    await expect(page.locator(".masthead__pilldot")).toHaveClass(/\bstale\b/, { timeout: 15000 });
+    await expect(page.locator(".masthead__pilldot")).toHaveAttribute("title", "reconnecting");
   });
 
   test("render-sanity: zero pageerror, zero console.error, with the live stream connected (pending, per the module doc)", async ({ page }) => {
@@ -214,7 +214,7 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
     });
 
     await page.goto("/index.html");
-    await expect(page.locator("#modebadge")).toContainText("live", { timeout: 15000 });
+    await expect(page.locator(".masthead__pilldot")).toHaveClass(/\blive\b/, { timeout: 15000 });
 
     expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
     expect(consoleErrors, `console.error events: ${consoleErrors.join("; ")}`).toHaveLength(0);
@@ -238,7 +238,7 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
     });
 
     await page.goto("/index.html");
-    await expect(page.locator("#modebadge")).toContainText("live", { timeout: 15000 });
+    await expect(page.locator(".masthead__pilldot")).toHaveClass(/\blive\b/, { timeout: 15000 });
     expect(seenStreamDates.has(meta.captured_date), "the initial stream must open against the captured day").toBe(true);
 
     // Jump the frozen clock's `Date.now()` straight across UTC midnight
@@ -286,7 +286,7 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
 test.describe("next-parity: live/SSE lens red-prove (harness self-test)", () => {
   // Unlike the sibling suites' 404-everything redprove (which proves their
   // STAGE-content goldens can fail), this lens has no stage-rendered golden
-  // to falsify — its observable surface is `#modebadge` + the `#meta` record
+  // to falsify — its observable surface is the pill's dot + the `#meta` record
   // count, both asserted directly above. What's worth proving here instead
   // is narrower and just as real: a blank/unreachable daemon's inert stream
   // (`installBlankRoutes`'s own `/flow/:date/stream` handler — an empty 200,
@@ -301,9 +301,9 @@ test.describe("next-parity: live/SSE lens red-prove (harness self-test)", () => 
     page.on("pageerror", (e) => pageErrors.push(String(e)));
 
     await page.goto("/index.html");
-    await expect(page.locator("#modebadge")).toBeAttached({ timeout: 15000 });
-    const stateAttr = await page.locator("#modebadge").getAttribute("data-state");
-    expect(["live", "reconnecting"], `#modebadge reported an unrecognized data-state: ${stateAttr}`).toContain(stateAttr);
+    await expect(page.locator(".masthead__pilldot")).toBeAttached({ timeout: 15000 });
+    const stateAttr = await page.locator(".masthead__pilldot").getAttribute("data-state");
+    expect(["live", "reconnecting"], `the pill's dot reported an unrecognized data-state: ${stateAttr}`).toContain(stateAttr);
     expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
   });
 });

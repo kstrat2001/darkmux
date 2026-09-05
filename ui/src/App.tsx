@@ -581,13 +581,13 @@ export function App() {
 
   return (
     <div className="app-shell">
-      {/* (Chrome packet) The masthead — brand, build chip, the catalog
-          trigger, the live/mode badge, refresh, topnav — moved out of this
-          function into its own component; see `Masthead.tsx`'s own doc for
-          why `<LiveStatusBadge>`'s live-route gating (the QA note that used
-          to live on this line) now lives there instead. Precedes
-          `.app-shell__crumbbar`, matching legacy's DOM order (`.top` before
-          `.crumbbar`). */}
+      {/* (Chrome packet) The masthead — brand, build chip, the catalog/
+          liveness pill, refresh, topnav — moved out of this function into
+          its own component; see `Masthead.tsx`'s own doc for why the pill's
+          live-route gating (the QA note that used to live on this line, and
+          the separate `#modebadge` it once described — retired in #2412)
+          now lives there instead. Precedes `.app-shell__crumbbar`, matching
+          legacy's DOM order (`.top` before `.crumbbar`). */}
       <Masthead
         route={displayRoute}
         liveStatus={liveStatus}

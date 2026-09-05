@@ -54,7 +54,7 @@ describe("CatalogPanel", () => {
     });
     renderPanel();
     screen.getByRole("button", { name: /browse history/i }).click();
-    await waitFor(() => expect(screen.getByText("● live · today")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("● live")).toBeInTheDocument());
     expect(screen.getByText(new RegExp(`^${today} · today$`))).toBeInTheDocument();
   });
 
@@ -96,8 +96,8 @@ describe("CatalogPanel", () => {
     stubFetch({});
     renderPanel();
     screen.getByRole("button", { name: /browse history/i }).click();
-    await waitFor(() => expect(screen.getByText("● live · today")).toBeInTheDocument());
-    screen.getByText("● live · today").closest("button")!.click();
+    await waitFor(() => expect(screen.getByText("● live")).toBeInTheDocument());
+    screen.getByText("● live").closest("button")!.click();
     await waitFor(() => expect(document.getElementById("catpanel")).toBeNull());
     expect(window.location.hash).toBe("");
   });
@@ -144,7 +144,7 @@ describe("CatalogPanel", () => {
     screen.getByRole("button", { name: /browse history/i }).click();
     await waitFor(() => expect(screen.getByText(/no recorded days yet/i)).toBeInTheDocument());
     // The live row still renders — a failed days fetch doesn't blank the whole panel.
-    expect(screen.getByText("● live · today")).toBeInTheDocument();
+    expect(screen.getByText("● live")).toBeInTheDocument();
   });
 
   // QA must-fix: legacy has THREE ways to close #catpanel
@@ -199,13 +199,13 @@ describe("CatalogPanel", () => {
       stubFetch({});
       renderPanel();
       fireEvent.click(screen.getByRole("button", { name: /browse history/i }));
-      await waitFor(() => expect(screen.getByText("● live · today")).toBeInTheDocument());
+      await waitFor(() => expect(screen.getByText("● live")).toBeInTheDocument());
 
       // The live row's own onClick already closes the panel (asserted
       // elsewhere) — this test's point is narrower: clicking INSIDE the
       // panel must not throw or misbehave now that a document-level click
       // listener is also active.
-      const liveRow = screen.getByText("● live · today").closest("button")!;
+      const liveRow = screen.getByText("● live").closest("button")!;
       expect(() => fireEvent.click(liveRow)).not.toThrow();
       await waitFor(() => expect(document.getElementById("catpanel")).toBeNull());
     });

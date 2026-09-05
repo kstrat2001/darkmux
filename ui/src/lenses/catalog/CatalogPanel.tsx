@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
@@ -74,16 +74,17 @@ import { CATALOG_MISSION_CAP, daySummary, missionSummary, missionsHeader, todayU
  * own box, so it can never cover it, regardless of what other App-level
  * chrome (like `#meta`) sits above.
  *
- * `label` (Chrome packet, optional): overrides the toggle button's VISIBLE
- * text — defaults to "browse history" (this component's original,
- * self-contained behavior, unchanged for every existing caller/test). The
- * button's ACCESSIBLE NAME is always "browse history" regardless (see the
- * button's own `aria-label` comment) — only `<Masthead>` passes this, to
- * make the toggle's on-page text match legacy's `#srcbadge` byte-for-byte
- * while every other consumer (and this component's own test suite) is
- * completely unaffected.
+ * `label` (Chrome packet, optional; widened to `ReactNode` in #2412 so
+ * `<Masthead>` can pass the pill's dot/glyph markup, not just a plain
+ * string): overrides the toggle button's VISIBLE content — defaults to
+ * "browse history" (this component's original, self-contained behavior,
+ * unchanged for every existing caller/test). The button's ACCESSIBLE NAME
+ * is always "browse history" regardless (see the button's own `aria-label`
+ * comment) — only `<Masthead>` passes this, to make the toggle's on-page
+ * content match the masthead's own pill byte-for-byte while every other
+ * consumer (and this component's own test suite) is completely unaffected.
  */
-export function CatalogPanel({ label }: { label?: string } = {}) {
+export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
   const [open, setOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement>(null);
 
@@ -151,8 +152,8 @@ export function CatalogPanel({ label }: { label?: string } = {}) {
         // regardless of `label` below — legacy's own `#srcbadge` does
         // exactly this split (visible text "today"/a date, `title`="browse
         // history" — viewer.html:3909) when `<Masthead>` renders this
-        // component in the source/date-badge slot: it passes `label="TODAY"`
-        // (etc.) so the VISIBLE text matches legacy's masthead byte-for-byte
+        // component in the source/date-badge slot: it passes the pill's own
+        // content (`label={pillLabel(...)}`) so the VISIBLE text matches the masthead byte-for-byte
         // (`tests/parity/goldens/fleet.txt`'s `=== topbar ===` section), while
         // the ACCESSIBLE NAME stays "browse history" so this button is still
         // found the same way everywhere — standalone (this component's own
@@ -219,7 +220,10 @@ function CatalogContent({
           restored-inspection-hook contract as the fleet card's `data-act`
           (see that component's own doc). */}
       <button type="button" className="catrow live" data-act="golive" onClick={onLive}>
-        <div className="cd">● live · today</div>
+        {/* (operator, 2026-09-06) "today" dropped: the fleet view's own 24H
+            window runs into yesterday, so the word was sometimes wrong on
+            top of being redundant with "live" itself. */}
+        <div className="cd">● live</div>
         <div className="cs">now-ish on present machines</div>
       </button>
       {missions.length > 0 && (

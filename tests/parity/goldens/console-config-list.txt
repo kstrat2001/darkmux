@@ -1,8 +1,8 @@
 === topbar ===
 darkmux
-◌ RECONNECTING
 ⟳
-TODAY
+◌ LIVE
+RECONNECTING
 home
 guide
 articles
