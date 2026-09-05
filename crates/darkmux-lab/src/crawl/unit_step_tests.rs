@@ -1786,3 +1786,93 @@ fn the_unit_dispatch_message_is_frozen_with_and_without_intent() {
     assert_ne!(plain, with_intent, "the intent block must actually render");
 }
 
+// ── (#2310 fix-loop E2) `draws`: a named ceiling, and dedup that only
+//    fires when there is more than one draw to dedup ACROSS ──────────────
+
+/// (#2310 fix-loop E2, S5-7) `draws` above [`MAX_UNIT_DRAWS`] is REFUSED at
+/// config-parse time, loudly and by name. Each draw is a whole extra
+/// dispatch of the same unit, so a typo'd `--param draws=80` is not a
+/// slightly-more-expensive run — it is an 80x one that nothing else in the
+/// pipeline would bound. The error names the cap and the value.
+#[test]
+fn draws_above_the_cap_is_refused_at_config_parse_time() {
+    let step = unit_step(serde_json::json!({
+        "plan": "/nonexistent/plan.json", "unit": "u-0001", "rule": "r", "draws": MAX_UNIT_DRAWS + 1
+    }));
+    let err = UnitStepConfig::from_step(&step).expect_err("draws above the cap must be refused");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(&format!("{}", MAX_UNIT_DRAWS + 1)), "the offending value is named: {msg}");
+    assert!(msg.contains(&format!("cap of {MAX_UNIT_DRAWS}")), "the cap is named: {msg}");
+}
+
+/// The cap is a CEILING, not an exclusive bound — exactly `MAX_UNIT_DRAWS`
+/// is accepted. Without this, tightening the comparison to `>=` would leave
+/// the refusal test above green while silently moving the real cap.
+#[test]
+fn draws_exactly_at_the_cap_is_accepted() {
+    let step = unit_step(serde_json::json!({
+        "plan": "/nonexistent/plan.json", "unit": "u-0001", "rule": "r", "draws": MAX_UNIT_DRAWS
+    }));
+    let cfg = UnitStepConfig::from_step(&step).expect("the cap itself is legal");
+    assert_eq!(cfg.draws, MAX_UNIT_DRAWS);
+}
+
+/// (#2310 fix-loop E2, S5-7) The cap holds for the STRING form too — a
+/// `--param draws=99` reaches step config as a JSON string, never a number,
+/// so a cap checked only on the `as_u64` branch would be bypassed by the
+/// one input shape an operator actually types.
+#[test]
+fn draws_above_the_cap_is_refused_in_its_string_form_too() {
+    let step = unit_step(serde_json::json!({
+        "plan": "/nonexistent/plan.json", "unit": "u-0001", "rule": "r", "draws": "99"
+    }));
+    let err = UnitStepConfig::from_step(&step).expect_err("the string form must be capped identically");
+    assert!(format!("{err:#}").contains("cap of"), "{err:#}");
+}
+
+/// (#2310 fix-loop E2, S1-4) Dedup is a CROSS-DRAW operation, and it is
+/// gated on there being more than one draw. Two DISTINCT findings that a
+/// single draw reported at the same `(rule, file, line)` — a real shape: a
+/// reviewer that finds two different problems on one line — must BOTH keep
+/// their `finding_refs` entry, because `create-mods` grows one coder task
+/// per entry and collapsing them silently drops one real finding on the
+/// floor. Before this gate, the second was discarded.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn one_draw_keeps_two_distinct_findings_that_share_a_file_and_line() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+
+    // ONE out dir, TWO findings, same file and line, different `why`.
+    let out = ws.path().join("out");
+    let rt = out.join(".darkmux-runtime");
+    fs::create_dir_all(&rt).unwrap();
+    fs::write(
+        rt.join("findings.jsonl"),
+        "{\"file\":\"/workspace/app/src/a.ts\",\"line\":7,\"pattern\":\"unnamed-predicate\",\"evidence\":\"if (a && b)\",\"why\":\"first problem\"}\n\
+         {\"file\":\"/workspace/app/src/a.ts\",\"line\":7,\"pattern\":\"unnamed-predicate\",\"evidence\":\"if (a && b)\",\"why\":\"second, different problem\"}\n",
+    )
+    .unwrap();
+
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_opts: DispatchOpts| {
+        ok_result(envelope("stop", 50, 10, 1_000), out.clone())
+    }));
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+
+    assert_eq!(parsed.findings, 2, "the store holds both");
+    assert_eq!(
+        parsed.finding_refs.len(),
+        2,
+        "a single draw never dedups — both findings must reach create-mods: {:?}",
+        parsed.finding_refs
+    );
+}

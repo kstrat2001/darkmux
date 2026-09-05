@@ -418,6 +418,13 @@ Two rules worth carrying without looking anything up:
   `config.json` field** via `darkmux config set <key> <value>` — do not reach
   for an env var as the primary mechanism. Env is for per-shell, CI, and test
   overrides.
+- **A `0` on a darkmux bound means UNBOUNDED, never "instantly".** It reads
+  that way for `redis.maxlen`, and (#2361/#2310) for
+  `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS` → `runtime.step_command_timeout_seconds`
+  (default `600`) — the bound on ONE shell command a step runs (`mods.gate`'s
+  `test_command`, `procedural.shell`'s `command`), on whose expiry the
+  command's whole process group is killed and the step reports the timeout.
+  `darkmux doctor` prints the resolved value and which reading it got.
 
 
 ## Where things live

@@ -84,6 +84,16 @@ pub struct GatedMod {
 pub struct DeliverScope {
     #[serde(default)]
     pub rules_run: Vec<String>,
+    /// (#2310 fix-loop E2) How many rules this run's config DECLARED —
+    /// the denominator the scope line's "N of M rules reviewed" needs.
+    /// `rules_run` alone can only say how many ran, and "2 rule(s)" reads
+    /// as complete coverage of a 2-rule review when the config had 7.
+    ///
+    /// Additive (`#[serde(default)]`), so a caller that does not set it
+    /// reads back `0` and [`Self::rules_declared`] falls back to what the
+    /// other two lists can prove.
+    #[serde(default)]
+    pub rules_total: usize,
     #[serde(default)]
     pub hunks_covered: usize,
     #[serde(default)]
@@ -109,6 +119,32 @@ pub struct DeliverScope {
     /// a clean `"noop"`, even when it produced zero findings.
     #[serde(default)]
     pub errored: Vec<String>,
+}
+
+/// (#2310 fix-loop E2, S1-6) The standing narrowness of EVERY run this kind
+/// delivers, stated once in the scope line whatever the per-run numbers
+/// say. `not_attempted` names what THIS run left out; this names what the
+/// mechanism itself does not do, which no run-shaped number can ever
+/// reveal. DESIGN.md's "The honest limit": a narrow review must never read
+/// as complete, and a reader who sees "7 of 7 rules reviewed, 12/12 hunks
+/// covered" has been told nothing about the whole class of problems a
+/// rule-shaped review cannot see.
+const STANDING_NARROWNESS: &str =
+    "This is a rule-shaped review; architectural breadth stays with the frontier gate.";
+
+impl DeliverScope {
+    /// The denominator for "N of M rules reviewed". `rules_total` when the
+    /// producer set it (never below the number that actually ran — a
+    /// smaller declared count than run count is a bookkeeping error, and
+    /// "3 of 2" would be a worse lie than a slightly generous M); otherwise
+    /// what the two lists can prove between them.
+    pub fn rules_declared(&self) -> usize {
+        if self.rules_total > 0 {
+            self.rules_total.max(self.rules_run.len())
+        } else {
+            self.rules_run.len() + self.not_attempted.len()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -482,9 +518,14 @@ pub fn render_github_review(
 /// refused count, and what the review did not attempt. Never reads as
 /// complete."
 fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
+    // (#2310 fix-loop E2) "N of M rules reviewed" — loop D made the VALUES
+    // honest (a rule with no completed unit no longer counts as run); the
+    // wording still said "2 rule(s)", which reads as the whole review
+    // rather than as two of seven.
     let mut line = format!(
-        "review ran: {} rule(s), {}/{} hunks covered, {} finding(s) considered, {} refused.",
+        "review ran: {} of {} rules reviewed, {}/{} hunks covered, {} finding(s) considered, {} refused.",
         scope.rules_run.len(),
+        scope.rules_declared(),
         scope.hunks_covered,
         scope.hunks_total,
         findings_considered,
@@ -505,6 +546,12 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
     if !scope.errored.is_empty() {
         line.push_str(&format!(" Errored: {}.", joined(&scope.errored)));
     }
+    // (#2310 fix-loop E2, S1-6) Appended ONCE, unconditionally, last — see
+    // `STANDING_NARROWNESS`. Unconditional because it is a property of the
+    // mechanism, not of the run: the cleanest possible run is exactly when
+    // a reader is most likely to mistake it for a complete review.
+    line.push(' ');
+    line.push_str(STANDING_NARROWNESS);
     line
 }
 
@@ -835,7 +882,33 @@ impl StepKind for DeliverGithubReviewStepKind {
             None => println!("{payload}"),
         }
         let dest = cfg.emit.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".to_string());
-        Ok(StepOutcome { output: dest, flow_records: Vec::new() })
+        // (#2310 fix-loop E2, from the C2 post-merge review) The step's
+        // output is a JSON OBJECT, not the emit path.
+        //
+        // `review-v2.json` declares `outcome_from: "deliver"`, which
+        // promotes this step's output into the run's `mission close`
+        // payload — and a bare path is not a JSON object, so
+        // `promoted_step_body` promoted NOTHING. A run whose whole point is
+        // to deliver a verdict closed with a null payload; the one fact
+        // every downstream reader wants (did this review say anything, and
+        // what) was reachable only by opening the emit file. `mode` is the
+        // verdict (`review`/`degraded`/`noop`), `summary` the same scope
+        // line the payload's own body leads with, and `emit` the
+        // destination the previous contract carried — nothing is lost, the
+        // shape just became promotable.
+        //
+        // Deliberately NOT the whole `DeliverOutcome`: the review body is
+        // model-authored text that would then be copied verbatim into a
+        // flow record, and the close payload is a summary surface, not a
+        // second copy of the artifact.
+        let summary = scope_line(&cfg.scope, cfg.findings.len());
+        let output = serde_json::to_string(&serde_json::json!({
+            "mode": outcome.mode,
+            "summary": summary,
+            "emit": dest,
+        }))
+        .context("serializing the deliver step output")?;
+        Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 }
 
@@ -1137,7 +1210,9 @@ mod tests {
             ..Default::default()
         };
         let line = scope_line(&scope, 4);
-        assert!(line.contains("2 rule(s)"));
+        // (#2310 fix-loop E2) The denominator here comes from the fallback:
+        // no `rules_total`, so 2 run + 1 not-attempted = 3 declared.
+        assert!(line.contains("2 of 3 rules reviewed"), "{line}");
         assert!(line.contains("2/5 hunks"));
         assert!(line.contains("4 finding(s)"));
         assert!(line.contains("Not attempted: architectural review."));
@@ -1459,10 +1534,125 @@ mod tests {
             image: None,
         };
         let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
-        assert_eq!(outcome.output, out_path.to_string_lossy());
+        // (#2310 fix-loop E2, from the C2 post-merge review) The step's own
+        // output is a promotable JSON object — `{mode, summary, emit}` —
+        // NOT the bare emit path it used to be. `review-v2.json` declares
+        // `outcome_from: "deliver"`, and a bare path promoted nothing, so
+        // the run closed with a null payload. The emit destination is still
+        // carried, as a field.
+        let step_output: serde_json::Value = serde_json::from_str(&outcome.output)
+            .expect("the deliver step's output must be a JSON object so `outcome_from` can promote it");
+        assert_eq!(step_output["emit"], json!(out_path.to_string_lossy()));
+        assert_eq!(step_output["mode"], json!("noop"), "the verdict rides the output: {step_output}");
+        assert!(
+            step_output["summary"].as_str().unwrap().contains("rules reviewed"),
+            "the scope line rides it too: {step_output}"
+        );
         let written = std::fs::read_to_string(&out_path).unwrap();
         let parsed: DeliverOutcome = serde_json::from_str(&written).unwrap();
         assert_eq!(parsed.mode, "noop", "zero findings, zero mods: nothing to say");
+    }
+
+    /// (#2310 fix-loop E2, from the C2 post-merge review) The verdict the
+    /// step output carries is the RUN's, not a constant: a degraded run
+    /// promotes `"degraded"`. Without this, hardcoding `"noop"` in `run`
+    /// would leave the test above green.
+    #[test]
+    fn the_step_outputs_verdict_is_the_runs_own_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out_path = dir.path().join("out.json");
+        let mut step = Step {
+            id: "deliver-step".into(),
+            task_id: "deliver-task".into(),
+            kind: DELIVER_GITHUB_REVIEW_KIND.into(),
+            gate: None,
+            status: crate::types::NodeStatus::Planned,
+            config: json!({}),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        step.config = json!({
+            "findings": [],
+            "mods": [],
+            "diff": DIFF,
+            "scope": { "errored": ["unit `u-1` (Error)"] },
+            "emit": out_path.to_string_lossy(),
+        });
+        let task = Task {
+            run_on: crate::types::default_run_on(),
+            id: "deliver-task".into(),
+            phase_id: "p".into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["deliver-step".into()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        assert_eq!(step_output["mode"], json!("degraded"), "{step_output}");
+        assert!(step_output["summary"].as_str().unwrap().contains("Errored:"), "{step_output}");
+    }
+
+    /// (#2310 fix-loop E2) The scope line names the DENOMINATOR: "2 of 7
+    /// rules reviewed", never a bare "2 rule(s)" that reads as the whole
+    /// review. Loop D made the numerator honest; this is the sentence that
+    /// makes the number mean something.
+    #[test]
+    fn the_scope_line_states_how_many_rules_of_how_many_were_reviewed() {
+        let scope = DeliverScope {
+            rules_run: vec!["a".into(), "b".into()],
+            rules_total: 7,
+            hunks_covered: 3,
+            hunks_total: 12,
+            ..Default::default()
+        };
+        let line = scope_line(&scope, 4);
+        assert!(line.contains("2 of 7 rules reviewed"), "{line}");
+        assert!(line.contains("3/12 hunks covered"), "{line}");
+    }
+
+    /// The denominator falls back to what the lists can PROVE when a
+    /// producer sets no `rules_total` — and never drops below the number
+    /// that ran, which would render the nonsense "3 of 2".
+    #[test]
+    fn the_rules_denominator_falls_back_and_never_undercounts() {
+        let no_total = DeliverScope {
+            rules_run: vec!["a".into(), "b".into()],
+            not_attempted: vec!["c".into()],
+            ..Default::default()
+        };
+        assert_eq!(no_total.rules_declared(), 3, "run + not-attempted is what the lists prove");
+
+        let understated =
+            DeliverScope { rules_run: vec!["a".into(), "b".into(), "c".into()], rules_total: 2, ..Default::default() };
+        assert_eq!(understated.rules_declared(), 3, "M is never below N");
+    }
+
+    /// (#2310 fix-loop E2, S1-6) Every scope line states the standing
+    /// narrowness of the mechanism — ONCE, and on the cleanest run too,
+    /// which is exactly when a reader is most likely to mistake a
+    /// rule-shaped review for a complete one.
+    #[test]
+    fn the_scope_line_states_the_standing_narrowness_exactly_once() {
+        for scope in [
+            DeliverScope { rules_run: vec!["a".into()], rules_total: 1, hunks_covered: 1, hunks_total: 1, ..Default::default() },
+            DeliverScope { errored: vec!["unit `u-1` (Error)".into()], ..Default::default() },
+            DeliverScope::default(),
+        ] {
+            let line = scope_line(&scope, 0);
+            assert_eq!(
+                line.matches("rule-shaped review").count(),
+                1,
+                "stated once, never twice and never omitted: {line}"
+            );
+            assert!(line.contains("architectural breadth stays with the frontier gate"), "{line}");
+        }
     }
 
     /// (#2310 P4b) The golden the brief asks for: one fixture set of
@@ -1517,6 +1707,7 @@ mod tests {
         ];
         let scope = DeliverScope {
             rules_run: vec!["unnamed-predicate".into(), "existing-solution".into()],
+            rules_total: 3,
             hunks_covered: 3,
             hunks_total: 4,
             refused: 2,
@@ -1609,7 +1800,10 @@ mod tests {
             image: None,
         };
         let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
-        assert_eq!(outcome.output, "-", "the step's own output names stdout, not a path");
+        // (#2310 fix-loop E2) The destination is now a FIELD on the step's
+        // promotable output object, not the whole output.
+        let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        assert_eq!(step_output["emit"], json!("-"), "the step's own output names stdout, not a path");
     }
 
     // ---------------------------------------------------------------

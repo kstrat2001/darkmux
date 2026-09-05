@@ -861,19 +861,38 @@ pub fn decode_b64(s: &str) -> Result<Vec<u8>> {
 /// nothing and anchors to nothing. Proven live: every gated mod on mission
 /// `review-v2-1788566897-9c149e` recorded "kit did not apply".
 ///
-/// Only the three header forms are touched — `diff --git`, `---`, `+++` —
-/// and only the `<source-id>` prefix (with or without git's `a/`/`b/`
-/// marker, and with or without the `/workspace/` root). The hunk body is
-/// never read: a `-`/`+` line that happens to contain a path is content,
-/// not a header. `/dev/null` is left exactly as it is. A kit already in
-/// repo-relative paths comes back byte-identical, which also makes this
-/// idempotent.
+/// Only header forms are touched — `diff --git`, `---`, `+++`, and (#2310
+/// fix-loop E2) the bare-path family `rename from`/`rename to`/`copy from`/
+/// `copy to` — and only the `<source-id>` prefix (with or without git's
+/// `a/`/`b/` marker, and with or without the `/workspace/` root). The hunk
+/// body is never read: a `-`/`+` line that happens to contain a path is
+/// content, not a header. `/dev/null` is left exactly as it is.
+///
+/// **Idempotent for the MARKED forms, not for the bare ones.** An
+/// `a/`/`b/`-prefixed header (what `git diff` emits, and what every kit
+/// observed so far uses) round-trips: `a/src/x.ts` has no `app/` prefix
+/// left to strip, so a second pass is a no-op. A BARE path cannot be told
+/// apart from an already-repo-relative one when the repo has a top-level
+/// directory named like the source id — `app/x.ts` is either "container
+/// coordinates for source `app`" or "the repo's own `app/` directory", and
+/// nothing in the header text distinguishes them. This function strips, so
+/// the second reading is over-stripped, and repeating the pass strips
+/// again. Deliberately NOT guessed around: the host knows the source id,
+/// not the repo's top-level layout, and every available heuristic would
+/// trade a rare wrong strip for a rare wrong keep. Pinned by
+/// `the_bare_path_branch_cannot_tell_container_coords_from_a_top_level_dir_of_the_same_name`.
 ///
 /// **This is the ONE place a stored kit is not byte-identical to the
 /// emission** — a host translation between two coordinate systems the host
 /// alone knows the mapping for, not an interpretation of the kit. The
 /// source id rides on [`ModRecord::source`] so the original is
 /// reconstructible.
+/// (#2310 fix-loop E2) The git header lines that carry ONE bare path each
+/// — no `a/`/`b/` marker, no `/dev/null` case, no trailing timestamp. Every
+/// one of them needs the same mapping the `---`/`+++`/`diff --git` headers
+/// get, or a renamed/copied file's kit describes two different trees.
+const RENAME_COPY_HEADERS: [&str; 4] = ["rename from ", "rename to ", "copy from ", "copy to "];
+
 pub fn strip_kit_source_prefix(source_id: &str, kit: &str) -> String {
     if source_id.is_empty() {
         return kit.to_string();
@@ -907,6 +926,16 @@ pub fn strip_kit_source_prefix(source_id: &str, kit: &str) -> String {
             } else {
                 body.to_string()
             }
+        } else if let Some((marker, path)) = RENAME_COPY_HEADERS.iter().find_map(|m| body.strip_prefix(*m).map(|r| (*m, r)))
+        {
+            // (#2310 fix-loop E2, from the loop-D review) A rename/copy
+            // carries its two paths on their OWN header lines, unmarked by
+            // `a/`/`b/`. Mapping the `diff --git` line while leaving these
+            // behind produced a kit whose halves disagreed about where the
+            // file lives, which `git apply` refuses outright — the mod then
+            // recorded "kit did not apply" and a real change posted as a
+            // double-check thread instead.
+            format!("{marker}{}", map_path(path))
         } else if let Some(rest) = body.strip_prefix("--- ").or_else(|| body.strip_prefix("+++ ")) {
             let marker = &body[..4];
             // A `---`/`+++` header may carry a tab plus timestamp
@@ -1107,10 +1136,27 @@ pub fn mods_for<'a>(all: &'a [ModRecord], finding_key: &str) -> Vec<&'a ModRecor
     all.iter().filter(|m| m.r#for.contains(&key)).collect()
 }
 
-/// Whether a mod names any finding recorded under this mission. The mission
-/// comes off the mod's OWN copied context, so the filter answers from the mod
-/// alone — the finding store need not still hold the finding.
+/// Whether a mod belongs to one mission. Answered from the mod ALONE — the
+/// finding store need not still hold anything it names.
+///
+/// (#2310 fix-loop E2, S5-8/S3-4) Two sources, in this order:
+///
+/// 1. **The mod's own `mission_id`** — HOST-stamped by
+///    [`create_from_emission`] from the proposing dispatch's scope, never
+///    model-supplied. This is the authoritative answer to "which run made
+///    this", and it is right even for a mod that cites no finding at all.
+/// 2. **The copied `for`-finding provenance** — the fallback for a mod with
+///    no run of its own (`mod create`, an external actor), which can only be
+///    placed through the findings it names.
+///
+/// Consulting only (2) made a run-produced mod with an EMPTY `for` list
+/// belong to no mission: invisible to `mod list --mission`, and — the real
+/// cost — filtered out of `records.gather`'s own mission scan, so a change
+/// the run had actually produced never reached the review it was made for.
 pub fn names_mission(record: &ModRecord, mission: &str) -> bool {
+    if record.mission_id.as_deref() == Some(mission) {
+        return true;
+    }
     record.context.findings.iter().any(|f| f.mission_id.as_deref() == Some(mission))
 }
 
@@ -1397,6 +1443,79 @@ mod tests {
         // No source id: nothing is touched.
         let container = "--- a/app/src/auth.ts\n";
         assert_eq!(strip_kit_source_prefix("", container), container);
+    }
+
+    /// (#2310 fix-loop E2, from the loop-D review) A RENAME kit maps too.
+    ///
+    /// `git diff` writes a rename as `rename from <path>` / `rename to
+    /// <path>` — repo-relative paths on their own header lines, with no
+    /// `a/`/`b/` marker. Mapping the `diff --git` line while leaving those
+    /// two behind produced a kit whose halves disagreed about where the
+    /// file lives, and `git apply` refuses that outright: the mod recorded
+    /// "kit did not apply" and a real change posted as a double-check
+    /// thread. `copy from`/`copy to` is the same header family (git emits
+    /// it for a detected copy) and has the same failure.
+    #[test]
+    fn a_rename_kit_maps_its_rename_headers_not_only_its_diff_git_line() {
+        let kit = "diff --git a/app/src/old.ts b/app/src/new.ts\n\
+                   similarity index 96%\n\
+                   rename from app/src/old.ts\n\
+                   rename to app/src/new.ts\n\
+                   --- a/app/src/old.ts\n\
+                   +++ b/app/src/new.ts\n\
+                   @@ -1 +1 @@\n\
+                   -const a = 1;\n\
+                   +const a = 2;\n";
+        let mapped = strip_kit_source_prefix("app", kit);
+        assert!(mapped.contains("rename from src/old.ts"), "{mapped}");
+        assert!(mapped.contains("rename to src/new.ts"), "{mapped}");
+        assert!(!mapped.contains("app/src/"), "no container path survives anywhere in the kit: {mapped}");
+        // The non-path metadata line is untouched.
+        assert!(mapped.contains("similarity index 96%"), "{mapped}");
+    }
+
+    /// The `copy from`/`copy to` half of the same header family.
+    #[test]
+    fn a_copy_kit_maps_its_copy_headers() {
+        let kit = "copy from app/src/a.ts\ncopy to app/src/b.ts\n";
+        assert_eq!(strip_kit_source_prefix("app", kit), "copy from src/a.ts\ncopy to src/b.ts\n");
+    }
+
+    /// (#2310 fix-loop E2, from the loop-D review) The idempotency claim,
+    /// pinned WITH its limitation rather than restated.
+    ///
+    /// The bare (unmarked) branch cannot distinguish two identical strings:
+    /// `app/x.ts` as CONTAINER coordinates for source `app` (map it to
+    /// `x.ts`) and `app/x.ts` as an already-repo-relative path in a repo
+    /// whose top-level directory happens to be named `app` (leave it). It
+    /// strips, so the second case is over-stripped — and mapping twice
+    /// strips twice.
+    ///
+    /// Not "fixed" here, because every available fix is a guess: the header
+    /// text carries no marker for which coordinate system it is in, and the
+    /// host knows only the source id, not the repo's own top-level layout.
+    /// The `a/`/`b/`-marked forms — which is what `git diff` actually emits
+    /// and what every real kit observed so far uses — are unaffected, since
+    /// their marker is stripped and re-attached around the mapping. This
+    /// test pins the CURRENT behavior so a future change to it is a
+    /// deliberate one.
+    #[test]
+    fn the_bare_path_branch_cannot_tell_container_coords_from_a_top_level_dir_of_the_same_name() {
+        // Case 1 — container coordinates. Mapping is correct.
+        assert_eq!(strip_kit_source_prefix("app", "rename from app/x.ts\n"), "rename from x.ts\n");
+        // Case 2 — the SAME string as a repo-relative path in a repo with a
+        // top-level `app/`. Indistinguishable, so it is over-stripped.
+        // KNOWN LIMITATION, not a desired behavior.
+        assert_eq!(
+            strip_kit_source_prefix("app", "--- app/x.ts\n"),
+            "--- x.ts\n",
+            "the bare branch over-strips a repo-relative path under a top-level dir named like the source id"
+        );
+        // And therefore the bare form is NOT idempotent under repetition
+        // when the path keeps re-matching.
+        let once = strip_kit_source_prefix("app", "--- app/app/x.ts\n");
+        assert_eq!(once, "--- app/x.ts\n");
+        assert_eq!(strip_kit_source_prefix("app", &once), "--- x.ts\n", "a second pass strips again");
     }
 
     /// The whole boundary, through the record: an emission whose kit is in
@@ -2013,5 +2132,62 @@ mod tests {
             !by_mission("crawl-1").contains(&none.key),
             "a mod naming no finding belongs to no mission"
         );
+    }
+
+    /// (#2310 fix-loop E2, S5-8/S3-4) A mod the RUN itself produced belongs
+    /// to that run, whether or not it names a finding.
+    ///
+    /// `create_from_emission` stamps the dispatch's own scope onto
+    /// `record.mission_id` — host-stamped, never model-supplied — and that
+    /// is the authoritative answer to "which run made this". Reading only
+    /// the copied `for`-finding provenance made a mod with an empty `for`
+    /// (a coder that proposed a change without citing a finding key, which
+    /// the record shape explicitly permits) belong to NO mission: it was
+    /// invisible to `mod list --mission M` and, worse, to
+    /// `records.gather`'s own `mods::names_mission` filter, so the review
+    /// it was made for never delivered it.
+    #[test]
+    fn a_mod_created_under_a_mission_names_it_even_with_an_empty_for_list() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("mods");
+        let findings_root = tmp.path().join("findings");
+
+        let rec = create_from_emission(
+            &root,
+            &findings_root,
+            "coder (darkmux:qwen3.6)",
+            &[],
+            "the patch text",
+            &[],
+            findings::Scope {
+                mission_id: Some("review-7".into()),
+                phase_id: Some("p-1".into()),
+                step_id: Some("step-3".into()),
+            },
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(rec.context.findings.is_empty(), "the fixture's premise: nothing to read provenance from");
+        assert!(names_mission(&rec, "review-7"), "the run that made it is the run that gathers it");
+        assert!(!names_mission(&rec, "review-8"), "and only that run");
+    }
+
+    /// The finding-provenance path is not replaced by the host stamp, it is
+    /// the FALLBACK: a `mod create` from an external actor has no
+    /// `mission_id` of its own and must still be found through the finding
+    /// it names. Without this, deleting the second half of `names_mission`
+    /// would leave the test above green.
+    #[test]
+    fn a_mod_with_no_mission_of_its_own_is_still_found_through_its_findings() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, Some("crawl-1"));
+
+        let rec = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("p"), &[], None).unwrap();
+        assert!(rec.mission_id.is_none(), "the fixture's premise: an external actor stamps no mission");
+        assert!(names_mission(&rec, "crawl-1"), "the copied finding provenance still answers");
     }
 }

@@ -84,6 +84,28 @@ const MAX_UNIT_MAX_TURNS: u32 = 40;
 /// `config.no_progress_turns`; `0` disables the check.
 const DEFAULT_NO_PROGRESS_TURNS: usize = 8;
 
+/// (#2310 fix-loop E2, S5-7) The largest `draws` a unit config may name.
+///
+/// A draw is a WHOLE extra dispatch of the same unit — its own container,
+/// its own turn budget, its own tokens — so `draws` multiplies a run's cost
+/// linearly with nothing else in the pipeline bounding it. A mistyped
+/// `--param draws=80` is not a slightly more expensive run; it is an 80x
+/// one whose first visible symptom is an operator watching the same unit go
+/// round for an hour. Refused at config-parse time
+/// ([`UnitStepConfig::from_step`]) rather than clamped: a silently-lowered
+/// value would make the run's own `draws` a lie, and operator sovereignty
+/// says surface the conflict rather than substitute a judgment.
+///
+/// 8 is the ceiling because the technique this ports (the retired funnel's
+/// k-draw recall) never measured past a handful of draws, and a value above
+/// [`UNIT_DRAWS_WARN_ABOVE`] is already warned about as unusual.
+pub const MAX_UNIT_DRAWS: usize = 8;
+
+/// (#2310 fix-loop E2, S5-7) Above this, `run` warns — the value is legal
+/// and honored, but it is far enough outside the measured range that a
+/// silent Nx run is more likely a typo than an intention.
+pub const UNIT_DRAWS_WARN_ABOVE: usize = 3;
+
 // ── the typed per-unit outcome ───────────────────────────────────────────
 
 /// [`UnitOutcome`]'s own schema version. Bumped when the shape below
@@ -839,6 +861,17 @@ impl UnitStepConfig {
                         )
                     })?;
                 anyhow::ensure!(n >= 1, "step `{}`: `{CRAWL_UNIT_KIND}` config.draws must be >= 1, got {n}", step.id);
+                // (#2310 fix-loop E2, S5-7) The ceiling, checked on the
+                // PARSED value so the string form (`--param draws=99`,
+                // which is the shape an operator actually types) is capped
+                // identically to the numeric one.
+                anyhow::ensure!(
+                    n <= MAX_UNIT_DRAWS as u64,
+                    "step `{}`: `{CRAWL_UNIT_KIND}` config.draws is {n}, above the cap of {MAX_UNIT_DRAWS} \
+                     — every draw is a whole extra dispatch of this same unit, so this run would cost \
+                     {n}x its own wall clock and tokens. Lower `draws`, or split the work across units.",
+                    step.id
+                );
                 usize::try_from(n).context("draws does not fit usize")?
             }
         };
@@ -1041,6 +1074,18 @@ impl StepKind for CrawlUnitStepKind {
     }
     fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let cfg = UnitStepConfig::from_step(step)?;
+        // (#2310 fix-loop E2, S5-7) Legal, honored, and said out loud: a
+        // value this far above the measured range is more often a typo than
+        // an intention, and the operator finds out here rather than from the
+        // wall clock. Above `MAX_UNIT_DRAWS` this is unreachable — the parse
+        // above already refused.
+        if cfg.draws > UNIT_DRAWS_WARN_ABOVE {
+            eprintln!(
+                "[darkmux] step `{}`: draws is {} — above {UNIT_DRAWS_WARN_ABOVE}, this unit will be \
+                 dispatched {} times and cost {}x one run's wall clock and tokens.",
+                step.id, cfg.draws, cfg.draws, cfg.draws
+            );
+        }
         let mission_id = mission_id_for(task)?;
         let run_dir = darkmux_crew::loader::missions_dir().join(&mission_id);
 
@@ -1288,7 +1333,7 @@ impl StepKind for CrawlUnitStepKind {
                     reason: None,
                     detections: last_detections.clone(),
                     host: last_host.clone(),
-                    finding_refs: dedup_finding_refs(all_finding_refs),
+                    finding_refs: dedup_across_draws(cfg.draws, all_finding_refs),
                 };
                 return Err(anyhow!(
                     "`{CRAWL_UNIT_KIND}`: unit `{}` ended `{result}` on draw {} of {} — {detail} (outcome: {})",
@@ -1305,7 +1350,7 @@ impl StepKind for CrawlUnitStepKind {
         // PER `finding_refs` entry (`crawl.summary`'s own `finding_refs`
         // union), so an undeduped multi-draw unit would dispatch a coder
         // twice at the "same" finding two draws independently observed.
-        let finding_refs = dedup_finding_refs(all_finding_refs);
+        let finding_refs = dedup_across_draws(cfg.draws, all_finding_refs);
 
         let outcome_record = UnitOutcome {
             schema_version: UNIT_OUTCOME_SCHEMA_VERSION.to_string(),
@@ -1357,6 +1402,29 @@ impl StepKind for CrawlUnitStepKind {
 /// finding whose `file`/`line` is absent (a rare, non-windowed report)
 /// dedups on `(rule, None, None)`, which still merges two IDENTICAL
 /// windowless reports of the same rule rather than doubling them.
+/// (#2310 fix-loop E2, S1-4) Dedup, but ONLY when there was more than one
+/// draw to dedup across.
+///
+/// The key [`dedup_finding_refs`] collapses on — `(rule, file, line)` — is
+/// what two DRAWS share when they independently re-observe one issue. It is
+/// also what two GENUINELY DIFFERENT findings share when a single draw
+/// reports two problems on the same line, which is an ordinary shape for a
+/// reviewer role (an unnamed predicate and a swallowed error can sit on one
+/// statement). Applied unconditionally, the second of those was silently
+/// discarded: `create-mods` grows one coder task per `finding_refs` entry,
+/// so the finding stayed in the store, never got a mod, and never reached
+/// the review. Gating on `draws > 1` keeps the cross-draw merge the knob
+/// exists for and stops it eating within-draw findings — a single-draw run
+/// (the default, and every run before the knob existed) now passes its refs
+/// through untouched, which is also what makes `draws: 1` byte-identical as
+/// this module's own docs claim.
+fn dedup_across_draws(draws: usize, refs: Vec<FindingRef>) -> Vec<FindingRef> {
+    if draws <= 1 {
+        return refs;
+    }
+    dedup_finding_refs(refs)
+}
+
 fn dedup_finding_refs(refs: Vec<FindingRef>) -> Vec<FindingRef> {
     let mut seen: std::collections::BTreeSet<(String, Option<String>, Option<u64>)> = std::collections::BTreeSet::new();
     let mut out = Vec::with_capacity(refs.len());

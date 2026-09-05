@@ -1447,12 +1447,21 @@ fn stranded_reason(
             return None;
         }
         if !dependency_satisfies_run_on(status, &task.run_on) {
-            let text = terminal_forward_reason(dep, status, steps).unwrap_or_else(|| {
-                format!(
-                    "dependency `{dep_id}` ended {status:?}, which this task's `run_on` does \
-                     not accept"
-                )
-            });
+            // (#2310 fix-loop E2, from the C2 post-merge review) The
+            // dependency's own text is ALWAYS a quotation, never the
+            // sentence. Forwarded bare it was attributed to the abandoned
+            // step itself — and for a COMPLETE dependency refused by a
+            // `run_on: ["error"]` task, that text is a SUCCESS line, so the
+            // record said "ok: wrote 12 rows" as the reason a step never
+            // ran. Wrapping is what keeps the cause and the subject
+            // distinguishable no matter which status was refused.
+            let base = format!(
+                "dependency `{dep_id}` ended {status:?}, which this task's run_on does not accept"
+            );
+            let text = match terminal_forward_reason(dep, status, steps) {
+                Some(t) if !t.trim().is_empty() => format!("{base}: {t}"),
+                _ => base,
+            };
             refused.get_or_insert(text);
         }
     }
@@ -2045,10 +2054,53 @@ mod tests {
             abandon_stranded_steps(["t-dep".to_string()], &tasks, &mut steps, &mut |_| {});
 
         assert_eq!(abandoned, vec!["t-dep-step".to_string()]);
+        // (#2310 fix-loop E2, from the C2 post-merge review) The cause is
+        // forwarded, but WRAPPED — the dependency's own text is a quotation,
+        // never the sentence. Unwrapped, this read as though the abandoned
+        // step itself had "exited with Some(3)".
         assert_eq!(
             steps["t-dep-step"].output.as_deref(),
-            Some("t-fail-step: command exited with Some(3)"),
-            "the sweep must forward the CAUSE, not the mechanism"
+            Some(
+                "dependency `t-fail` ended Error, which this task's run_on does not accept: \
+                 t-fail-step: command exited with Some(3)"
+            ),
+            "the sweep must forward the CAUSE, attributed to the dependency"
+        );
+    }
+
+    /// (#2310 fix-loop E2, from the C2 post-merge review) The same wrapping,
+    /// for the case that made it a bug rather than a wording nit: a
+    /// `run_on: ["error"]` task whose dependency COMPLETED is refused, and
+    /// `terminal_forward_reason` then hands back that dependency's SUCCESS
+    /// text. Forwarded bare, the abandoned step's own record said "ok:
+    /// wrote 12 rows" as the reason it never ran — a record that means the
+    /// opposite of what happened. The wrapper is what makes the quoted text
+    /// unmistakably the dependency's.
+    #[test]
+    fn abandon_stranded_steps_attributes_a_complete_dependencys_text_to_the_dependency() {
+        let (mut done, mut done_step) = task_and_step("t-done", &[]);
+        done_step.status = NodeStatus::Complete;
+        done_step.output = Some("ok: wrote 12 rows".to_string());
+        done.run_on = crate::types::default_run_on();
+
+        // Only accepts an ERRORED dependency, so a Complete one is refused.
+        let (dep, dep_step) = task_and_step("t-onerr", &["t-done"]);
+        let mut dep = dep;
+        dep.run_on = vec!["error".to_string()];
+
+        let (tasks, mut steps) = graph_with(vec![(done, vec![done_step]), (dep, vec![dep_step])]);
+        let abandoned =
+            abandon_stranded_steps(["t-onerr".to_string()], &tasks, &mut steps, &mut |_| {});
+
+        assert_eq!(abandoned, vec!["t-onerr-step".to_string()]);
+        let reason = steps["t-onerr-step"].output.clone().unwrap_or_default();
+        assert!(
+            reason.starts_with("dependency `t-done` ended Complete, which this task's run_on does not accept"),
+            "the sentence is about the DEPENDENCY, not about this step: {reason}"
+        );
+        assert!(
+            reason.contains("ok: wrote 12 rows"),
+            "and the dependency's own text is still carried, as a quotation: {reason}"
         );
     }
 

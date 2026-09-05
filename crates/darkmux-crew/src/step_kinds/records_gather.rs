@@ -150,11 +150,22 @@ impl StepKind for RecordsGatherStepKind {
         // never what a plan intended. See `plan_totals`.
         let (rules_run, hunks_covered) = plan_totals(&mission_id, hunks_total, &scan.completed_units);
         not_attempted.extend(scan.not_attempted);
+        // (#2310 fix-loop E2, S1-6) The rules the run never MINTED a task
+        // for — see `pruned_rules`.
+        let declared = declared_rules(&mission_id);
+        not_attempted.extend(pruned_rules(&mission_id, &declared));
         not_attempted.sort();
         not_attempted.dedup();
 
         let scope = DeliverScope {
             rules_run,
+            // (#2310 fix-loop E2, S1-6) The DENOMINATOR the scope line's
+            // "N of M rules reviewed" needs, taken from the run's own
+            // config snapshot — the one artifact that still names a rule
+            // whose task was pruned before the mint. `0` when the snapshot
+            // is unreadable, which `DeliverScope::rules_declared` reads as
+            // "fall back to what the lists prove".
+            rules_total: declared.len(),
             hunks_covered,
             hunks_total,
             refused: scan.findings_rejected,
@@ -194,6 +205,54 @@ fn mission_id_for(task: &Task) -> Result<String> {
                 task.phase_id
             )
         })
+}
+
+/// (#2310 fix-loop E2, S1-6) Every rule this run's CONFIG declared, mapped
+/// from the document task that declares it: `task id -> rule id`.
+///
+/// Read from the config SNAPSHOT (`lifecycle::load_config_snapshot`), which
+/// is the as-declared document with its `enabled` flags intact — deliberately
+/// not the pruned one, because the whole point is to see the tasks that were
+/// pruned away. A rule id is the `rule` key on any of the task's step configs,
+/// the same definition `mission_launch::task_declares_rule` uses for
+/// `--param rules=` selection (duplicated here rather than shared: that
+/// function lives in the binary crate, which this library cannot depend on).
+///
+/// An unreadable/absent snapshot yields an empty map — descriptive, never an
+/// error, the same posture `plan_totals`/`scan_unit_and_plan_steps` take.
+fn declared_rules(mission_id: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(Some(config)) = crate::lifecycle::load_config_snapshot(mission_id) else { return out };
+    for phase in &config.phases {
+        for task in &phase.tasks {
+            if let Some(rule) = task.steps.iter().find_map(|s| s.config.get("rule").and_then(|v| v.as_str())) {
+                out.insert(task.id.clone(), rule.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// (#2310 fix-loop E2, S1-6) Rules whose task was PRUNED before the mint —
+/// `enabled: false` in the document, or deselected for this launch by
+/// `--param rules=<csv>`.
+///
+/// These are the rules `scan_unit_and_plan_steps` structurally cannot see: a
+/// pruned task mints no `Task`, no `Step` and no `plan/<rule>.json`, so from
+/// every on-disk record the run looks as though those rules were never part
+/// of it. That is precisely the shape DESIGN.md's "The honest limit" is about
+/// — a run narrowed to 2 of 7 rules read exactly like a complete 2-rule
+/// review, on a payload an operator acts on.
+///
+/// `graph-report.json` (`PruneReport::pruned`) is the one record that
+/// survives the prune, and it names the TASK id; `declared` maps that back to
+/// the rule. A pruned entry naming no rule-bearing task (a phase, a step, a
+/// task with no `rule` key at all — the crawl's own `summary`) contributes
+/// nothing: this list is about rules, and inventing an entry for a
+/// non-rule task would put a task id in a rules sentence.
+fn pruned_rules(mission_id: &str, declared: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    let Ok(Some(report)) = crate::lifecycle::load_graph_report(mission_id) else { return Vec::new() };
+    report.pruned.iter().filter_map(|p| declared.get(&p.id).cloned()).collect()
 }
 
 /// `(rules_run, hunks_covered)` from every `plan/<rule>.json` this mission
@@ -504,6 +563,105 @@ mod tests {
             schema_version: crate::mods::MOD_SCHEMA_VERSION.to_string(),
             extras: Default::default(),
         }
+    }
+
+    /// Writes a config snapshot naming `rules` (one `plan-<rule>` task per
+    /// entry, each with a `rule`-bearing step) plus a graph report that
+    /// prunes the tasks in `pruned`, with the reason given.
+    fn save_snapshot_and_prune_report(rules: &[&str], pruned: &[(&str, &str)]) {
+        let phases = serde_json::json!([{
+            "id": "plan",
+            "tasks": rules.iter().map(|r| serde_json::json!({
+                "id": format!("plan-{r}"),
+                "steps": [{"id": format!("plan-{r}-step"), "kind": "plan.sites", "config": {"rule": r}}],
+            })).collect::<Vec<_>>(),
+        }]);
+        let config: crate::mission_config::MissionConfig = serde_json::from_value(serde_json::json!({
+            "id": "review-v2", "name": "Review v2", "phases": phases,
+        }))
+        .unwrap();
+        crate::lifecycle::save_config_snapshot(MISSION, &config).unwrap();
+
+        let report = crate::mission_config::prune::PruneReport {
+            pruned: pruned
+                .iter()
+                .map(|(id, reason)| crate::mission_config::prune::Pruned {
+                    id: (*id).to_string(),
+                    kind: "task".to_string(),
+                    reason: (*reason).to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        crate::lifecycle::save_graph_report(MISSION, &report).unwrap();
+    }
+
+    /// (#2310 fix-loop E2, S1-6) A rule pruned before the mint — by the
+    /// document's own `enabled: false`, or by this launch's `--param
+    /// rules=` selection — is NAMED in `not_attempted`, and counts toward
+    /// the "of M" denominator.
+    ///
+    /// This is the case no on-disk RUN record can reveal: a pruned task
+    /// mints no Task, no Step and no `plan/<rule>.json`, so
+    /// `scan_unit_and_plan_steps` and `plan_totals` both see a run that
+    /// simply never had those rules. A review narrowed from 4 rules to 1
+    /// therefore rendered as a complete 1-rule review. `graph-report.json`
+    /// is the only surviving record of the prune, and the config snapshot
+    /// is the only thing that can map its task ids back to rule ids.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn rules_pruned_before_the_mint_are_named_as_not_attempted() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        save_snapshot_and_prune_report(
+            &["intent-vs-diff", "test-gap", "union-vs-enum", "swallowed-error"],
+            &[("plan-test-gap", "disabled"), ("plan-union-vs-enum", "not_selected")],
+        );
+
+        let outcome = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped =
+            crate::step_output::Output::<GatherOutput>::read(&outcome.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        let scope = &wrapped.body.scope;
+
+        assert!(
+            scope.not_attempted.contains(&"test-gap".to_string()),
+            "a rule disabled in the document was never attempted: {scope:?}"
+        );
+        assert!(
+            scope.not_attempted.contains(&"union-vs-enum".to_string()),
+            "a rule deselected for this launch was never attempted either: {scope:?}"
+        );
+        assert!(
+            !scope.not_attempted.contains(&"intent-vs-diff".to_string()),
+            "a rule that was NOT pruned must not be named: {scope:?}"
+        );
+        assert_eq!(
+            scope.rules_total, 4,
+            "the denominator is what the CONFIG declared, pruned rules included: {scope:?}"
+        );
+    }
+
+    /// The mapping is task-id -> rule-id, and only rule-bearing tasks
+    /// contribute: a pruned task with no `rule` key (the crawl's own
+    /// `summary`) must not put a TASK id into a sentence about rules.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn a_pruned_task_that_names_no_rule_contributes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        save_snapshot_and_prune_report(&["intent-vs-diff"], &[("summarize", "disabled")]);
+
+        let outcome = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped =
+            crate::step_output::Output::<GatherOutput>::read(&outcome.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert!(
+            wrapped.body.scope.not_attempted.is_empty(),
+            "a non-rule task's id is not a rule name: {:?}",
+            wrapped.body.scope
+        );
+        assert_eq!(wrapped.body.scope.rules_total, 1);
     }
 
     #[test]
@@ -900,6 +1058,10 @@ mod tests {
         };
         let outcome =
             super::super::deliver_github_review::DeliverGithubReviewStepKind.run(&deliver_step, &task(), &input).unwrap();
-        assert_eq!(outcome.output, "-");
+        // (#2310 fix-loop E2) The deliver step's output is a promotable
+        // `{mode, summary, emit}` object; the destination is the `emit`
+        // field.
+        let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        assert_eq!(step_output["emit"], json!("-"));
     }
 }

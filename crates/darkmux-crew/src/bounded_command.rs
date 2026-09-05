@@ -39,7 +39,14 @@
 //!
 //! The bound comes from `runtime.step_command_timeout_seconds`
 //! (`env(DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS) > config.json > 600`), read
-//! through `darkmux_types::config_access` like every other knob.
+//! through `darkmux_types::config_access` like every other knob. `0` means
+//! UNBOUNDED (#2310 fix-loop E2) — see [`configured_timeout`].
+//!
+//! 3. **A finished command's leftovers are killed too.** If the output
+//!    drains have not reached EOF within [`DRAIN_GRACE`] after the command
+//!    itself exited, something it spawned is holding the pipe; that
+//!    process group is killed before the runner returns, so a
+//!    `test_command` that starts a daemon leaks nothing.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -89,9 +96,27 @@ pub enum Bounded {
     SpawnFailed(std::io::Error),
 }
 
+/// (#2310 fix-loop E2) The value [`configured_timeout`] returns for a
+/// configured `0`. Not a real instant: the deadline is only ever compared
+/// against with `started.elapsed() >= timeout`, which `Duration::MAX` can
+/// never satisfy, so the bound simply never fires. Never added to an
+/// `Instant`, which is the one thing `Duration::MAX` cannot survive.
+pub const UNBOUNDED: Duration = Duration::MAX;
+
 /// The configured bound, as a `Duration`.
+///
+/// (#2310 fix-loop E2, from the loop-D review) **`0` means UNBOUNDED**, the
+/// same reading every other darkmux zero-knob has (`redis.maxlen: 0` is
+/// unbounded retention, an absent `runtime.max_turns` is uncapped). It used
+/// to mean "kill instantly": `started.elapsed() >= Duration::ZERO` is true
+/// on the first poll, so an operator who wrote `0` intending "no bound" got
+/// every step command killed after about a millisecond, with a
+/// `TimedOut{0}` naming a bound they thought they had disabled.
 pub fn configured_timeout() -> Duration {
-    Duration::from_secs(darkmux_types::config_access::step_command_timeout_seconds())
+    match darkmux_types::config_access::step_command_timeout_seconds() {
+        0 => UNBOUNDED,
+        n => Duration::from_secs(n),
+    }
 }
 
 /// Run `cmd` under `timeout`, in its own process group, registered with the
@@ -170,11 +195,26 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Bounded {
                 // period — see the drain comment above for why this is
                 // never an unconditional join.
                 let grace_until = Instant::now() + DRAIN_GRACE;
+                let mut eofs = 0;
                 for _ in 0..2 {
                     let left = grace_until.saturating_duration_since(Instant::now());
                     if eof_rx.recv_timeout(left).is_err() {
                         break;
                     }
+                    eofs += 1;
+                }
+                if eofs < 2 {
+                    // (#2310 fix-loop E2, from the loop-D review) The
+                    // command exited but SOMETHING it spawned still holds
+                    // the pipe. Walking away here leaked that process — one
+                    // per gated mod for a `test_command` that starts a
+                    // daemon — and paid the full grace every time. The
+                    // group is ours (the child was `setpgid`-ed into its
+                    // own), so killing it reaches exactly what the command
+                    // left behind and nothing else. Output already drained
+                    // is kept: the snapshot below reads what the buffers
+                    // hold, which is everything written before the kill.
+                    kill_group(pid);
                 }
                 break Bounded::Finished {
                     success: status.success(),
@@ -273,7 +313,10 @@ mod tests {
         let started = Instant::now();
         let out = run_bounded(sh(&format!("sleep {m} & printf ok")), Duration::from_secs(600));
         let elapsed = started.elapsed();
-        // Clean up the deliberately-orphaned marker process.
+        // (#2310 fix-loop E2) The runner now kills the pipe-holding
+        // group itself, so this is belt-and-braces rather than the
+        // cleanup it used to be — see
+        // `a_finished_command_that_leaves_a_process_holding_stdout_has_its_group_killed`.
         let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
         match out {
             Bounded::Finished { success, stdout, .. } => {
@@ -381,6 +424,83 @@ mod tests {
         );
         assert!(matches!(out, Bounded::Finished { success: false, .. }), "got {out:?}");
         darkmux_types::child_registry::reset_for_test();
+    }
+
+    /// (#2310 fix-loop E2, from the loop-D review) A command that FINISHES
+    /// but leaves something holding its stdout pipe has its process group
+    /// killed before the runner returns.
+    ///
+    /// The drain grace exists so a held-open pipe cannot hang the runner —
+    /// but expiring it and walking away leaks whatever is holding the pipe.
+    /// A `test_command` that starts a daemon then leaked one process PER
+    /// GATED MOD, and paid a flat 2s for the privilege. The requirement is
+    /// the kill; the time saving is a consequence.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_finished_command_that_leaves_a_process_holding_stdout_has_its_group_killed() {
+        let m = marker(7);
+        let started = Instant::now();
+        let out = run_bounded(sh(&format!("sleep {m} & printf hi")), Duration::from_secs(600));
+        let elapsed = started.elapsed();
+        match out {
+            Bounded::Finished { success, ref stdout, .. } => {
+                assert!(success, "the command itself succeeded: {out:?}");
+                assert_eq!(String::from_utf8_lossy(stdout), "hi", "its output is still captured in full");
+            }
+            ref other => panic!("expected Finished, got {other:?}"),
+        }
+        let left = survivors(&m);
+        let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
+        assert!(left.is_empty(), "the pipe-holding grandchild was leaked: {left}");
+        // A bonus, not the requirement: with the group killed the drains
+        // hit EOF instead of burning the whole grace.
+        assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+    }
+
+    /// (#2310 fix-loop E2, from the loop-D review) A configured `0` means
+    /// UNBOUNDED, the way every other darkmux zero-knob does — not "kill
+    /// instantly", which is what it meant before: `started.elapsed() >= 0`
+    /// is true on the first poll, so a `0` in config.json turned every step
+    /// command into a `TimedOut{0}` after about a millisecond.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS, a process-global
+    fn a_configured_zero_is_unbounded_not_instant() {
+        let k = "DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS";
+        let prior = std::env::var(k).ok();
+        std::env::set_var(k, "0");
+        let timeout = configured_timeout();
+        match &prior {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+        assert_eq!(timeout, UNBOUNDED, "zero disables the bound");
+        // And a real command under it still runs to completion rather than
+        // being killed on the first poll.
+        match run_bounded(sh("printf hi"), timeout) {
+            Bounded::Finished { success, stdout, .. } => {
+                assert!(success);
+                assert_eq!(String::from_utf8_lossy(&stdout), "hi");
+            }
+            other => panic!("a zero bound must not kill anything, got {other:?}"),
+        }
+    }
+
+    /// A non-zero configured value is still a real bound — without this,
+    /// making `configured_timeout` return `UNBOUNDED` unconditionally would
+    /// leave the test above green.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS, a process-global
+    fn a_configured_non_zero_is_still_a_real_bound() {
+        let k = "DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS";
+        let prior = std::env::var(k).ok();
+        std::env::set_var(k, "7");
+        let timeout = configured_timeout();
+        match &prior {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+        assert_eq!(timeout, Duration::from_secs(7));
     }
 
     #[test]

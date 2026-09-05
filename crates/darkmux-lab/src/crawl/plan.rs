@@ -1052,6 +1052,48 @@ fn diff_git_header_paths(diff_text: &str) -> std::collections::BTreeSet<String> 
     out
 }
 
+/// (#2310 fix-loop E2, B-R2) How many DISTINCT paths this diff names that
+/// [`crate::lab::bundle::diff::header_path`] refuses to decode.
+///
+/// Counted from the raw header text because that is the only place the
+/// refusal is still visible: `header_path` returns `None`, both
+/// `parse_diff` and [`diff_git_header_paths`] drop the entry, and every
+/// counter downstream is then computed over a set the file never entered.
+///
+/// Both header dialects are scanned — a `diff --git` line and a `+++` line
+/// — because a header-less diff has only the latter, which is exactly the
+/// shape that produced an empty ledger. DISTINCT by the raw new-side token,
+/// so an ordinary `git diff` naming one file on both of its headers counts
+/// that file once, not twice.
+///
+/// Only a value that LOOKS quoted is examined: an unquoted path that
+/// `header_path` declines (`/dev/null`, or an empty one) is a deletion, and
+/// that case has its own counter and its own ledger line already.
+fn undecodable_header_paths(diff_text: &str) -> usize {
+    let mut bad: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for ln in diff_text.lines() {
+        let new_side = if let Some(rest) = ln.strip_prefix("+++ ") {
+            rest
+        } else if let Some(rest) = ln.strip_prefix("diff --git ") {
+            match rest.strip_prefix("a/").and_then(|r| r.find(" b/").map(|i| &r[i + 1..])) {
+                Some(p) => p,
+                None => match no_prefix_new_side(rest) {
+                    Some(p) => p,
+                    None => continue,
+                },
+            }
+        } else {
+            continue;
+        };
+        let new_side = new_side.split('\t').next().unwrap_or(new_side);
+        let new_side = new_side.strip_suffix('\r').unwrap_or(new_side);
+        if new_side.starts_with('"') && crate::lab::bundle::diff::header_path(new_side).is_none() {
+            bad.insert(new_side);
+        }
+    }
+    bad.len()
+}
+
 /// The NEW side of a prefixless `diff --git <old> <new>` header.
 ///
 /// (#2310 fix-loop, review) `<old> <new>` is genuinely ambiguous when a
@@ -1313,6 +1355,28 @@ pub fn plan_diff_rule(materialized: &Materialized, rule: &Rule, diff_text: &str,
             reason: format!(
                 "the diff names {entries_absent_from_tree} file(s) that are not in the workspace \
                  tree (deleted by this diff) — nothing to plan a site from"
+            ),
+            file: String::new(),
+            source: Some(source.id.clone()),
+        });
+    }
+    // (#2310 fix-loop E2, B-R2) The failure NO other counter can see.
+    // `header_path` refuses a C-quoted path whose escapes do not assemble
+    // into valid UTF-8 and binds no file — its own doc names this ledger as
+    // where that absence is recorded, and until now it was not. For a
+    // header-LESS diff (a bare `--- `/`+++ ` unified diff, which `diff -u`
+    // and plenty of CI diff artifacts emit) there is no `diff --git` line to
+    // put the path into `mentioned` either, so every counter above is
+    // computed over empty sets and the plan came back `units: 0,
+    // skipped: []` — indistinguishable from a clean review of a diff that
+    // genuinely had nothing for this rule.
+    let undecodable = undecodable_header_paths(diff_text);
+    if undecodable > 0 {
+        skipped.push(SkippedEntry {
+            reason: format!(
+                "{undecodable} diff path(s) could not be decoded (a git-quoted path whose escapes \
+                 do not assemble into valid UTF-8) — no file was bound, so nothing was planned \
+                 from them"
             ),
             file: String::new(),
             source: Some(source.id.clone()),
@@ -2551,6 +2615,78 @@ line two
         assert!(ws.totals.skipped.iter().any(|s| s.reason.contains("diff_bytes: 4")), "{:?}", ws.totals.skipped);
     }
 
+    /// (#2310 fix-loop E2, B-R2) A diff whose ONLY path cannot be decoded
+    /// plans zero units — and must SAY SO.
+    ///
+    /// `header_path` refuses a quoted path whose escapes do not assemble
+    /// into valid UTF-8 (`\303` alone is a truncated UTF-8 sequence), and
+    /// its own doc says "the caller's ledger (`plan.rs`) is where its
+    /// absence is recorded". It was not: for a header-LESS kit — a bare
+    /// `--- `/`+++ ` unified diff with no `diff --git` line, which is what
+    /// `diff -u` and many CI diff artifacts emit — `parse_diff` binds no
+    /// file and `diff_git_header_paths` has no header to read, so every
+    /// existing counter is computed over empty sets. The plan came back
+    /// `units: 0, skipped: []`, which is byte-identical to a clean review
+    /// of a diff that legitimately had nothing for this rule. The whole
+    /// point of this ledger is that those two must never look the same.
+    #[test]
+    fn plan_diff_rule_records_a_path_it_could_not_decode() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f.ts"), "export const x = 1;\n").unwrap();
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"a".repeat(40))], Vec::new());
+        // No `diff --git` header at all, and the one path it does name is
+        // C-quoted with a truncated UTF-8 escape.
+        let diff_text = ["--- \"a/caf\\303.ts\"", "+++ \"b/caf\\303.ts\"", "@@ -1,1 +1,2 @@", " one", "+two", ""].join("\n");
+        let plan = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap();
+        assert!(plan.units.is_empty(), "an undecodable path binds no file: {:?}", plan.units);
+        let note = plan
+            .totals
+            .skipped
+            .iter()
+            .find(|s| s.reason.contains("could not be decoded"))
+            .unwrap_or_else(|| panic!("the undecodable path is a stated fact: {:?}", plan.totals.skipped));
+        assert!(note.reason.contains('1'), "names how many: {}", note.reason);
+    }
+
+    /// The counter is DISTINCT paths, not header lines: a normal `git diff`
+    /// names the same file on its `diff --git` line and its `+++` line, and
+    /// counting both would report two undecodable paths for one file.
+    #[test]
+    fn one_undecodable_file_named_by_two_headers_counts_once() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f.ts"), "export const x = 1;\n").unwrap();
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"a".repeat(40))], Vec::new());
+        let diff_text = [
+            "diff --git \"a/caf\\303.ts\" \"b/caf\\303.ts\"",
+            "--- \"a/caf\\303.ts\"",
+            "+++ \"b/caf\\303.ts\"",
+            "@@ -1,1 +1,2 @@",
+            " one",
+            "+two",
+            "",
+        ]
+        .join("\n");
+        let plan = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap();
+        let note = plan.totals.skipped.iter().find(|s| s.reason.contains("could not be decoded")).expect("recorded");
+        assert!(note.reason.contains("1 diff path"), "one FILE, not one per header line: {}", note.reason);
+    }
+
+    /// A diff whose paths all decode records nothing — the ledger entry is
+    /// a fact about a real failure, never a line every plan carries.
+    #[test]
+    fn a_decodable_diff_records_no_decode_failure() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f.ts"), "function f() {\n  try {\n    risky();\n  } catch (e) {\n  }\n}\n").unwrap();
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"a".repeat(40))], Vec::new());
+        let diff_text = ["diff --git a/f.ts b/f.ts", "--- a/f.ts", "+++ b/f.ts", "@@ -1,1 +1,2 @@", " one", "+two", ""].join("\n");
+        let plan = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap();
+        assert!(
+            !plan.totals.skipped.iter().any(|s| s.reason.contains("could not be decoded")),
+            "{:?}",
+            plan.totals.skipped
+        );
+    }
+
     /// (#2310 fix-loop round 3, R1 — PROVEN) `diff_git_header_paths` did
     /// not unquote or prefix-strip the way `header_path` does, so a diff
     /// touching a git-quoted path (non-ASCII, or a space) put the RAW
@@ -3647,7 +3783,11 @@ line two
 
         // one comment per delivery form, plus the scope line naming every rule run
         assert_eq!(review.comments.len(), 1, "exactly one in-diff suggestion (swallowed-error's gated mod): {review:?}");
-        assert!(review.body.contains("review ran: 5 rule(s)"), "{}", review.body);
+        // (#2310 fix-loop E2) "N of M rules reviewed". This fixture saves
+        // no config snapshot, so `rules_total` is 0 and the denominator
+        // falls back to what the lists prove: 5 run, none not-attempted.
+        assert!(review.body.contains("review ran: 5 of 5 rules reviewed"), "{}", review.body);
+        assert!(review.body.contains("rule-shaped review"), "the standing narrowness: {}", review.body);
         assert!(review.body.contains(&up_key), "gate-failed unnamed-predicate mod renders as a double-check: {}", review.body);
         assert!(review.body.contains(&es_key), "existing-solution renders as a question: {}", review.body);
         assert!(review.body.contains("did you check for an existing retry helper"));
