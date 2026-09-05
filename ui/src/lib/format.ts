@@ -65,9 +65,9 @@ export function clkhm(t: number): string {
 
 /** `lday()` — viewer.html:992. Local DATE, no time. Ported with #1800's
  * replay meta line, the only surface that names a calendar day: a live view
- * says "today" in the badge, a replay states the actual date its records
- * came from. Same locale-dependence as `clk` above — the harness pins the
- * timezone for both sides. */
+ * says "LIVE" in the masthead pill (#2412), a replay states the actual date
+ * its records came from. Same locale-dependence as `clk` above — the
+ * harness pins the timezone for both sides. */
 export function lday(t: number): string {
   return new Date(t).toLocaleDateString();
 }
