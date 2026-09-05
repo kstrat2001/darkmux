@@ -166,6 +166,13 @@ impl StepKind for ModsGateStepKind {
         // questions and must not collapse into one summary field.
         let no_command_reason =
             if test_command.is_none() { Some("no test_command configured".to_string()) } else { None };
+        // The source id is the name of the one checkout beneath the workdir —
+        // the same resolution `gate_one_mod` applies the kit in. Recorded on
+        // every mod this step gates that arrived without one, so the deliverer
+        // can map container-coordinate kits the way the gate did.
+        let resolved_source: Option<String> = workdir
+            .and_then(|w| resolve_single_source_dir(Path::new(w)).ok())
+            .and_then(|d| d.file_name().and_then(|n| n.to_str()).map(str::to_string));
         let mut mods_gated = 0usize;
         for m in &targets {
             // A mutation self-check on this line is documented in this
@@ -181,7 +188,7 @@ impl StepKind for ModsGateStepKind {
                 None => (None, no_command_reason.clone()),
                 Some(cmd) => gate_one_mod(m, cmd, workdir),
             };
-            let res = mods::record_gate(&root, &m.key, outcome, skip_reason.as_deref())
+            let res = mods::record_gate_with_source(&root, &m.key, outcome, skip_reason.as_deref(), resolved_source.as_deref())
                 .with_context(|| format!("step `{}`: recording the gate for mod `{}`", step.id, m.key))?;
             if res == mods::Materialized::Created {
                 mods_gated += 1;
@@ -928,6 +935,29 @@ mod tests {
         let gate = gate_kit("mod-badctx", &kit);
         assert_eq!(gate.applied, Some(false), "{gate:?}");
         assert_eq!(gate.reason.as_deref(), Some("kit did not apply"));
+    }
+
+    /// The gate resolved the source checkout to apply the kit; a mod that
+    /// arrived with no `source` (every create-mod dispatch) gets that id
+    /// recorded, so the deliverer can map the kit the same way the gate did.
+    #[test]
+    #[serial_test::serial]
+    fn the_gate_records_the_source_id_it_resolved_on_a_sourceless_mod() {
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        let kit = one_line_kit("wrong", "right").replace("a/answer.txt", "a/app/answer.txt").replace("b/answer.txt", "b/app/answer.txt");
+        mods::materialize(mods_dir.path(), &a_mod_kit("mod-src", "sess-a/1", &kit, Some("unified-diff"))).unwrap();
+        ModsGateStepKind
+            .run(
+                &step(json!({ "for_key": "sess-a/1", "test_command": "true", "workdir": tree_root.to_string_lossy() })),
+                &task(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let rec = mods::load_at(mods_dir.path(), "mod-src").unwrap().unwrap();
+        assert_eq!(rec.source.as_deref(), Some("app"), "the resolved source id must be recorded: {rec:?}");
+        assert_eq!(rec.gate.as_ref().map(|g| g.applied), Some(Some(true)));
     }
 
     #[test]
