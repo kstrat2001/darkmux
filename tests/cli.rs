@@ -8224,31 +8224,47 @@ fn the_wait_command_completes_when_the_mod_appears_mid_wait() {
     assert!(stdout.contains("sess-midwait/3"), "the output names the finding it waited for: {stdout}");
 }
 
-/// (#2310 P4e) No mod, small bound: the step ERRORS, honestly, naming the
-/// finding and the bound. That error is what cascades the gate and leaves
-/// the finding delivering as a question rather than a suggestion.
-/// Red-proved by changing the loop's terminal `exit 1` to `exit 0` — the
-/// step then reports success having produced nothing.
+/// (#2310 P4e review, item 8) No mod inside the bound is a CLEAN outcome,
+/// not an error. A frontier that read the finding and declined to write a
+/// mod — because it is a search-form finding, or because the finding does
+/// not hold — is the correct behavior, and the skill instructs it
+/// explicitly. Exiting non-zero there made every decline an Error step and
+/// finalized the run Degraded, which reads as "darkmux broke" for the one
+/// path the design calls right. So the bound-exhausted branch exits 0 with
+/// `found: false`; the gate then records its ordinary no-mod skip and the
+/// deliverer renders the finding as a question. A non-numeric bound is
+/// still exit 2 (a real config defect), and an infra failure still errors.
 ///
 /// The store is deliberately NOT empty: it holds a mod for a DIFFERENT
-/// finding, because the probe's whole job is `mod list --for <this key>` and
-/// an empty store would pass just as well with the filter dropped.
-/// Red-proved a second way by deleting `--for "$key"` from the command — the
-/// unrelated mod then satisfies this finding's wait and the step reports a
-/// mod it does not have.
+/// finding, because the probe's whole job is `mod list --for <this key>`
+/// and an empty store would pass just as well with the filter dropped.
+/// Red-proved three ways: change the terminal `exit 1`/`exit 0` back to
+/// `exit 1` (the status assertion fails); delete `--for "$key"` from the
+/// command (the unrelated mod satisfies this finding's wait and `found`
+/// comes back true); flip the terminal `"found":false` to `"found":true`.
 #[test]
-fn the_wait_command_errors_when_no_mod_appears_within_the_bound() {
+fn the_wait_command_completes_with_found_false_when_no_mod_appears_within_the_bound() {
     let home = TempDir::new().unwrap();
     let workdir = TempDir::new().unwrap();
     record_mod_for(home.path(), workdir.path(), "sess-someone-else/2");
     let out = run_wait_command(home.path(), &create_mod_wait_command("sess-never/9", "3"));
 
-    assert!(
-        !out.status.success(),
-        "another finding's mod must not read as a completed wait for this one"
-    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(stderr.contains("sess-never/9"), "the error names the finding: {stderr}");
+    assert!(
+        out.status.success(),
+        "a decline is a clean outcome, never a step error: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        stdout.contains("\"found\":false"),
+        "and it says so in its output, so the gate and the deliverer can tell: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"waited\":true"),
+        "the wait DID run — `waited` reports that, `found` reports the outcome: {stdout}"
+    );
+    assert!(stdout.contains("sess-never/9"), "naming the finding it waited for: {stdout}");
+    assert!(stderr.contains("sess-never/9"), "the note names the finding: {stderr}");
     assert!(stderr.contains("3s"), "and the bound it waited: {stderr}");
 }
 

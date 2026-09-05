@@ -212,6 +212,13 @@ pub(crate) struct InputJson {
     /// `--json` consumer never has to distinguish "false" from "absent".
     pub ignored: bool,
     pub ignored_reason: Option<String>,
+    /// (#2310 P4e review, item 3) The document's own `default`, verbatim
+    /// (a JSON value, not a string — a default may be a number or a bool).
+    /// `MissionInput::default`'s doc promises the operator can read the
+    /// value off `mission config show`; without this field that promise
+    /// was false on both the text and `--json` surfaces, and a defaulted
+    /// input was indistinguishable from an unset optional one.
+    pub default: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -588,6 +595,7 @@ pub(crate) fn build_show(
                 required: i.required.unwrap_or(true),
                 ignored: i.ignored.unwrap_or(false),
                 ignored_reason: i.ignored_reason.clone(),
+                default: i.default.clone(),
             })
             .collect(),
         panel,
@@ -596,6 +604,16 @@ pub(crate) fn build_show(
         registry: registry_json,
         residency: residency_json,
         warnings: warnings.to_vec(),
+    }
+}
+
+/// (#2310 P4e review, item 3) A document default rendered for the text
+/// surface: a string default prints bare (`0`, not `"0"`, which is how the
+/// operator types it on `--param`), anything else as its JSON.
+fn render_default(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -700,6 +718,16 @@ fn render_show_text(show: &ConfigShow) -> String {
         out.push_str("  inputs:\n");
         for i in &other_inputs {
             let req = if i.required { "required" } else { "optional" };
+            // (#2310 P4e review, item 3) A default is rendered INLINE with
+            // the optionality, because the two together are the whole
+            // answer to "what happens if I don't pass this": `optional`
+            // alone means the key is omitted and a step kind's own
+            // fallback applies; `optional, default: 0` means this exact
+            // value is collected on every launch.
+            let req = match &i.default {
+                Some(v) => format!("{req}, default: {}", render_default(v)),
+                None => req.to_string(),
+            };
             // (#2310 P4c-2 review item 3) An ignored input's line names
             // WHY, so an operator reading `mission config show` sees the
             // same signal the launch-time warning gives, without having to
@@ -1452,6 +1480,63 @@ mod tests {
         let text = render_show_text(&show);
         assert!(text.contains("bundle, probe, dedup."), "phase description missing:\n{text}");
         assert!(text.contains("\"Bundle the diff\""), "task display_name missing:\n{text}");
+    }
+
+    /// (#2310 P4e review, item 3) `MissionInput::default`'s own doc says
+    /// the operator can read the value off `mission config show`. Both
+    /// surfaces must actually carry it, or a defaulted input reads
+    /// identically to an unset optional one — and those behave
+    /// differently at launch. Red-proved by dropping `default: i.default
+    /// .clone()` from the mapping (the JSON assertion fails) and by
+    /// restoring the bare `req` string (the text assertion fails).
+    #[test]
+    fn show_renders_an_inputs_document_default_in_text_and_json() {
+        let registry = StepKindRegistry::new();
+        let mut cfg = doc(vec![phase("p1", vec![task("t1", None, vec![step("s1", "k")])])]);
+        cfg.inputs = vec![
+            MissionInput {
+                name: "mod_wait_seconds".to_string(),
+                description: None,
+                required: Some(false),
+                default: Some(serde_json::json!("0")),
+                ignored: None,
+                ignored_reason: None,
+                extras: Default::default(),
+            },
+            MissionInput {
+                name: "diff_file".to_string(),
+                description: None,
+                required: Some(true),
+                default: None,
+                ignored: None,
+                ignored_reason: None,
+                extras: Default::default(),
+            },
+        ];
+        let show = build_show(
+            "x",
+            &loaded_doc(cfg),
+            &registry,
+            Err("no registry needed"),
+            &|_| RoleBinding::Unmapped,
+            Err("no lms needed"),
+            &[],
+        );
+
+        let text = render_show_text(&show);
+        assert!(
+            text.contains("mod_wait_seconds (optional, default: 0)"),
+            "a defaulted input must name its default, unquoted the way the operator types it:\n{text}"
+        );
+        assert!(
+            text.contains("diff_file (required)"),
+            "and an input with no default must be unchanged:\n{text}"
+        );
+
+        let waited = show.inputs.iter().find(|i| i.name == "mod_wait_seconds").unwrap();
+        assert_eq!(waited.default, Some(serde_json::json!("0")), "--json carries it verbatim");
+        let diff = show.inputs.iter().find(|i| i.name == "diff_file").unwrap();
+        assert_eq!(diff.default, None, "and omits it where the document declares none");
     }
 
     #[test]

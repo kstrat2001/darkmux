@@ -784,7 +784,16 @@ pub(crate) fn launch(
     spec_origin: crew::types::MissionSpecOrigin,
 ) -> Result<i32> {
     let timeout_seconds = timeout_seconds.unwrap_or(REVIEW_DEFAULT_TIMEOUT_SECONDS);
-    let collected = mission_launch::collect_inputs(input_file, params)?;
+    let mut collected = mission_launch::collect_inputs(input_file, params)?;
+    // (#2310 P4e review, item 6) The SAME defaults pass the generic
+    // launcher runs. The frozen `review` config declares no `default`
+    // today, so this changes nothing for it right now — but a document
+    // default that silently applies on one launcher and not the other
+    // would be a difference no reader could see from the document, and
+    // `review-lean`-style user-tier variants of this config are a
+    // supported thing to write.
+    mission_launch::apply_input_defaults(config, &mut collected);
+    let collected = collected;
 
     let diff_file = path_input(&collected, "diff_file").ok_or_else(|| {
         anyhow!(

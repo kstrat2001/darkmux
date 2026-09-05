@@ -2241,6 +2241,26 @@ impl StepKind for ProceduralShellStepKind {
         // step's own work. Set only when `current_exe` resolves; a command
         // written as `"${DARKMUX_BIN:-darkmux}"` still works when it does
         // not.
+        //
+        // (#2310 P4e review, item 8) Two cases where this is set but not
+        // the darkmux an operator means, both of which the fallback CANNOT
+        // rescue because the variable is present, just wrong:
+        //
+        //  - **Under `cargo test`** it is the TEST HARNESS binary, not
+        //    darkmux. A step command that shells out to it gets a test
+        //    runner. Harmless for the in-process kind tests (which only
+        //    read the variable), and the integration tests that exercise a
+        //    real command set `DARKMUX_BIN` themselves to
+        //    `assert_cmd::cargo::cargo_bin("darkmux")` — but a future test
+        //    that lets this default through would be testing the harness.
+        //  - **After an in-place reinstall** (`cargo install` renames, but
+        //    a `cp` over a running binary does not) `current_exe` can name
+        //    a path that no longer exists. The command then fails on a
+        //    missing file rather than falling back to `PATH`.
+        //
+        // Both are narrower than the failure this closes (a `PATH` with no
+        // darkmux on it at all, which is the ordinary case for a worktree
+        // build), so it stays — named here rather than silently inherited.
         if let Ok(exe) = std::env::current_exe() {
             cmd.env("DARKMUX_BIN", exe);
         }

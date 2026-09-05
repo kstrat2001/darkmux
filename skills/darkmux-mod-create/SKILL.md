@@ -45,9 +45,19 @@ The record carries `emitted` (the model's own `file` / `line` / `pattern` /
 `evidence` / `why`) and `context` (`workspace`, `source`, `sha`) — the tree the
 finding was observed in, pinned.
 
-**A finding whose `file` is a container path** (`/workspace/<source>/src/a.ts`)
-is normal: that is what the model saw inside its sandbox. The **repo-relative**
-path is what the kit must use — strip the `/workspace/<source>/` prefix.
+**The STORED record's `file` is already repo-relative** — `darkmux finding show`
+gives you the path the kit needs, as-is. The host mapped it at write time: the
+model wrote its sandbox's coordinates (`/workspace/<source>/src/a.ts`), and
+`build_record` maps the `/workspace/<source>/` prefix off before storing,
+keeping the source id in the record's own `source` field so nothing is lost
+(`findings.rs`, `FindingRecord::emitted` / `::source`).
+
+Where you WILL see the container path is the **raw hook or flow record** —
+`payload.emitted.file` on the fired `dispatch.tool` record is the model's
+verbatim argument, unmapped. So if you are working from the stream rather than
+the store, strip the `/workspace/<source>/` prefix yourself, or just read the
+stored record instead, which is the simpler move. Either way the kit's paths are
+repo-relative: `--- a/src/a.ts`, never the mount path.
 
 ## Step 2 — Open the tree the finding was observed in
 
@@ -82,6 +92,13 @@ A wrong mod is worse than no mod: it passes a gate on an unrelated test target
 and delivers as a one-click suggestion on a PR. `deliver.github_review` renders a
 finding with no mod as a question ("worth a double check"), which is the honest
 outcome for an unconfirmed intuition.
+
+**Declining costs the run nothing.** A wait that ends with no mod completes
+cleanly (`{"waited": true, "found": false, …}`, exit 0), the gate records its
+ordinary no-mod skip, and the run stays Clean — a decline is a supported outcome,
+not a failure. The same is true of a **search-form** finding, where the right
+answer is a thread listing instances rather than a patch: record no mod and say
+what you found.
 
 ## Step 4 — Write the smallest unified diff
 
