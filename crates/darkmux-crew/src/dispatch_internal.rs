@@ -5374,11 +5374,31 @@ const TAILER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TELEMETRY_SAMPLE_INTERVAL: Duration = Duration::from_millis(TELEMETRY_SAMPLE_INTERVAL_MS);
 /// Same cadence as [`TELEMETRY_SAMPLE_INTERVAL`], as a plain `u64` — feeds
 /// `reduce_host_extras`'s sleep-gap cap (#2108 review finding), which wants
-/// milliseconds, not a `Duration`. `pub` (#2111 review finding) so
-/// `darkmux doctor`'s `check_telemetry_record_every_samples` derives its
-/// "≈Ns" cadence message FROM this constant instead of a hardcoded literal
-/// that could silently drift from the sampler's real tick.
+/// milliseconds, not a `Duration`, and [`telemetry_emission_due`]'s tests
+/// (#2413 M2). (#2413 C7) The doctor check this constant's `pub`
+/// visibility originally served, `check_telemetry_record_every_samples`,
+/// is retired along with the config knob it surfaced — `pub` stays
+/// because this module's own test file (`dispatch_internal_tests.rs`,
+/// `super::*`) and callers elsewhere in this crate still read it, not
+/// because a doctor check derives a message from it any more.
 pub const TELEMETRY_SAMPLE_INTERVAL_MS: u64 = 2000;
+
+/// (#2413 M2, review round 2) Whether a machine-scoped `machine.telemetry`
+/// emission is due on this tick. The dispatch-owned sampler's outer loop
+/// ticks every `TELEMETRY_SAMPLE_INTERVAL_MS` (2s) for the things that
+/// stay on that cadence (lms diffs, the thermal governor); the
+/// `machine.telemetry` curve itself must honor the operator's configured
+/// `host_sampler_interval_ms()` knob instead of piggybacking on the 2s
+/// tick, or it silently emits ~2.5x more records than the `interval_ms`
+/// it stamps into each one claims. Pure — testable without a real
+/// sampler thread. `last_emit_at_ms` is `None` before the first
+/// emission (always due).
+pub(crate) fn telemetry_emission_due(last_emit_at_ms: Option<u64>, now_at_ms: u64, interval_ms: u64) -> bool {
+    match last_emit_at_ms {
+        None => true,
+        Some(last) => now_at_ms.saturating_sub(last) >= interval_ms,
+    }
+}
 
 /// Granularity at which the sampler re-checks its stop flag while waiting
 /// out a `TELEMETRY_SAMPLE_INTERVAL`. Mirrors the watchdog's 500ms poll:
@@ -5887,6 +5907,11 @@ fn run_telemetry_sampler(
     // last time's measured cost instead of a build-only proxy mislabeled
     // as "the write".
     let mut prev_record_write_ms: Option<u64> = None;
+    // (#2413 M2, review round 2) `at_ms` of the last `machine.telemetry`
+    // EMISSION (not heartbeat) — feeds `telemetry_emission_due` so the
+    // curve honors `machine_sampler_interval_ms` instead of the 2s outer
+    // loop tick. `None` before the first emission.
+    let mut last_telemetry_emit_at_ms: Option<u64> = None;
 
     let mut prev: Vec<darkmux_types::LoadedModel> = Vec::new();
     let mut seeded = false;
@@ -6046,6 +6071,17 @@ fn run_telemetry_sampler(
         // whoever won be the sole emitter, per the "at most one" rule).
         if let Some(guard) = sampler_lock.as_ref() {
             if guard.heartbeat(machine_sampler_interval_ms) {
+                // (#2413 M2, review round 2) The outer loop ticks every
+                // `TELEMETRY_SAMPLE_INTERVAL_MS` (2s) — right for the lms
+                // diffs and thermal governor above, which want fine-grained
+                // sampling, but wrong for the `machine.telemetry` curve,
+                // which must honor the operator's `host_sampler_interval_ms`
+                // knob (`machine_sampler_interval_ms` here) or it silently
+                // emits ~2.5x more records than its own `interval_ms` field
+                // claims. The heartbeat above still runs every tick (cheap,
+                // keeps the lock's staleness window nowhere near tripping);
+                // only the flow-record emission itself is gated.
+                if telemetry_emission_due(last_telemetry_emit_at_ms, at_ms, machine_sampler_interval_ms) {
                 // (#2111 review finding, kept) `at_ms` above is RELATIVE to
                 // this sampler's own start (`started.elapsed()`) — correct
                 // for the reduction math and the thermal governor's gap
@@ -6075,8 +6111,40 @@ fn run_telemetry_sampler(
                 let write_start = Instant::now();
                 let _ = darkmux_flow::record(rec);
                 prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
+                last_telemetry_emit_at_ms = Some(at_ms);
+                }
             } else {
                 sampler_lock = None;
+            }
+        } else if machine_sampler_interval_ms > 0 {
+            // (#2413 C1) Retry every tick even after failing (or never
+            // holding) the lock — a file read every `TELEMETRY_SAMPLE_
+            // INTERVAL_MS` (2s) is cheap, and it means a live dispatch
+            // takes over the machine's sampler role as soon as whoever
+            // held it (typically the daemon) dies mid-run, instead of the
+            // machine going emitter-less until this dispatch happens to
+            // restart. `0` (disabled) never retries, matching the initial
+            // acquire's own `> 0` gate above.
+            // (#2413 C2) `_quiet`: this is the SAME "opportunistic,
+            // usually-declined" shape as the daemon's own per-tick retry
+            // (see `darkmux-serve::host_sampler`'s identical comment) —
+            // recording contention on every routine decline here would
+            // spam `darkmux doctor`'s "two live pids" marker for the
+            // entire duration of any dispatch that starts while the
+            // daemon (or another dispatch) already legitimately holds
+            // the lock, which is the common, correct case.
+            sampler_lock = crate::host_sampler_lock::try_acquire_quiet("dispatch", machine_sampler_interval_ms);
+            if sampler_lock.is_some() {
+                // Fresh acquisition: the next tick's heartbeat branch
+                // above will find `last_telemetry_emit_at_ms` still
+                // reflecting whatever it was before (`None` at dispatch
+                // start, or a stale past value if we previously held and
+                // lost the lock) — either way `telemetry_emission_due`
+                // treats a `None` as always-due, and a stale `Some` from
+                // long before `at_ms` also reads as due, so the newly
+                // reacquired sampler emits promptly rather than waiting a
+                // full stale interval.
+                last_telemetry_emit_at_ms = None;
             }
         }
 

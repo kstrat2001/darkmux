@@ -68,7 +68,6 @@ use crate::flow;
 use crate::coder_phase;
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
-use crew::run_obs;
 use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus, Step};
 use darkmux_types::style;
 use std::any::Any;
@@ -329,29 +328,6 @@ pub(crate) fn mission_bookend_record(
     );
     record.source = Some("mission".to_string());
     record
-}
-
-/// Drain every telemetry sample buffered since the last drain and
-/// backfill `mission_id` onto each — mirrors `run_step_graph`'s own emit
-/// closure's backfill discipline (`record.mission_id.get_or_insert_with`)
-/// below, applied to telemetry the same way the now-deleted dedicated
-/// review launcher's `FleetFlowEmitter` used to backfill it for `review`'s
-/// own samples, so a coder-phase run's telemetry is joinable to its
-/// mission in the viewer — `review` now gets the same joinability through
-/// this same generic path, since it runs through it too.
-///
-/// `pub(crate)` (#1877 QA must-fix 1): shared with `acp_panel::
-/// run_ephemeral`'s own telemetry drain — same backfill discipline, keyed
-/// on that path's minted `correlation_id` instead of a real mission id.
-pub(crate) fn drained_telemetry(telemetry: &run_obs::HostTelemetrySampler, mission_id: &str) -> Vec<flow::FlowRecord> {
-    telemetry
-        .try_drain()
-        .into_iter()
-        .map(|mut sample| {
-            sample.mission_id.get_or_insert_with(|| mission_id.to_string());
-            sample
-        })
-        .collect()
 }
 
 /// (#2131 review round 2, item 5) RAII stop-signal for `launch`'s own
@@ -1151,14 +1127,6 @@ pub fn launch(
     // mandate on its own. With that private construction gone, `review`'s
     // telemetry rides this same shared construction — no double-sampling
     // risk to guard against, since there is only one construction left.
-    let telemetry = run_obs::HostTelemetrySampler::start(
-        mission_id.clone(),
-        config_id.to_string(),
-        run_obs::DEFAULT_TELEMETRY_INTERVAL,
-        run_obs::DEFAULT_TELEMETRY_POLL,
-        crew::telemetry_sampler::sample_host,
-        darkmux_profiles::lms::list_loaded,
-    );
     let mut dispatch_sink = |record: flow::FlowRecord| {
         let _ = flow::record(record);
     };
@@ -1556,9 +1524,6 @@ pub fn launch(
             // handed to `run_step_graph` by itself) — same underlying sink
             // either way (`dispatch_sink` IS `flow::record`), so this is a
             // borrow-driven split, not two different destinations.
-            for sample in drained_telemetry(&telemetry, &mission_id) {
-                let _ = flow::record(sample);
-            }
             let _ = flow::record(record);
         },
         &mut |step| {
@@ -1647,9 +1612,6 @@ pub fn launch(
         guard.close(|| {
             reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e)
         });
-        for sample in drained_telemetry(&telemetry, &mission_id) {
-            bookend.emit_now(sample);
-        }
         bookend.close(
             "dispatch",
             mission_bookend_record(
@@ -1731,9 +1693,6 @@ pub fn launch(
         // gate-reached; see `coder_branch_terminal_bookend`'s own doc for
         // why the bookend record itself keys on `reached_gate` instead.
         let (_reached_gate, record) = coder_branch_terminal_bookend(&outcome, config_id, &mission_id);
-        for sample in drained_telemetry(&telemetry, &mission_id) {
-            bookend.emit_now(sample);
-        }
         bookend.close("dispatch", record);
         emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), success);
         // (#2131) A no-op unless a signal was actually observed — see the
@@ -1828,9 +1787,6 @@ pub fn launch(
     emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), exit_code == 0);
     // (#1877) Explicit close on the gate-less generic finish — the third
     // and last KNOWN exit this guard covers.
-    for sample in drained_telemetry(&telemetry, &mission_id) {
-        bookend.emit_now(sample);
-    }
     bookend.close(
         "dispatch",
         mission_bookend_record(
@@ -6947,61 +6903,6 @@ mod tests {
         assert_eq!(payload["gate"], serde_json::json!("coder-phase"));
     }
 
-    /// `HostTelemetrySampler` itself never stamps `mission_id` (it doesn't
-    /// know one — see its own doc). `drained_telemetry` is the one place
-    /// that backfill happens for the generic launch path, mirroring what
-    /// the now-deleted dedicated review launcher's `FleetFlowEmitter` used
-    /// to do for `review`'s own samples — `review` now gets the same
-    /// backfill through this same generic path. Fast injected cadence (5ms) — same
-    /// discipline `crates/darkmux-crew/src/run_obs.rs`'s own tests use — so
-    /// this doesn't race the real ~600-900ms `top`/`vm_stat`/`ioreg` shells
-    /// against the production 2s cadence `launch` itself uses.
-    #[test]
-    fn drained_telemetry_backfills_mission_id_onto_samples_that_lack_one() {
-        fn fake_sample() -> darkmux_crew::telemetry_sampler::HostSample {
-            darkmux_crew::telemetry_sampler::HostSample { cpu: Some(1), mem: Some(2), gpu: Some(3) }
-        }
-        // (#1877 QA nit) A non-empty `Ok(..)` — NOT `Ok(Vec::new())` — so
-        // `lms_diff`'s first (unseeded) call actually reports a load and
-        // the sampler's `telemetry.lms` half (routed through the SAME
-        // `try_drain` channel `telemetry.process` uses) gets covered too,
-        // not just the process-sample half.
-        fn fake_lms() -> anyhow::Result<Vec<darkmux_types::LoadedModel>> {
-            Ok(vec![darkmux_types::LoadedModel {
-                identifier: "darkmux:fake-model".to_string(),
-                model: "fake-model".to_string(),
-                status: "loaded".to_string(),
-                size: "1GB".to_string(),
-                context: 4096,
-            }])
-        }
-        let telemetry = run_obs::HostTelemetrySampler::start(
-            "case".to_string(),
-            "crew".to_string(),
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(2),
-            fake_sample,
-            fake_lms,
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let samples = drained_telemetry(&telemetry, "mission-xyz");
-        assert!(!samples.is_empty(), "no sample landed within 200ms (40x the 5ms cadence) — sampler did not run");
-        assert!(
-            samples.iter().any(|s| s.action == "telemetry.process"),
-            "expected at least one `telemetry.process` sample: {samples:#?}"
-        );
-        assert!(
-            samples.iter().any(|s| s.action == "telemetry.lms"),
-            "expected at least one `telemetry.lms` sample (the fake resident model should have \
-             produced a load diff on the first, unseeded call): {samples:#?}"
-        );
-        assert!(
-            samples.iter().all(|s| s.mission_id.as_deref() == Some("mission-xyz")),
-            "every drained sample of EVERY kind must carry the backfilled mission_id: {samples:#?}"
-        );
-        drop(telemetry);
-    }
-
     /// (#1877 "Bookends fire on a panic") Mirrors `darkmux_flow::bookend`'s
     /// own `panic_while_armed_still_fires_the_abort_record` test, but
     /// exercises the EXACT construction `launch` uses (`mission_bookend_
@@ -7050,35 +6951,29 @@ mod tests {
         assert_eq!(records[1].source.as_deref(), Some("mission"));
     }
 
-    /// (#1877 QA should-fix 6) `read_all_flow_records`-based tests can only
-    /// observe telemetry SAMPLES landing at the real 2s production cadence
-    /// (`run_obs.rs`'s own "sleep first, then sample" design deliberately
-    /// makes that impossible to race in a sub-second test — see this
-    /// module's `drained_telemetry_backfills_...` test, which uses an
-    /// injected fast cadence instead). So nothing in this file's `launch_*`
-    /// tests would notice all four `drained_telemetry(&telemetry, ...)`
-    /// call sites being deleted from `launch` — a real, silent way to lose
-    /// telemetry interleaving without any test going red. Pin the call
-    /// SITE COUNT as a cheap structural backstop: one per exit
-    /// (`run_step_graph`'s own emit closure, the scheduler-error return,
-    /// the coder-gate return, and the gate-less finish).
+    /// (#2413 M3) The retired per-dispatch process sampler had a standalone
+    /// constructor call this file used to make, and its curve had a
+    /// dedicated action string this file used to emit. One machine-scoped
+    /// sampler now owns that emission (see `host_sampler_lock.rs`), and
+    /// this file must never grow either back. A source tripwire, not a
+    /// runtime assertion — nothing in this file's `launch_*` tests
+    /// exercises the real 2s production sampler cadence (see the
+    /// now-deleted backfill test's own doc for why a regression here would
+    /// otherwise ship silently). Mirrors `dispatch_internal_tests.rs`'s own
+    /// retired-action-string tripwire; the needles below are built from
+    /// split pieces so this test's OWN source doesn't self-match.
     #[test]
-    fn launch_drains_telemetry_at_every_emission_point_and_every_exit() {
+    fn mission_launch_never_reintroduces_the_retired_process_sampler() {
         const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mission_launch.rs"));
-        // Built via `concat!` (not a plain string literal) so this test's
-        // OWN source line — which necessarily names the exact call shape
-        // it's counting — doesn't self-match and inflate the count by one,
-        // the same idiom `mission_launch_review_and_review_bench_construct_
-        // graphs_through_the_same_launcher`'s `run_needle` used for the
-        // identical reason, in the now-deleted `mission_launch_review.rs`
-        // (#2310 P4d-1).
-        let needle = concat!("drained_telemetry(&telemetry, ", "&mission_id)");
-        let count = SRC.matches(needle).count();
-        assert_eq!(
-            count, 4,
-            "expected exactly 4 call sites of `{needle}` in mission_launch.rs (the run_step_graph \
-             emit closure + the 3 known exit points) — got {count}. If this changed on purpose, \
-             update this count; if not, telemetry interleaving silently regressed somewhere."
+        let sampler_ctor_needle = concat!("Host", "TelemetrySampler::start");
+        assert!(
+            !SRC.contains(sampler_ctor_needle),
+            "mission_launch.rs must not construct the retired per-dispatch sampler (#2413)"
+        );
+        let action_needle = concat!("\"telemetry", ".process\"");
+        assert!(
+            !SRC.contains(action_needle),
+            "mission_launch.rs must not emit the retired process-sampler action string (#2413)"
         );
     }
 

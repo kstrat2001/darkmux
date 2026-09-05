@@ -840,19 +840,19 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.42.0";
 //               1.38.0 is days old, unreleased, and had no consumers
 //               outside this repo.
 //
-//   1.42.0 (#2413): `telemetry.process` RETIRED from the container-loop
-//           dispatch path — `dispatch_internal::run_telemetry_sampler`
-//           (the per-dispatch, 2s-cadence CPU/mem/gpu-only emitter this
-//           issue measured at 37,455 records/day) no longer writes it.
-//           **Known remaining producer, explicitly OUT OF this bump's
-//           scope:** `darkmux_crew::run_obs::HostTelemetrySampler` — an
-//           older, separate mechanism (shells to `top`/`vm_stat`/`ioreg`)
-//           used by `mission_launch.rs` (mission-level runs), `acp_panel.rs`
-//           (ACP sessions), and (until its own deletion, tracked
-//           separately) `darkmux-lab::lab::review`'s pipeline — still
-//           writes `telemetry.process` at this version. A reader still
-//           sees it, from both this producer and historical (pre-1.42.0)
-//           day files — lenient-on-read either way, no migration.
+//   1.42.0 (#2413): `telemetry.process` RETIRED, full stop — no producer
+//           writes it at this version. `dispatch_internal::
+//           run_telemetry_sampler` (the per-dispatch, 2s-cadence
+//           CPU/mem/gpu-only emitter this issue measured at 37,455
+//           records/day) was the first to go; round 2 of the same issue
+//           deleted the other remaining producer, `darkmux_crew::
+//           run_obs::HostTelemetrySampler` (and the type itself, along
+//           with `RunObs` — both had no caller left once `mission_launch.
+//           rs`, `acp_panel.rs`, and `darkmux-lab::lab::review`'s pipeline
+//           each stopped constructing one). A reader may still see the
+//           action from historical (pre-1.42.0) day files —
+//           lenient-on-read, no migration — but nothing in this version
+//           of the binary can produce a new one.
 //
 //           `machine.telemetry` becomes MACHINE-scoped: it is now emitted
 //           by exactly ONE process per machine (the daemon's host sampler,

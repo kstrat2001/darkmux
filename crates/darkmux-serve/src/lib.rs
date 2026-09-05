@@ -3142,7 +3142,17 @@ async fn catalog_records_response(
         // through to replay it returns zero records: a dead end created by
         // making the mission visible in the first place.
         let fleet = fleet_flow_records();
-        let (records, truncated) = collect_records_by_field(&dir, &fleet.records, field, &id);
+        let (mut records, truncated) = collect_records_by_field(&dir, &fleet.records, field, &id);
+        // (#2413 M4) A session's own record set carries no host cpu/ram/gpu
+        // samples any more — M3 retired the per-dispatch `telemetry.process`
+        // producer that used to write them WITH this session's `session_id`.
+        // Join the machine-scoped replacement back in by time before this
+        // response goes out, so the run-detail SYSTEM pane (which reads
+        // this same session-scoped record set) doesn't have to learn a
+        // second fetch.
+        if field == "session_id" {
+            join_host_samples_into_session_records(&dir, &fleet.records, &mut records);
+        }
         (records, truncated, fleet.state)
     })
     .await
@@ -3218,6 +3228,62 @@ fn collect_records_by_field(
         ts(a).cmp(&ts(b))
     });
     (records, truncated)
+}
+
+/// (#2413 M4) After [`collect_records_by_field`] gathers a session's own
+/// records, join the machine-scoped `machine.telemetry` samples covering
+/// its run window back in — see [`runs::is_host_sample_in_window`]'s own
+/// doc for why a time+machine join replaced the old session_id match.
+/// A no-op when the session carries no `machine_uid` (pre-#2413 historical
+/// records, or a record shape this join can't key on) or no parsable
+/// `dispatch.start` — the run-detail pane's own "no host samples" tile
+/// covers that case, not a synthesized window here.
+fn join_host_samples_into_session_records(
+    flows_dir: &std::path::Path,
+    fleet: &[serde_json::Value],
+    records: &mut Vec<serde_json::Value>,
+) {
+    let Some(machine_uid) =
+        records.iter().find_map(|r| r.get("machine_uid").and_then(|m| m.as_str()).map(str::to_string))
+    else {
+        return;
+    };
+    let is_start = |r: &serde_json::Value| r.get("action").and_then(|a| a.as_str()) == Some("dispatch.start");
+    let is_terminal = |r: &serde_json::Value| {
+        matches!(
+            r.get("action").and_then(|a| a.as_str()),
+            Some("dispatch.complete") | Some("dispatch.error") | Some("session.end")
+        )
+    };
+    let ts_ms = |r: &serde_json::Value| -> Option<u64> {
+        r.get("ts").and_then(|t| t.as_str()).and_then(runs::parse_flow_ts).map(|secs| secs.saturating_mul(1000))
+    };
+    let Some(start_ms) = records.iter().filter(|r| is_start(r)).filter_map(ts_ms).min() else {
+        return;
+    };
+    let end_ms = records.iter().filter(|r| is_terminal(r)).filter_map(ts_ms).max().unwrap_or(u64::MAX);
+    let mut joined: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for v in fleet {
+        if runs::is_host_sample_in_window(v, &machine_uid, start_ms, end_ms) {
+            seen.insert(flow_record_identity(v));
+            joined.push(v.clone());
+        }
+    }
+    for_each_flow_record_across_days(flows_dir, |_date, v| {
+        if runs::is_host_sample_in_window(v, &machine_uid, start_ms, end_ms) && !seen.contains(&flow_record_identity(v)) {
+            joined.push(v.clone());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    if joined.is_empty() {
+        return;
+    }
+    records.extend(joined);
+    records.sort_by(|a, b| {
+        let ts = |r: &serde_json::Value| r.get("ts").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+        ts(a).cmp(&ts(b))
+    });
 }
 
 /// Aggregate the day's flow records — Redis-when-available, file-otherwise.

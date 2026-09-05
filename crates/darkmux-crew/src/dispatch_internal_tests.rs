@@ -3,6 +3,19 @@
     use std::io::Write;
     use tempfile::TempDir;
 
+    // ─── #2413 M2 (review round 2): telemetry_emission_due honors the knob ─
+
+    #[test]
+    fn telemetry_emission_due_honors_the_knob_not_the_2s_tick() {
+        // 2s outer-loop tick, 5s host_sampler_interval_ms knob: emission
+        // must land only every 5s, not every 2s tick.
+        assert!(telemetry_emission_due(None, 0, 5000), "first tick is always due");
+        assert!(!telemetry_emission_due(Some(0), 2000, 5000), "one 2s tick in: not yet 5s");
+        assert!(!telemetry_emission_due(Some(0), 4000, 5000), "two 2s ticks in: still not 5s");
+        assert!(telemetry_emission_due(Some(0), 5000, 5000), "exactly the knob: due");
+        assert!(telemetry_emission_due(Some(0), 6000, 5000), "past the knob: due");
+    }
+
     // ─── #1405 review: operator identity is local-only ────────────────────
 
     #[test]

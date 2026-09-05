@@ -76,7 +76,22 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Process-local guard against a same-process race (#2413 M1). The file
+/// lock's identity is the OS pid — but `concurrent_dispatch.rs` runs
+/// parallel units as THREADS in one process, so every thread shares the
+/// same real pid. Without this, a second in-process `try_acquire` fell
+/// through the `existing.pid == my_pid` branch in `try_acquire_with_pid`
+/// and happily re-acquired, so every thread believed it owned the
+/// sampler — and the first one's `Drop` deleted the lock file out from
+/// under the rest, leaving zero emitters for the remainder of the run.
+/// Only the REAL entry point (`try_acquire`) touches this flag; the
+/// test-only `try_acquire_as_for_test` deliberately bypasses it, since it
+/// exists specifically to simulate a genuinely DIFFERENT process sharing
+/// this test binary's real pid.
+static PROCESS_OWNS_LOCK: AtomicBool = AtomicBool::new(false);
 
 /// A lock stays stale-eligible-for-stealing once its heartbeat is older
 /// than this many times its own declared `interval_ms`. Matches the
@@ -113,6 +128,11 @@ pub struct ContentionInfo {
 /// staleness/dead-pid reclaim to find.
 pub struct SamplerLockGuard {
     pid: u32,
+    /// Whether this guard is responsible for clearing
+    /// [`PROCESS_OWNS_LOCK`] on drop — true only for guards minted by the
+    /// real `try_acquire()` entry point (never the test-only
+    /// `try_acquire_as_for_test`, which simulates a different process).
+    owns_process_flag: bool,
 }
 
 impl SamplerLockGuard {
@@ -140,6 +160,9 @@ impl Drop for SamplerLockGuard {
             if state.pid == self.pid {
                 let _ = fs::remove_file(lock_path());
             }
+        }
+        if self.owns_process_flag {
+            PROCESS_OWNS_LOCK.store(false, Ordering::Release);
         }
     }
 }
@@ -217,7 +240,8 @@ fn write_lock_state(state: &LockState) -> Result<()> {
     let path = lock_path();
     let dir = path.parent().context("lock path has no parent directory")?;
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let tmp = dir.join(format!("host-sampler.lock.{}.tmp", state.pid));
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let tmp = dir.join(format!("host-sampler.lock.{}.{}.tmp", state.pid, nonce));
     let json = serde_json::to_string_pretty(state).context("serializing host-sampler lock")?;
     fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, &path).with_context(|| format!("renaming lock into place at {}", path.display()))?;
@@ -265,7 +289,47 @@ fn record_contention(declined_pid: u32, declined_owner: &str, observed_holder_pi
 /// Returns `None` when a different, alive, fresh-heartbeat pid already
 /// holds it (and best-effort records contention for `darkmux doctor`).
 pub fn try_acquire(owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
-    try_acquire_with_pid(std::process::id(), owner, interval_ms)
+    try_acquire_named(owner, interval_ms, true)
+}
+
+/// (#2413 C2) Same as [`try_acquire`], but for an OPPORTUNISTIC per-tick
+/// retry that already expects to be declined most of the time — the
+/// daemon's own steady-state loop re-probes every tick purely to notice
+/// when a dispatch that held the lock has since exited, and a dispatch's
+/// own C1 retry does the same when it doesn't currently hold it. Neither
+/// case is a genuine race worth flagging: a fresh, alive lock declining
+/// this call is the CORRECT, expected steady state whenever something
+/// else legitimately holds the sampler role, not contention. Recording it
+/// anyway would make `darkmux doctor`'s "two live pids" check fire
+/// constantly during ordinary, healthy operation. Only a caller's
+/// FIRST/explicit acquisition attempt (plain [`try_acquire`]) still
+/// records contention — that one genuinely does indicate two things
+/// wanting the role at the same moment.
+pub fn try_acquire_quiet(owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
+    try_acquire_named(owner, interval_ms, false)
+}
+
+fn try_acquire_named(owner: &str, interval_ms: u64, record_on_decline: bool) -> Option<SamplerLockGuard> {
+    // Claim the process-local slot FIRST (#2413 M1) — a second thread in
+    // this same process must be declined before it ever touches the file,
+    // matching the file-lock's own "decline, don't merge" semantics.
+    if PROCESS_OWNS_LOCK.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return None;
+    }
+    match try_acquire_with_pid(std::process::id(), owner, interval_ms, record_on_decline) {
+        Some(mut guard) => {
+            guard.owns_process_flag = true;
+            Some(guard)
+        }
+        None => {
+            // The file-level acquire lost (e.g. a genuinely different,
+            // alive process holds it) — release the process-local claim
+            // we optimistically took so a later call in this process can
+            // still try.
+            PROCESS_OWNS_LOCK.store(false, Ordering::Release);
+            None
+        }
+    }
 }
 
 /// Test-only: same as [`try_acquire`], but with an EXPLICIT `my_pid`
@@ -278,16 +342,31 @@ pub fn try_acquire(owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
 /// (which — for a lock this same test process wrote — genuinely is alive).
 #[cfg(any(test, feature = "test-support"))]
 pub fn try_acquire_as_for_test(my_pid: u32, owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
-    try_acquire_with_pid(my_pid, owner, interval_ms)
+    // Deliberately bypasses PROCESS_OWNS_LOCK — this helper simulates a
+    // DIFFERENT process (a distinct simulated pid) sharing the real test
+    // binary's pid, so the real process's in-process singleton must not
+    // apply to it.
+    try_acquire_with_pid(my_pid, owner, interval_ms, true)
 }
 
-fn try_acquire_with_pid(my_pid: u32, owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
+/// Test-only: the quiet (non-contention-recording) counterpart of
+/// [`try_acquire_as_for_test`] — exercises [`try_acquire_quiet`]'s file-
+/// level behavior with an explicit simulated pid, same rationale as its
+/// contention-recording sibling.
+#[cfg(any(test, feature = "test-support"))]
+pub fn try_acquire_quiet_as_for_test(my_pid: u32, owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
+    try_acquire_with_pid(my_pid, owner, interval_ms, false)
+}
+
+fn try_acquire_with_pid(my_pid: u32, owner: &str, interval_ms: u64, record_on_decline: bool) -> Option<SamplerLockGuard> {
     if let Some(existing) = read_lock() {
         if existing.pid != my_pid {
             let alive = pid_alive(existing.pid);
             let stale = is_stale(&existing, epoch_ms());
             if alive && !stale {
-                record_contention(my_pid, owner, existing.pid);
+                if record_on_decline {
+                    record_contention(my_pid, owner, existing.pid);
+                }
                 return None;
             }
         }
@@ -311,7 +390,7 @@ fn try_acquire_with_pid(my_pid: u32, owner: &str, interval_ms: u64) -> Option<Sa
     // doc) by re-reading immediately. If someone else's write landed after
     // ours, back off rather than proceed believing we hold it.
     match read_lock() {
-        Some(after) if after.pid == my_pid => Some(SamplerLockGuard { pid: my_pid }),
+        Some(after) if after.pid == my_pid => Some(SamplerLockGuard { pid: my_pid, owns_process_flag: false }),
         _ => None,
     }
 }
@@ -344,6 +423,38 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn a_second_in_process_acquire_with_the_real_pid_is_declined() {
+        // (#2413 M1) Same-process parallel dispatches (concurrent_dispatch.rs
+        // runs sibling units as THREADS in one process) all carry the SAME
+        // real OS pid, so the file-lock's pid comparison alone can't tell
+        // them apart. Before the process-local guard, a second `try_acquire`
+        // in this process fell through the `existing.pid == my_pid` branch
+        // and happily re-acquired, making every thread believe it owns the
+        // sampler.
+        with_isolated_home(|| {
+            let first = try_acquire("daemon", 5000).expect("first acquire in this process succeeds");
+            let second = try_acquire("dispatch", 5000);
+            assert!(second.is_none(), "a second in-process acquire with the real pid must be declined");
+            // The first holder's lock file is untouched by the declined attempt.
+            let state = read_lock().expect("first holder's lock file still present");
+            assert_eq!(state.pid, std::process::id());
+            drop(first);
+            assert!(read_lock().is_none(), "dropping the sole holder removes the file");
+        });
+    }
+
+    #[test]
+    fn releasing_the_first_in_process_holder_lets_a_later_acquire_succeed() {
+        with_isolated_home(|| {
+            let first = try_acquire("daemon", 5000).expect("first acquire succeeds");
+            assert!(try_acquire("dispatch", 5000).is_none(), "declined while first still holds it");
+            drop(first);
+            let second = try_acquire("dispatch", 5000);
+            assert!(second.is_some(), "the process-local guard is released on Drop, so a later acquire can succeed");
+        });
     }
 
     #[test]
@@ -474,6 +585,25 @@ mod tests {
             drop(guard);
             let after = read_lock().expect("a lock still exists");
             assert_eq!(after.pid, 424_242, "the other process's lock must survive our Drop");
+        });
+    }
+
+    #[test]
+    fn quiet_acquire_declined_by_a_live_holder_does_not_record_contention() {
+        // (#2413 C2) The daemon's opportunistic per-tick retry (and the
+        // dispatch-side C1 retry) probes every tick regardless of whether
+        // anything else holds the lock — that is the CORRECT, expected
+        // steady state whenever a dispatch legitimately holds it, not a
+        // genuine race. Recording contention on every one of those
+        // routine declines would make `darkmux doctor`'s "two live pids"
+        // check fire constantly during ordinary, healthy operation.
+        with_isolated_home(|| {
+            let holder = try_acquire("daemon", 5000).expect("first holder acquires");
+            let other_pid = std::process::id().wrapping_add(1);
+            let declined = try_acquire_quiet_as_for_test(other_pid, "dispatch", 5000);
+            assert!(declined.is_none(), "a fresh lock held by a different alive pid is still not stealable");
+            assert!(read_contention().is_none(), "the quiet path must not record contention on decline");
+            drop(holder);
         });
     }
 

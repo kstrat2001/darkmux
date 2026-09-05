@@ -147,7 +147,11 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     // drop is applied (see `SessionReplay.tsx`'s comment on `endedByPresence`)
     // — read the settled value, then assert nothing moves it after that.
     const frozen = wallText();
-    expect(frozen).toBe("9:57 so far0");
+    // (#2413 M4) The trailing "—" is the explicit HOST tile's value — this
+    // fixture has model work but no host telemetry, so the pane now says so
+    // instead of silently omitting the tile (see sessionRun.ts's own test
+    // for the same behavior in isolation).
+    expect(frozen).toBe("9:57 so far0—");
     act(() => {
       vi.advanceTimersByTime(30_000);
     });

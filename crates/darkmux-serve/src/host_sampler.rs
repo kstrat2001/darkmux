@@ -43,7 +43,7 @@ use darkmux_crew::telemetry_sampler::{reduce_host_stats, HostSampleAt};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 10 minutes of history at the default 5s cadence. The ring is capacity-
 /// bounded by ENTRY COUNT, not by wall-clock span — at a faster-than-default
@@ -400,6 +400,17 @@ pub(crate) fn spawn(
         // `interval_ms` unconditionally per the issue's "the ring keeps
         // sampling at the configured rate regardless" rule.
         let mut ticks_since_emit: u64 = 0;
+        // (#2413 C3) The live-vs-idle decision, cached across ticks —
+        // `any_dispatch_live_locally` parses the WHOLE day's flow file, so
+        // this used to run every tick (every `interval_ms`, typically
+        // 5s). Re-probing only right before an actual emission (below)
+        // cuts that to once per emission instead. One EAGER probe here,
+        // before the loop's first iteration, so the very first emission
+        // still reflects the real live/idle state rather than a hardcoded
+        // guess — every later re-probe happens right before the emission
+        // it gates, same as the steady-state case.
+        let mut cached_live =
+            crate::runs::any_dispatch_live_locally(darkmux_crew::host_probe::epoch_ms_now(), crate::runs::stale_after_ms());
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 break;
@@ -421,13 +432,20 @@ pub(crate) fn spawn(
                 let _ = darkmux_flow::record(rec);
             }
 
-            // (#2413) Opportunistically (re)acquire the singleton lock
-            // every tick this thread doesn't already hold it — a dispatch
-            // process that held it may have exited (releasing it via its
-            // own `Drop`) since our last attempt, freeing the machine up
-            // for the daemon to take over as the steady-state emitter.
+            // (#2413, C2) Opportunistically (re)acquire the singleton
+            // lock every tick this thread doesn't already hold it — a
+            // dispatch process that held it may have exited (releasing it
+            // via its own `Drop`) since our last attempt, freeing the
+            // machine up for the daemon to take over as the steady-state
+            // emitter. `_quiet`: a fresh, alive lock declining this call
+            // is the CORRECT, expected steady state whenever a dispatch
+            // legitimately holds the sampler role — not a race — so this
+            // must not feed `darkmux doctor`'s "two live pids" contention
+            // marker, or that check would fire constantly during ordinary
+            // healthy operation (a daemon idly deferring to a live
+            // dispatch, every tick, for as long as the dispatch runs).
             if sampler_lock.is_none() {
-                sampler_lock = darkmux_crew::host_sampler_lock::try_acquire("daemon", interval_ms);
+                sampler_lock = darkmux_crew::host_sampler_lock::try_acquire_quiet("daemon", interval_ms);
             }
             if let Some(guard) = sampler_lock.as_ref() {
                 if guard.heartbeat(interval_ms) {
@@ -439,16 +457,32 @@ pub(crate) fn spawn(
                     // above regardless — only the FLOW-RECORD WRITE is
                     // gated, per the observer-cost rule (the sample is
                     // already taken; only the write is the added cost).
-                    let live = crate::runs::any_dispatch_live_locally(at_ms, crate::runs::stale_after_ms());
-                    let emit_every_n_ticks = if live { 1 } else { IDLE_EMIT_MULTIPLIER };
+                    // (#2413 C3) `cached_live` drives THIS tick's
+                    // threshold check — the fresh probe (measured below)
+                    // only runs right before an actual emission, so a
+                    // live/idle transition is caught with at most one
+                    // extra cycle's delay rather than costing a full
+                    // day-file parse on every tick.
+                    let emit_every_n_ticks = if cached_live { 1 } else { IDLE_EMIT_MULTIPLIER };
                     if ticks_since_emit >= emit_every_n_ticks {
                         ticks_since_emit = 0;
+                        let probe_start = Instant::now();
+                        cached_live = crate::runs::any_dispatch_live_locally(at_ms, crate::runs::stale_after_ms());
+                        let liveness_probe_ms = probe_start.elapsed().as_millis() as u64;
                         let effective_interval_ms = interval_ms.saturating_mul(emit_every_n_ticks);
-                        let rec = darkmux_crew::host_probe::build_machine_scoped_telemetry_record(
+                        let mut rec = darkmux_crew::host_probe::build_machine_scoped_telemetry_record(
                             &sample,
                             at_ms,
                             effective_interval_ms,
                         );
+                        // (CLAUDE.md "samplers stamp their own cost") The
+                        // liveness probe this emission's cadence decision
+                        // depended on is part of this record's own write
+                        // cost — stamped so "the observer was negligible"
+                        // stays a verifiable claim in the data.
+                        if let Some(obj) = rec.payload.as_mut().and_then(|p| p.as_object_mut()) {
+                            obj.insert("liveness_probe_ms".into(), serde_json::json!(liveness_probe_ms));
+                        }
                         let _ = darkmux_flow::record(rec);
                     }
                 } else {
@@ -738,6 +772,11 @@ mod tests {
             let payload = &rec["payload"];
             assert!(payload["sampled_at_ms"].is_u64(), "carries sampled_at_ms: {payload}");
             assert!(payload["interval_ms"].is_u64(), "carries the effective interval_ms: {payload}");
+            // (#2413 C3) The liveness probe this emission's cadence
+            // decision depended on stamps its own cost — "the observer was
+            // negligible" stays a verifiable claim in the data rather than
+            // an assumption (CLAUDE.md's samplers-stamp-their-own-cost rule).
+            assert!(payload["liveness_probe_ms"].is_u64(), "carries liveness_probe_ms: {payload}");
         });
     }
 

@@ -162,6 +162,7 @@ pub fn run() -> DoctorReport {
         check_redis_config(),
         check_gh_allowlist(),
         check_removed_review_config_block(),
+        check_removed_telemetry_record_every_samples(),
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
@@ -1740,6 +1741,37 @@ fn check_removed_review_config_block() -> Check {
         hint: Some(
             "the review funnel this block configured was deleted in #2310 P4d; remove the \
              `review` block from ~/.darkmux/config.json — it is read leniently but has no effect"
+                .into(),
+        ),
+    }
+}
+
+/// (#2413 M5) `runtime.telemetry_record_every_samples` is retired — the
+/// per-dispatch `machine.telemetry` curve it configured a downsample rate
+/// for is gone (one machine-scoped sampler now owns that emission). Same
+/// shape as `check_removed_review_config_block` just above: `Pass` when
+/// absent (including a fresh `with_defaults()` config), `Warn` naming the
+/// key and telling the operator to delete it when present.
+fn check_removed_telemetry_record_every_samples() -> Check {
+    let name = "runtime.telemetry_record_every_samples (removed)";
+    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
+    let present = cfg
+        .runtime
+        .as_ref()
+        .is_some_and(|r| r.extras.contains_key("telemetry_record_every_samples"));
+    if !present {
+        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: "config.json has `runtime.telemetry_record_every_samples` — retired in CONFIG 1.22; \
+                  delete it from config.json"
+            .into(),
+        hint: Some(
+            "the per-dispatch machine.telemetry curve it downsampled is gone (#2413) — remove \
+             `telemetry_record_every_samples` from the `runtime` block in ~/.darkmux/config.json; \
+             it is read leniently but has no effect"
                 .into(),
         ),
     }
@@ -6913,6 +6945,76 @@ mod tests {
         );
     }
 
+    // ─── (#2413 M5) check_removed_telemetry_record_every_samples ──────────
+
+    #[serial_test::serial]
+    #[test]
+    fn check_telemetry_record_every_samples_removed_passes_when_absent() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("config.json"), r#"{"schema_version":"1.22"}"#).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_removed_telemetry_record_every_samples();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_telemetry_record_every_samples_removed_passes_against_with_defaults() {
+        use darkmux_types::config::DarkmuxConfig;
+        let home = tempfile::TempDir::new().unwrap();
+        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
+        std::fs::write(home.path().join("config.json"), contents).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_removed_telemetry_record_every_samples();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "with_defaults() must never itself trip the removed-key warning: {}",
+            check.message
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_telemetry_record_every_samples_warns_and_names_the_key_when_present() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"schema_version":"1.21","runtime":{"telemetry_record_every_samples":30}}"#,
+        )
+        .unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_removed_telemetry_record_every_samples();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("telemetry_record_every_samples"), "names the key: {}", check.message);
+        assert!(
+            check.message.contains("1.22"),
+            "names the schema version it was retired in: {}",
+            check.message
+        );
+    }
+
     // ─── (#2413) check_host_sampler — singleton lock Pass/Warn/Warn ───
 
     /// Isolate `host_sampler_lock_path()` to a fresh tempdir for the
@@ -8296,22 +8398,22 @@ mod tests {
         // hooks checks are a different, disabled-by-default surface] + one
         // per active eureka rule.
         //
-        // (round-3 merge fix) The constant here is 54, not 53: the static
-        // array above literally has 53 entries (recount it before touching
-        // this number — `grep -c` inside the `let checks = vec![...]`
-        // block), `check_hooks()` always contributes exactly 1 more
-        // (disabled by default → the single overview check), and only
-        // THEN does `eureka_checks()` add one per active rule. A prior
-        // rebase kept an origin/main-side "53" that predated this branch's
-        // own `check_runtime_binary_cache` addition to the static array,
-        // silently undercounting by exactly the one check the OTHER side
-        // of that same merge conflict had just added — proof that a
-        // colliding-file rebase needs its literal counts re-derived, not
-        // just its prose reconciled.
+        // (round-3 merge fix) The constant here is 55, not 54: #2413 M5
+        // added `check_removed_telemetry_record_every_samples` to the
+        // static array (recount it before touching this number — `grep -c`
+        // inside the `let checks = vec![...]` block), `check_hooks()`
+        // always contributes exactly 1 more (disabled by default → the
+        // single overview check), and only THEN does `eureka_checks()` add
+        // one per active rule. A prior rebase kept an origin/main-side
+        // "53" that predated this branch's own `check_runtime_binary_cache`
+        // addition to the static array, silently undercounting by exactly
+        // the one check the OTHER side of that same merge conflict had
+        // just added — proof that a colliding-file rebase needs its
+        // literal counts re-derived, not just its prose reconciled.
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 54 + darkmux_eureka::all_rules().len();
+        let expected = 55 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

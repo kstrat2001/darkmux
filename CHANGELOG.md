@@ -30,6 +30,19 @@ darkmux release.
 - `mode`/`envelope_out` are accepted on `review` for CLI-surface parity
   with the retired funnel launcher but IGNORED, with a warning when
   supplied.
+- **One host sampler per machine** ([#2413](https://github.com/kstrat2001/darkmux/issues/2413)). `telemetry.process`
+  (the per-dispatch, 2s-cadence CPU/mem/gpu emitter) is RETIRED — FLOW
+  1.42.0 — and `machine.telemetry` becomes machine-scoped: exactly one
+  process per machine (the daemon, or a live dispatch when no daemon
+  runs, arbitrated by a cross-process singleton lock) emits it, at the
+  operator's configured `runtime.host_sampler_interval_ms` cadence. A
+  run's SYSTEM pane now joins to the machine-scoped curve by
+  `machine_uid` + a time window instead of by session. Same-process
+  parallel dispatches (a crawl's sibling units) no longer all believe
+  they own the sampler.
+- `CONFIG_SCHEMA_VERSION` 1.22 also drops `runtime.telemetry_record_every_samples`
+  — the per-dispatch downsample knob it configured has nothing left to
+  configure. Read leniently; `darkmux doctor` warns on it.
 
 ### Removed
 

@@ -1878,6 +1878,33 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
+/// (#2413 M4) Whether a raw flow record `v` is a `machine.telemetry`
+/// sample that belongs to a run's SYSTEM pane: same `machine_uid`,
+/// timestamped inside `[start_ms, end_ms]`. M3 retired the per-dispatch
+/// `telemetry.process` producer these CPU/RAM/GPU tiles used to read
+/// directly (a record carrying the run's own `session_id`) — the
+/// machine-scoped replacement carries no `session_id` at all, so a
+/// consumer must join it in BY TIME instead. Pure over one record + the
+/// window bounds so it's testable without exercising the day-file walk
+/// `join_host_samples_into_session_records` (`lib.rs`) wraps this in.
+pub(crate) fn is_host_sample_in_window(v: &serde_json::Value, machine_uid: &str, start_ms: u64, end_ms: u64) -> bool {
+    if v.get("action").and_then(|a| a.as_str()) != Some("machine.telemetry") {
+        return false;
+    }
+    if v.get("machine_uid").and_then(|m| m.as_str()) != Some(machine_uid) {
+        return false;
+    }
+    let Some(ts_ms) = v
+        .get("ts")
+        .and_then(|t| t.as_str())
+        .and_then(parse_flow_ts)
+        .map(|secs| secs.saturating_mul(1000))
+    else {
+        return false;
+    };
+    ts_ms >= start_ms && ts_ms <= end_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1891,6 +1918,38 @@ mod tests {
     #[test]
     fn parse_flow_ts_epoch_zero() {
         assert_eq!(parse_flow_ts("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    // ── is_host_sample_in_window (#2413 M4) ─────────────────────────────
+
+    fn host_sample(machine_uid: &str, ts: &str) -> serde_json::Value {
+        serde_json::json!({ "action": "machine.telemetry", "machine_uid": machine_uid, "ts": ts })
+    }
+
+    #[test]
+    fn is_host_sample_in_window_true_when_machine_and_time_match() {
+        let v = host_sample("m-1", "1970-01-01T00:00:05Z");
+        assert!(is_host_sample_in_window(&v, "m-1", 0, 10_000));
+    }
+
+    #[test]
+    fn is_host_sample_in_window_false_for_a_different_machine() {
+        let v = host_sample("m-2", "1970-01-01T00:00:05Z");
+        assert!(!is_host_sample_in_window(&v, "m-1", 0, 10_000));
+    }
+
+    #[test]
+    fn is_host_sample_in_window_false_outside_the_time_bounds() {
+        let before = host_sample("m-1", "1970-01-01T00:00:00Z");
+        let after = host_sample("m-1", "1970-01-01T00:00:20Z");
+        assert!(!is_host_sample_in_window(&before, "m-1", 5_000, 10_000));
+        assert!(!is_host_sample_in_window(&after, "m-1", 5_000, 10_000));
+    }
+
+    #[test]
+    fn is_host_sample_in_window_false_for_a_non_telemetry_action() {
+        let v = serde_json::json!({ "action": "dispatch.start", "machine_uid": "m-1", "ts": "1970-01-01T00:00:05Z" });
+        assert!(!is_host_sample_in_window(&v, "m-1", 0, 10_000));
     }
 
     #[test]
