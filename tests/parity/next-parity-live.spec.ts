@@ -125,6 +125,57 @@ async function installHangingStream(page, matchesStreamPath) {
   });
 }
 
+// (#2416) The event filter now defaults to model activity only, and the
+// `flow.note` record this suite delivers over SSE is an activity the default
+// hides, so the count never rose. These goldens freeze RENDER parity of the events list, not the
+// filter default, so the spec seeds the operator's "everything on" picks
+// exactly as the e2e mission-lens specs do (one global stored payload,
+// version 2). The default itself is pinned by event-log-filters-default.spec.
+const SHOW_ALL_ACTIVITIES = [
+  'reasoning',
+  'checkpoint',
+  'tool call',
+  'turn',
+  'heartbeat',
+  'dispatch start',
+  'dispatch end',
+  'dispatch error',
+  'feedback',
+  'routing',
+  'compaction',
+  'note',
+  'machine online',
+  'machine offline',
+  'session end',
+  'detector',
+  'runtime',
+  'tokens',
+  'lms',
+  'host telemetry',
+  'telemetry',
+  'other',
+  'step start',
+  'phase start',
+  'mission start',
+  'step complete',
+  'phase complete',
+  'mission close',
+  'step result',
+  'step timing',
+];
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript((acts: string[]) => {
+    window.sessionStorage.setItem("dmux.eventfilters", JSON.stringify({
+      version: 2,
+      act: { include: acts, exclude: [] },
+      cat: { include: [], exclude: [] },
+      tier: { include: [], exclude: [] },
+      src: { include: [], exclude: [] },
+      q: "",
+    }));
+  }, SHOW_ALL_ACTIVITIES);
+});
+
 test.describe("next-parity: live/SSE lens (Packet 5)", () => {
   test("an SSE-delivered record raises the live window's record count by exactly one", async ({ page }) => {
     const meta = loadMeta();
