@@ -171,6 +171,7 @@ pub fn run() -> DoctorReport {
         check_generation_checkpoint_interval(),
         check_thermal_governor(),
         check_host_probe(),
+        check_quarantined_mirrors(),
         checks_power::check_power_posture(),
         check_remote_endpoint_credentials(),
         check_env_masks_config(),
@@ -2385,6 +2386,110 @@ fn check_thermal_governor() -> Check {
 ///
 /// Costs ~120 ms total (a one-time probe construction plus two samples);
 /// `doctor` is a diagnostic command, not a hot path.
+/// (#2399) List the mirrors `workspace_spec::materialize` has quarantined
+/// — `<darkmux-root>/workspaces/<name>/mirror/<id>.git.corrupt-<unix-ts>`.
+///
+/// A quarantine happens when an existing mirror fails materialize's
+/// self-check (not bare, or pointing at an origin the spec doesn't name):
+/// the directory is MOVED aside, never deleted, because it is evidence of
+/// whatever wrote into darkmux's own cache — the live 2026-09-05 case was
+/// most likely an external `git` run inside it. Moved-aside is also
+/// invisible: nothing else in darkmux ever mentions those directories
+/// again, and they hold a full clone's worth of bytes. So this check is
+/// informational and always `Pass` — reporting disk that darkmux
+/// deliberately kept is not a defect, and deciding when evidence has
+/// served its purpose is the operator's call (#44), not doctor's.
+fn check_quarantined_mirrors() -> Check {
+    let workspaces = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+        .root
+        .join("workspaces");
+    quarantined_mirrors_check_at(&workspaces)
+}
+
+/// The body of [`check_quarantined_mirrors`], against an explicit
+/// workspaces root so a test can point it at a fixture instead of the
+/// operator's real darkmux home.
+fn quarantined_mirrors_check_at(workspaces_root: &std::path::Path) -> Check {
+    let name = "workspaces.quarantined-mirrors";
+    let mut found: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    if let Ok(workspaces) = std::fs::read_dir(workspaces_root) {
+        for ws in workspaces.flatten() {
+            let Ok(mirrors) = std::fs::read_dir(ws.path().join("mirror")) else { continue };
+            for entry in mirrors.flatten() {
+                if entry.file_name().to_string_lossy().contains(".corrupt-") {
+                    let bytes = dir_size_bytes(&entry.path());
+                    found.push((entry.path(), bytes));
+                }
+            }
+        }
+    }
+    found.sort();
+
+    if found.is_empty() {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("none under {}", workspaces_root.display()),
+            hint: None,
+        };
+    }
+    let total: u64 = found.iter().map(|(_, b)| *b).sum();
+    let listing = found
+        .iter()
+        .map(|(p, b)| format!("{} ({})", p.display(), human_bytes(*b)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "{} quarantined mirror(s), {} total — {listing}",
+            found.len(),
+            human_bytes(total)
+        ),
+        hint: Some(
+            "each one is a repository that failed `workspace_spec::materialize`'s bare/origin \
+             self-check (#2399) and was moved aside rather than deleted. Inspect it \
+             (`git -C <path> log -1`, `git -C <path> config --list`) to see what wrote into \
+             darkmux's cache, then remove it when you're done with the evidence."
+                .into(),
+        ),
+    }
+}
+
+/// Recursive byte total of a directory, symlinks never followed. Only ever
+/// called on a quarantined mirror, which is normally a set of zero.
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            total += dir_size_bytes(&entry.path());
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < KB * KB {
+        format!("{:.1} KB", b / KB)
+    } else if b < KB * KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else {
+        format!("{:.1} GB", b / (KB * KB * KB))
+    }
+}
+
 fn check_host_probe() -> Check {
     let mut probe = darkmux_crew::host_probe::HostProbe::new();
     let _seed = probe.sample();
@@ -9666,4 +9771,37 @@ mod tests {
         assert!(check.message.contains("bad-confirm"), "{}", check.message);
         assert!(check.message.contains("failed to parse"), "{}", check.message);
     }
+
+    // ─── (#2399) check_quarantined_mirrors ───
+
+    #[test]
+    fn quarantined_mirrors_reports_none_on_a_clean_workspaces_root() {
+        let home = tempfile::TempDir::new().unwrap();
+        let workspaces = home.path().join("workspaces");
+        std::fs::create_dir_all(workspaces.join("w1").join("mirror").join("app.git")).unwrap();
+        let check = quarantined_mirrors_check_at(&workspaces);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.starts_with("none"), "{}", check.message);
+        assert!(check.hint.is_none(), "{:?}", check.hint);
+    }
+
+    #[test]
+    fn quarantined_mirrors_lists_each_corrupt_sibling_with_its_size() {
+        let home = tempfile::TempDir::new().unwrap();
+        let workspaces = home.path().join("workspaces");
+        let quarantined = workspaces.join("review-v2-live").join("mirror").join("app.git.corrupt-1788610000");
+        std::fs::create_dir_all(quarantined.join("objects")).unwrap();
+        std::fs::write(quarantined.join("objects").join("blob"), vec![7u8; 4096]).unwrap();
+        // A healthy sibling in the same mirror dir must NOT be listed.
+        std::fs::create_dir_all(workspaces.join("review-v2-live").join("mirror").join("app.git")).unwrap();
+
+        let check = quarantined_mirrors_check_at(&workspaces);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("1 quarantined mirror(s)"), "{}", check.message);
+        assert!(check.message.contains("app.git.corrupt-1788610000"), "{}", check.message);
+        assert!(check.message.contains("4.0 KB"), "the size is reported: {}", check.message);
+        assert!(!check.message.contains("mirror/app.git ("), "a healthy mirror is not listed: {}", check.message);
+        assert!(check.hint.as_deref().is_some_and(|h| h.contains("#2399")), "{:?}", check.hint);
+    }
+
 }
