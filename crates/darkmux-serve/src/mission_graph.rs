@@ -136,10 +136,10 @@ pub struct StepRow {
     /// Additive camelCase (`tokensFinal`/`turnsFinal`/`cloud`); pre-#1432
     /// consumers ignore them.
     ///
-    /// **Gated on `started_ts.is_some()` (#1488 follow-up).** The review
-    /// pipeline's step ids (`review-verify-step`, `review-judge-step`, …)
-    /// are literal constants reused by EVERY review mission instance, not
-    /// scoped to one mission run, and the backfill's day-file window has no
+    /// **Gated on `started_ts.is_some()` (#1488 follow-up).** `review.json`'s
+    /// step ids (`unit-intent-vs-diff-step`, `deliver-step`, …) are literal
+    /// constants reused by EVERY review mission instance, not scoped to one
+    /// mission run, and the backfill's day-file window has no
     /// upper bound — so an unrelated, earlier same-day mission's real
     /// completed dispatch can fold onto a same-named step that hasn't
     /// started in THIS mission. A not-yet-started step (no `started_ts`)
@@ -1521,10 +1521,10 @@ mod tests {
 
     // ─── (#1488 follow-up) planned steps show no phantom tokens ─────────
     //
-    // The review pipeline's step ids (`review-verify-step`, `review-judge-
-    // step`, …) are literal constants reused by EVERY review mission
-    // instance — not scoped to one mission run — and the backfill's
-    // day-file window has no upper bound. So `fold_step_finals` can
+    // `review.json`'s step ids (`unit-intent-vs-diff-step`, `deliver-step`,
+    // …) are literal constants reused by EVERY review mission instance —
+    // not scoped to one mission run — and the backfill's day-file window
+    // has no upper bound. So `fold_step_finals` can
     // correctly correlate a record to a step id string while that record
     // actually belongs to a DIFFERENT, earlier mission instance that
     // dispatched the same-named step for real. A step that has not

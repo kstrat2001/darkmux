@@ -678,7 +678,7 @@ fn render_role_line(role: &RoleResolution) -> String {
 }
 
 /// Every role id the graph actually declares a task under — used to group
-/// the per-role override "pseudo-inputs" (`review`'s `review-probe-high`
+/// the per-role override "pseudo-inputs" (`review`'s `reviewer`, `coder`,
 /// etc.) into one line instead of one per role (CONSIDER 10).
 fn declared_role_ids_in_graph(show: &ConfigShow) -> BTreeSet<&str> {
     show.phases
@@ -880,14 +880,14 @@ fn parse_role_overrides(params: &[String]) -> Result<BTreeMap<String, String>> {
         let Some((role, profile)) = raw.split_once('=') else {
             return Err(anyhow!(
                 "darkmux mission config show: --param `{raw}` must be in `ROLE=PROFILE` form, \
-                 e.g. --param review-judge=review-mid"
+                 e.g. --param reviewer=review-mid"
             ));
         };
         let (role, profile) = (role.trim(), profile.trim());
         if role.is_empty() || profile.is_empty() {
             return Err(anyhow!(
                 "darkmux mission config show: --param `{raw}` must be in `ROLE=PROFILE` form, \
-                 e.g. --param review-judge=review-mid"
+                 e.g. --param reviewer=review-mid"
             ));
         }
         map.insert(role.to_string(), profile.to_string());
