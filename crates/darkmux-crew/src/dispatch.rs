@@ -334,7 +334,10 @@ pub struct DispatchOpts {
     /// mint its own fresh tempdir. `Some(dir)` is for a caller that needs
     /// to know the out dir BEFORE the dispatch returns — the crawl
     /// launcher is the one caller that sets this today: it mints
-    /// `<mission run dir>/units/<unit-id>/out` and records it into a
+    /// `<mission run dir>/units/<rule>/<unit-id>/out` (#2360 — rule-
+    /// namespaced, since a per-rule plan numbers its own units from
+    /// `u-0001` and two rules routinely grow the same unit id into one
+    /// mission) and records it into a
     /// PROVISIONAL per-unit row before dispatching, so an interrupted or
     /// hard-crashed dispatch (which returns an `Err` with no
     /// `DispatchResult::out_dir` to read back) still leaves a resumable
