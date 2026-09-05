@@ -147,9 +147,16 @@ interface ProcSample {
   rx: number;
 }
 
-function isTelemetryProcessRecord(r: FlowRecord): boolean {
+/** (#2413) Recognizes BOTH the retired per-dispatch `telemetry.process`
+ * (still emitted, at time of writing, by mission launches' and ACP
+ * sessions' separate legacy `run_obs::HostTelemetrySampler` — see
+ * `FLOW_SCHEMA_VERSION` 1.42.0's changelog) and the new machine-scoped
+ * `machine.telemetry` (`source: "host"`, no session_id). This readout was
+ * already machine-level rather than mission-scoped (see this function's
+ * caller's own doc), so `machine.telemetry` is a direct, complete fit. */
+function isHostSampleRecord(r: FlowRecord): boolean {
   return (
-    (r.action === "telemetry.process" || (r.category === "telemetry" && r.source === "process")) &&
+    (r.action === "telemetry.process" || r.action === "machine.telemetry" || (r.category === "telemetry" && r.source === "process")) &&
     !!r.payload &&
     typeof r.payload === "object"
   );
@@ -182,7 +189,7 @@ function useProcReadout(tail: FlowRecord[] | undefined): ProcSample | null {
     if (!tail || !tail.length) return null;
     let found: FlowRecord | null = null;
     for (const r of tail) {
-      if (!r || typeof r !== "object" || !isTelemetryProcessRecord(r)) continue;
+      if (!r || typeof r !== "object" || !isHostSampleRecord(r)) continue;
       if (!found || (r.ts ?? "") >= (found.ts ?? "")) found = r;
     }
     return found;
@@ -191,11 +198,16 @@ function useProcReadout(tail: FlowRecord[] | undefined): ProcSample | null {
   const [proc, setProc] = useState<ProcSample | null>(null);
   useEffect(() => {
     if (!latest || !latest.payload) return;
-    const p = latest.payload as { cpu?: unknown; gpu?: unknown; mem?: unknown };
+    // (#2413) `machine.telemetry` carries `cpu_pct`/`mem_pct`/`gpu_pct`
+    // (the full `host_probe` shape); the retired `telemetry.process`
+    // carried bare `cpu`/`mem`/`gpu`. Prefer the new keys, fall back to
+    // the old ones.
+    const p = latest.payload as { cpu?: unknown; gpu?: unknown; mem?: unknown; cpu_pct?: unknown; gpu_pct?: unknown; mem_pct?: unknown };
+    const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
     setProc({
-      cpu: typeof p.cpu === "number" ? p.cpu : undefined,
-      gpu: typeof p.gpu === "number" ? p.gpu : undefined,
-      mem: typeof p.mem === "number" ? p.mem : undefined,
+      cpu: num(p.cpu_pct) ?? num(p.cpu),
+      gpu: num(p.gpu_pct) ?? num(p.gpu),
+      mem: num(p.mem_pct) ?? num(p.mem),
       rx: Date.now(),
     });
   }, [latest]);
@@ -206,7 +218,7 @@ function ProcEl({ proc }: { proc: ProcSample | null }) {
   const fresh = !!proc && Date.now() - proc.rx < PROC_FRESH_MS;
   if (!fresh || !proc) return null;
   return (
-    <span className="mproc" title="host activity (telemetry.process)">
+    <span className="mproc" title="host activity (machine.telemetry)">
       {typeof proc.gpu === "number" ? (
         <span>
           gpu <b className={proc.gpu >= 60 ? "hot" : ""}>{proc.gpu}%</b>

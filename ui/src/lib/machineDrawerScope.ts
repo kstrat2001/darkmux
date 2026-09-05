@@ -31,8 +31,20 @@ export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
  * shouldn't be reported as if it just happened to be quiet. */
 const LAST_KNOWN_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
-function isTelemetryProcessRecord(r: FlowRecord): boolean {
-  return r.action === "telemetry.process" || (r.category === "telemetry" && r.source === "process");
+/** (#2413) Accepts BOTH the retired per-dispatch `telemetry.process`
+ * (still emitted, at time of writing, by the separate legacy
+ * `run_obs::HostTelemetrySampler` mechanism used by mission launches and
+ * ACP sessions — see `FLOW_SCHEMA_VERSION` 1.42.0's changelog) and the new
+ * machine-scoped `machine.telemetry` (`source: "host"`, no session_id) —
+ * so a machine still running an older/partial rollout, or a mission/ACP
+ * session whose own telemetry hasn't migrated yet, keeps showing SOMETHING
+ * rather than going blank the moment this ships. */
+function isHostSampleRecord(r: FlowRecord): boolean {
+  return (
+    r.action === "telemetry.process" ||
+    r.action === "machine.telemetry" ||
+    (r.category === "telemetry" && r.source === "process")
+  );
 }
 
 function toPoint(r: FlowRecord): ProcSamplePoint {
@@ -44,7 +56,15 @@ function toPoint(r: FlowRecord): ProcSamplePoint {
     const n = Number(v);
     return Number.isFinite(n) ? n : undefined;
   };
-  return { cpu: num(f?.cpu), mem: num(f?.mem), gpu: num(f?.gpu) };
+  // (#2413) `machine.telemetry` carries the full `host_probe` shape
+  // (`cpu_pct`/`mem_pct`/`gpu_pct`); the retired `telemetry.process`
+  // carried bare `cpu`/`mem`/`gpu`. Prefer the new keys, fall back to the
+  // old ones, so either record shape resolves to the same point.
+  return {
+    cpu: num(f?.cpu_pct ?? f?.cpu),
+    mem: num(f?.mem_pct ?? f?.mem),
+    gpu: num(f?.gpu_pct ?? f?.gpu),
+  };
 }
 
 export interface LastKnownSample {
@@ -77,7 +97,7 @@ export interface DrawerScope {
 export function rollingWindowSamples(records: FlowRecord[], uid: string | null, nowMs: number): ProcSamplePoint[] {
   const cutoff = nowMs - DRAWER_ROLLING_WINDOW_MS;
   return records
-    .filter((r) => isTelemetryProcessRecord(r) && (uid == null || uidOf(r) === uid) && T(r.ts) >= cutoff && T(r.ts) <= nowMs)
+    .filter((r) => isHostSampleRecord(r) && (uid == null || uidOf(r) === uid) && T(r.ts) >= cutoff && T(r.ts) <= nowMs)
     .sort((a, b) => T(a.ts) - T(b.ts))
     .map(toPoint);
 }
@@ -92,7 +112,7 @@ export function rollingWindowSamples(records: FlowRecord[], uid: string | null, 
 export function findLastKnownSample(records: FlowRecord[], uid: string | null, nowMs: number): LastKnownSample | null {
   let best: { r: FlowRecord; ts: number } | null = null;
   for (const r of records) {
-    if (!isTelemetryProcessRecord(r)) continue;
+    if (!isHostSampleRecord(r)) continue;
     if (uid != null && uidOf(r) !== uid) continue;
     const ts = T(r.ts);
     if (!Number.isFinite(ts) || ts > nowMs) continue;
@@ -110,7 +130,7 @@ export function resolveDrawerScope(
   nowMs: number,
 ): DrawerScope {
   if (route.kind === "mission" || route.kind === "dispatch") {
-    const scoped = routeRecords.filter(isTelemetryProcessRecord).sort((a, b) => T(a.ts) - T(b.ts));
+    const scoped = routeRecords.filter(isHostSampleRecord).sort((a, b) => T(a.ts) - T(b.ts));
     return {
       scopeLabel: route.kind === "mission" ? "this mission" : "this dispatch",
       samples: scoped.map(toPoint),

@@ -56,6 +56,13 @@ const RING_CAPACITY: usize = 120;
 /// ticks — bounds shutdown latency to this, not a full sample interval.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// (#2413) While idle (no dispatch live anywhere on this machine), the
+/// singleton sampler emits `machine.telemetry` flow records at this many
+/// times the configured `interval_ms` — the issue's own "one tenth of that
+/// rate idle" (the multiplier reads as ticks-between-emissions, so a 10x
+/// SLOWER rate is expressed as "emit every 10th tick").
+const IDLE_EMIT_MULTIPLIER: u64 = 10;
+
 /// One ring entry: a host reading plus the wall-clock it was taken at.
 ///
 /// The probe stamps its own cost INTO the sample
@@ -380,6 +387,19 @@ pub(crate) fn spawn(
         // (#2111) The known thermal state carried between ticks for
         // `thermal_edge`'s edge detection — see that function's own doc.
         let mut known_thermal_state: Option<String> = None;
+        // (#2413) This thread is a candidate to be the machine's singleton
+        // `machine.telemetry` emitter — see the module doc's "one emitter
+        // per machine" section. `None` means it currently does NOT hold
+        // the lock (a dispatch process, or nothing yet, holds it); the
+        // ring above still samples unconditionally either way, since
+        // `/machine/resources` must keep working regardless of who else
+        // is emitting flow records.
+        let mut sampler_lock: Option<darkmux_crew::host_sampler_lock::SamplerLockGuard> = None;
+        // (#2413) Ticks since the last EMITTED `machine.telemetry` record
+        // — independent of the ring's OWN cadence, which stays at
+        // `interval_ms` unconditionally per the issue's "the ring keeps
+        // sampling at the configured rate regardless" rule.
+        let mut ticks_since_emit: u64 = 0;
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 break;
@@ -387,11 +407,11 @@ pub(crate) fn spawn(
 
             let sample = probe.sample();
             // (#2111 review finding) The shared epoch-ms read — the same
-            // one `dispatch_internal::run_telemetry_sampler` now uses for
-            // `machine.telemetry`'s `sampled_at_ms`, so a viewer strip
-            // charting both producers' records is comparing the same
-            // clock, not one producer's epoch against another's
-            // sampler-relative offset.
+            // one the machine-scoped telemetry record below (and a
+            // dispatch process's own sampler) uses for `sampled_at_ms`, so
+            // a viewer strip charting both possible producers is
+            // comparing the same clock, not one producer's epoch against
+            // another's sampler-relative offset.
             let at_ms = darkmux_crew::host_probe::epoch_ms_now();
             // (#2111) Edge-detect BEFORE the sample moves into the ring —
             // `thermal_edge` only borrows it.
@@ -400,7 +420,47 @@ pub(crate) fn spawn(
             if let Some(rec) = transition {
                 let _ = darkmux_flow::record(rec);
             }
-            // Best-effort like the dispatch-scoped sampler: a tick where
+
+            // (#2413) Opportunistically (re)acquire the singleton lock
+            // every tick this thread doesn't already hold it — a dispatch
+            // process that held it may have exited (releasing it via its
+            // own `Drop`) since our last attempt, freeing the machine up
+            // for the daemon to take over as the steady-state emitter.
+            if sampler_lock.is_none() {
+                sampler_lock = darkmux_crew::host_sampler_lock::try_acquire("daemon", interval_ms);
+            }
+            if let Some(guard) = sampler_lock.as_ref() {
+                if guard.heartbeat(interval_ms) {
+                    ticks_since_emit += 1;
+                    // (#2413) Live-vs-idle cadence: the base
+                    // `interval_ms` while at least one dispatch is
+                    // running anywhere on this machine, else
+                    // `IDLE_EMIT_MULTIPLIER`x that. The ring sampled
+                    // above regardless — only the FLOW-RECORD WRITE is
+                    // gated, per the observer-cost rule (the sample is
+                    // already taken; only the write is the added cost).
+                    let live = crate::runs::any_dispatch_live_locally(at_ms, crate::runs::stale_after_ms());
+                    let emit_every_n_ticks = if live { 1 } else { IDLE_EMIT_MULTIPLIER };
+                    if ticks_since_emit >= emit_every_n_ticks {
+                        ticks_since_emit = 0;
+                        let effective_interval_ms = interval_ms.saturating_mul(emit_every_n_ticks);
+                        let rec = darkmux_crew::host_probe::build_machine_scoped_telemetry_record(
+                            &sample,
+                            at_ms,
+                            effective_interval_ms,
+                        );
+                        let _ = darkmux_flow::record(rec);
+                    }
+                } else {
+                    // Lost the lock to a steal race — stop emitting until
+                    // the next tick's opportunistic re-acquire (which will
+                    // fail again, harmlessly, for as long as someone else
+                    // holds a fresh lock).
+                    sampler_lock = None;
+                }
+            }
+
+            // Best-effort like a dispatch-scoped sampler: a tick where
             // every field failed still gets recorded (with the probe's own
             // cost stamped) rather than skipped, since the cost of the
             // failed gather is itself part of the observer-cost claim.
@@ -424,6 +484,7 @@ mod tests {
     use super::*;
     use darkmux_crew::host_probe::{CpuCluster, PowerSample, ThermalSample};
     use std::time::Instant;
+    use tempfile::TempDir;
 
     fn entry(at_ms: u64, cpu: u64, mem: u64, gpu: u64, cost_ms: u64) -> RingEntry {
         RingEntry {
@@ -602,6 +663,186 @@ mod tests {
             t0.elapsed() < Duration::from_secs(2),
             "teardown must be prompt (bounded by STOP_POLL_INTERVAL), not a full interval wait"
         );
+    }
+
+    // ─── (#2413) spawn() — the singleton machine.telemetry emitter ─────
+
+    /// Isolate `DARKMUX_HOME` (the lock path) and `DARKMUX_FLOWS_DIR` (where
+    /// records land) to fresh tempdirs for the duration of `f`, restoring
+    /// both afterward. Every test below mutates process-global env, hence
+    /// `#[serial_test::serial]` on each.
+    fn with_isolated_env(f: impl FnOnce(&std::path::Path)) {
+        let home = TempDir::new().unwrap();
+        let flows = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
+        }
+        f(flows.path());
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    /// Poll `flows_dir/<today>.jsonl` until a `machine.telemetry` record
+    /// appears (bounded), returning it as raw JSON. Panics past the
+    /// deadline — every caller expects one to land.
+    fn wait_for_machine_telemetry_record(flows_dir: &std::path::Path, deadline: Duration) -> serde_json::Value {
+        let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
+        let start = Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&day_path) {
+                for line in text.lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        if v.get("action").and_then(|a| a.as_str()) == Some("machine.telemetry") {
+                            return v;
+                        }
+                    }
+                }
+            }
+            if start.elapsed() > deadline {
+                panic!("no machine.telemetry record landed in {} within {deadline:?}", day_path.display());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn spawn_emits_a_machine_scoped_record_with_no_session_fields() {
+        with_isolated_env(|flows_dir| {
+            let ring = HostSamplerRing::new();
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
+
+            let rec = wait_for_machine_telemetry_record(flows_dir, Duration::from_secs(10));
+
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap();
+
+            assert_eq!(rec["source"], "host");
+            let absent_or_null = |v: Option<&serde_json::Value>| v.is_none() || v.unwrap().is_null();
+            assert!(absent_or_null(rec.get("session_id")), "no session_id: {rec}");
+            assert!(absent_or_null(rec.get("model")), "no model: {rec}");
+            assert!(absent_or_null(rec.get("mission_id")), "no mission_id: {rec}");
+            assert!(absent_or_null(rec.get("phase_id")), "no phase_id: {rec}");
+            let payload = &rec["payload"];
+            assert!(payload["sampled_at_ms"].is_u64(), "carries sampled_at_ms: {payload}");
+            assert!(payload["interval_ms"].is_u64(), "carries the effective interval_ms: {payload}");
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn spawn_emits_at_10x_the_base_interval_while_idle() {
+        with_isolated_env(|flows_dir| {
+            // Nothing live on this machine — `any_dispatch_live_locally`
+            // must read false, so the FIRST emitted record's `interval_ms`
+            // is 10x the base 50ms cadence passed to `spawn`.
+            let ring = HostSamplerRing::new();
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
+            let rec = wait_for_machine_telemetry_record(flows_dir, Duration::from_secs(10));
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap();
+            assert_eq!(rec["payload"]["interval_ms"], 500, "idle: 10x the 50ms base interval");
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn spawn_emits_at_1x_the_base_interval_while_a_dispatch_is_live() {
+        with_isolated_env(|flows_dir| {
+            // A fresh, still-open dispatch bookend on THIS machine —
+            // `any_dispatch_live_locally` must read true.
+            let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
+            let live_start = darkmux_flow::ts_utc_now();
+            std::fs::write(
+                &day_path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "ts": live_start, "level": "info", "category": "work", "tier": "local",
+                        "stage": "dispatch", "action": "dispatch start", "handle": "h",
+                        "session_id": "live-session-1",
+                    })
+                ),
+            )
+            .unwrap();
+
+            let ring = HostSamplerRing::new();
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
+            let rec = wait_for_machine_telemetry_record(flows_dir, Duration::from_secs(10));
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap();
+            assert_eq!(rec["payload"]["interval_ms"], 50, "live: 1x the base interval, no idle backoff");
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn spawn_stops_emitting_once_another_process_holds_the_lock() {
+        with_isolated_env(|flows_dir| {
+            // Simulate a dispatch process already holding the singleton
+            // lock, using pid 1 (launchd/init — DETERMINISTICALLY alive on
+            // any Unix, unlike `std::process::id() + 1`, which is only
+            // alive BY LUCK depending on what else happens to be running)
+            // as the "other" pid so `try_acquire`'s alive-check reliably
+            // reads true; see `host_sampler_lock::try_acquire_as_for_test`'s
+            // own doc for why a distinct pid must be injected at all.
+            // A large declared interval (unrelated to the daemon's own
+            // 50ms cadence below) so this simulated lock's OWN staleness
+            // threshold (3x its interval) vastly outlives the test's
+            // wait — a real dispatch holder would keep heartbeating every
+            // tick; this test doesn't, so it needs a generous declared
+            // interval instead to stay "fresh" without one.
+            let other_pid = 1u32;
+            let _guard = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 60_000)
+                .expect("the lock is free at test start");
+
+            let ring = HostSamplerRing::new();
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
+
+            // Give the sampler well past the IDLE emission threshold
+            // (`IDLE_EMIT_MULTIPLIER` x the 50ms base interval = 500ms
+            // nominal — measured in practice as needing real headroom:
+            // each tick's own work pushes real per-tick wall-clock
+            // noticeably above the nominal 50ms, so far fewer than the
+            // nominal 10 ticks land in a short sleep). 3s is comfortably
+            // past the threshold either way, and still fast enough not to
+            // slow the suite.
+            std::thread::sleep(Duration::from_millis(3000));
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap();
+
+            let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
+            let text = std::fs::read_to_string(&day_path).unwrap_or_default();
+            let emitted_machine_telemetry = text.lines().any(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .ok()
+                    .and_then(|v| v.get("action").and_then(|a| a.as_str().map(str::to_string)))
+                    .as_deref()
+                    == Some("machine.telemetry")
+            });
+            assert!(
+                !emitted_machine_telemetry,
+                "the daemon sampler must not emit while another process holds a fresh lock"
+            );
+            // Still samples its OWN ring regardless (the ring is
+            // unconditional, per the issue's own rule).
+            assert!(ring.snapshot().is_some(), "the ring keeps sampling regardless of who holds the lock");
+        });
     }
 
     // ─── (#2111) thermal_edge — pure edge detection ─────────────────────

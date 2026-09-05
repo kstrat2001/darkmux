@@ -17,6 +17,9 @@ darkmux-profiles = { path = "../darkmux-profiles" }
 # (concurrent_dispatch.rs) calls gestalt's pure `plan_waves` once up front to
 # partition local jobs into co-resident-safe waves before executing them.
 darkmux-gestalt = { path = "../darkmux-gestalt" }
+# (#2413) `host_sampler_lock` stamps the machine's stable hardware identity
+# into the lock file.
+darkmux-hardware = { path = "../darkmux-hardware" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -77,3 +80,9 @@ libc = "0.2"
 # features into a normal dependency, so the release binary never pulls
 # `ts-rs` in.
 ts-export = ["dep:ts-rs"]
+# (#2413) Exposes `host_sampler_lock::write_lock_state_for_test` to a
+# downstream crate's own tests (darkmux-doctor's `check_host_sampler`
+# fixtures need to construct stale/dead-pid lock states directly). Mirrors
+# `darkmux-types`'s `test-support` feature — enabled only as a
+# dev-dependency, never pulled into a release build.
+test-support = []

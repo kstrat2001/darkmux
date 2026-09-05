@@ -444,6 +444,24 @@ describe("MissionGraphLens", () => {
     // class, matching legacy's own `proc.gpu >= 60 ? "hot" : ""`.
     expect(document.querySelector(".mproc b.hot")?.textContent).toBe("72%");
   });
+  it("(#2413) shows the host-activity readout from a machine-scoped machine.telemetry sample (cpu_pct/gpu_pct shape, no session_id)", async () => {
+    mockFetch({ graph: RUNNING_GRAPH });
+    const { queryClient } = renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    expect(document.querySelector(".mproc")).toBeNull();
+
+    seedLiveTail(queryClient, [
+      { ts: new Date().toISOString(), action: "machine.telemetry", category: "machinery", source: "host", payload: { cpu_pct: 41, gpu_pct: 72, mem_pct: 0.5, sampled_at_ms: Date.now(), interval_ms: 5000 } },
+    ]);
+
+    await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
+    const proc = document.querySelector(".mproc");
+    expect(proc?.textContent).toContain("gpu");
+    expect(proc?.textContent).toContain("72%");
+    expect(proc?.textContent).toContain("cpu");
+    expect(proc?.textContent).toContain("41%");
+  });
+
   it("(#2332) the host readout is for RUNNING missions only — a finalized mission shows none even with a fresh sample", async () => {
     mockFetch();
     const { queryClient } = renderLens();

@@ -9306,31 +9306,13 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
-    // ─── (#2111) should_record_machine_telemetry — periodic curve cadence ─
+    // ─── (#2413) build_machine_scoped_telemetry_record — no session fields ─
 
     #[test]
-    fn should_record_machine_telemetry_every_5th_of_12_yields_exactly_2() {
-        let every = 5;
-        let hits: Vec<u64> =
-            (1..=12u64).filter(|&i| super::should_record_machine_telemetry(i, every)).collect();
-        assert_eq!(hits, vec![5, 10], "exactly the 5th and 10th of 12 ticks");
-    }
-
-    #[test]
-    fn should_record_machine_telemetry_zero_disables_entirely() {
-        for i in 1..=50u64 {
-            assert!(
-                !super::should_record_machine_telemetry(i, 0),
-                "every=0 must never fire, tick {i}"
-            );
-        }
-    }
-
-    // ─── (#2111) build_machine_telemetry_record — payload + mission context ─
-
-    #[test]
-    fn build_machine_telemetry_record_carries_mission_context_and_full_payload() {
-        use crate::host_probe::{CpuCluster, HostSampleFull, PowerSample, ThermalSample};
+    fn build_machine_scoped_telemetry_record_carries_full_payload_and_interval_no_session_fields() {
+        use crate::host_probe::{
+            build_machine_scoped_telemetry_record, CpuCluster, HostSampleFull, PowerSample, ThermalSample,
+        };
         let sample = HostSampleFull {
             cost_ms: 7,
             cpu_pct: Some(42),
@@ -9347,23 +9329,16 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             thermal: Some(ThermalSample { state: "fair".into(), cpu_speed_limit_pct: 90 }),
             power: Some(PowerSample { cpu_mw: 800.0, gpu_mw: 100.0, ane_mw: 0.0 }),
         };
-        let record_context = Some(serde_json::json!({ "unit": "u-1", "source": "repo" }));
-        let rec = super::build_machine_telemetry_record(
-            &sample,
-            12_345,
-            "coder",
-            "session-1",
-            "qwen3.6-35b-a3b",
-            Some("mission-1"),
-            Some("phase-1"),
-            &record_context,
-        );
+        let rec = build_machine_scoped_telemetry_record(&sample, 12_345, 5000);
         assert_eq!(rec.action, "machine.telemetry");
-        assert!(matches!(rec.category, darkmux_flow::Category::Telemetry));
-        assert_eq!(rec.mission_id.as_deref(), Some("mission-1"));
-        assert_eq!(rec.phase_id.as_deref(), Some("phase-1"));
-        assert_eq!(rec.session_id.as_deref(), Some("session-1"));
-        assert_eq!(rec.model.as_deref(), Some("qwen3.6-35b-a3b"));
+        assert!(matches!(rec.category, darkmux_flow::Category::Machinery));
+        assert_eq!(rec.source.as_deref(), Some("host"));
+        // (#2413) The whole point: no dispatch-scoped fields on a
+        // machine-scoped record.
+        assert!(rec.mission_id.is_none(), "machine-scoped: no mission context");
+        assert!(rec.phase_id.is_none(), "machine-scoped: no phase context");
+        assert!(rec.session_id.is_none(), "machine-scoped: no session_id");
+        assert!(rec.model.is_none(), "machine-scoped: no model");
         let payload = rec.payload.expect("payload present");
         assert_eq!(payload["cpu_pct"], 42);
         assert_eq!(payload["mem_pct"], 55);
@@ -9371,24 +9346,29 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(payload["gpu_mhz"], 500);
         assert_eq!(payload["sampler_cost_ms"], 7);
         assert_eq!(payload["sampled_at_ms"], 12345);
+        assert_eq!(payload["interval_ms"], 5000, "the EFFECTIVE emission cadence rides the payload");
         assert_eq!(payload["thermal"]["state"], "fair");
         assert_eq!(payload["thermal"]["cpu_speed_limit_pct"], 90);
         assert_eq!(payload["power_mw"]["total"], 900);
         assert_eq!(payload["cpu_clusters"][0]["name"], "Super");
-        assert_eq!(payload["context"]["unit"], "u-1", "record_context merges under payload.context");
+        assert!(payload.get("context").is_none(), "no record_context merge — this record has no dispatch to key to");
     }
 
+    // ─── (#2413) dispatch() emits ZERO retired-emitter records ───────────
+
     #[test]
-    fn build_machine_telemetry_record_omits_mission_and_context_when_absent() {
-        use crate::host_probe::HostSampleFull;
-        let sample = HostSampleFull { cpu_pct: Some(10), ..Default::default() };
-        let rec = super::build_machine_telemetry_record(
-            &sample, 0, "coder", "session-1", "some-model", None, None, &None,
+    fn dispatch_side_sampler_never_builds_telemetry_process_records() {
+        // (#2413 neighbor check) The retired per-dispatch `telemetry.process`
+        // emitter had no standalone builder function to unit-test directly
+        // (it built its payload inline in the sampler loop) — this test
+        // documents the mechanical proof instead: the action string no
+        // longer appears anywhere in this module's source, so it cannot be
+        // emitted by any code path in it.
+        let src = include_str!("dispatch_internal.rs");
+        assert!(
+            !src.contains("\"telemetry.process\""),
+            "the retired telemetry.process action string must not appear in dispatch_internal.rs"
         );
-        assert!(rec.mission_id.is_none());
-        assert!(rec.phase_id.is_none());
-        let payload = rec.payload.expect("payload present");
-        assert!(payload.get("context").is_none(), "no record_context ⇒ no payload.context key");
     }
 
     // ─── (#2111) host_window_json — the dispatch-summary flow-record field ─

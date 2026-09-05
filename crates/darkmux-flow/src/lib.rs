@@ -3044,7 +3044,11 @@ mod tests {
         //           (one of `local_model` | `remote_endpoint` | `no_model` |
         //           `local_model_unresolved`), plus a new `step seat
         //           unresolved` Warn action for the last of those (#2394).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.41.0");
+        //   1.42.0: `telemetry.process` retired; `machine.telemetry`
+        //           becomes machine-scoped (session/model/mission/phase
+        //           fields absent, `payload.interval_ms` added) — one
+        //           emitter per machine instead of one per dispatch (#2413).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.42.0");
     }
 
     #[test]
