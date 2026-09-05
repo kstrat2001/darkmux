@@ -226,10 +226,10 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
 }
 
 /// (#2360) Two DIFFERENT rules whose plans both mint a unit named
-/// `u-0001` — exactly the shape a real crawl/review-v2 mission produces,
+/// `u-0001` — exactly the shape a real crawl/review mission produces,
 /// since a per-rule plan numbers its own units starting from 1
 /// (`plan::unit_seq`). Live evidence: mission
-/// `review-v2-1788566897-9c149e` (2026-09-05), 4 of 5 units errored with
+/// the 2026-09-05 live review run, 4 of 5 units errored with
 /// "caller-provided out-dir already exists — refusing to reuse it",
 /// because both rules' units resolved to the SAME
 /// `<mission>/units/u-0001/out` with no rule component.
@@ -244,7 +244,7 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
 /// dir). After the fix, both rules get their own on-disk home and this
 /// also serves as the two-rules-one-mission-dir harness scenario the
 /// issue asks for, since `crawl.unit` is dispatched (stubbed) for real,
-/// not bypassed the way `review_v2_fixture_plans_every_rule_and_delivers_
+/// not bypassed the way `review_fixture_plans_every_rule_and_delivers_
 /// one_comment_per_form` (`plan.rs`) stubs findings directly.
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
@@ -508,7 +508,7 @@ fn a_task_naming_a_different_role_dispatches_as_that_role_and_stamps_its_confirm
 }
 
 /// (#2310 P4c review round 2, item (e) — proven) `intent_file` was an
-/// input `review-v2.json` declares and NOTHING reads — `intent-vs-diff`'s
+/// input `review.json` declares and NOTHING reads — `intent-vs-diff`'s
 /// own `match`/`compare` prose talks about "the intent you were given for
 /// this change (a PR body or intent file, provided alongside your
 /// window)", which was a lie: no intent text ever reached the dispatch,
@@ -1004,7 +1004,7 @@ fn the_summary_reads_the_runs_own_plan_files_for_what_was_planned() {
 }
 
 /// (#2310 P4c-2b PR #2357 round-2 review item 5) `crawl.json` shares
-/// `src/mission_launch.rs::grow_phase` with `review-v2.json` — since that
+/// `src/mission_launch.rs::grow_phase` with `review.json` — since that
 /// function now grows zero units from an errored plan step's rule rather
 /// than aborting the whole launch (MUST FIX C), a crawl run reaches
 /// `summarize` with a silently smaller `units_in_plan` unless the summary

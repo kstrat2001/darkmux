@@ -4912,7 +4912,7 @@ mod tests {
             "tier": "local",
             "stage": "dispatch",
             "action": "mission.grow",
-            "handle": "review-v2",
+            "handle": "review",
             "schema_version": "1.41.0",
             "an_unknown_top_level_key": 7,
             "payload": {

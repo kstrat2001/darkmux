@@ -77,7 +77,6 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             freeform,
             agentic,
             dialectic,
-            funnel,
             workdirs,
             prosecutor_profile,
             defender_profile,
@@ -94,9 +93,7 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 config_path: profiles,
                 timeout_seconds: timeout,
                 scores_out,
-                mode: if funnel {
-                    lab::review_bench::BenchMode::Funnel
-                } else if dialectic {
+                mode: if dialectic {
                     lab::review_bench::BenchMode::Dialectic
                 } else if agentic {
                     lab::review_bench::BenchMode::Agentic

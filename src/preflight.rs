@@ -1,6 +1,6 @@
 //! (#2112) Mission/crawl pre-flight — power-posture warnings + the
 //! thermal-state refusal, called once from each long-mission entry point
-//! (`mission_launch::launch`, `mission_launch_review::launch`) before any real work
+//! (`mission_launch::launch`, the retired review funnel launcher) before any real work
 //! starts.
 //!
 //! Reads through the SAME probe `darkmux doctor`'s "power posture" check
@@ -232,7 +232,7 @@ mod tests {
 
     // ── #2112 review finding 1 (+ second-pass finding A): the
     //    long-running entry points (`mission_launch::launch`,
-    //    `mission_launch_review::launch` — the LATTER is reached via
+    //    the retired review funnel launcher — the LATTER is reached via
     //    `mission_launch::launch`'s OWN dedicated-launcher routing for
     //    `config_uses_review_kinds`, BEFORE `mission_launch::launch`'s own
     //    #2112 call site, so review needs its own call) must each still
@@ -247,17 +247,17 @@ mod tests {
     #[test]
     fn all_long_running_entry_points_call_the_preflight_and_hold_a_sleep_assertion() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        // (#2301) `src/crawl_launch.rs` was the third entry point until
-        // the crawl folded onto the generic path; a crawl now reaches the
-        // pre-flight through `mission_launch::launch` like every other
-        // config, so there is no third file to check.
-        for path in ["src/mission_launch.rs", "src/mission_launch_review.rs"] {
-            let text = std::fs::read_to_string(root.join(path)).expect("read source");
-            assert!(
-                text.contains("preflight::check_power_posture(params)"),
-                "{path} must call the power-posture pre-flight"
-            );
-            assert!(text.contains("SleepAssertion::hold("), "{path} must hold a sleep assertion");
-        }
+        // (#2301) `src/crawl_launch.rs` was the second entry point until the
+        // crawl folded onto the generic path, and (#2310 P4d) the bespoke
+        // review launcher was the third until it was deleted. Both now reach
+        // the pre-flight through `mission_launch::launch` like every other
+        // config, so ONE file carries it.
+        let path = "src/mission_launch.rs";
+        let text = std::fs::read_to_string(root.join(path)).expect("read source");
+        assert!(
+            text.contains("preflight::check_power_posture(params)"),
+            "{path} must call the power-posture pre-flight"
+        );
+        assert!(text.contains("SleepAssertion::hold("), "{path} must hold a sleep assertion");
     }
 }

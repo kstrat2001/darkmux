@@ -172,11 +172,11 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
     CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse,
+    PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionCloseCapabilities,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
     SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    StopReason, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    StopReason, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Stdio as AcpStdio};
@@ -186,25 +186,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio as ProcStdio;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-
-/// The review pipeline's stages in order, paired with a lowercase substring
-/// to look for in the subprocess's stderr lines. SPIKE-GRADE recognition
-/// (see module docs) — these stems come from reading
-/// `crates/darkmux-types/src/dispatch_liveness.rs`'s `[darkmux-liveness]`
-/// phase names (`bundling-start`/`bundling-done`, etc.) plus the stage
-/// names named in issue #1388 itself. Index into this array doubles as the
-/// index into the [`Plan`] entries this file sends, so keep the two in
-/// lockstep.
-const REVIEW_STAGES: &[(&str, &str)] = &[
-    ("bundl", "bundle"),
-    ("prob", "probe"),
-    ("dedup", "dedup"),
-    ("judg", "judge"),
-    ("verif", "verify"),
-    ("synthes", "synthesis"),
-];
 
 /// Per-session state: the `cwd` the client handed us in `session/new` (or
 /// `session/load`), the session's artifact shelf (#1698 Packet B2, scope C
@@ -1183,15 +1165,6 @@ async fn execute_route_plan(
     sessions: &Sessions,
 ) -> Result<()> {
     match plan {
-        // `review` keeps its EXISTING bespoke path, byte-for-byte
-        // unchanged (#1684 rule C) — only routed to differently.
-        // `config_id` (#1695 merge-gate MUST FIX) is the
-        // REGISTRY-RESOLVABLE id `route_command` decided on —
-        // never a hardcoded `"review"` — so a panel-advertised
-        // review VARIANT launches itself, not the built-in.
-        crate::acp_panel::RoutePlan::Review(config_id) => {
-            run_review(session_id, &config_id, args, cwd, cx, sessions).await
-        }
         crate::acp_panel::RoutePlan::Ephemeral(config) => {
             run_ephemeral_command(session_id, *config, args.to_string(), cwd.to_path_buf(), cx, sessions).await
         }
@@ -1360,268 +1333,6 @@ async fn answer_no_slash_refusal(
     }
 }
 
-/// Drives one review-family turn end to end: `git diff` → Plan update →
-/// spawn the review subprocess → stream progress → final result chunk.
-/// Returns `Err` only for genuinely internal failures (spawn failed, io
-/// error, mutex poisoned upstream already handled) — the caller turns any
-/// `Err` into a chunk instead of a protocol-level error.
-///
-/// `config_id` (#1695 merge-gate MUST FIX) is the REGISTRY-RESOLVABLE
-/// mission-config id `acp_panel::route_command` decided this invocation
-/// should launch — `RoutePlan::Review(String)`, never a hardcoded
-/// `"review"` literal. Everything else here is byte-identical for the
-/// plain `/review` case (where `config_id == "review"`); the only new
-/// behavior is that a panel-advertised review VARIANT (an operator config
-/// carrying `review.*` step kinds under a different id, e.g.
-/// `review-lean`) spawns ITSELF instead of silently spawning the built-in
-/// `review` config in its place.
-///
-/// `args` (#1695 merge-gate finding 4) is the raw text typed after the
-/// command name. No review-family config consumes it today (the dedicated
-/// review launcher, `mission_launch_review::launch`, declares no `args`
-/// input), so trailing args are silently accepted by the ACP layer but
-/// have no effect on the dispatched review — the final message says so
-/// explicitly rather than leaving the operator to infer it from the
-/// hint's "(no arguments)" text alone.
-async fn run_review(
-    session_id: &SessionId,
-    config_id: &str,
-    args: &str,
-    cwd: &Path,
-    cx: &ConnectionTo<Client>,
-    sessions: &Sessions,
-) -> Result<()> {
-    let diff = git_diff(cwd).await?;
-    if diff.trim().is_empty() {
-        cx.send_notification(agent_chunk(
-            session_id,
-            "No uncommitted changes to review in this working tree.",
-        ))?;
-        return Ok(());
-    }
-
-    // (b) Plan update naming the review stages, sent up front so the
-    // operator sees the graph immediately, before any model work starts.
-    let mut plan_entries = initial_plan_entries();
-    cx.send_notification(SessionNotification::new(
-        session_id.clone(),
-        SessionUpdate::Plan(Plan::new(plan_entries.clone())),
-    ))?;
-
-    let case_id = derive_case_id(cwd, &diff);
-    let diff_path =
-        std::env::temp_dir().join(format!("darkmux-acp-{}-{case_id}.diff", std::process::id()));
-    tokio::fs::write(&diff_path, &diff)
-        .await
-        .with_context(|| format!("writing the diff to {}", diff_path.display()))?;
-
-    let exe = std::env::current_exe().context("resolving darkmux's own executable path")?;
-    let diff_file_arg = format!("diff_file={}", diff_path.display());
-    let worktree_arg = format!("worktree={}", cwd.display());
-    let case_id_arg = format!("case_id={case_id}");
-    let bundler_param = choose_bundler(&diff);
-
-    eprintln!(
-        "[darkmux-acp] session/prompt: spawning `mission launch {config_id}` case={case_id} \
-         diff_file={} bundler={}",
-        diff_path.display(),
-        bundler_param.as_deref().unwrap_or("(built-in)")
-    );
-
-    let mut cmd = Command::new(&exe);
-    cmd.args([
-        "mission",
-        "launch",
-        config_id,
-        "--param",
-        &diff_file_arg,
-        "--param",
-        &worktree_arg,
-        "--param",
-        &case_id_arg,
-    ]);
-    if let Some(bundler) = &bundler_param {
-        cmd.args(["--param", bundler]);
-    }
-    let mut child = cmd
-        .current_dir(cwd)
-        .stdin(ProcStdio::null())
-        .stdout(ProcStdio::piped())
-        .stderr(ProcStdio::piped())
-        // (#1684 remainder — cancellation) A `session/cancel` aborts the
-        // `tokio::spawn`'d task awaiting this child (see `run_cancellable`),
-        // which drops `child` mid-`.wait()`. `kill_on_drop` is what turns
-        // that drop into a real SIGKILL on the OS process instead of an
-        // orphan — see the module doc's "Cancellation is wired" note.
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("spawning `darkmux mission launch {config_id}` subprocess"))?;
-
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-
-    // Drain stdout in the background. THE CRITICAL CONSTRAINT: this is the
-    // subprocess's stdout — never this process's own. Today the review
-    // pipeline prints exactly one thing to stdout (the final rendered-
-    // review JSON blob from `pr_review::emit_rendered`), so this task's job
-    // is really just "buffer everything until the pipe closes, forwarding
-    // anything that doesn't look like that JSON blob as a chunk too" (kept
-    // uniform with the stderr handling below on the offhand chance that
-    // changes). It deliberately does NOT touch stage-recognition state —
-    // see the note on `current_stage` below for why that's safe today.
-    let stdout_session_id = session_id.clone();
-    let stdout_cx = cx.clone();
-    let stdout_task: tokio::task::JoinHandle<String> = tokio::spawn(async move {
-        let mut buf = String::new();
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if let Some(display) = forwardable_chunk_text(&line) {
-                        let _ = stdout_cx.send_notification(agent_chunk(
-                            &stdout_session_id,
-                            display,
-                        ));
-                    }
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    eprintln!("[darkmux-acp] reading subprocess stdout: {err}");
-                    break;
-                }
-            }
-        }
-        buf
-    });
-
-    // Foreground: drain stderr line-by-line. Stage-transition tracking
-    // (`current_stage`, the Plan entries, the per-stage ToolCall) lives
-    // ONLY here, not in the stdout task above — the review pipeline's
-    // progress markers (`[darkmux-liveness] ...`) only ever land on
-    // stderr today, so there's no real concurrent-writer race to guard
-    // against. If that ever changes, this state would need to move behind
-    // a shared lock.
-    let mut current_stage: Option<usize> = None;
-    // Heartbeat rendering (operator finding, first live Zed run: the probe
-    // stage runs for minutes and the stage card sat motionless — "looks
-    // stuck. If I didn't have the ability to go hunting for evidence of
-    // work on LM Studio I might be confused as a user"). The subprocess
-    // already streams `[darkmux-liveness]` markers on stderr; render each
-    // one into the active stage card's title so the card visibly ticks.
-    let mut stage_marker_count: usize = 0;
-    let mut last_liveness_title = String::new();
-    let mut stderr_lines = BufReader::new(stderr).lines();
-    loop {
-        let line = match stderr_lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            Err(err) => {
-                eprintln!("[darkmux-acp] reading subprocess stderr: {err}");
-                break;
-            }
-        };
-
-        if let Some(stage_idx) = recognize_stage(&line) {
-            if current_stage != Some(stage_idx) {
-                advance_plan(&mut plan_entries, stage_idx);
-                cx.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::Plan(Plan::new(plan_entries.clone())),
-                ))?;
-
-                let (_, label) = REVIEW_STAGES[stage_idx];
-                cx.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::ToolCall(
-                        ToolCall::new(stage_tool_call_id(label), format!("darkmux review — {label}"))
-                            .kind(ToolKind::Execute)
-                            .status(ToolCallStatus::InProgress),
-                    ),
-                ))?;
-                current_stage = Some(stage_idx);
-                stage_marker_count = 0;
-            }
-        }
-
-        if let Some(marker) = liveness_marker(&line) {
-            if let Some(stage_idx) = current_stage {
-                stage_marker_count += 1;
-                let (_, label) = REVIEW_STAGES[stage_idx];
-                let title = format!("darkmux review — {label} · [{stage_marker_count}] {marker}");
-                if title != last_liveness_title {
-                    cx.send_notification(SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                            stage_tool_call_id(label),
-                            ToolCallUpdateFields::new().title(title.clone()),
-                        )),
-                    ))?;
-                    last_liveness_title = title;
-                }
-            }
-        }
-
-        if let Some(display) = forwardable_chunk_text(&line) {
-            cx.send_notification(agent_chunk(session_id, display))?;
-        }
-    }
-
-    let status = child
-        .wait()
-        .await
-        .with_context(|| format!("waiting on the `{config_id}` subprocess"))?;
-    let stdout_buf = stdout_task.await.unwrap_or_default();
-    let _ = tokio::fs::remove_file(&diff_path).await;
-
-    // (e) Close out the last stage's ToolCall + Plan, then the final
-    // human-readable result.
-    if let Some(stage_idx) = current_stage {
-        let (_, label) = REVIEW_STAGES[stage_idx];
-        let final_status = if status.success() {
-            ToolCallStatus::Completed
-        } else {
-            ToolCallStatus::Failed
-        };
-        cx.send_notification(SessionNotification::new(
-            session_id.clone(),
-            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                stage_tool_call_id(label),
-                ToolCallUpdateFields::new().status(final_status),
-            )),
-        ))?;
-    }
-    if status.success() {
-        for entry in &mut plan_entries {
-            entry.status = PlanEntryStatus::Completed;
-        }
-        cx.send_notification(SessionNotification::new(
-            session_id.clone(),
-            SessionUpdate::Plan(Plan::new(plan_entries)),
-        ))?;
-    }
-
-    let mut final_text = render_final_message(&stdout_buf, status);
-    // (#1695 merge-gate finding 4) No review-family config consumes `args`
-    // today — say so explicitly rather than silently swallowing whatever
-    // the operator typed after the command name.
-    if !args.trim().is_empty() {
-        final_text.push_str(&format!(
-            "\n\n_(arguments `{}` were ignored — `{config_id}` takes none)_",
-            args.trim()
-        ));
-    }
-    // (#1698 Packet B2, scope C) Shelve the rendered result BEFORE sending
-    // it — the answering seat's own dispatch (if this session later asks a
-    // question the router refuses) never races the shelf write against the
-    // notification itself.
-    session_shelf_push(sessions, session_id, crate::radio_answer::shelf_entry(config_id, args, &final_text));
-    cx.send_notification(agent_chunk(session_id, final_text))?;
-
-    Ok(())
-}
-
 /// (#1684 rule D) Drive a procedural-only panel command's graph in-process
 /// via `acp_panel::run_ephemeral` — no mission instance minted, no
 /// lifecycle records. `run_ephemeral` is fully synchronous (it shells out
@@ -1780,6 +1491,86 @@ impl Drop for EphemeralJoinGuard {
     }
 }
 
+/// Raise `session/request_permission` to the connected client and await its
+/// decision — the async half of [`acp_gate_handler`]. Runs on a freshly
+/// spawned, concurrent task (never inline inside a request handler — see
+/// `acp_gate_handler`'s own doc on the deadlock this avoids).
+async fn request_operator_sign_off(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    step_id: &str,
+    facts_text: &str,
+) -> crate::crew::gate::GateDecision {
+    const ALLOW: &str = "allow";
+    const REJECT: &str = "reject";
+
+    // (#1684 QA CONSIDER) This `ToolCallId` is never announced via a prior
+    // `SessionUpdate::ToolCall` before this request — unlike `run_review`'s
+    // stage tool calls (`stage_tool_call_id`), which always send a
+    // `ToolCall` notification before referencing that id again. Per the
+    // schema, `RequestPermissionRequest.tool_call` is a `ToolCallUpdate`
+    // (an upsert, not an update-only reference), so this SHOULD be fine on
+    // a spec-compliant client — but this is the same class of "Zed drops
+    // a message naming something it doesn't know about yet" surprise the
+    // Packet-1 wire-ordering finding hit for `AvailableCommandsUpdate` (see
+    // `session/new`'s handler comment above). Live dogfood verified the
+    // dialog renders — for the FIRST gated invocation only, which is why
+    // the id below carries a nonce:
+    //
+    // (#1684, confirmed live) A DETERMINISTIC id here collides on the
+    // second gated invocation in one session: the first dialog's tool call
+    // is already terminal under the same id, Zed renders no new dialog,
+    // and the agent blocks forever on a reply that cannot come (the
+    // operator's canonical approve-then-merge pair hit this on its first
+    // real use). A process-global counter makes every request's id unique.
+    static GATE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = GATE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tool_call = ToolCallUpdate::new(
+        ToolCallId::new(format!("darkmux-gate-{step_id}-{nonce}")),
+        ToolCallUpdateFields::new()
+            .title(format!("darkmux — operator sign-off required: `{step_id}`"))
+            .kind(ToolKind::Execute)
+            .status(ToolCallStatus::Pending)
+            .content(vec![ToolCallContent::from(facts_text.to_string())]),
+    );
+    let options = vec![
+        PermissionOption::new(ALLOW, "Allow", PermissionOptionKind::AllowOnce),
+        PermissionOption::new(REJECT, "Reject", PermissionOptionKind::RejectOnce),
+    ];
+    let request = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
+
+    match cx.send_request(request).block_task().await {
+        Ok(response) => match response.outcome {
+            RequestPermissionOutcome::Selected(sel) if &*sel.option_id.0 == ALLOW => {
+                crate::crew::gate::GateDecision::Approved
+            }
+            RequestPermissionOutcome::Selected(sel) => crate::crew::gate::GateDecision::Declined {
+                reason: format!(
+                    "step `{step_id}` — operator selected `{}` at the sign-off dialog",
+                    sel.option_id
+                ),
+            },
+            RequestPermissionOutcome::Cancelled => crate::crew::gate::GateDecision::Declined {
+                reason: format!("step `{step_id}` — the sign-off request was cancelled"),
+            },
+            // `RequestPermissionOutcome` is `#[non_exhaustive]` (the schema
+            // crate may add a variant in a future minor release this
+            // binary's pinned version predates) — an outcome this match
+            // doesn't recognize is exactly a "no sign-off received" case,
+            // so it fails closed like `Cancelled` rather than panicking on
+            // an unmatched arm.
+            _ => crate::crew::gate::GateDecision::Declined {
+                reason: format!(
+                    "step `{step_id}` — the client returned an unrecognized sign-off outcome"
+                ),
+            },
+        },
+        Err(e) => crate::crew::gate::GateDecision::Declined {
+            reason: format!("step `{step_id}` — the sign-off request to the client failed: {e}"),
+        },
+    }
+}
+
 /// (#1684 Packet 2) Build the ACP surface's operator sign-off gate handler
 /// — the `darkmux_crew::gate::GateHandler` the ephemeral runner invokes,
 /// via `darkmux_crew::scheduler::run_step_graph`, for any step whose
@@ -1881,86 +1672,6 @@ fn render_gate_facts(facts: &BTreeMap<String, String>) -> String {
     facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n")
 }
 
-/// Raise `session/request_permission` to the connected client and await its
-/// decision — the async half of [`acp_gate_handler`]. Runs on a freshly
-/// spawned, concurrent task (never inline inside a request handler — see
-/// `acp_gate_handler`'s own doc on the deadlock this avoids).
-async fn request_operator_sign_off(
-    cx: &ConnectionTo<Client>,
-    session_id: &SessionId,
-    step_id: &str,
-    facts_text: &str,
-) -> crate::crew::gate::GateDecision {
-    const ALLOW: &str = "allow";
-    const REJECT: &str = "reject";
-
-    // (#1684 QA CONSIDER) This `ToolCallId` is never announced via a prior
-    // `SessionUpdate::ToolCall` before this request — unlike `run_review`'s
-    // stage tool calls (`stage_tool_call_id`), which always send a
-    // `ToolCall` notification before referencing that id again. Per the
-    // schema, `RequestPermissionRequest.tool_call` is a `ToolCallUpdate`
-    // (an upsert, not an update-only reference), so this SHOULD be fine on
-    // a spec-compliant client — but this is the same class of "Zed drops
-    // a message naming something it doesn't know about yet" surprise the
-    // Packet-1 wire-ordering finding hit for `AvailableCommandsUpdate` (see
-    // `session/new`'s handler comment above). Live dogfood verified the
-    // dialog renders — for the FIRST gated invocation only, which is why
-    // the id below carries a nonce:
-    //
-    // (#1684, confirmed live) A DETERMINISTIC id here collides on the
-    // second gated invocation in one session: the first dialog's tool call
-    // is already terminal under the same id, Zed renders no new dialog,
-    // and the agent blocks forever on a reply that cannot come (the
-    // operator's canonical approve-then-merge pair hit this on its first
-    // real use). A process-global counter makes every request's id unique.
-    static GATE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = GATE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tool_call = ToolCallUpdate::new(
-        ToolCallId::new(format!("darkmux-gate-{step_id}-{nonce}")),
-        ToolCallUpdateFields::new()
-            .title(format!("darkmux — operator sign-off required: `{step_id}`"))
-            .kind(ToolKind::Execute)
-            .status(ToolCallStatus::Pending)
-            .content(vec![ToolCallContent::from(facts_text.to_string())]),
-    );
-    let options = vec![
-        PermissionOption::new(ALLOW, "Allow", PermissionOptionKind::AllowOnce),
-        PermissionOption::new(REJECT, "Reject", PermissionOptionKind::RejectOnce),
-    ];
-    let request = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
-
-    match cx.send_request(request).block_task().await {
-        Ok(response) => match response.outcome {
-            RequestPermissionOutcome::Selected(sel) if &*sel.option_id.0 == ALLOW => {
-                crate::crew::gate::GateDecision::Approved
-            }
-            RequestPermissionOutcome::Selected(sel) => crate::crew::gate::GateDecision::Declined {
-                reason: format!(
-                    "step `{step_id}` — operator selected `{}` at the sign-off dialog",
-                    sel.option_id
-                ),
-            },
-            RequestPermissionOutcome::Cancelled => crate::crew::gate::GateDecision::Declined {
-                reason: format!("step `{step_id}` — the sign-off request was cancelled"),
-            },
-            // `RequestPermissionOutcome` is `#[non_exhaustive]` (the schema
-            // crate may add a variant in a future minor release this
-            // binary's pinned version predates) — an outcome this match
-            // doesn't recognize is exactly a "no sign-off received" case,
-            // so it fails closed like `Cancelled` rather than panicking on
-            // an unmatched arm.
-            _ => crate::crew::gate::GateDecision::Declined {
-                reason: format!(
-                    "step `{step_id}` — the client returned an unrecognized sign-off outcome"
-                ),
-            },
-        },
-        Err(e) => crate::crew::gate::GateDecision::Declined {
-            reason: format!("step `{step_id}` — the sign-off request to the client failed: {e}"),
-        },
-    }
-}
-
 /// (#1684 rule D) Launch a panel command whose graph has at least one
 /// model-dispatching step as a normal `darkmux mission launch <id>`
 /// subprocess — a full instance, same pattern [`run_review`] uses for its
@@ -2057,295 +1768,6 @@ async fn run_launch_command(
     session_shelf_push(sessions, session_id, crate::radio_answer::shelf_entry(config_id, args, &text));
     cx.send_notification(agent_chunk(session_id, text))?;
     Ok(())
-}
-
-fn initial_plan_entries() -> Vec<PlanEntry> {
-    REVIEW_STAGES
-        .iter()
-        .map(|(_, label)| {
-            PlanEntry::new(
-                format!("darkmux review — {label}"),
-                PlanEntryPriority::Medium,
-                PlanEntryStatus::Pending,
-            )
-        })
-        .collect()
-}
-
-/// Mark every entry before `stage_idx` Completed, `stage_idx` itself
-/// InProgress, and leave later entries Pending. The protocol replaces the
-/// whole plan on every update, so the full entry list is resent each call.
-fn advance_plan(entries: &mut [PlanEntry], stage_idx: usize) {
-    for (i, entry) in entries.iter_mut().enumerate() {
-        entry.status = match i.cmp(&stage_idx) {
-            std::cmp::Ordering::Less => PlanEntryStatus::Completed,
-            std::cmp::Ordering::Equal => PlanEntryStatus::InProgress,
-            std::cmp::Ordering::Greater => PlanEntryStatus::Pending,
-        };
-    }
-}
-
-fn stage_tool_call_id(stage_label: &str) -> ToolCallId {
-    ToolCallId::new(format!("darkmux-review-{stage_label}"))
-}
-
-/// SPIKE-GRADE stage recognition (see module docs): lowercase-substring
-/// match against [`REVIEW_STAGES`]. Returns the index of the first stage
-/// whose stem appears in `line`.
-fn recognize_stage(line: &str) -> Option<usize> {
-    let lower = line.to_ascii_lowercase();
-    REVIEW_STAGES.iter().position(|(stem, _)| lower.contains(stem))
-}
-
-/// What to forward to the ACP client as an `AgentMessageChunk`, if
-/// anything: trims the line, skips blanks, and skips anything that looks
-/// like a raw JSON payload (the one thing on stdout we specifically want
-/// buffered-only, not dumped into the chat as a giant blob — see
-/// `render_final_message`). Strips the `[darkmux-liveness] ` prefix when
-/// present so the chat reads as prose instead of a log-file dump.
-///
-/// (#1684 — chunk-noise filter) Also drops darkmux-flow's sink-init
-/// diagnostics (`crates/darkmux-flow/src/lib.rs::build_default_sink`),
-/// which print UNCONDITIONALLY on stderr the first time ANY process touches
-/// the flow crate — i.e. every `mission launch` subprocess this file spawns,
-/// review or otherwise, every time. Observed live leaking into the Zed
-/// panel as raw agent chunks (e.g. "flow: Redis sink enabled —
-/// url=redis://... stream=darkmux:flow max_len=None (composed via
-/// TeeSink)"). These lines are legitimate diagnostics for a terminal
-/// operator — never silenced at the source, matching the module's own "why
-/// stdout is off-limits" reasoning about not touching the emitter — but
-/// infrastructure chatter with nothing to say to someone reading a chat
-/// panel. Matched on the flow crate's own literal `"flow: "` prefix
-/// convention, the ONLY startup-noise prefix in the tree confirmed to fire
-/// unconditionally on a normal `mission launch` run (audited 2026-08-12:
-/// the `warning:`/`radio:`/`funnels:`/`scores:`/`debates:`/`machine:`
-/// prefixes elsewhere in the codebase are either error-path-only or belong
-/// to CLI verbs this file never subprocesses into) — a narrow, conservative
-/// match, never a broad heuristic that could eat real model output.
-fn forwardable_chunk_text(line: &str) -> Option<String> {
-    forwardable_chunk_text_with_record(line, |dropped| {
-        eprintln!("[darkmux-acp] subprocess: {dropped}");
-    })
-}
-
-/// [`forwardable_chunk_text`]'s actual logic, with the "what to do with a
-/// line we're dropping from the chat" side effect factored out as an
-/// injectable `record` callback (#1777 merge gate, MUST FIX 2) — the SAME
-/// `Arc<dyn Fn>`-injection shape this file already uses for
-/// `RouterCall`/`AnswererCall`/`ScopeCall` so the decision ("forward to
-/// chat" vs "suppress but still record") stays unit-testable without
-/// capturing this PROCESS'S real stderr (fd 2 is process-global; every
-/// `cargo test` thread shares it, so redirecting it mid-test would be
-/// flaky by construction). Production wraps this with a plain
-/// `eprintln!("[darkmux-acp] subprocess: {line}")` — see
-/// [`forwardable_chunk_text`] — so every filtered line still lands on
-/// this process's own stderr (Zed's logs panel) even when it's not
-/// narrated in the chat transcript: filter the CHAT, never the RECORD.
-fn forwardable_chunk_text_with_record(line: &str, mut record: impl FnMut(&str)) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with("flow: ") {
-        record(line);
-        return None;
-    }
-    let display = trimmed.strip_prefix("[darkmux-liveness] ").unwrap_or(trimmed);
-    Some(format!("`{display}`"))
-}
-
-/// Deterministic case id (no `Date`/random, per the task brief): the diff's
-/// content hash plus the cwd's directory name, so repeated reviews of an
-/// unchanged diff in the same workspace reuse the same case id while a
-/// changed diff or a different workspace gets a new one.
-///
-/// `pub(crate)` (#1698 Packet B carry-list item 1) — reused by
-/// `synthesize_review_launch_params` below, which `src/radio_cli.rs`'s CLI
-/// review route calls into rather than re-deriving the same hash.
-pub(crate) fn derive_case_id(cwd: &Path, diff: &str) -> String {
-    let hash = blake3::hash(diff.as_bytes());
-    let short = &hash.to_hex().to_string()[..8];
-    let base = cwd
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("workspace");
-    format!("zed-{base}-{short}")
-}
-
-/// The `--param` strings + written diff tempfile a review-route launch
-/// needs — `run_review`'s own required inputs (`diff_file`, `worktree`,
-/// `case_id`, optional `bundler`), extracted into a pure(-ish; one tempfile
-/// write) synchronous helper so `src/radio_cli.rs`'s CLI review route can
-/// synthesize the SAME inputs the panel's `run_review` builds inline below
-/// (#1698 Packet B carry-list item 1, the #1701 merge-gate headline
-/// finding: `radio "review this"` used to route correctly then die at the
-/// launcher's missing-inputs error because the CLI path never built these
-/// params at all). `run_review` itself is left untouched — its own inline
-/// construction still uses `tokio::fs::write` (async-friendly inside its
-/// already-async function); this helper exists for a caller that has no
-/// tokio runtime to run inside, and reuses [`derive_case_id`] /
-/// [`choose_bundler`] rather than re-deriving either.
-pub(crate) struct ReviewLaunchParams {
-    /// The tempfile path the diff was written to — the caller must clean
-    /// this up after the launched subprocess exits (`run_review`'s own
-    /// `tokio::fs::remove_file` is the async-context precedent).
-    pub diff_path: PathBuf,
-    pub diff_file_arg: String,
-    pub worktree_arg: String,
-    pub case_id_arg: String,
-    pub bundler_param: Option<String>,
-}
-
-/// Build a [`ReviewLaunchParams`] from an already-fetched `diff` string and
-/// the session's `cwd` — writes the diff to a tempfile (the one I/O side
-/// effect) and derives the case id + bundler choice from its content.
-/// `diff` empty/whitespace-only is the caller's OWN "nothing to review"
-/// check (mirroring `run_review`'s own early return) — this function does
-/// not special-case it, since a synthesized `case_id`/`diff_path` for an
-/// empty diff is harmless, just pointless; the caller decides whether to
-/// call this at all.
-pub(crate) fn synthesize_review_launch_params(cwd: &Path, diff: &str) -> Result<ReviewLaunchParams> {
-    let case_id = derive_case_id(cwd, diff);
-    let diff_path =
-        std::env::temp_dir().join(format!("darkmux-acp-{}-{case_id}.diff", std::process::id()));
-    std::fs::write(&diff_path, diff)
-        .with_context(|| format!("writing the diff to {}", diff_path.display()))?;
-    Ok(ReviewLaunchParams {
-        diff_file_arg: format!("diff_file={}", diff_path.display()),
-        worktree_arg: format!("worktree={}", cwd.display()),
-        case_id_arg: format!("case_id={case_id}"),
-        bundler_param: choose_bundler(diff),
-        diff_path,
-    })
-}
-
-/// Compact human rendering of a `[darkmux-liveness]` stderr marker:
-/// `<phase> · +<s>s` or `<phase> (<detail>) · +<s>s`; `None` for any other
-/// line. Wire format per `darkmux_types::dispatch_liveness::emit`:
-/// `[darkmux-liveness] <ts> +<ms>ms <phase> pid=<n> case=<id> | <detail>`
-/// — the pid/case/timestamp are noise at this grain (the case is constant
-/// for the whole run), but the `+<ms>ms` elapsed clock is exactly the
-/// "is it moving" signal, so it renders as seconds.
-fn liveness_marker(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("[darkmux-liveness] ")?;
-    let mut tokens = rest.split_whitespace();
-    let _ts = tokens.next()?;
-    let elapsed_ms = tokens.next()?;
-    let phase = tokens.next()?;
-    let secs = elapsed_ms
-        .strip_prefix('+')
-        .and_then(|t| t.strip_suffix("ms"))
-        .and_then(|t| t.parse::<u64>().ok())
-        .map(|ms| ms / 1000);
-    let detail = rest.split(" | ").nth(1).map(str::trim).filter(|d| !d.is_empty());
-    let mut out = match detail {
-        Some(d) => format!("{phase} ({d})"),
-        None => phase.to_string(),
-    };
-    if let Some(s) = secs {
-        out.push_str(&format!(" · +{s}s"));
-    }
-    Some(out)
-}
-
-/// SPIKE-GRADE bundler routing (see module docs): scan the diff's
-/// `+++ b/` target paths — TypeScript anywhere wins the built-in bundler
-/// (`None`); otherwise any `.edge` file routes to the operator's
-/// `darkmux-bundler-edge` plugin. A mixed ts+edge diff takes the TS path
-/// and the templates are skipped — good enough for a spike, wrong for
-/// the real feature (bundler composition is a #1388 follow-up). Without
-/// this routing, a template-only diff is a guaranteed degenerate close
-/// ("3 skipped: non-code extension" — observed live on the first Zed
-/// demo, 2026-08-07).
-///
-/// `pub(crate)` (#1698 Packet B carry-list item 1) — reused by
-/// `synthesize_review_launch_params` below, same reason as
-/// [`derive_case_id`].
-pub(crate) fn choose_bundler(diff: &str) -> Option<String> {
-    let mut saw_edge = false;
-    for line in diff.lines() {
-        if let Some(target) = line.strip_prefix("+++ b/") {
-            let t = target.trim();
-            if t.ends_with(".ts") || t.ends_with(".tsx") {
-                return None;
-            }
-            if t.ends_with(".edge") {
-                saw_edge = true;
-            }
-        }
-    }
-    saw_edge.then(edge_bundler_param)
-}
-
-/// The `bundler=<cmd>` param value for the Edge plugin. Resolved to an
-/// absolute path when the plugin exists at its conventional install
-/// location (`~/.local/bin/darkmux-bundler-edge`) — the agent may be
-/// running under Zed's GUI environment, whose PATH does not necessarily
-/// include `~/.local/bin` — falling back to the bare PATH-resolved name.
-fn edge_bundler_param() -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = Path::new(&home).join(".local/bin/darkmux-bundler-edge");
-        if p.is_file() {
-            return format!("bundler={}", p.display());
-        }
-    }
-    "bundler=darkmux-bundler-edge".to_string()
-}
-
-async fn git_diff(cwd: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .arg("diff")
-        .arg("HEAD")
-        .current_dir(cwd)
-        .stdin(ProcStdio::null())
-        .stdout(ProcStdio::piped())
-        .stderr(ProcStdio::piped())
-        .output()
-        .await
-        .with_context(|| format!("running `git diff HEAD` in {}", cwd.display()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "`git diff HEAD` failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// The review comment is rendered for its normal destination — a GitHub PR
-/// comment, where embedded HTML renders. Zed's agent panel renders markdown
-/// but NOT embedded HTML, so the one piece of HTML furniture the renderer
-/// emits (the `<sub>…</sub>` small-print footer — `src/pr_review.rs`, its
-/// only HTML) shows up in the panel as literal tags (operator, first live
-/// run: "is that the github PR output leaking into the agent panel?" —
-/// yes, verbatim). Translate exactly that furniture to markdown emphasis.
-/// Deliberately a KNOWN-TAG translation, never a generic HTML stripper:
-/// finding evidence legitimately quotes literal HTML (tonight's flagged
-/// `<form …>` tag) and must pass through untouched.
-fn panelize_comment(comment: &str) -> String {
-    comment.replace("<sub>", "*").replace("</sub>", "*")
-}
-
-fn render_final_message(stdout_buf: &str, status: std::process::ExitStatus) -> String {
-    let trimmed = stdout_buf.trim();
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(comment) = value.get("comment").and_then(|v| v.as_str()) {
-            return panelize_comment(comment);
-        }
-        let mode = value.get("mode").and_then(|v| v.as_str()).unwrap_or("unknown");
-        return format!(
-            "darkmux review finished (mode: {mode}) but produced no renderable comment.\n\n\
-             ```json\n{trimmed}\n```"
-        );
-    }
-    if status.success() {
-        format!(
-            "darkmux review finished (exit 0) but its output didn't parse as the expected \
-             JSON envelope. Raw stdout:\n\n```\n{trimmed}\n```"
-        )
-    } else {
-        format!(
-            "darkmux review failed ({status}). Raw stdout:\n\n```\n{trimmed}\n```"
-        )
-    }
 }
 
 fn extract_text(prompt: &[ContentBlock]) -> String {
@@ -2974,70 +2396,6 @@ mod tests {
 
         let final_response = recv_json(&mut reader).await;
         assert_end_turn(&final_response);
-    }
-
-    /// (#1684 remainder — chunk-noise filter) darkmux-flow's sink-init
-    /// diagnostics must never reach the ACP wire as agent chunks — the
-    /// defect observed live (issue #1684's own "flow: ... composed via
-    /// TeeSink" example). A real (non-noise) stderr line must still pass
-    /// through untouched, proving the filter is narrow, not a blanket drop.
-    #[test]
-    fn forwardable_chunk_text_filters_flow_sink_startup_noise() {
-        assert_eq!(
-            forwardable_chunk_text(
-                "flow: Redis sink enabled — url=redis://x stream=darkmux:flow max_len=None (composed via TeeSink)"
-            ),
-            None
-        );
-        assert_eq!(
-            forwardable_chunk_text(
-                "flow: AuditFileSink enabled — audit_dir=/tmp/x (hash-chained, flock-serialized)"
-            ),
-            None
-        );
-        assert_eq!(
-            forwardable_chunk_text("some real progress line"),
-            Some("`some real progress line`".to_string())
-        );
-    }
-
-    /// (#1777 merge gate — MUST FIX 2) A dropped line is filtered from the
-    /// CHAT, never from the RECORD. darkmux-flow's degraded-mode warnings
-    /// (a rotted Redis password, a POSIX-only audit sink on an unsupported
-    /// platform — `crates/darkmux-flow/src/lib.rs::build_default_sink`)
-    /// share the SAME `"flow: "` prefix as its benign startup-success
-    /// chatter, so the narrow chat filter above would otherwise make a
-    /// genuinely degraded fleet stream invisible everywhere: every
-    /// `/review` subprocess prints the warning, the chat filter eats it,
-    /// and nothing anywhere says so. This proves the drop branch still
-    /// hands every filtered line to its `record` callback — production
-    /// wires that to `eprintln!` on this process's own stderr (asserted by
-    /// inspection at the call site, not here — fd 2 is process-global and
-    /// shared by every concurrently-running `cargo test` thread, so
-    /// redirecting it mid-test would be flaky by construction; the
-    /// callback-injection seam is what makes the DECISION testable without
-    /// needing to capture real stderr).
-    #[test]
-    fn forwardable_chunk_text_still_records_a_filtered_degraded_mode_warning() {
-        let flow_warning = "flow: Redis sink construction failed (connection refused); \
-                             continuing without it. Other sinks intact.";
-        let mut recorded = Vec::new();
-        let result = forwardable_chunk_text_with_record(flow_warning, |line| recorded.push(line.to_string()));
-        assert_eq!(result, None, "a degraded-mode flow warning still must not reach the chat verbatim");
-        assert_eq!(
-            recorded,
-            vec![flow_warning.to_string()],
-            "but it MUST still reach the record — never silently eaten"
-        );
-
-        // A line that reaches the chat must NOT also be pushed onto the
-        // record path — the two are mutually exclusive per line, proving
-        // this isn't a blanket "record everything" change in disguise.
-        let mut recorded_real = Vec::new();
-        let real_line = "some real progress line";
-        let result = forwardable_chunk_text_with_record(real_line, |line| recorded_real.push(line.to_string()));
-        assert_eq!(result, Some("`some real progress line`".to_string()));
-        assert!(recorded_real.is_empty(), "a forwarded (non-filtered) line must not also be recorded");
     }
 
     /// (#1684 remainder — cancellation) `session/cancel` actually aborts an

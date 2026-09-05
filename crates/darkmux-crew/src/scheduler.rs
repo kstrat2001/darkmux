@@ -722,8 +722,8 @@ pub fn run_step_graph(
                 // (#1530) An UNREGISTERED kind contributes no `provides()` to
                 // the pre-scan above, so it can make a sibling's requirement
                 // look unmet — e.g. a stale user-tier config still naming
-                // `review.probe` (retired in #1442) loses that kind's ports and
-                // the operator gets "nothing provides review.probe-selection"
+                // a Tier-3 kind loses that kind's ports and the operator gets a
+                // "nothing provides <port>"
                 // instead of "unknown step kind". Track them so the message can
                 // name the real cause rather than misdirecting — which is the
                 // whole point of this change.
@@ -1382,7 +1382,7 @@ fn cascade_abandon_with_reason(
 /// [`dependency_satisfies_run_on`] correctly refuses a still-`Planned`
 /// dependency — so the ONE declaration a config author writes to keep a
 /// delivery/report task alive across a failure was inert for every edge
-/// that crosses a phase boundary, which in `review-v2.json` and
+/// that crosses a phase boundary, which in `review.json` and
 /// `crawl.json` is every edge there is.
 ///
 /// The caller runs this at PHASE ENTRY, once the phase's tasks and steps
@@ -1641,7 +1641,7 @@ pub const STEP_LIFECYCLE_ACTIONS: [&str; 3] = ["step start", "step complete", "s
 /// instead: every production caller wraps `emit` so a record with no
 /// `mission_id` gets THIS run's id stamped on before it's written
 /// (`get_or_insert`-style — never overwrites a record that already carries
-/// one) — see `src/mission_launch.rs`'s and `src/mission_launch_review.rs`'s
+/// one) — see `src/mission_launch.rs`'s and the retired review funnel launcher's
 /// (`FleetFlowEmitter`) `run_step_graph`/`run_review_graph` call sites.
 /// Without that wrap, `session_id` here is CONFIG-scoped
 /// (`session_id::task` hashes only `step.task_id`, a string straight out of
@@ -1747,7 +1747,7 @@ pub fn step_lifecycle_record_with_payload(step: &Step, action: &str, payload: Op
 ///
 /// **Deliberately its own action, never `"step result"`.** A `StepKind`'s
 /// own business-result record (`dispatch.map`'s per-item/aggregate records,
-/// `darkmux_lab::lab::review`'s `review.bundle`/`review.judge`/etc.) already
+/// the launch-owned Tier-3 kinds) already
 /// emits under `action: "step result"`, `source: "scheduler"` or
 /// `source: "review"`, for the steps that cooperate, and that record
 /// carries real `items_in`/`items_out` this module cannot observe (see

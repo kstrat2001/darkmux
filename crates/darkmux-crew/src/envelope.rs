@@ -51,7 +51,7 @@
 //!
 //! [`MissionEnvelope::outcome`] carries a [`crate::run_outcome::RunOutcome`]
 //! when the mission driver has one — today, only the PR-review pipeline
-//! (`src/mission_launch_review.rs`'s `review_result_to_mission_envelope`)
+//! (the retired review funnel launcher's `review_result_to_mission_envelope`)
 //! does. Before this field existed, "a run was partially covered" lived as
 //! a CONVENTION: review pushed a warning string into `warnings` and this
 //! module's own status derivation read "non-empty warnings" as `Degraded`.

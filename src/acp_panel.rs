@@ -11,7 +11,6 @@
 //! should run:
 //!
 //! - A config whose graph structurally uses a review-pipeline step kind
-//!   (`crate::mission_launch::config_uses_review_kinds` — the SAME test
 //!   `src/mission_launch.rs::launch` uses, never an `id == "review"`
 //!   string literal) keeps `acp.rs`'s EXISTING bespoke path (`run_review`)
 //!   unchanged — this module never touches it beyond routing to it.
@@ -185,16 +184,6 @@ pub fn parse_command(text: &str) -> Option<(String, String)> {
 /// What `session/prompt`'s command dispatch decided to do with an invoked
 /// command name — see [`route_command`].
 pub enum RoutePlan {
-    /// The config's graph uses a review-pipeline step kind
-    /// (`config_uses_review_kinds`) — the EXISTING bespoke path in
-    /// `acp.rs` (`run_review`), unchanged by this module. Carries the
-    /// REGISTRY-RESOLVABLE id (#1695 merge-gate MUST FIX) so `run_review`
-    /// spawns `mission launch <this-id>`, never a hardcoded `"review"` —
-    /// a panel-advertised review VARIANT (an operator config carrying
-    /// `review.*` kinds under a different id, e.g. `review-lean`) must
-    /// launch ITSELF, not silently launch the built-in `review` config in
-    /// its place.
-    Review(String),
     /// The config's graph contains ZERO model-dispatching steps (every
     /// step kind is `procedural.*`) — run in-process via [`run_ephemeral`],
     /// no mission instance minted.
@@ -226,21 +215,10 @@ pub enum RoutePlan {
 /// first, never a panic. The MATCHED entry's own (correctly-cased) `id` is
 /// what actually gets loaded/launched — never the lowercased `cmd` the
 /// user typed.
-///
-/// The review route is decided STRUCTURALLY — `config_uses_review_kinds`,
-/// the SAME test `src/mission_launch.rs::launch` uses to route a config to
-/// the dedicated review launcher (#1530) — never by an `id == "review"`
-/// string literal (#1684 QA finding). A renamed variant (`review-lean`)
-/// carrying real `review.*` step kinds still reaches the bespoke stage-plan
-/// path; an id that merely happens to be named `"review"` but carries no
-/// review kinds does not.
 pub fn route_command(advertised: &[PanelCommand], cmd: &str) -> Option<RoutePlan> {
     let matched = advertised.iter().find(|c| c.id.eq_ignore_ascii_case(cmd))?;
     let resolved_id = matched.id.clone();
     let loaded = mission_config::load(&resolved_id).ok()?;
-    if crate::mission_launch::config_uses_review_kinds(&loaded.config) {
-        return Some(RoutePlan::Review(resolved_id));
-    }
     if is_procedural_only(&loaded.config) {
         Some(RoutePlan::Ephemeral(Box::new(loaded.config)))
     } else {
@@ -948,66 +926,6 @@ mod tests {
     fn route_command_returns_none_for_an_unadvertised_command() {
         let advertised = vec![PanelCommand { id: "review".to_string(), description: "d".to_string(), hint: None }];
         assert!(route_command(&advertised, "not-advertised").is_none());
-    }
-
-    #[test]
-    fn review_always_routes_to_the_review_variant() {
-        let advertised = vec![PanelCommand { id: "review".to_string(), description: "d".to_string(), hint: None }];
-        let plan = route_command(&advertised, "review").expect("review must route");
-        let RoutePlan::Review(id) = plan else { panic!("expected RoutePlan::Review") };
-        assert_eq!(id, "review");
-    }
-
-    /// (#1695 merge-gate MUST FIX) A panel-advertised review VARIANT — an
-    /// operator config under a DIFFERENT id, carrying real `review.*` step
-    /// kinds — must route to `RoutePlan::Review` carrying ITS OWN id, not
-    /// the built-in `"review"`. Pre-fix, `run_review` hardcoded `mission
-    /// launch review` regardless of which id actually routed here, so a
-    /// variant would advertise and invoke fine while silently launching
-    /// the wrong config underneath.
-    #[test]
-    #[serial_test::serial]
-    fn review_variant_routes_to_review_carrying_its_own_id_not_the_builtin() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
-
-        let dir = tmp.path().join("mission-configs");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("review-lean.json"),
-            serde_json::to_string(&serde_json::json!({
-                "id": "review-lean",
-                "name": "Review Lean",
-                "panel": {"description": "A leaner review"},
-                "phases": [{
-                    "id": "adjudicate",
-                    "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "review.judge"}]}]
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let advertised =
-            vec![PanelCommand { id: "review-lean".to_string(), description: "A leaner review".to_string(), hint: None }];
-        let plan = route_command(&advertised, "review-lean").expect("review-lean must route");
-        let RoutePlan::Review(launch_id) = plan else { panic!("expected RoutePlan::Review for a config carrying review.* kinds") };
-        assert_eq!(
-            launch_id, "review-lean",
-            "the routed id must be the VARIANT's own registry key — this is what \
-             `run_review` spawns as `mission launch <launch_id>`, so a wrong id here \
-             means the wrong config launches"
-        );
-
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
     }
 
     /// (#1695 merge-gate finding 2) A mixed-case on-disk config filename

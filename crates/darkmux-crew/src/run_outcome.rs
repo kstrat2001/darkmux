@@ -29,7 +29,7 @@
 //! derived FROM `outcome` (`MissionOutcomeStatus::from_outcome`,
 //! `MissionEnvelope::from_outcome`) rather than hand-computed a second time.
 //! Review is the first (and, as of this PR, only) adopter —
-//! `review_result_to_mission_envelope` (`src/mission_launch_review.rs`)
+//! `review_result_to_mission_envelope` (the retired review funnel launcher)
 //! builds its `RunOutcome` via `darkmux_lab::lab::review::
 //! review_mission_outcome` and hands it straight to `MissionEnvelope::
 //! from_outcome`, so "partial" is a typed `RunOutcome::Partial { reasons }`

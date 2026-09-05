@@ -1015,7 +1015,7 @@ fn flows_dir_default() -> std::path::PathBuf {
 /// that isolated itself means it. Only a test that isolated NOTHING (so
 /// `paths::resolve` would otherwise land on the real user root) falls back to
 /// the throwaway path. This was previously unconditional, which is exactly
-/// why `mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl`'s
+/// why `the retired review funnel launcher_sigterm_mid_probe_finalizes_and_reaps_curl`'s
 /// own comment (tests/cli.rs) notes "flow records do NOT follow DARKMUX_HOME
 /// at all" and sets `DARKMUX_FLOWS_DIR` explicitly as a workaround — it no
 /// longer needs to, though existing explicit overrides remain harmless (env

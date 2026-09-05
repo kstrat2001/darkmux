@@ -2125,9 +2125,9 @@ mod tests {
         assert_eq!(sites.len(), 5);
     }
 
-    /// (#2310 P4b) The review-conformance diff fixture's post-image
+    /// (#2310 P4b) The diff-source fixture's post-image
     /// content, reconstructed by hand from `tests/fixtures/
-    /// review-conformance/diff.patch`'s own `+`/context lines — DiffSource
+    /// diff-source/diff.patch`'s own `+`/context lines — DiffSource
     /// reads through the checked-out TREE (DESIGN.md: "the tree is the
     /// confirmation surface"), so a test needs the tree at the diff's
     /// head, not just the diff text. `docs/setup.md` and `src/config.ts`
@@ -2157,7 +2157,7 @@ mod tests {
 
     fn diff_fixture_text() -> String {
         fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/review-conformance/diff.patch"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff-source/diff.patch"),
         )
         .unwrap()
     }
@@ -3479,7 +3479,7 @@ line two
         assert_eq!(files_hit, vec!["real.ts"], "{files_hit:?}");
     }
 
-    // ─── #2310 P4c-2b item 5: review-v2 fixture + harness ──────────────
+    // ─── #2310 P4c-2b item 5: review fixture + harness ──────────────
 
     /// Scopes `DARKMUX_HOME` for one test and restores the prior value —
     /// same pattern `crawl::unit_step_tests::HomeGuard` uses.
@@ -3500,17 +3500,17 @@ line two
         }
     }
 
-    fn review_v2_fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/review-v2")
+    fn review_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/review")
     }
 
-    fn review_v2_diff_text() -> String {
-        fs::read_to_string(review_v2_fixture_dir().join("diff.patch")).unwrap()
+    fn review_diff_text() -> String {
+        fs::read_to_string(review_fixture_dir().join("diff.patch")).unwrap()
     }
 
-    /// (#2310 P4c-2b item 5) `review-v2`'s own fixture + harness: five
+    /// (#2310 P4c-2b item 5) `review`'s own fixture + harness: five
     /// rules PLAN for real over the checked-in fixture tree + diff (the
-    /// two rules review-v2 reuses from crawl, `swallowed-error`/
+    /// two rules review reuses from crawl, `swallowed-error`/
     /// `unnamed-predicate` — DESIGN.md's confirm=`mod` pair — plus the
     /// three P4c-2b names explicitly: `existing-solution` (confirm=
     /// `question`), `union-vs-enum` and `shared-symbol-callers` (both
@@ -3518,16 +3518,16 @@ line two
     /// model, no container — the same discipline `deliver_github_review`'s
     /// own golden test uses), one finding per rule feeds `records.gather`
     /// → `deliver.github_review` (the SAME same-task-predecessor `input`
-    /// wiring `review-v2.json`'s `deliver` phase uses) and the rendered
+    /// wiring `review.json`'s `deliver` phase uses) and the rendered
     /// payload is compared byte-for-byte against a committed golden.
     #[test]
     #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
-    fn review_v2_fixture_plans_every_rule_and_delivers_one_comment_per_form() {
+    fn review_fixture_plans_every_rule_and_delivers_one_comment_per_form() {
         use darkmux_crew::step_kinds::StepKind as _;
         let home = TempDir::new().unwrap();
         let _g = ReviewV2HomeGuard::set(home.path());
-        const MISSION: &str = "review-v2-2310-fixture";
-        const PHASE: &str = "review-v2-2310-fixture-deliver";
+        const MISSION: &str = "review-2310-fixture";
+        const PHASE: &str = "review-2310-fixture-deliver";
         darkmux_crew::lifecycle::save_phase(&darkmux_crew::types::Phase {
             id: PHASE.into(),
             mission_id: MISSION.into(),
@@ -3543,8 +3543,8 @@ line two
         .unwrap();
 
         // ── plan every rule for real, over the fixture ─────────────────
-        let tree = review_v2_fixture_dir().join("tree");
-        let diff_text = review_v2_diff_text();
+        let tree = review_fixture_dir().join("tree");
+        let diff_text = review_diff_text();
         let materialized = materialized_for(vec![diff_source_at(&tree, "app", &"f".repeat(40))], Vec::new());
         let (rules, _) = darkmux_crew::rules::load_all(None);
         for rule_id in ["existing-solution", "union-vs-enum", "shared-symbol-callers", "swallowed-error", "unnamed-predicate"] {
@@ -3741,14 +3741,14 @@ line two
         );
         mk_mod(&up_key, "a proposed fix nobody sees", Some(false));
 
-        // ── records.gather then deliver.github_review, same two-step-task wiring `review-v2.json` uses ──
+        // ── records.gather then deliver.github_review, same two-step-task wiring `review.json` uses ──
         let gather_step = darkmux_crew::types::Step {
             id: "records-gather-step".into(),
             task_id: "deliver".into(),
             kind: darkmux_crew::step_kinds::RECORDS_GATHER_KIND.into(),
             gate: None,
             status: darkmux_crew::types::NodeStatus::Planned,
-            config: serde_json::json!({ "diff_file": review_v2_fixture_dir().join("diff.patch").to_string_lossy() }),
+            config: serde_json::json!({ "diff_file": review_fixture_dir().join("diff.patch").to_string_lossy() }),
             started_ts: None,
             completed_ts: None,
             output: None,
@@ -3849,7 +3849,7 @@ line two
         }
 
         let actual = serde_json::to_string_pretty(&payload).unwrap();
-        let golden_path = review_v2_fixture_dir().join("golden-payload.json");
+        let golden_path = review_fixture_dir().join("golden-payload.json");
         if std::env::var("DARKMUX_REVIEW_V2_GOLDEN_UPDATE").is_ok() {
             fs::write(&golden_path, format!("{actual}\n")).unwrap();
         } else {

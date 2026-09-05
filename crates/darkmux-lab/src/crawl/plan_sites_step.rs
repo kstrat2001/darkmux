@@ -45,25 +45,20 @@
 //! see `plan::plan_diff_rule`'s own doc) and reads the diff at
 //! `config.diff_file`, then calls `plan::plan_diff_rule`.
 //!
-//! **`head_sha`/`github` are accepted but not yet wired to a fetch.**
-//! DESIGN.md says the diff source's sha/ref "come from the launch inputs
-//! `head_sha`/`github` or the diff file's own header", and a review-v2
-//! launch's `--param head_sha=`/`--param github=` DO reach this step's
-//! config (see `review-v2.json`'s `plan-<rule>` phase, which templates
-//! them in) — but this packet's proof runs "over a tempdir tree of the
-//! post-diff fixture" (the P4 brief's own live-plumbing-proof recipe): the
-//! operator checks out the diff's head into a `workspace` spec's `path`
-//! source themselves, same as any other `workspace_spec` source. A
-//! `github`-sourced fetch that materializes a tree from a PR reference
-//! with no local checkout is real future work (the old bespoke launcher's
-//! `resolve_source`/`GithubApi` path did this for the funnel's bundler,
-//! which never needed a tree — only diff hunks); wiring `plan.sites` to
-//! it is out of this packet's scope, and is a real gap named rather than
-//! papered over: today's written `Plan.sources[0].sha`/`.git_ref` come
-//! ONLY from the checked-out tree the operator's `workspace` spec names,
-//! never from `config.head_sha`/`config.github`. Both fields still ride
-//! the step config, parsed but unused, so a launch's params don't need a
-//! second, `plan.sites`-specific spelling later when the fetch lands.
+//! **`workspace` is optional when `github` + `head_sha` are present.**
+//! `.github/workflows/darkmux-review.yml` launches `review` from a
+//! self-hosted runner with `--param github=<owner/repo> --param
+//! head_sha=<sha>` and NO `workspace` — there is no operator-authored
+//! workspace spec on that runner. When `config.workspace` is absent and
+//! both of those ARE present, this kind DERIVES the one-source
+//! `WorkspaceSpec` itself ([`derive_workspace_spec`]): a single `git`
+//! source whose origin is the repository's GitHub URL and whose `ref` is
+//! `head_sha`, materialized through the SAME `workspace_spec::materialize`
+//! path an on-disk spec takes (the runner carries git credentials, so the
+//! clone/fetch is the ordinary materialization, not a second mechanism).
+//! An explicit `workspace` always wins — the derivation is the fallback,
+//! never an override. With neither, the step refuses by name at parse
+//! time rather than failing partway through `run`.
 //!
 //! Tier 3 by #1352's test, same reasoning as `plan_step.rs`: this is
 //! genuinely new control flow (a strategy selector over two sources), not
@@ -127,7 +122,7 @@ impl StepKind for PlanSitesStepKind {
             None => plan_step::default_plan_path(task, &cfg.rule)?,
         };
         let the_plan = match cfg.source {
-            Source::Tree => plan_step::plan_one_rule(&cfg.as_tree_config())?,
+            Source::Tree => plan_step::plan_one_rule(&cfg.as_tree_config()?)?,
             Source::Diff => plan_diff(&cfg)?,
         };
         let wrapped = darkmux_crew::step_output::Output::wrap(
@@ -149,7 +144,11 @@ enum Source {
 #[derive(Debug, Clone)]
 struct SitesStepConfig {
     rule: String,
-    workspace: PathBuf,
+    /// `None` when the launch supplied no workspace spec — legal only when
+    /// `github` + `head_sha` are both present, in which case
+    /// [`derive_workspace_spec`] builds the spec instead. See this module's
+    /// own doc.
+    workspace: Option<PathBuf>,
     params: PlanParams,
     fetch: bool,
     plan_out: Option<PathBuf>,
@@ -164,11 +163,11 @@ struct SitesStepConfig {
     /// naming the path the operator wrote, not a canonicalize failure
     /// about a path that was never going to resolve anyway.
     diff_file: Option<PathBuf>,
-    /// Accepted, parsed, and NOT YET used — see this module's doc for why.
-    #[allow(dead_code)]
+    /// The diff's own head sha. With `github` and no `workspace`, this is
+    /// the `ref` of the derived source — see [`derive_workspace_spec`].
     head_sha: Option<String>,
-    /// Accepted, parsed, and NOT YET used — see this module's doc for why.
-    #[allow(dead_code)]
+    /// `owner/repo` (or a full GitHub URL). With `head_sha` and no
+    /// `workspace`, this is the origin of the derived source.
     github: Option<String>,
 }
 
@@ -183,14 +182,30 @@ impl SitesStepConfig {
                 .ok_or_else(|| anyhow!("step `{}`: `{PLAN_SITES_KIND}` requires config.{key}", step.id))
         };
         let rule = str_field("rule")?;
-        let workspace = PathBuf::from(str_field("workspace")?);
+        let opt_str = |key: &str| -> Option<String> {
+            step.config
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from)
+        };
+        let workspace = opt_str("workspace").map(PathBuf::from);
+        let head_sha = opt_str("head_sha");
+        let github = opt_str("github");
+        if workspace.is_none() && !(head_sha.is_some() && github.is_some()) {
+            anyhow::bail!(
+                "step `{}`: `{PLAN_SITES_KIND}` requires config.workspace, or both \
+                 config.github and config.head_sha to derive one",
+                step.id
+            );
+        }
         // (#2310 P4c-2 review MUST-do 1) Shared with `plan_step.rs` so the
         // two `plan.*` kinds cannot silently drift back apart on
         // CLI-string leniency — this kind still parsed `sizing`/`no_fetch`
         // STRICTLY (`as_u64`/`as_bool`) after item 0 shipped item 0's
         // generic substitution, which always carries a `--param`-sourced
         // value through as a JSON string; the strict parse silently
-        // dropped every such override for `review-v2.json`'s own
+        // dropped every such override for `review.json`'s own
         // `plan.sites` steps.
         let (params, fetch) = plan::parse_sizing_and_no_fetch(&step.config, &step.id, PLAN_SITES_KIND)?;
         let plan_out = step.config.get("plan_out").and_then(|v| v.as_str()).map(PathBuf::from);
@@ -214,24 +229,92 @@ impl SitesStepConfig {
                 step.id
             );
         }
-        let head_sha = step.config.get("head_sha").and_then(|v| v.as_str()).map(String::from);
-        let github = step.config.get("github").and_then(|v| v.as_str()).map(String::from);
         Ok(Self { rule, workspace, params, fetch, plan_out, source, diff_file, head_sha, github })
+    }
+
+    /// The workspace spec this step plans against — loaded from
+    /// `config.workspace` when the launch named one, else DERIVED from
+    /// `github` + `head_sha` (see this module's doc). `from_step` refuses a
+    /// config with neither, so the `else` branch's `expect`s document that
+    /// invariant rather than re-threading two `Option`s.
+    fn resolve_spec(&self) -> Result<(WorkspaceSpec, Vec<String>)> {
+        match &self.workspace {
+            Some(path) => WorkspaceSpec::load(path)
+                .with_context(|| format!("loading workspace spec {}", path.display())),
+            None => {
+                let github = self.github.as_deref().expect("from_step refuses no workspace with no github");
+                let head_sha =
+                    self.head_sha.as_deref().expect("from_step refuses no workspace with no head_sha");
+                Ok((derive_workspace_spec(github, head_sha)?, Vec::new()))
+            }
+        }
     }
 
     /// `Source::Tree`'s config, in `plan_step::plan_one_rule`'s own shape —
     /// the byte-identical-to-`crawl.plan` guarantee this module's doc
     /// promises lives entirely in reusing that struct/function, not in
     /// re-deriving them here.
-    fn as_tree_config(&self) -> plan_step::PlanStepConfig {
-        plan_step::PlanStepConfig {
+    fn as_tree_config(&self) -> Result<plan_step::PlanStepConfig> {
+        let workspace = self.workspace.clone().ok_or_else(|| {
+            anyhow!(
+                "`{PLAN_SITES_KIND}` config.source=\"tree\" requires config.workspace \
+                 (the github/head_sha derivation is diff-scoped)"
+            )
+        })?;
+        Ok(plan_step::PlanStepConfig {
             rule: self.rule.clone(),
-            workspace: self.workspace.clone(),
+            workspace,
             params: self.params,
             fetch: self.fetch,
             plan_out: None, // `run` above resolves + writes the path itself either way
-        }
+        })
     }
+}
+
+/// (#2310 P4d) Build the one-source [`WorkspaceSpec`] a `github` +
+/// `head_sha` launch implies: a single `git` source at the repository's
+/// GitHub URL, pinned to `head_sha`. `github` is accepted as `owner/repo`
+/// or as a full URL (with or without a trailing `.git`); anything else is
+/// refused by name. Pure — it builds the spec and nothing else; the
+/// caller materializes it through the same path an on-disk spec takes.
+pub(crate) fn derive_workspace_spec(github: &str, head_sha: &str) -> Result<WorkspaceSpec> {
+    let trimmed = github.trim().trim_end_matches('/');
+    let slug = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .or_else(|| trimmed.strip_prefix("git@github.com:"))
+        .unwrap_or(trimmed)
+        .trim_end_matches(".git");
+    let mut parts = slug.split('/');
+    let (owner, repo) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(o), Some(r), None) if !o.is_empty() && !r.is_empty() => (o, r),
+        _ => {
+            anyhow::bail!(
+                "`{PLAN_SITES_KIND}`: config.github must be `owner/repo` or a GitHub URL, got {github:?}"
+            )
+        }
+    };
+    let head_sha = head_sha.trim();
+    if head_sha.is_empty() {
+        anyhow::bail!("`{PLAN_SITES_KIND}`: config.head_sha must not be empty");
+    }
+    Ok(WorkspaceSpec {
+        schema_version: None,
+        name: Some(repo.to_string()),
+        root: None,
+        sources: vec![darkmux_crew::workspace_spec::SourceSpec {
+            id: repo.to_string(),
+            git: Some(format!("https://github.com/{owner}/{repo}")),
+            path: None,
+            git_ref: Some(head_sha.to_string()),
+            extras: BTreeMap::new(),
+        }],
+        include: None,
+        exclude: None,
+        edges: Vec::new(),
+        rules: Vec::new(),
+        extras: BTreeMap::new(),
+    })
 }
 
 fn plan_diff(cfg: &SitesStepConfig) -> Result<Plan> {
@@ -246,8 +329,7 @@ fn plan_diff(cfg: &SitesStepConfig) -> Result<Plan> {
         .next()
         .ok_or_else(|| anyhow!("plan.sites: rule '{}' resolved to nothing", cfg.rule))?;
 
-    let (spec, spec_warnings) = WorkspaceSpec::load(&cfg.workspace)
-        .with_context(|| format!("loading workspace spec {}", cfg.workspace.display()))?;
+    let (spec, spec_warnings) = cfg.resolve_spec()?;
     for w in &spec_warnings {
         eprintln!("[darkmux] warning: plan.sites: {w}");
     }
@@ -361,6 +443,85 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.source, Source::Diff);
         assert_eq!(cfg.diff_file.as_deref(), Some(std::path::Path::new("/tmp/d.diff")));
+    }
+
+    /// (#2310 P4d — RED before the derivation landed: `from_step` required
+    /// `config.workspace` unconditionally, so the workflow's own params
+    /// (`github` + `head_sha`, no workspace) were refused at parse time.)
+    /// The derived spec is exactly one source, pointing at the repository's
+    /// GitHub URL, at the launch's `head_sha`. Pure — no materialization,
+    /// no network.
+    #[test]
+    fn a_github_slug_and_head_sha_derive_one_source_at_that_sha() {
+        let spec = derive_workspace_spec("kstrat2001/darkmux", "abc123def").unwrap();
+        assert_eq!(spec.sources.len(), 1, "exactly one source: {:?}", spec.sources);
+        let src = &spec.sources[0];
+        assert_eq!(src.git.as_deref(), Some("https://github.com/kstrat2001/darkmux"));
+        assert_eq!(src.path, None, "a derived source is a git origin, never a local path");
+        assert_eq!(src.resolved_ref(), "abc123def");
+    }
+
+    /// The workflow passes `github` as `$REPO` (`owner/repo`), but an
+    /// operator pasting a browser URL must resolve to the SAME origin.
+    #[test]
+    fn a_full_github_url_derives_the_same_origin_as_the_slug() {
+        let from_url = derive_workspace_spec("https://github.com/kstrat2001/darkmux.git", "sha1").unwrap();
+        let from_slug = derive_workspace_spec("kstrat2001/darkmux", "sha1").unwrap();
+        assert_eq!(from_url.sources[0].git, from_slug.sources[0].git);
+    }
+
+    #[test]
+    fn a_github_value_that_is_not_owner_slash_repo_is_refused_by_name() {
+        let err = derive_workspace_spec("darkmux", "sha1").unwrap_err();
+        assert!(err.to_string().contains("owner/repo"), "{err}");
+    }
+
+    /// The workflow's own invocation shape: no `workspace`, but `github` +
+    /// `head_sha` present. Must parse, and must resolve to the derived
+    /// one-source spec.
+    #[test]
+    fn no_workspace_with_github_and_head_sha_parses_and_resolves_to_the_derived_spec() {
+        let cfg = SitesStepConfig::from_step(&step(serde_json::json!({
+            "rule": "swallowed-error", "source": "diff", "diff_file": "/tmp/d.diff",
+            "github": "kstrat2001/darkmux", "head_sha": "abc123def"
+        })))
+        .unwrap();
+        assert!(cfg.workspace.is_none());
+        let (spec, warnings) = cfg.resolve_spec().unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(spec.sources.len(), 1);
+        assert_eq!(spec.sources[0].resolved_ref(), "abc123def");
+    }
+
+    /// An explicit `workspace` is never overridden by the derivation.
+    #[test]
+    fn an_explicit_workspace_wins_over_the_github_derivation() {
+        let cfg = SitesStepConfig::from_step(&step(serde_json::json!({
+            "rule": "swallowed-error", "workspace": "/tmp/ws.json", "source": "diff",
+            "diff_file": "/tmp/d.diff", "github": "kstrat2001/darkmux", "head_sha": "abc123def"
+        })))
+        .unwrap();
+        assert_eq!(cfg.workspace.as_deref(), Some(std::path::Path::new("/tmp/ws.json")));
+    }
+
+    #[test]
+    fn neither_workspace_nor_github_head_sha_is_refused_naming_both_ways_in() {
+        let err = SitesStepConfig::from_step(&step(serde_json::json!({
+            "rule": "swallowed-error", "source": "diff", "diff_file": "/tmp/d.diff"
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("config.workspace"), "{err}");
+        assert!(err.to_string().contains("config.github"), "{err}");
+    }
+
+    #[test]
+    fn a_tree_source_with_no_workspace_is_refused_naming_workspace() {
+        let cfg = SitesStepConfig::from_step(&step(serde_json::json!({
+            "rule": "swallowed-error", "github": "kstrat2001/darkmux", "head_sha": "abc"
+        })))
+        .unwrap();
+        let err = cfg.as_tree_config().unwrap_err();
+        assert!(err.to_string().contains("config.workspace"), "{err}");
     }
 
     #[test]

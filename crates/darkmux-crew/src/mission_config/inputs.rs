@@ -3,7 +3,7 @@
 //!
 //! This is the ONE mechanism that replaces `mission_launch.rs`'s old
 //! `crawl_plan_step_overrides`, which special-cased exactly one step kind
-//! (`crawl.plan`) and therefore reached zero of `review-v2.json`'s
+//! (`crawl.plan`) and therefore reached zero of `review.json`'s
 //! `plan.sites` steps — the P4c-1 BLOCKER (see `P4c-brief-draft.md`'s
 //! "Status" section). A document declares an input in its own `inputs`
 //! list (`MissionConfig::inputs`) and references it anywhere in a step's

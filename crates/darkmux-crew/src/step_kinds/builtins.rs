@@ -2292,7 +2292,7 @@ impl StepKind for ProceduralShellStepKind {
             cmd.env(format!("DARKMUX_STEP_INPUT_{env_key}"), output);
         }
         // (#2310 P4e) `DARKMUX_BIN` — THIS darkmux, by absolute path, so a
-        // step command that has to ask darkmux something (`review-v2`'s
+        // step command that has to ask darkmux something (`review`'s
         // wait step polls `mod list --for`) calls the binary running the
         // mission rather than whatever `darkmux` on `PATH` resolves to. A
         // step spawned from `cargo run`, from a worktree's `target/`, or

@@ -49,7 +49,7 @@
 //!
 //! `review` (the 3-phase PR-review config, #1284 Packet 4b, the clean verb
 //! break that retired `darkmux pr-review run`) is executable through this
-//! verb too, but via a DEDICATED launcher (`crate::mission_launch_review`)
+//! verb too, but via a DEDICATED launcher (the retired review funnel launcher)
 //! rather than steps 2-4 above: `launch` branches to it as early as
 //! possible (right after config load + validation, before this module's own
 //! `--input`/`--param` collection or its generic header banner — review's
@@ -58,7 +58,7 @@
 //! resolution (`staffing`, `judge_concurrency` — see `templates/
 //! builtin/mission-configs/review.json`'s own `inputs` doc) that
 //! `crates/darkmux-lab/src/lab/review.rs::build_review_graph` already knows
-//! how to do — `mission_launch_review::launch` is a NEW CALLER of that
+//! how to do — the retired review funnel launcher is a NEW CALLER of that
 //! SAME driver (the former `pr_review.rs::run_dispatch`), not a second
 //! graph builder; see that module's doc for why review does not collapse
 //! into steps 2-4's generic `mission_config::interpret` + `crew::
@@ -101,20 +101,6 @@ use std::sync::{Arc, Mutex};
 /// constructed doesn't say whether coder-phase-specific wiring should run).
 const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", "mission.verify"];
 
-/// The five Tier 3 step kinds `crates/darkmux-lab/src/lab/review.rs` defines
-/// for `review`'s graph (#1352; `review.probe`/`review.verify` retired in
-/// #1442 — the probe/verify stages ride the generic Tier-1 `dispatch.map`) —
-/// wired through via a DEDICATED launcher
-/// ([`crate::mission_launch_review::launch`]), not this
-/// module's generic `mission_config::interpret` + `crew::scheduler::
-/// run_step_graph` path. `build_review_graph`/`run_review_graph` already
-/// carry real, working, tested cross-step behavior (a shared remote-token
-/// bucket, host telemetry sampling, post-run envelope merges) a generic
-/// collapse would either lose or have to re-derive — an audited non-collapse
-/// per `CLAUDE.md`'s StepKind tiering section ("a collapse that changes
-/// observable behavior isn't a tiering fix, it's a feature change wearing a
-/// tiering fix's clothes").
-///
 /// (#2384) The input names THIS launcher consumes in Rust rather than
 /// through `{{name}}` substitution into a step's config — the second of
 /// darkmux's two consumption paths, and the one no document scan can see.
@@ -132,8 +118,10 @@ const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", 
 /// same commit as the code that reads it.
 ///
 /// The frozen `review` config's own inputs are deliberately ABSENT: that
-/// document routes to `mission_launch_review::launch` above this check,
-/// so its inputs are that launcher's to account for.
+/// document routed to `mission_launch_review::launch` above this check
+/// before that dedicated launcher was retired — `review` now runs the same
+/// generic path as every other config, so its inputs are accounted for the
+/// same way any other config's are.
 const LAUNCHER_CONSUMED_INPUTS: &[&str] = &[
     "args",
     "base",
@@ -146,25 +134,6 @@ const LAUNCHER_CONSUMED_INPUTS: &[&str] = &[
     "role",
     "rules",
     "workdir",
-];
-
-/// **Structural-routing use ONLY (#1530 — one global step-kind registry).**
-/// Mirrors [`CODER_PHASE_TIER3_KINDS`]'s doc: this list no longer feeds
-/// validation or any execution registry (both now read [`all_step_kinds`]'s
-/// `registry.ids()` instead) — it exists purely so
-/// [`config_uses_review_kinds`] can decide, structurally, whether a config's
-/// graph is a review pipeline that must route to the dedicated launcher.
-const REVIEW_TIER3_KINDS: &[&str] = &[
-    "review.bundle",
-    "review.dedup",
-    "review.judge",
-    // (#1442 ship-2b) `review.probe` / `review.verify` retired — the
-    // probe/verify stages ride the generic Tier-1 `dispatch.map` (already
-    // in the builtin known set); each stage's bespoke half is a
-    // frozen-prompt render step.
-    "review.probe-render",
-    "review.verify-render",
-    "review.synthesis",
 ];
 
 /// The ONE registry every step kind darkmux can construct resolves through:
@@ -185,10 +154,9 @@ const REVIEW_TIER3_KINDS: &[&str] = &[
 /// registry — rather than per-graph-per-call — is safe.
 ///
 /// [`launch`] uses this registry for BOTH the known-kind validation pass
-/// (replacing the old `CODER_PHASE_TIER3_KINDS` + `REVIEW_TIER3_KINDS`
-/// hand-maintained unions) and the real execution registry. The payoff: a
-/// config whose graph names BOTH a `mission.coder` step and a `review.judge`
-/// step resolves every kind against this ONE registry — a capability that
+/// (replacing the old hand-maintained per-family unions) and the real execution registry. The payoff: a
+/// config whose graph names BOTH a `mission.coder` step and a crawl-family
+/// planning step resolves every kind against this ONE registry — a capability that
 /// was structurally impossible while `review`'s dedicated launcher and this
 /// module's coder-phase path each built their own PARTIAL registry (see
 /// `both_families_resolve_against_one_registry` in this module's tests).
@@ -198,21 +166,19 @@ const REVIEW_TIER3_KINDS: &[&str] = &[
 /// a re-derived approximation.
 pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
     let registry = crew::step_kinds::StepKindRegistry::with_builtins();
-    darkmux_lab::lab::review::register_review_kinds(&registry)
-        .context("registering review step kinds")?;
     register_coder_phase_step_kinds(&registry).context("registering coder-phase step kinds")?;
     // (#2298) The crawl's planning as a step kind — one `crawl.plan` task per
     // rule in `crawl.json`. Registered here so `mission config show crawl`
     // validates its graph without an unknown-kind warning and so the graph
     // is constructible the day the literal launcher retires (#2301).
     darkmux_lab::crawl::plan_step::register_crawl_kinds(&registry).context("registering crawl step kinds")?;
-    // (#2310 P4c-2b) `review-v2.json`'s `deliver` phase — gather this run's
+    // (#2310 P4c-2b) `review.json`'s `deliver` phase — gather this run's
     // own finding/mod records, render a GitHub review payload. Neither is
     // wired into `StepKindRegistry::with_builtins()`'s always-on set (see
     // each kind's own module doc for why).
     crew::step_kinds::register_records_gather_kind(&registry).context("registering records.gather")?;
     crew::step_kinds::register_deliver_kind(&registry).context("registering deliver.github_review")?;
-    // (#2310 P4c-2b) `review-v2.json`'s `create-mod` task's `gate-step`.
+    // (#2310 P4c-2b) `review.json`'s `create-mod` task's `gate-step`.
     crew::step_kinds::register_mods_gate_kind(&registry).context("registering mods.gate")?;
     Ok(registry)
 }
@@ -242,7 +208,7 @@ pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
 /// operator omitted it — resolved PER CONFIG (#1284 Packet 4b review gate,
 /// must-fix 1): the generic/coder-phase path below resolves `None` -> 600
 /// (`mission run`'s own default); the `review` branch passes the `Option`
-/// through so `mission_launch_review::launch` can resolve `None` -> 3600
+/// through so the retired review funnel launcher can resolve `None` -> 3600
 /// (the retired `pr-review run`'s per-call default — a 600s ceiling would
 /// silently degrade any review whose judge pass runs long).
 /// (#1562) [`MissionConfigSource`] → the recorded [`MissionSpecOrigin`]:
@@ -327,7 +293,7 @@ fn emit_launch_cmd_audit(
 
 /// (#1877 — "no blind runs" is now PRESCRIBED for the generic launch path,
 /// not opt-in per config) Build a whole-run `dispatch *` bookend record —
-/// the same coarse liveness edge `mission_launch_review.rs`'s own
+/// the same coarse liveness edge the retired review funnel launcher's own
 /// `review_bookend_record`/`with_dispatch_bookends` gives `review`
 /// privately, generalized here so every OTHER config `launch` runs gets
 /// it too, unconditionally (see the guard construction in `launch` for
@@ -373,7 +339,7 @@ pub(crate) fn mission_bookend_record(
 /// Drain every telemetry sample buffered since the last drain and
 /// backfill `mission_id` onto each — mirrors `run_step_graph`'s own emit
 /// closure's backfill discipline (`record.mission_id.get_or_insert_with`)
-/// below, applied to telemetry the same way `mission_launch_review.rs`'s
+/// below, applied to telemetry the same way the retired review funnel launcher's
 /// `FleetFlowEmitter` backfills it for `review`'s own samples, so a
 /// coder-phase run's telemetry is joinable to its mission in the viewer
 /// exactly like review's already is.
@@ -479,36 +445,6 @@ pub fn launch(
         eprintln!("{}", style::warn(&f.to_string()));
     }
 
-    // (#1284 Packet 4b) `review` gets a DEDICATED launcher rather than
-    // falling through the generic interpret/scheduler path below — see
-    // `REVIEW_TIER3_KINDS`'s doc for why. Review has no operator sign-off
-    // gate (unlike coder-phase): its envelope finalizes generically via
-    // `crew::envelope::finalize_mission` inside that module, and this
-    // function's own exit-code/gate machinery never runs for it. Branches
-    // BEFORE the generic header banner below (never AFTER): review's
-    // rendered `{mode, review, comment}` JSON is a stdout CONTRACT the CI
-    // workflow parses byte-for-byte on `--param emit=-`, so nothing
-    // decorative may land on stdout ahead of it — `mission_launch_review::
-    // launch` prints its own (stderr-only) diagnostics instead.
-    //
-    // (#1530) Routed STRUCTURALLY (does the graph use review kinds?), not by
-    // the literal id `"review"` — the same shape `coder-phase` already uses
-    // via `config_uses_coder_phase_kinds`. This is what lets a differently-
-    // NAMED review variant (e.g. a stored `review-lean` with fewer probe
-    // draws) launch through the same dedicated driver: the driver is already
-    // config-driven (`build_review_graph`/`resolve_review_roles` read the
-    // graph + every declared `role_id` off the document), so the only thing
-    // the old id-literal gated was the NAME, never a capability.
-    if config_uses_review_kinds(config) {
-        return crate::mission_launch_review::launch(
-            config,
-            input_file,
-            params,
-            timeout_seconds,
-            spec_origin_for(loaded.source),
-        );
-    }
-
     println!(
         "{}",
         style::header(&format!(
@@ -531,7 +467,7 @@ pub fn launch(
     // below — the required check, the typo warning, the dry-run print, the
     // inputs fingerprint and both placeholder passes — so a defaulted
     // input is indistinguishable from one the operator typed. That is the
-    // point: `review-v2`'s wait command interpolates `mod_wait_seconds`
+    // point: `review`'s wait command interpolates `mod_wait_seconds`
     // from inside a string, and an EMBEDDED placeholder naming an
     // uncollected input is refused at mint (`check_embedded_inputs_
     // collected`), so without this the config could not ship a default at
@@ -544,7 +480,7 @@ pub fn launch(
     }
 
     // (#2310 P4f review, CONSIDER 3) `mod_seat_profile` names the profile
-    // `review-v2`'s optional endpoint create-mod seat dispatches to. A name
+    // `review`'s optional endpoint create-mod seat dispatches to. A name
     // that matches NO defined profile does not fail — it silently becomes
     // the machine's `default_profile`, because
     // `ProfileRegistry::resolve_active` falls back by design (so a
@@ -670,11 +606,11 @@ pub fn launch(
     }
 
     // (#2310 P4c-2 item 4) An input the document declares `"ignored":
-    // true` on (`review-v2.json`'s `bundler`, accepted for CLI-surface
+    // true` on (`review.json`'s `bundler`, accepted for CLI-surface
     // parity with the frozen `review` config's launch line but never
-    // consumed by review-v2's own planner) gets a named warning when the
+    // consumed by review's own planner) gets a named warning when the
     // operator supplies it — STRUCTURAL, any config on any input, never
-    // keyed on a config id (replaces the old `config.id == "review-v2"`
+    // keyed on a config id (replaces the old `config.id == "review"`
     // special case). BEFORE the `--dry-run` short-circuit below so the
     // signal is visible on the free path too, not only on a real (costly)
     // launch.
@@ -802,9 +738,9 @@ pub fn launch(
 
     // (#2131 review round 4, F2) SIGINT + SIGTERM + SIGHUP — this launcher
     // (generic graphs + coder-phase) previously installed no signal
-    // handling at all, the gap #2124 fixed for `mission_launch_review.rs`
+    // handling at all, the gap #2124 fixed for the retired review funnel launcher
     // and #1959 fixed (SIGINT only) for the retired crawl launcher. Installed HERE
-    // — ahead of `mint_run_id` below, matching `mission_launch_review.rs`'s
+    // — ahead of `mint_run_id` below, matching the retired review funnel launcher's
     // `run_dispatch`, which arms before ITS mint too — not merely ahead of
     // the config-snapshot write / interpret / freeform-mint /
     // executable-check work that follows the mint. `mint_run_id` itself is
@@ -812,7 +748,7 @@ pub fn launch(
     // it is harmless today regardless), but arming any later would make
     // "is it safe to be here" a fact the reader has to re-derive from
     // `mint_run_id`'s own implementation rather than something structurally
-    // true by placement — the SAME reasoning `mission_launch_review.rs`
+    // true by placement — the SAME reasoning the retired review funnel launcher
     // already applies. The flag is live well before the real-execution
     // section (below) constructs this launcher's own `LaunchFinalizeGuard`.
     crate::launch_guard::arm();
@@ -1081,7 +1017,7 @@ pub fn launch(
     });
     // (#2131) `run_step_graph` (below) is ONE blocking, synchronous call on
     // THIS thread, with no polling seam of its own — the same shape
-    // `mission_launch_review.rs`'s dispatch had before #2124, which fixed
+    // the retired review funnel launcher's dispatch had before #2124, which fixed
     // it there with a supervised worker thread. That shape doesn't collapse
     // cleanly onto this launcher's much larger surface (coder-phase's own
     // gate machinery, the generic-graph persist/emit closures, and the
@@ -1153,7 +1089,7 @@ pub fn launch(
     //
     // Generic/coder-phase timeout default: `None` -> 600, matching
     // `mission run`'s own default (see `launch`'s doc — `review` resolves
-    // its own 3600 default in `mission_launch_review::launch` instead).
+    // its own 3600 default in the retired review funnel launcher instead).
     let timeout_seconds = timeout_seconds.unwrap_or(600);
     let uses_coder_phase_kinds = declared.values().any(|s| CODER_PHASE_TIER3_KINDS.contains(&s.kind.as_str()));
     let coder_handles = if uses_coder_phase_kinds {
@@ -1207,7 +1143,7 @@ pub fn launch(
     // `mission_id`, far above (before this function's own `--input`/
     // `--param` collection even runs) — review builds its own telemetry
     // sampler and its own `with_dispatch_bookends` privately
-    // (`mission_launch_review.rs` / `darkmux_lab::lab::review::
+    // (the retired review funnel launcher / `darkmux_lab::lab::review::
     // run_review_graph`), already satisfying the mandate on its own. The
     // two constructions are mutually exclusive by CONTROL FLOW, not by a
     // runtime check — there is no code path that reaches both, so no
@@ -2494,42 +2430,6 @@ pub(crate) fn derive_phase_ids(mission_id: &str, config: &MissionConfig) -> BTre
     config.phases.iter().map(|p| (p.id.clone(), format!("{mission_id}-{}", p.id))).collect()
 }
 
-/// Mint the Mission + one Phase per declared phase, with per-launcher
-/// PROVENANCE overrides (#1284 Packet 4b review gate, must-fix 2). (#1503)
-/// Every call is a FRESH mint — the reuse/reopen-by-derived-id path is
-/// gone: since `mission_id` is now minted uniquely per launch (never
-/// derived from inputs), a launch never revisits an existing mission's id,
-/// so there is nothing to reopen. If the id somehow already exists on disk
-/// (should be impossible given `mint_run_id`'s uniqueness guarantee), this
-/// bails loud rather than silently reopening or overwriting a stranger's
-/// record.
-///
-/// A dedicated launcher whose instances are per-case (the review launcher:
-/// N CI reviews of N PRs) passes a case-bearing `description` ("PR review
-/// — owner/repo@sha (crew `x`)") so the mission board / viewer can tell
-/// the instances apart — falling back to the generic config-derived
-/// description when `None` (the generic `launch` path). `spec` (#1503) is
-/// the run's GROUPING metadata — which config, which resolved-inputs
-/// fingerprint — recorded on the minted `Mission`; `None` for a caller
-/// with no meaningful spec (a bare test fixture, e.g.).
-///
-/// Hydrates `Mission.source_input`/`Mission.ticket` from the config's
-/// `extras` (#1284 review round 1, must-fix 2) — that's where `mission
-/// propose` preserves the operator's verbatim words (#815) and ticket id
-/// (#816), and dropping them silently broke `coder_brief`'s source-input
-/// injection plus the conventions' `{ticket}` templates.
-///
-/// Returns the doc phase id → real (composed) phase id map every subsequent
-/// step needs.
-pub(crate) fn ensure_mission_and_phases_with_provenance(
-    mission_id: &str,
-    config: &MissionConfig,
-    description: Option<&str>,
-    spec: Option<MissionSpec>,
-) -> Result<BTreeMap<String, String>> {
-    ensure_mission_and_phases_with_provenance_and_start_payload(mission_id, config, description, spec, None)
-}
-
 /// (#2299) The same mint, with an optional payload for the `mission start`
 /// record — the config launcher passes its prune report (`graph`) here so
 /// the record says what the config declared and what was minted.
@@ -2627,7 +2527,7 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
 /// last task" — `review.json` names `review-synthesis-task` so the review
 /// mission's close payload is the final envelope (`review.rs`'s
 /// `ReviewEnvelope`), not whatever task happens to be graph-positionally
-/// last (the `report` task's own render step, once #2310 P3's `review.report`
+/// last (the `report` task's own render step, once the review render step
 /// step lands after synthesis).
 ///
 /// Deliberately positional-by-DEFAULT rather than keyed on a step KIND: the
@@ -2783,7 +2683,7 @@ fn outcome_task<'a>(
 /// `run_summary_payload`, so this returns `false` rather than raising the
 /// same failure twice.
 ///
-/// (#2310 fix-loop C2 / C2-4) **Who subscribes.** `review-v2.json` declares
+/// (#2310 fix-loop C2 / C2-4) **Who subscribes.** `review.json` declares
 /// `outcome_from: "deliver"` — a review that never shipped is a failed run,
 /// and the CI job that launches it keys on the exit code. `crawl.json`
 /// deliberately does NOT: its `summary` task TOTALS a run rather than
@@ -2812,7 +2712,7 @@ fn delivery_failed(
 /// object passes through as-is (the pre-wrapper shape); anything that isn't
 /// a JSON object contributes nothing.
 ///
-/// **Shared with `src/mission_launch_review.rs::finalize_review_mission`**
+/// **Shared with the retired review funnel launcher**
 /// (#2310 P3) — the review launcher's own close-payload promotion. That
 /// caller never walks a persisted `Step.output` string the way
 /// [`run_summary_payload`] does (the bespoke launcher's `dispatch_worker`
@@ -2925,7 +2825,7 @@ fn build_launch_params(
         task_overrides,
         // (#2310 P4c-2 item 0) The old `crawl_plan_step_overrides` (deleted)
         // only ever substituted `{{workspace}}`, and only into `crawl.plan`
-        // steps — `review-v2.json`'s `plan.sites` steps never got their
+        // steps — `review.json`'s `plan.sites` steps never got their
         // `{{workspace}}`/`{{diff_file}}`/etc placeholders resolved on a
         // real launch (P4c-1's BLOCKER). `mission_config::interpret` now
         // substitutes every declared input generically, from
@@ -2958,27 +2858,6 @@ fn config_uses_coder_phase_kinds(config: &MissionConfig) -> bool {
         p.tasks
             .iter()
             .any(|t| t.steps.iter().any(|s| CODER_PHASE_TIER3_KINDS.contains(&s.kind.as_str())))
-    })
-}
-
-/// (#1530) True when the config's graph uses any review-pipeline step kind —
-/// the structural test that routes a review config to its dedicated launcher
-/// (`crate::mission_launch_review::launch`) regardless of the config's `id`.
-/// Mirrors [`config_uses_coder_phase_kinds`]: a config carrying any
-/// `REVIEW_TIER3_KINDS` step is a review-pipeline config and must go through
-/// the driver that owns review bundling/staffing/side-paths, whether it is
-/// named `review`, `review-lean`, or anything else the operator stored.
-///
-/// `pub(crate)` (#1684 QA finding) — `src/acp_panel.rs`'s panel-command
-/// router uses the SAME structural test to decide whether an invoked
-/// command routes to `acp.rs`'s bespoke `run_review` path, rather than an
-/// `id == "review"` string-literal check that would miss a renamed
-/// variant exactly the way this function's own doc warns against.
-pub(crate) fn config_uses_review_kinds(config: &MissionConfig) -> bool {
-    config.phases.iter().any(|p| {
-        p.tasks
-            .iter()
-            .any(|t| t.steps.iter().any(|s| REVIEW_TIER3_KINDS.contains(&s.kind.as_str())))
     })
 }
 
@@ -3628,7 +3507,7 @@ fn load_mission_for_brief(mission_id: &str) -> Result<Mission> {
     serde_json::from_str(&text).context("parsing mission.json")
 }
 
-// `pub(crate)` — `mission_launch_review.rs` reuses this (and
+// `pub(crate)` — the retired review funnel launcher reuses this (and
 // `lazy_start_phase_for_step` below) rather than re-deriving the same
 // read.
 pub(crate) fn load_phase_for_brief(mission_id: &str, phase_id: &str) -> Result<Phase> {
@@ -3762,7 +3641,7 @@ pub(crate) fn lazy_start_phase_for_step(
 ///
 /// **Scope.** The GENERIC launcher (this module) is the only caller today.
 /// The review launcher persists at transition only and closes its phases
-/// in `mission_launch_review.rs`'s own finalize; it retires onto this path
+/// in the retired review funnel launcher's own finalize; it retires onto this path
 /// in #2310 P4d, at which point this doc covers it too.
 pub(crate) fn lazy_close_prior_phases(
     mission_id: &str,
@@ -4157,6 +4036,46 @@ fn print_run_summary(mission_id: &str, steps: &BTreeMap<String, crew::types::Ste
         ))
     );
     println!("  {}", style::dim(&format!("darkmux mission status   (or) darkmux mission debrief {mission_id}")));
+}
+
+// (#2310 P4d) Test-only since the bespoke review launcher — its last
+// production caller — retired; the tests below still exercise the real
+// mission/phase provenance write.
+#[cfg(test)]
+/// Mint the Mission + one Phase per declared phase, with per-launcher
+/// PROVENANCE overrides (#1284 Packet 4b review gate, must-fix 2). (#1503)
+/// Every call is a FRESH mint — the reuse/reopen-by-derived-id path is
+/// gone: since `mission_id` is now minted uniquely per launch (never
+/// derived from inputs), a launch never revisits an existing mission's id,
+/// so there is nothing to reopen. If the id somehow already exists on disk
+/// (should be impossible given `mint_run_id`'s uniqueness guarantee), this
+/// bails loud rather than silently reopening or overwriting a stranger's
+/// record.
+///
+/// A dedicated launcher whose instances are per-case (the review launcher:
+/// N CI reviews of N PRs) passes a case-bearing `description` ("PR review
+/// — owner/repo@sha (crew `x`)") so the mission board / viewer can tell
+/// the instances apart — falling back to the generic config-derived
+/// description when `None` (the generic `launch` path). `spec` (#1503) is
+/// the run's GROUPING metadata — which config, which resolved-inputs
+/// fingerprint — recorded on the minted `Mission`; `None` for a caller
+/// with no meaningful spec (a bare test fixture, e.g.).
+///
+/// Hydrates `Mission.source_input`/`Mission.ticket` from the config's
+/// `extras` (#1284 review round 1, must-fix 2) — that's where `mission
+/// propose` preserves the operator's verbatim words (#815) and ticket id
+/// (#816), and dropping them silently broke `coder_brief`'s source-input
+/// injection plus the conventions' `{ticket}` templates.
+///
+/// Returns the doc phase id → real (composed) phase id map every subsequent
+/// step needs.
+pub(crate) fn ensure_mission_and_phases_with_provenance(
+    mission_id: &str,
+    config: &MissionConfig,
+    description: Option<&str>,
+    spec: Option<MissionSpec>,
+) -> Result<BTreeMap<String, String>> {
+    ensure_mission_and_phases_with_provenance_and_start_payload(mission_id, config, description, spec, None)
 }
 
 #[cfg(test)]
@@ -6086,13 +6005,14 @@ mod tests {
 
     /// (#1530) Structural conformance: every step kind the SHIPPED mission
     /// configs declare must be in the known-kind union `launch` feeds to
-    /// `MissionConfig::validate` — the Tier-1 builtins plus
-    /// `CODER_PHASE_TIER3_KINDS` plus `REVIEW_TIER3_KINDS`. A kind missing
-    /// from that union doesn't fail: it emits a `Warning` per step, so every
-    /// launch of that config prints a spurious "unknown step kind" line and
-    /// erodes a loud-validation surface. Adding `review.probe-render` hit
-    /// exactly that, caught only by review; this pins the lists against the
-    /// documents instead of against a reviewer noticing. Reads the embedded
+    /// `MissionConfig::validate` — the Tier-1 builtins plus the launch-owned
+    /// coder-phase and crawl-family kinds. A kind missing from that union
+    /// doesn't fail: it emits a `Warning` per step, so every launch of that
+    /// config prints a spurious "unknown step kind" line and erodes a
+    /// loud-validation surface. A step kind added to a shipped document
+    /// without registering it hit exactly that once, caught only by review;
+    /// this pins the registry against the documents instead of against a
+    /// reviewer noticing. Reads the embedded
     /// templates directly (never `mission_config::load`, which would prefer a
     /// user-tier copy and make the test machine-dependent).
     #[test]
@@ -6148,19 +6068,15 @@ mod tests {
         }
     }
 
-    /// (#1530 — one global step-kind registry) The payoff this packet
-    /// exists to deliver: a config whose GRAPH names BOTH a coder-phase step
-    /// (`mission.coder`) and a review step (`review.judge`) resolves EVERY
-    /// kind against `all_step_kinds`'s single shared registry — never a real
-    /// built-in document shape (each pipeline's dedicated launcher owns its
-    /// own document), but exactly the capability that was structurally
-    /// impossible before this packet: `review`'s dedicated launcher built
-    /// its own registry via `StepKindRegistry::with_builtins()` +
-    /// `register_review_kinds` (nothing of `mission.*`), and this module's
-    /// execution registry built its own via `with_builtins()` +
-    /// `register_coder_phase_kinds` (nothing of `review.*`) — no single
-    /// registry instance could ever have resolved a graph naming both
-    /// families at once.
+    /// (#1530 — one global step-kind registry; #2310 P4d) The payoff this
+    /// packet exists to deliver: a config whose GRAPH names BOTH a
+    /// coder-phase step (`mission.coder`) and a crawl/review planning step
+    /// (`plan.sites`) resolves EVERY kind against `all_step_kinds`'s single
+    /// shared registry — never a real built-in document shape, but exactly
+    /// the capability that was structurally impossible while each pipeline's
+    /// dedicated launcher built its own PARTIAL registry. (The review
+    /// family's own Tier-3 kinds retired with the funnel launcher in
+    /// #2310 P4d; the crawl-shared kinds took their place in this test.)
     #[test]
     fn both_families_resolve_against_one_registry() {
         let cfg: MissionConfig = serde_json::from_value(serde_json::json!({
@@ -6171,7 +6087,7 @@ mod tests {
                 "name": "p1",
                 "tasks": [
                     { "id": "t1", "steps": [{ "id": "s1", "kind": "mission.coder" }] },
-                    { "id": "t2", "steps": [{ "id": "s2", "kind": "review.judge" }] },
+                    { "id": "t2", "steps": [{ "id": "s2", "kind": "plan.sites" }] },
                 ]
             }]
         }))
@@ -6184,14 +6100,14 @@ mod tests {
         // The SAME validation pass `launch` runs on every config: a step
         // whose kind isn't in `known_kinds` produces an "unknown step kind"
         // warning (`mission_config::validate`'s own doc). Neither
-        // `mission.coder` nor `review.judge` should trigger one — both
+        // `mission.coder` nor `plan.sites` should trigger one — both
         // resolve against this ONE registry.
         let findings = cfg.validate(&known_kinds);
         let kind_warnings: Vec<_> =
             findings.iter().filter(|f| f.message.contains("unknown step kind")).collect();
         assert!(
             kind_warnings.is_empty(),
-            "a graph naming both a coder-phase kind and a review kind must produce no \
+            "a graph naming both a coder-phase kind and a crawl-shared kind must produce no \
              \"unknown step kind\" warnings against ONE shared registry — got: {kind_warnings:?}"
         );
 
@@ -6200,9 +6116,7 @@ mod tests {
         // list — actually gettable).
         assert!(registry.get("dispatch.internal").is_ok(), "dispatch.internal must resolve");
         assert!(registry.get("mission.coder").is_ok(), "mission.coder must resolve");
-        assert!(registry.get("review.judge").is_ok(), "review.judge must resolve");
-        // The legacy funnel.* alias review registers alongside review.judge.
-        assert!(registry.get("funnel.judge").is_ok(), "funnel.judge legacy alias must resolve");
+        assert!(registry.get("plan.sites").is_ok(), "plan.sites must resolve");
     }
 
     /// (#1549) The overrides must reach a coder-phase-shaped graph even when
@@ -6270,22 +6184,6 @@ mod tests {
             }]
         }))
         .expect("minimal config deserializes")
-    }
-
-    #[test]
-    fn review_routes_by_kind_not_by_the_literal_id() {
-        // The canonical `review` config still routes (kinds present).
-        assert!(config_uses_review_kinds(&config_with_kind("review", "review.judge")));
-        // The whole point of #1530: a differently-NAMED review variant
-        // (`review-lean`) routes to the same dedicated driver — the old
-        // `id == "review"` literal would have missed it and dropped it onto
-        // the generic path, which cannot construct the review kinds.
-        assert!(config_uses_review_kinds(&config_with_kind("review-lean", "review.synthesis")));
-        // A non-review graph does NOT route to the review driver.
-        assert!(!config_uses_review_kinds(&config_with_kind("something", "dispatch.internal")));
-        // And a config named "review" with no review kinds is NOT forced to
-        // the review driver — routing is the graph's shape, never the name.
-        assert!(!config_uses_review_kinds(&config_with_kind("review", "dispatch.single_shot")));
     }
 
     /// (#1635) Killed a mutant `cargo-mutants` found surviving in
@@ -7045,7 +6943,7 @@ mod tests {
     /// `HostTelemetrySampler` itself never stamps `mission_id` (it doesn't
     /// know one — see its own doc). `drained_telemetry` is the one place
     /// that backfill happens for the generic launch path, mirroring
-    /// `mission_launch_review.rs`'s `FleetFlowEmitter`, which does the same
+    /// the retired review funnel launcher's `FleetFlowEmitter`, which does the same
     /// for `review`'s own samples. Fast injected cadence (5ms) — same
     /// discipline `crates/darkmux-crew/src/run_obs.rs`'s own tests use — so
     /// this doesn't race the real ~600-900ms `top`/`vm_stat`/`ioreg` shells
@@ -7144,89 +7042,6 @@ mod tests {
         assert_eq!(records[1].source.as_deref(), Some("mission"));
     }
 
-    /// (#1877 requirement 2 — "review must stop building its own, or you
-    /// get two samplers double-sampling one run") Structural proof of the
-    /// reconciliation this arc chose: NEITHER — `review` never receives
-    /// this guard, and it isn't made nestable either, because the two
-    /// constructions are mutually exclusive by CONTROL FLOW. `launch`
-    /// returns into the dedicated `mission_launch_review::launch` (which
-    /// mints no `mission_id` and builds its own telemetry sampler +
-    /// `with_dispatch_bookends` privately) strictly BEFORE this generic
-    /// path ever reaches `run_obs::HostTelemetrySampler::start` — so
-    /// double-sampling is not a runtime risk to guard against, it is
-    /// unreachable code. This test pins the ORDERING so a future refactor
-    /// that moved the guard construction earlier (or the review branch
-    /// later) would fail loud here instead of silently double-sampling
-    /// review runs in production.
-    #[test]
-    fn review_branch_returns_before_the_mission_telemetry_bookend_guard_is_ever_constructed() {
-        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mission_launch.rs"));
-        let review_branch = SRC
-            .find("if config_uses_review_kinds(config) {")
-            .expect("the review-kind routing branch must exist in mission_launch.rs");
-        let guard_construction = SRC
-            .find("run_obs::HostTelemetrySampler::start(")
-            .expect("the mission telemetry guard must exist in mission_launch.rs");
-        assert!(
-            review_branch < guard_construction,
-            "the review-kind branch (which returns into mission_launch_review::launch before \
-             minting a mission_id here) must appear BEFORE the telemetry/bookend guard is \
-             constructed — otherwise review's own sampler and this generic one could both run \
-             over the same review dispatch"
-        );
-    }
-
-    /// (#1877 QA should-fix 5) The source-ordering test above pins TEXTUAL
-    /// position, not the actual invariant — a refactor that extracts the
-    /// guard construction into a helper `fn` defined earlier in the file
-    /// (called later) would still fail it while the invariant holds, and
-    /// one that moves the review branch's CALL later while its definition
-    /// stays early would pass it while double-sampling. This test pins the
-    /// invariant BEHAVIORALLY instead: launch a config whose graph uses a
-    /// review kind and assert zero `source: "mission"` records land,
-    /// regardless of how `launch`'s internals are structured.
-    ///
-    /// The config fails fast inside `mission_launch_review::launch` on the
-    /// missing required `diff_file` input (`launch`'s own doc — no
-    /// LMStudio, no worktree, no real work reachable before that `?`) —
-    /// which is fine: the claim under test is "review never reaches the
-    /// generic guard," not "review succeeds," and a review-kind config
-    /// that never even reaches the missing-input bail (a hang, a panic, a
-    /// successful launch) would ALSO be caught here, since any of those
-    /// would either fail this test's `expect_err` or leave the flow
-    /// records inspected below unrepresentative.
-    #[test]
-    #[serial_test::serial]
-    fn review_kind_config_launch_emits_zero_mission_source_records() {
-        let guard = LaunchTestGuard::new();
-        const REVIEW_KIND_CONFIG: &str = r#"{
-            "id": "review-kind-test-mission",
-            "name": "Review Kind Test Mission",
-            "schema_version": "2.3",
-            "phases": [{
-                "id": "p1",
-                "tasks": [{ "id": "t1", "steps": [{ "id": "s1", "kind": "review.judge" }] }]
-            }]
-        }"#;
-        guard.write_config("review-kind-test-mission", REVIEW_KIND_CONFIG);
-
-        let err = launch("review-kind-test-mission", None, &[], None)
-            .expect_err("no `diff_file` input was supplied — the review launcher must bail");
-        assert!(
-            err.to_string().contains("diff_file"),
-            "sanity: this must be review's own missing-input bail, not some other failure: {err}"
-        );
-
-        let records = read_all_flow_records();
-        assert!(
-            records.iter().all(|r| r["source"] != "mission"),
-            "a review-kind config must NEVER reach the generic guard's `source: \"mission\"` \
-             bookend — got {:#?}",
-            records.iter().filter(|r| r["source"] == "mission").collect::<Vec<_>>()
-        );
-        drop(guard);
-    }
-
     /// (#1877 QA should-fix 6) `read_all_flow_records`-based tests can only
     /// observe telemetry SAMPLES landing at the real 2s production cadence
     /// (`run_obs.rs`'s own "sleep first, then sample" design deliberately
@@ -7245,7 +7060,7 @@ mod tests {
         // Built via `concat!` (not a plain string literal) so this test's
         // OWN source line — which necessarily names the exact call shape
         // it's counting — doesn't self-match and inflate the count by one,
-        // the same idiom `mission_launch_review_and_review_bench_construct_
+        // the same idiom `the retired review funnel launcher_and_review_bench_construct_
         // graphs_through_the_same_launcher`'s `run_needle` uses for the
         // identical reason.
         let needle = concat!("drained_telemetry(&telemetry, ", "&mission_id)");

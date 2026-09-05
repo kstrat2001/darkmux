@@ -14,7 +14,7 @@
 //! module rather than in `darkmux-crew`'s shared `step_kinds/` because no
 //! second mission plans. Promote when one does.
 //!
-//! (#2310 P4c) A second mission plans now — `review-v2.json` uses
+//! (#2310 P4c) A second mission plans now — `review.json` uses
 //! `plan_sites_step::PLAN_SITES_KIND` (`"plan.sites"`, this file's
 //! sibling), whose `"source": "tree"` config literally calls this
 //! module's own [`plan_one_rule`], so `crawl.plan`'s tree-source behavior
@@ -24,7 +24,7 @@
 //! `crawl.plan` becomes `plan.sites`'s tree-source alias for real (or
 //! retires) once the crawl side of the consolidation is decided. Until
 //! then, `crawl.plan` is the kind `crawl.json` names; `plan.sites` is the
-//! kind `review-v2.json` names; both produce the same `Plan` content
+//! kind `review.json` names; both produce the same `Plan` content
 //! (`CRAWL_PLAN_OUTPUT_KIND`), so `crawl.unit` reads either without
 //! modification.
 //!
@@ -259,7 +259,7 @@ pub(crate) fn write_plan(path: &Path, the_plan: &darkmux_crew::step_output::Outp
 pub fn register_crawl_kinds(registry: &StepKindRegistry) -> Result<()> {
     registry.register(Arc::new(CrawlPlanStepKind)).context("registering crawl.plan")?;
     crate::crawl::unit_step::register(registry)?;
-    // (#2310 P4c) `plan.sites` — review-v2.json's planner. Registered
+    // (#2310 P4c) `plan.sites` — review.json's planner. Registered
     // alongside the crawl kinds (not a separate top-level call in
     // `all_step_kinds`) so one call still gives a launcher every kind
     // either config declares, matching this function's own existing

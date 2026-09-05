@@ -558,7 +558,7 @@ fn mission_config_show_review_names_every_phase_and_flags_unconstructible_kinds(
     assert_eq!(v["id"], "review");
     let phase_ids: Vec<&str> =
         v["phases"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
-    assert_eq!(phase_ids, vec!["investigate", "adjudicate", "report"]);
+    assert_eq!(phase_ids, vec!["plan", "review", "summarize", "create-mods", "deliver"]);
     // Every step review.json declares is a real registered kind (Tier 1 +
     // the review Tier 3 kinds) — none should be flagged unconstructible.
     for phase in v["phases"].as_array().unwrap() {
@@ -574,20 +574,20 @@ fn mission_config_show_review_names_every_phase_and_flags_unconstructible_kinds(
     }
 }
 
-/// (#2310 P4c-2 review item 3 — proven) `mission config show review-v2`
+/// (#2310 P4c-2 review item 3 — proven) `mission config show review`
 /// must render its `bundler` input's `ignored`/`ignored_reason` — both in
 /// `--json` (typed fields, always present) and in the text form (`(optional,
 /// ignored: <reason>)`), so an operator sees the same signal launch-time
 /// gives without having to launch first.
 #[test]
-fn mission_config_show_review_v2_renders_the_ignored_bundler_input() {
+fn mission_config_show_review_renders_the_ignored_bundler_input() {
     let tmp = TempDir::new().unwrap();
     let json_out = Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_HOME", tmp.path())
-        .args(["mission", "config", "show", "review-v2", "--json"])
+        .args(["mission", "config", "show", "review", "--json"])
         .output()
-        .expect("mission config show review-v2 --json runs");
+        .expect("mission config show review --json runs");
     assert!(json_out.status.success(), "stderr: {}", String::from_utf8_lossy(&json_out.stderr));
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&json_out.stdout)).expect("valid JSON");
     let bundler = v["inputs"]
@@ -603,9 +603,9 @@ fn mission_config_show_review_v2_renders_the_ignored_bundler_input() {
     let text_out = Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_HOME", tmp.path())
-        .args(["mission", "config", "show", "review-v2"])
+        .args(["mission", "config", "show", "review"])
         .output()
-        .expect("mission config show review-v2 runs");
+        .expect("mission config show review runs");
     assert!(text_out.status.success(), "stderr: {}", String::from_utf8_lossy(&text_out.stderr));
     let text = String::from_utf8_lossy(&text_out.stdout);
     assert!(
@@ -616,11 +616,11 @@ fn mission_config_show_review_v2_renders_the_ignored_bundler_input() {
     // A LIVE (non-ignored) input on the same config must NOT get the
     // ignored suffix.
     assert!(
-        text.contains("workspace (required)\n") || text.contains("workspace (required,"),
+        text.contains("diff_file (required)\n") || text.contains("diff_file (required,"),
         "a live input keeps the plain form:\n{text}"
     );
     assert!(
-        !text.contains("workspace (required, ignored"),
+        !text.contains("diff_file (required, ignored"),
         "a live input must never render an ignored suffix:\n{text}"
     );
 }
@@ -638,13 +638,13 @@ fn mission_config_show_unknown_id_exits_nonzero_with_hint() {
         .stderr(predicate::str::contains("not found"));
 }
 
-/// (merge-gate MUST-FIX 3, end to end) `--param` applies as a launch
-/// binding on the review route: with a `role_profiles` map naming a REAL
-/// profile for `review-judge`, `show`'s JSON must report `provenance:
-/// "role_profiles map"` (unmapped roles still resolve too) — this
-/// specific test overrides via `--param` and checks the override wins.
+/// (merge-gate MUST-FIX 3; #2310 P4d) `--param <role>=<profile>` no longer
+/// applies as a launch binding on ANY route — the review route was the only
+/// launcher that did, and it retired with the bespoke funnel. `show` must
+/// mirror that: the override is reported as ignored, with a warning, and the
+/// role still resolves through the registry's own binding.
 #[test]
-fn mission_config_show_review_param_override_applies_with_launch_override_provenance() {
+fn mission_config_show_review_param_override_is_reported_ignored_with_a_warning() {
     let tmp = TempDir::new().unwrap();
     let profiles_path = tmp.path().join("profiles.json");
     fs::write(
@@ -665,25 +665,31 @@ fn mission_config_show_review_param_override_applies_with_launch_override_proven
             "--profiles-file",
             profiles_path.to_str().unwrap(),
             "--param",
-            "review-judge=deep",
+            "reviewer=deep",
         ])
         .output()
         .expect("runs");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["warnings"].as_array().unwrap().len(), 0, "a role the review config declares must not warn");
-    let judge_role = v["phases"]
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap_or("").contains("ignored")),
+        "an override no launcher applies must be reported, not silently honored: {warnings:?}"
+    );
+    let reviewer_role = v["phases"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|p| p["tasks"].as_array().unwrap())
         .find_map(|t| {
             let r = &t["role"];
-            (r["role_id"] == "review-judge").then(|| r.clone())
+            (r["role_id"] == "reviewer").then(|| r.clone())
         })
-        .expect("review-judge task must be present");
-    assert_eq!(judge_role["provenance"], "launch override (--param)");
-    assert_eq!(judge_role["profile"], "deep");
+        .expect("a reviewer task must be present");
+    assert_ne!(
+        reviewer_role["provenance"], "launch override (--param)",
+        "no launcher applies --param role overrides any more: {reviewer_role}"
+    );
 }
 
 /// (merge-gate MUST-FIX 3, end to end) `mission launch` never converts
@@ -2172,877 +2178,6 @@ fn dispatch_licensed_adjacent_role_bails_at_ack_gate_before_docker() {
         );
 }
 
-// ── `mission launch review` integration tests (#1284 Packet 4b — retired
-// from `pr-review run`, #1222 Phase B packet 5) ────────────────────────────
-
-/// A small diff whose one added line ("const b = 2;") lands at new-side
-/// line 2 of src/x.ts — the anchor the canned envelope's confirmed flag
-/// resolves against.
-fn pr_review_run_diff() -> &'static str {
-    // A single-line literal with explicit `\n` escapes (NOT a backslash-
-    // continued multi-line literal) — Rust's line-continuation trims
-    // leading whitespace on the next physical line, which would silently
-    // eat the single-space context-line marker unified diffs rely on.
-    "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,2 +1,3 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n"
-}
-
-/// A canned `FunnelEnvelope` (see `darkmux_lab::lab::funnel::FunnelEnvelope`)
-/// with one double-confirmed flag anchored to the diff above — the
-/// `--from-envelope` synthesis-only path's fixture. Deliberately hand-built
-/// JSON (not produced by a real dispatch) so this test needs zero model
-/// calls and zero bundling, matching the CLI's own "CI-testable path"
-/// framing for `--from-envelope`.
-fn pr_review_run_envelope() -> &'static str {
-    r#"{
-        "case_id": "test-case",
-        "crew": "test-crew",
-        "mode": "sequential",
-        "members": [
-            {"model": "darkmux:probe-model", "seat": "review-probe", "draws": 2, "wall_ms": 10, "total_tokens": 100},
-            {"model": "darkmux:judge-model", "seat": "review-judge", "draws": 2, "wall_ms": 5, "total_tokens": 50}
-        ],
-        "steps": [],
-        "bundles": 1,
-        "raw_flags": 2,
-        "deduped_flags": 1,
-        "flags": [],
-        "judged": [
-            {
-                "flag": {
-                    "bundle_id": "computeB@src/x.ts",
-                    "fact_family": "unscoped",
-                    "member": "darkmux:probe-model",
-                    "draw": 0,
-                    "charge_text": "the added constant shadows the config default",
-                    "anchor": "const b = 2;"
-                },
-                "pass1": {"ruling": "confirmed", "decisive_evidence": "the clamp is bypassed", "note_for_author": "shadows the config default", "pass": 1, "seconds": 0.2},
-                "pass2": {"ruling": "confirmed", "decisive_evidence": "confirmed on recheck", "note_for_author": "shadows the config default", "pass": 2, "seconds": 0.2},
-                "tier": "confirmed",
-                "demoted_by_pass2": false
-            }
-        ],
-        "confirmed": 1,
-        "needs_check": 0,
-        "archived": 0,
-        "fingerprint": {"judge_model": "darkmux:judge-model", "judge_temperature": 0.2, "judge_persona_blake3": "abc123", "protocol": "double-confirm-v1"}
-    }"#
-}
-
-/// `--from-envelope` + `--diff` + `--emit -` synthesizes the canned
-/// envelope's confirmed flag into an inline review comment on a NON-blocking
-/// `COMMENT`-event review (#1302 — advisory by default; the canned envelope
-/// carries no `request_changes` opt-in) — zero model calls, zero bundling
-/// (the CI-testable path the packet brief names).
-#[test]
-fn pr_review_run_from_envelope_synthesizes_confirmed_review_to_stdout() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let envelope_path = tmp.path().join("funnel.json");
-    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            "emit=-",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {stdout}"));
-    assert_eq!(v["mode"], "review");
-    assert_eq!(v["review"]["event"], "COMMENT", "advisory by default (#1302)");
-    let comments = v["review"]["comments"].as_array().unwrap();
-    assert_eq!(comments.len(), 1);
-    assert_eq!(comments[0]["path"], "src/x.ts");
-    assert_eq!(comments[0]["line"], 2);
-    let body = comments[0]["body"].as_str().unwrap();
-    assert!(body.contains("shadows the config default"), "{body}");
-    // (#1521-adjacent UX) The local-judge marker is no longer repeated on
-    // each finding's own comment — it renders once, on the review's
-    // top-level body, alongside the verdict line.
-    let top_body = v["review"]["body"].as_str().unwrap();
-    assert!(
-        top_body.contains("needs frontier verification"),
-        "the review header carries the local-judge marker once: {top_body}"
-    );
-}
-
-// (#2310 P0) Render-side half of the review conformance harness — see
-// `crates/darkmux-lab/tests/review_conformance.rs`'s module doc for the
-// pipeline-side half. This exercises `pr_review::synthesize_review` at the
-// CLI boundary (`mission launch review --param from_envelope=... --param
-// diff_file=... --param emit=-` — the CI-testable, zero-model-call,
-// zero-bundling synthesis-only path; there is no bare `pr-review render`
-// top-level verb — see `retired_top_level_pr_review_verb_is_unknown` above,
-// that spelling was retired and this is the real one) against the SAME
-// `ReviewEnvelope` the conformance harness's graph run produced and pinned
-// as its own golden — read directly from
-// `crates/darkmux-lab/tests/golden/review-conformance/envelope.json` (Hole
-// 5, #2336 review: this used to be a byte-copy at
-// `tests/fixtures/review-conformance/envelope.json` with nothing asserting
-// the two stayed in sync; single-sourced now, one file on disk, not two).
-// Together the two goldens (this render golden + the crate's pipeline
-// golden) cover both halves of the bespoke `src/mission_launch_review.rs`
-// launcher #2310 P4 will retire: build+run the graph (pipeline golden) and
-// render the resulting envelope into a postable payload (this golden).
-mod review_conformance {
-    use super::*;
-    use std::path::PathBuf;
-
-    /// (Hole 5, #2336 review) The CLI-only fixtures (the render golden —
-    /// no crate-side equivalent exists for it).
-    fn fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/review-conformance")
-    }
-
-    /// (Hole 5, #2336 review) `envelope.json` and `diff.patch` used to be
-    /// byte-copies duplicated under `tests/fixtures/review-conformance/`,
-    /// with nothing asserting the two copies stayed in sync — a hand-edit
-    /// to one drifts from the other silently. Single-sourced now: this
-    /// reads the SAME files `crates/darkmux-lab/tests/review_conformance.rs`
-    /// pins as its own golden/fixture, so there is exactly one envelope and
-    /// one diff on disk, not two that happen to match today.
-    fn crate_fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/darkmux-lab/tests/fixtures/review-conformance")
-    }
-
-    fn crate_golden_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/darkmux-lab/tests/golden/review-conformance")
-    }
-
-    /// Run the CLI's `from_envelope` synthesis path over the committed
-    /// envelope + diff fixtures and return the parsed `{mode, review,
-    /// comment}` stdout payload. (Hole 5, #2336 review) `DARKMUX_HOME`
-    /// scopes to a per-call tempdir — mirrors the 26+ other `cli.rs` tests
-    /// that set it — so a user-tier `~/.darkmux/mission-configs/review.json`
-    /// on the box running this test cannot change what gets rendered.
-    fn render_conformance_envelope() -> serde_json::Value {
-        let home = TempDir::new().unwrap();
-        let output = Command::cargo_bin("darkmux")
-            .unwrap()
-            .env("DARKMUX_HOME", home.path())
-            .args([
-                "mission",
-                "launch",
-                "review",
-                "--param",
-                &format!("from_envelope={}", crate_golden_dir().join("envelope.json").to_str().unwrap()),
-                "--param",
-                &format!("diff_file={}", crate_fixture_dir().join("diff.patch").to_str().unwrap()),
-                "--param",
-                "emit=-",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {stdout}"))
-    }
-
-    fn golden_path() -> PathBuf {
-        fixture_dir().join("rendered.golden.json")
-    }
-
-    /// The render golden itself: the conformance envelope, rendered,
-    /// pinned byte-for-byte. To regenerate after a deliberate, reviewed
-    /// rendering change: `DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN=1 cargo
-    /// test --test cli review_conformance::` then review the diff before
-    /// committing.
-    #[test]
-    fn rendered_payload_matches_the_committed_golden() {
-        let v = render_conformance_envelope();
-        let pretty = serde_json::to_string_pretty(&v).unwrap();
-
-        if std::env::var("DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN").is_ok() {
-            fs::write(golden_path(), format!("{pretty}\n")).unwrap();
-            return;
-        }
-        let expected = fs::read_to_string(golden_path()).unwrap_or_else(|_| {
-            panic!(
-                "missing golden at {} — run with DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN=1 to generate it",
-                golden_path().display()
-            )
-        });
-        assert_eq!(
-            pretty.trim_end(),
-            expected.trim_end(),
-            "the review conformance envelope's RENDERED payload drifted from the committed golden \
-             at {} — this is the #2310 refactor's regression net; if the drift is intended, \
-             regenerate with DARKMUX_REVIEW_CONFORMANCE_UPDATE_GOLDEN=1 cargo test --test cli \
-             review_conformance:: then review the diff before committing.",
-            golden_path().display()
-        );
-    }
-
-    /// Sanity checks on the render's SHAPE (not just the opaque golden
-    /// diff) — fails loud + legibly if the fixture stops exercising what
-    /// it claims to. Mirrors `bundle_golden.rs`'s convention of pairing a
-    /// byte-golden with independent shape assertions.
-    #[test]
-    fn rendered_payload_has_the_expected_shape() {
-        let v = render_conformance_envelope();
-        assert_eq!(v["mode"], "review");
-        assert_eq!(v["review"]["event"], "COMMENT", "advisory by default — the fixture's `request_changes` is false");
-        let comments = v["review"]["comments"].as_array().expect("comments array");
-        assert_eq!(comments.len(), 1, "exactly the one CONFIRMED (billing.ts) finding posts a comment");
-        assert_eq!(comments[0]["path"], "src/billing.ts");
-        let body = comments[0]["body"].as_str().unwrap();
-        assert!(body.contains("numeric-add bug"), "{body}");
-    }
-
-    /// (Hole 5, #2336 review) Positive proof the `DARKMUX_HOME` scoping in
-    /// `render_conformance_envelope` is real containment, not decoration.
-    /// `mission launch review`'s liveness floor
-    /// (`darkmux_types::dispatch_liveness::liveness_dir`) writes a heartbeat
-    /// file straight to `<DARKMUX_HOME>/liveness/<pid>.log` with NO config
-    /// load in between (its own doc: "resolves the darkmux home WITHOUT
-    /// touching config resolution"), and falls back to the real `~/.darkmux`
-    /// when `DARKMUX_HOME` is unset. Asserting the heartbeat file lands
-    /// inside OUR tempdir is the closest this suite can get to red-proving
-    /// the scoping without ever actually letting an unscoped run touch the
-    /// operator's real home (which this harness's own rules forbid) —
-    /// dropping `.env("DARKMUX_HOME", ...)` here would make this assertion
-    /// fail (no `liveness/` dir under the tempdir at all) while silently
-    /// writing the heartbeat to the real `~/.darkmux/liveness/` instead.
-    #[test]
-    fn render_conformance_envelope_confines_its_liveness_heartbeat_to_the_scoped_home() {
-        let home = TempDir::new().unwrap();
-        let output = Command::cargo_bin("darkmux")
-            .unwrap()
-            .env("DARKMUX_HOME", home.path())
-            .args([
-                "mission",
-                "launch",
-                "review",
-                "--param",
-                &format!("from_envelope={}", crate_golden_dir().join("envelope.json").to_str().unwrap()),
-                "--param",
-                &format!("diff_file={}", crate_fixture_dir().join("diff.patch").to_str().unwrap()),
-                "--param",
-                "emit=-",
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
-        let liveness_dir = home.path().join("liveness");
-        let entries: Vec<_> = fs::read_dir(&liveness_dir)
-            .unwrap_or_else(|e| panic!("expected a liveness heartbeat under the scoped DARKMUX_HOME at {}: {e}", liveness_dir.display()))
-            .collect();
-        assert!(!entries.is_empty(), "the liveness heartbeat file must exist under the scoped home");
-    }
-}
-
-/// `--from-envelope` also honors `--envelope-out` (a round-trip re-write of
-/// the same envelope, pretty-printed) alongside the rendered `--emit`.
-#[test]
-fn pr_review_run_from_envelope_also_writes_envelope_out() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let envelope_path = tmp.path().join("funnel.json");
-    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
-    let out_path = tmp.path().join("out-envelope.json");
-    let emit_path = tmp.path().join("rendered.json");
-
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("envelope_out={}", out_path.to_str().unwrap()),
-            "--param",
-            &format!("emit={}", emit_path.to_str().unwrap()),
-        ])
-        .assert()
-        .success();
-
-    let rewritten = fs::read_to_string(&out_path).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
-    assert_eq!(v["confirmed"], 1);
-    assert_eq!(v["case_id"], "test-case");
-
-    let rendered = fs::read_to_string(&emit_path).unwrap();
-    let r: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-    assert_eq!(r["mode"], "review");
-}
-
-/// (#1311, part of #1278) The dependency-free liveness FLOOR: `mission
-/// launch review` emits phase markers to BOTH stderr and a
-/// `<darkmux-home>/liveness/<pid>.log` heartbeat file, in order. Driven
-/// offline via `from_envelope` (no model, no keychain, no network) so it
-/// exercises `mission_launch_review::launch`'s early path — the markers a
-/// real hang would leave behind. `DARKMUX_HOME` points the floor's home
-/// resolution at the tempdir so the heartbeat file is inspectable.
-#[test]
-fn pr_review_run_emits_liveness_floor_markers_in_order() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let envelope_path = tmp.path().join("funnel.json");
-    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_HOME", tmp.path())
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            "emit=-",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
-
-    // The from-envelope path fires process-start -> synthesis -> done (it skips
-    // run_dispatch's config/crew/bundling markers, which need a live dispatch).
-    let expected = ["process-start", "synthesis", "done"];
-
-    // Surface 1: stderr (the most reliable surface — all that #563 could ever
-    // have shown). Assert the markers appear in order.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_in_order(&stderr, &expected, "stderr");
-
-    // Surface 2: the heartbeat FILE — proves the best-effort append landed.
-    // Exactly one `<pid>.log` for this one child process.
-    let liveness_dir = tmp.path().join("liveness");
-    let mut logs: Vec<_> = fs::read_dir(&liveness_dir)
-        .expect("liveness dir should exist")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "log"))
-        .collect();
-    assert_eq!(logs.len(), 1, "expected one heartbeat file, got {logs:?}");
-    let file_body = fs::read_to_string(logs.pop().unwrap()).unwrap();
-    assert_in_order(&file_body, &expected, "heartbeat file");
-    // Each file line is `<ts> <phase> pid=<pid> case=<case>`.
-    assert!(file_body.contains("pid="), "line shape: {file_body}");
-    assert!(file_body.contains("case="), "line shape: {file_body}");
-}
-
-/// Assert each of `needles` appears in `haystack`, in the given order.
-fn assert_in_order(haystack: &str, needles: &[&str], label: &str) {
-    let mut from = 0;
-    for n in needles {
-        match haystack[from..].find(n) {
-            Some(idx) => from += idx + n.len(),
-            None => panic!("{label}: expected {n:?} after offset {from} in:\n{haystack}"),
-        }
-    }
-}
-
-/// `worktree` and `github` are mutually exclusive — `mission_launch_review::
-/// resolve_source` enforces it manually now (`mission launch` has no clap
-/// `conflicts_with`/`requires` pairing across `--param` inputs the way the
-/// retired `pr-review run` flags did).
-#[test]
-fn pr_review_run_worktree_and_github_conflict() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("worktree={}", tmp.path().to_str().unwrap()),
-            "--param",
-            "github=kstrat2001/darkmux",
-            "--param",
-            "head_sha=deadbeef",
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            "crew=whatever",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("mutually exclusive"));
-}
-
-/// `github` without `head_sha` is also rejected — loud and named.
-#[test]
-fn pr_review_run_github_without_head_sha_rejected() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            "github=kstrat2001/darkmux",
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            "crew=whatever",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("head_sha"));
-}
-
-/// (#1475 packet 2) A real (non `from_envelope`) run on a registry with a
-/// profile but NO `default_profile`, and no role→profile bindings (a bare
-/// DARKMUX_HOME with no `role_profiles` config), fails loud at role→profile
-/// resolution: an UNMAPPED review role has no `default_profile` floor to fall
-/// back to. Loud + named, before any bundling/dispatch happens.
-#[test]
-fn pr_review_run_no_profile_binding_or_default_errors_loudly() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let profiles = tmp.path().join("profiles.json");
-    // A valid registry with a profile but NO default_profile — and no
-    // role_profiles bindings, so every review role is unmapped with no floor.
-    fs::write(
-        &profiles,
-        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}}}"#,
-    )
-    .unwrap();
-
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        // Isolate the config root so no operator `role_profiles` bindings leak
-        // in — a bare DARKMUX_HOME (no config.json) means every review role is
-        // unmapped, exercising the no-binding-and-no-default path deterministically.
-        .env("DARKMUX_HOME", tmp.path())
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("worktree={}", tmp.path().to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("profiles={}", profiles.to_str().unwrap()),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("default_profile"));
-}
-
-/// (#2345 C1) `review-report-step`'s task `depends_on: ["review-synthesis-
-/// task"]` — an upstream step erroring leaves it `NodeStatus::Planned`
-/// forever, so before this fix an errored graph run rendered nothing at
-/// all: exit 0, empty stdout. Forces a hermetic, no-network step error via
-/// a `--bundler` pointed at a nonexistent executable — `review-bundle-
-/// step`'s own `run_streaming` propagates that spawn failure as a genuine
-/// `NodeStatus::Error`, which blocks every downstream task (probe/dedup/
-/// judge/verify/synthesis/report) from ever reaching `Complete` — no real
-/// LMStudio/Docker/network needed, matching this suite's hermeticity rules
-/// (the graph never gets far enough to dispatch a single model call).
-#[test]
-fn pr_review_run_errored_graph_still_emits_a_degraded_payload() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let profiles = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles,
-        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
-    )
-    .unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        // Isolate the config root — same hermeticity discipline as every
-        // other graph-path test in this file.
-        .env("DARKMUX_HOME", tmp.path())
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("worktree={}", tmp.path().to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("profiles={}", profiles.to_str().unwrap()),
-            "--param",
-            "bundler=/definitely/not/a/real/darkmux-bundler-xyz",
-            "--param",
-            "emit=-",
-        ])
-        .output()
-        .unwrap();
-
-    // (#2345 C1) `run_dispatch` never turns a step-level error into a hard
-    // process `Err` — the exit code stays 0 on any produced review output,
-    // matching `mission_launch_review::launch`'s own documented contract.
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("stdout was not JSON — the errored graph run rendered nothing ({e}): {stdout}")
-    });
-    assert_eq!(v["mode"], "degraded", "an errored graph run must still render as degraded, not silence");
-}
-
-/// (#1311, restored #2345 I2) The GRAPH path's own `synthesis`/`done`
-/// liveness markers, dropped when #2310 P3 moved the render itself into
-/// `review-report-step` without carrying the bracket along — the
-/// `from_envelope` path (`pr_review_run_emits_liveness_floor_markers_in_order`)
-/// never lost them, since it renders inline in the launcher and always
-/// has. Reuses the same hermetic errored-graph fixture as the C1 test
-/// above (the fallback path is exactly where these markers were missing).
-#[test]
-fn pr_review_run_errored_graph_still_emits_synthesis_and_done_liveness_markers() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let profiles = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles,
-        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
-    )
-    .unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_HOME", tmp.path())
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("worktree={}", tmp.path().to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("profiles={}", profiles.to_str().unwrap()),
-            "--param",
-            "bundler=/definitely/not/a/real/darkmux-bundler-xyz",
-            "--param",
-            "emit=-",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_in_order(&stderr, &["process-start", "synthesis", "done"], "stderr");
-
-    let liveness_dir = tmp.path().join("liveness");
-    let mut logs: Vec<_> = fs::read_dir(&liveness_dir)
-        .expect("liveness dir should exist")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "log"))
-        .collect();
-    assert_eq!(logs.len(), 1, "expected one heartbeat file, got {logs:?}");
-    let file_body = fs::read_to_string(logs.pop().unwrap()).unwrap();
-    assert_in_order(&file_body, &["process-start", "synthesis", "done"], "heartbeat file");
-}
-
-/// (#2345 I3) `run_dispatch` used to REPLACE `review-report-step`'s whole
-/// `config` with only the launch's own `emit`/`envelope_out`/`attribution`
-/// — silently discarding whatever the document itself already declared
-/// there (a user-tier config may pin a fixed `attribution`). It now MERGES,
-/// launcher values winning only for keys the launch actually supplied.
-/// Proven with a launch that passes NO `--param attribution=` of its own:
-/// the document's own stamped attribution must still appear in the
-/// rendered footer. An empty diff + empty worktree (no `--param bundler`)
-/// exercises the WHOLE graph — bundle -> probe -> dedup -> judge -> verify
-/// -> synthesis -> report — hermetically: the built-in bundler yields zero
-/// bundles for an empty diff, so every downstream stage completes
-/// trivially with zero model calls, and `review-report-step` itself runs
-/// and renders (unlike the C1/I2 tests above, which force an upstream
-/// ERROR so the step never runs at all — exactly the case this test needs
-/// to AVOID, since the step's own config merge is what's under test).
-#[test]
-fn pr_review_run_document_stamped_attribution_survives_the_launcher_merge() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("empty.diff");
-    fs::write(&diff_path, "").unwrap();
-    let profiles = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles,
-        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
-    )
-    .unwrap();
-
-    let builtin_path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates/builtin/mission-configs/review.json");
-    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&builtin_path).unwrap()).unwrap();
-    doc["id"] = serde_json::json!("review-attrib-test");
-    let report_phase = doc["phases"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|p| p["id"] == "report")
-        .expect("review.json declares a report phase");
-    let report_task = report_phase["tasks"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|t| t["id"] == "review-report-task")
-        .expect("review.json declares review-report-task");
-    let report_step = report_task["steps"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|s| s["id"] == "review-report-step")
-        .expect("review.json declares review-report-step");
-    report_step["config"] = serde_json::json!({ "attribution": "custom-doc-attribution-marker" });
-
-    let config_dir = tmp.path().join("mission-configs");
-    fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("review-attrib-test.json"), serde_json::to_string(&doc).unwrap()).unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_HOME", tmp.path())
-        .args([
-            "mission",
-            "launch",
-            "review-attrib-test",
-            "--param",
-            &format!("worktree={}", tmp.path().to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("profiles={}", profiles.to_str().unwrap()),
-            "--param",
-            "emit=-",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("custom-doc-attribution-marker"),
-        "the document's own stamped attribution must survive the launcher's config merge: {stdout}"
-    );
-
-    // (#2345 CONSIDER-3, round 2) The (#1311/I2) synthesis/done liveness
-    // bracket fires on the CLEAN path too (`review-report-step` actually
-    // ran here, never the fallback) — pin the ordering here as well, not
-    // just on the errored-graph variant.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_in_order(&stderr, &["process-start", "synthesis", "done"], "stderr");
-}
-
-/// (#2345 CONSIDER-1, round 2) The errored-run FALLBACK used to honor a
-/// merged `attribution` but still pass the raw launch-only `emit`/
-/// `envelope_out` — so a document-stamped `emit: <file>` was written by a
-/// CLEAN run (the step reads its own merged config) but silently dumped to
-/// STDOUT by an errored run (the fallback ignored the merge for those two
-/// fields). Forces the fallback via the same hermetic bogus-`--bundler`
-/// error the C1 test uses, over a document that stamps a fixed `emit` file
-/// path on `review-report-step` with NO `--param emit=` of its own —
-/// exactly the pairing CONSIDER-1 named.
-#[test]
-fn pr_review_run_errored_graph_honors_the_documents_stamped_emit_path_in_the_fallback() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let profiles = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles,
-        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
-    )
-    .unwrap();
-
-    let builtin_path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates/builtin/mission-configs/review.json");
-    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&builtin_path).unwrap()).unwrap();
-    doc["id"] = serde_json::json!("review-emit-fallback-test");
-    let report_phase = doc["phases"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|p| p["id"] == "report")
-        .expect("review.json declares a report phase");
-    let report_task = report_phase["tasks"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|t| t["id"] == "review-report-task")
-        .expect("review.json declares review-report-task");
-    let report_step = report_task["steps"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|s| s["id"] == "review-report-step")
-        .expect("review.json declares review-report-step");
-    let stamped_emit_path = tmp.path().join("stamped-emit.json");
-    report_step["config"] = serde_json::json!({ "emit": stamped_emit_path.display().to_string() });
-
-    let config_dir = tmp.path().join("mission-configs");
-    fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("review-emit-fallback-test.json"), serde_json::to_string(&doc).unwrap()).unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_HOME", tmp.path())
-        .args([
-            "mission",
-            "launch",
-            "review-emit-fallback-test",
-            "--param",
-            &format!("worktree={}", tmp.path().to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("profiles={}", profiles.to_str().unwrap()),
-            "--param",
-            "bundler=/definitely/not/a/real/darkmux-bundler-xyz",
-            // Deliberately NO --param emit= — the document's own stamped
-            // path is the only thing naming a destination.
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.trim().is_empty(),
-        "with no --param emit=, the document's own stamped path must receive the payload, not stdout: {stdout}"
-    );
-    let written = fs::read_to_string(&stamped_emit_path).unwrap_or_else(|e| {
-        panic!(
-            "expected the document-stamped emit path to receive the fallback's rendered payload: {e}"
-        )
-    });
-    let v: serde_json::Value = serde_json::from_str(&written).expect("stamped emit file holds valid JSON");
-    assert_eq!(v["mode"], "degraded", "an errored graph run must still render as degraded, not silence");
-}
-
-/// (#2345 CONSIDER-3, round 2) `effective_attribution` (the fallback's own
-/// read of the merged report-step config) is DEAD CODE on the CLEAN path —
-/// `pr_review_run_document_stamped_attribution_survives_the_launcher_merge`
-/// exercises the step's own direct read of `step.config`, never this
-/// launcher-side variable, so a mutation to `effective_attribution`'s own
-/// computation left that test green. This forces the FALLBACK (the same
-/// hermetic bogus-`--bundler` error C1/CONSIDER-1 use) over a document
-/// that stamps a fixed `attribution`, with no `--param attribution=` of
-/// its own — the only path that actually reads `effective_attribution`.
-#[test]
-fn pr_review_run_errored_graph_honors_the_documents_stamped_attribution_in_the_fallback() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let profiles = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles,
-        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
-    )
-    .unwrap();
-
-    let builtin_path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates/builtin/mission-configs/review.json");
-    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&builtin_path).unwrap()).unwrap();
-    doc["id"] = serde_json::json!("review-attrib-fallback-test");
-    let report_phase = doc["phases"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|p| p["id"] == "report")
-        .expect("review.json declares a report phase");
-    let report_task = report_phase["tasks"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|t| t["id"] == "review-report-task")
-        .expect("review.json declares review-report-task");
-    let report_step = report_task["steps"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|s| s["id"] == "review-report-step")
-        .expect("review.json declares review-report-step");
-    report_step["config"] = serde_json::json!({ "attribution": "custom-fallback-attribution-marker" });
-
-    let config_dir = tmp.path().join("mission-configs");
-    fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("review-attrib-fallback-test.json"), serde_json::to_string(&doc).unwrap()).unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_HOME", tmp.path())
-        .args([
-            "mission",
-            "launch",
-            "review-attrib-fallback-test",
-            "--param",
-            &format!("worktree={}", tmp.path().to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("profiles={}", profiles.to_str().unwrap()),
-            "--param",
-            "bundler=/definitely/not/a/real/darkmux-bundler-xyz",
-            "--param",
-            "emit=-",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("custom-fallback-attribution-marker"),
-        "the document's own stamped attribution must survive the FALLBACK's config merge too: {stdout}"
-    );
-}
 
 // ─── #2124: SIGTERM mid-probe leaves a terminal record + no orphaned curl ──
 
@@ -3204,211 +2339,6 @@ fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
         survivors.is_empty(),
         "a darkmux {label} curl process is still running after the parent exited: {survivors}"
     );
-}
-
-/// (#2124) `kill <pid>` (SIGTERM) on a `mission launch review` blocked
-/// mid-probe (a real `curl` call to an endpoint that never answers) must:
-/// exit within 5s, leave a `mission close` flow record naming the signal,
-/// leave the mission `finalized` with every phase `abandoned` (never stuck
-/// `active`), and leave no `curl` process still holding the stub
-/// connection open. Reproduces the exact scenario from the issue: `kill
-/// <pid>` on a real review launch, mid-probe, previously left the mission
-/// `active` forever with the `curl` child running past the parent's death.
-#[test]
-fn mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl() {
-    let stub = HangingStubServer::start();
-
-    let home = TempDir::new().unwrap();
-    // (#661/Beat-33 flattened layout) `DARKMUX_HOME` alone puts missions at
-    // `<home>/missions` directly (`crew::loader::missions_dir` — no `crew/`
-    // nesting), but flow records do NOT follow `DARKMUX_HOME` at all
-    // (`config_access::flows_dir` resolves independently via
-    // `DARKMUX_FLOWS_DIR` > config > `~/.darkmux/flows`, and a `cargo test`
-    // build's own default is a SHARED `/tmp/darkmux-test-isolated/flows` —
-    // isolating it here avoids colliding with any other test in this same
-    // binary run). Both set explicitly so this test never depends on which
-    // default each one happens to fall back to.
-    let flows = TempDir::new().unwrap();
-    let worktree = TempDir::new().unwrap();
-    fs::create_dir_all(worktree.path().join("src")).unwrap();
-    // A one-line change INSIDE a function body — `build_bundles`'s TS
-    // extraction unit is the enclosing function, not a bare top-level
-    // `const` (a diff touching only top-level statements, like
-    // `pr_review_run_diff()` elsewhere in this file, produces ZERO
-    // bundles and short-circuits to a degenerate envelope before any
-    // probe ever dispatches — proven nothing about SIGTERM handling; this
-    // fixture is deliberately function-shaped so a real probe dispatch
-    // actually happens). The worktree file holds the POST-change content;
-    // `pr.diff` describes the same edit as a unified diff.
-    fs::write(
-        worktree.path().join("src/x.ts"),
-        "function computeB(a) {\n  const b = 2;\n  return a + b;\n}\n",
-    )
-    .unwrap();
-    let diff_path = worktree.path().join("pr.diff");
-    fs::write(
-        &diff_path,
-        "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,4 +1,4 @@\n function computeB(a) {\n-  const b = 1;\n+  const b = 2;\n   return a + b;\n }\n",
-    )
-    .unwrap();
-    let profiles_path = worktree.path().join("profiles.json");
-    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
-
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_darkmux"))
-        .env("DARKMUX_HOME", home.path())
-        .env("DARKMUX_FLOWS_DIR", flows.path())
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("worktree={}", worktree.path().to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("profiles={}", profiles_path.to_str().unwrap()),
-            // Every declared review role routed at the same hanging
-            // endpoint — the FIRST one dispatched is enough to reproduce
-            // "mid-probe", but naming all of them means this test doesn't
-            // silently stop proving anything if the probe roster changes.
-            "--param",
-            "review-probe-high=hang",
-            "--param",
-            "review-probe-mid=hang",
-            "--param",
-            "review-probe-low=hang",
-            "--param",
-            "review-judge=hang",
-            "--param",
-            "review-verify=hang",
-            // Comfortably longer than this test's own 5s reap bound — the
-            // signal must be what ends the run, not curl's own `-m`.
-            "--timeout",
-            "60",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawning darkmux mission launch review");
-    let pid = child.id();
-
-    // Wait for the precise "now it's mid-probe" signal — curl actually
-    // connecting to the stub — rather than a fixed sleep that would either
-    // race a slow CI runner (mint + bundle + crew resolution before the
-    // first probe dispatch) or waste time on a fast one. A generous bound:
-    // this is proving SIGTERM handling, not probe dispatch latency.
-    assert!(
-        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
-        "the review dispatch never reached a probe call to the stub server within 20s — \
-         something upstream of SIGTERM handling broke (mint, bundling, or crew resolution)"
-    );
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "the review launcher must still be running (blocked on the hanging probe) before SIGTERM"
-    );
-
-    let kill_status = std::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status()
-        .expect("running kill -TERM");
-    assert!(kill_status.success(), "kill -TERM itself must succeed");
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let exit_status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "mission launch review did not exit within 5s of SIGTERM (#2124 regression)"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
-    assert!(!exit_status.success(), "a signal-interrupted review must not exit 0");
-
-    // The stub server's per-connection reader must observe curl's socket
-    // closing — proof the process-group reap actually reached the child,
-    // not just that the PARENT died (an orphaned `curl` would leave this
-    // hanging until ITS OWN `-m` bound, far past this wait).
-    assert!(
-        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
-        "no `curl` connection to the stub server was ever torn down — a child process survived \
-         the parent (#2124 regression)"
-    );
-
-    // Secondary corroboration via the process table: `remote_chat_attempt`
-    // (crates/darkmux-crew/src/dispatch_internal.rs) always spawns curl as
-    // `curl -sS -m <t> -K <tmp-path>`, where `<tmp-path>` is named
-    // `darkmux-remote-<pid>-<n>.curl` — a distinctive `-f`-matchable
-    // fragment regardless of the port curl was told to hit (the URL lives
-    // INSIDE that config file, never in argv). The `<pid>` is THIS test's
-    // darkmux child — matching on the bare prefix would also see the sibling
-    // SIGTERM test's still-live curl when cargo runs them concurrently
-    // (that cross-match failed both tests together on main's coverage job).
-    // `pgrep` missing entirely (non-macOS/Linux CI image) — the socket-close
-    // proof above already covers this.
-    assert_no_surviving_remote_curl(child.id(), "review-dispatch");
-
-    // The mission itself: exactly one was minted under this isolated
-    // DARKMUX_HOME, so no id needs to be captured from the child's own
-    // output — read whichever one is there. `<home>/missions` directly
-    // (the flattened post-Beat-33 layout — `crew::loader::missions_dir`),
-    // not `<home>/crew/missions`.
-    let missions_dir = home.path().join("missions");
-    let mission_id = fs::read_dir(&missions_dir)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", missions_dir.display()))
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .next()
-        .expect("exactly one mission must have been minted");
-
-    let mission_json: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(missions_dir.join(&mission_id).join("mission.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        mission_json["status"], "finalized",
-        "an interrupted review must reach a terminal mission status, never stay active: {mission_json}"
-    );
-
-    let phases_dir = missions_dir.join(&mission_id).join("phases");
-    let mut saw_a_phase = false;
-    for entry in fs::read_dir(&phases_dir).unwrap().filter_map(|e| e.ok()) {
-        let phase_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap();
-        assert_eq!(
-            phase_json["status"], "abandoned",
-            "a signal-interrupted run must abandon its phases, never complete one: {phase_json}"
-        );
-        saw_a_phase = true;
-    }
-    assert!(saw_a_phase, "the mint must have produced at least one phase to check");
-
-    // The flow record: `mission close`, carrying the signal in its reason
-    // — the "mission close with reason: signal" vocabulary #2124 asks for
-    // (see `review_finalize_guard.rs`'s own doc for why this reuses
-    // `finalize_review_mission`'s existing `mission close`/Finalized path
-    // rather than inventing a separate `mission abort`/Aborted one — the
-    // SAME choice `crawl_launch.rs`'s `CrawlFinalizeGuard` already made for
-    // an interrupted crawl).
-    let mut found_mission_close = false;
-    for entry in fs::read_dir(flows.path()).unwrap_or_else(|e| panic!("reading {}: {e}", flows.path().display())) {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        for line in fs::read_to_string(&path).unwrap().lines() {
-            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            if record["action"] == "mission close" && record["mission_id"] == mission_id {
-                found_mission_close = true;
-                let reasoning = record["reasoning"].as_str().unwrap_or_default();
-                assert!(
-                    reasoning.to_lowercase().contains("signal"),
-                    "the mission close record's reason must name the signal: {reasoning}"
-                );
-            }
-        }
-    }
-    assert!(found_mission_close, "expected a `mission close` flow record for {mission_id}");
 }
 
 // ─── #2131: the shared LaunchFinalizeGuard, ported to crawl + generic ─────
@@ -3788,191 +2718,6 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
 // attempted. A live corpus run is maintainer-executed (see the doc comment
 // on `run_funnel_case` in `crates/darkmux-lab/src/lab/review_bench.rs`).
 
-#[test]
-fn review_bench_funnel_conflicts_with_dialectic() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["lab", "eval", "--funnel", "--dialectic"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
-}
-
-#[test]
-fn review_bench_funnel_conflicts_with_agentic_and_freeform() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["lab", "eval", "--funnel", "--agentic"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
-
-    let mut cmd2 = Command::cargo_bin("darkmux").unwrap();
-    cmd2.args(["lab", "eval", "--funnel", "--freeform"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
-}
-
-#[test]
-fn review_bench_crew_requires_funnel() {
-    // --crew named without --funnel: clap's `requires = "funnel"` fires
-    // before the command handler ever runs (no dispatch, no cases loaded).
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["lab", "eval", "--roster-profile", "review-funnel"])
-        .assert()
-        .failure()
-        .stderr(
-            predicate::str::contains("required arguments were not provided")
-                .and(predicate::str::contains("--funnel")),
-        );
-}
-
-#[test]
-fn review_bench_exec_mode_k_and_bundler_each_require_funnel() {
-    for (flag, value) in [
-        ("--exec-mode", "sequential"),
-        ("--k", "3"),
-        ("--bundler", "some-bundler"),
-    ] {
-        let mut cmd = Command::cargo_bin("darkmux").unwrap();
-        cmd.args(["lab", "eval", flag, value])
-            .assert()
-            .failure()
-            .stderr(
-                predicate::str::contains("required arguments were not provided")
-                    .and(predicate::str::contains("--funnel")),
-            );
-    }
-}
-
-#[test]
-fn review_bench_funnel_requires_workdirs() {
-    // --funnel alone (no --workdirs): reuses the same preflight
-    // --agentic/--dialectic already run, extended to include --funnel.
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["lab", "eval", "--funnel", "--roster-profile", "review-funnel"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--funnel requires --workdirs"));
-}
-
-#[test]
-fn review_bench_funnel_no_resolvable_roster_fails_preflight() {
-    // (#1426 ship-2) --funnel + --workdirs but no --roster-profile/--profile AND
-    // a registry with no default_profile: the funnel-context preflight
-    // (resolve_funnel_ctx → the role→profile resolver) fails loud before any
-    // dispatch spends a token, naming the missing roster. Uses a minimal
-    // one-case fixture so the --workdirs tree-existence check (which runs
-    // first) passes and the resourcing check is the one under test.
-    let tmp = TempDir::new().unwrap();
-    let cases_dir = tmp.path().join("cases");
-    fs::create_dir_all(&cases_dir).unwrap();
-    fs::write(
-        cases_dir.join("c1.label.json"),
-        r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
-    )
-    .unwrap();
-    fs::write(cases_dir.join("c1.diff"), "diff --git a b\n").unwrap();
-    let workdirs = tmp.path().join("workdirs");
-    fs::create_dir_all(workdirs.join("c1")).unwrap();
-    let profiles = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles,
-        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}}}"#,
-    )
-    .unwrap();
-
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args([
-        "lab",
-        "eval",
-        "--cases-dir",
-        cases_dir.to_str().unwrap(),
-        "--funnel",
-        "--profiles-file",
-        profiles.to_str().unwrap(),
-        "--workdirs",
-        workdirs.to_str().unwrap(),
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains("roster profile"));
-}
-
-#[test]
-fn review_bench_funnel_k_zero_rejected_at_cli_layer() {
-    // --k 0 would otherwise slip past resolve_crew's k>=1 guard via the
-    // post-resolution override (resolve_funnel_ctx overwrites every
-    // review-probe staffing's k AFTER resolve_crew validated the crew's OWN
-    // k), guaranteeing a degenerate run (zero probe draws). The clap
-    // `value_parser` range rejects it before the command handler ever runs.
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args([
-        "lab",
-        "eval",
-        "--funnel",
-        "--roster-profile",
-        "review-funnel",
-        "--k",
-        "0",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains("not in 1.."));
-}
-
-#[test]
-fn review_bench_funnel_roster_local_model_without_n_ctx_fails_loud() {
-    // (#1426 ship-2) The registry LOADS fine, but the named ROSTER profile's
-    // local model omits `n_ctx` (#1282) — a LOCAL review seat is loaded at its
-    // declared context, so the resourcing resolver fails loud at that seat,
-    // BEFORE the per-case table header prints, naming the seat and the field.
-    let tmp = TempDir::new().unwrap();
-    let cases_dir = tmp.path().join("cases");
-    fs::create_dir_all(&cases_dir).unwrap();
-    fs::write(
-        cases_dir.join("c1.label.json"),
-        r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
-    )
-    .unwrap();
-    fs::write(cases_dir.join("c1.diff"), "diff --git a b\n").unwrap();
-    let workdirs = tmp.path().join("workdirs");
-    fs::create_dir_all(workdirs.join("c1")).unwrap();
-
-    let profiles_path = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles_path,
-        r#"{
-            "profiles": {
-                "ctxless": {
-                    "models": [{"id": "local-b"}]
-                }
-            },
-            "default_profile": "ctxless"
-        }"#,
-    )
-    .unwrap();
-
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "lab",
-            "eval",
-            "--cases-dir",
-            cases_dir.to_str().unwrap(),
-            "--funnel",
-            "--workdirs",
-            workdirs.to_str().unwrap(),
-            "--roster-profile",
-            "ctxless",
-            "--profiles-file",
-            profiles_path.to_str().unwrap(),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("n_ctx").and(predicate::str::contains("review-probe")))
-        .stdout(predicate::str::contains("outcome").not());
-}
-
 // ─── review-bench --funnel end-to-end, offline (#1222 Phase B coverage) ───
 //
 // A funnel run whose bundler produces ZERO bundles short-circuits to a
@@ -3982,467 +2727,6 @@ fn review_bench_funnel_roster_local_model_without_n_ctx_fails_loud() {
 // tests exercise the real preflight (registry load + crew resolution +
 // role-prompt resolution), the per-case funnel branch, the console line,
 // and the scores.json/funnels.json artifact pair.
-
-/// (#1475) A profiles registry whose `review-funnel` profile every review seat
-/// is pinned to for the funnel bench (via the per-run role→profile override);
-/// `--roster-profile review-funnel` names it. The resolver staffs
-/// probe/judge/verify from its default model; no LMStudio involved.
-fn funnel_registry_json() -> &'static str {
-    r#"{
-        "profiles": {
-            "review-funnel": {
-                "description": "review roster",
-                "models": [
-                    {"id": "model-a", "n_ctx": 32000}
-                ]
-            }
-        },
-        "default_profile": "review-funnel"
-    }"#
-}
-
-/// One-case corpus whose diff touches only a non-TS file — the built-in
-/// bundler finds zero bundles, so the funnel resolves degenerately with
-/// zero dispatches.
-fn write_funnel_fixture(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    let cases_dir = tmp.path().join("cases");
-    fs::create_dir_all(&cases_dir).unwrap();
-    fs::write(
-        cases_dir.join("c1.label.json"),
-        r#"{"kind":"clean","intent_title":"docs touch-up","expect_verdict":"pass"}"#,
-    )
-    .unwrap();
-    fs::write(
-        cases_dir.join("c1.diff"),
-        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Title\n+New line\n",
-    )
-    .unwrap();
-    let workdirs = tmp.path().join("workdirs");
-    fs::create_dir_all(workdirs.join("c1")).unwrap();
-    let registry = tmp.path().join("profiles.json");
-    fs::write(&registry, funnel_registry_json()).unwrap();
-    (cases_dir, workdirs, registry)
-}
-
-#[test]
-fn review_bench_funnel_nonexistent_roster_fails_preflight_listing_available() {
-    // (#1475) --roster-profile names a profile the registry doesn't have: the
-    // bench's roster pre-check fails loud BEFORE any dispatch, and the error
-    // names both the missing profile and the profiles that DO exist (get_profile's
-    // "Available:" listing) — the operator never has to open profiles.json.
-    let tmp = TempDir::new().unwrap();
-    let (cases_dir, workdirs, registry) = write_funnel_fixture(&tmp);
-
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args([
-        "lab",
-        "eval",
-        "--cases-dir",
-        cases_dir.to_str().unwrap(),
-        "--funnel",
-        "--workdirs",
-        workdirs.to_str().unwrap(),
-        "--roster-profile",
-        "ghost",
-        "--profiles-file",
-        registry.to_str().unwrap(),
-    ])
-    .assert()
-    .failure()
-    .stderr(
-        predicate::str::contains("ghost")
-            .and(predicate::str::contains("not found"))
-            .and(predicate::str::contains("review-funnel")),
-    );
-}
-
-#[test]
-fn review_bench_funnel_degenerate_run_completes_offline_with_console_line_and_artifact_pair() {
-    // The full --funnel path, end-to-end, zero dispatches: preflight
-    // (registry + crew + embedded review-probe.md/review-judge.md role
-    // prompts) → per-case run_funnel_case → built-in bundler finds no TS
-    // bundles → degenerate envelope → scored degenerate (never a clean
-    // pass) → per-case funnel console line → scores.json + funnels.json
-    // both written.
-    let tmp = TempDir::new().unwrap();
-    let (cases_dir, workdirs, registry) = write_funnel_fixture(&tmp);
-    let scores_out = tmp.path().join("out").join("scores.json");
-
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args([
-        "lab",
-        "eval",
-        "--cases-dir",
-        cases_dir.to_str().unwrap(),
-        "--funnel",
-        "--workdirs",
-        workdirs.to_str().unwrap(),
-        "--roster-profile",
-        "review-funnel",
-        "--exec-mode",
-        "sequential",
-        "--profiles-file",
-        registry.to_str().unwrap(),
-        "--scores-out",
-        scores_out.to_str().unwrap(),
-    ])
-    .assert()
-    .success()
-    // The per-case funnel console line (#1222 packet 7's funnel branch in
-    // run_review_bench) — a degenerate case still reports its shape.
-    .stdout(
-        predicate::str::contains("bundles 0")
-            .and(predicate::str::contains("flags 0"))
-            .and(predicate::str::contains("DEGENERATE")),
-    )
-    .stderr(predicate::str::contains("mode=funnel").and(predicate::str::contains("funnels:")));
-
-    // scores.json: funnel provenance extras (crew / exec_mode).
-    let scores: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&scores_out).unwrap()).unwrap();
-    assert_eq!(scores["mode"], serde_json::json!("funnel"));
-    assert_eq!(scores["crew"], serde_json::json!("review-funnel"));
-    assert_eq!(scores["exec_mode"], serde_json::json!("sequential"));
-    // (#1512, #1513 review M1) The `"k"` extras field is RETIRED — draw
-    // multiplication no longer exists, so there is no value left to snapshot.
-    assert!(scores.get("k").is_none(), "the retired \"k\" field must not reappear in the artifact");
-
-    // funnels.json: one envelope, degenerate reason set, zero dispatches.
-    let funnels: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(scores_out.with_file_name("funnels.json")).unwrap())
-            .unwrap();
-    let env = &funnels[0];
-    assert_eq!(env["case_id"], serde_json::json!("c1"));
-    assert_eq!(env["crew"], serde_json::json!("review-funnel"));
-    assert_eq!(env["mode"], serde_json::json!("sequential"));
-    assert_eq!(env["bundles"], serde_json::json!(0));
-    assert!(
-        env["degenerate"].as_str().unwrap().contains("no bundles"),
-        "the zero-bundle reason must be recorded on the envelope: {}",
-        env["degenerate"]
-    );
-    assert_eq!(env["members"], serde_json::json!([]), "zero dispatches — no member rows");
-}
-
-#[cfg(unix)]
-#[test]
-fn review_bench_funnel_bundler_flag_reaches_external_bundles_and_fails_loud_per_case() {
-    // --bundler plumbing, CLI → run_funnel_case → bundle::external_bundles:
-    // a stub bundler emitting an empty bundle set trips external_bundles'
-    // own loud contract check, wrapped with the case id. The failure happens
-    // BEFORE any probe/judge dispatch, so this too runs fully offline. The
-    // diff names a .ts file so the failure is attributable to the external
-    // bundler, not to the built-in bundler's TS filter.
-    use std::os::unix::fs::PermissionsExt;
-    let tmp = TempDir::new().unwrap();
-    let (cases_dir, workdirs, registry) = write_funnel_fixture(&tmp);
-    fs::write(
-        cases_dir.join("c1.diff"),
-        "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1 +1,2 @@\n foo\n+bar\n",
-    )
-    .unwrap();
-    let bundler = tmp.path().join("empty-bundler.sh");
-    fs::write(&bundler, "#!/bin/sh\necho '{\"bundles\":[]}'\n").unwrap();
-    let mut perms = fs::metadata(&bundler).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&bundler, perms).unwrap();
-
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args([
-        "lab",
-        "eval",
-        "--cases-dir",
-        cases_dir.to_str().unwrap(),
-        "--funnel",
-        "--workdirs",
-        workdirs.to_str().unwrap(),
-        "--roster-profile",
-        "review-funnel",
-        "--exec-mode",
-        "sequential",
-        "--profiles-file",
-        registry.to_str().unwrap(),
-        "--bundler",
-        bundler.to_str().unwrap(),
-    ])
-    .assert()
-    .failure()
-    .stderr(
-        predicate::str::contains("funneling case c1")
-            .and(predicate::str::contains("external bundler"))
-            .and(predicate::str::contains("empty bundle set")),
-    );
-}
-
-/// `--envelope-out` pointed at a path whose parent directory doesn't exist
-/// must fail loudly (`std::fs::write` errors, wrapped by `.with_context`)
-/// — not silently swallow the write. `fn main() -> Result<()>` propagating
-/// an `Err` up through `anyhow` prints the error chain to stderr and exits
-/// **1** (characterized here, not previously asserted anywhere).
-#[test]
-fn pr_review_run_envelope_out_unwritable_dir_fails_loudly() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let envelope_path = tmp.path().join("funnel.json");
-    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
-    let bad_out = tmp.path().join("no-such-dir").join("out.json");
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("envelope_out={}", bad_out.to_str().unwrap()),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "an unwritable envelope_out dir must exit 1, stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("writing envelope_out"), "{stderr}");
-}
-
-/// A degenerate envelope routed through `--from-envelope` still exits
-/// **0** — `synthesize_funnel`'s `mode: "degraded"` is carried in the JSON
-/// payload, not surfaced as a process failure (that distinction is the
-/// posting workflow's job to read, not the CLI's job to signal via exit
-/// code). Characterizes the previously-unasserted exit-code half of the
-/// degraded contract.
-#[test]
-fn pr_review_run_from_envelope_degenerate_exits_zero_with_degraded_mode() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let envelope_path = tmp.path().join("degenerate.json");
-    fs::write(
-        &envelope_path,
-        r#"{
-            "case_id": "test-case", "crew": "test-crew", "mode": "sequential",
-            "members": [], "steps": [], "bundles": 0, "raw_flags": 0, "deduped_flags": 0,
-            "flags": [], "judged": [], "confirmed": 0, "needs_check": 0, "archived": 0,
-            "degenerate": "zero flags from all probe draws",
-            "fingerprint": {}
-        }"#,
-    )
-    .unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            "emit=-",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "a degraded outcome is still a successful *run* — stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v["mode"], "degraded");
-}
-
-/// A malformed `--charges-file` (re-judge without re-probing) must fail
-/// loudly, named, BEFORE any model dispatch — the parse happens right
-/// after bundling and before the judge's `chat` closure is ever called, so
-/// this is exercisable with a stub `--bundler` and no live LMStudio.
-#[cfg(unix)]
-#[test]
-fn pr_review_run_malformed_charges_file_errors_loudly() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-
-    let profiles_path = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles_path,
-        r#"{
-            "profiles": { "fast": { "models": [{"id": "test-model", "n_ctx": 8000}] } },
-            "default_profile": "fast"
-        }"#,
-    )
-    .unwrap();
-
-    // A stub external bundler emitting exactly one valid `Bundle` — cheap
-    // to satisfy `parse_bundle_set`'s non-empty-set requirement without
-    // needing a real checkout matching the diff (`slice_code` tolerates an
-    // unreadable/missing path; it just marks the excerpt unreadable).
-    let bundler_path = tmp.path().join("fake-bundler.sh");
-    fs::write(
-        &bundler_path,
-        "#!/bin/sh\necho '{\"bundles\":[{\"id\":\"computeEnd@src/x.ts\",\"code\":[{\"path\":\"src/x.ts\",\"start\":1,\"end\":2}],\"facts\":[],\"fact_family\":\"unscoped\"}]}'\n",
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&bundler_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&bundler_path, perms).unwrap();
-    }
-
-    let charges_path = tmp.path().join("charges.json");
-    fs::write(&charges_path, "not valid json{{{").unwrap();
-
-    let worktree_dir = tmp.path().join("wt");
-    fs::create_dir(&worktree_dir).unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("worktree={}", worktree_dir.to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            "profile=fast",
-            "--param",
-            &format!("profiles={}", profiles_path.to_str().unwrap()),
-            "--param",
-            &format!("bundler={}", bundler_path.to_str().unwrap()),
-            "--param",
-            &format!("charges_file={}", charges_path.to_str().unwrap()),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "malformed charges_file must exit loud, stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("charges_file"), "{stderr}");
-    assert!(stderr.contains("flag list"), "{stderr}");
-}
-
-/// (#2345 MUST FIX, round 2) `--charges-file` mints NO graph — before this
-/// fix, nothing ever rendered this path's envelope: `launch`'s own tail
-/// used to render + emit unconditionally after every `run_dispatch`
-/// (pre-#2310 P3); P3 moved the render into `review-report-step`, a step
-/// this path never reaches (it mints no Mission and runs no graph at all).
-/// Production symptom: `darkmux mission launch review --param
-/// charges_file=<flags> --param emit=-` exited 0 with EMPTY stdout. An
-/// EMPTY flags array makes `run_judge_only` short-circuit before any
-/// dispatch (`env.degenerate = Some("--charges-file carried zero
-/// flags")`), so this needs no LMStudio; an empty diff/worktree keeps the
-/// eager pre-dispatch bundling pass hermetic too (the built-in bundler
-/// yields zero bundles for an empty diff, no `--bundler` subprocess
-/// needed).
-#[test]
-fn pr_review_run_charges_file_renders_a_payload_to_stdout() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("empty.diff");
-    fs::write(&diff_path, "").unwrap();
-    let profiles_path = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles_path,
-        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}},"default_profile":"fast"}"#,
-    )
-    .unwrap();
-    let charges_path = tmp.path().join("charges.json");
-    fs::write(&charges_path, "[]").unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_HOME", tmp.path())
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("worktree={}", tmp.path().to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            &format!("profiles={}", profiles_path.to_str().unwrap()),
-            "--param",
-            &format!("charges_file={}", charges_path.to_str().unwrap()),
-            "--param",
-            "emit=-",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("stdout was not JSON — the charges_file path rendered nothing ({e}): {stdout}")
-    });
-    assert!(v["mode"].is_string(), "expected a rendered {{mode, review, comment}} payload: {stdout}");
-
-    // Bonus: the (#2345 I2-style) synthesis/done liveness bracket applies
-    // to this path too now, not just the graph path.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_in_order(&stderr, &["synthesis", "done"], "stderr");
-}
-
-/// `mission_launch_review::launch`'s `from_envelope` ignored-input warning
-/// (src/mission_launch_review.rs) surfaces `bundler` as a dispatch-shaping
-/// input with nothing to shape when synthesis-only (`k` follows the same
-/// `ignored` Vec and warning path) — operator sovereignty: surface, never
-/// silently ignore.
-#[test]
-fn pr_review_run_bundler_should_warn_ignored_with_from_envelope() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let envelope_path = tmp.path().join("funnel.json");
-    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--param",
-            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
-            "--param",
-            &format!("diff_file={}", diff_path.to_str().unwrap()),
-            "--param",
-            "bundler=/nonexistent-bundler-binary",
-            "--param",
-            "emit=-",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("bundler"),
-        "expected an ignored-flag warning naming `bundler`: {stderr}"
-    );
-}
 
 // ── `darkmux radio` (#1698 Packet A) ─────────────────────────────────────
 //
@@ -5002,7 +3286,7 @@ fn crawl_dry_run_prunes_the_rules_the_launch_did_not_select() {
     assert_ne!(all_out, one_out, "`--param rules=` must change the minted graph");
 }
 
-/// (#2310 P4c review round 2, item (f) — proven) `review-v2.json`'s
+/// (#2310 P4c review round 2, item (f) — proven) `review.json`'s
 /// `bundler` input was documented as "accepted and ignored" with no actual
 /// warning — a silent no-op that would leave an operator carrying the
 /// funnel's `bundler=` param over from the frozen `review` config with no
@@ -5011,7 +3295,7 @@ fn crawl_dry_run_prunes_the_rules_the_launch_did_not_select() {
 /// `--dry-run` path (before any real dispatch), so the signal is visible
 /// with zero cost.
 #[test]
-fn review_v2_dry_run_warns_when_bundler_is_passed() {
+fn review_dry_run_warns_when_bundler_is_passed() {
     let workdir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let workspace_root = workdir.path().join("tree");
@@ -5020,7 +3304,7 @@ fn review_v2_dry_run_warns_when_bundler_is_passed() {
     fs::write(
         &spec_path,
         serde_json::json!({
-            "name": "review-v2-fixture",
+            "name": "review-fixture",
             "sources": [{"id": "app", "path": workspace_root.to_string_lossy(), "ref": "main"}]
         })
         .to_string(),
@@ -5034,7 +3318,7 @@ fn review_v2_dry_run_warns_when_bundler_is_passed() {
         .args([
             "mission",
             "launch",
-            "review-v2",
+            "review",
             "--dry-run",
             "--param",
             &format!("workspace={}", spec_path.display()),
@@ -5045,12 +3329,12 @@ fn review_v2_dry_run_warns_when_bundler_is_passed() {
         ])
         .env("DARKMUX_HOME", home.path())
         .output()
-        .expect("mission launch review-v2 --dry-run runs");
+        .expect("mission launch review --dry-run runs");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("bundler") && stderr.contains("ignored"),
-        "a `bundler` param on review-v2 must warn that it is ignored: {stderr}"
+        "a `bundler` param on review must warn that it is ignored: {stderr}"
     );
 
     // Negative leg: no `bundler` param, no warning.
@@ -5059,7 +3343,7 @@ fn review_v2_dry_run_warns_when_bundler_is_passed() {
         .args([
             "mission",
             "launch",
-            "review-v2",
+            "review",
             "--dry-run",
             "--param",
             &format!("workspace={}", spec_path.display()),
@@ -5068,7 +3352,7 @@ fn review_v2_dry_run_warns_when_bundler_is_passed() {
         ])
         .env("DARKMUX_HOME", home.path())
         .output()
-        .expect("mission launch review-v2 --dry-run runs");
+        .expect("mission launch review --dry-run runs");
     assert!(quiet.status.success(), "stderr: {}", String::from_utf8_lossy(&quiet.stderr));
     let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
     assert!(
@@ -5078,7 +3362,7 @@ fn review_v2_dry_run_warns_when_bundler_is_passed() {
 }
 
 /// (#2310 P4c-2 item 4 — proven structurally) A SYNTHETIC config (not
-/// `review-v2`, not any name the launcher's source recognizes) proves the
+/// `review`, not any name the launcher's source recognizes) proves the
 /// `"ignored": true` input-declaration flag is honored by ANY config, not
 /// detected by matching `config.id`. Both legs: an ignored input supplied
 /// warns naming the input and reason; a LIVE (non-ignored) input supplied
@@ -5388,18 +3672,18 @@ fn an_embedded_placeholder_naming_an_unset_optional_input_is_refused_before_any_
 }
 
 /// (#2310 P4c-2 item 0 — the P4c-1 BLOCKER, proven) A REAL (non-dry-run)
-/// `review-v2` launch — stubbed before dispatch via `DARKMUX_LMS_BIN=/usr/
+/// `review` launch — stubbed before dispatch via `DARKMUX_LMS_BIN=/usr/
 /// bin/true`, so this proves MINTING, not model behavior — must leave no
 /// literal `{{` in ANY minted step's config, in both the statically
 /// declared `plan-<rule>-step`s (`{{workspace}}`/`{{diff_file}}`) and the
 /// GROWN `unit-<rule>-step`s (`{{intent_file}}`, wired into `grow.config`
 /// by this same packet). Before this packet, `crawl_plan_step_overrides`
 /// only ever substituted `{{workspace}}`, and only for `kind ==
-/// "crawl.plan"` — `review-v2.json`'s `plan.sites` steps got NO
+/// "crawl.plan"` — `review.json`'s `plan.sites` steps got NO
 /// substitution on a real launch, so this is the fix's own regression
 /// test, not incidental coverage.
 #[test]
-fn review_v2_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
+fn review_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
     let workdir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let app = workdir.path().join("app");
@@ -5431,7 +3715,7 @@ fn review_v2_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
     fs::write(
         &spec_path,
         serde_json::json!({
-            "name": "review-v2-real-launch",
+            "name": "review-real-launch",
             "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}]
         })
         .to_string(),
@@ -5449,7 +3733,7 @@ fn review_v2_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
         .args([
             "mission",
             "launch",
-            "review-v2",
+            "review",
             "--param",
             &format!("workspace={}", spec_path.display()),
             "--param",
@@ -5460,7 +3744,7 @@ fn review_v2_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
             &format!("intent_file={}", intent_path.display()),
         ])
         .output()
-        .expect("mission launch review-v2 runs");
+        .expect("mission launch review runs");
     let combined =
         format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
@@ -5523,7 +3807,7 @@ fn review_v2_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
     assert!(braces.is_empty(), "literal `{{{{` survived minting:\n{}", braces.join("\n"));
 }
 
-/// (#2310 P4c-2b self-QA) A REAL (non-dry-run) `review-v2` launch — stubbed
+/// (#2310 P4c-2b self-QA) A REAL (non-dry-run) `review` launch — stubbed
 /// before dispatch via `DARKMUX_LMS_BIN=/usr/bin/true`, same discipline the
 /// sibling brace test above uses — proving the `deliver` phase this packet
 /// adds actually MINTS and RUNS to completion end to end through the real
@@ -5536,10 +3820,10 @@ fn review_v2_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
 /// WIRING (the phase existing, running, and writing its file) and about
 /// the mode being HONEST about the error, not about model behavior;
 /// `crates/darkmux-lab/src/crawl/plan.rs`'s own
-/// `review_v2_fixture_plans_every_rule_and_delivers_one_comment_per_form`
+/// `review_fixture_plans_every_rule_and_delivers_one_comment_per_form`
 /// unit test is what proves the full RENDER with real (stubbed) records.
 #[test]
-fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
+fn review_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     let workdir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
@@ -5563,7 +3847,7 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     fs::write(
         &spec_path,
         serde_json::json!({
-            "name": "review-v2-deliver-launch",
+            "name": "review-deliver-launch",
             "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}]
         })
         .to_string(),
@@ -5581,7 +3865,7 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
         .args([
             "mission",
             "launch",
-            "review-v2",
+            "review",
             "--param",
             &format!("workspace={}", spec_path.display()),
             "--param",
@@ -5591,10 +3875,10 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
             "--param",
             &format!("emit={}", emit_path.display()),
             "--param",
-            "attribution=darkmux review-v2 self-QA proof",
+            "attribution=darkmux review self-QA proof",
         ])
         .output()
-        .expect("mission launch review-v2 runs");
+        .expect("mission launch review runs");
     let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
     let mission_dir = one_mission_dir(&home);
@@ -5631,7 +3915,7 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
                 );
                 assert_eq!(
                     step["config"]["attribution"],
-                    serde_json::json!("darkmux review-v2 self-QA proof"),
+                    serde_json::json!("darkmux review self-QA proof"),
                     "the deliver step's `{{{{attribution}}}}` must resolve too: {step}"
                 );
             }
@@ -5654,14 +3938,14 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     let body = payload["review"]["body"].as_str().unwrap();
     assert!(body.contains("Errored:") && body.contains("unit-swallowed-error"), "{payload}");
 
-    // (#2310 fix-loop C2 / C2-4) `review-v2.json` declares
+    // (#2310 fix-loop C2 / C2-4) `review.json` declares
     // `outcome_from: "deliver"`, which is what gives the
     // exit-1-on-delivery-failure rule a production subscriber (the rule is
     // scoped to an EXPLICIT declaration, never the positional guess).
     // THIS run is the other side of that pair: the units errored, so the
     // run is `Degraded` — but the DELIVERY itself succeeded, and a
     // partially-constrained run that still shipped its review exits 0.
-    // (`review_v2_real_launch_exits_non_zero_when_the_deliver_step_errors`
+    // (`review_real_launch_exits_non_zero_when_the_deliver_step_errors`
     // is the failing half.)
     assert_eq!(out.status.code(), Some(0), "{combined}");
     let close = flow_actions(&flows)
@@ -5709,7 +3993,7 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
 /// does not exist makes `deliver.github_review`'s own write fail, which is
 /// the narrowest way to fail exactly that step.
 #[test]
-fn review_v2_real_launch_exits_non_zero_when_the_deliver_step_errors() {
+fn review_real_launch_exits_non_zero_when_the_deliver_step_errors() {
     let workdir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
@@ -5718,7 +4002,7 @@ fn review_v2_real_launch_exits_non_zero_when_the_deliver_step_errors() {
     fs::write(
         &spec_path,
         serde_json::json!({
-            "name": "review-v2-deliver-error",
+            "name": "review-deliver-error",
             "sources": [{"id": "app", "path": missing_source.to_string_lossy(), "ref": "main"}]
         })
         .to_string(),
@@ -5741,7 +4025,7 @@ fn review_v2_real_launch_exits_non_zero_when_the_deliver_step_errors() {
         .args([
             "mission",
             "launch",
-            "review-v2",
+            "review",
             "--param",
             &format!("workspace={}", spec_path.display()),
             "--param",
@@ -5752,7 +4036,7 @@ fn review_v2_real_launch_exits_non_zero_when_the_deliver_step_errors() {
             &format!("emit={}", emit_path.display()),
         ])
         .output()
-        .expect("mission launch review-v2 runs");
+        .expect("mission launch review runs");
     let combined =
         format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
@@ -5792,7 +4076,7 @@ fn review_v2_real_launch_exits_non_zero_when_the_deliver_step_errors() {
 /// `not_attempted`, and `mode` is `"degraded"` (MUST FIX D) since the
 /// plan step itself errored.
 #[test]
-fn review_v2_real_launch_survives_a_plan_phase_error_and_still_delivers() {
+fn review_real_launch_survives_a_plan_phase_error_and_still_delivers() {
     let workdir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
@@ -5804,7 +4088,7 @@ fn review_v2_real_launch_survives_a_plan_phase_error_and_still_delivers() {
     fs::write(
         &spec_path,
         serde_json::json!({
-            "name": "review-v2-plan-error-launch",
+            "name": "review-plan-error-launch",
             "sources": [{"id": "app", "path": missing_source.to_string_lossy(), "ref": "main"}]
         })
         .to_string(),
@@ -5829,7 +4113,7 @@ fn review_v2_real_launch_survives_a_plan_phase_error_and_still_delivers() {
         .args([
             "mission",
             "launch",
-            "review-v2",
+            "review",
             "--param",
             &format!("workspace={}", spec_path.display()),
             "--param",
@@ -5840,7 +4124,7 @@ fn review_v2_real_launch_survives_a_plan_phase_error_and_still_delivers() {
             &format!("emit={}", emit_path.display()),
         ])
         .output()
-        .expect("mission launch review-v2 runs");
+        .expect("mission launch review runs");
     let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
     // MUST FIX C's own claim: the launch does NOT abort — `deliver` still
@@ -7262,7 +5546,7 @@ fn mission_launch_fails_loudly_when_the_producer_output_is_not_a_json_path() {
 // C1/C4) reproduced its end state from, as a fixture. Three phases, a
 // deliberate failure in the first, and dependents in the SECOND that reach
 // back across the phase boundary into it — the shape every built-in config
-// (`review-v2.json`, `crawl.json`) actually has, and the one the per-phase
+// (`review.json`, `crawl.json`) actually has, and the one the per-phase
 // scheduler split (#2300) broke. Everything is `procedural.shell` /
 // `procedural.noop`: no model, no container, no network.
 //
@@ -7285,7 +5569,7 @@ fn fail_probe_fixture(deliver_command: &str) -> (TempDir, TempDir) {
 }
 
 /// `deliver_extra` is spliced into p3's `t-deliver` object — the
-/// review-v2 shape is `"depends_on": [...], "run_on": ["complete","error"],`
+/// review shape is `"depends_on": [...], "run_on": ["complete","error"],`
 /// naming a task in an EARLIER phase.
 fn fail_probe_fixture_with(deliver_command: &str, deliver_extra: &str) -> (TempDir, TempDir) {
     let home = TempDir::new().unwrap();
@@ -7851,7 +6135,7 @@ fn fail_probe_errored_delivery_task_exits_non_zero() {
     );
 }
 
-/// (#2310 fix-loop C1 / S4-2) The review-v2 / crawl shape specifically: a
+/// (#2310 fix-loop C1 / S4-2) The review / crawl shape specifically: a
 /// DELIVERY task in the last phase whose `depends_on` reaches back into an
 /// earlier phase (`deliver` ← `create-mod` / `records-gather`) and which
 /// declares `run_on: ["complete","error"]` so it survives an upstream
@@ -8020,11 +6304,11 @@ fn clean_generic_run_leaves_no_non_terminal_step_behind() {
 /// four of four kits that applied raw.
 ///
 /// (#2310 P4e) This test used to assert the message was byte-identical in
-/// `crawl.json` and `review-v2.json`. P4e made review's create-mods task a
+/// `crawl.json` and `review.json`. P4e made review's create-mods task a
 /// bounded WAIT with no local seat and no message at all, so for one packet
 /// the message was `crawl.json`'s alone.
 ///
-/// (#2310 P4f) It is SHARED again, by a different task: review-v2 now also
+/// (#2310 P4f) It is SHARED again, by a different task: review now also
 /// ships `create-mod-dispatch`, off by default, which staffs the same seat
 /// with a `coder` on a HOSTED ENDPOINT profile for the unattended runner.
 /// That template does read a message, and it must be the same one, because
@@ -8065,26 +6349,26 @@ fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
     // `create-mod-dispatch` template's — the endpoint seat. The WAIT
     // template must still carry none.
     let mut review =
-        create_mod_messages(include_str!("../templates/builtin/mission-configs/review-v2.json"));
+        create_mod_messages(include_str!("../templates/builtin/mission-configs/review.json"));
     assert_eq!(
         review.len(),
         1,
-        "exactly one create-mod message in review-v2.json — the `create-mod-dispatch` template's; the \
+        "exactly one create-mod message in review.json — the `create-mod-dispatch` template's; the \
          attended `create-mod` template WAITS for a frontier mod and must never grow a message of its \
          own: {review:?}"
     );
     let review = review.remove(0);
     assert_eq!(
         review, crawl,
-        "the create-mod message must be BYTE-IDENTICAL in crawl.json and review-v2.json — same job, \
+        "the create-mod message must be BYTE-IDENTICAL in crawl.json and review.json — same job, \
          same specification of the kit `mods.gate` has to `git apply`"
     );
     // And it must hang off `create-mod-dispatch`, not off the wait
     // template: the message reaching the wrong task would pass the
     // byte-identity assertion above while meaning the opposite thing.
     let doc: serde_json::Value =
-        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
-            .expect("review-v2.json parses");
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review.json"))
+            .expect("review.json parses");
     let tasks = doc["phases"]
         .as_array()
         .unwrap()
@@ -8129,12 +6413,12 @@ fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
 /// the undeclared-placeholder check nor the embedded-optional warning has
 /// anything to say about it).
 #[test]
-fn review_v2_ships_both_mod_seat_templates_and_validates_clean() {
+fn review_ships_both_mod_seat_templates_and_validates_clean() {
     let cfg: darkmux_crew::mission_config::MissionConfig =
-        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
-            .expect("review-v2.json parses");
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review.json"))
+            .expect("review.json parses");
     let findings = cfg.validate(&[]);
-    assert!(findings.is_empty(), "review-v2 as shipped must validate clean: {findings:?}");
+    assert!(findings.is_empty(), "review as shipped must validate clean: {findings:?}");
 
     // Defaults: the wait template is live, the endpoint template is not.
     let tasks: Vec<_> = cfg
@@ -8183,8 +6467,8 @@ fn review_v2_ships_both_mod_seat_templates_and_validates_clean() {
 #[test]
 fn enabling_both_mod_seat_templates_is_a_validate_error_naming_them() {
     let mut doc: serde_json::Value =
-        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
-            .expect("review-v2.json parses");
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review.json"))
+            .expect("review.json parses");
     let phase = doc["phases"]
         .as_array_mut()
         .unwrap()
@@ -8213,7 +6497,7 @@ fn enabling_both_mod_seat_templates_is_a_validate_error_naming_them() {
 }
 
 /// The shared fixture for the endpoint-seat tests: a `DARKMUX_HOME` holding
-/// a user-tier `review-v2.json` with the two `enabled` fields flipped
+/// a user-tier `review.json` with the two `enabled` fields flipped
 /// (exactly how a runner opts in), a workspace spec, an empty diff, and a
 /// profile registry defining `grok-endpoint`.
 ///
@@ -8240,7 +6524,7 @@ fn endpoint_seat_fixture() -> EndpointSeatFixture {
     fs::write(
         &spec_path,
         serde_json::json!({
-            "name": "review-v2-fixture",
+            "name": "review-fixture",
             "sources": [{"id": "app", "path": workspace_root.to_string_lossy(), "ref": "main"}]
         })
         .to_string(),
@@ -8272,8 +6556,8 @@ fn endpoint_seat_fixture() -> EndpointSeatFixture {
     // The built-in document, copied to the user tier with TWO fields
     // flipped — the whole opt-in.
     let mut doc: serde_json::Value =
-        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
-            .expect("review-v2.json parses");
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review.json"))
+            .expect("review.json parses");
     {
         let phase = doc["phases"]
             .as_array_mut()
@@ -8287,7 +6571,7 @@ fn endpoint_seat_fixture() -> EndpointSeatFixture {
     }
     let config_dir = home.path().join("mission-configs");
     fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("review-v2.json"), doc.to_string()).unwrap();
+    fs::write(config_dir.join("review.json"), doc.to_string()).unwrap();
 
     EndpointSeatFixture { _workdir: workdir, home, spec_path, diff_path, profiles_path }
 }
@@ -8298,7 +6582,7 @@ fn endpoint_seat_dry_run(fx: &EndpointSeatFixture, seat: &str) -> std::process::
         .args([
             "mission",
             "launch",
-            "review-v2",
+            "review",
             "--dry-run",
             "--param",
             &format!("workspace={}", fx.spec_path.display()),
@@ -8312,7 +6596,7 @@ fn endpoint_seat_dry_run(fx: &EndpointSeatFixture, seat: &str) -> std::process::
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .env("DARKMUX_PROFILES", &fx.profiles_path)
         .output()
-        .expect("mission launch review-v2 --dry-run runs")
+        .expect("mission launch review --dry-run runs")
 }
 
 /// A user-tier copy with the two `enabled` fields flipped — exactly how a
@@ -8320,7 +6604,7 @@ fn endpoint_seat_dry_run(fx: &EndpointSeatFixture, seat: &str) -> std::process::
 /// dry-run graph is where the operator sees which seat is live: the other
 /// template is pruned at mint, never drawn gray.
 #[test]
-fn review_v2_dry_run_shows_the_endpoint_seat_when_a_user_tier_copy_enables_it() {
+fn review_dry_run_shows_the_endpoint_seat_when_a_user_tier_copy_enables_it() {
     let fx = endpoint_seat_fixture();
     let out = endpoint_seat_dry_run(&fx, "grok-endpoint");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -8398,10 +6682,10 @@ fn a_mod_seat_profile_naming_a_defined_profile_proceeds() {
     );
 }
 
-// ─── #2310 P4e: review-v2's create-mods waits for a frontier mod ────────
+// ─── #2310 P4e: review's create-mods waits for a frontier mod ────────
 //
 // The seat that writes a mod moved off the local tier (see the config's own
-// `create-mods` phase description). What ships in `review-v2.json` is
+// `create-mods` phase description). What ships in `review.json` is
 // therefore not a coder dispatch but a shell command, and a shell command in
 // a JSON document is exactly the kind of artifact that rots silently. These
 // tests execute the SHIPPED BYTES: `create_mod_wait_command` pulls the
@@ -8415,8 +6699,8 @@ fn a_mod_seat_profile_naming_a_defined_profile_proceeds() {
 /// them.
 fn create_mod_wait_command(finding_key: &str, bound: &str) -> String {
     let doc: serde_json::Value =
-        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
-            .expect("review-v2.json parses");
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review.json"))
+            .expect("review.json parses");
     let phase = doc["phases"]
         .as_array()
         .unwrap()
@@ -8478,17 +6762,17 @@ fn run_wait_command(home: &std::path::Path, command: &str) -> std::process::Outp
 /// creation any more. Red-proved by restoring `dispatch.internal` as the
 /// first step — every assertion below fails.
 #[test]
-fn review_v2_create_mods_waits_for_a_mod_instead_of_dispatching_a_coder() {
+fn review_create_mods_waits_for_a_mod_instead_of_dispatching_a_coder() {
     let doc: serde_json::Value =
-        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
-            .expect("review-v2.json parses");
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review.json"))
+            .expect("review.json parses");
 
     let input = doc["inputs"]
         .as_array()
         .unwrap()
         .iter()
         .find(|i| i["name"] == serde_json::json!("mod_wait_seconds"))
-        .expect("review-v2 declares mod_wait_seconds");
+        .expect("review declares mod_wait_seconds");
     assert_eq!(input["required"], serde_json::json!(false));
     // The unattended path (the self-hosted runner) has no orchestrator
     // session to receive the hook and no frontier seat, so the DEFAULT must
@@ -8656,12 +6940,12 @@ fn the_wait_command_does_not_wait_at_all_when_the_bound_is_zero() {
 /// (#2310 P4e) The document default reaches a real launch. `--dry-run`
 /// prints the resolved inputs, which is the surface an operator reads to
 /// see what a launch will use — so this proves both the new
-/// `MissionInput::default` plumbing and that `review-v2` ships `0`.
+/// `MissionInput::default` plumbing and that `review` ships `0`.
 /// Red-proved by removing `apply_input_defaults`'s call site: the line
 /// disappears from the dry-run output and a real launch is refused for an
 /// uncollected embedded placeholder.
 #[test]
-fn review_v2_dry_run_resolves_mod_wait_seconds_to_the_documents_default() {
+fn review_dry_run_resolves_mod_wait_seconds_to_the_documents_default() {
     let workdir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
@@ -8671,7 +6955,7 @@ fn review_v2_dry_run_resolves_mod_wait_seconds_to_the_documents_default() {
     fs::write(
         &spec_path,
         serde_json::json!({
-            "name": "review-v2-default-inputs",
+            "name": "review-default-inputs",
             "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}]
         })
         .to_string(),
@@ -8688,7 +6972,7 @@ fn review_v2_dry_run_resolves_mod_wait_seconds_to_the_documents_default() {
         .args([
             "mission",
             "launch",
-            "review-v2",
+            "review",
             "--param",
             &format!("workspace={}", spec_path.display()),
             "--param",
@@ -8696,7 +6980,7 @@ fn review_v2_dry_run_resolves_mod_wait_seconds_to_the_documents_default() {
             "--dry-run",
         ])
         .output()
-        .expect("mission launch review-v2 --dry-run runs");
+        .expect("mission launch review --dry-run runs");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
         stdout.contains("mod_wait_seconds = 0"),
@@ -8717,7 +7001,7 @@ fn a_supplied_mod_wait_seconds_beats_the_documents_default() {
     fs::write(
         &spec_path,
         serde_json::json!({
-            "name": "review-v2-supplied-input",
+            "name": "review-supplied-input",
             "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}]
         })
         .to_string(),
@@ -8734,7 +7018,7 @@ fn a_supplied_mod_wait_seconds_beats_the_documents_default() {
         .args([
             "mission",
             "launch",
-            "review-v2",
+            "review",
             "--param",
             &format!("workspace={}", spec_path.display()),
             "--param",
@@ -8744,7 +7028,7 @@ fn a_supplied_mod_wait_seconds_beats_the_documents_default() {
             "--dry-run",
         ])
         .output()
-        .expect("mission launch review-v2 --dry-run runs");
+        .expect("mission launch review --dry-run runs");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(stdout.contains("mod_wait_seconds = 45"), "{stdout}");
 }

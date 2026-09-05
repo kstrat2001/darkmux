@@ -85,7 +85,7 @@ const EMBEDDED_SKILLS: &[(&str, &str)] = &[
     ),
     // (#2310 P4e) SHIPPED, not maintainer-only: it operates on the
     // operator's own finding/mod stores, never on the darkmux source tree.
-    // It is also the half of `review-v2`'s create-mods phase darkmux cannot
+    // It is also the half of `review`'s create-mods phase darkmux cannot
     // perform itself — that phase waits for a mod a frontier session
     // records, and this is the procedure that records it.
     (

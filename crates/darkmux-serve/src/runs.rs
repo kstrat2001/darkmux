@@ -2112,7 +2112,7 @@ mod tests {
     /// `Some(..)`, or drop its registration from `attribution_registry`,
     /// and this goes red.
     #[test]
-    fn step_session_id_excludes_the_non_dispatching_review_v2_kinds() {
+    fn step_session_id_excludes_the_non_dispatching_review_kinds() {
         let registry = attribution_registry();
         for kind in ["records.gather", "mods.gate", "deliver.github_review"] {
             let mut step = minimal_step("s-nd", "t-nd", None);
@@ -2160,7 +2160,7 @@ mod tests {
         // nothing, while under-claiming one that does produces a phantom
         // run on the board.
         let mut step = minimal_step("s-tier3", "t1", None);
-        step.kind = "review.judge".to_string();
+        step.kind = "mission.coder".to_string();
         assert_eq!(
             step_session_id(&step, &StepKindRegistry::with_builtins()),
             Some(darkmux_types::session_id::step("s-tier3")),
@@ -2169,11 +2169,11 @@ mod tests {
 
     #[test]
     fn step_session_id_unregistered_kind_still_honors_an_explicit_config_session() {
-        // The fallback must not swallow a caller-named session — review's
-        // and coder-phase's steps DO set one, and claiming the wrong id
+        // The fallback must not swallow a caller-named session — the
+        // launch-owned Tier-3 steps DO set one, and claiming the wrong id
         // would reintroduce the ghost this fixes from the other side.
         let mut step = minimal_step("s-tier3", "t1", Some("mission-run-m1-p1"));
-        step.kind = "review.judge".to_string();
+        step.kind = "mission.coder".to_string();
         assert_eq!(
             step_session_id(&step, &StepKindRegistry::with_builtins()),
             Some("mission-run-m1-p1".to_string()),
@@ -3839,7 +3839,7 @@ mod tests {
 
         // The run-level case-string bookend session — post-fix, carries
         // mission_id (see `review_bookend_record`'s doc in
-        // `src/mission_launch_review.rs`).
+        // the retired review funnel launcher).
         write_day_file(
             flows.path(),
             &today(),

@@ -19,7 +19,7 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("scribe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/scribe.json"))),
     ("code-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reviewer.json"))),
     ("crawler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/crawler.json"))),
-    // (#2310 P4c) review-v2.json's unit-<rule> dispatch role — crawler.json's
+    // (#2310 P4c) review.json's unit-<rule> dispatch role — crawler.json's
     // sibling, `crawl.unit` reused with `role_id: "reviewer"`.
     ("reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/reviewer.json"))),
     // Tool-less PR reviewer for CI: reads a diff, emits cite-the-line JSON a
@@ -388,7 +388,7 @@ pub(crate) fn load_role_prompt_for(role: &Role) -> Option<String> {
 
 /// Public accessor for [`load_role_prompt`] (#1222 Phase B packet 5
 /// reconciliation). `darkmux mission launch review` (the `darkmux` binary
-/// crate, `src/mission_launch_review.rs`) dispatches `review-probe`/`review-judge` through
+/// crate, the retired review funnel launcher) dispatches `review-probe`/`review-judge` through
 /// `darkmux_crew::single_shot::single_shot_chat`, not
 /// `darkmux_crew::dispatch`/`dispatch_internal` — so it needs the raw
 /// system-prompt text itself rather than a full role dispatch, and

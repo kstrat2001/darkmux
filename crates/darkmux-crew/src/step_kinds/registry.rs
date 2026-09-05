@@ -292,15 +292,15 @@ mod tests {
     #[test]
     fn register_alias_resolves_a_legacy_id_to_the_same_kind() {
         let registry = StepKindRegistry::new();
-        let kind = Arc::new(StubKind("review.probe:fast"));
+        let kind = Arc::new(StubKind("crawl.unit:fast"));
         registry.register(kind.clone()).unwrap();
-        registry.register_alias("funnel.probe:fast", kind).unwrap();
-        assert_eq!(registry.get("review.probe:fast").unwrap().id(), "review.probe:fast");
+        registry.register_alias("funnel.unit:fast", kind).unwrap();
+        assert_eq!(registry.get("crawl.unit:fast").unwrap().id(), "crawl.unit:fast");
         // The legacy id resolves to the SAME impl — its `.id()` still
         // reports the CURRENT id (kind.id() is a property of the impl,
         // not of which key found it), proving both keys point at one
         // instance rather than two independently-registered stubs.
-        assert_eq!(registry.get("funnel.probe:fast").unwrap().id(), "review.probe:fast");
+        assert_eq!(registry.get("funnel.unit:fast").unwrap().id(), "crawl.unit:fast");
     }
 
     #[test]

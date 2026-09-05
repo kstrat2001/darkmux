@@ -207,7 +207,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Bumped to **"3.5"** (#2310 P4f) — additive: [`TaskConfig`] gained the
 /// optional `excludes` field — document-wide task ids that must not be
 /// `enabled` alongside this one, so a phase can ship TWO templates for one
-/// slot with exactly one live. `review-v2.json`'s `create-mods` phase is
+/// slot with exactly one live. `review.json`'s `create-mods` phase is
 /// the first user: the attended `create-mod` (wait for a frontier-written
 /// mod) and the unattended `create-mod-dispatch` (a coder on a
 /// hosted-endpoint profile, for the self-hosted runner where no
@@ -509,14 +509,14 @@ pub struct MissionInput {
     pub default: Option<serde_json::Value>,
     /// (#2310 P4c-2 item 4) `true` when this input is accepted for
     /// CLI-surface parity with another config but has NO EFFECT here —
-    /// e.g. `review-v2.json`'s `bundler`, accepted so an operator carrying
+    /// e.g. `review.json`'s `bundler`, accepted so an operator carrying
     /// a param line over from the frozen `review` config gets a signal
     /// instead of a silent no-op. The generic launcher warns (naming
     /// [`Self::ignored_reason`]) when the operator supplies an ignored
     /// input, on the `--dry-run` path too, before anything mints. Absent
     /// or `false` means the input is live. STRUCTURAL: any config may
     /// declare this on any input; the launcher's check never matches on a
-    /// config id (replaces the old `config.id == "review-v2"` special
+    /// config id (replaces the old `config.id == "review"` special
     /// case).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored: Option<bool>,
@@ -604,7 +604,7 @@ pub struct TaskConfig {
     pub enabled: Option<bool>,
     /// (#2310 P4f, schema 3.5) Task ids, document-wide, that must not be
     /// ENABLED alongside this one — two ways to staff the SAME slot, of
-    /// which exactly one may be live. `review-v2.json`'s `create-mods`
+    /// which exactly one may be live. `review.json`'s `create-mods`
     /// phase is the first user: `create-mod` waits for a frontier-written
     /// mod (the attended path) and `create-mod-dispatch` sends a coder to
     /// a hosted-endpoint profile (the unattended runner path); both
@@ -1501,7 +1501,7 @@ impl MissionConfig {
         // way to embed an optional input — it is the only mechanism that
         // reaches inside a string — so warning on it told the operator to
         // make a genuinely-optional input required, on every `mission
-        // config show review-v2` and every doctor pass, about a document
+        // config show review` and every doctor pass, about a document
         // that is correct.
         for (where_, name) in inputs::embedded_placeholders(self) {
             if let Some(input) = self.inputs.iter().find(|i| i.name == name) {
@@ -1683,7 +1683,7 @@ mod tests {
 
     // ─── (#2310 P4f, schema 3.5) `excludes`: two ways to staff one seat ───
     //
-    // A phase can ship TWO templates for the same slot — review-v2's
+    // A phase can ship TWO templates for the same slot — review's
     // create-mods phase carries the attended `create-mod` (wait for a
     // frontier-written mod) and the unattended `create-mod-dispatch` (a
     // coder on a hosted endpoint). Exactly one is meant to be live. Both
@@ -2475,15 +2475,15 @@ mod tests {
     /// validation refuses. `crawl` deliberately declares nothing: its
     /// `summary` totals a run rather than delivering one.
     #[test]
-    fn review_v2_builtin_declares_its_delivering_task_and_crawl_does_not() {
-        let cfg = embedded_config("review-v2");
+    fn review_builtin_declares_its_delivering_task_and_crawl_does_not() {
+        let cfg = embedded_config("review");
         assert_eq!(cfg.outcome_from.as_deref(), Some("deliver"));
         let deliver = cfg
             .phases
             .iter()
             .flat_map(|p| p.tasks.iter())
             .find(|t| t.id == "deliver")
-            .expect("review-v2 declares a `deliver` task");
+            .expect("review declares a `deliver` task");
         assert!(deliver.grow.is_none(), "outcome_from may not name a grow template");
         assert!(deliver.is_enabled(), "outcome_from may not name a disabled task");
         let known = known_kinds();
@@ -2502,184 +2502,46 @@ mod tests {
 
     #[test]
     fn review_builtin_has_the_expected_graph_shape() {
+        // (#2310 P4d) `review` is now a config on the crawl's shared blocks
+        // — the funnel document (investigate/adjudicate/report over ten
+        // Tier-3 `review.*` kinds) and its bespoke launcher are deleted.
         let cfg = &embedded_config("review");
         assert_eq!(cfg.id, "review");
-        assert!(!cfg.inputs.is_empty(), "review declares its runtime-only inputs");
-        assert!(
-            cfg.inputs.iter().any(|i| i.name == "staffing"),
-            "the resolved staffing snapshot must be named as a declared input"
-        );
+        assert!(!cfg.inputs.is_empty(), "review declares its runtime inputs");
+        // The workflow's frozen param names all stay declared, so
+        // `.github/workflows/darkmux-review.yml` runs unchanged.
+        for frozen in ["github", "head_sha", "diff_file", "intent_file", "mode", "bundler", "envelope_out", "emit"] {
+            assert!(
+                cfg.inputs.iter().any(|i| i.name == frozen),
+                "the workflow's frozen `--param {frozen}=` must stay declared"
+            );
+        }
+        // Every declared input is either referenced by the graph or marked
+        // ignored — the launch-side guard refuses a config that declares an
+        // input nothing consumes.
+        let body = serde_json::to_string(&cfg.phases).expect("phases serialize");
+        for input in &cfg.inputs {
+            let referenced = body.contains(&format!("{{{{{}}}}}", input.name));
+            let ignored = input.ignored.unwrap_or(false);
+            // `rules`/`dry_run` are launcher-consumed (task pruning, the CLI
+            // flag), the same way `crawl.json` declares them.
+            let launcher_consumed = matches!(input.name.as_str(), "rules" | "dry_run");
+            assert!(
+                referenced || ignored || launcher_consumed,
+                "input `{}` is declared but nothing references it and it is not marked ignored",
+                input.name
+            );
+        }
 
         let phase_ids: Vec<&str> = cfg.phases.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(phase_ids, vec!["investigate", "adjudicate", "report"]);
-
-        // (#1512) Three EXPLICIT one-role probe tasks, statically declared
-        // (the expansion primitive that could have made these a dynamic
-        // template was retired in #1550 cluster item 2 — see
-        // `MISSION_CONFIG_SCHEMA`'s doc, schema 2.0), each depending only
-        // on the bundle task (parallelism emergent from `depends_on`, never
-        // a "parallel" flag).
-        let investigate = &cfg.phases[0];
-        let investigate_task_ids: Vec<&str> =
-            investigate.tasks.iter().map(|t| t.id.as_str()).collect();
-        // (#2310 P1) The context step is the pipeline's first task; every
-        // review task reads its typed output.
-        assert_eq!(
-            investigate_task_ids,
-            vec![
-                "review-context-task",
-                "review-bundle-task",
-                "review-probe-high-task",
-                "review-probe-mid-task",
-                "review-probe-low-task",
-                "review-dedup-task"
-            ]
-        );
-        for (task_id, role_id) in [
-            ("review-probe-high-task", "review-probe-high"),
-            ("review-probe-mid-task", "review-probe-mid"),
-            ("review-probe-low-task", "review-probe-low"),
-        ] {
-            let task = investigate.tasks.iter().find(|t| t.id == task_id).unwrap();
-            assert_eq!(task.role_id.as_deref(), Some(role_id), "task `{task_id}` carries its own role_id");
-            assert_eq!(
-                task.depends_on,
-                vec!["review-bundle-task".to_string()],
-                "task `{task_id}` depends only on the bundle task"
-            );
-            // (#1530 follow-on Packet A1 + #2310 P2) Each probe task is now
-            // THREE sequential steps — the Tier-3 `review.probe-render`
-            // step (renders this seat's prompt collection AT RUN TIME),
-            // the generic `dispatch.map`, then the Tier-3
-            // `review.probe-collect` step (turns the map's raw results
-            // into this seat's typed `review.probe-flags` output) —
-            // mirroring the verify task's own render/dispatch.map/collect
-            // split (asserted below).
-            assert_eq!(task.steps.len(), 3);
-            assert_eq!(task.steps[0].kind, "review.probe-render");
-            assert_eq!(task.steps[1].kind, "dispatch.map");
-            assert_eq!(task.steps[2].kind, "review.probe-collect");
+        assert_eq!(phase_ids, vec!["plan", "review", "summarize", "create-mods", "deliver"]);
+        // The plan phase is diff-scoped `plan.sites`, one task per rule.
+        let plan = &cfg.phases[0];
+        assert!(!plan.tasks.is_empty(), "one plan task per rule");
+        for t in &plan.tasks {
+            assert_eq!(t.steps[0].kind, "plan.sites", "task {}", t.id);
         }
-        let dedup = investigate.tasks.iter().find(|t| t.id == "review-dedup-task").unwrap();
-        assert_eq!(
-            dedup.depends_on,
-            vec![
-                "review-probe-high-task".to_string(),
-                "review-probe-mid-task".to_string(),
-                "review-probe-low-task".to_string()
-            ],
-            "dedup fans in from all three explicit probe tasks — parallelism is emergent from \
-             depends_on (#1512). (#1513 review) the probe role SET is no longer read off this \
-             list: `darkmux_crew::resourcing::resolve_review_roles` discovers each probe role \
-             structurally, by step kind, walking every task in the document directly"
-        );
-
-        let adjudicate = &cfg.phases[1];
-        assert_eq!(adjudicate.tasks.len(), 1);
-        assert_eq!(adjudicate.tasks[0].id, "review-judge-task");
-        // (#1619) Cross-phase DATA rides the ledger (`reads`), not a rendered
-        // `depends_on` edge — judge still receives dedup's docket and still
-        // cannot start before dedup completes, but the graph no longer draws
-        // an investigate→adjudicate task connector that read as a bypass.
-        assert_eq!(adjudicate.tasks[0].depends_on, Vec::<String>::new());
-        // (#2310 P2) `review-bundle-task` is new here — `ReviewJudgeStepKind::
-        // residency()` now reads the typed bundle set off `input` (the
-        // retired `REVIEW_BUNDLES_ARTIFACT` bus artifact used to reach it
-        // transitively, via dedup + the probe tasks).
-        assert_eq!(
-            adjudicate.tasks[0].reads,
-            vec!["review-dedup-task", "review-context-task", "review-bundle-task"]
-        );
-        assert_eq!(adjudicate.tasks[0].steps[0].kind, "review.judge");
-        // (#1475 packet 2) The judge task assigns the `review-judge` role — the
-        // role→profile flip's model source (the crew is the task→role→profile
-        // rollup).
-        assert_eq!(adjudicate.tasks[0].role_id.as_deref(), Some("review-judge"));
-        assert_eq!(
-            adjudicate.tasks[0].steps[0].config,
-            serde_json::json!({"concurrency": 1})
-        );
-
-        let report = &cfg.phases[2];
-        let report_task_ids: Vec<&str> = report.tasks.iter().map(|t| t.id.as_str()).collect();
-        // (#2310 P3) `review-report-task` is new — the terminal render/emit
-        // step, graph-native now instead of living in the bespoke
-        // launcher's own post-dispatch tail.
-        assert_eq!(
-            report_task_ids,
-            vec!["review-verify-task", "review-synthesis-task", "review-report-task"]
-        );
-        // (#1475 packet 2) The verify task assigns the `review-verify` role.
-        assert_eq!(report.tasks[0].role_id.as_deref(), Some("review-verify"));
-        // (#1442 ship-2b + #2310 P2) The verify task is three sequential
-        // steps — the bespoke frozen-prompt render, the GENERIC
-        // dispatch.map the stage's dispatches ride, then the bespoke
-        // collect step (turns the map's raw results into typed
-        // `review.verify-results`).
-        let verify_step_kinds: Vec<&str> =
-            report.tasks[0].steps.iter().map(|s| s.kind.as_str()).collect();
-        assert_eq!(verify_step_kinds, vec!["review.verify-render", "dispatch.map", "review.verify-collect"]);
-        // (#2310 P2 review, minor finding) The verify task's own `reads`
-        // was asserted nowhere in this test even though judge's and
-        // synthesis's siblings both are (just above/below) — `review-bundle
-        // -task` is new here too, for the SAME reason `ReviewJudgeStepKind`
-        // and `ReviewSynthesisStepKind` need it: `ReviewVerifyRenderStepKind
-        // ::requires()` reads the typed bundle set directly (see that
-        // kind's own doc).
-        assert_eq!(
-            report.tasks[0].reads,
-            vec!["review-judge-task", "review-context-task", "review-bundle-task"]
-        );
-        // (#1619) synthesis still receives all three upstream outputs (#1442 —
-        // the judged docket flows directly from the judge; verify's own
-        // output is the map's result array), but the CROSS-PHASE pair now
-        // rides the ledger (`reads`) while the same-phase verify edge stays
-        // `depends_on` — the one connector the graph SHOULD draw. This is
-        // the exact config the operator read as "dedup going direct into
-        // synthesis... looks like the design includes short circuits":
-        // same data, no more phantom bypass arrows.
-        assert_eq!(report.tasks[1].depends_on, vec!["review-verify-task"]);
-        // (#2310 P2) `review-bundle-task` is new here — `ReviewSynthesisStepKind`
-        // now reads the typed bundle set (count/skip-report/bundler-fallback)
-        // directly, for its zero-bundle degenerate gate.
-        assert_eq!(
-            report.tasks[1].reads,
-            vec!["review-dedup-task", "review-judge-task", "review-context-task", "review-bundle-task"]
-        );
-        // (#2310 P3) The report task: depends on synthesis (its envelope)
-        // — a single `review.report` step, config `null` in the document
-        // (stamped at launch time from `emit`/`envelope_out`/
-        // `attribution`, never from the document itself — see
-        // `ReviewReportStepKind`'s own doc). (#2310 P4a review fix M1)
-        // `reads` widened to the SAME four typed outputs
-        // `review-synthesis-task` itself reads (bundle/dedup/judge/
-        // verify), so `ReviewReportStepKind::run_streaming`'s own
-        // degraded-envelope fallback can fold whichever of them actually
-        // completed — the same shape `run_review_graph`'s errored branch
-        // already builds from the full `steps` map, now buildable from
-        // this task's own gathered `input` alone.
-        assert_eq!(report.tasks[2].id, "review-report-task");
-        assert_eq!(report.tasks[2].depends_on, vec!["review-synthesis-task"]);
-        assert_eq!(
-            report.tasks[2].reads,
-            vec![
-                "review-synthesis-task",
-                "review-context-task",
-                "review-bundle-task",
-                "review-dedup-task",
-                "review-judge-task",
-                "review-verify-task",
-            ]
-        );
-        assert_eq!(report.tasks[2].steps.len(), 1);
-        assert_eq!(report.tasks[2].steps[0].kind, "review.report");
-
-        // (#2310 P3) The close-payload override: the review mission's
-        // `mission close` record promotes `review-synthesis-task`'s body
-        // (the final `ReviewEnvelope`), never the report task's own
-        // rendered-comment output, even though the report task is
-        // graph-positionally last.
-        assert_eq!(cfg.outcome_from.as_deref(), Some("review-synthesis-task"));
+        assert_eq!(cfg.outcome_from.as_deref(), Some("deliver"));
     }
 
     #[test]
@@ -2760,7 +2622,7 @@ mod tests {
     /// apply_input_defaults` collects it on every launch before either
     /// placeholder pass runs, so the placeholder always resolves. Warning
     /// on it told the operator to make a genuinely-optional input
-    /// required, on every `mission config show review-v2` and every doctor
+    /// required, on every `mission config show review` and every doctor
     /// pass, about a document that is correct.
     ///
     /// Red-proved by restoring the `input.required != Some(true)`
@@ -2769,7 +2631,7 @@ mod tests {
     fn a_defaulted_embedded_input_does_not_warn() {
         let known = known_kinds();
         let known_refs = known_kinds_refs(&known);
-        for id in ["review-v2", "crawl"] {
+        for id in ["review", "crawl"] {
             let cfg = embedded_config(id);
             let findings = cfg.validate(&known_refs);
             let input_findings: Vec<&ValidationFinding> =
@@ -2816,13 +2678,13 @@ mod tests {
     ///
     /// This replaces three per-config assertions that lived inside three
     /// separate graph-shape tests. That arrangement covered `review`,
-    /// `coder-phase` and `crawl` and silently did NOT cover `review-v2` —
-    /// which is the config this packet edited: mutating `review-v2.json`'s
+    /// `coder-phase` and `crawl` and silently did NOT cover `review` —
+    /// which is the config this packet edited: mutating `review.json`'s
     /// declared version to a stale `"3.4"` left the whole suite green,
     /// while the identical mutation on `crawl.json` went red. A per-config
     /// pin only ever covers the configs somebody remembered to write one
     /// for, and the one nobody remembered is exactly the one drifting. A
-    /// FIFTH config now inherits this check by existing.
+    /// Every config inherits this check by existing.
     ///
     /// A declared version is not cosmetic: `validate` warns on a
     /// major-version mismatch, and the version is the only signal an older
@@ -2830,7 +2692,10 @@ mod tests {
     #[test]
     fn every_embedded_builtin_declares_the_current_schema_version() {
         let embedded = load::embedded_all();
-        assert!(embedded.len() >= 4, "the embedded set should not have shrunk: {embedded:?}");
+        // (#2310 P4d) THREE built-ins: the funnel `review` document retired
+        // and its replacement took the `review` id, so the set is
+        // coder-phase + crawl + review.
+        assert!(embedded.len() >= 3, "the embedded set should not have shrunk: {embedded:?}");
         for (id, _) in embedded {
             let cfg = embedded_config(id);
             assert_eq!(
@@ -3297,7 +3162,7 @@ mod tests {
     }
 
     /// The other side: an OPTIONAL input with a default is the ordinary,
-    /// correct shape (`review-v2`'s `mod_wait_seconds`) and must be silent.
+    /// correct shape (`review`'s `mod_wait_seconds`) and must be silent.
     #[test]
     fn an_optional_input_with_a_default_is_clean() {
         let cfg = MissionConfig {

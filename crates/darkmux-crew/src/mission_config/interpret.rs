@@ -280,7 +280,7 @@ pub fn real_task_ids(
 /// here (growth is a separate, earlier substitution pass over a different
 /// namespace), so what's left to resolve is exactly the declared-input
 /// placeholders a grow template's static keys may also carry (e.g.
-/// `review-v2.json`'s `unit-<rule>` tasks wiring `{{intent_file}}` into
+/// `review.json`'s `unit-<rule>` tasks wiring `{{intent_file}}` into
 /// every grown unit's config).
 pub fn interpret_grown(
     grown: &[super::TaskConfig],
@@ -708,18 +708,18 @@ mod tests {
         let cfg = doc(vec![phase(
             "adjudicate",
             vec![task(
-                "review-judge-task",
+                "judge-task",
                 &[],
                 None,
-                vec![step("review-judge-step", "review.judge", serde_json::json!({"concurrency": 1}))],
+                vec![step("judge-step", "dispatch.map", serde_json::json!({"concurrency": 1}))],
             )],
         )]);
         let mut step_config_overrides = Map::new();
-        step_config_overrides.insert("review-judge-step".to_string(), serde_json::json!({"concurrency": 5}));
+        step_config_overrides.insert("judge-step".to_string(), serde_json::json!({"concurrency": 5}));
         let params = LaunchParams { step_config_overrides, ..Default::default() };
 
         let (_tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
-        assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 5}));
+        assert_eq!(steps["judge-step"].config, serde_json::json!({"concurrency": 5}));
     }
 
     #[test]
@@ -727,16 +727,16 @@ mod tests {
         let cfg = doc(vec![phase(
             "adjudicate",
             vec![task(
-                "review-judge-task",
+                "judge-task",
                 &[],
                 None,
-                vec![step("review-judge-step", "review.judge", serde_json::json!({"concurrency": 1}))],
+                vec![step("judge-step", "dispatch.map", serde_json::json!({"concurrency": 1}))],
             )],
         )]);
         let params = LaunchParams::default();
 
         let (_tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
-        assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 1}));
+        assert_eq!(steps["judge-step"].config, serde_json::json!({"concurrency": 1}));
     }
 
     // (#1550 cluster item 2) The expansion primitive's tests

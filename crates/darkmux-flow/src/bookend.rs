@@ -7,7 +7,7 @@
 //! per-step ones; originally `funnel.rs`'s `FunnelBookendGuard`, later the
 //! review driver's run-guard — since RETIRED in #1434, when the review path
 //! folded onto one generic `step result` vocabulary and dropped its
-//! per-run bookend entirely), and `src/mission_launch_review.rs`'s
+//! per-run bookend entirely), and the retired review funnel launcher's
 //! `with_dispatch_bookends` (flat, bridging a review-pipeline run into the
 //! `dispatch *` vocabulary). Same shape every time: emit a `started`
 //! record, arm a guard, and guarantee a matching terminal record fires no
@@ -202,7 +202,7 @@ pub fn remote_route_label(host: &str, model_id: &str) -> String {
     //
     // It was previously by remembering, and two of three callers forgot:
     // `dispatch_internal::remote_endpoint_label` (the dispatch path) and
-    // `mission_launch_review::crew_route_label` both handed over a raw
+    // the retired review funnel launcher both handed over a raw
     // authority. Only `review.rs`'s `seat_endpoint_host` stripped it, and
     // its comment spells out why: nothing stops an operator pasting
     // `https://tok@proxy/v1` into a profile's `url` — some LiteLLM/proxy

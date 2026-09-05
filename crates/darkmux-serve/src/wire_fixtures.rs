@@ -176,7 +176,7 @@ mod tests {
                         StepRow {
                             id: "judge-cloud".to_string(),
                             label: "Judge".to_string(),
-                            kind: "review.judge".to_string(),
+                            kind: "dispatch.map".to_string(),
                             status: "complete",
                             started_ts: Some(1_785_404_428),
                             completed_ts: Some(1_785_404_600),
@@ -189,7 +189,7 @@ mod tests {
                         StepRow {
                             id: "judge-local".to_string(),
                             label: "Judge".to_string(),
-                            kind: "review.judge".to_string(),
+                            kind: "dispatch.map".to_string(),
                             status: "complete",
                             started_ts: Some(1_785_404_428),
                             completed_ts: Some(1_785_404_610),
@@ -205,7 +205,7 @@ mod tests {
                             // alone, and must read as UNKNOWN (#1626).
                             id: "judge-unknown".to_string(),
                             label: "Judge".to_string(),
-                            kind: "review.judge".to_string(),
+                            kind: "dispatch.map".to_string(),
                             status: "error",
                             started_ts: Some(1_785_404_428),
                             completed_ts: None,

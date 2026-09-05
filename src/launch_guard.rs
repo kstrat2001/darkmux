@@ -6,7 +6,7 @@
 //!
 //! **Why a closure-parameterized guard, not one hardcoded to a Mission
 //! envelope type.** The three launchers finalize completely differently —
-//! `mission_launch_review.rs` writes a `ReviewEnvelope`-derived
+//! the retired review funnel launcher writes a `ReviewEnvelope`-derived
 //! `MissionEnvelope`, the retired crawl launcher wrote a crawl summary + its own
 //! `mission_terminal_with_reasoning_and_payload` call, `mission_launch.rs`
 //! writes either a gate banner (coder-phase, no finalize at all on the
@@ -44,6 +44,7 @@
 //! between-units polling seam (the crawl launcher's, retired in #2301) never needed to call it at
 //! all — its own loop already stops cleanly once `close` runs.
 
+#[cfg(test)]
 use std::any::Any;
 
 /// Install SIGINT + SIGTERM + SIGHUP handling — call ONCE, before minting
@@ -57,22 +58,6 @@ pub(crate) fn arm() {
     darkmux_types::interrupt::install();
     darkmux_types::interrupt::install_term();
     darkmux_types::interrupt::install_hup();
-}
-
-/// Best-effort rendering of a caught `std::thread::JoinHandle::join()`
-/// panic payload — the two shapes `std::panic!`/`.expect()`/`.unwrap()`
-/// actually produce (`&'static str`, `String`); anything else names itself
-/// honestly rather than guessing. Shared by every launcher that supervises
-/// its dispatch on a worker thread (review; `mission_launch.rs`'s
-/// generic-graph/coder-phase path).
-pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic payload".to_string()
-    }
 }
 
 /// A launcher that ran its dispatch on a worker thread it deliberately
@@ -158,6 +143,25 @@ impl<A: FnMut()> Drop for LaunchFinalizeGuard<A> {
         // places, some of which (a test, a caller with more cleanup of its
         // own) must not have the whole process pulled out from under them.
         darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+    }
+}
+
+// (#2310 P4d) Test-only since the bespoke review launcher — its last
+// production caller — retired.
+#[cfg(test)]
+/// Best-effort rendering of a caught `std::thread::JoinHandle::join()`
+/// panic payload — the two shapes `std::panic!`/`.expect()`/`.unwrap()`
+/// actually produce (`&'static str`, `String`); anything else names itself
+/// honestly rather than guessing. Shared by every launcher that supervises
+/// its dispatch on a worker thread (review; `mission_launch.rs`'s
+/// generic-graph/coder-phase path).
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 

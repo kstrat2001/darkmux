@@ -104,12 +104,12 @@ pub struct StepRow {
     /// Resolved via [`resolve_step_label`] — StepKind display name → kind
     /// id → step id → `"unknown"` (#1402).
     pub label: String,
-    /// (#1403) The RAW step kind id (`"dispatch.internal"`, `"review.probe"`,
+    /// (#1403) The RAW step kind id (`"dispatch.internal"`, `"dispatch.map"`,
     /// `"mission.coder"`, `"procedural.shell"`, …) — distinct from the
     /// human `label`. The page gates the live token/turn meter on this: an
-    /// AI-DISPATCHING kind (`dispatch.*`, `review.probe/judge/verify`,
+    /// AI-DISPATCHING kind (`dispatch.*`, `crawl.unit`,
     /// `mission.coder/verify`) shows a meter; a procedural kind
-    /// (`procedural.*`, `review.bundle/dedup`, `mission.worktree`) shows
+    /// (`procedural.*`, `records.gather`, `mission.worktree`) shows
     /// none. Empty string when the kind is genuinely unknown (a synthesized
     /// step with no config-snapshot recovery — see `build_mission_graph`);
     /// the page then falls back to showing a meter only if metrics arrive.
@@ -506,17 +506,16 @@ pub fn mission_step_kind_display_name(kind: &str) -> Option<&'static str> {
 
 /// The full display-name resolution, trying every kind family this crate
 /// can see: Tier 1 builtins (via the real registry — `darkmux-serve`
-/// already depends on `darkmux-crew`), Tier 3 `review.*` (via
-/// `darkmux-lab`, already a dependency), then Tier 3 `mission.*` (the
+/// already depends on `darkmux-crew`), then Tier 3 `mission.*` (the
 /// static table above, this crate's own literal). `None` when `kind`
-/// isn't recognized by any of them — the caller falls back further (see
-/// [`resolve_step_label`]).
+/// isn't recognized by either — the caller falls back further (see
+/// [`resolve_step_label`]). (#2310 P4d) The `review.*` family is gone: the
+/// review pipeline's Tier-3 kinds retired with the funnel launcher, and
+/// `review` now runs on the shared `plan.sites`/`crawl.*` blocks the
+/// builtin registry and the crawl launcher already name.
 fn step_kind_display_name(kind: &str) -> Option<&'static str> {
     if let Ok(k) = darkmux_crew::step_kinds::StepKindRegistry::with_builtins().get(kind) {
         return Some(k.display_name());
-    }
-    if let Some(n) = darkmux_lab::lab::review::review_step_kind_display_name(kind) {
-        return Some(n);
     }
     mission_step_kind_display_name(kind)
 }
@@ -957,7 +956,7 @@ fn backfill_step_finals_bounded(
 /// (`src/mission_launch.rs` — the only `lifecycle::save_step` caller on a
 /// production path; the coder-phase graph runs through it). The review
 /// driver (`darkmux-lab`'s `review.rs`) takes its `persist` hook from
-/// `src/mission_launch_review.rs`, which writes at TRANSITION only, so a
+/// the retired review funnel launcher, which writes at TRANSITION only, so a
 /// step of its graph that has not transitioned yet still has no file.
 /// Synthesis therefore still matters — it just no longer describes every
 /// runner. Rather than
@@ -1463,7 +1462,7 @@ mod tests {
         let step_ids = ids(&["review-judge-step"]);
         let rec = serde_json::json!({
             "action": "step result",
-            "payload": { "step_id": "review-judge-step", "kind": "review.judge", "tokens": 4200 }
+            "payload": { "step_id": "judge-step", "kind": "dispatch.map", "tokens": 4200 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["review-judge-step"].tokens, Some(4200), "review `tokens` payload folds");
@@ -1829,12 +1828,6 @@ mod tests {
         assert_eq!(step_model_from_config(&serde_json::json!({ "concurrency": 3 })), None);
         // Empty / whitespace values are treated as absent, never a blank chip.
         assert_eq!(step_model_from_config(&serde_json::json!({ "model": "   " })), None);
-    }
-
-    #[test]
-    fn resolve_step_label_review_kind_resolves_via_darkmux_lab() {
-        assert_eq!(resolve_step_label("review.bundle", "s1"), "Bundle");
-        assert_eq!(resolve_step_label("review.probe:alpha", "s1"), "Probe");
     }
 
     #[test]

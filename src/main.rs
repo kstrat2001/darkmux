@@ -73,23 +73,16 @@ mod coder_phase;
 // entry point (`mission_launch::launch`).
 mod preflight;
 // `darkmux mission launch crawl` (#1959 packet 2) — the crawl launcher,
-// a dedicated launcher alongside mission_launch_review for the same
-// reason: it needs execution shape the generic mission_config::interpret
-// + scheduler path has no seam for. See its own module doc.
+// a dedicated launcher: it needs execution shape the generic
+// mission_config::interpret + scheduler path has no seam for. See its own
+// module doc.
 mod mission_launch;
-mod mission_launch_review;
 // (#2131) The shared SIGINT/SIGTERM/SIGHUP-aware finalize guard + child
-// reaping used by all three `mission launch` launchers (review, crawl,
+// reaping used by the `mission launch` launchers (crawl,
 // generic/coder-phase) — extracted from #2124/#2130's review-only
 // `review_finalize_guard.rs`, which this replaces.
 mod launch_guard;
 mod notebook;
-// (#2310 P3) `src/pr_review.rs` moved to `darkmux-lab`'s own
-// `lab::review_render` module — pure rendering, needed by that crate's own
-// `review.report` step kind. Kept as a re-export under the old name so
-// every existing bin-crate caller (`src/mission_launch_review.rs`,
-// `src/acp.rs`, `tests/cli.rs`) keeps compiling unchanged.
-pub use darkmux_lab::lab::review_render as pr_review;
 pub use darkmux_lab::providers;
 // (#1698 Packet A) The radio interpreter core (catalog compiler, closed-set
 // router, frozen prompt assembly) — surface-neutral engine capability. See

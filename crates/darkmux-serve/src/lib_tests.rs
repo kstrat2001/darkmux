@@ -3440,7 +3440,7 @@
                 "ts": "2026-01-01T00:05:00Z", "level": "info", "category": "work",
                 "tier": "local", "stage": "dispatch", "action": "step result",
                 "handle": "judge", "session_id": case_id, "source": "review",
-                "payload": {"step_id": "judge", "kind": "review.judge", "items_in": 6, "items_out": 6}
+                "payload": {"step_id": "judge", "kind": "dispatch.map", "items_in": 6, "items_out": 6}
             }),
         );
         fs::write(dir.join("funnel-events.jsonl"), events).unwrap();

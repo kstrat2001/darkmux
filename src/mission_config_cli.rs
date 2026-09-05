@@ -15,7 +15,7 @@
 //!   "constructible" verdict here is the identical check `launch` exits `4`
 //!   against, not a re-derived approximation.
 //! - `darkmux_profiles::profiles::resolve_role_profile_with` — the SAME
-//!   role → profile → model resolution `mission_launch_review` performs for
+//!   role → profile → model resolution `the retired review funnel launcher` performs for
 //!   every review role, given the SAME `RoleBinding` precedence (`--param`
 //!   override > `role_profiles` map > `default_profile` fallback). And the
 //!   same local-model gate every dispatch path applies before trusting a
@@ -37,7 +37,7 @@
 //!
 //! **`--param ROLE=PROFILE` applies only where `mission launch` would apply
 //! it.** Role→profile overrides are converted into launch bindings ONLY on
-//! the review route (`mission_launch_review.rs`, gated structurally by
+//! the review route (the retired review funnel launcher, gated structurally by
 //! `mission_launch::config_uses_review_kinds`) — for any other config (e.g.
 //! `coder-phase`), `mission launch` ignores `--param <role>=<profile>`
 //! entirely (a coder-phase `--param role=<id>` instead REBINDS the task's
@@ -836,18 +836,14 @@ fn binding_for(role: &str, overrides: &BTreeMap<String, String>, mapped: Option<
     }
 }
 
-/// (merge-gate MUST-FIX 3) `--param ROLE=PROFILE` is applied as a launch
-/// binding ONLY where `mission launch` would apply it: the review route
-/// (`mission_launch_review.rs`), gated by the SAME structural test
-/// `mission launch` itself uses to route there
-/// (`mission_launch::config_uses_review_kinds`). Any other config (e.g.
-/// `coder-phase`) has `--param` overrides silently ignored by `launch`
-/// today — `show` must not claim a parity it can't deliver. Returns the
-/// overrides actually eligible to apply (empty, with a warning, when the
-/// config doesn't use the review kinds) plus zero or more warnings —
-/// including one per override naming a role NO task in the graph declares
-/// (an operator typo `show` can catch before it's a wasted `mission
-/// launch` invocation).
+/// (merge-gate MUST-FIX 3; #2310 P4d) `--param ROLE=PROFILE` is applied as
+/// a launch binding ONLY where `mission launch` would apply it. The review
+/// route was the one launcher that did, and it retired with the bespoke
+/// funnel launcher — every config now resolves its roles through the
+/// `role_profiles` map / `default_profile` only, so `show` reports the
+/// overrides as ignored rather than claiming a parity no launcher can
+/// deliver. Returns the overrides actually eligible to apply (always
+/// empty today) plus the warning naming what was ignored.
 fn effective_overrides_and_warnings(
     config: &MissionConfig,
     overrides: BTreeMap<String, String>,
@@ -855,39 +851,21 @@ fn effective_overrides_and_warnings(
     if overrides.is_empty() {
         return (overrides, Vec::new());
     }
-    if !crate::mission_launch::config_uses_review_kinds(config) {
-        let roles: Vec<&str> = overrides.keys().map(String::as_str).collect();
-        return (
-            BTreeMap::new(),
-            vec![format!(
-                "--param {} ignored for planning parity: this config's launcher does not apply \
-                 role→profile overrides on this route (only the review route does) — every \
-                 role below resolves as a real `mission launch {}` would (role_profiles map / \
-                 default_profile only)",
-                roles.iter().map(|r| format!("{r}=…")).collect::<Vec<_>>().join(", "),
-                config.id
-            )],
-        );
-    }
-    let declared: BTreeSet<&str> = config
-        .phases
-        .iter()
-        .flat_map(|p| p.tasks.iter())
-        .filter_map(|t| t.role_id.as_deref())
-        .collect();
-    let mut warnings = Vec::new();
-    for role in overrides.keys() {
-        if !declared.contains(role.as_str()) {
-            warnings.push(format!(
-                "--param {role}=… ignored: no task in this config declares role_id \"{role}\""
-            ));
-        }
-    }
-    (overrides, warnings)
+    let roles: Vec<&str> = overrides.keys().map(String::as_str).collect();
+    (
+        BTreeMap::new(),
+        vec![format!(
+            "--param {} ignored for planning parity: no launcher applies role→profile \
+             overrides — every role below resolves as a real `mission launch {}` would \
+             (role_profiles map / default_profile only)",
+            roles.iter().map(|r| format!("{r}=…")).collect::<Vec<_>>().join(", "),
+            config.id
+        )],
+    )
 }
 
 /// `--param ROLE=PROFILE` overrides, exactly as `mission launch --param
-/// <role>=<profile>` parses them (mirrors `mission_launch_review`'s own
+/// <role>=<profile>` parses them (mirrors `the retired review funnel launcher`'s own
 /// `collect_role_overrides`), except a malformed entry bails immediately
 /// with a copy-pasteable example rather than being silently dropped — a
 /// `show` invocation with a typo'd override should never render as if the
@@ -1639,17 +1617,11 @@ mod tests {
     }
 
     // ── launch-route parity for --param (merge-gate MUST-FIX 3) ────────
-    // `mission launch` converts `--param <role>=<profile>` into a launch
-    // binding ONLY on the review route. `show` must mirror that structural
-    // gate, not apply the override universally and claim a parity that
-    // doesn't hold for e.g. coder-phase.
-
-    fn review_route_config() -> MissionConfig {
-        doc(vec![phase(
-            "p1",
-            vec![task("review-judge-task", Some("review-judge"), vec![step("s1", "review.judge")])],
-        )])
-    }
+    // (#2310 P4d) `mission launch` no longer converts `--param
+    // <role>=<profile>` into a launch binding on ANY route — the review
+    // route was the only launcher that did, and it retired with the funnel.
+    // `show` must mirror that, reporting every override as ignored rather
+    // than claiming a parity no launcher delivers.
 
     fn non_review_route_config() -> MissionConfig {
         doc(vec![phase(
@@ -1659,23 +1631,14 @@ mod tests {
     }
 
     #[test]
-    fn param_overrides_apply_on_the_review_route() {
-        let mut overrides = BTreeMap::new();
-        overrides.insert("review-judge".to_string(), "deep".to_string());
-        let (effective, warnings) = effective_overrides_and_warnings(&review_route_config(), overrides.clone());
-        assert_eq!(effective, overrides, "review-route configs must apply the override unchanged");
-        assert!(warnings.is_empty(), "a role the graph actually declares must not warn: {warnings:?}");
-    }
-
-    #[test]
-    fn param_overrides_are_neutered_and_warned_off_the_non_review_route() {
+    fn param_overrides_are_neutered_and_warned_on_every_route() {
         let mut overrides = BTreeMap::new();
         overrides.insert("coder".to_string(), "deep".to_string());
         let (effective, warnings) =
             effective_overrides_and_warnings(&non_review_route_config(), overrides);
         assert!(
             effective.is_empty(),
-            "a non-review-route config's launcher ignores --param; show must not apply it either"
+            "no launcher applies --param role overrides; show must not apply one either"
         );
         assert!(
             warnings.iter().any(|w| w.contains("--param") && w.contains("ignored")),
@@ -1684,24 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn param_overrides_naming_an_undeclared_role_warn_on_the_review_route() {
-        let mut overrides = BTreeMap::new();
-        overrides.insert("review-judge".to_string(), "deep".to_string());
-        overrides.insert("no-such-role".to_string(), "deep".to_string());
-        let (effective, warnings) = effective_overrides_and_warnings(&review_route_config(), overrides.clone());
-        assert_eq!(effective, overrides, "eligible overrides still apply even when a sibling is unconsumed");
-        assert!(
-            warnings.iter().any(|w| w.contains("no-such-role") && w.contains("no task")),
-            "got: {warnings:?}"
-        );
-        assert!(
-            !warnings.iter().any(|w| w.contains("review-judge") && w.contains("no task")),
-            "a role the graph DOES declare must not be flagged unconsumed: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn no_overrides_supplied_produces_no_warnings_on_either_route() {
+    fn no_overrides_supplied_produces_no_warnings() {
         let (effective, warnings) =
             effective_overrides_and_warnings(&non_review_route_config(), BTreeMap::new());
         assert!(effective.is_empty());
