@@ -41,7 +41,7 @@
 //! `StepKind::run` takes no such argument.
 
 use crate::crawl::plan::{Plan, ReadFileEntry, Site, Unit};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, DispatchResult};
 use darkmux_crew::rules::{self, Rule};
 use darkmux_crew::step_kinds::{Port, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
@@ -623,7 +623,10 @@ fn strip_source_prefix(source_id: &str, raw: &str) -> String {
 }
 
 /// Read this unit's accepted findings, stamp the crawl's provenance onto
-/// each, and write them beside the run as `<unit>.findings.jsonl`.
+/// each, and write them beside the run as `<rule>.<unit>.findings.jsonl` (#2360 —
+/// rule-namespaced, since a per-rule plan numbers its own units from
+/// `u-0001` and two rules routinely grow the same unit id into one
+/// mission).
 /// Returns how many there were AND one [`FindingRef`] per accepted
 /// finding, from the SAME read (#2302). The two are returned separately
 /// rather than as one list because they answer to different guards: the
@@ -946,11 +949,29 @@ fn single_rule_id(rule_ids: &[String]) -> Option<String> {
 /// re-deriving it from the plan unit's rule id(s), so the two never
 /// silently disagree. Falls back to the plan unit's own rule ids only
 /// when the step config left `rule` unset (not a shape either built-in
-/// mission config produces today, but a multi-rule read unit's own
-/// `rule_ids` still yields a stable, non-colliding component rather than
-/// panicking).
-fn unit_rule_dir(declared: Option<&str>, rule_ids: &[String]) -> String {
-    declared.map(str::to_string).or_else(|| single_rule_id(rule_ids)).unwrap_or_else(|| rule_ids.join("+"))
+/// mission config produces today).
+///
+/// REFUSES rather than resolving to something unsafe (#2360 follow-up):
+/// an empty result (`config.rule` unset AND the plan unit names no rule
+/// id at all) would otherwise silently revert to the pre-fix, colliding
+/// `units/<unit_id>` path and a leading-dot mission-root file
+/// (`.` + `<unit_id>.findings.jsonl`) — and this string becomes a raw
+/// path component with no guard downstream, so every `+`-joined part is
+/// also checked against [`rules::is_safe_rule_id`] here, at the one place
+/// that turns a rule id into a path.
+fn unit_rule_dir(declared: Option<&str>, rule_ids: &[String]) -> Result<String> {
+    let dir = declared.map(str::to_string).or_else(|| single_rule_id(rule_ids)).unwrap_or_else(|| rule_ids.join("+"));
+    ensure!(
+        !dir.is_empty(),
+        "`{CRAWL_UNIT_KIND}`: could not resolve a rule for this unit's on-disk path - `config.rule` is unset and the plan unit names no rule id; refusing rather than reverting to the pre-#2360 colliding `units/<unit_id>` layout"
+    );
+    for part in dir.split('+') {
+        ensure!(
+            rules::is_safe_rule_id(part),
+            "`{CRAWL_UNIT_KIND}`: rule id `{part}` (from `{dir}`) is not a safe path component — it must be non-empty, <= 128 chars, never start with `.`, and hold only ascii alphanumerics, `-`, `_`, or `.`"
+        );
+    }
+    Ok(dir)
 }
 
 /// (#2310 P4c) Same "one id or null" shape as [`single_rule`], but the
@@ -1085,7 +1106,7 @@ impl StepKind for CrawlUnitStepKind {
         // different rules routinely grow a unit named `u-0001` into the
         // SAME mission — see `unit_rule_dir`'s own doc for the live
         // collision this closes.
-        let rule_dir = unit_rule_dir(cfg.rule.as_deref(), &ctx.rule_ids);
+        let rule_dir = unit_rule_dir(cfg.rule.as_deref(), &ctx.rule_ids)?;
 
         // Mint this unit's own out dir BEFORE dispatch (#2153): the dir is
         // then known and recorded even if the dispatch returns `Err` with

@@ -337,6 +337,30 @@ fn two_rules_growing_unit_u_0001_do_not_collide_on_disk() {
     assert!(findings_b.contains("swallowed-error"));
 }
 
+/// (#2360 follow-up) An empty rule-dir component (no declared
+/// `config.rule` AND a plan unit naming no rule id at all) must be
+/// REFUSED, never silently resolved to `""` — an empty component would
+/// revert `units/<rule_dir>/<unit_id>` to the pre-fix colliding
+/// `units/<unit_id>` and turn the mission-root findings file into a
+/// leading-dot dotfile (`.` + `<unit_id>.findings.jsonl`), which is a
+/// second, quieter way back to the exact bug this issue closed.
+#[test]
+fn unit_rule_dir_refuses_when_nothing_names_a_rule() {
+    let err = unit_rule_dir(None, &[]).expect_err("no declared rule and no plan rule id must refuse");
+    assert!(err.to_string().contains("could not resolve a rule"), "{err:#}");
+}
+
+/// (#2360 follow-up) The resolved rule-dir component becomes a raw path
+/// segment (`units/<rule_dir>/<unit_id>`) with no guard downstream, so
+/// `unit_rule_dir` is the one place that must refuse a traversal-shaped
+/// id rather than trust the plan/config to have already checked it.
+#[test]
+fn unit_rule_dir_refuses_a_path_traversal_shaped_rule_id() {
+    let err = unit_rule_dir(Some("../x"), &["../x".to_string()])
+        .expect_err("a rule id shaped like a path traversal must be refused, not joined onto a path");
+    assert!(err.to_string().contains("not a safe path component"), "{err:#}");
+}
+
 /// (#2310 P4c-2b) `config.draws: 2` dispatches the same unit TWICE —
 /// proven by a stub dispatcher that counts its own calls and stamps a
 /// distinct session id per call — and the resulting `finding_refs` dedup
@@ -395,6 +419,20 @@ fn draws_dispatches_the_unit_n_times_and_dedups_matching_finding_refs() {
     );
     assert_eq!(parsed.wall_ms, 2_000, "wall_ms sums across draws");
     assert_eq!(parsed.prompt_tokens, 100);
+
+    // (#2360 follow-up) The draw-1 (`d2`) readback file must be
+    // rule-namespaced too — `<rule>.<unit>.findings.jsonl.d2`, never bare
+    // `<unit>.findings.jsonl.d2` — because a second rule growing the same
+    // unit id and also drawing twice would otherwise `std::fs::write`
+    // (truncate) the SAME `.d2` path this draw just wrote. Nothing else in
+    // this test reads this exact path, so dropping the rule prefix off
+    // ONLY the `draw > 0` branch would otherwise leave every assertion
+    // above green.
+    let draw2_findings = fs::read_to_string(
+        darkmux_crew::loader::missions_dir().join(MISSION).join("unnamed-predicate.u-0001.findings.jsonl.d2"),
+    )
+    .expect("draw 1's readback file must be rule-namespaced");
+    assert!(draw2_findings.contains("unnamed-predicate"), "{draw2_findings}");
 }
 
 /// (#2310 P4c-2b) `draws` absent (the default) must dispatch exactly ONCE
