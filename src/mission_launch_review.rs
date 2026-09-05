@@ -2871,6 +2871,136 @@ mod tests {
         assert_eq!(phase_status(&mission_id, &order[2]), "planned");
     }
 
+    /// (#2310 fix-loop C2 / S4-1) A prior phase whose FULL step set (every
+    /// minted step is persisted at mint now) holds a still-`Planned` step
+    /// did not finish — so it closes `Abandoned`, and `phase_abandon`'s own
+    /// #1504 reconcile terminalizes the leftover.
+    ///
+    /// The old rule deferred on ANY non-terminal step, which judged the
+    /// phase from whichever subset happened to have transitioned: a phase
+    /// whose steps were all still `Planned` on disk looked "every step on
+    /// disk is terminal" and closed `Complete`, after which `phase_abandon`
+    /// refused it forever and finalize could not reconcile. `Running` is
+    /// still deferred on — that is genuinely live work.
+    #[test]
+    #[serial_test::serial]
+    fn a_prior_phase_holding_a_planned_step_closes_abandoned_not_complete() {
+        let _guard = CrewDirGuard::new();
+        let config = crew::mission_config::load("review").expect("review is embedded").config;
+        let mission_id = mission_launch::mint_run_id("review").unwrap();
+        let real_phase_ids = mission_launch::ensure_mission_and_phases_with_provenance(
+            &mission_id,
+            &config,
+            Some("PR review test — planned step blocks Complete"),
+            None,
+        )
+        .unwrap();
+        let order: Vec<String> = ["investigate", "adjudicate", "report"]
+            .iter()
+            .map(|k| real_phase_ids[*k].clone())
+            .collect();
+        let mut started = std::collections::HashSet::new();
+        let mut closed = std::collections::HashSet::new();
+
+        let mk = |id: &str, status: crew::types::NodeStatus| crew::types::Step {
+            id: format!("{}-{id}", order[0]),
+            task_id: format!("{}-t1", order[0]),
+            gate: None,
+            kind: "procedural.noop".to_string(),
+            status,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let done = mk("s1", crew::types::NodeStatus::Complete);
+        let never_ran = mk("s2", crew::types::NodeStatus::Planned);
+        crew::lifecycle::save_step(&mission_id, &order[0], &done).unwrap();
+        crew::lifecycle::save_step(&mission_id, &order[0], &never_ran).unwrap();
+
+        assert!(mission_launch::lazy_start_phase_for_step(
+            &mission_id,
+            &order[0],
+            crew::types::NodeStatus::Running,
+            &mut started,
+        ));
+        assert!(mission_launch::lazy_start_phase_for_step(
+            &mission_id,
+            &order[1],
+            crew::types::NodeStatus::Running,
+            &mut started,
+        ));
+        mission_launch::lazy_close_prior_phases(&mission_id, &order, &order[1], &mut closed);
+
+        assert_eq!(
+            phase_status(&mission_id, &order[0]),
+            "abandoned",
+            "a phase with a step that never ran did not finish — it must not read Complete,              and it must not be left Running for finalize to trip over either"
+        );
+        let reconciled = crew::lifecycle::load_steps_for_phase(&mission_id, &order[0]).unwrap();
+        let leftover = reconciled.iter().find(|s| s.id == never_ran.id).unwrap();
+        assert_eq!(
+            leftover.status,
+            crew::types::NodeStatus::Abandoned,
+            "phase_abandon's #1504 reconcile must terminalize the leftover step"
+        );
+    }
+
+    /// A prior phase with a step still RUNNING is still deferred on — the
+    /// conservative half of the rule above, unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn a_prior_phase_holding_a_running_step_is_still_left_alone() {
+        let _guard = CrewDirGuard::new();
+        let config = crew::mission_config::load("review").expect("review is embedded").config;
+        let mission_id = mission_launch::mint_run_id("review").unwrap();
+        let real_phase_ids = mission_launch::ensure_mission_and_phases_with_provenance(
+            &mission_id,
+            &config,
+            Some("PR review test — running step defers"),
+            None,
+        )
+        .unwrap();
+        let order: Vec<String> = ["investigate", "adjudicate", "report"]
+            .iter()
+            .map(|k| real_phase_ids[*k].clone())
+            .collect();
+        let mut started = std::collections::HashSet::new();
+        let mut closed = std::collections::HashSet::new();
+
+        let live = crew::types::Step {
+            id: format!("{}-s1", order[0]),
+            task_id: format!("{}-t1", order[0]),
+            gate: None,
+            kind: "procedural.noop".to_string(),
+            status: crew::types::NodeStatus::Running,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        crew::lifecycle::save_step(&mission_id, &order[0], &live).unwrap();
+        assert!(mission_launch::lazy_start_phase_for_step(
+            &mission_id,
+            &order[0],
+            crew::types::NodeStatus::Running,
+            &mut started,
+        ));
+        assert!(mission_launch::lazy_start_phase_for_step(
+            &mission_id,
+            &order[1],
+            crew::types::NodeStatus::Running,
+            &mut started,
+        ));
+        mission_launch::lazy_close_prior_phases(&mission_id, &order, &order[1], &mut closed);
+
+        assert_eq!(
+            phase_status(&mission_id, &order[0]),
+            "running",
+            "genuinely live work is left for finalize to reconcile with full information"
+        );
+    }
+
     /// (#1432 item 2) The review launcher's mint path threads each phase's
     /// `display_name` from the embedded review config onto the persisted
     /// `Phase` — so the most-viewed mission kind shows "Investigate" /

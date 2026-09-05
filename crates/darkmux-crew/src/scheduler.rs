@@ -261,6 +261,42 @@ fn dependency_satisfies_run_on(dep_status: NodeStatus, run_on: &[String]) -> boo
     }
 }
 
+/// (#2310 fix-loop C3 / S4-3) The step of `task` whose own outcome MADE
+/// the task's derived status what it is — the step whose `output` is the
+/// honest thing to forward to a downstream dependent:
+/// - `Complete` → the LAST step (the task's final product; unchanged from
+///   the pre-fix `step_ids.last()` rule, which is why every default-
+///   `run_on` consumer sees byte-identical inputs).
+/// - `Error` → the FIRST errored step (`task_status` reads `Error` off
+///   ANY errored step, so that step IS the cause; the task's later steps
+///   are `Planned` forever by `step_is_ready`'s intra-task rule).
+/// - `Abandoned` → the first abandoned step carrying output, which
+///   `cascade_abandon` wrote as the ORIGIN's `"<step-id>: <reason>"` — so
+///   the true root cause travels one more hop without re-wrapping.
+/// - `Planned`/`Running` → `None` (nothing terminal to forward).
+fn terminal_source_step<'a>(
+    task: &Task,
+    status: NodeStatus,
+    steps: &'a BTreeMap<String, Step>,
+) -> Option<&'a Step> {
+    let of = |id: &String| steps.get(id);
+    match status {
+        NodeStatus::Complete => task.step_ids.last().and_then(of),
+        NodeStatus::Error => {
+            task.step_ids.iter().filter_map(of).find(|s| s.status == NodeStatus::Error)
+        }
+        NodeStatus::Abandoned => task
+            .step_ids
+            .iter()
+            .filter_map(of)
+            .find(|s| s.status == NodeStatus::Abandoned && s.output.is_some())
+            .or_else(|| {
+                task.step_ids.iter().filter_map(of).find(|s| s.status == NodeStatus::Abandoned)
+            }),
+        NodeStatus::Planned | NodeStatus::Running => None,
+    }
+}
+
 // ─── Input gathering (#1341 — Task-aware) ──────────────────────────────
 
 /// The `input` map `step`'s job should receive:
@@ -327,12 +363,21 @@ pub fn gather_inputs(
         .chain(task.reads.iter())
         .filter_map(|dep_task_id| {
             let dep_task = tasks.get(dep_task_id)?;
-            let last_step_id = dep_task.step_ids.last()?;
-            let last_step = steps.get(last_step_id)?;
-            if !dependency_satisfies_run_on(last_step.status, &task.run_on) {
+            // (#2310 fix-loop C3 / S4-3 / #2352 item 2) Keyed on the
+            // dependency TASK's derived status and on the step that MADE it
+            // terminal — not on `step_ids.last()`. For a multi-step task
+            // whose FIRST step errored, the last step is still `Planned`
+            // (`step_is_ready`'s intra-task rule guarantees it can never
+            // run), so the old `last()` lookup forwarded nothing at all and
+            // a `run_on: ["error"]` dependent ran with an EMPTY view of why
+            // — the one thing the reason-forwarding contract above exists
+            // to prevent.
+            let dep_status = task_status(dep_task, steps);
+            if !dependency_satisfies_run_on(dep_status, &task.run_on) {
                 return None;
             }
-            last_step.output.clone().map(|output| (dep_task_id.clone(), output))
+            let src = terminal_source_step(dep_task, dep_status, steps)?;
+            src.output.clone().map(|output| (dep_task_id.clone(), output))
         })
         .collect();
 
@@ -1195,6 +1240,28 @@ fn cascade_abandon(
     steps: &mut BTreeMap<String, Step>,
     persist: &mut dyn FnMut(&Step),
 ) {
+    cascade_abandon_with_reason(
+        errored_task_id,
+        &format!("{origin_step_id}: {origin_reason}"),
+        tasks,
+        steps,
+        persist,
+    );
+}
+
+/// [`cascade_abandon`]'s body, taking the ALREADY-COMPOSED reason text
+/// rather than an `(origin step id, message)` pair — so a second entry
+/// point ([`cascade_dead_dependents`], #2310 fix-loop C1) can propagate a
+/// reason it recovered from an already-abandoned task's own `Step.output`
+/// without re-wrapping it into a second `"<id>: <id>: <text>"` prefix.
+/// One composition site, one shape.
+fn cascade_abandon_with_reason(
+    errored_task_id: &str,
+    reason: &str,
+    tasks: &BTreeMap<String, Task>,
+    steps: &mut BTreeMap<String, Step>,
+    persist: &mut dyn FnMut(&Step),
+) {
     let at = now_unix();
     // (#2310 P4a review fix M1) Every step this cascade abandons — no
     // matter how many hops from `errored_task_id` — gets the SAME output
@@ -1210,7 +1277,6 @@ fn cascade_abandon(
     // a caller with only a gathered `input` map (no `report`/`steps`
     // access) can recover an IDENTICALLY SHAPED reason from this text
     // alone.
-    let reason = format!("{origin_step_id}: {origin_reason}");
     let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     queue.push_back(errored_task_id.to_string());
     while let Some(tid) = queue.pop_front() {
@@ -1240,7 +1306,7 @@ fn cascade_abandon(
                     if s.status == NodeStatus::Planned {
                         s.status = NodeStatus::Abandoned;
                         s.completed_ts = Some(at);
-                        s.output = Some(reason.clone());
+                        s.output = Some(reason.to_string());
                         persist(s);
                     }
                 }
@@ -1248,6 +1314,119 @@ fn cascade_abandon(
             queue.push_back(dep_id);
         }
     }
+}
+
+/// (#2310 fix-loop C1 / S4-2) Run [`cascade_abandon`]'s rule over the
+/// WHOLE minted graph handed in — every task that has already reached
+/// `Error` or `Abandoned` starts a walk over its dependents, right now.
+///
+/// **Why this exists as a separate entry point.** `cascade_abandon` fires
+/// from `apply_step_terminal`, i.e. INSIDE a `run_step_graph` call, over
+/// exactly the `tasks` map that call was given. Since #2300 the generic
+/// launcher calls `run_step_graph` ONCE PER PHASE with a cumulative map
+/// holding only the phases entered SO FAR — so a dependent living in a
+/// LATER phase is not in the map when its dependency dies, the walk cannot
+/// reach it, and it is left `Planned`. Two things then go wrong at once:
+/// the leftover step never reaches a terminal status (a Finalized mission
+/// persisting `Planned` steps — S4-1), and a task whose own `run_on`
+/// accepts `"error"` never becomes ready either, because
+/// [`dependency_satisfies_run_on`] correctly refuses a still-`Planned`
+/// dependency — so the ONE declaration a config author writes to keep a
+/// delivery/report task alive across a failure was inert for every edge
+/// that crosses a phase boundary, which in `review-v2.json` and
+/// `crawl.json` is every edge there is.
+///
+/// The caller runs this at PHASE ENTRY, once the phase's tasks and steps
+/// have been merged into the cumulative maps and before that phase's
+/// `run_step_graph` — the moment the newly-visible dependents first
+/// exist. Idempotent: a task already terminal is skipped by the walk, so
+/// calling it every phase re-walks nothing.
+///
+/// The RULE itself stays here, in `scheduler.rs`, rather than being
+/// re-derived by the launcher: same `run_on` acceptance, same
+/// `"<origin-step-id>: <origin reason>"` output text, same persist hook,
+/// same no-new-flow-record contract (`STEP_LIFECYCLE_ACTIONS` stays three
+/// strings — see `cascade_abandon`'s doc).
+pub fn cascade_dead_dependents(
+    tasks: &BTreeMap<String, Task>,
+    steps: &mut BTreeMap<String, Step>,
+    persist: &mut dyn FnMut(&Step),
+) {
+    // Snapshot the dead set BEFORE mutating, so a task this pass abandons
+    // is not itself re-walked with a reason it only just acquired — the
+    // walk already reaches everything downstream of it.
+    let dead: Vec<(String, String)> = tasks
+        .values()
+        .filter_map(|task| {
+            let status = task_status(task, steps);
+            if !matches!(status, NodeStatus::Error | NodeStatus::Abandoned) {
+                return None;
+            }
+            let src = terminal_source_step(task, status, steps)?;
+            let reason = match status {
+                // An already-abandoned task's own output IS the origin
+                // text (`cascade_abandon` wrote it) — forward it verbatim.
+                NodeStatus::Abandoned => src.output.clone()?,
+                _ => format!("{}: {}", src.id, src.output.clone().unwrap_or_default()),
+            };
+            Some((task.id.clone(), reason))
+        })
+        .collect();
+    for (task_id, reason) in dead {
+        cascade_abandon_with_reason(&task_id, &reason, tasks, steps, persist);
+    }
+}
+
+/// (#2310 fix-loop C2 / S4-1) Roll every still-`Planned` step of the named
+/// tasks to `Abandoned` — the in-memory twin of
+/// `lifecycle::reconcile_phase_steps_terminal`, run by the launcher the
+/// moment a phase's `run_step_graph` returns.
+///
+/// A step of a phase whose scheduler pass has ENDED and is still `Planned`
+/// can never run: its owning task either errored (its own later steps are
+/// stranded by `step_is_ready`'s intra-task rule — deliberately NOT the
+/// cascade's domain, see `cascade_abandon`'s doc) or its dependency chain
+/// holds a status its `run_on` refuses. Leaving it `Planned` is what let a
+/// Finalized mission persist non-terminal steps: the launcher's end-of-run
+/// bulk save wrote the stale `Planned` back over a phase record that had
+/// already closed around them.
+///
+/// Reason text follows the SAME vocabulary the cascade uses: when the
+/// owning task has an errored step, the stranded step names it
+/// (`"<step-id>: <reason>"`) so the operator reads the real cause off the
+/// step itself; otherwise it gets the plain "never started" line
+/// `reconcile_phase_steps_terminal` uses for the same situation. Returns
+/// the ids it abandoned.
+pub fn abandon_stranded_steps(
+    task_ids: impl IntoIterator<Item = String>,
+    tasks: &BTreeMap<String, Task>,
+    steps: &mut BTreeMap<String, Step>,
+    persist: &mut dyn FnMut(&Step),
+) -> Vec<String> {
+    let at = now_unix();
+    let mut abandoned = Vec::new();
+    for task_id in task_ids {
+        let Some(task) = tasks.get(&task_id) else { continue };
+        let reason = match terminal_source_step(task, NodeStatus::Error, steps) {
+            Some(src) => {
+                format!("{}: {}", src.id, src.output.clone().unwrap_or_default())
+            }
+            None => "not started: the phase's scheduler pass ended before this step ran"
+                .to_string(),
+        };
+        for step_id in task.step_ids.clone() {
+            if let Some(s) = steps.get_mut(&step_id) {
+                if s.status == NodeStatus::Planned {
+                    s.status = NodeStatus::Abandoned;
+                    s.completed_ts = Some(at);
+                    s.output.get_or_insert_with(|| reason.clone());
+                    persist(s);
+                    abandoned.push(step_id);
+                }
+            }
+        }
+    }
+    abandoned
 }
 
 /// The value a `dispatch.internal`/etc. job closure returns through
@@ -1603,6 +1782,161 @@ mod tests {
         step.status = NodeStatus::Running;
         let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into_iter().collect();
         assert_eq!(task_status(&task, &steps), NodeStatus::Running);
+    }
+
+
+    // ─── cross-phase reconcile (#2310 fix-loop C1/C2, S4-1/S4-2) ────────
+
+    /// A two-step Task whose FIRST step errored — the `t-fail` shape:
+    /// `s-fail` Error, `s-after` Planned forever.
+    fn errored_two_step_task(id: &str, deps: &[&str]) -> (Task, Vec<Step>) {
+        let (mut task, first) = task_and_step(id, deps);
+        let mut first = first;
+        first.status = NodeStatus::Error;
+        first.output = Some("command exited with Some(3)".to_string());
+        let mut second = first.clone();
+        second.id = format!("{id}-step-2");
+        second.status = NodeStatus::Planned;
+        second.output = None;
+        second.completed_ts = None;
+        task.step_ids.push(second.id.clone());
+        (task, vec![first, second])
+    }
+
+    fn graph_with(
+        pairs: Vec<(Task, Vec<Step>)>,
+    ) -> (BTreeMap<String, Task>, BTreeMap<String, Step>) {
+        let mut tasks = BTreeMap::new();
+        let mut steps = BTreeMap::new();
+        for (t, ss) in pairs {
+            for s in ss {
+                steps.insert(s.id.clone(), s);
+            }
+            tasks.insert(t.id.clone(), t);
+        }
+        (tasks, steps)
+    }
+
+    fn run_on_error(mut task: Task) -> Task {
+        task.run_on = vec!["complete".to_string(), "error".to_string()];
+        task
+    }
+
+    /// (#2310 fix-loop C1 / S4-2) The rule `run_step_graph`'s own in-pass
+    /// cascade cannot apply across a phase boundary: a dependent that only
+    /// became visible in a LATER phase is abandoned now, with the
+    /// ORIGINATING step's id and reason, and a dependent that accepts
+    /// `"error"` is left alone so it can run.
+    #[test]
+    fn cascade_dead_dependents_reaches_a_dependent_minted_after_the_failure() {
+        let (dead, dead_steps) = errored_two_step_task("t-fail", &[]);
+        let (dep, dep_step) = task_and_step("t-dep", &["t-fail"]);
+        let (chain, chain_step) = task_and_step("t-chain", &["t-dep"]);
+        let (survivor, survivor_step) = task_and_step("t-dep2", &["t-fail"]);
+        let (tasks, mut steps) = graph_with(vec![
+            (dead, dead_steps),
+            (dep, vec![dep_step]),
+            (chain, vec![chain_step]),
+            (run_on_error(survivor), vec![survivor_step]),
+        ]);
+
+        let mut persisted: Vec<String> = Vec::new();
+        cascade_dead_dependents(&tasks, &mut steps, &mut |s| persisted.push(s.id.clone()));
+
+        for id in ["t-dep-step", "t-chain-step"] {
+            assert_eq!(steps[id].status, NodeStatus::Abandoned, "{id}");
+            assert_eq!(
+                steps[id].output.as_deref(),
+                Some("t-fail-step: command exited with Some(3)"),
+                "{id} must carry the ORIGINATING step's id and reason verbatim"
+            );
+        }
+        // Accepts `"error"` — untouched, and the walk stops there.
+        assert_eq!(steps["t-dep2-step"].status, NodeStatus::Planned);
+        // The errored task's OWN stranded step is never the cascade's
+        // domain (see `cascade_abandon`'s doc) — the phase-exit sweep owns it.
+        assert_eq!(steps["t-fail-step-2"].status, NodeStatus::Planned);
+        assert!(persisted.contains(&"t-dep-step".to_string()), "{persisted:?}");
+    }
+
+    /// Idempotent: a second pass over an already-cascaded graph re-walks a
+    /// now-`Abandoned` task without re-wrapping its reason into
+    /// `"<id>: <id>: <text>"` — the launcher calls this at EVERY phase entry.
+    #[test]
+    fn cascade_dead_dependents_is_idempotent_and_never_double_wraps_the_reason() {
+        let (dead, dead_steps) = errored_two_step_task("t-fail", &[]);
+        let (dep, dep_step) = task_and_step("t-dep", &["t-fail"]);
+        let (chain, chain_step) = task_and_step("t-chain", &["t-dep"]);
+        let (tasks, mut steps) =
+            graph_with(vec![(dead, dead_steps), (dep, vec![dep_step]), (chain, vec![chain_step])]);
+
+        cascade_dead_dependents(&tasks, &mut steps, &mut |_| {});
+        let after_first = steps["t-chain-step"].output.clone();
+        cascade_dead_dependents(&tasks, &mut steps, &mut |_| {});
+        assert_eq!(steps["t-chain-step"].output, after_first);
+        assert_eq!(
+            after_first.as_deref(),
+            Some("t-fail-step: command exited with Some(3)"),
+            "an already-Abandoned task forwards its origin text as-is"
+        );
+    }
+
+    /// (#2310 fix-loop C2 / S4-1) The phase-exit sweep terminalizes a
+    /// stranded step and names the task's own failure as the reason.
+    #[test]
+    fn abandon_stranded_steps_terminalizes_the_errored_tasks_leftover_step() {
+        let (dead, dead_steps) = errored_two_step_task("t-fail", &[]);
+        let (ok, mut ok_step) = task_and_step("t-ok", &[]);
+        ok_step.status = NodeStatus::Complete;
+        let (tasks, mut steps) = graph_with(vec![(dead, dead_steps), (ok, vec![ok_step])]);
+
+        let mut persisted: Vec<String> = Vec::new();
+        let abandoned = abandon_stranded_steps(
+            ["t-fail".to_string(), "t-ok".to_string()],
+            &tasks,
+            &mut steps,
+            &mut |s| persisted.push(s.id.clone()),
+        );
+
+        assert_eq!(abandoned, vec!["t-fail-step-2".to_string()]);
+        assert_eq!(steps["t-fail-step-2"].status, NodeStatus::Abandoned);
+        assert_eq!(
+            steps["t-fail-step-2"].output.as_deref(),
+            Some("t-fail-step: command exited with Some(3)")
+        );
+        // A completed step is untouched, and nothing else is persisted.
+        assert_eq!(steps["t-ok-step"].status, NodeStatus::Complete);
+        assert_eq!(persisted, vec!["t-fail-step-2".to_string()]);
+    }
+
+    /// (#2310 fix-loop C3 / S4-3 / #2352 item 2) The reason reaches a
+    /// `run_on: ["error"]` dependent even though the errored task's LAST
+    /// step is the one that never ran.
+    #[test]
+    fn gather_inputs_forwards_the_errored_step_not_the_never_run_last_step() {
+        let (dead, dead_steps) = errored_two_step_task("t-fail", &[]);
+        let (dep, dep_step) = task_and_step("t-dep2", &["t-fail"]);
+        let dep = run_on_error(dep);
+        let (tasks, steps) = graph_with(vec![(dead, dead_steps), (dep, vec![dep_step])]);
+
+        let inputs = gather_inputs(&steps["t-dep2-step"], &tasks["t-dep2"], &tasks, &steps);
+        assert_eq!(
+            inputs.get("t-fail").map(String::as_str),
+            Some("command exited with Some(3)"),
+            "got {inputs:?}"
+        );
+    }
+
+    /// The default-`run_on` case is byte-identical to pre-fix behavior: a
+    /// dead dependency forwards nothing at all.
+    #[test]
+    fn gather_inputs_default_run_on_still_forwards_nothing_from_a_dead_dependency() {
+        let (dead, dead_steps) = errored_two_step_task("t-fail", &[]);
+        let (dep, dep_step) = task_and_step("t-dep", &["t-fail"]);
+        let (tasks, steps) = graph_with(vec![(dead, dead_steps), (dep, vec![dep_step])]);
+
+        let inputs = gather_inputs(&steps["t-dep-step"], &tasks["t-dep"], &tasks, &steps);
+        assert!(inputs.is_empty(), "got {inputs:?}");
     }
 
     // ─── step_is_ready ──────────────────────────────────────────────

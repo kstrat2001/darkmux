@@ -234,7 +234,13 @@ fn relative_age(now: u64, then: u64) -> String {
 /// with an open phase is no longer a reachable state to detect. (Its `phase
 /// complete`/`phase abandon` reconcile hints went with the retired `phase`
 /// family; the surviving hints point at `mission finalize` / `mission abort`.)
-fn detect_drift(m: &Mission, phases: &[&Phase], now: u64, stale_days: u64) -> Vec<Drift> {
+fn detect_drift(
+    m: &Mission,
+    phases: &[&Phase],
+    live_steps: &BTreeMap<String, Vec<String>>,
+    now: u64,
+    stale_days: u64,
+) -> Vec<Drift> {
     let mut out = Vec::new();
     let open: Vec<&&Phase> = phases.iter().filter(|s| !is_terminal(s.status)).collect();
     let complete = phases.iter().filter(|s| s.status == PhaseStatus::Complete).count();
@@ -257,7 +263,113 @@ fn detect_drift(m: &Mission, phases: &[&Phase], now: u64, stale_days: u64) -> Ve
     }
 
     out.extend(unreachable_phase_drifts(m, phases));
+    out.extend(live_step_drifts(m, phases, live_steps));
 
+    out
+}
+
+/// (#2310 fix-loop C4 / S4-C4) Drift BELOW the phase level: a step left
+/// `Planned`/`Running` under a phase — or a mission — that has already
+/// reached a terminal status.
+///
+/// Every check above stops at the phase, which is why the board reported
+/// "clean" through the whole S4-1/S4-2 class: a Finalized mission whose p2
+/// read `Complete` on disk while four of its steps were still `Planned`
+/// passed every phase-level rule there was. Both halves of that
+/// contradiction are now named, because they are reconciled differently in
+/// principle even though one command fixes both today: a terminal PHASE
+/// holding a live step means the phase closed around work it never
+/// accounted for (the #1504 reconcile did not run, or ran before the step
+/// existed on disk); a terminal MISSION holding one means the whole run
+/// closed over it. A SIGKILLed run leaves exactly this shape too.
+///
+/// `live_steps` maps a phase id to the ids of its non-terminal steps —
+/// passed in rather than loaded here so this function stays IO-free and
+/// unit-testable against a hand-built board, the same discipline the rest
+/// of this module's drift rules follow.
+fn live_step_drifts(
+    m: &Mission,
+    phases: &[&Phase],
+    live_steps: &BTreeMap<String, Vec<String>>,
+) -> Vec<Drift> {
+    let mut out = Vec::new();
+    let mission_terminal =
+        matches!(m.status, MissionStatus::Finalized | MissionStatus::Aborted);
+
+    let mut in_terminal_phase: Vec<String> = Vec::new();
+    let mut under_terminal_mission: Vec<String> = Vec::new();
+    for phase in phases {
+        let Some(ids) = live_steps.get(phase.id.as_str()) else { continue };
+        if ids.is_empty() {
+            continue;
+        }
+        if is_terminal(phase.status) {
+            in_terminal_phase.extend(ids.iter().cloned());
+        } else if mission_terminal {
+            // Counted ONCE: a live step under a terminal phase is already
+            // named above, and on a Finalized mission it is the same
+            // instance of the same problem, not two.
+            under_terminal_mission.extend(ids.iter().cloned());
+        }
+    }
+
+    // (#1582) ONE drift per KIND, never one per instance — same rule
+    // `unreachable_phase_drifts` follows: this is one problem with N
+    // instances, and the instances ride `detail`.
+    if !in_terminal_phase.is_empty() {
+        out.push(Drift {
+            kind: "phase-terminal-live-step",
+            detail: format!(
+                "{} step(s) are still Planned/Running under a phase that already reached a                  terminal status: {}",
+                in_terminal_phase.len(),
+                in_terminal_phase.join(", ")
+            ),
+            suggest: vec![format!("darkmux mission finalize {}", m.id)],
+        });
+    }
+    if mission_terminal && !under_terminal_mission.is_empty() {
+        out.push(Drift {
+            kind: "mission-terminal-live-step",
+            detail: format!(
+                "mission is {:?} but {} step(s) are still Planned/Running: {}",
+                m.status,
+                under_terminal_mission.len(),
+                under_terminal_mission.join(", ")
+            ),
+            suggest: vec![format!("darkmux mission finalize {}", m.id)],
+        });
+    }
+    out
+}
+
+/// (#2310 fix-loop C4) The non-terminal step ids of each of `phases`,
+/// keyed by phase id — the input [`live_step_drifts`] judges.
+///
+/// Deliberately loads only where a rule could FIRE: a phase that is itself
+/// terminal, or any phase when the MISSION is terminal. An Active
+/// mission's own Running phase is where live steps are supposed to be, and
+/// reading every one of them on every board render would buy nothing.
+/// Best-effort — a phase whose steps can't be read contributes no entry
+/// rather than a false "clean".
+fn live_steps_for(m: &Mission, phases: &[&Phase]) -> BTreeMap<String, Vec<String>> {
+    let mission_terminal = matches!(m.status, MissionStatus::Finalized | MissionStatus::Aborted);
+    let mut out = BTreeMap::new();
+    for phase in phases {
+        if !(mission_terminal || is_terminal(phase.status)) {
+            continue;
+        }
+        let Ok(steps) = crew::lifecycle::load_steps_for_phase(&m.id, &phase.id) else { continue };
+        let live: Vec<String> = steps
+            .iter()
+            .filter(|s| {
+                matches!(s.status, crew::types::NodeStatus::Planned | crew::types::NodeStatus::Running)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        if !live.is_empty() {
+            out.insert(phase.id.clone(), live);
+        }
+    }
     out
 }
 
@@ -450,7 +562,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
                 running: ss.iter().filter(|s| s.status == PhaseStatus::Running).count(),
                 planned: ss.iter().filter(|s| s.status == PhaseStatus::Planned).count(),
                 abandoned: ss.iter().filter(|s| s.status == PhaseStatus::Abandoned).count(),
-                drifts: detect_drift(m, &ss, now, stale_days),
+                drifts: detect_drift(m, &ss, &live_steps_for(m, &ss), now, stale_days),
                 graph: crew::lifecycle::load_graph_report(&m.id).ok().flatten(),
                 m,
             }
@@ -1832,21 +1944,21 @@ mod tests {
         let m = mission("m1", MissionStatus::Finalized);
         let running = phase("s1", "m1", PhaseStatus::Running);
         let planned = phase("s2", "m1", PhaseStatus::Planned);
-        assert!(detect_drift(&m, &[&running, &planned], 0, 14).is_empty());
+        assert!(detect_drift(&m, &[&running, &planned], &BTreeMap::new(), 0, 14).is_empty());
     }
 
     #[test]
     fn finalized_mission_all_terminal_is_clean() {
         let m = mission("m1", MissionStatus::Finalized);
         let s = phase("s1", "m1", PhaseStatus::Complete);
-        assert!(detect_drift(&m, &[&s], 0, 14).is_empty());
+        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), 0, 14).is_empty());
     }
 
     #[test]
     fn active_mission_all_terminal_suggests_finalize() {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("s1", "m1", PhaseStatus::Complete);
-        let d = detect_drift(&m, &[&s], 0, 14);
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), 0, 14);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].kind, "done-not-finalized");
         assert!(d[0].suggest[0].contains("mission finalize m1"));
@@ -1857,7 +1969,7 @@ mod tests {
         // Work in flight is normal, not drift.
         let m = mission("m1", MissionStatus::Active);
         let s = phase("s1", "m1", PhaseStatus::Running);
-        assert!(detect_drift(&m, &[&s], 0, 14).is_empty());
+        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), 0, 14).is_empty());
     }
 
     #[test]
@@ -1865,13 +1977,13 @@ mod tests {
         // All terminal but nothing COMPLETE → not "done", don't nag to close.
         let m = mission("m1", MissionStatus::Active);
         let s = phase("s1", "m1", PhaseStatus::Abandoned);
-        assert!(detect_drift(&m, &[&s], 0, 14).is_empty());
+        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), 0, 14).is_empty());
     }
 
     #[test]
     fn mission_with_no_phases_is_clean() {
         let m = mission("m1", MissionStatus::Active);
-        assert!(detect_drift(&m, &[], 0, 14).is_empty());
+        assert!(detect_drift(&m, &[], &BTreeMap::new(), 0, 14).is_empty());
     }
 
     // ─── stale-active (#1230 Packet 5) ─────────────────────────────────
@@ -1882,7 +1994,7 @@ mod tests {
         m.started_ts = Some(0);
         // No phases at all — zero complete either way.
         let now = 15 * 86_400; // 15 days later
-        let d = detect_drift(&m, &[], now, 14);
+        let d = detect_drift(&m, &[], &BTreeMap::new(), now, 14);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].kind, "stale-active");
         assert!(d[0].detail.contains("15 day"));
@@ -1898,7 +2010,7 @@ mod tests {
     fn stale_active_actionable_commands_are_each_their_own_suggestion() {
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
-        let d = detect_drift(&m, &[], 15 * 86_400, 14);
+        let d = detect_drift(&m, &[], &BTreeMap::new(), 15 * 86_400, 14);
         let stale = d.iter().find(|dr| dr.kind == "stale-active").expect("stale-active drift");
 
         for want in ["darkmux mission abort m1", "darkmux mission finalize m1"] {
@@ -1924,7 +2036,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
         let now = 5 * 86_400; // only 5 days in — under the 14-day default
-        assert!(detect_drift(&m, &[], now, 14).is_empty());
+        assert!(detect_drift(&m, &[], &BTreeMap::new(), now, 14).is_empty());
     }
 
     #[test]
@@ -1933,7 +2045,7 @@ mod tests {
         // staleness, fails closed rather than flagging.
         let m = mission("m1", MissionStatus::Active);
         assert!(m.started_ts.is_none());
-        assert!(detect_drift(&m, &[], 999 * 86_400, 14).is_empty());
+        assert!(detect_drift(&m, &[], &BTreeMap::new(), 999 * 86_400, 14).is_empty());
     }
 
     #[test]
@@ -1943,10 +2055,72 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
         let s = phase("s1", "m1", PhaseStatus::Complete);
-        let d = detect_drift(&m, &[&s], 30 * 86_400, 14);
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), 30 * 86_400, 14);
         // `done-not-finalized` fires (all terminal + complete>0), but NOT
         // `stale-active`.
         assert!(!d.iter().any(|dr| dr.kind == "stale-active"));
+    }
+
+    // ─── step-level drift (#2310 fix-loop C4 / S4-C4) ──────────────────
+
+    /// The S4-1 board shape, hand-built: a Finalized mission whose phase
+    /// closed `Complete` while steps under it were still `Planned`. Before
+    /// this rule the board printed "board is clean, drift: []" for exactly
+    /// this — every check stopped at the phase.
+    #[test]
+    fn terminal_phase_holding_a_non_terminal_step_drifts() {
+        let done = phase("p2", "m1", PhaseStatus::Complete);
+        let mut m = mission("m1", MissionStatus::Finalized);
+        m.phase_ids = vec!["p2".to_string()];
+        let live = BTreeMap::from([(
+            "p2".to_string(),
+            vec!["s-dep".to_string(), "s-chain".to_string()],
+        )]);
+
+        let d = detect_drift(&m, &[&done], &live, 0, 14);
+        let hit = d
+            .iter()
+            .find(|dr| dr.kind == "phase-terminal-live-step")
+            .unwrap_or_else(|| panic!("no step-level drift: {:?}", d.iter().map(|x| x.kind).collect::<Vec<_>>()));
+        assert!(hit.detail.contains("s-dep") && hit.detail.contains("s-chain"), "{}", hit.detail);
+        assert!(hit.suggest.iter().any(|c| c.contains("mission finalize m1")), "{:?}", hit.suggest);
+    }
+
+    /// The SIGKILL shape: the mission closed but a phase it left open still
+    /// holds live steps. Named as a MISSION-level contradiction, distinct
+    /// from the phase-level one above.
+    #[test]
+    fn terminal_mission_holding_a_non_terminal_step_drifts() {
+        let open = phase("p1", "m1", PhaseStatus::Running);
+        let mut m = mission("m1", MissionStatus::Aborted);
+        m.phase_ids = vec!["p1".to_string()];
+        let live = BTreeMap::from([("p1".to_string(), vec!["s-1".to_string()])]);
+
+        let d = detect_drift(&m, &[&open], &live, 0, 14);
+        assert!(
+            d.iter().any(|dr| dr.kind == "mission-terminal-live-step" && dr.detail.contains("s-1")),
+            "{:?}",
+            d.iter().map(|x| x.kind).collect::<Vec<_>>()
+        );
+        // Not double-counted as the phase-level kind — the phase is Running.
+        assert!(!d.iter().any(|dr| dr.kind == "phase-terminal-live-step"));
+    }
+
+    /// An Active mission's Running phase with live steps is exactly where
+    /// live steps belong — no drift.
+    #[test]
+    fn live_steps_under_a_running_phase_of_an_active_mission_are_not_drift() {
+        let open = phase("p1", "m1", PhaseStatus::Running);
+        let mut m = mission("m1", MissionStatus::Active);
+        m.phase_ids = vec!["p1".to_string()];
+        let live = BTreeMap::from([("p1".to_string(), vec!["s-1".to_string()])]);
+
+        let d = detect_drift(&m, &[&open], &live, 0, 14);
+        assert!(
+            !d.iter().any(|dr| dr.kind.ends_with("live-step")),
+            "{:?}",
+            d.iter().map(|x| x.kind).collect::<Vec<_>>()
+        );
     }
 
     // ─── unreachable-phase (#1230 Packet 5) ────────────────────────────
@@ -1962,7 +2136,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = vec!["dead".to_string(), "blocked".to_string()];
 
-        let d = detect_drift(&m, &[&dead, &blocked], 0, 14);
+        let d = detect_drift(&m, &[&dead, &blocked], &BTreeMap::new(), 0, 14);
         // (#1463 CONSIDER 5) The suggestion must scope the teardown to the ONE
         // blocked phase (`--phase blocked`), not a bare whole-mission abort that
         // would abandon every healthy phase too.
@@ -1985,7 +2159,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = ["dead", "blocked-a", "blocked-b"].map(String::from).to_vec();
 
-        let d = detect_drift(&m, &[&dead, &a, &b], 0, 14);
+        let d = detect_drift(&m, &[&dead, &a, &b], &BTreeMap::new(), 0, 14);
         let un: Vec<_> = d.iter().filter(|dr| dr.kind == "unreachable-phase").collect();
         assert_eq!(un.len(), 1, "two blocked siblings must not repeat the rationale twice");
 
@@ -2026,7 +2200,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = ["healthy", "dead", "blocked"].map(String::from).to_vec();
 
-        let d = detect_drift(&m, &[&healthy, &dead, &blocked], 0, 14);
+        let d = detect_drift(&m, &[&healthy, &dead, &blocked], &BTreeMap::new(), 0, 14);
         let un = d.iter().find(|dr| dr.kind == "unreachable-phase").expect("unreachable drift");
         assert!(un.detail.contains("ends the WHOLE mission"), "caveat missing: {}", un.detail);
         assert!(
@@ -2060,7 +2234,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = ["dead", "in-flight", "blocked"].map(String::from).to_vec();
 
-        let d = detect_drift(&m, &[&dead, &running, &blocked], 0, 14);
+        let d = detect_drift(&m, &[&dead, &running, &blocked], &BTreeMap::new(), 0, 14);
         let un = d.iter().find(|dr| dr.kind == "unreachable-phase").expect("unreachable drift");
         assert!(
             un.detail.contains("1 phase that can still run"),
@@ -2080,7 +2254,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = vec!["done".to_string(), "next".to_string()];
 
-        let d = detect_drift(&m, &[&done, &next], 0, 14);
+        let d = detect_drift(&m, &[&done, &next], &BTreeMap::new(), 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
     }
 
@@ -2093,7 +2267,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = vec!["dead".to_string(), "done".to_string()];
 
-        let d = detect_drift(&m, &[&dead, &done], 0, 14);
+        let d = detect_drift(&m, &[&dead, &done], &BTreeMap::new(), 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
     }
 
@@ -2148,7 +2322,7 @@ mod tests {
             vec![&runtime_capture, &file_match, &sovereignty_verbs, &validate_cure];
 
         let now = now_unix(); // real elapsed time since the real started_ts
-        let d = detect_drift(&m, &phases, now, 14);
+        let d = detect_drift(&m, &phases, &BTreeMap::new(), now, 14);
 
         assert!(
             d.iter().any(|dr| dr.kind == "stale-active"),
