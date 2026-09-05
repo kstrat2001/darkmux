@@ -2609,6 +2609,35 @@
         /// `telemetry.process` filling the newest 10k window, and the
         /// matching `dispatch.complete` at the very end.
         #[tokio::test]
+        async fn flow_file_read_caps_the_bookend_ring_too() {
+            // (#2410 review) The bookend keep-list is a ring under the same
+            // cap, not an unbounded Vec — a crash-looping producer that fires
+            // a bookend per second must not scale this read with the file.
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            let total = MAX_FLOW_FILE_RECORDS + 50;
+            let mut buf = String::with_capacity(total * 70);
+            for i in 0..total {
+                buf.push_str(&format!(
+                    r#"{{"ts":"{today}T00:00:00Z","action":"dispatch.start","session_id":"s{i}","n":{i}}}"#
+                ));
+                buf.push('\n');
+            }
+            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+
+            let records = read_flow_records_from_file(&today, tmp.path()).await;
+
+            assert_eq!(records.len(), MAX_FLOW_FILE_RECORDS, "bookends alone must respect the cap");
+            assert_eq!(
+                records.first().unwrap()["n"].as_u64(),
+                Some(50),
+                "the NEWEST bookends are the ones kept: {:?}",
+                records.first()
+            );
+            assert_eq!(records.last().unwrap()["n"].as_u64(), Some((total - 1) as u64));
+        }
+
+        #[tokio::test]
         async fn flow_file_read_keeps_dispatch_start_above_the_cap() {
             let today = today_utc_date();
             let tmp = TempDir::new().unwrap();

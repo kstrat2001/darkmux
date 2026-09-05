@@ -3719,9 +3719,11 @@ fn read_flow_records_from_redis(
 /// liveness) requires that liveness surfaces key on these bookends, and
 /// that supplementary vocabularies (here, high-cadence `telemetry.process`
 /// / `dispatch.turn.heartbeat` / `machine.telemetry`) never evict them. A
-/// live day file measured ~118 bookends against 56,829 total records — the
-/// unconditional bookend keep-list stays a small, bounded addition (~100-200
-/// records/day), not a second unbounded read.
+/// live day file measured ~118 bookends against 56,829 total records. The
+/// bookend keep-list is its OWN ring under this same cap (newest kept), so
+/// the read stays constant-bounded even when a crash-looping producer emits
+/// a `dispatch error` bookend every second — #900's bound, not a second
+/// unbounded read.
 const MAX_FLOW_FILE_RECORDS: usize = 10_000;
 
 /// Parse `<flows_dir>/<date>.jsonl` into a Vec of JSON values, keeping every
@@ -3766,7 +3768,14 @@ async fn read_flow_records_from_file(
         std::collections::VecDeque::with_capacity(MAX_FLOW_FILE_RECORDS.min(1024));
     // (#2409) Every dispatch-liveness bookend, kept unconditionally
     // regardless of the ring's cap — see the function doc comment above.
-    let mut bookends: Vec<(u64, serde_json::Value)> = Vec::new();
+    // (#2410 review) A SECOND ring, not an unbounded Vec: a crash-looping
+    // producer fires the `dispatch error` RAII bookend on every abnormal
+    // exit (~86k/day at one restart per second), and #900's whole point was
+    // that this read must not scale with the day file. Same cap, same
+    // pop-front rule — a real day has a few hundred bookends and never
+    // notices.
+    let mut bookends: std::collections::VecDeque<(u64, serde_json::Value)> =
+        std::collections::VecDeque::new();
     // (#2409) Monotonic file-order position of each successfully-parsed
     // line, so the ring and the bookend list — each individually sorted by
     // construction — can be merged back into one file-order sequence
@@ -3831,7 +3840,7 @@ async fn read_flow_records_from_file(
 fn push_flow_line(
     line: &[u8],
     ring: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
-    bookends: &mut Vec<(u64, serde_json::Value)>,
+    bookends: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
     next_index: &mut u64,
 ) {
     let s = match std::str::from_utf8(line) {
@@ -3852,7 +3861,10 @@ fn push_flow_line(
         || darkmux_flow::is_dispatch_complete(action)
         || darkmux_flow::is_dispatch_error(action)
     {
-        bookends.push((index, v));
+        if bookends.len() >= MAX_FLOW_FILE_RECORDS {
+            bookends.pop_front();
+        }
+        bookends.push_back((index, v));
         return;
     }
 
@@ -3869,7 +3881,7 @@ fn push_flow_line(
 /// not a full re-sort.
 fn merge_ring_and_bookends(
     ring: std::collections::VecDeque<(u64, serde_json::Value)>,
-    bookends: Vec<(u64, serde_json::Value)>,
+    bookends: std::collections::VecDeque<(u64, serde_json::Value)>,
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::with_capacity(ring.len() + bookends.len());
     let mut ring_iter = ring.into_iter().peekable();
