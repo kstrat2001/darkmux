@@ -1704,41 +1704,58 @@ fn build_hooks_check(
     out
 }
 
-/// (#1876/#1877) Informational: the review pipeline's judge-stage
-/// remote-budget exhaustion policy. Always `Pass` (it's a two-value operator
-/// preference, not a health signal) — surfaces the resolved value with
-/// provenance so an operator who set the strict knob (or is wondering why
-/// they DIDN'T) doesn't have to go read `config.json`/env by hand. Mirrors
-/// `check_fleet_mode`'s provenance-display shape.
+/// (#1876/#1877; #2310 P4d) The `review{}` config block's judge knobs —
+/// `judge_fail_on_any_skip` and `judge_concurrency` — are INERT. They
+/// governed the retired review funnel's judge stage; that pipeline, its ten
+/// step kinds and its launcher were deleted in #2310 P4d, and today's
+/// `review` mission has no judge stage for either knob to reach. The keys
+/// still LOAD (config is lenient on read, so an existing `config.json` is
+/// never bricked by them) — which is exactly why an operator needs to be
+/// told here rather than left believing a setting is doing something.
+///
+/// `Warn` only when one is actually SET; a machine that never set them has
+/// nothing to act on and gets a `Pass` saying so.
 fn check_review_judge_exhaustion_policy() -> Check {
-    let name = "review.judge_fail_on_any_skip";
+    let name = "review.judge_* (inert)";
     let env_set = std::env::var("DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP")
         .ok()
         .is_some_and(|s| !s.trim().is_empty());
-    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
-        .review
-        .and_then(|r| r.judge_fail_on_any_skip)
-        .is_some();
-    let provenance = if env_set {
-        "from DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP env"
-    } else if cfg_set {
-        "from config.json"
-    } else {
-        "default"
-    };
-    let strict = darkmux_types::config_access::review_judge_fail_on_any_skip();
-    let message = if strict {
-        format!(
-            "strict ({provenance}) — ANY judge-stage remote-token skip degrades the whole review \
-             run, even when most flags were judged"
-        )
-    } else {
-        format!(
-            "partial ({provenance}) — a judge-stage remote-token skip renders the flags that WERE \
-             judged, with a banner naming the shortfall; only a run with zero usable rulings degrades"
-        )
-    };
-    Check { name: name.into(), status: Status::Pass, message, hint: None }
+    let review = darkmux_types::config::DarkmuxConfig::load_resolved().review;
+    let skip_set = review.as_ref().and_then(|r| r.judge_fail_on_any_skip).is_some();
+    let concurrency_set = review.as_ref().and_then(|r| r.judge_concurrency).is_some();
+    if !env_set && !skip_set && !concurrency_set {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: "not set — nothing reads these keys since the review funnel retired (#2310 P4d)"
+                .into(),
+            hint: None,
+        };
+    }
+    let mut set: Vec<&str> = Vec::new();
+    if env_set {
+        set.push("DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP (env)");
+    }
+    if skip_set {
+        set.push("review.judge_fail_on_any_skip");
+    }
+    if concurrency_set {
+        set.push("review.judge_concurrency");
+    }
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!(
+            "{} is set but has NO effect — the review funnel's judge stage retired in #2310 P4d, \
+             and today's `review` mission has no judge stage to configure",
+            set.join(", ")
+        ),
+        hint: Some(
+            "remove the key(s) from ~/.darkmux/config.json (and unset the env var) — they are read \
+             leniently and ignored, never applied"
+                .into(),
+        ),
+    }
 }
 
 /// (#2361, swarm S4-4) Informational: the bound on ONE operator-supplied

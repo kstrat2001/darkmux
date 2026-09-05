@@ -538,6 +538,15 @@ pub fn remote_concurrent_cap() -> u32 {
     pick_parsed("DARKMUX_REMOTE_CONCURRENT_CAP", cfg, Some(4)).unwrap()
 }
 // ── Review pipeline (#1349) ──
+/// **(#2310 P4d) INERT.** Nothing reads this any more: the review
+/// funnel's judge stage — its only consumer — was deleted with the
+/// pipeline. The accessor and its config key are kept so an existing
+/// `config.json` still loads, and `darkmux doctor` SAYS the key is inert
+/// (`check_review_judge_exhaustion_policy`) rather than letting a set
+/// value look like it applies. Delete both when the `review{}` block is
+/// retired on a config schema bump. The rest of this doc describes what
+/// it DID:
+///
 /// (#1349) The PR-review pipeline's judge step internal bounded-concurrency
 /// for-each cap. Resolves `env(DARKMUX_REVIEW_JUDGE_CONCURRENCY) >
 /// config.review.judge_concurrency > 1` (fully sequential) — mirrors
@@ -551,6 +560,15 @@ pub fn review_judge_concurrency() -> u32 {
         .unwrap()
         .max(1)
 }
+/// **(#2310 P4d) INERT.** Nothing reads this any more: the review
+/// funnel's judge stage — its only consumer — was deleted with the
+/// pipeline. The accessor and its config key are kept so an existing
+/// `config.json` still loads, and `darkmux doctor` SAYS the key is inert
+/// (`check_review_judge_exhaustion_policy`) rather than letting a set
+/// value look like it applies. Delete both when the `review{}` block is
+/// retired on a config schema bump. The rest of this doc describes what
+/// it DID:
+///
 /// (#1876/#1877) The judge stage's remote-token-budget exhaustion policy —
 /// `true` restores the pre-#1876 "any skip degrades the whole run" behavior;
 /// `false` (the default) treats a skip as a coverage fact, never a verdict,

@@ -226,6 +226,163 @@ pub fn route_command(advertised: &[PanelCommand], cmd: &str) -> Option<RoutePlan
     }
 }
 
+/// (#2310 P4d) The inputs a diff-scoped config needs that an invoked
+/// COMMAND surface (`/review` in the editor panel, `radio "review this"`)
+/// cannot type: the diff itself, and a workspace the planner can read the
+/// post-diff tree through.
+///
+/// **Why this exists.** The bespoke review launcher used to synthesize
+/// `diff_file`/`worktree` for the panel before spawning; it retired with
+/// the funnel, while `review.json` still declares `diff_file` REQUIRED. A
+/// panel invocation therefore has to supply it or the launch bails on a
+/// missing input. Deciding that STRUCTURALLY — does this config declare a
+/// required `diff_file`? — rather than by matching the id `"review"` keeps
+/// a renamed variant working, the same discipline `route_command` follows.
+///
+/// **What it reviews, stated plainly.** The diff is the branch's COMMITTED
+/// work (`git diff <base>..HEAD`, base = the merge-base with the upstream
+/// default branch, else `HEAD~1`), NOT the uncommitted working tree the
+/// retired launcher used to pass. That is forced by the planner's own
+/// contract: `plan.sites`'s diff source reads the post-diff content through
+/// a MATERIALIZED tree ("the tree is the confirmation surface"), and a
+/// materialized checkout is a clone at a ref — it cannot contain
+/// uncommitted work. Reviewing the working tree would hand the rules a diff
+/// whose lines do not exist in the tree they are read against. Uncommitted
+/// changes are reported as excluded rather than silently reviewed.
+pub enum DiffLaunchInputs {
+    /// The config declares no required `diff_file` — nothing to synthesize.
+    NotNeeded,
+    /// A git repo with nothing committed to review against its base.
+    Nothing(String),
+    /// The `--param key=value` values to append, plus the tempdir holding
+    /// the diff + workspace spec.
+    Ready(SynthesizedInputs),
+}
+
+/// The synthesized `--param` values and the tempdir they live in. The
+/// tempdir is removed by [`Drop`] — every exit path, including a `?` out of
+/// the caller and a cancelled subprocess, since the guard is dropped with
+/// the caller's frame.
+pub struct SynthesizedInputs {
+    params: Vec<String>,
+    dir: std::path::PathBuf,
+    /// Non-empty when the working tree carries changes this review does NOT
+    /// cover — surfaced by the caller so the operator is never told a
+    /// review covered work it could not read.
+    pub excluded_note: Option<String>,
+}
+
+impl SynthesizedInputs {
+    /// The `key=value` strings to pass as `--param` arguments.
+    pub fn params(&self) -> &[String] {
+        &self.params
+    }
+}
+
+impl Drop for SynthesizedInputs {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Run `git` in `cwd`, returning trimmed stdout on success.
+fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").args(args).current_dir(cwd).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// See [`DiffLaunchInputs`]. `Err` only for genuine IO failures (the repo
+/// itself missing, an unwritable temp dir) — an empty diff is a
+/// [`DiffLaunchInputs::Nothing`] outcome the caller renders, not an error.
+pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Result<DiffLaunchInputs> {
+    let needs_diff = config
+        .inputs
+        .iter()
+        .any(|i| i.name == "diff_file" && i.required.unwrap_or(true));
+    if !needs_diff {
+        return Ok(DiffLaunchInputs::NotNeeded);
+    }
+    let head = git_out(cwd, &["rev-parse", "HEAD"]).ok_or_else(|| {
+        anyhow::anyhow!(
+            "`{}` needs a diff, and {} is not a git repository with a commit to review",
+            config.id,
+            cwd.display()
+        )
+    })?;
+    // The base to diff against: the merge-base with the remote's default
+    // branch when there is one, else the previous commit. Tried in order,
+    // first hit wins — a fresh clone with no upstream still reviews its
+    // last commit rather than refusing.
+    let base = ["origin/HEAD", "origin/main", "origin/master"]
+        .iter()
+        .find_map(|r| git_out(cwd, &["merge-base", "HEAD", r]))
+        .filter(|b| b != &head)
+        .or_else(|| git_out(cwd, &["rev-parse", "HEAD~1"]))
+        .unwrap_or_else(|| head.clone());
+    let diff = if base == head {
+        String::new()
+    } else {
+        git_out(cwd, &["diff", &format!("{base}..{head}")]).unwrap_or_default()
+    };
+    if diff.trim().is_empty() {
+        return Ok(DiffLaunchInputs::Nothing(format!(
+            "Nothing committed to review in {} (no changes between {} and HEAD).",
+            cwd.display(),
+            &base[..base.len().min(12)]
+        )));
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "darkmux-{}-{}-review",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating the synthesized-input dir {}", dir.display()))?;
+    // Constructed BEFORE the writes below so an error on either one still
+    // drops the guard and removes the directory.
+    let mut synthesized = SynthesizedInputs { params: Vec::new(), dir: dir.clone(), excluded_note: None };
+
+    let diff_path = dir.join("review.diff");
+    std::fs::write(&diff_path, &diff)
+        .with_context(|| format!("writing the synthesized diff {}", diff_path.display()))?;
+
+    // One `path` source at THIS checkout, pinned to the diff's own head —
+    // the same `workspace_spec` shape an operator writes by hand, so the
+    // planner materializes it through exactly one mechanism.
+    let name = cwd.file_name().and_then(|s| s.to_str()).unwrap_or("workspace").to_string();
+    let spec_path = dir.join("workspace.json");
+    let spec = serde_json::json!({
+        "name": name,
+        "sources": [{ "id": name, "path": cwd.to_string_lossy(), "ref": head }],
+    });
+    std::fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)
+        .with_context(|| format!("writing the synthesized workspace spec {}", spec_path.display()))?;
+
+    synthesized.params = vec![
+        format!("diff_file={}", diff_path.display()),
+        format!("workspace={}", spec_path.display()),
+        format!("head_sha={head}"),
+    ];
+    if let Some(dirty) = git_out(cwd, &["status", "--porcelain"]).filter(|s| !s.trim().is_empty()) {
+        let n = dirty.lines().count();
+        synthesized.excluded_note = Some(format!(
+            "{n} uncommitted change{} in this tree {} NOT part of this review — it reads the \
+             committed tree at {}.",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "is" } else { "are" },
+            &head[..head.len().min(12)]
+        ));
+    }
+    Ok(DiffLaunchInputs::Ready(synthesized))
+}
+
 /// `true` iff the config's graph declares at least one step AND every
 /// declared step kind's REGISTRY ID is prefixed `procedural.` — the
 /// ephemeral-vs-mission-launch routing test (rule D). This is a
@@ -1813,4 +1970,163 @@ mod tests {
             }
         }
     }
+
+    // ── (#2310 P4d) diff synthesis for the panel/radio surfaces ────────
+
+    /// A git repo with `n` commits, each adding one line to `src/a.rs`.
+    fn temp_repo(commits: usize) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for i in 0..commits {
+            let mut body = String::new();
+            for k in 0..=i {
+                body.push_str(&format!("fn f{k}() {{}}\n"));
+            }
+            std::fs::write(dir.path().join("src/a.rs"), body).unwrap();
+            run(&["add", "-A"]);
+            run(&["commit", "-q", "-m", &format!("c{i}")]);
+        }
+        dir
+    }
+
+    fn embedded_review() -> MissionConfig {
+        mission_config::load("review").expect("the embedded review config loads").config
+    }
+
+    /// RED before this packet's synthesis existed: the panel typed no
+    /// params, `review.json` declares `diff_file` REQUIRED, and the launch
+    /// bailed on the missing input — `/review` in the editor was broken.
+    #[test]
+    #[serial_test::serial]
+    fn a_diff_scoped_config_gets_its_diff_workspace_and_head_synthesized_from_the_cwd() {
+        let repo = temp_repo(2);
+        let synth = match synthesize_diff_launch_inputs(&embedded_review(), repo.path()).unwrap() {
+            DiffLaunchInputs::Ready(s) => s,
+            other => panic!("expected Ready, got {}", match other {
+                DiffLaunchInputs::NotNeeded => "NotNeeded",
+                DiffLaunchInputs::Nothing(_) => "Nothing",
+                DiffLaunchInputs::Ready(_) => unreachable!(),
+            }),
+        };
+        let by_key = |k: &str| {
+            synth
+                .params()
+                .iter()
+                .find_map(|p| p.strip_prefix(&format!("{k}=")).map(String::from))
+                .unwrap_or_else(|| panic!("no `{k}=` among {:?}", synth.params()))
+        };
+        let diff = std::fs::read_to_string(by_key("diff_file")).expect("the diff file is written");
+        assert!(diff.contains("src/a.rs"), "the synthesized diff must cover the commit: {diff}");
+        let spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(by_key("workspace")).unwrap()).unwrap();
+        let sources = spec["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1, "exactly one source: {spec}");
+        assert_eq!(
+            sources[0]["path"].as_str().unwrap(),
+            repo.path().to_string_lossy(),
+            "the source is a `path` origin at THIS checkout — no clone from a remote: {spec}"
+        );
+        let head = by_key("head_sha");
+        assert_eq!(sources[0]["ref"].as_str().unwrap(), head, "the source is pinned to the diff's head");
+    }
+
+    /// The tempdir is removed when the guard drops — every exit path, since
+    /// the caller holds it for the whole spawn.
+    #[test]
+    #[serial_test::serial]
+    fn dropping_the_synthesized_inputs_removes_their_tempdir() {
+        let repo = temp_repo(2);
+        let dir = match synthesize_diff_launch_inputs(&embedded_review(), repo.path()).unwrap() {
+            DiffLaunchInputs::Ready(s) => {
+                let d = s.params()[0]
+                    .strip_prefix("diff_file=")
+                    .map(|p| std::path::PathBuf::from(p).parent().unwrap().to_path_buf())
+                    .unwrap();
+                assert!(d.exists());
+                d
+            }
+            _ => panic!("expected Ready"),
+        };
+        assert!(!dir.exists(), "the synthesized-input dir must be gone once the guard drops");
+    }
+
+    /// A repo whose HEAD has nothing to review against its base is a
+    /// rendered outcome, never an error or a launch that bails on a
+    /// missing input.
+    #[test]
+    #[serial_test::serial]
+    fn a_repo_with_no_reviewable_commit_reports_nothing_rather_than_launching() {
+        let repo = temp_repo(1);
+        match synthesize_diff_launch_inputs(&embedded_review(), repo.path()).unwrap() {
+            DiffLaunchInputs::Nothing(msg) => assert!(msg.contains("Nothing committed"), "{msg}"),
+            _ => panic!("expected Nothing"),
+        }
+    }
+
+    /// A config that declares no required `diff_file` is untouched — the
+    /// decision is STRUCTURAL, never `id == "review"`.
+    #[test]
+    #[serial_test::serial]
+    fn a_config_without_a_required_diff_file_gets_nothing_synthesized() {
+        let repo = temp_repo(2);
+        let cfg = config(
+            "plain",
+            None,
+            vec![phase("p1", vec![task("t1", &[], &[], vec![step("s1", "dispatch.internal", serde_json::Value::Null)])])],
+        );
+        assert!(matches!(
+            synthesize_diff_launch_inputs(&cfg, repo.path()).unwrap(),
+            DiffLaunchInputs::NotNeeded
+        ));
+    }
+
+    /// The end the operator actually cares about: the params the panel
+    /// synthesizes make `mission launch review --dry-run` resolve every
+    /// input and mint the graph. Stubbed home/profiles/`lms` — no model,
+    /// no network, no mutation of the operator's real state.
+    #[test]
+    #[serial_test::serial]
+    fn the_panel_synthesized_params_dry_run_green() {
+        use assert_cmd::prelude::*;
+        let repo = temp_repo(2);
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("profiles.json"), r#"{"profiles":{},"default_profile":null}"#).unwrap();
+        let synth = match synthesize_diff_launch_inputs(&embedded_review(), repo.path()).unwrap() {
+            DiffLaunchInputs::Ready(s) => s,
+            _ => panic!("expected Ready"),
+        };
+        let mut cmd = std::process::Command::cargo_bin("darkmux").unwrap();
+        cmd.args(["mission", "launch", "review"]);
+        for p in synth.params() {
+            cmd.args(["--param", p]);
+        }
+        let out = cmd
+            .arg("--dry-run")
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", home.path().join("flows"))
+            .env("DARKMUX_PROFILES", home.path().join("profiles.json"))
+            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+            .output()
+            .expect("mission launch review --dry-run runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "dry run must be green.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(stdout.contains("plan.sites"), "the graph must mint the plan steps:\n{stdout}");
+        assert!(
+            !stdout.contains("diff_file") || stdout.contains("diff_file = "),
+            "diff_file must resolve, never be reported missing:\n{stdout}"
+        );
+    }
+
 }

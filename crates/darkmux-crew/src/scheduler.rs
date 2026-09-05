@@ -2315,7 +2315,7 @@ mod tests {
         // ready once its dependency reaches ANY terminal status —
         // `Error` included — not only `Complete`. This is the "still runs
         // the second when it declares run_on error" half of the brief's
-        // two-task test (`review-report-task`'s real-world shape).
+        // two-task test (the review config's delivery task's real-world shape).
         let (task_a, step_a) = step_with_status("a", &[], NodeStatus::Error);
         let (mut task_b, step_b) = task_and_step("b", &["a"]);
         task_b.run_on = vec!["complete".to_string(), "error".to_string()];

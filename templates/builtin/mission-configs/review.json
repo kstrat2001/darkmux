@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "workspace",
-      "description": "Path to a workspace spec JSON naming the checked-out tree at the diff's own head. OPTIONAL (#2310 P4d): when it is absent and both `github` and `head_sha` are present, each `plan-<rule>` step DERIVES a one-source spec itself (git origin = the repository's GitHub URL, ref = `head_sha`) and materializes it through the same `workspace_spec::materialize` path an on-disk spec takes -- which is what lets `.github/workflows/darkmux-review.yml` launch this config from a self-hosted runner that has git credentials but no operator-authored spec. An explicit `workspace` always wins. Must resolve to exactly ONE source either way.",
+      "description": "Path to a workspace spec JSON naming the checked-out tree at the diff's own head. OPTIONAL (#2310 P4d): when it is absent and both `github` and `head_sha` are present, each `plan-<rule>` step DERIVES a one-source spec itself (git origin = the repository's GitHub URL, ref = `head_sha`) and materializes it through the same `workspace_spec::materialize` path an on-disk spec takes -- which is what lets `.github/workflows/darkmux-review.yml` launch this config from a runner with no operator-authored spec. The derived origin is an ANONYMOUS https URL, so the derivation reaches PUBLIC repositories only -- a private repo needs an explicit `workspace` spec whose source names an ssh origin (or an https origin a credential helper on that machine can authenticate). An explicit `workspace` always wins. Must resolve to exactly ONE source either way.",
       "required": false
     },
     {
@@ -32,6 +32,11 @@
     {
       "name": "github",
       "description": "owner/repo — mirrors the frozen `review` config's input. Reaches each `plan-<rule>` step's config but is not yet consumed (no fetch path exists yet — see `plan_sites_step.rs`'s module doc).",
+      "required": false
+    },
+    {
+      "name": "pr",
+      "description": "The pull-request NUMBER this review covers, when the launch knows one (`.github/workflows/darkmux-review.yml` passes its own `pr` input). Reaches every `plan-<rule>` step and decides the DERIVED source's ref: with `pr`, the derived spec names `refs/pull/<pr>/head`; without it, the bare `head_sha`. This is what makes a FORK pull request reviewable at all -- a fork PR's head commit is in no branch of this repository, so a mirror asked for the bare sha fails with git's \"Needed a single revision\". Ignored when an explicit `workspace` is supplied (that spec names its own sources).",
       "required": false
     },
     {
@@ -107,43 +112,43 @@
           "id": "plan-intent-vs-diff",
           "display_name": "Plan: Intent vs diff",
           "description": "Plan the `intent-vs-diff` rule over the diff.",
-          "steps": [{"id": "plan-intent-vs-diff-step", "kind": "plan.sites", "config": {"rule": "intent-vs-diff", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+          "steps": [{"id": "plan-intent-vs-diff-step", "kind": "plan.sites", "config": {"rule": "intent-vs-diff", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}", "pr": "{{pr}}"}}]
         },
         {
           "id": "plan-existing-solution",
           "display_name": "Plan: Existing solution",
           "description": "Plan the `existing-solution` rule over the diff.",
-          "steps": [{"id": "plan-existing-solution-step", "kind": "plan.sites", "config": {"rule": "existing-solution", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+          "steps": [{"id": "plan-existing-solution-step", "kind": "plan.sites", "config": {"rule": "existing-solution", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}", "pr": "{{pr}}"}}]
         },
         {
           "id": "plan-shared-symbol-callers",
           "display_name": "Plan: Shared symbol callers",
           "description": "Plan the `shared-symbol-callers` rule over the diff.",
-          "steps": [{"id": "plan-shared-symbol-callers-step", "kind": "plan.sites", "config": {"rule": "shared-symbol-callers", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+          "steps": [{"id": "plan-shared-symbol-callers-step", "kind": "plan.sites", "config": {"rule": "shared-symbol-callers", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}", "pr": "{{pr}}"}}]
         },
         {
           "id": "plan-union-vs-enum",
           "display_name": "Plan: Union vs enum",
           "description": "Plan the `union-vs-enum` rule over the diff.",
-          "steps": [{"id": "plan-union-vs-enum-step", "kind": "plan.sites", "config": {"rule": "union-vs-enum", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+          "steps": [{"id": "plan-union-vs-enum-step", "kind": "plan.sites", "config": {"rule": "union-vs-enum", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}", "pr": "{{pr}}"}}]
         },
         {
           "id": "plan-test-gap",
           "display_name": "Plan: Test gap",
           "description": "Plan the `test-gap` rule over the diff.",
-          "steps": [{"id": "plan-test-gap-step", "kind": "plan.sites", "config": {"rule": "test-gap", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+          "steps": [{"id": "plan-test-gap-step", "kind": "plan.sites", "config": {"rule": "test-gap", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}", "pr": "{{pr}}"}}]
         },
         {
           "id": "plan-swallowed-error",
           "display_name": "Plan: Swallowed errors",
           "description": "Plan the `swallowed-error` rule over the diff — it declares `scope: [\"tree\",\"diff\"]`.",
-          "steps": [{"id": "plan-swallowed-error-step", "kind": "plan.sites", "config": {"rule": "swallowed-error", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+          "steps": [{"id": "plan-swallowed-error-step", "kind": "plan.sites", "config": {"rule": "swallowed-error", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}", "pr": "{{pr}}"}}]
         },
         {
           "id": "plan-unnamed-predicate",
           "display_name": "Plan: Unnamed predicates",
           "description": "Plan the `unnamed-predicate` rule over the diff — it declares `scope: [\"tree\",\"diff\"]`.",
-          "steps": [{"id": "plan-unnamed-predicate-step", "kind": "plan.sites", "config": {"rule": "unnamed-predicate", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+          "steps": [{"id": "plan-unnamed-predicate-step", "kind": "plan.sites", "config": {"rule": "unnamed-predicate", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}", "pr": "{{pr}}"}}]
         }
       ]
     },

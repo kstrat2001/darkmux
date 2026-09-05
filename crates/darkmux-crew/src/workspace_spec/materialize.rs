@@ -223,6 +223,54 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
     })
 }
 
+/// The refspecs a darkmux mirror fetches, applied idempotently (an
+/// `--add` of a spec already present would duplicate it, and git then
+/// fetches it twice).
+///
+/// - `+refs/heads/*` — branches, force-updated so a rewritten branch
+///   advances. `git clone --bare` does NOT configure this the way a normal
+///   clone does, which is why it is set explicitly.
+/// - `+refs/tags/*` — `+` force-update, same reason: git's default
+///   auto-follow-tags won't move an EXISTING local tag ref that diverged.
+/// - `+refs/pull/*/head` (#2310 P4d) — **the fork-PR fix.** A pull request
+///   from a FORK has no branch in this repository, so its head commit is
+///   reachable only from `refs/pull/<n>/head`. Without this refspec the
+///   mirror never fetches it and the checkout fails with git's opaque
+///   "Needed a single revision" — the reviewer reproduced exactly that
+///   against a fork PR. GitHub serves the namespace read-only; a host that
+///   does not have it simply matches nothing, so this costs nothing
+///   elsewhere.
+fn ensure_fetch_refspecs(mirror_path: &Path, source_id: &str) -> Result<()> {
+    const REFSPECS: [&str; 3] = [
+        "+refs/heads/*:refs/heads/*",
+        "+refs/tags/*:refs/tags/*",
+        "+refs/pull/*/head:refs/pull/*/head",
+    ];
+    let existing = Command::new("git")
+        .current_dir(mirror_path)
+        .args(["config", "--get-all", "remote.origin.fetch"])
+        .output()
+        .with_context(|| format!("reading fetch refspecs for source '{source_id}'"))?;
+    // A mirror with NO refspec configured yet exits non-zero here — an
+    // empty set, not an error.
+    let have: Vec<String> = if existing.status.success() {
+        String::from_utf8_lossy(&existing.stdout).lines().map(|l| l.trim().to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    for spec in REFSPECS {
+        if have.iter().any(|h| h == spec) {
+            continue;
+        }
+        run_git(
+            Some(mirror_path),
+            &["config", "--add", "remote.origin.fetch", spec],
+            &format!("configuring fetch refspec {spec} for source '{source_id}'"),
+        )?;
+    }
+    Ok(())
+}
+
 fn resolve_one(
     source: &SourceSpec,
     mirror_root: &Path,
@@ -288,26 +336,16 @@ fn resolve_one(
             &["clone", "--bare", "--no-hardlinks", "--", origin, &mirror_path.to_string_lossy()],
             &format!("cloning source '{}' ({origin})", source.id),
         )?;
-        // `git clone --bare` does NOT configure `remote.origin.fetch` the
-        // way a normal clone does — configure the refspec explicitly, once,
-        // right after the initial clone, so a later `git fetch --prune
-        // origin` actually advances the mirror's own `refs/heads/*`.
-        run_git(
-            Some(&mirror_path),
-            &["config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"],
-            &format!("configuring fetch refspec for source '{}'", source.id),
-        )?;
-        // A second, `--add`ed refspec for tags — `+` force-update, same as
-        // the branches refspec, so a moved tag advances too (git's default
-        // auto-follow-tags won't move an EXISTING local tag ref that has
-        // diverged).
-        run_git(
-            Some(&mirror_path),
-            &["config", "--add", "remote.origin.fetch", "+refs/tags/*:refs/tags/*"],
-            &format!("configuring tag fetch refspec for source '{}'", source.id),
-        )?;
+        // See `ensure_fetch_refspecs` for what is configured and why.
+        ensure_fetch_refspecs(&mirror_path, &source.id)?;
         bump_fetch_generation(&generation_key);
     } else if fetch && !fetch_is_redundant(gen_before, fetch_generation(&generation_key)) {
+        // (#2310 P4d) An EXISTING mirror is brought up to the current
+        // refspec set before the fetch, not only at clone time — a mirror
+        // cloned before a refspec was added would otherwise never learn it,
+        // and the ref it cannot see fails as "not found" at rev-parse with
+        // no hint that a refspec was the cause.
+        ensure_fetch_refspecs(&mirror_path, &source.id)?;
         run_git(
             Some(&mirror_path),
             &["fetch", "--prune", "--prune-tags", "origin"],
@@ -1021,6 +1059,49 @@ mod tests {
 
     const RW: MaterializeOptions = MaterializeOptions { fetch: true, read_only: false };
     const RO: MaterializeOptions = MaterializeOptions { fetch: true, read_only: true };
+
+
+    /// (#2310 P4d — RED before `ensure_fetch_refspecs` added the pull
+    /// namespace: this failed at rev-parse with git's opaque "Needed a
+    /// single revision", the exact failure the reviewer reproduced against
+    /// a FORK pull request.) A fork PR's head lives in NO branch of the
+    /// reviewed repository — only `refs/pull/<n>/head`. The mirror's fetch
+    /// refspec has to name that namespace, and an EXISTING mirror (cloned
+    /// before the ref was created, which is every real CI run) has to pick
+    /// it up on its next fetch, not only at clone time.
+    #[test]
+    fn a_commit_reachable_only_from_a_pull_ref_resolves_after_a_fetch() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git").current_dir(source.path()).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // First materialize clones the mirror while only `main` exists.
+        let spec = spec_for("pullref-test", workdir.path(), source.path(), "main");
+        materialize(&spec, RO).expect("the initial clone at main materializes");
+
+        // NOW create a commit reachable only from refs/pull/7/head — the
+        // shape of a fork PR: the branch it came from does not exist here.
+        run(&["checkout", "-q", "-b", "tmp-fork-head"]);
+        fs::write(source.path().join("fork.txt"), "from a fork\n").unwrap();
+        run(&["add", "fork.txt"]);
+        run(&["commit", "-q", "-m", "fork head"]);
+        let fork_sha = run(&["rev-parse", "HEAD"]);
+        run(&["update-ref", "refs/pull/7/head", &fork_sha]);
+        run(&["checkout", "-q", "main"]);
+        run(&["branch", "-q", "-D", "tmp-fork-head"]);
+
+        let pull_spec = spec_for("pullref-test", workdir.path(), source.path(), "refs/pull/7/head");
+        let out = materialize(&pull_spec, RO).expect("a pull-ref source materializes");
+        assert_eq!(out.sources[0].sha, fork_sha, "the checkout must be the pull ref's own commit");
+        assert!(
+            out.sources[0].tree.join("fork.txt").exists(),
+            "the materialized tree must carry the fork commit's file"
+        );
+    }
 
     /// (#1959) `Materialized.name`/`.edges` carry the spec's own
     /// `effective_name()`/`edges` verbatim — so a consumer (the crawl

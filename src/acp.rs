@@ -157,11 +157,11 @@
 //! ACP's wire transport IS stdout: `AcpStdio::new()` below wires the
 //! JSON-RPC connection directly to this process's stdin/stdout
 //! (`agent_client_protocol::Stdio`, aliased here to avoid colliding with
-//! `std::process::Stdio`). `darkmux mission launch review` prints its
-//! rendered result to STDOUT (`pr_review::emit_rendered`'s `println!`), so
-//! this file NEVER calls the review pipeline in-process — it always shells
-//! out to a SUBPROCESS (the current executable, re-invoked as
-//! `mission launch review`) with stdout/stderr captured as pipes, and never
+//! `std::process::Stdio`). A launched mission prints its own result to
+//! STDOUT (`deliver.github_review` emits the rendered payload there when
+//! `emit` is `-`), so this file NEVER runs a mission in-process — it always
+//! shells out to a SUBPROCESS (the current executable, re-invoked as
+//! `mission launch <id>`) with stdout/stderr captured as pipes, and never
 //! writes anything but the ACP JSON-RPC stream to this process's own
 //! stdout. Anything this file wants to log for its own debugging goes to
 //! STDERR only (`[darkmux-acp]`-prefixed, matching the existing
@@ -1672,6 +1672,16 @@ fn render_gate_facts(facts: &BTreeMap<String, String>) -> String {
     facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n")
 }
 
+/// Load a mission config by the id `route_command` resolved, for the
+/// launch-time input synthesis above. Separate from `route_command`'s own
+/// load because the two run at different moments (routing, then spawning)
+/// and the registry is the source of truth at each.
+fn loaded_config(config_id: &str) -> Result<crate::crew::mission_config::MissionConfig> {
+    crate::crew::mission_config::load(config_id)
+        .map(|l| l.config)
+        .with_context(|| format!("loading mission config \"{config_id}\""))
+}
+
 /// (#1684 rule D) Launch a panel command whose graph has at least one
 /// model-dispatching step as a normal `darkmux mission launch <id>`
 /// subprocess — a full instance, same pattern [`run_review`] uses for its
@@ -1732,6 +1742,33 @@ async fn run_launch_command(
     if !args.trim().is_empty() {
         cmd.args(["--param", &format!("args={args}")]);
     }
+
+    // (#2310 P4d) A diff-scoped config (`review`) declares `diff_file`
+    // REQUIRED, and a panel invocation types no params — synthesize the
+    // diff + workspace from this session's cwd, exactly as the retired
+    // review launcher used to before it spawned. `_synth` is held for the
+    // whole spawn: its Drop removes the tempdir, so every exit path below
+    // (success, failure, a cancelled subprocess) cleans up.
+    let _synth = match crate::acp_panel::synthesize_diff_launch_inputs(&loaded_config(config_id)?, cwd) {
+        Ok(crate::acp_panel::DiffLaunchInputs::NotNeeded) => None,
+        Ok(crate::acp_panel::DiffLaunchInputs::Nothing(msg)) => {
+            cx.send_notification(agent_chunk(session_id, msg))?;
+            return Ok(());
+        }
+        Ok(crate::acp_panel::DiffLaunchInputs::Ready(synth)) => {
+            for p in synth.params() {
+                cmd.args(["--param", p]);
+            }
+            if let Some(note) = &synth.excluded_note {
+                let _ = cx.send_notification(agent_chunk(session_id, format!("darkmux: {note}")));
+            }
+            Some(synth)
+        }
+        Err(e) => {
+            cx.send_notification(agent_chunk(session_id, format!("darkmux: `{config_id}` cannot run here — {e:#}")))?;
+            return Ok(());
+        }
+    };
 
     eprintln!(
         "[darkmux-acp] session/prompt: spawning `mission launch {config_id}` cwd={}",

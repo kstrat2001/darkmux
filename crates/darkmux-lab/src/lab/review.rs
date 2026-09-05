@@ -548,3 +548,97 @@ pub fn review_mission_outcome(env: &ReviewEnvelope) -> RunOutcome {
 // re-exported) — both were private on `origin/main` with no caller
 // outside this file, so keeping them off the crate's public surface
 // preserves that.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (#2310 P4d) The ONE recovered golden from the deleted conformance
+    /// suite, kept as a DESERIALIZATION fixture. Recorded by a real funnel
+    /// run before that pipeline was deleted.
+    ///
+    /// **Why this file still earns its place.** The funnel is gone, but its
+    /// envelopes are on disk in every operator's run artifacts, and
+    /// `darkmux-serve` still reads them — through a `serde_json::from_str::
+    /// <Vec<ReviewEnvelope>>` whose failure it swallows into an empty list.
+    /// A field renamed or retyped on these structs would therefore make the
+    /// viewer render NOTHING for every past review run, silently, with no
+    /// test going red anywhere. This fixture is that guard: it is the only
+    /// thing standing between a careless edit to the surviving envelope
+    /// types and a viewer that quietly forgets history.
+    const RECORDED_ENVELOPE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/review-envelope/envelope.json"
+    ));
+
+    fn recorded() -> ReviewEnvelope {
+        serde_json::from_str(RECORDED_ENVELOPE)
+            .expect("a real recorded review envelope must still deserialize into ReviewEnvelope")
+    }
+
+    #[test]
+    fn a_recorded_envelope_still_deserializes_with_its_counts_and_tiers_intact() {
+        let env = recorded();
+        assert_eq!(env.mode, "sequential");
+        assert_eq!(env.bundles, 4);
+        assert_eq!((env.raw_flags, env.deduped_flags), (5, 4));
+        assert_eq!((env.confirmed, env.needs_check, env.archived), (1, 1, 2));
+        assert_eq!(env.judged.len(), 4, "every judged flag survives the round trip");
+        assert_eq!(env.members.len(), 5, "the per-seat member records survive");
+        assert!(
+            env.judged.iter().any(|j| j.tier == Tier::Confirmed),
+            "the tier enum must still decode the recorded spelling"
+        );
+    }
+
+    /// The viewer reads these envelopes back as JSON, so a re-serialize has
+    /// to preserve what a reader keys on. Round-tripping through the types
+    /// catches a field that silently stopped being emitted (a
+    /// `skip_serializing_if` added to a field a consumer reads).
+    #[test]
+    fn a_recorded_envelope_round_trips_through_the_types() {
+        let env = recorded();
+        let again: ReviewEnvelope =
+            serde_json::from_str(&serde_json::to_string(&env).expect("re-serializes"))
+                .expect("re-deserializes");
+        assert_eq!(again.confirmed, env.confirmed);
+        assert_eq!(again.judged.len(), env.judged.len());
+        assert_eq!(again.members.len(), env.members.len());
+    }
+
+    /// `review_outcome`/`review_mission_outcome` have no production caller
+    /// left (the funnel that called them is deleted) — so they are TESTED
+    /// rather than left as unexercised code: a recorded envelope with no
+    /// degenerate reason, no warnings and no judge-budget shortfall is a
+    /// COMPLETE run under both mappings.
+    #[test]
+    fn both_outcome_mappings_read_a_clean_recorded_envelope_as_complete() {
+        let env = recorded();
+        assert!(env.degenerate.is_none(), "fixture sanity: this recording is not degenerate");
+        assert!(matches!(review_outcome(&env), RunOutcome::Complete), "{:?}", review_outcome(&env));
+        assert!(
+            matches!(review_mission_outcome(&env), RunOutcome::Complete),
+            "{:?}",
+            review_mission_outcome(&env)
+        );
+    }
+
+    /// The degenerate half of the same mapping, on the same recording — a
+    /// run whose envelope names a degenerate reason is EMPTY, and the
+    /// mission mapping's neutral zero-bundle kinds are the one exception
+    /// (they stay Complete rather than failing a PR check).
+    #[test]
+    fn a_degenerate_recorded_envelope_maps_to_empty_except_for_the_neutral_kinds() {
+        let mut env = recorded();
+        env.degenerate = Some("no bundles resolved".to_string());
+        env.degenerate_kind = Some(DegenerateKind::Error);
+        assert!(matches!(review_outcome(&env), RunOutcome::Empty { .. }));
+        assert!(matches!(review_mission_outcome(&env), RunOutcome::Empty { .. }));
+
+        env.degenerate_kind = Some(DegenerateKind::BenignEmpty);
+        assert!(
+            matches!(review_mission_outcome(&env), RunOutcome::Complete),
+            "a benign zero-bundle run must not fail the mission mapping"
+        );
+    }
+}

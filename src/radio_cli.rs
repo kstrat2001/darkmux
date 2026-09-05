@@ -9,10 +9,10 @@
 //! - Procedural-only targets run in-process via `crate::acp_panel::
 //!   run_ephemeral` (already `pub`, no hoist needed — surface neutrality
 //!   held without moving a single line of `acp_panel.rs`).
-//! - Model-seated targets (`RoutePlan::Launch` / `RoutePlan::Review` — the
-//!   latter already resolves to the SAME `mission launch <id>` invocation
-//!   via `mission_launch::launch`'s own structural routing, so this module
-//!   never special-cases Review) spawn `darkmux mission launch <id>` as a
+//! - Model-seated targets (`RoutePlan::Launch` — #2310 P4d retired the
+//!   separate Review arm along with the bespoke launcher behind it, so
+//!   every routed command resolves to the SAME `mission launch <id>`
+//!   invocation) spawn `darkmux mission launch <id>` as a
 //!   child process INHERITING the tty (unlike `src/acp.rs`'s headless ACP
 //!   spawn, `Command`'s default stdio) — so `mission launch`'s own
 //!   interactive sign-off gate prompt (`mission_launch.rs`'s private
@@ -116,8 +116,13 @@ fn advertised_list_message(catalog: &[CatalogEntry]) -> String {
 /// the SAME structural Review/Ephemeral/Launch decision the panel surface
 /// uses — rather than re-implementing that classification here.
 ///
-/// `Review` and `Launch` used to share `spawn_mission_launch` — correct for
-/// `Launch` (no required inputs beyond the optional `args` hook).
+/// `Launch` covers every routed command now (#2310 P4d retired the bespoke
+/// review arm along with its launcher). It is NOT true that a launched
+/// config has "no required inputs beyond the optional `args` hook": a
+/// diff-scoped config declares `diff_file` required, and `spawn_mission_
+/// launch` synthesizes it from the cwd — see
+/// `acp_panel::synthesize_diff_launch_inputs`, the same seam the editor
+/// panel uses, so the two surfaces cannot drift.
 fn execute(command: &str, args: &str) -> Result<i32> {
     let advertised = crate::acp_panel::list_panel_commands();
     let plan = crate::acp_panel::route_command(&advertised, command).ok_or_else(|| {
@@ -176,6 +181,30 @@ fn spawn_mission_launch(config_id: &str, args: &str) -> Result<i32> {
     if !args.trim().is_empty() {
         cmd.args(["--param", &format!("args={args}")]);
     }
+    // (#2310 P4d) Same synthesis the editor panel does, from the same
+    // function: a diff-scoped config gets its `diff_file`/`workspace`/
+    // `head_sha` from this cwd. `_synth`'s Drop removes the tempdir on
+    // every exit path below.
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    let config = crate::crew::mission_config::load(config_id)
+        .with_context(|| format!("loading mission config \"{config_id}\""))?
+        .config;
+    let _synth = match crate::acp_panel::synthesize_diff_launch_inputs(&config, &cwd)? {
+        crate::acp_panel::DiffLaunchInputs::NotNeeded => None,
+        crate::acp_panel::DiffLaunchInputs::Nothing(msg) => {
+            println!("radio: {msg}");
+            return Ok(0);
+        }
+        crate::acp_panel::DiffLaunchInputs::Ready(synth) => {
+            for p in synth.params() {
+                cmd.args(["--param", p]);
+            }
+            if let Some(note) = &synth.excluded_note {
+                println!("radio: {note}");
+            }
+            Some(synth)
+        }
+    };
     println!("radio: launching `{config_id}` …");
     let status = cmd
         .status()

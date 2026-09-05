@@ -219,7 +219,7 @@ mod tests {
                             // Never started: no tokens, no clock (#1481).
                             id: "verify-planned".to_string(),
                             label: "Verify".to_string(),
-                            kind: "review.verify".to_string(),
+                            kind: "dispatch.map".to_string(),
                             status: "planned",
                             started_ts: None,
                             completed_ts: None,

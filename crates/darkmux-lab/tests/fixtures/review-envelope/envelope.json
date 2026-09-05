@@ -1,0 +1,264 @@
+{
+  "archived": 2,
+  "bundles": 4,
+  "case_id": "review-conformance-case",
+  "confirmed": 1,
+  "crew": "review-conformance",
+  "deduped_flags": 4,
+  "fingerprint": {
+    "judge_model": "darkmux:review-conformance-judge",
+    "judge_persona_blake3": "a6ab0ef74ce185b07d8d391bc90e7dc265a0a58dc4cb2f8e6be2e74f646d64a7",
+    "judge_temperature": 0.20000000298023224,
+    "protocol": "double-confirm-v1"
+  },
+  "flags": [
+    {
+      "also_flagged": [
+        "a real defect: `const end = start.plus(30)`"
+      ],
+      "anchor": "const end = start.plus(30)",
+      "bundle_id": "billing@src/billing.ts",
+      "charge_text": "a real defect: `const end = start.plus(30)`",
+      "draw": 0,
+      "fact_family": "billing",
+      "member": "darkmux:review-conformance-probe-high"
+    },
+    {
+      "anchor": "if (user.role = \"admin\")",
+      "bundle_id": "auth@src/auth.ts",
+      "charge_text": "a real defect: `if (user.role = \"admin\")`",
+      "draw": 0,
+      "fact_family": "auth",
+      "member": "darkmux:review-conformance-probe-mid"
+    },
+    {
+      "anchor": "A new heading appears here",
+      "bundle_id": "docs@docs/setup.md",
+      "charge_text": "a suspicious change: `A new heading appears here`",
+      "draw": 0,
+      "fact_family": "other",
+      "member": "darkmux:review-conformance-probe-low"
+    },
+    {
+      "anchor": "const port = env.PORT + 1",
+      "bundle_id": "config@src/config.ts",
+      "charge_text": "a real defect: `const port = env.PORT + 1`",
+      "draw": 0,
+      "fact_family": "config",
+      "member": "darkmux:review-conformance-probe-low"
+    }
+  ],
+  "judged": [
+    {
+      "demoted_by_pass2": false,
+      "flag": {
+        "also_flagged": [
+          "a real defect: `const end = start.plus(30)`"
+        ],
+        "anchor": "const end = start.plus(30)",
+        "bundle_id": "billing@src/billing.ts",
+        "charge_text": "a real defect: `const end = start.plus(30)`",
+        "draw": 0,
+        "fact_family": "billing",
+        "member": "darkmux:review-conformance-probe-high"
+      },
+      "pass1": {
+        "decisive_evidence": "the value is treated as a string",
+        "note_for_author": "looks like a numeric-add bug",
+        "pass": 1,
+        "ruling": "confirmed",
+        "seconds": 0.0
+      },
+      "pass2": {
+        "decisive_evidence": "the value is treated as a string",
+        "note_for_author": "looks like a numeric-add bug",
+        "pass": 2,
+        "ruling": "confirmed",
+        "seconds": 0.0
+      },
+      "tier": "confirmed",
+      "verify": {
+        "decisive_evidence": "confirmed against the diff",
+        "model": "review-conformance-verify",
+        "note_for_author": "holds up",
+        "ruling": "verified",
+        "seconds": 0.0
+      }
+    },
+    {
+      "demoted_by_pass2": true,
+      "flag": {
+        "anchor": "if (user.role = \"admin\")",
+        "bundle_id": "auth@src/auth.ts",
+        "charge_text": "a real defect: `if (user.role = \"admin\")`",
+        "draw": 0,
+        "fact_family": "auth",
+        "member": "darkmux:review-conformance-probe-mid"
+      },
+      "pass1": {
+        "decisive_evidence": "the value is treated as a string",
+        "note_for_author": "looks like a numeric-add bug",
+        "pass": 1,
+        "ruling": "confirmed",
+        "seconds": 0.0
+      },
+      "pass2": {
+        "decisive_evidence": "could not confirm on recheck",
+        "note_for_author": "worth a second look",
+        "pass": 2,
+        "ruling": "needs_check",
+        "seconds": 0.0
+      },
+      "tier": "needs_check"
+    },
+    {
+      "demoted_by_pass2": false,
+      "flag": {
+        "anchor": "A new heading appears here",
+        "bundle_id": "docs@docs/setup.md",
+        "charge_text": "a suspicious change: `A new heading appears here`",
+        "draw": 0,
+        "fact_family": "other",
+        "member": "darkmux:review-conformance-probe-low"
+      },
+      "pass1": {
+        "decisive_evidence": "docs have no execution semantics",
+        "note_for_author": "not a defect",
+        "pass": 1,
+        "ruling": "false_positive",
+        "seconds": 0.0
+      },
+      "pass2": null,
+      "tier": "archived"
+    },
+    {
+      "demoted_by_pass2": false,
+      "demoted_by_verify": true,
+      "flag": {
+        "anchor": "const port = env.PORT + 1",
+        "bundle_id": "config@src/config.ts",
+        "charge_text": "a real defect: `const port = env.PORT + 1`",
+        "draw": 0,
+        "fact_family": "config",
+        "member": "darkmux:review-conformance-probe-low"
+      },
+      "pass1": {
+        "decisive_evidence": "the value is treated as a string",
+        "note_for_author": "looks like a numeric-add bug",
+        "pass": 1,
+        "ruling": "confirmed",
+        "seconds": 0.0
+      },
+      "pass2": {
+        "decisive_evidence": "the value is treated as a string",
+        "note_for_author": "looks like a numeric-add bug",
+        "pass": 2,
+        "ruling": "confirmed",
+        "seconds": 0.0
+      },
+      "tier": "archived",
+      "verify": {
+        "decisive_evidence": "the increment is applied to a numeric env value",
+        "model": "review-conformance-verify",
+        "note_for_author": "does not reproduce",
+        "ruling": "refuted",
+        "seconds": 0.0
+      }
+    }
+  ],
+  "members": [
+    {
+      "draws": 4,
+      "model": "darkmux:review-conformance-probe-high",
+      "seat": "review-probe",
+      "total_tokens": 7,
+      "wall_ms": 0
+    },
+    {
+      "draws": 4,
+      "model": "darkmux:review-conformance-probe-mid",
+      "seat": "review-probe",
+      "total_tokens": 6,
+      "wall_ms": 0
+    },
+    {
+      "draws": 4,
+      "model": "darkmux:review-conformance-probe-low",
+      "seat": "review-probe",
+      "total_tokens": 6,
+      "wall_ms": 0
+    },
+    {
+      "draws": 7,
+      "model": "darkmux:review-conformance-judge",
+      "seat": "review-judge",
+      "total_tokens": 7,
+      "wall_ms": 0
+    },
+    {
+      "draws": 2,
+      "endpoint": "review-conformance.example.invalid",
+      "model": "review-conformance-verify",
+      "remote": true,
+      "seat": "review-verify",
+      "total_tokens": 2,
+      "wall_ms": 0
+    }
+  ],
+  "mode": "sequential",
+  "needs_check": 1,
+  "raw_flags": 5,
+  "refuted": 1,
+  "remote_budgets": [
+    {
+      "exhausted": false,
+      "max_tokens": 500000,
+      "skipped_calls": 0,
+      "stage": "verify",
+      "used_tokens": 2
+    }
+  ],
+  "staffing": {
+    "judge": {
+      "k": 1,
+      "model": "darkmux:review-conformance-judge",
+      "name": "review-conformance",
+      "passes": 2,
+      "role_id": "review-judge"
+    },
+    "probes": [
+      {
+        "k": 1,
+        "model": "darkmux:review-conformance-probe-high",
+        "name": "review-conformance",
+        "passes": 2,
+        "role_id": "review-probe-high"
+      },
+      {
+        "k": 1,
+        "model": "darkmux:review-conformance-probe-mid",
+        "name": "review-conformance",
+        "passes": 2,
+        "role_id": "review-probe-mid"
+      },
+      {
+        "k": 1,
+        "model": "darkmux:review-conformance-probe-low",
+        "name": "review-conformance",
+        "passes": 2,
+        "role_id": "review-probe-low"
+      }
+    ],
+    "verify": {
+      "endpoint": "review-conformance.example.invalid",
+      "k": 1,
+      "model": "review-conformance-verify",
+      "name": "review-conformance",
+      "passes": 2,
+      "remote": true,
+      "role_id": "review-verify"
+    }
+  },
+  "steps": [],
+  "verified": 1
+}

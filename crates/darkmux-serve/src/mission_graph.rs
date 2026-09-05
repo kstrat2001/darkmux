@@ -1453,19 +1453,20 @@ mod tests {
         assert!(!out.contains_key("someone-else"));
     }
 
-    /// (#1445 gate should-fix) The review vocabulary's step results carry
-    /// `payload.tokens`, never `total_tokens` — the fold reads the fallback
-    /// so review probe/judge/verify rows backfill (item 4's stated purpose
-    /// on the most-viewed mission kind).
+    /// (#1445 gate should-fix) A step result may carry `payload.tokens`
+    /// rather than `total_tokens` — the fold reads the fallback so those
+    /// rows backfill. The `step_id` is the JOIN KEY the fold matches on
+    /// (#2310 P4d: the kind moved off the retired review vocabulary; the
+    /// id must keep matching `step_ids`, which is what this pins).
     #[test]
     fn fold_finals_review_vocabulary_tokens_payload_folds() {
         let step_ids = ids(&["review-judge-step"]);
         let rec = serde_json::json!({
             "action": "step result",
-            "payload": { "step_id": "judge-step", "kind": "dispatch.map", "tokens": 4200 }
+            "payload": { "step_id": "review-judge-step", "kind": "dispatch.map", "tokens": 4200 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
-        assert_eq!(out["review-judge-step"].tokens, Some(4200), "review `tokens` payload folds");
+        assert_eq!(out["review-judge-step"].tokens, Some(4200), "a `tokens` payload folds");
     }
 
     /// (#1445 gate should-fix) `total_tokens` wins when both keys are

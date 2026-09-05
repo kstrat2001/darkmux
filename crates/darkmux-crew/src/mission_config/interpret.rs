@@ -349,14 +349,13 @@ pub fn interpret_grown(
 /// reference something that actually EXISTS in the document — a typo'd key
 /// silently matching nothing is worse than an error, because the launch
 /// proceeds with the document's static value instead of the operator's
-/// resolved one. The concrete hazard that motivated this: the
-/// `"review-judge-step"` literal lives UNLINKED in both `review.rs` (the
-/// launcher's `step_config_overrides` key) and `review.json` (the step id)
-/// — if either side drifts, the judge's concurrency silently reverts to
-/// the document's static `1`, discarding the operator's
-/// `config.review.judge_concurrency`. `interpret` holds the whole document,
-/// so the cross-check is cheap; drift now fails the launch loudly, naming
-/// the dangling key.
+/// resolved one. The hazard that motivated this (from the since-retired
+/// review funnel, #2310 P4d): a step-id literal lived UNLINKED in the
+/// launcher's `step_config_overrides` key and in the document's own step
+/// id — if either side drifted, the operator's resolved value silently
+/// reverted to the document's static one. `interpret` holds the whole
+/// document, so the cross-check is cheap; drift now fails the launch
+/// loudly, naming the dangling key.
 fn check_params_reference_the_document(config: &MissionConfig, params: &LaunchParams) -> Result<()> {
     let phase_ids: std::collections::BTreeSet<&str> =
         config.phases.iter().map(|p| p.id.as_str()).collect();

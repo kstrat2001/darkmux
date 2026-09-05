@@ -4932,24 +4932,27 @@
         }
     }
 
-    /// (item 7, #1512) Shape test against a REAL review-config-interpreted
-    /// graph: loads the embedded `review` mission config and interprets it
-    /// (no expansion collection needed — the probe stage is three EXPLICIT
-    /// static tasks now, not a template), persists the resulting
-    /// Mission/Phase/Task/Step graph, and asserts the graph.json node
-    /// counts match `review.json`'s own declared shape: 3 phase nodes, 8
-    /// task nodes (bundle, probe-high, probe-mid, probe-low, dedup, judge,
-    /// verify, synthesis), 9 step nodes-worth of rows (verify carries two).
+    /// (item 7, #1512; #2310 P4d) Shape test against a REAL
+    /// review-config-interpreted graph: loads the embedded `review` mission
+    /// config and interprets it, persists the resulting
+    /// Mission/Phase/Task/Step graph, and asserts the graph.json node counts
+    /// match `review.json`'s own declared shape. Post-P4d that shape is the
+    /// crawl-blocks one: 5 phase nodes (plan, review, summarize, create-mods,
+    /// deliver) and the tasks the DOCUMENT declares statically — seven
+    /// `plan.sites` tasks, the summary task, and the deliver task. The
+    /// `review` phase's `unit-<rule>` tasks and `create-mods`' `create-mod`
+    /// are GROWN/pruned at run time from a plan step's output, so `interpret`
+    /// alone never mints them; that is what makes 9 tasks the honest number
+    /// here, not a regression.
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_review_config_interpreted_shape() {
         let _guard = CrewDirGuard::new();
         let loaded = darkmux_crew::mission_config::load("review").expect("embedded review config loads");
 
-        // (#1512) review.json declares its three probe tasks explicitly, so
-        // `interpret` needs nothing beyond the document itself to produce
-        // the full graph shape (the expansion collection this once needed
-        // was retired in #1550 cluster item 2).
+        // `interpret` needs nothing beyond the document itself: every task
+        // it mints here is statically declared (the grown `unit-<rule>`
+        // tasks come later, from a plan step's real output).
         let params = darkmux_crew::mission_config::LaunchParams {
             phase_ids: std::collections::BTreeMap::new(),
             task_overrides: std::collections::BTreeMap::new(),
@@ -4989,18 +4992,13 @@
 
         let nodes = json["nodes"].as_array().unwrap();
         let count_kind = |kind: &str| nodes.iter().filter(|n| n["kind"] == kind).count();
-        assert_eq!(count_kind("phase"), 3, "{nodes:?}");
-        // (#1512, #2310 P1) Three EXPLICIT one-role probe tasks, statically
-        // declared — context + bundle + 3 probe maps + dedup + judge +
-        // verify + synthesis + report. `review-context-task` (#2310 P1) is
-        // the pipeline's first task now — it resolves the review's shared
-        // context as a real typed step output, and every other review task
-        // formally `reads` it. `review-report-task` (#2310 P3) is the
-        // terminal render/emit task.
+        assert_eq!(count_kind("phase"), 5, "plan/review/summarize/create-mods/deliver: {nodes:?}");
+        // Seven `plan.sites` tasks (one per rule the document declares) +
+        // the summary task + the deliver task.
         assert_eq!(
             count_kind("task"),
-            10,
-            "expected context+bundle+3 probe maps+dedup+judge+verify+synthesis+report: {nodes:?}"
+            9,
+            "expected 7 plan tasks + summary + deliver: {nodes:?}"
         );
         // (#1401) No separate "step" node kind anymore — every task's
         // steps render as rows on ITS OWN node instead.
@@ -5010,41 +5008,31 @@
             .filter(|n| n["kind"] == "task")
             .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
             .sum();
-        // (#1530, #2310 P1/P2/P3) Each of the three probe tasks and the
-        // verify task carries THREE rows (a bespoke render step + the
-        // generic `dispatch.map` + a bespoke collect step); every other
-        // task (context, bundle, dedup, judge, synthesis, report) carries
-        // ONE. 10 tasks: context(1) + bundle(1) + 3×probe(3) + dedup(1) +
-        // judge(1) + verify(3) + synthesis(1) + report(1) = 18 step rows.
+        // The deliver task carries TWO rows (`records.gather` then
+        // `deliver.github_review`); every other task here carries ONE.
+        // 9 tasks: 7×plan(1) + summary(1) + deliver(2) = 10 step rows.
         assert_eq!(
             total_step_rows,
-            18,
-            "context/bundle/dedup/judge/synthesis/report carry one row each, probe + verify carry three: {nodes:?}"
+            10,
+            "plan + summary carry one row each, deliver carries two: {nodes:?}"
         );
-        assert_eq!(tasks.len(), 10);
-        assert_eq!(steps.len(), 18);
+        assert_eq!(tasks.len(), 9);
+        assert_eq!(steps.len(), 10);
 
         // (#1402) Every row's label resolves through the real StepKind
-        // display-name fallback chain — the probe/verify dispatch rows are
-        // generic `dispatch.map` steps (#1442) and read the BUILTIN
-        // registry's "Dispatch (map)" label; the bespoke review kinds keep
-        // their own labels.
+        // display-name fallback chain. This crate sees the Tier-1 builtins
+        // plus its own `mission.*` table; the launch-owned crawl-family
+        // kinds are registered by the LAUNCHER, not here, so their rows fall
+        // back to the raw kind id — which is the honest label a daemon that
+        // cannot construct the kind can offer (#2310 P4d retired the
+        // `review.*` lookup that used to reach into `darkmux-lab`).
         let all_labels: Vec<String> = nodes
             .iter()
             .filter(|n| n["kind"] == "task")
             .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
             .filter_map(|row| row["label"].as_str().map(String::from))
             .collect();
-        for expected in [
-            "Review context",
-            "Bundle",
-            "Dispatch (map)",
-            "Dedup",
-            "Judge",
-            "Probe prompts",
-            "Verify prompts",
-            "Synthesis",
-        ] {
+        for expected in ["plan.sites", "crawl.summary", "records.gather", "deliver.github_review"] {
             assert!(
                 all_labels.iter().any(|l| l == expected),
                 "expected a \"{expected}\" row label among {all_labels:?}"
