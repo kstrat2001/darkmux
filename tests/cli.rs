@@ -5098,7 +5098,16 @@ fn an_ignored_input_flag_warns_on_any_config_never_by_id() {
                 {"name": "legacy_flag", "required": false, "ignored": true, "ignored_reason": "kept for CLI parity only, never read"},
                 {"name": "live_flag", "required": false}
             ],
-            "phases": []
+            // (#2386 MF1) `live_flag` must be genuinely LIVE — referenced by
+            // a step — or `check_supplied_inert_inputs` refuses a launch
+            // that supplies it, which is exactly the behavior this test's
+            // OTHER half (`with_ignored`) exists to prove is now wired up.
+            // An empty `phases: []` predates that refusal and made this
+            // test's own `live_flag` inert by construction.
+            "phases": [{"id": "p", "tasks": [{
+                "id": "t",
+                "steps": [{"id": "t-step", "kind": "procedural.noop", "config": {"note": "{{live_flag}}"}}]
+            }]}]
         })
         .to_string(),
     )

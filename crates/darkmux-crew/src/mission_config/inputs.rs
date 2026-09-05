@@ -520,14 +520,25 @@ pub fn unreferenced_inputs(config: &MissionConfig, consumed_by_launcher: &[&str]
 /// the launcher prints for every inert input on every launch AND dry run
 /// (see [`unreferenced_inputs`]'s call site in `mission_launch.rs`). Tighten
 /// this to the blanket form once no shipped config trips it.
+///
+/// **`operator_supplied` is the PRE-default set, deliberately (#2386 MF3).**
+/// A defaulted-only input (declared with a `default`, never named on the
+/// operator's own `--param`/stdin) must NOT count as "supplied" here — the
+/// caller applies document defaults to its own `collected` map for every
+/// OTHER purpose (placeholder substitution, the dry-run print, the inputs
+/// fingerprint), and passing that post-default map here would make a
+/// defaulted inert input look like the operator's own action and refuse a
+/// config the operator could not have changed. The caller therefore
+/// captures the set of keys BEFORE calling `apply_input_defaults` and
+/// passes that here, not the final `collected`.
 pub fn check_supplied_inert_inputs(
     config: &MissionConfig,
     consumed_by_launcher: &[&str],
-    collected: &BTreeMap<String, Value>,
+    operator_supplied: &BTreeSet<String>,
 ) -> Result<()> {
     let supplied: Vec<String> = unreferenced_inputs(config, consumed_by_launcher)
         .into_iter()
-        .filter(|name| collected.contains_key(name))
+        .filter(|name| operator_supplied.contains(name))
         .collect();
     if supplied.is_empty() {
         return Ok(());
@@ -925,11 +936,10 @@ mod tests {
             "the inert knob is named"
         );
         // Not supplied: the launch proceeds (and warns).
-        assert!(check_supplied_inert_inputs(&cfg, &[], &BTreeMap::new()).is_ok());
+        assert!(check_supplied_inert_inputs(&cfg, &[], &BTreeSet::new()).is_ok());
         // Supplied: refused before anything mints, naming it.
-        let collected: BTreeMap<String, Value> =
-            [("review-probe-high".to_string(), json!("probe-4b"))].into_iter().collect();
-        let err = check_supplied_inert_inputs(&cfg, &[], &collected).unwrap_err().to_string();
+        let supplied: BTreeSet<String> = ["review-probe-high".to_string()].into_iter().collect();
+        let err = check_supplied_inert_inputs(&cfg, &[], &supplied).unwrap_err().to_string();
         assert!(err.contains("review-probe-high"), "{err}");
         assert!(err.contains("would change nothing about this run"), "{err}");
         assert!(err.contains("ignored"), "the remedy names the escape hatch: {err}");
@@ -983,9 +993,8 @@ mod tests {
             ignored_reason: None,
             extras: BTreeMap::new(),
         });
-        let collected: BTreeMap<String, Value> =
-            [("dry_run".to_string(), json!(true))].into_iter().collect();
-        assert!(check_supplied_inert_inputs(&cfg, &["dry_run"], &collected).is_ok());
+        let supplied: BTreeSet<String> = ["dry_run".to_string()].into_iter().collect();
+        assert!(check_supplied_inert_inputs(&cfg, &["dry_run"], &supplied).is_ok());
         assert_eq!(unreferenced_inputs(&cfg, &[]), vec!["dry_run".to_string()], "and it IS caught without the allowance");
     }
 

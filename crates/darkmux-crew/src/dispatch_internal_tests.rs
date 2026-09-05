@@ -4867,6 +4867,87 @@
         assert_eq!(crate::dispatch_internal::cached_runtime_binary_version_at(tmp.path()), None);
     }
 
+    // ─── (#2386 C4) the cache is ALSO keyed on the source image's id ──────
+
+    /// A matching version is not enough on its own once BOTH sides carry an
+    /// image id: a rebuilt image (same darkmux build, different content —
+    /// a local `docker build` between two dispatches) must invalidate the
+    /// cache even though the version did not change.
+    #[test]
+    fn a_matching_version_but_different_image_id_is_treated_as_stale() {
+        let stamp = crate::dispatch_internal::RuntimeBinaryStamp {
+            version: "3.6.0".into(),
+            image_id: Some("sha256:aaa".into()),
+        };
+        assert!(!stamp_is_current(&stamp, "3.6.0", Some("sha256:bbb")));
+        // Same id: current.
+        assert!(stamp_is_current(&stamp, "3.6.0", Some("sha256:aaa")));
+    }
+
+    /// Neither side of the id comparison is known to be wrong when EITHER
+    /// side lacks an id — a pre-C4 (single-line) stamp, or a live
+    /// `docker image inspect` that failed — so the pre-C4 version-only rule
+    /// applies rather than treating "unknown" as "different".
+    #[test]
+    fn a_stamp_or_a_live_lookup_missing_an_image_id_falls_back_to_version_only() {
+        let no_id_stamp = crate::dispatch_internal::RuntimeBinaryStamp {
+            version: "3.6.0".into(),
+            image_id: None,
+        };
+        assert!(stamp_is_current(&no_id_stamp, "3.6.0", Some("sha256:aaa")), "stamp predates C4 or was written without one");
+        let with_id_stamp = crate::dispatch_internal::RuntimeBinaryStamp {
+            version: "3.6.0".into(),
+            image_id: Some("sha256:aaa".into()),
+        };
+        assert!(stamp_is_current(&with_id_stamp, "3.6.0", None), "a live lookup that failed just now");
+        // A version mismatch is still stale regardless of id availability.
+        assert!(!stamp_is_current(&no_id_stamp, "3.7.0", None));
+    }
+
+    /// The stamp's own on-disk shape: version then image id, and a written
+    /// "unavailable" round-trips to `None` exactly like an absent second
+    /// line — both mean "we don't know", and the file states it rather
+    /// than leaving an ambiguous blank line.
+    #[test]
+    fn stamp_contents_round_trips_through_parse_stamp() {
+        let with_id = crate::dispatch_internal::stamp_contents("3.6.0", Some("sha256:aaa"));
+        assert_eq!(parse_stamp(&with_id).unwrap(), crate::dispatch_internal::RuntimeBinaryStamp {
+            version: "3.6.0".into(),
+            image_id: Some("sha256:aaa".into()),
+        });
+        let without_id = crate::dispatch_internal::stamp_contents("3.6.0", None);
+        assert!(without_id.contains("unavailable"), "{without_id}");
+        assert_eq!(parse_stamp(&without_id).unwrap(), crate::dispatch_internal::RuntimeBinaryStamp {
+            version: "3.6.0".into(),
+            image_id: None,
+        });
+        // A pre-C4, single-line stamp still parses with no image id.
+        assert_eq!(parse_stamp("3.5.0").unwrap(), crate::dispatch_internal::RuntimeBinaryStamp {
+            version: "3.5.0".into(),
+            image_id: None,
+        });
+    }
+
+    /// (#2386 C8) `doctor` needs to tell "nothing cached" apart from "a
+    /// binary is cached but predates version stamping" — both currently
+    /// invalidate the same way, but they read very differently to an
+    /// operator. `cached_runtime_binary_stamp_at` returns `None` for both;
+    /// `runtime_binary_file_exists_at` is the other half of the pair
+    /// `check_runtime_binary_cache` (darkmux-doctor) uses to distinguish
+    /// them.
+    #[test]
+    fn runtime_binary_file_exists_is_independent_of_a_readable_stamp() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!crate::dispatch_internal::runtime_binary_file_exists_at(tmp.path()), "nothing written yet");
+        seed_cached_binary(tmp.path(), None);
+        assert!(crate::dispatch_internal::runtime_binary_file_exists_at(tmp.path()), "the binary file is there");
+        assert_eq!(
+            crate::dispatch_internal::cached_runtime_binary_stamp_at(tmp.path()),
+            None,
+            "but it predates the stamp"
+        );
+    }
+
     /// (#2386 review, item 6) The argv's `--session-id` value and the id the
     /// finding tailer stamps into a stored key must be ONE string. Pinning
     /// only the literal `"sess-test"` would stay green if the two drifted to

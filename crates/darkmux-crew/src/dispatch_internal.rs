@@ -572,10 +572,15 @@ fn apply_cache_mount(args: &mut Vec<String>, cache: &Path) {
 /// musl-static, so it runs in any Linux image (verified against alpine +
 /// debian). Returns the cached path.
 ///
-/// Staleness: (#2386 review) the cache IS auto-invalidated now — it carries a
-/// sibling stamp naming the darkmux build it was extracted for, and a binary
-/// stamped for a different build (or carrying no stamp at all) is re-extracted
-/// on the next dispatch. `darkmux doctor` surfaces a stale one too.
+/// Staleness: (#2386 review, C4) the cache IS auto-invalidated now — it
+/// carries a sibling stamp naming the darkmux build it was extracted for AND
+/// the source image's own id (`docker image inspect`), and a binary whose
+/// stamp names a different build, a different image id, or carries no stamp
+/// at all is re-extracted on the next dispatch. Both a `cargo install` of a
+/// new darkmux build and a `docker build` of the same-tagged image (new
+/// content, unchanged tag) invalidate it — a manual `rm
+/// ~/.darkmux/runtime/darkmux-runtime` is no longer needed for either case.
+/// `darkmux doctor` surfaces a stale one too.
 /// (#907, P2 defense-in-depth) Reject image refs that could be smuggled as a
 /// docker flag or carry shell/control characters. An image ref is a positional
 /// arg to `docker create`/`docker run`; a leading `-`, embedded whitespace, or
@@ -618,21 +623,119 @@ pub fn runtime_binary_cache_paths_at(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join(RUNTIME_BINARY_NAME), dir.join(RUNTIME_BINARY_STAMP))
 }
 
-/// The build the cached binary was extracted for, or `None` when there is no
-/// cached binary — or when it predates the stamp, which is indistinguishable
-/// from a stale one and is treated as stale for that reason.
-pub fn cached_runtime_binary_version_at(dir: &Path) -> Option<String> {
+/// (#2386 C4) The stamp's second line when `docker image inspect` could not
+/// resolve the source image's id at write time — written explicitly rather
+/// than left blank, so an operator reading the stamp file sees a stated
+/// reason rather than an ambiguous empty line.
+const STAMP_IMAGE_ID_UNAVAILABLE: &str = "unavailable";
+
+/// Parsed contents of the runtime-binary version stamp.
+///
+/// (#2386 C4) `image_id` is the source image's own content-addressed id
+/// (`docker image inspect -f '{{.Id}}'`) at the time the binary was
+/// extracted — `None` means either a pre-C4 stamp (a single-line,
+/// version-only file) or one written when `docker image inspect` failed
+/// (recorded in the file as [`STAMP_IMAGE_ID_UNAVAILABLE`]). The two cases
+/// are indistinguishable on purpose and both fall back to a version-only
+/// comparison in [`stamp_is_current`] — "we don't know the image id" must
+/// never be treated as "the image id differs".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBinaryStamp {
+    pub version: String,
+    pub image_id: Option<String>,
+}
+
+fn parse_stamp(raw: &str) -> Option<RuntimeBinaryStamp> {
+    let mut lines = raw.lines();
+    let version = lines.next()?.trim().to_string();
+    if version.is_empty() {
+        return None;
+    }
+    let image_id = lines
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != STAMP_IMAGE_ID_UNAVAILABLE)
+        .map(String::from);
+    Some(RuntimeBinaryStamp { version, image_id })
+}
+
+fn stamp_contents(version: &str, image_id: Option<&str>) -> String {
+    format!("{version}\n{}\n", image_id.unwrap_or(STAMP_IMAGE_ID_UNAVAILABLE))
+}
+
+/// Whether the cached BINARY FILE is present at all — independent of
+/// whether it carries a readable stamp. (#2386 C8) `doctor` needs this
+/// distinction: "nothing cached yet" and "a binary predates version
+/// stamping" are different states an operator should read differently,
+/// even though both currently invalidate the cache the same way.
+pub fn runtime_binary_file_exists_at(dir: &Path) -> bool {
+    runtime_binary_cache_paths_at(dir).0.exists()
+}
+
+/// The full stamp for the cached binary at `dir`, or `None` when there is no
+/// cached binary — or when it predates the stamp (no readable version line),
+/// which is indistinguishable from a stale one and is treated as stale for
+/// that reason. See [`runtime_binary_file_exists_at`] for telling "no binary"
+/// apart from "unstamped binary".
+pub fn cached_runtime_binary_stamp_at(dir: &Path) -> Option<RuntimeBinaryStamp> {
     let (binary, stamp) = runtime_binary_cache_paths_at(dir);
     if !binary.exists() {
         return None;
     }
-    let v = fs::read_to_string(stamp).ok()?.trim().to_string();
-    (!v.is_empty()).then_some(v)
+    let raw = fs::read_to_string(stamp).ok()?;
+    parse_stamp(&raw)
 }
 
-/// Whether the cache can be used as-is for `want_version`.
-fn cached_binary_is_current_at(dir: &Path, want_version: &str) -> bool {
-    cached_runtime_binary_version_at(dir).is_some_and(|v| v == want_version)
+/// The build the cached binary was extracted for, or `None` when there is no
+/// cached binary — or when it predates the stamp, which is indistinguishable
+/// from a stale one and is treated as stale for that reason.
+pub fn cached_runtime_binary_version_at(dir: &Path) -> Option<String> {
+    cached_runtime_binary_stamp_at(dir).map(|s| s.version)
+}
+
+/// (#2386 C4) Whether a stamp still describes what a fresh extraction would
+/// produce for `want_version`/`want_image_id`. Pure and docker-free —
+/// exercised directly so the id-comparison guard is testable without a
+/// docker daemon.
+///
+/// A rebuilt image (same darkmux build, different image content — a local
+/// `docker build` between two dispatches, say) must invalidate the cache
+/// even though the VERSION did not change; version alone stopped being
+/// sufficient the moment `--image` became something an operator rebuilds
+/// independently of darkmux's own release cycle.
+fn stamp_is_current(stamp: &RuntimeBinaryStamp, want_version: &str, want_image_id: Option<&str>) -> bool {
+    if stamp.version != want_version {
+        return false;
+    }
+    match (stamp.image_id.as_deref(), want_image_id) {
+        (Some(have), Some(want)) => have == want,
+        // Either side lacks an id (a pre-C4 stamp, or `docker image
+        // inspect` failed at write time or now) — fall back to the pre-C4
+        // version-only rule rather than treating "unknown" as "different".
+        _ => true,
+    }
+}
+
+/// Whether the cache can be used as-is for `want_version`/`want_image_id`.
+fn cached_binary_is_current_at(dir: &Path, want_version: &str, want_image_id: Option<&str>) -> bool {
+    cached_runtime_binary_stamp_at(dir).is_some_and(|s| stamp_is_current(&s, want_version, want_image_id))
+}
+
+/// (#2386 C4) `docker image inspect -f '{{.Id}}'` — the source image's own
+/// content-addressed id, which changes when its layers change even under
+/// the same tag. `None` on any failure (docker unavailable, image not
+/// present locally, non-UTF8 output) — the caller falls back to
+/// version-only comparison rather than treating "unknown" as "different".
+fn resolve_image_id(source_image: &str) -> Option<String> {
+    let out = Command::new("docker")
+        .args(["image", "inspect", "-f", "{{.Id}}", "--", source_image])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
 }
 
 fn ensure_runtime_binary_cached(source_image: &str) -> Result<PathBuf> {
@@ -651,7 +754,18 @@ fn ensure_runtime_binary_cached_at(
     want_version: &str,
 ) -> Result<PathBuf> {
     let (dest, stamp) = runtime_binary_cache_paths_at(dir);
-    if cached_binary_is_current_at(dir, want_version) {
+    // (#2386 C4) Resolved BEFORE the cache-hit check, since the id is part
+    // of the decision — but never gated on `validate_image_ref` first: this
+    // `Command` is `--`-fenced exactly like `docker create` below, so a
+    // bogus ref just fails the docker call (caught by `.ok()`, folding to
+    // `None`) rather than aborting a would-be cache HIT before it is even
+    // checked. `a_cached_runtime_binary_stamped_for_this_build_is_reused`
+    // depends on exactly this: a stamp with no recorded image id (the
+    // pre-C4 shape) falls back to version-only comparison regardless of
+    // what this resolves to, so a hit must still short-circuit even when
+    // `source_image` is a ref `validate_image_ref` would refuse outright.
+    let want_image_id = resolve_image_id(source_image);
+    if cached_binary_is_current_at(dir, want_version, want_image_id.as_deref()) {
         return Ok(dest);
     }
     // Not a cache miss but a cache INVALIDATION — say which, once, because
@@ -749,13 +863,14 @@ fn ensure_runtime_binary_cached_at(
     fs::rename(&tmp, &dest)
         .with_context(|| format!("publishing runtime binary to {}", dest.display()))?;
 
-    fs::write(&stamp, want_version)
+    fs::write(&stamp, stamp_contents(want_version, want_image_id.as_deref()))
         .with_context(|| format!("writing runtime-binary version stamp {}", stamp.display()))?;
 
     eprintln!(
         "darkmux dispatch: cached runtime binary → {} (from {source_image}, darkmux \
-         {want_version}, for --image injection)",
-        dest.display()
+         {want_version}, image id {}, for --image injection)",
+        dest.display(),
+        want_image_id.as_deref().unwrap_or("unavailable")
     );
     Ok(dest)
 }

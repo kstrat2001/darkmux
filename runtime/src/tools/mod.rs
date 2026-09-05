@@ -1227,6 +1227,28 @@ mod tests {
         assert!(rejected.emitted.is_none() && rejected.emit_seq.is_none(), "a rejected report emits nothing");
     }
 
+    /// (#2386 MF2) `execute_create_finding`'s key hand-back is unpinned at
+    /// its own call site without this — nothing above exercises the
+    /// KEY-BEARING branch of the RESULT text end to end (the test above
+    /// calls the no-identity form on purpose, and gets "Recorded." with no
+    /// key). Drives `execute_create_finding_with` directly with an
+    /// explicit dispatch identity, mirroring `execute_create_mod_with`'s
+    /// own test seam, and asserts the RESULT the model actually reads
+    /// carries the backticked key.
+    #[test]
+    fn execute_create_finding_with_hands_the_backticked_key_back_in_the_result() {
+        let ws = finding_workspace(&numbered_src(5, 2, "  if (a && b) {"));
+        let out = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({
+            "file": "src/a.rs", "line": 2, "pattern": "p",
+            "evidence": "  if (a && b) {", "why": "w",
+        })
+        .to_string();
+        let run = execute_create_finding_with(&raw, out.path(), ws.path(), Some("me")).unwrap();
+        assert!(run.result.contains("`me/1`"), "the key the host will file this under: {}", run.result);
+        assert_eq!(run.emit_seq, Some(1));
+    }
+
     // (#2267 review) A source line that ITSELF begins with `N: ` on line N:
     // the compliant quote (prefix stripped) and the verbatim read quote
     // (prefix kept) must BOTH be accepted — the first version accepted only
@@ -1757,6 +1779,25 @@ y = 2
         assert!(keys.contains("a/1") && keys.contains("b/2"), "{keys:?}");
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert!(brief_finding_keys("no tags here key=\"c/1\"").is_empty());
+    }
+
+    /// (#2386 C9) `<findings …>` and `<finding-x …>` are not the `<finding
+    /// …>` tag `findings::brief_block` renders — a bare `<finding` prefix
+    /// match would read either as a hit and hand the model a key it never
+    /// actually received.
+    #[test]
+    fn brief_finding_keys_never_matches_a_finding_prefixed_tag_name() {
+        assert!(
+            brief_finding_keys("<findings key=\"a/1\">body</findings>").is_empty(),
+            "a plural wrapper tag is not a finding tag"
+        );
+        assert!(
+            brief_finding_keys("<finding-x key=\"a/1\">body</finding-x>").is_empty(),
+            "a hyphen-suffixed tag name is not a finding tag"
+        );
+        // The real tag still matches.
+        let keys = brief_finding_keys("<finding key=\"a/1\">body</finding>");
+        assert!(keys.contains("a/1"), "{keys:?}");
     }
 
     /// (#2386 review, item 4) The degraded mode must ANNOUNCE itself — a
@@ -2666,8 +2707,14 @@ fn dispatch_brief() -> &'static str {
 /// `format!("{session_id}/{seq}")` on the host: a key the model is told to
 /// use and the store then files under a different address is worse than no
 /// key at all.
-fn finding_key(seq: usize) -> Option<String> {
-    dispatch_id().map(|d| finding_key_for(d, seq))
+///
+/// (#2386 MF2) Takes the dispatch identity IN rather than reading the
+/// process-wide `dispatch_id()` itself — mirrors `execute_create_mod_with`'s
+/// own reason for existing (a test that needs an identity should not have
+/// to set an `OnceLock` every later test in the binary would then inherit).
+/// The real call site (`execute_create_finding`) passes `dispatch_id()`.
+fn finding_key_with(my_dispatch: Option<&str>, seq: usize) -> Option<String> {
+    my_dispatch.map(|d| finding_key_for(d, seq))
 }
 
 fn finding_key_for(dispatch: &str, seq: usize) -> String {
@@ -2725,8 +2772,12 @@ fn canonical_key(key: &str) -> Option<String> {
 fn brief_finding_keys(brief: &str) -> std::collections::BTreeSet<String> {
     let mut keys = std::collections::BTreeSet::new();
     let mut rest = brief;
-    while let Some(at) = rest.find("<finding") {
-        let after = &rest[at + "<finding".len()..];
+    // (#2386 C9) The trailing space is the attribute boundary — `find`ing
+    // the bare `<finding` prefix also matches `<findings …>` and
+    // `<finding-x …>`, neither of which is the tag `findings::brief_block`
+    // renders.
+    while let Some(at) = rest.find("<finding ") {
+        let after = &rest[at + "<finding ".len()..];
         // Bound the search to THIS opening tag, so a `key="…"` in some later
         // element's body can never be read as this one's attribute.
         let tag = match after.find('>') {
@@ -2952,6 +3003,23 @@ fn execute_create_finding(
     out_dir: &Path,
     workspace_root: &Path,
 ) -> Result<ToolRun> {
+    execute_create_finding_with(raw_args, out_dir, workspace_root, dispatch_id())
+}
+
+/// (#2386 MF2) The same tool with its dispatch identity passed IN —
+/// mirrors `execute_create_mod_with`'s own seam and reason for existing.
+/// `finding_key`'s return riding the tool's RESULT text is otherwise
+/// unpinned: deleting the call and returning `recorded_finding_message`
+/// with `None` instead leaves the bin/lib suites green (`recorded_
+/// finding_message` alone is tested against both forms, but nothing
+/// previously exercised `execute_create_finding[_with]` actually calling
+/// the key-bearing form end to end).
+fn execute_create_finding_with(
+    raw_args: &str,
+    out_dir: &Path,
+    workspace_root: &Path,
+    my_dispatch: Option<&str>,
+) -> Result<ToolRun> {
     // NEVER return Err from a model-facing tool.
     //
     // Measured on the first live crawl: one malformed call returned an error,
@@ -3090,7 +3158,7 @@ fn execute_create_finding(
     // (#2386) `recorded` IS the `emit_seq` the host keys the stored record
     // by, so the key handed back here is the address the store will use.
     Ok(ToolRun {
-        result: recorded_finding_message(finding_key(recorded).as_deref(), recorded, remaining),
+        result: recorded_finding_message(finding_key_with(my_dispatch, recorded).as_deref(), recorded, remaining),
         emitted: verbatim,
         emit_seq: Some(recorded),
     })

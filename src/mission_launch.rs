@@ -519,6 +519,14 @@ pub fn launch(
     );
 
     let mut collected = collect_inputs(input_file, params)?;
+    // (#2386 MF3) The operator's OWN action, captured before a single
+    // default lands — the inert-input checks below need to tell "the
+    // operator passed this knob" apart from "the document defaulted it".
+    // Everything else in this function wants the POST-default view (see
+    // the next comment); this set does not, and reading it off `collected`
+    // after defaults apply would make every defaulted-but-inert input look
+    // operator-supplied and refuse a launch the operator never touched.
+    let operator_supplied: std::collections::BTreeSet<String> = collected.keys().cloned().collect();
     // (#2310 P4e) Document-declared defaults land BEFORE every consumer
     // below — the required check, the typo warning, the dry-run print, the
     // inputs fingerprint and both placeholder passes — so a defaulted
@@ -731,28 +739,38 @@ pub fn launch(
     // select, so a `--param rules=<one>` launch would otherwise flag an
     // input whose only reference lives in a task that was pruned away.
     //
-    // Two strengths, for two different readers. SUPPLIED and inert is the
-    // operator's own action being silently discarded — refused. Merely
-    // declared and inert is the document's bug, and refusing a launch over
-    // a knob nobody touched would block work rather than protect it — a
-    // named warning, on every launch AND every dry run, so it is visible on
-    // the free path too. See `check_supplied_inert_inputs`'s own doc for
-    // why the blanket refusal is not on yet, and what has to happen first.
+    // Two strengths, for two different readers. SUPPLIED (by the OPERATOR
+    // — see `operator_supplied`, captured before defaults, above) and
+    // inert is the operator's own action being silently discarded —
+    // refused, below. Merely declared and inert is the document's bug, and
+    // refusing a launch over a knob nobody touched would block work rather
+    // than protect it — a named warning, on every launch AND every dry
+    // run, so it is visible on the free path too. See
+    // `check_supplied_inert_inputs`'s own doc for why the blanket refusal
+    // is not on yet, and what has to happen first.
+    //
+    // (#2386 MF3) A defaulted-only inert input (declared with a `default`,
+    // never named on the operator's own `--param`/stdin) is neither of
+    // those two readers: it is not the operator's action (nothing to
+    // refuse) and its `collected` value came from the document, not from
+    // silently discarding anything the operator asked for. It gets its own
+    // WARN wording naming the default explicitly, still on the WARN path
+    // — never the refusal, which is reserved for `operator_supplied`.
     for name in mission_config::unreferenced_inputs(config_as_declared, LAUNCHER_CONSUMED_INPUTS) {
-        eprintln!(
-            "{}",
-            darkmux_types::style::warn(&format!(
-                "input `{name}` is declared by \"{config_id}\" but referenced by no step and \
-                 read by no launcher — supplying it would do nothing; mark it `\"ignored\": \
-                 true` with an `ignored_reason`, reference it as `{{{{{name}}}}}` in a step's \
-                 config, or delete it"
-            ))
-        );
+        if operator_supplied.contains(&name) {
+            // (#2386 C7) `check_supplied_inert_inputs` below is about to
+            // bail and list this exact name — one message per input, not
+            // a WARN immediately followed by a refusal naming the same
+            // thing.
+            continue;
+        }
+        let msg = declared_inert_input_warning(config_id, &name, collected.contains_key(&name));
+        eprintln!("{}", darkmux_types::style::warn(&msg));
     }
     mission_config::check_supplied_inert_inputs(
         config_as_declared,
         LAUNCHER_CONSUMED_INPUTS,
-        &collected,
+        &operator_supplied,
     )?;
 
     // (#1959) `--dry-run`: everything above this point (config load,
@@ -2359,6 +2377,30 @@ fn missing_inputs_message(config: &MissionConfig, missing: &[&mission_config::Mi
             .join(" "),
     );
     msg
+}
+
+/// (#2386 MF3) The declared-inert WARN text for one name — extracted to a
+/// pure function (mirrors `missing_inputs_message` above) so the wording is
+/// unit-testable without needing to capture the `eprintln!` this feeds at
+/// its one call site. `has_default` distinguishes a defaulted-only input
+/// (the document's `default` landed in `collected`, the operator never
+/// touched it) from one that is simply unset — the two get different
+/// wording (see `mission_launch.rs::launch`'s own call site comment for
+/// why).
+fn declared_inert_input_warning(config_id: &str, name: &str, has_default: bool) -> String {
+    if has_default {
+        format!(
+            "input `{name}` is declared with a default but referenced by no step; the default \
+             changes nothing about this run — mark it `\"ignored\": true` with an \
+             `ignored_reason`, reference it as `{{{{{name}}}}}` in a step's config, or delete it"
+        )
+    } else {
+        format!(
+            "input `{name}` is declared by \"{config_id}\" but referenced by no step and read by \
+             no launcher — supplying it would do nothing; mark it `\"ignored\": true` with an \
+             `ignored_reason`, reference it as `{{{{{name}}}}}` in a step's config, or delete it"
+        )
+    }
 }
 
 /// (#1503) Mint a fresh, UNIQUE run id for one `mission launch` call — never
@@ -5138,6 +5180,114 @@ mod tests {
         assert!(msg.contains("workdir"), "{msg}");
         assert!(all_mission_ids().is_empty());
         let _ = guard;
+    }
+
+    // ── (#2386 MF1/MF3) declared-but-unreferenced input ("inert knob") ──
+    // on the real `launch()` path, not just `check_supplied_inert_inputs`
+    // in isolation — proving the checks actually fire from their real call
+    // site, not only that the pure function they call is correct.
+
+    const INERT_KNOB_CONFIG: &str = r#"{
+        "id": "inert-knob-test-mission",
+        "name": "Inert Knob Test Mission",
+        "schema_version": "2.3",
+        "inputs": [
+            {"name": "knob", "description": "a knob nothing consumes"}
+        ],
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop"}]}]}
+        ]
+    }"#;
+
+    const INERT_KNOB_WITH_DEFAULT_CONFIG: &str = r#"{
+        "id": "inert-knob-default-test-mission",
+        "name": "Inert Knob With Default Test Mission",
+        "schema_version": "2.3",
+        "inputs": [
+            {"name": "knob", "description": "a knob nothing consumes", "default": "unchanged"}
+        ],
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop"}]}]}
+        ]
+    }"#;
+
+    /// (#2386 MF1) `check_supplied_inert_inputs`'s call site in `launch()`
+    /// is unpinned without this — deleting the call (or passing it the
+    /// wrong set) leaves the bin suite green. An operator-supplied `--param
+    /// knob=1` naming an input NO step references must bail, pre-mint,
+    /// naming `knob` — on the real launch path, with a real on-disk
+    /// mission config (not `check_supplied_inert_inputs` called directly).
+    #[test]
+    #[serial_test::serial]
+    fn launch_refuses_an_operator_supplied_input_no_step_references() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("inert-knob-test-mission", INERT_KNOB_CONFIG);
+        let err = launch(
+            "inert-knob-test-mission",
+            None,
+            &["knob=1".to_string(), "dry_run=true".to_string()],
+            None,
+        )
+        .expect_err("an operator-supplied inert input must be refused, even under --dry-run");
+        let msg = err.to_string();
+        assert!(msg.contains("knob"), "{msg}");
+        assert!(all_mission_ids().is_empty(), "a refused launch must mint nothing");
+        let _ = guard;
+    }
+
+    /// (#2386 MF3) The mirror case: `knob` is declared with a `default`
+    /// and the operator never named it on `--param`/stdin. Before the
+    /// MF3 fix, `apply_input_defaults` ran BEFORE the supplied-set was
+    /// captured, so the defaulted value looked operator-supplied and this
+    /// exact launch was refused — unlaunchable even under `--dry-run`,
+    /// over a value the operator never touched. Must now succeed (the
+    /// WARN path, not the refusal path).
+    #[test]
+    #[serial_test::serial]
+    fn dry_run_succeeds_for_a_defaulted_only_inert_input() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("inert-knob-default-test-mission", INERT_KNOB_WITH_DEFAULT_CONFIG);
+        let exit = launch(
+            "inert-knob-default-test-mission",
+            None,
+            &["dry_run=true".to_string()],
+            None,
+        )
+        .expect("a defaulted-only inert input must not be refused, even though it lands in `collected`");
+        assert_eq!(exit, 0);
+        assert!(all_mission_ids().is_empty(), "a dry run must mint no mission");
+        let _ = guard;
+    }
+
+    /// (#2386 C7) One message per input: an operator-supplied inert input
+    /// must not ALSO print the declared-inert WARN before the refusal
+    /// names it. `declared_inert_input_warning` (the WARN body) is a
+    /// separate concern tested directly below; the guard the call site
+    /// applies (`operator_supplied.contains(&name)` skips the WARN loop
+    /// entirely) is proven by `launch_refuses_an_operator_supplied_input_
+    /// no_step_references` above bailing with the refusal's own wording
+    /// ("would change nothing about this run") rather than the WARN's
+    /// ("supplying it would do nothing").
+    #[test]
+    fn c7_refusal_wording_differs_from_the_warn_wording_so_the_two_are_distinguishable() {
+        let warn = declared_inert_input_warning("cfg", "knob", false);
+        assert!(warn.contains("supplying it would do nothing"), "{warn}");
+        assert!(!warn.contains("would change nothing about this run"), "{warn}");
+    }
+
+    /// (#2386 MF3) The two declared-inert WARN wordings are distinct and
+    /// each names the input.
+    #[test]
+    fn declared_inert_input_warning_distinguishes_defaulted_from_merely_unset() {
+        let defaulted = declared_inert_input_warning("cfg", "knob", true);
+        assert!(defaulted.contains("knob"), "{defaulted}");
+        assert!(defaulted.contains("declared with a default"), "{defaulted}");
+        assert!(defaulted.contains("the default changes nothing"), "{defaulted}");
+
+        let unset = declared_inert_input_warning("cfg", "knob", false);
+        assert!(unset.contains("knob"), "{unset}");
+        assert!(unset.contains("referenced by no step and read by no launcher"), "{unset}");
+        assert_ne!(defaulted, unset);
     }
 
     // ── coder-phase wiring — registration only, never a live dispatch ──

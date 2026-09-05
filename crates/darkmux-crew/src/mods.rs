@@ -1121,9 +1121,19 @@ pub fn create_from_emission(
     let missing = missing_finding_keys(findings_root, &for_keys)?;
     let mut warnings = warnings;
     for key in &missing {
+        // (#2386 C6) The usual cause here is NOT a typo — this producer's
+        // key already passed the runtime's own tool-boundary check on the
+        // dispatch's own machine. The far more common reason a key is
+        // missing on THIS machine's store is the cross-machine case: the
+        // finding was recorded on a different machine's tailer and this
+        // one's `finding sync` never replayed it. Point at the fix that
+        // actually applies, same wording as the other two producers
+        // (`findings::brief_ref`, `mods::create`'s own missing-finding
+        // refusal above).
         warnings.push(format!(
-            "dropped `for` key {key:?}: no finding with that key is in the store, so the link \
-             would follow to nothing"
+            "dropped `for` key {key:?}: no finding with that key is in this machine's store, so \
+             the link would follow to nothing — `darkmux finding sync` replays the flow stream \
+             into it, which is the fix when the finding was recorded on a different machine"
         ));
     }
     let for_keys: Vec<String> = for_keys.into_iter().filter(|k| !missing.contains(k)).collect();
@@ -1867,6 +1877,14 @@ mod tests {
         assert!(
             rec.warnings.iter().any(|w| w.contains("sess-abc/1")),
             "the reason rides the record: {:?}",
+            rec.warnings
+        );
+        // (#2386 C6) The usual cause is the cross-machine case (recorded on
+        // a different machine's tailer, never synced to this one's store)
+        // rather than a typo — the warning must point at the actual fix.
+        assert!(
+            rec.warnings.iter().any(|w| w.contains("darkmux finding sync")),
+            "must name the cross-machine fix: {:?}",
             rec.warnings
         );
     }
