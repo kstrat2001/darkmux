@@ -39,11 +39,14 @@ test.beforeEach(async ({ page }) => {
   page.on('pageerror', (e) => { throw new Error(`uncaught page error: ${e}`); });
 });
 
-/** The events column's own count chip ("50 of 6092 events" / "0 events"). */
+/** The events column's own count chip ("50 of 6092 events" / "0 events" /
+ *  "50 of 6092 events · 4952 hidden" — #2417 round 2 appends the hidden-by-
+ *  filters count whenever the facet defaults hide something, which is the
+ *  common case on the demo's busy fixture). */
 async function eventCountText(page) {
   return page.evaluate(() => {
     const el = [...document.querySelectorAll('*')].find(
-      (e) => e.children.length === 0 && /^\d+\+? (of \d+\+? )?events?$/.test((e.textContent || '').trim()),
+      (e) => e.children.length === 0 && /^\d+\+? (of \d+\+? )?events?( · \d+ hidden)?$/.test((e.textContent || '').trim()),
     );
     return el ? el.textContent.trim() : null;
   });

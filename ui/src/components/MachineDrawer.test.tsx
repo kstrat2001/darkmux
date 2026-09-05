@@ -575,9 +575,13 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
     const records: FlowRecord[] = [
       {
         ts: "2026-01-01T00:00:00Z",
-        category: "note",
+        // (#2416) `dispatch.reasoning` — the default event-filter view now
+        // curates by activity (reasoning/checkpoint/tool call/turn/dispatch
+        // error); `note` no longer shows by default, and this test isn't
+        // about filtering, just that the tab mounts the column at all.
+        category: "work",
         source: "operator",
-        action: "note",
+        action: "dispatch.reasoning",
         handle: "hello",
       },
     ];
