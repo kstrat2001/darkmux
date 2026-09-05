@@ -3926,6 +3926,13 @@ fn reconcile_and_finalize_on_error(
     // interrupt and never reached is here, named, rather than dropped
     // from the tally.
     let (completed, errored, never_ran) = partition_step_outcomes(steps);
+    // (F3, from #2379's review) ...and the same one-line WARNING the happy
+    // path emits, so an operator reading `warnings` learns about the steps
+    // that never ran on the path where that is most common — not only a
+    // reader of the payload key.
+    if let Some(w) = launch_outcome_warning(errored.len(), never_ran.len(), steps.len()) {
+        envelope.warnings.push(w);
+    }
     envelope.payload = serde_json::json!({
         "completed_steps": completed,
         "errored_steps": errored,
@@ -3935,13 +3942,13 @@ fn reconcile_and_finalize_on_error(
 }
 
 fn print_run_summary(mission_id: &str, steps: &BTreeMap<String, crew::types::Step>) {
-    let complete = steps.values().filter(|s| s.status == NodeStatus::Complete).count();
-    let errored = steps.values().filter(|s| s.status == NodeStatus::Error).count();
     // (#2310 swarm F) The summary counts what NEVER RAN too — a run whose
     // declared steps were abandoned used to print "N complete, 0 errored"
-    // and read as a clean run on the operator's own terminal.
-    let abandoned =
-        steps.values().filter(|s| !matches!(s.status, NodeStatus::Complete | NodeStatus::Error)).count();
+    // and read as a clean run on the operator's own terminal. (F3) Off the
+    // same exhaustive partition the envelope uses, so the terminal line and
+    // the envelope cannot classify a status differently.
+    let (completed, errored, never_ran) = partition_step_outcomes(steps);
+    let (complete, errored, abandoned) = (completed.len(), errored.len(), never_ran.len());
     println!(
         "\n{}",
         style::header(&format!(
@@ -6513,6 +6520,15 @@ mod tests {
         };
         assert_eq!(ids("completed_steps"), vec!["p1-step".to_string()], "{payload}");
         assert_eq!(ids("errored_steps"), vec!["p2-step".to_string()], "{payload}");
+        // (F3, from #2379's review) The failure path WARNS about the steps
+        // that never ran, the same sentence the happy path emits — not just
+        // a payload key an operator reading `warnings` never sees. The
+        // reconciled Running step counts as errored here (1), p3 never ran (1).
+        assert!(
+            persisted.warnings.iter().any(|w| w == "1 of 3 step(s) errored and 1 never ran (abandoned) during launch execution"),
+            "the error-path envelope must carry the never-ran warning: {:?}",
+            persisted.warnings
+        );
     }
 
     /// (F2, from #2374's review) The warning names only the halves that

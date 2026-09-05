@@ -1404,8 +1404,9 @@ impl StepKind for CrawlUnitStepKind {
 /// (`<dispatch session>/<seq>`), which is unique per draw by construction
 /// and so could never collide. First occurrence (draw order) wins; a
 /// finding whose `file`/`line` is absent (a rare, non-windowed report)
-/// dedups on `(rule, None, None)`, which still merges two IDENTICAL
-/// windowless reports of the same rule rather than doubling them.
+/// dedups on `(rule, None, None)`, which merges two windowless reports of
+/// the same rule only when they come from DIFFERENT draws — within one
+/// draw they are two findings, like any other same-key pair (F2/F3).
 /// (#2310 fix-loop E2, S1-4) Dedup ACROSS draws — and only across draws.
 ///
 /// The key this collapses on — `(rule, file, line)` — is what two DRAWS
