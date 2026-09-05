@@ -7948,10 +7948,11 @@ mod tests {
         // battery/Low-Power-Mode/thermal-state/thermal-emergency] +
         // max-stall-recoveries [#2190] +
         // step-command-timeout [#2361] +
-        // dispatch-free-concurrency [#2394]) + one per active eureka rule.
+        // dispatch-free-concurrency [#2394] +
+        // quarantined-mirrors [#2399]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 52 + darkmux_eureka::all_rules().len();
+        let expected = 53 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
