@@ -608,19 +608,14 @@ pub fn finding_rule_for(pattern: Option<&str>, rule_ids: &[String]) -> (String, 
     )
 }
 
-/// Strip a container-path prefix off a finding's `file` field — either the
-/// absolute form (`/workspace/<source-id>/<rel>`) or the bare relative one
-/// (`<source-id>/<rel>`, since a model may have copied the scope listing
-/// verbatim). Falls through unchanged when neither matches.
-fn strip_source_prefix(source_id: &str, raw: &str) -> String {
-    if let Some(rel) = raw.strip_prefix(&format!("/workspace/{source_id}/")) {
-        return rel.to_string();
-    }
-    if let Some(rel) = raw.strip_prefix(&format!("{source_id}/")) {
-        return rel.to_string();
-    }
-    raw.to_string()
-}
+/// Strip a container-path prefix off a finding's `file` field.
+///
+/// (#2361) The rule now lives in ONE place — `darkmux_crew::findings::
+/// strip_source_prefix`, which the STORE's own writer uses too. It used to
+/// live only here, so this run-local artifact normalized while the stored
+/// record kept the container path, and every host-side consumer (the diff
+/// test, the gate's scratch checkout) read a path that did not exist.
+use darkmux_crew::findings::strip_source_prefix;
 
 /// Read this unit's accepted findings, stamp the crawl's provenance onto
 /// each, and write them beside the run as `<rule>.<unit>.findings.jsonl` (#2360 —

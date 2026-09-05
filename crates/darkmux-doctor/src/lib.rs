@@ -161,6 +161,7 @@ pub fn run() -> DoctorReport {
         check_redis_config(),
         check_gh_allowlist(),
         check_review_judge_exhaustion_policy(),
+        check_step_command_timeout(),
         check_turn_delay(),
         check_reasoning_checkpoint_interval(),
         check_max_stall_recoveries(),
@@ -1735,6 +1736,41 @@ fn check_review_judge_exhaustion_policy() -> Check {
         )
     };
     Check { name: name.into(), status: Status::Pass, message, hint: None }
+}
+
+/// (#2361, swarm S4-4) Informational: the bound on ONE operator-supplied
+/// shell command a step runs — `mods.gate`'s `test_command` and
+/// `procedural.shell`'s `command`. Always `Pass` (a preference, not a
+/// health signal); surfaces the resolved value with provenance so an
+/// operator whose gate reported `test_command exceeded <n>s` can see which
+/// tier set that number without reading `config.json`. Mirrors
+/// `check_review_judge_exhaustion_policy`'s provenance-display shape.
+fn check_step_command_timeout() -> Check {
+    let name = "runtime.step_command_timeout_seconds";
+    let env_set = std::env::var("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .runtime
+        .and_then(|r| r.step_command_timeout_seconds)
+        .is_some();
+    let provenance = if env_set {
+        "from DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    let seconds = darkmux_types::config_access::step_command_timeout_seconds();
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "{seconds}s ({provenance}) — a step's shell command (mods.gate's test_command, \
+             procedural.shell) is killed at this bound, process group and all"
+        ),
+        hint: None,
+    }
 }
 
 /// (#2094) Surface the resolved `runtime.turn_delay_ms` with provenance —
@@ -7583,10 +7619,11 @@ mod tests {
         // mission-envelope-readability [#1881] + hooks [#2093] +
         // rules [#1959] + host-probe [#2107] + power-posture [#2112,
         // battery/Low-Power-Mode/thermal-state/thermal-emergency] +
-        // max-stall-recoveries [#2190]) + one per active eureka rule.
+        // max-stall-recoveries [#2190] +
+        // step-command-timeout [#2361]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 50 + darkmux_eureka::all_rules().len();
+        let expected = 51 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

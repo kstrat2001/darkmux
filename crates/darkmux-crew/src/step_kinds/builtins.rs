@@ -2230,22 +2230,44 @@ impl StepKind for ProceduralShellStepKind {
             cmd.env(format!("DARKMUX_STEP_INPUT_{env_key}"), output);
         }
 
-        let out = cmd
-            .output()
-            .with_context(|| format!("step `{}`: spawning shell command", step.id))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "step `{}`: command exited with {:?}\nstdout: {}\nstderr: {}",
-                step.id,
-                out.status.code(),
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr),
-            );
+        // (#2361, swarm S4-4) BOUNDED, in its own process group, and
+        // registered with the child registry — see
+        // `crate::bounded_command`'s module doc. An unbounded `.output()`
+        // here pinned the mission Active with no way for a caught
+        // SIGTERM/SIGINT to reach the child.
+        let timeout = crate::bounded_command::configured_timeout();
+        match crate::bounded_command::run_bounded(cmd, timeout) {
+            crate::bounded_command::Bounded::Finished { success, code, stdout, stderr } => {
+                if !success {
+                    anyhow::bail!(
+                        "step `{}`: command exited with {:?}\nstdout: {}\nstderr: {}",
+                        step.id,
+                        code,
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr),
+                    );
+                }
+                Ok(StepOutcome {
+                    output: String::from_utf8_lossy(&stdout).to_string(),
+                    flow_records: Vec::new(),
+                })
+            }
+            // A killed command produced no output this step could hand on,
+            // so — unlike `mods.gate`, where a hung `test_command` is
+            // recorded as gate DATA — this is a step error naming the bound.
+            crate::bounded_command::Bounded::TimedOut { seconds } => anyhow::bail!(
+                "step `{}`: command exceeded {seconds}s and was killed \
+                 (`runtime.step_command_timeout_seconds`)",
+                step.id
+            ),
+            crate::bounded_command::Bounded::Interrupted => anyhow::bail!(
+                "step `{}`: interrupted before the command finished; the child was killed",
+                step.id
+            ),
+            crate::bounded_command::Bounded::SpawnFailed(e) => {
+                Err(anyhow::Error::new(e)).with_context(|| format!("step `{}`: spawning shell command", step.id))
+            }
         }
-        Ok(StepOutcome {
-            output: String::from_utf8_lossy(&out.stdout).to_string(),
-            flow_records: Vec::new(),
-        })
     }
 }
 
@@ -2462,6 +2484,33 @@ mod tests {
         let s = step("s1", "procedural.shell", json!({"command": "exit 3"}));
         let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("exited with"), "{err}");
+    }
+
+    /// (#2361, swarm S4-4) A shell step's command is BOUNDED. Before the
+    /// fix this was a plain `.output()`: the step never returned, the
+    /// mission stayed Active, and a caught SIGTERM/SIGINT could not reach
+    /// the child because its pid was never registered. Unlike `mods.gate`
+    /// (where a hung `test_command` is data about the RUN, recorded as a
+    /// gate skip), a `procedural.shell` step that outran its bound has no
+    /// output to hand on — it is a step ERROR naming the bound.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS
+    fn procedural_shell_past_the_deadline_is_killed_and_errors_with_the_bound() {
+        let k = "DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "2") };
+        let s = step("s1", "procedural.shell", json!({"command": "sleep 300"}));
+        let started = std::time::Instant::now();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let elapsed = started.elapsed();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert!(elapsed < std::time::Duration::from_secs(20), "must return at its bound, took {elapsed:?}");
+        assert!(err.to_string().contains("exceeded 2s"), "{err}");
     }
 
     #[test]

@@ -108,6 +108,9 @@ const KEYS: &[(&str, Ty)] = &[
     ("audit.dir", Ty::Str),
     ("runtime.inactivity_timeout_seconds", Ty::Uint),
     ("runtime.model_load_timeout_seconds", Ty::Uint),
+    // (#2361) The bound on a step's own shell command — mods.gate's
+    // test_command, procedural.shell.
+    ("runtime.step_command_timeout_seconds", Ty::Uint),
     ("runtime.max_turns", Ty::Uint),
     ("runtime.max_tokens", Ty::Uint),
     ("runtime.max_tokens_per_call", Ty::Uint),

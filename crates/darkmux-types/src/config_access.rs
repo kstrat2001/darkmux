@@ -399,6 +399,17 @@ pub fn model_load_timeout_seconds() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.model_load_timeout_seconds);
     pick_parsed("DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS", cfg, Some(600)).unwrap()
 }
+/// (#2361, swarm finding S4-4) Bound on ONE operator-supplied shell command
+/// a STEP runs — `mods.gate`'s `test_command`, `procedural.shell`'s
+/// `command`. Both used to run unbounded and unregistered, so a hung suite
+/// pinned the mission open and neither SIGTERM nor SIGINT could reach it.
+/// Consumed by `darkmux_crew::bounded_command::run_shell_bounded`. Mirrors
+/// [`model_load_timeout_seconds`]' wiring exactly — the sibling bound on a
+/// host model load.
+pub fn step_command_timeout_seconds() -> u64 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.step_command_timeout_seconds);
+    pick_parsed("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS", cfg, Some(600)).unwrap()
+}
 pub fn max_turns() -> Option<u32> {
     max_turns_with_source().0
 }
@@ -1526,6 +1537,27 @@ mod tests {
         // An unparseable env value falls through (here, to the default).
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(model_load_timeout_seconds(), 600);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── step_command_timeout_seconds (#2361, swarm S4-4): env > config >
+    //    600 default, mirroring model_load_timeout_seconds exactly ──
+    #[serial_test::serial]
+    #[test]
+    fn step_command_timeout_env_overrides_then_default() {
+        let k = "DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        assert_eq!(step_command_timeout_seconds(), 600);
+        unsafe { std::env::set_var(k, "2") };
+        assert_eq!(step_command_timeout_seconds(), 2, "env wins live");
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(step_command_timeout_seconds(), 600);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

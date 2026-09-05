@@ -873,6 +873,7 @@ mod tests {
             step_id: None,
             context,
             emitted: json!({ "file": file, "line": line, "pattern": "test", "evidence": evidence, "why": why }),
+            source: None,
             schema_version: crate::findings::FINDING_SCHEMA_VERSION.to_string(),
             extras: Default::default(),
         }
@@ -900,6 +901,7 @@ mod tests {
                 mission_id: None,
                 phase_id: None,
                 step_id: None,
+                source: None,
                 gate: None,
                 gate_skipped_reason: None,
                 schema_version: crate::mods::MOD_SCHEMA_VERSION.to_string(),

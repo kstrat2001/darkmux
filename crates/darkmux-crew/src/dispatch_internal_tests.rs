@@ -4506,7 +4506,25 @@
         );
         assert_eq!(rec["phase_id"], "crawl-1788402801-crawl", "got: {rec}");
         assert_eq!(rec["step_id"], "step-7", "got: {rec}");
-        assert_eq!(rec["emitted"], emitted, "the emission is stored untouched");
+        // (#2361) The emission is stored untouched EXCEPT for the one
+        // named host translation: this dispatch's launcher context names
+        // source `acme`, so a `file` in the CONTAINER's coordinates
+        // (`/workspace/acme/src/x.ts`) is mapped to the repo-relative path
+        // every host-side consumer speaks, and the source id it used is
+        // recorded so nothing is lost. Every other field is byte-identical
+        // — asserted field-by-field rather than by exempting the whole
+        // object, so a future writer that reshapes anything else still
+        // fails here.
+        assert_eq!(rec["emitted"]["file"], "src/x.ts", "the one mapped field: {rec}");
+        assert_eq!(rec["source"], "acme", "the source id the mapping used rides on the record: {rec}");
+        for key in ["line", "why", "evidence", "rect"] {
+            assert_eq!(rec["emitted"][key], emitted[key], "`{key}` must be stored untouched: {rec}");
+        }
+        assert_eq!(
+            rec["emitted"].as_object().unwrap().len(),
+            emitted.as_object().unwrap().len(),
+            "no field is added to or dropped from the emission: {rec}"
+        );
 
         // WRITE-ONCE. Mutate the file, replay the identical event, and the
         // mutation must survive: the record is an event, not a cache.

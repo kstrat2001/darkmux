@@ -15,6 +15,9 @@
 // (#1230 Packet 1) Bounded concurrent-dispatch executor over gestalt's
 // `plan_waves` — see the module doc. No production caller in this packet;
 // Packet 2's `run_step_graph` scheduler is the intended first consumer.
+/// (#2361, swarm S4-4) The ONE bounded runner every step kind that shells
+/// out goes through — `mods.gate`'s `test_command`, `procedural.shell`.
+pub mod bounded_command;
 pub mod brief_refs;
 pub mod concurrent_dispatch;
 /// Unified-diff parsing (#2310 P4b) — moved down from `darkmux-lab`'s

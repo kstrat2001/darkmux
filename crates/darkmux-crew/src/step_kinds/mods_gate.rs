@@ -73,7 +73,35 @@
 //! never fails the STEP over the command's own exit code, or over a kit
 //! that failed to apply — either is exactly as valid an outcome as a
 //! pass; only a genuine infrastructure problem (an unreadable mod store, a
-//! malformed config) fails the step itself.
+//! malformed config) fails the step itself. A `test_command` that exceeds
+//! `runtime.step_command_timeout_seconds` is likewise a named SKIP
+//! (`"test_command exceeded <n>s"`, #2361 / swarm S4-4), never a
+//! fabricated `passed: false`: a suite that hung says nothing about the
+//! kit.
+//!
+//! # Trust boundary — a gate run EXECUTES model-authored code (S5-1)
+//!
+//! This is the one place in darkmux where a MODEL's product is not just
+//! recorded but RUN. The gate applies a mod's kit — written by whatever
+//! model the create-mods seat was staffed with — to a scratch copy and
+//! then runs the operator's `test_command` inside that patched tree, as
+//! the darkmux user, with that user's filesystem and network. A kit is
+//! only a "small unified diff" by convention: one that edits
+//! `package.json`'s `scripts`, a `Makefile`, `conftest.py`, `build.rs`,
+//! `.cargo/config.toml`, or any file the test command loads is model code
+//! that executes the moment the gate runs. `git apply --check` proves a
+//! patch APPLIES; it says nothing about what the patched tree then does.
+//!
+//! What bounds the blast radius here, honestly: the patch lands in a
+//! throwaway copy (the source checkout is never patched), kit paths that
+//! escape the checkout are refused before the apply, and the command is
+//! killed at the configured deadline. What does NOT bound it: the
+//! command's own privileges, its network access, or anything it writes
+//! outside the scratch dir. **So point `test_command` only at a tree you
+//! would be willing to run untrusted code in** — and treat enabling the
+//! gate on a machine holding credentials as the decision it is. An
+//! operator who configures no `test_command` never executes anything: the
+//! gate skips with `"no test_command configured"`.
 
 use crate::mods::{self, GateOutcome, ModRecord};
 use crate::step_kinds::registry::StepKindRegistry;
@@ -202,6 +230,18 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
     if let Err(e) = copy_dir_recursive(&source_dir, &scratch_checkout) {
         return (None, Some(format!("could not copy the source checkout: {e}")));
     }
+    // (#2361, swarm S5-6a) The copy must not carry the source's `.git`. A
+    // materialized source is a LINKED WORKTREE, so its `.git` is a small
+    // FILE (`gitdir: …/worktrees/<id>`) pointing back at the shared bare
+    // mirror — copied verbatim, the scratch becomes a second live worktree
+    // of that mirror, and a `test_command` that does any git write (`git
+    // stash`, `git commit`, `git checkout`) mutates the mirror every other
+    // unit in the run is reading from. Nothing here needs a repo: `git
+    // apply` runs as a raw patch tool under `GIT_CEILING_DIRECTORIES`
+    // (below), which is the mode this kind already wants.
+    if let Err(e) = strip_git_dir(&scratch_checkout) {
+        return (None, Some(format!("could not detach the scratch copy from git: {e}")));
+    }
     let patch_path = scratch.path().join("mod.patch");
     if let Err(e) = std::fs::write(&patch_path, kit) {
         return (None, Some(format!("could not write the mod's kit to a scratch file: {e}")));
@@ -302,20 +342,48 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
     // of the fix. A command that cannot even be SPAWNED (a missing
     // interpreter, a workdir that vanished) is an infra skip; a command
     // that runs and exits nonzero is a real, data `passed: false`.
+    //
+    // (#2361, swarm S4-4) BOUNDED, in its own process group, and
+    // registered with the child registry — see
+    // `crate::bounded_command`'s module doc for the three failures the
+    // unbounded `.output()` here produced live. A command that outruns
+    // `runtime.step_command_timeout_seconds` is a named SKIP, not a
+    // `passed: false`: a suite that hung says nothing about the kit.
     let mut test_cmd = std::process::Command::new("sh");
     test_cmd.arg("-c").arg(command).current_dir(&scratch_checkout);
-    match test_cmd.output() {
-        Ok(out) => (
+    let timeout = crate::bounded_command::configured_timeout();
+    match crate::bounded_command::run_bounded(test_cmd, timeout) {
+        crate::bounded_command::Bounded::Finished { success, code, .. } => (
             Some(GateOutcome {
-                passed: out.status.success(),
+                passed: success,
                 command: command.to_string(),
-                exit_code: out.status.code(),
+                exit_code: code,
                 applied: Some(true),
                 reason: None,
             }),
             None,
         ),
-        Err(e) => (None, Some(format!("could not run the gate command in {}: {e}", scratch_checkout.display()))),
+        crate::bounded_command::Bounded::TimedOut { seconds } => {
+            (None, Some(format!("test_command exceeded {seconds}s")))
+        }
+        crate::bounded_command::Bounded::Interrupted => {
+            (None, Some("interrupted before test_command finished".to_string()))
+        }
+        crate::bounded_command::Bounded::SpawnFailed(e) => {
+            (None, Some(format!("could not run the gate command in {}: {e}", scratch_checkout.display())))
+        }
+    }
+}
+
+/// Remove a copied `.git` — a FILE for a linked worktree, a directory for
+/// a plain clone — so the scratch copy is a plain tree, related to no
+/// repository. Absent is fine (a source that is not a checkout at all).
+fn strip_git_dir(checkout: &Path) -> std::io::Result<()> {
+    let dot_git = checkout.join(".git");
+    match std::fs::symlink_metadata(&dot_git) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&dot_git),
+        Ok(_) => std::fs::remove_file(&dot_git),
+        Err(_) => Ok(()),
     }
 }
 
@@ -377,6 +445,16 @@ fn resolve_single_source_dir(tree_root: &Path) -> Result<PathBuf, String> {
 /// whether or not the mirror is a real git checkout, and leaves the
 /// mirror's own `.git` (if any) untouched rather than sharing object
 /// storage with a scratch worktree that gets deleted out from under it.
+///
+/// (#2361, swarm S5-6b) **Why a serial per-file copy is cheap enough:**
+/// it is one `fs::copy` per file (~8k files/s measured) and what it copies
+/// is a MATERIALIZED source tree — a worktree checked out by
+/// `workspace_spec::materialize`, which holds tracked files only: no
+/// `target/`, no `node_modules/`, no build output (the spec's own
+/// `DEFAULT_EXCLUDE` names those, and nothing in the run ever builds
+/// inside the mirror). A source whose checkout DID hold a build tree would
+/// make this the gate's dominant cost, and the fix then is a
+/// copy-on-write clone (`clonefile`/`FICLONE`), not more threads.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -496,6 +574,7 @@ mod tests {
             mission_id: None,
             phase_id: None,
             step_id: None,
+            source: None,
             gate: None,
             gate_skipped_reason: None,
             schema_version: crate::mods::MOD_SCHEMA_VERSION.to_string(),
@@ -618,6 +697,156 @@ mod tests {
         // (MUST FIX A) the mirror is provably untouched — the gate ran
         // against a SCRATCH copy, never the source checkout itself.
         assert_eq!(std::fs::read_to_string(&mirror_file).unwrap(), before, "the source mirror must never be modified");
+    }
+
+    /// (#2361, swarm S4-4, proven live) A `test_command` that never
+    /// returns is BOUNDED. Before the fix this ran `sh -c … .output()`
+    /// with no deadline and no registered child: the step never returned,
+    /// the mission stayed Active, and a SIGTERM did nothing until the
+    /// command did. The bound is data about the RUN, not about the kit —
+    /// a named skip, never a fabricated `passed: false`.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_MODS_DIR + the timeout env var
+    fn a_test_command_past_the_deadline_is_killed_and_skipped_with_the_reason() {
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        let kit = one_line_kit("wrong", "right");
+        mods::materialize(mods_dir.path(), &a_mod_kit("mod-hang", "sess-a/1", &kit, Some("unified-diff"))).unwrap();
+
+        let k = "DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "2") };
+        let started = std::time::Instant::now();
+        let outcome = ModsGateStepKind
+            .run(
+                &step(json!({
+                    "for_key": "sess-a/1",
+                    "test_command": "sleep 300",
+                    "workdir": tree_root.to_string_lossy(),
+                })),
+                &task(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert!(elapsed < std::time::Duration::from_secs(20), "the gate must return at its bound, took {elapsed:?}");
+        let summary: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        assert_eq!(summary["mods_seen"], 1);
+
+        let rec = mods::load_at(mods_dir.path(), "mod-hang").unwrap().unwrap();
+        assert!(rec.gate.is_none(), "a hung command says nothing about the kit: {rec:?}");
+        assert_eq!(rec.gate_skipped_reason.as_deref(), Some("test_command exceeded 2s"));
+    }
+
+    /// (S5-6a) The scratch copy carries NO `.git`. A materialized source
+    /// is a linked worktree, so its `.git` is a FILE pointing at the
+    /// shared bare mirror's worktree dir — copied verbatim, the scratch
+    /// becomes a live second worktree of that mirror and a `test_command`
+    /// doing any git write (`git stash`, `git commit`) mutates the mirror
+    /// every other unit is reading. `git apply` needs no repo (this kind
+    /// already runs it as a raw patch tool under
+    /// `GIT_CEILING_DIRECTORIES`), so removing it costs nothing.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_MODS_DIR, a process-global
+    fn the_scratch_copy_carries_no_git_and_the_kit_still_applies() {
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        // The exact shape a linked worktree has: `.git` is a FILE.
+        std::fs::write(tree_root.join("app/.git"), "gitdir: /nowhere/.git/worktrees/app\n").unwrap();
+        let kit = one_line_kit("wrong", "right");
+        mods::materialize(mods_dir.path(), &a_mod_kit("mod-nogit", "sess-a/1", &kit, Some("unified-diff"))).unwrap();
+
+        ModsGateStepKind
+            .run(
+                &step(json!({
+                    "for_key": "sess-a/1",
+                    // Passes only if the kit applied AND `.git` is gone.
+                    "test_command": "grep -q right answer.txt && ! test -e .git",
+                    "workdir": tree_root.to_string_lossy(),
+                })),
+                &task(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        let rec = mods::load_at(mods_dir.path(), "mod-nogit").unwrap().unwrap();
+        let gate = rec.gate.as_ref().unwrap_or_else(|| panic!("expected a real gate outcome: {rec:?}"));
+        assert!(gate.passed, "the kit must apply with no `.git` in the scratch: {gate:?}");
+        assert_eq!(gate.applied, Some(true));
+        // The source checkout keeps its own `.git` — only the COPY is stripped.
+        assert!(tree_root.join("app/.git").exists(), "the source checkout must be left exactly as it was");
+    }
+
+    /// (S5-6a, the consequence stated as a test) A `test_command` that
+    /// does a git WRITE must not reach the shared mirror. With the
+    /// worktree's `.git` copied into the scratch, the scratch IS a live
+    /// second worktree of that mirror: a `git commit` inside it moves the
+    /// worktree's HEAD in the mirror's own `.git/worktrees/<id>/` and
+    /// writes objects into the mirror every other unit in the run is
+    /// reading. Asserted against the real thing — a real `git worktree`,
+    /// the real HEAD, the real worktree list.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_MODS_DIR, a process-global
+    fn a_gate_command_doing_git_writes_cannot_reach_the_shared_mirror() {
+        fn git(cwd: &Path, args: &[&str]) -> std::process::Output {
+            std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("git must be available")
+        }
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+        let home = TempDir::new().unwrap();
+        // A real repo, and a real linked worktree at <tree_root>/app —
+        // exactly the shape `workspace_spec::materialize` produces.
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("answer.txt"), "wrong\n").unwrap();
+        git(&repo, &["add", "answer.txt"]);
+        git(&repo, &["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q", "-m", "seed"]);
+        let tree_root = home.path().join("tree");
+        std::fs::create_dir_all(&tree_root).unwrap();
+        let checkout = tree_root.join("app");
+        git(&repo, &["worktree", "add", "-q", "--detach", &checkout.to_string_lossy()]);
+        assert!(checkout.join(".git").is_file(), "a linked worktree's `.git` is a FILE");
+
+        let head_before = git(&checkout, &["rev-parse", "HEAD"]).stdout;
+        let worktrees_before = git(&repo, &["worktree", "list"]).stdout;
+        let log_before = git(&repo, &["log", "--oneline", "--all"]).stdout;
+
+        let kit = one_line_kit("wrong", "right");
+        mods::materialize(mods_dir.path(), &a_mod_kit("mod-git", "sess-a/1", &kit, Some("unified-diff"))).unwrap();
+        ModsGateStepKind
+            .run(
+                &step(json!({
+                    "for_key": "sess-a/1",
+                    // The hostile shape: a kit's test target that commits.
+                    "test_command": "git -c user.email=t@e -c user.name=t commit -q -am pwned; true",
+                    "workdir": tree_root.to_string_lossy(),
+                })),
+                &task(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]).stdout, head_before, "the worktree's HEAD moved");
+        assert_eq!(git(&repo, &["worktree", "list"]).stdout, worktrees_before, "the mirror's worktree list changed");
+        assert_eq!(git(&repo, &["log", "--oneline", "--all"]).stdout, log_before, "a commit reached the mirror");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("answer.txt")).unwrap(),
+            "wrong\n",
+            "the checkout itself must be untouched"
+        );
     }
 
     /// (#2310 P4c-2b PR #2357 review MUST FIX A, proven) The inverse

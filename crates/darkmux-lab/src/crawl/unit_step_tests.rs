@@ -1308,6 +1308,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
                 step_id: Some("unit-step".into()),
                 context: serde_json::json!({"unit": "u-0001"}),
                 emitted: serde_json::json!({"why": "w"}),
+                source: None,
                 schema_version: darkmux_crew::findings::FINDING_SCHEMA_VERSION.into(),
                 extras: serde_json::Map::new(),
             },
