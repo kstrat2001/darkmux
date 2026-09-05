@@ -41,7 +41,7 @@ finding_refs: Array<FindingRef>,
  * (#2310 P4c-2b PR #2357 round-2 review item 5) Rule ids (falling
  * back to the step id when a rule can't be named) whose `crawl.plan`
  * step did NOT reach `Complete` this run. `crawl.json` shares
- * `src/mission_launch.rs::grow_phase` with `review-v2.json`: since
+ * `src/mission_launch.rs::grow_phase` with `review.json`: since
  * that function stopped `bail!`ing the whole launch on an errored
  * grow producer (#2310 P4c-2b MUST FIX C) and instead grows zero
  * units from the affected rule, a crawl whose plan step failed now

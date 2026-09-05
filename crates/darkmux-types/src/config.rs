@@ -154,7 +154,18 @@ use std::path::Path;
 //           this one always has a value (absence is not a distinct
 //           behavior). `Option<u32>`, lenient-on-read: an older binary
 //           ignores the field and keeps its old serialized behavior.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.21";
+// 1.22 (#2404 P4d round 3): REMOVED the `review{}` block
+//           (`judge_concurrency` / `judge_fail_on_any_skip`) added in 1.4.
+//           The funnel driver those knobs tuned was deleted in #2310 — the
+//           `review` mission config is now an ordinary on-disk mission
+//           config run through the generic launch path, with no judge
+//           step left to bound. Pre-1.0, no-compat-baggage posture: the
+//           field is removed outright rather than deprecated in place. An
+//           older config's `review` key still loads fine — it lands in
+//           top-level `extras` overflow, same lenient-read guarantee as
+//           every other removal (see 1.8's `orchestrator` precedent);
+//           `darkmux doctor` names it and tells the operator to delete it.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.22";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -191,8 +202,6 @@ pub struct DarkmuxConfig {
     // MissionConfig -> MissionBoardConfig (#1284; see that struct's doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<MissionBoardConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review: Option<ReviewConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radio: Option<RadioConfig>,
     /// (#1685) The `gh`-verb allowlist — see [`CmdConfig`]'s own doc.
@@ -550,34 +559,42 @@ pub struct FleetConfig {
 }
 
 /// (#1260/#1177) Remote (hosted-endpoint) dispatch knobs — the config home
-/// for the per-execution token bucket the review pipeline enforces on
-/// endpoint-staffed seats. Unlike `redis{}`/`audit{}` there is NO `enabled`
+/// for the per-execution token bucket darkmux enforces on endpoint-staffed
+/// seats. Unlike `redis{}`/`audit{}` there is NO `enabled`
 /// gate: remote staffing is enabled by the profile itself (endpoint present
 /// on the staffing's model — contract 1, profile uniformity), so the block
 /// carries only the allowance knob. `darkmux init` writes it visible with
 /// the default populated, per the visible-defaults doctrine.
 ///
 /// **What an "execution" is (operator decision, 2026-07-10 design chat):**
-/// one pipeline stage — the review pipeline's probe pass, each judge pass, the
-/// verify pass; a bare `dispatch` is one execution. Each stage's
+/// one pipeline stage; a bare `dispatch` is one execution. Each stage's
 /// REMOTE calls draw from their own allowance, so a runaway stage is caught
 /// at the cap without starving later stages. Tokens only — never currency.
 ///
-/// **Which paths this meters (1.18.0 scope — be precise):** the review
-/// pipeline's remote seats (probe / judge-pass1 / judge-pass2 / verify) AND the
-/// tool-less single-shot remote `dispatch` path (`dispatch_remote`). The
-/// AGENTIC-remote container path (#1187 — a tool-granting role on an endpoint
-/// profile, driven by the multi-call container loop) is NOT metered by this
-/// bucket in 1.18.0; metering that loop is tracked as a follow-up. A path
-/// this bucket does not yet meter is documented as such, never silently
-/// counted "off the meter".
+/// **Which paths this meters, for the shipped `review` config (#2310 P4d
+/// — the funnel deletion; the old probe/judge-pass1/judge-pass2/verify
+/// funnel seats this doc used to name are gone):** any generic
+/// `dispatch.map`/`dispatch.internal` step staffed with an endpoint
+/// profile (`review`'s own `create-mod-dispatch` seat, when enabled, is
+/// the one shipped example) AND the tool-less single-shot remote
+/// `dispatch` path (`dispatch_remote`). The AGENTIC-remote container path
+/// (#1187 — a tool-granting role on an endpoint profile, driven by the
+/// multi-call container loop) is NOT metered by this bucket; metering
+/// that loop is tracked as a follow-up. A path this bucket does not yet
+/// meter is documented as such, never silently counted "off the meter".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteConfig {
     /// Max remote `total_tokens` one pipeline stage may spend (default
-    /// 500000). When a stage exhausts it, that stage's remaining remote
-    /// calls stop with the reason named in the run's envelope: a
-    /// load-bearing stage (judge/verify) exhausting is an honest degraded
-    /// run; probe exhaustion is a reduced-coverage warning.
+    /// 500000) — e.g. an endpoint-staffed `crawl.unit` seat, or `review`'s
+    /// own `create-mod-dispatch` seat. When a stage exhausts it, that
+    /// stage's remaining remote calls stop with the reason named in the
+    /// run's envelope. A group of `dispatch.map` steps that name the same
+    /// `bucket_group` share ONE allowance between them (#1442) — the
+    /// scheduler hands every sibling in the group the same shared bucket,
+    /// so a fan-out never multiplies the stage ceiling by the step count;
+    /// a `dispatch.map` step naming no group gets its own step-scoped
+    /// allowance. See `docs/ENVIRONMENT.md`'s entry for this field's env
+    /// override for the full per-stage degradation semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens_per_execution: Option<u64>,
     /// (#1230 Packet 1) Max CONCURRENT remote (hosted-endpoint) dispatches
     /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once — remote
@@ -610,38 +627,6 @@ pub struct MissionBoardConfig {
     /// no drift surfaced at all, because the pre-#1230-Packet-5 detector
     /// only checked Closed+non-terminal and Active+all-terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub stale_active_days: Option<u64>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
-}
-
-/// (#1349) The PR-review pipeline's own tuning knobs — separate from
-/// `RuntimeBehaviorConfig`/`RemoteConfig` because they're specific to
-/// `darkmux mission launch review`'s driver (`darkmux_lab::lab::review`), not
-/// general dispatch behavior.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ReviewConfig {
-    /// The judge step's internal bounded-concurrency for-each cap —
-    /// dispatch pass-1 (then pass-2 if confirmed) for up to this many
-    /// deduped flags AT ONCE (default 1, fully sequential). Was a bare
-    /// `std::env::var("DARKMUX_FUNNEL_JUDGE_CONCURRENCY")` read prior to
-    /// #1349 (deliberately, per its own doc — a placeholder pending real
-    /// concurrency-ceiling data); wired through the standard precedence
-    /// chain now that it's being renamed anyway, per `config_access`'s
-    /// "every setting resolves in ONE place" contract.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub judge_concurrency: Option<u32>,
-    /// (#1876/#1877) The judge stage's remote-token-budget exhaustion
-    /// policy. `false` (DEFAULT, "partial"): a skipped judge call is a
-    /// COVERAGE fact, not a verdict — the flags that DID get judged still
-    /// render, alongside a loud banner naming the shortfall (never a clean
-    /// pass). `true` ("strict"): restores the pre-#1876 behavior — ANY
-    /// skipped judge call, regardless of how many flags were successfully
-    /// judged, degrades the whole run and discards its findings. An
-    /// operator who genuinely wants "any skip is fatal" sets this; nobody
-    /// else needs to touch it. Named after the incident it fixes: a judge
-    /// that had ruled 123 of 134 flags (7 confirmed, 67 needs-check, both
-    /// complete with evidence) discarded all of it and posted "the review
-    /// produced no signal" because the last 11 calls were skipped when the
-    /// per-execution token bucket ran out.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub judge_fail_on_any_skip: Option<bool>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1096,11 +1081,6 @@ impl DarkmuxConfig {
             }),
             mission: Some(MissionBoardConfig {
                 stale_active_days: Some(14),
-                extras: Default::default(),
-            }),
-            review: Some(ReviewConfig {
-                judge_concurrency: Some(1),
-                judge_fail_on_any_skip: Some(false),
                 extras: Default::default(),
             }),
             // (#1698 Packet B2) Written visible with empty (unset) profile

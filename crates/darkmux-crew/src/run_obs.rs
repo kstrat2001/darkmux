@@ -186,7 +186,7 @@ pub fn step_result_record(
 /// deliberately not wrapped in a `Mutex` (that would force every
 /// `RunEmitter` impl through lock-guarded access for a feature this
 /// narrow). Instead, [`RunObs`] (or a caller managing the sampler
-/// directly, as `run_review_graph` does) drains the channel via
+/// directly, as the now-deleted `run_review_graph` used to) drains the channel via
 /// [`Self::try_drain`] immediately before every `step result` record it
 /// emits, so telemetry interleaves with the run's other records close to
 /// when it was sampled — never batched at end-of-run.

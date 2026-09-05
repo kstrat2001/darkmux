@@ -32,7 +32,7 @@
         {
           "id": "judge-cloud",
           "label": "Judge",
-          "kind": "review.judge",
+          "kind": "dispatch.map",
           "status": "complete",
           "startedTs": 1785404428,
           "completedTs": 1785404600,
@@ -44,7 +44,7 @@
         {
           "id": "judge-local",
           "label": "Judge",
-          "kind": "review.judge",
+          "kind": "dispatch.map",
           "status": "complete",
           "startedTs": 1785404428,
           "completedTs": 1785404610,
@@ -56,7 +56,7 @@
         {
           "id": "judge-unknown",
           "label": "Judge",
-          "kind": "review.judge",
+          "kind": "dispatch.map",
           "status": "error",
           "startedTs": 1785404428,
           "tokensFinal": 7000
@@ -64,7 +64,7 @@
         {
           "id": "verify-planned",
           "label": "Verify",
-          "kind": "review.verify",
+          "kind": "dispatch.map",
           "status": "planned"
         }
       ]

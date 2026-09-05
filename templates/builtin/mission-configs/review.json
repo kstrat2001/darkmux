@@ -1,396 +1,242 @@
 {
   "id": "review",
-  "name": "PR Review",
-  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired the `pr-review run` verb in Packet 4b): investigate (resolve bundles from the diff, probe every explicit one-role probe task (#1512 -- no `expand` template, no crew-level probe-role enumeration), dedup the flags with domain reconstruction at the dedup boundary) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of #1512, the probe stage is three EXPLICIT tasks (`review-probe-high-task`/`-mid-task`/`-low-task`), each carrying its own `role_id` and depending only on `review-bundle-task` -- parallelism is emergent from `depends_on` (all three share one dependency, none depend on each other, so `review-dedup-task`'s three-way `depends_on` is a real fan-in). Changing the probe COUNT is a config edit (add/remove a probe task with its own `role_id`), never a Rust change -- as of #1513's review dissolution, roles are discovered by `darkmux_crew::resourcing::resolve_review_roles`, which classifies EVERY role-bearing task in this document STRUCTURALLY by its step kind (a `review.judge` step names the judge task; a `review.verify-render` step names the verify task; anything else carrying a `role_id` is a probe), never by enumerating role names in Rust and never by reading `review-dedup-task`'s `depends_on` (that list is `build_review_graph`'s CLAIM/PRUNE boundary only -- a resolved staffing claims its declared task by role_id, and any declared task nobody claims gets pruned, loudly, with a warning). This document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
-  "schema_version": "3.5",
+  "name": "Review",
+  "description": "(#2310 P4d) The code review, built on the shared mission building blocks rather than a pipeline of its own — and, since P4d, the ONLY `review`: the bespoke funnel launcher and its ten Tier-3 `review.*` step kinds are deleted, so this document runs through the generic launcher with no bespoke launcher and no literal routing. `plan-<rule>` mints one `plan.sites` task per rule with `source: \"diff\"` (the DIFF-scoped strategy on the shared planning pattern — see plan_sites_step.rs; with no `workspace` but a `github` + `head_sha`, it derives its own one-source spec at that sha, which is how `.github/workflows/darkmux-review.yml` launches it from a runner with no operator-authored spec). `unit-<rule>` GROWS one `crawl.unit` dispatch per planned site, `role_id: \"reviewer\"`. `create-mods` waits, bounded, for the frontier-written mod one finding describes and gates it; `deliver` gathers this run's own finding/mod stores and renders a GitHub review payload. Two step `kind` ids below still carry a neighboring mission's vocabulary — `crawl.unit` and `crawl.summary` — because that is where the shared blocks live today; the vocabulary is the leftover, not the coupling, and a later packet folds both into mission-agnostic kinds. `outcome_from: \"deliver\"` names what this run DELIVERS rather than inheriting the positional 'last phase's last task' guess: the `mission close` payload is the deliver step's own DeliverOutcome, and a run whose delivery task itself errored exits 1 instead of 0.",
   "panel": {
-    "description": "Review the working-tree diff with darkmux's local-model review crew",
+    "description": "Review a diff with darkmux's local-model review crew",
     "hint": "(no arguments)"
   },
+  "schema_version": "3.5",
+  "outcome_from": "deliver",
   "inputs": [
     {
+      "name": "workspace",
+      "description": "Path to a workspace spec JSON naming the checked-out tree at the diff's own head. OPTIONAL (#2310 P4d): when it is absent and both `github` and `head_sha` are present, each `plan-<rule>` step DERIVES a one-source spec itself (git origin = the repository's GitHub URL, ref = `head_sha`) and materializes it through the same `workspace_spec::materialize` path an on-disk spec takes -- which is what lets `.github/workflows/darkmux-review.yml` launch this config from a runner with no operator-authored spec. The derived origin is an ANONYMOUS https URL, so the derivation reaches PUBLIC repositories only -- a private repo needs an explicit `workspace` spec whose source names an ssh origin (or an https origin a credential helper on that machine can authenticate). An explicit `workspace` always wins. Must resolve to exactly ONE source either way.",
+      "required": false
+    },
+    {
       "name": "diff_file",
-      "description": "Path to the unified diff file under review. `mission_launch_review::launch` reads it into ReviewStepContext.diff and feeds it to every probe/judge/verify dispatch. Required unconditionally -- even a `from_envelope` synthesis-only launch needs it, to resolve each finding's quoted anchor back to a diff line.",
+      "description": "Path to the unified diff this review plans against. Canonicalized at step-config parse time.",
       "required": true
     },
     {
-      "name": "case_id",
-      "description": "Unique id for this review run (ReviewStepContext.case_id) -- correlates flow records and the review envelope, and seeds the minted mission's instance id. LAUNCHER-DERIVED when absent: `owner/repo@head_sha` for a GitHub source, the worktree path, or `local` -- an explicit value always wins. Never asked of the operator by the generic missing-inputs gate (mirrors `coder-phase`'s `mission_id` input).",
-      "required": false
-    },
-    {
-      "name": "worktree",
-      "description": "Local checkout directory to bundle from. Alternative to `github` + `head_sha` (mutually exclusive; exactly one source is required unless `from_envelope`).",
-      "required": false
-    },
-    {
-      "name": "github",
-      "description": "GitHub source `owner/repo` -- bundles via the GitHub API, no local checkout. Requires `head_sha`.",
+      "name": "intent_file",
+      "description": "Path to the PR body / intent text `intent-vs-diff` compares the diff against. Mirrors the frozen `review` config's own input of the same name. READ, on every unit dispatch: each `unit-<rule>` task grows `\"intent_file\": \"{{intent_file}}\"` into its `crawl.unit` step's config, `UnitStepConfig::from_step` parses it (unit_step.rs L823-828, empty string filtered to absent so a launch that passes no `intent_file` is not a path-read failure), `run` reads the file (L1092) and `build_message` renders its text ahead of the window as \"The stated intent for this change (a PR body or intent file) is:\" (L342-345). Leave it unset and `intent-vs-diff` has nothing to compare the hunk against, so it reports nothing — the rule runs, sees no stated intent, and every unit it planned comes back empty.",
       "required": false
     },
     {
       "name": "head_sha",
-      "description": "Commit SHA to read file content at (GitHub source only).",
+      "description": "The diff's own head sha — mirrors the frozen `review` config's input. Reaches each `plan-<rule>` step's config but is not yet consumed (see `plan_sites_step.rs`'s module doc: `Plan.sources[0].sha` comes from the checked-out tree today, not this param).",
       "required": false
     },
     {
-      "name": "intent_file",
-      "description": "Path to a file carrying the author's stated intent for the change (PR title + description, one blob), fed into the JUDGE prompt only (ReviewStepContext.intent_body; intent_title stays empty -- matches the retired CLI). Absent -> \"(no description provided)\".",
-      "required": false
-    },
-    {
-      "name": "review-probe-high",
-      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the high-recall probe seat (`--param review-probe-high=<profile>`). The named profile must exist in the registry; its default model staffs the seat for this run only. Precedence: this override > the machine-local `role_profiles` map in config.json > `default_profile`. Absent -> the map (else the fresh-user default_profile floor).",
-      "required": false
-    },
-    {
-      "name": "review-probe-mid",
-      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the mid-recall probe seat (`--param review-probe-mid=<profile>`). Same precedence + semantics as `review-probe-high`.",
-      "required": false
-    },
-    {
-      "name": "review-probe-low",
-      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the low-recall probe seat (`--param review-probe-low=<profile>`). Same precedence + semantics as `review-probe-high`.",
-      "required": false
-    },
-    {
-      "name": "review-judge",
-      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the judge seat (`--param review-judge=<profile>`). Same precedence + semantics as `review-probe-high` -- override the machine's `role_profiles` binding for one run without editing config.json (e.g. escalate the judge to a denser profile).",
-      "required": false
-    },
-    {
-      "name": "review-verify",
-      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the verify seat (`--param review-verify=<profile>`). Same precedence + semantics as `review-probe-high`.",
-      "required": false
-    },
-    {
-      "name": "request_changes",
-      "description": "(#1426 ship-2) When truthy (`true`/`1`/`yes`/`on`), confirmed findings render as a blocking REQUEST_CHANGES review; else (default) an advisory COMMENT. Replaces the retired crew's `request_changes` field.",
+      "name": "github",
+      "description": "owner/repo — mirrors the frozen `review` config's input. Reaches each `plan-<rule>` step's config but is not yet consumed (no fetch path exists yet — see `plan_sites_step.rs`'s module doc).",
       "required": false
     },
     {
       "name": "mode",
-      "description": "Execution mode: sequential | parallel | auto (default auto). `auto` lets the gestalt wave planner decide co-residency from the resolved seats; the value is resolved via `resolve_mode` and recorded on the envelope as `mode` provenance, not a behavioral switch the operator normally sets.",
-      "required": false
-    },
-    {
-      "name": "passes",
-      "description": "(#1266) The judge seat's consensus DEPTH (passes) — 1 single / 2 double-confirm / N unanimous. Governs the JUDGE seat only (the sole consumer; the probe/verify seats ignore it). Absent -> the resolver's default (2, double-confirm). Validated `>= 1` at resolution time (a zero-pass judge makes no ruling); lenient on read otherwise (contract 7). Threaded to the already-parameterized `multi_pass_confirm` pass count via `ResolvedSeatStaffing.passes`.",
-      "required": false
+      "description": "Accepted for CLI-surface parity with the retired funnel launcher (`.github/workflows/darkmux-review.yml` still passes it) and IGNORED: this document has no sequential/parallel residency split to switch on -- each `unit-<rule>` task's dispatches are scheduled by the generic scheduler.",
+      "required": false,
+      "ignored": true,
+      "ignored_reason": "review has no exec-mode split; the scheduler owns dispatch ordering"
     },
     {
       "name": "envelope_out",
-      "description": "Path to write the full review envelope (pretty JSON).",
-      "required": false
+      "description": "Accepted for CLI-surface parity with the retired funnel launcher and IGNORED: `deliver.github_review` writes the rendered `{mode, review}` payload only (via `emit`), never a separate full envelope file -- there is no envelope shape in this document's own pipeline for this to name.",
+      "required": false,
+      "ignored": true,
+      "ignored_reason": "review writes its rendered payload via emit; there is no separate envelope artifact"
     },
     {
       "name": "emit",
-      "description": "Path to write the rendered `{mode, review, comment}` payload. `-` (or omitted) writes to stdout -- a CONTRACT the CI workflow parses byte-for-byte, so `mission launch` prints no decorative banner ahead of it for this config.",
-      "required": false
-    },
-    {
-      "name": "profiles",
-      "description": "Override path for profiles.json (else DARKMUX_PROFILES / the default resolution).",
+      "description": "Path to write the rendered `{mode, review}` payload the `deliver` phase's `deliver-step` produces. `-` (or omitted) writes to stdout, matching the frozen `review` config's own `emit` contract.",
       "required": false
     },
     {
       "name": "attribution",
-      "description": "Attribution text for the posted footer (#1113) -- the default derives \"where the model ran\" from the envelope's own member records.",
+      "description": "Attribution text for the posted footer, threaded to the `deliver` phase's `deliver-step` — mirrors the frozen `review` config's own `attribution` input. Absent means no footer line (`deliver.github_review`'s own default), NOT the frozen config's envelope-derived default — this document has no member-record envelope to derive one from.",
       "required": false
     },
     {
-      "name": "bundler",
-      "description": "External bundler command (`<cmd> --worktree <dir> --diff <file>`), standing in for the built-in bundler.",
+      "name": "test_command",
+      "description": "The gate command `create-mods` runs against a proposed mod before counting it confirmed (#2310 P4c — DESIGN.md \"the changed files name the test targets\"). Wired (#2310 P4c-2b): the `create-mod` task's `gate-step` (`mods.gate`) takes `{{item.tree_root}}` as its `workdir` and, for every mod naming the finding the task addresses, resolves the single source checkout beneath it, copies that checkout to a scratch dir, `git apply`s the mod's kit there, and only then runs this command INSIDE the patched copy (mods_gate.rs L193-202, L266-269, L305-306) — never in `tree_root` and never in the read-only source itself, so a gate can never mutate the tree a finding was observed in. `tree_root` is where the checkout is resolved FROM, not where the command runs. Each mod is recorded `gate_passed`/`gate_skipped_reason`. Leaving it unset means every mod is recorded `gate_skipped_reason: \"no test_command configured\"`, never gate-verified — and the visible consequence in the delivered review (#2310 fix loop A, S1-5) is that NO suggestion block is ever rendered: `deliver.github_review` turns a mod into a one-click suggestion only when its gate PASSED, so with no `test_command` every mod-form finding delivers as a \"Worth a double check\" thread instead.",
       "required": false
     },
     {
-      "name": "workspace",
-      "description": "(#1959) Optional path to a workspace spec JSON (darkmux_crew::workspace_spec::WorkspaceSpec) scoping this review. When given, resolve_bundles drops every bundle whose changed-file path fails the spec's include/exclude (workspace_spec::glob::applies, matching what a crawl materializing the same spec would keep), recorded as SkipReason::ExcludedByWorkspaceSpec so a zero-bundle run this scoping causes renders as a benign no-op, not an unexplained error. Absent -> unfiltered, byte-identical to before this input existed. Wired into the --charges-file (run_judge_only) path only -- the main graph launch path (ReviewBundleStepKind) does not yet read this input; materialization (git resolution) is NOT performed for review, only the spec's static include/exclude globs are matched against already-known bundle paths.",
+      "name": "rules",
+      "description": "Comma-separated rule ids to review with, the same rule-selection mechanism every rule-planning document uses — a `plan-<rule>` task whose rule is not named is pruned at mint with reason `not_selected`. Absent means every enabled plan task this document declares.",
       "required": false
     },
     {
-      "name": "charges_file",
-      "description": "Re-judge a previously-recorded flag list without re-running the probe (run_judge_only) -- the bundler still runs, since the judge needs the code each flag's bundle_id refers to. Mints NO mission (same as the retired CLI).",
+      "name": "draws",
+      "description": "How many times to dispatch each planned unit (#2310 P4c-2b — DESIGN.md \"a draws-per-unit knob, off by default, ports the measured k-draw recall technique from the funnel\"). Absent means 1 (`crawl.unit`'s own default) — one dispatch per unit, unchanged from before this input existed. `finding_refs` dedup on `(rule, file, line)` across a unit's own draws before `create-mods` grows from them, so a duplicate observation across draws never mints two coder tasks for the same window.",
       "required": false
     },
     {
-      "name": "from_envelope",
-      "description": "Synthesis-only: read a previously-written envelope_out and emit the rendered payload -- zero model calls, zero bundling, zero mission minted. The CI-testable path.",
+      "name": "dry_run",
+      "description": "The generic `mission launch --dry-run` flag, injected by the CLI layer. Prints the task/step graph this launch would mint and mints nothing.",
       "required": false
     },
     {
-      "name": "intent_title",
-      "description": "INTERNALLY DERIVED, never operator-supplied -- `mission_launch_review::run_dispatch` always passes an empty string (matches the retired CLI's own RunOpts shape, which carried one intent blob with no separate title field). ReviewStepContext.intent_title.",
-      "required": false
+      "name": "mod_wait_seconds",
+      "description": "How long the `create-mods` phase waits, per finding, for a frontier-written mod to appear in the mod store. **Default `0`, which means DO NOT WAIT**: the wait step completes immediately with `{\"waited\": false, \"found\": false, ...}`, the gate finds no mod, and `deliver.github_review` renders that finding as a question, exactly as it does today. That is the honest behavior on the UNATTENDED path (the self-hosted runner running `darkmux-review.yml`): no orchestrator session is watching the hook there and the runner has no frontier seat, so a per-finding wait would be pure wall-clock. An ATTENDED run opts in with `--param mod_wait_seconds=<N>`, N being the window the operator's monitor + the `darkmux-mod-create` skill needs to record a mod. Poll cadence is ~5s, so the effective wait rounds up to a multiple of 5. **Keep N below `runtime.step_command_timeout_seconds`** (env `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS`, default 600): that is the bound `procedural.shell` applies to EVERY step command, it is the outer bound here, and if it is the smaller of the two it kills the poll first and the step errors naming it rather than naming this input. **A wait that ends with NO mod is a CLEAN outcome, not an error** (#2310 P4e review): the step exits 0 with `{\"waited\": true, \"found\": false, ...}`, the gate records its ordinary no-mod skip and the finding delivers as a question. A frontier that reads a finding and declines to write a mod \u2014 a search-form finding, or one that does not hold \u2014 is doing the RIGHT thing, and erroring there would finalize every such run Degraded. Only a non-numeric `mod_wait_seconds` (exit 2, a real config defect) and an infra failure error the step.",
+      "required": false,
+      "default": "0"
     },
     {
-      "name": "staffing",
-      "description": "Resolved probe/judge/verify seat staffing (StaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from `darkmux_crew::resourcing::resolve_review_roles` (#1475, #1512, #1513 review -- each review role resolves via launch override > role_profiles map > default_profile), never a literal CLI input. The probe roles themselves are read directly off this document -- every task classified structurally by its STEP KIND (a `review.judge` step is the judge task; a `review.verify-render` step is the verify task; anything else carrying a `role_id` is a probe, e.g. the three explicit `review-probe-high-task`/`-mid-task`/`-low-task`); there is no Rust-side enumeration of probe role ids and no dependence on `review-dedup-task.depends_on` for discovery (that list is the SEPARATE claim/prune boundary `build_review_graph` uses).",
-      "required": false
-    },
-    {
-      "name": "judge_concurrency",
-      "description": "The judge step's real config.concurrency, resolved by the launcher from darkmux_types::config_access::review_judge_concurrency() (env > config.review.judge_concurrency > 1) -- never a literal CLI input. ALWAYS supplied by the launcher as a step_config_override on review-judge-step -- the static `config.concurrency: 1` below is a documented DEFAULT for a human reading this file, never load-bearing at launch.",
+      "name": "mod_seat_profile",
+      "description": "The endpoint profile the OPTIONAL `create-mod-dispatch` template staffs its `coder` seat with (#2310 P4f) — an unattended alternative to `create-mod`'s bounded wait, for the self-hosted runner where no orchestrator session exists to receive the create_finding hook. Names a profile in `~/.darkmux/profiles.json` whose model declares an `endpoint` (xAI, Google Gemini and OpenAI are all OpenAI-compatible; the key lives in a macOS Keychain item the profile's `endpoint.auth.keychain` names, never in the config). Reaches the dispatch as the step's `profile_name`, the same override `dispatch.internal` reads from a Task or a step config. **Only read when `create-mod-dispatch` is ENABLED** — the template ships `\"enabled\": false` and is pruned at mint, so on a default launch this input is inert. Leaving it UNSET while the template is enabled is also legal and is the other way to staff the seat: a declared-but-uncollected whole-value placeholder omits its key entirely, so no `profile_name` reaches the step and the dispatch resolves `coder` through the machine's own `role_profiles.coder` binding. **Data boundary:** a hosted endpoint sees the finding and the source it names — public repositories only.",
       "required": false
     }
   ],
   "phases": [
     {
-      "id": "investigate",
-      "display_name": "Investigate",
-      "description": "resolve review bundles from the diff, probe every explicit probe task, dedup",
+      "id": "plan",
+      "display_name": "Plan",
+      "description": "One planning task per rule, diff-scoped. Each resolves its source (a `workspace` spec, or a one-source spec derived from `github` + `head_sha`), reads `diff_file`, and writes plan/<rule>.json — the shared `Plan` content shape, produced from a diff's hunks rather than a whole-tree walk.",
       "tasks": [
         {
-          "id": "review-context-task",
-          "display_name": "Context",
-          "description": "(#2310 P1) resolve the review's shared context (diff/intent/prompts/staffing) as the pipeline's first typed step output — review-bundle-task depends on it",
-          "depends_on": [],
-          "steps": [
-            {
-              "id": "review-context-step",
-              "kind": "review.context",
-              "config": null
+          "id": "plan-intent-vs-diff",
+          "display_name": "Plan: Intent vs diff",
+          "description": "Plan the `intent-vs-diff` rule over the diff.",
+          "steps": [{"id": "plan-intent-vs-diff-step", "kind": "plan.sites", "config": {"rule": "intent-vs-diff", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+        },
+        {
+          "id": "plan-existing-solution",
+          "display_name": "Plan: Existing solution",
+          "description": "Plan the `existing-solution` rule over the diff.",
+          "steps": [{"id": "plan-existing-solution-step", "kind": "plan.sites", "config": {"rule": "existing-solution", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+        },
+        {
+          "id": "plan-shared-symbol-callers",
+          "display_name": "Plan: Shared symbol callers",
+          "description": "Plan the `shared-symbol-callers` rule over the diff.",
+          "steps": [{"id": "plan-shared-symbol-callers-step", "kind": "plan.sites", "config": {"rule": "shared-symbol-callers", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+        },
+        {
+          "id": "plan-union-vs-enum",
+          "display_name": "Plan: Union vs enum",
+          "description": "Plan the `union-vs-enum` rule over the diff.",
+          "steps": [{"id": "plan-union-vs-enum-step", "kind": "plan.sites", "config": {"rule": "union-vs-enum", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+        },
+        {
+          "id": "plan-test-gap",
+          "display_name": "Plan: Test gap",
+          "description": "Plan the `test-gap` rule over the diff.",
+          "steps": [{"id": "plan-test-gap-step", "kind": "plan.sites", "config": {"rule": "test-gap", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+        },
+        {
+          "id": "plan-swallowed-error",
+          "display_name": "Plan: Swallowed errors",
+          "description": "Plan the `swallowed-error` rule over the diff — it declares `scope: [\"tree\",\"diff\"]`.",
+          "steps": [{"id": "plan-swallowed-error-step", "kind": "plan.sites", "config": {"rule": "swallowed-error", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+        },
+        {
+          "id": "plan-unnamed-predicate",
+          "display_name": "Plan: Unnamed predicates",
+          "description": "Plan the `unnamed-predicate` rule over the diff — it declares `scope: [\"tree\",\"diff\"]`.",
+          "steps": [{"id": "plan-unnamed-predicate-step", "kind": "plan.sites", "config": {"rule": "unnamed-predicate", "workspace": "{{workspace}}", "source": "diff", "diff_file": "{{diff_file}}", "head_sha": "{{head_sha}}", "github": "{{github}}"}}]
+        }
+      ]
+    },
+    {
+      "id": "review",
+      "display_name": "Review",
+      "description": "One dispatch per planned unit, `role_id: \"reviewer\"` — the shared per-unit dispatch kind, which reads the role off the Task rather than hardcoding one.",
+      "tasks": [
+        {"id": "unit-intent-vs-diff", "display_name": "Review: Intent vs diff", "description": "One task per unit `plan-intent-vs-diff` produced.", "role_id": "reviewer", "depends_on": ["plan-intent-vs-diff"], "grow": {"from": "plan-intent-vs-diff", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "intent-vs-diff", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-intent-vs-diff-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-existing-solution", "display_name": "Review: Existing solution", "description": "One task per unit `plan-existing-solution` produced.", "role_id": "reviewer", "depends_on": ["plan-existing-solution"], "grow": {"from": "plan-existing-solution", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "existing-solution", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-existing-solution-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-shared-symbol-callers", "display_name": "Review: Shared symbol callers", "description": "One task per unit `plan-shared-symbol-callers` produced.", "role_id": "reviewer", "depends_on": ["plan-shared-symbol-callers"], "grow": {"from": "plan-shared-symbol-callers", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "shared-symbol-callers", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-shared-symbol-callers-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-union-vs-enum", "display_name": "Review: Union vs enum", "description": "One task per unit `plan-union-vs-enum` produced.", "role_id": "reviewer", "depends_on": ["plan-union-vs-enum"], "grow": {"from": "plan-union-vs-enum", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "union-vs-enum", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-union-vs-enum-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-test-gap", "display_name": "Review: Test gap", "description": "One task per unit `plan-test-gap` produced.", "role_id": "reviewer", "depends_on": ["plan-test-gap"], "grow": {"from": "plan-test-gap", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "test-gap", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-test-gap-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-swallowed-error", "display_name": "Review: Swallowed errors", "description": "One task per unit `plan-swallowed-error` produced.", "role_id": "reviewer", "depends_on": ["plan-swallowed-error"], "grow": {"from": "plan-swallowed-error", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "swallowed-error", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-swallowed-error-step", "kind": "crawl.unit", "config": {}}]},
+        {"id": "unit-unnamed-predicate", "display_name": "Review: Unnamed predicates", "description": "One task per unit `plan-unnamed-predicate` produced.", "role_id": "reviewer", "depends_on": ["plan-unnamed-predicate"], "grow": {"from": "plan-unnamed-predicate", "items": "units", "id": "{{item.id}}", "config": {"plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "unnamed-predicate", "intent_file": "{{intent_file}}", "draws": "{{draws}}"}}, "steps": [{"id": "unit-unnamed-predicate-step", "kind": "crawl.unit", "config": {}}]}
+      ]
+    },
+    {
+      "id": "summarize",
+      "display_name": "Summarize",
+      "description": "This run's totals, read back through every unit step's own outcome.",
+      "tasks": [
+        {
+          "id": "summary",
+          "display_name": "Summary",
+          "description": "Total this review's units, findings and tokens.",
+          "steps": [{"id": "summary-step", "kind": "crawl.summary", "config": {}}]
+        }
+      ]
+    },
+    {
+      "id": "create-mods",
+      "display_name": "Create mods",
+      "description": "**#2310 P4e: the coder seat here is a hook, not a dispatch.** Measured 2026-09-05, local coder seats wrote an applying unified diff 1/4, 0/3 and 1/10 times across three seats where a clean-context frontier session wrote 4/4 — so mod CREATION moved off the local tier while DETECTION (the `review` phase's units) stays local. darkmux still never calls a frontier model itself: the hooks sink already fires on `dispatch.tool` + `payload.tool_name == \\\"create_finding\\\"` + `payload.ok == true`, the operator's orchestrator session watches those matches, invokes the bundled `darkmux-mod-create` skill, and the skill's subagent records the mod with the ordinary `darkmux mod create --for <key>` verb. This task's job is therefore to WAIT for that mod, bounded, and then gate it — so its first step is a Tier-1 `procedural.shell` poll of `mod list --for` (no `role_id`, no dispatch, no model), and the create-mod MESSAGE that used to live here is gone. The other mission that creates mods still dispatches a coder for it and is untouched by this change, which is why the two documents no longer share one create-mod message. The gate step and the `deliver` phase are unchanged: `mods.gate` takes `{{item.tree_root}}` as its `workdir`, resolves the single source checkout under it, copies that checkout to a scratch dir, `git apply`s the mod's kit there and runs `test_command` inside the PATCHED copy (mods_gate.rs L193-202, L305-306), recording `gate_passed`/`gate_skipped_reason` on every mod naming this task's finding; `deliver.github_review` renders a gate-passed mod as an inline suggestion and everything else as a question. **`mod_wait_seconds` defaults to `0` — do not wait** — so the unattended CI path (no orchestrator session, no frontier seat on the runner) delivers detections without burning a per-finding wait; an attended run opts in with `--param mod_wait_seconds=<N>`. The outer bound on the poll is `runtime.step_command_timeout_seconds`, which `procedural.shell` applies to every step command. **(#2310 P4f) A SECOND way to staff this seat ships beside the first, off:** `create-mod-dispatch` dispatches a `coder` to a HOSTED ENDPOINT profile (`--param mod_seat_profile=<profile>`) instead of waiting, for the unattended self-hosted runner where there is no orchestrator session to receive the hook and therefore nothing a wait could wait for. It carries the byte-identical create-mod message the other mod-creating document carries, because it is the same job — what changed is the TIER of the seat reading it, which is exactly what the measurement above found to matter. The two templates `excludes` each other: exactly one may be enabled, both enabled is a validate-time Error naming both, and the dry-run graph shows whichever one is live because the other is pruned at mint. Data boundary: the endpoint seat sends the finding and the source it names off the machine, so it is for PUBLIC repositories only.",
+      "tasks": [
+        {
+          "id": "create-mod",
+          "display_name": "Await mod: the frontier proposes the change one finding describes",
+          "description": "Wait, bounded, for a mod naming this finding, then gate it — one task per entry in the summary's `finding_refs`. No model runs in this task; the mod comes from the operator's frontier monitor (see the phase description).",
+          "depends_on": ["summary"],
+          "grow": {
+            "from": "summary",
+            "items": "finding_refs",
+            "id": "{{item.id}}",
+            "config": {
+              "workdir": "{{item.tree_root}}",
+              "command": "set -eu\nkey='{{item.key}}'\nbound='{{mod_wait_seconds}}'\ncase \"$bound\" in\n  ''|*[!0-9]*)\n    printf 'mod_wait_seconds must be a whole number of seconds, got %s\\n' \"'$bound'\" >&2\n    exit 2\n    ;;\nesac\nif [ \"$bound\" -eq 0 ]; then\n  printf '{\"waited\":false,\"found\":false,\"for\":\"%s\",\"reason\":\"mod_wait_seconds=0, no frontier monitor expected\"}\\n' \"$key\"\n  exit 0\nfi\nelapsed=0\nwhile :; do\n  if \"${DARKMUX_BIN:-darkmux}\" mod list --for \"$key\" --json 2>/dev/null | grep -q '\"key\"'; then\n    printf '{\"waited\":true,\"found\":true,\"for\":\"%s\",\"waited_seconds\":%s}\\n' \"$key\" \"$elapsed\"\n    exit 0\n  fi\n  if [ \"$elapsed\" -ge \"$bound\" ]; then\n    break\n  fi\n  sleep 5\n  elapsed=$((elapsed + 5))\ndone\nprintf 'no mod names %s after %ss; delivering it as a question\\n' \"$key\" \"$bound\" >&2\nprintf '{\"waited\":true,\"found\":false,\"for\":\"%s\",\"waited_seconds\":%s}\\n' \"$key\" \"$elapsed\"\nexit 0\n",
+              "for_key": "{{item.key}}",
+              "test_command": "{{test_command}}"
             }
+          },
+          "steps": [
+            {"id": "wait-for-mod-step", "kind": "procedural.shell", "config": {}},
+            {"id": "gate-step", "kind": "mods.gate", "config": {}}
           ]
         },
         {
-          "id": "review-bundle-task",
-          "display_name": "Bundle",
-          "description": "resolve review bundles from the diff",
-          "depends_on": [
-            "review-context-task"
-          ],
-          "steps": [
-            {
-              "id": "review-bundle-step",
-              "kind": "review.bundle",
-              "config": null
+          "id": "create-mod-dispatch",
+          "enabled": false,
+          "excludes": ["create-mod"],
+          "display_name": "Create mod: a cloud seat proposes the change one finding describes",
+          "description": "The UNATTENDED way to staff the same seat `create-mod` staffs (#2310 P4f): a `coder` dispatch on a HOSTED ENDPOINT profile, for the self-hosted runner that runs `darkmux-review.yml` on every PR and has no orchestrator session to receive the hook. Ships `\"enabled\": false` and `excludes: [\"create-mod\"]` — the two templates are two ways to staff ONE slot, so exactly one is ever live and enabling both is a validate-time Error naming both (see `TaskConfig::excludes`). To use it, copy this document to `~/.darkmux/mission-configs/review.json` and flip the two `enabled` fields: `true` here, `false` on `create-mod`. The seat is pinned with `--param mod_seat_profile=<an endpoint profile name>`; leaving it unset drops the `profile_name` key entirely (a declared-but-uncollected whole-value placeholder omits its key — `mission_config::inputs`) and the dispatch resolves the `coder` role through the machine's own `role_profiles.coder` binding, which is the other way a runner staffs this. The MESSAGE is byte-identical to the other mod-creating document's create-mod message and pinned as such by a test: it is the same job (read the finding, write the smallest applying diff, call `create_mod`), and the kit-shape clauses are what the measurement in DESIGN.md's \"the seat boundary is a hook\" showed local seats failing. A hosted frontier-class endpoint is the seat that passed. Data boundary: this sends the finding and the file it names to a third-party endpoint, so it is for PUBLIC repositories only. The gate step is the same `mods.gate` the wait template ends with, under its own id (step ids are unique document-wide).",
+          "role_id": "coder",
+          "depends_on": ["summary"],
+          "grow": {
+            "from": "summary",
+            "items": "finding_refs",
+            "id": "{{item.id}}",
+            "config": {
+              "workdir": "{{item.tree_root}}",
+              "profile_name": "{{mod_seat_profile}}",
+              "brief_refs": [{"kind": "finding", "key": "{{item.key}}"}],
+              "message": "A finding recorded earlier in this run is appended below. Your job is to PROPOSE the change that finding describes, as a mod. The workspace you have been given is the tree the finding was observed in, mounted read-only: you cannot edit it, and you are not meant to.\n\n1. Read the file the finding names, around the line it names. The finding's `file` is relative to the repository root, and the repository is mounted at `/workspace/<source>` (the `source` field in the finding's context), so `src/x.ts` is `/workspace/<source>/src/x.ts` here; a path that seems missing is almost always this mapping, not a stale finding.\n2. If the finding does not hold against what you read, record nothing and say why.\n3. Otherwise write the smallest change that resolves it as a unified diff against the file as it is, and call `create_mod` with: `kit` = one sentence saying what to apply, then the exact diff; `for` = the finding's key exactly as the block below spells it. A diff written into your reply is not a mod; only `create_mod` records one.\n\nThe diff is applied by a program, so its shape matters:\n- File paths relative to the repository root, exactly as the finding's `file` field spells them (`--- a/src/x.ts` / `+++ b/src/x.ts`), never the mount path.\n- Context lines copied exactly as they appear in the file you read; one hunk per changed region.\n- The diff as plain text, not inside a code fence, and the kit must end with a newline.\n\nDo not run tests, and do not touch anything the finding does not name. The mod is your product; someone else integrates it.",
+              "for_key": "{{item.key}}",
+              "test_command": "{{test_command}}"
             }
-          ]
-        },
-        {
-          "id": "review-probe-high-task",
-          "display_name": "Probe high",
-          "description": "probe role `review-probe-high` — one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
-          "role_id": "review-probe-high",
-          "depends_on": [
-            "review-bundle-task"
-          ],
-          "reads": [
-            "review-context-task"
-          ],
+          },
           "steps": [
-            {
-              "id": "review-probe-high-render-step",
-              "kind": "review.probe-render",
-              "config": null
-            },
-            {
-              "id": "review-probe-high-step",
-              "kind": "dispatch.map",
-              "config": null
-            },
-            {
-              "id": "review-probe-high-collect-step",
-              "kind": "review.probe-collect",
-              "config": null
-            }
-          ],
-          "notes": [
-            "always three steps (#1530 follow-on Packet A1 + #2310 P2), mirroring the verify task's render/dispatch.map/collect split: the render step (review.probe-render) reads this seat's selector + role id from its OWN config (stamped by build_review_graph_from_config) and this run's bundles (the typed review-bundle-task output), renders the probe_user_message collection AT RUN TIME, and the dispatch.map step resolves that collection from the render step's output via resolve_map_collection's single-dependency fallback (config.collection is no longer stamped). The collect step (review.probe-collect) turns the map step's raw per-item results into this seat's typed review.probe-flags output -- it recomputes the render step's bundle selection itself (same selector, same typed bundle set) rather than reading a bus publish."
-          ]
-        },
-        {
-          "id": "review-probe-mid-task",
-          "display_name": "Probe mid",
-          "description": "probe role `review-probe-mid` — one role, one task (#1512)",
-          "role_id": "review-probe-mid",
-          "depends_on": [
-            "review-bundle-task"
-          ],
-          "reads": [
-            "review-context-task"
-          ],
-          "steps": [
-            {
-              "id": "review-probe-mid-render-step",
-              "kind": "review.probe-render",
-              "config": null
-            },
-            {
-              "id": "review-probe-mid-step",
-              "kind": "dispatch.map",
-              "config": null
-            },
-            {
-              "id": "review-probe-mid-collect-step",
-              "kind": "review.probe-collect",
-              "config": null
-            }
-          ]
-        },
-        {
-          "id": "review-probe-low-task",
-          "display_name": "Probe low",
-          "description": "probe role `review-probe-low` — one role, one task (#1512)",
-          "role_id": "review-probe-low",
-          "depends_on": [
-            "review-bundle-task"
-          ],
-          "reads": [
-            "review-context-task"
-          ],
-          "steps": [
-            {
-              "id": "review-probe-low-render-step",
-              "kind": "review.probe-render",
-              "config": null
-            },
-            {
-              "id": "review-probe-low-step",
-              "kind": "dispatch.map",
-              "config": null
-            },
-            {
-              "id": "review-probe-low-collect-step",
-              "kind": "review.probe-collect",
-              "config": null
-            }
-          ]
-        },
-        {
-          "id": "review-dedup-task",
-          "display_name": "Dedup",
-          "description": "dedup probe flags — mechanism-family keying + anchor matching. (#1512, #1513 review) `depends_on` below is build_review_graph's CLAIM/PRUNE boundary, NOT the probe role registry: a resolved staffing claims its declared task by role_id, and any declared task nobody claims is pruned (loudly, with a warning). Probe roles are discovered separately, by resolve_review_roles walking every task in this document and classifying each by its step kind. Adding/removing a probe task here (with its own role_id, and its entry in this depends_on list) still changes the probe count with zero Rust changes.",
-          "depends_on": [
-            "review-probe-high-task",
-            "review-probe-mid-task",
-            "review-probe-low-task"
-          ],
-          "reads": [
-            "review-context-task"
-          ],
-          "steps": [
-            {
-              "id": "review-dedup-step",
-              "kind": "review.dedup",
-              "config": null
-            }
+            {"id": "create-mod-dispatch-step", "kind": "dispatch.internal", "config": {}},
+            {"id": "dispatch-gate-step", "kind": "mods.gate", "config": {}}
           ]
         }
       ]
     },
     {
-      "id": "adjudicate",
-      "display_name": "Adjudicate",
-      "description": "double-confirm judge over deduped flags",
+      "id": "deliver",
+      "display_name": "Deliver",
+      "description": "#2310 P4c-2b closes the gap the `create-mods` phase's own description names: `records.gather` reads THIS mission's own finding/mod stores (scoped by mission id — the way `finding list --mission`/`mod list --mission` resolve it) plus `diff_file`, into the typed shape `deliver.github_review` renders. Two steps of ONE task, `records-gather-step` then `deliver-step` — the SAME same-task-predecessor `Step.output` -> `input` wiring (`scheduler::gather_inputs`) every other multi-step task in this codebase uses, never a new mechanism. `run_on: [\"complete\",\"error\"]` on the task documents the intent DESIGN.md's own retirement finding names (\"an errored run rendered nothing... None were in a step\") — an errored `create-mods` phase must not silence delivery; this task declares no `depends_on` at all (an edge naming `create-mod`, a grow TEMPLATE, is refused at validation — see `mission_config::interpret`'s own doc), so ordering comes from `create-mods` being an earlier PHASE in this document — the same phase-ordering a summarize phase relies on to see every grown unit's results with no `depends_on` of its own.",
       "tasks": [
         {
-          "id": "review-judge-task",
-          "display_name": "Judge",
-          "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
-          "role_id": "review-judge",
-          "steps": [
-            {
-              "id": "review-judge-step",
-              "kind": "review.judge",
-              "config": {
-                "concurrency": 1
-              }
-            }
-          ],
-          "reads": [
-            "review-dedup-task",
-            "review-context-task",
-            "review-bundle-task"
-          ]
-        }
-      ]
-    },
-    {
-      "id": "report",
-      "display_name": "Report",
-      "description": "verify confirmed findings, synthesize tier counts",
-      "tasks": [
-        {
-          "id": "review-verify-task",
-          "display_name": "Verify",
-          "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
-          "role_id": "review-verify",
-          "steps": [
-            {
-              "id": "review-verify-render-step",
-              "kind": "review.verify-render",
-              "config": null
-            },
-            {
-              "id": "review-verify-step",
-              "kind": "dispatch.map",
-              "config": null
-            },
-            {
-              "id": "review-verify-collect-step",
-              "kind": "review.verify-collect",
-              "config": null
-            }
-          ],
-          "notes": [
-            "always present in the graph even when no verify seat is staffed -- the render step (review.verify-render) emits an EMPTY collection in that case (and on a judge-doomed run, and on a zero-confirmed docket), which makes the dispatch.map step a completed no-op with residency None: zero model loads, zero dispatches (#1442, the generic port of the empty-docket short-circuit).",
-            "the render step consumes the judge task's output and emits one frozen verify_prompt per CONFIRMED finding (byte parity with the #1256 golden by construction); build_review_graph stamps the map step's dispatch config (model/system/max_tokens/bucket_budget/...) only when a verify seat is staffed. (#2310 P2) The collect step (review.verify-collect) is the verify-APPLY boundary's PARSE half -- it turns the map step's raw per-item results into typed review.verify-results (one VerifyRecord per confirmed flag plus the seat's member/warning/budget-row facts); the synthesis step applies those records back onto the judged docket."
-          ],
-          "reads": [
-            "review-judge-task",
-            "review-context-task",
-            "review-bundle-task"
-          ]
-        },
-        {
-          "id": "review-synthesis-task",
-          "display_name": "Synthesis",
-          "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
-          "depends_on": [
-            "review-verify-task"
-          ],
-          "steps": [
-            {
-              "id": "review-synthesis-step",
-              "kind": "review.synthesis",
-              "config": null
-            }
-          ],
-          "reads": [
-            "review-dedup-task",
-            "review-judge-task",
-            "review-context-task",
-            "review-bundle-task"
-          ]
-        },
-        {
-          "id": "review-report-task",
-          "display_name": "Report",
-          "description": "(#2310 P3) render the final envelope into the {mode, review, comment} GitHub payload and emit it (stdout or a file); optionally also write the full envelope as pretty JSON. No GitHub post -- the CI workflow posts the emitted file.",
-          "depends_on": [
-            "review-synthesis-task"
-          ],
+          "id": "deliver",
+          "display_name": "Deliver: gather this run's records and render a GitHub review",
+          "description": "Gather then deliver — see this phase's own description.",
           "run_on": ["complete", "error"],
           "steps": [
-            {
-              "id": "review-report-step",
-              "kind": "review.report",
-              "config": null
-            }
-          ],
-          "reads": [
-            "review-synthesis-task",
-            "review-context-task",
-            "review-bundle-task",
-            "review-dedup-task",
-            "review-judge-task",
-            "review-verify-task"
+            {"id": "records-gather-step", "kind": "records.gather", "config": {"diff_file": "{{diff_file}}"}},
+            {"id": "deliver-step", "kind": "deliver.github_review", "config": {"emit": "{{emit}}", "attribution": "{{attribution}}"}}
           ]
         }
       ]
     }
-  ],
-  "outcome_from": "review-synthesis-task"
+  ]
 }

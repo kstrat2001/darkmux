@@ -284,7 +284,7 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
     // (#2387) Terminate the patch. A kit arrives as a JSON string, which
     // needs no trailing newline and rarely has one; `git apply` reads an
     // unterminated last hunk line as "corrupt patch" — three of four kits in
-    // the first live review-v2 run failed here byte-for-byte applicable.
+    // the first live review run failed here byte-for-byte applicable.
     let kit: std::borrow::Cow<str> = if kit.ends_with('\n') { kit.into() } else { format!("{kit}\n").into() };
     if let Err(e) = std::fs::write(&patch_path, kit.as_bytes()) {
         return (None, Some(format!("could not write the mod's kit to a scratch file: {e}")));
@@ -463,7 +463,7 @@ fn new_scratch_dir() -> std::io::Result<tempfile::TempDir> {
 
 /// The single directory `tree_root` (the crawl's own `tree_root` — the
 /// PARENT of the materialized source, per `FindingRef::tree_root`'s own
-/// doc) holds. A single-source workspace spec (the only shape review-v2
+/// doc) holds. A single-source workspace spec (the only shape review
 /// supports today — `plan_diff_rule` itself refuses more than one source)
 /// has exactly one. Zero or more than one is an infra-level refusal, never
 /// a guess at which one is "the" source.
@@ -635,7 +635,7 @@ mod tests {
     /// shape a real crawl unit's `tree_root` (the PARENT of the source
     /// checkout) has. `content` is the file's baseline (pre-kit) text.
     /// Returns `(tree_root_holder, tree_root_path)`; the caller passes
-    /// `tree_root_path` as `config.workdir`, exactly what `review-v2.json`
+    /// `tree_root_path` as `config.workdir`, exactly what `review.json`
     /// wires from `{{item.tree_root}}`.
     fn fixture_tree(content: &str) -> (TempDir, PathBuf) {
         let tmp = TempDir::new().unwrap();

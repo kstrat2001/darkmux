@@ -239,7 +239,7 @@ fn merge_grown_config(
 ///
 /// (#2310 P4c-2 item 0) A placeholder in NEITHER namespace is left VERBATIM
 /// in the output, not refused — `grow.config` may carry a launch's own
-/// declared-input placeholder (`review-v2.json`'s `unit-<rule>` tasks grow
+/// declared-input placeholder (`review.json`'s `unit-<rule>` tasks grow
 /// `"intent_file": "{{intent_file}}"` into every unit's config), which this
 /// function knows nothing about and has no `collected` map to resolve. The
 /// literal text survives into the grown step's config for

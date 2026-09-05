@@ -289,7 +289,7 @@ fn pruned_rules(mission_id: &str, declared: &std::collections::BTreeMap<String, 
 ///
 /// (#2310 P4c-2b PR #2357 review CONSIDER E, proven nonsensical) Summing
 /// `totals.units` ACROSS rules double(-N)-counted: several rules in
-/// review-v2's own catalog (`existing-solution`/`union-vs-enum`/
+/// review's own catalog (`existing-solution`/`union-vs-enum`/
 /// `shared-symbol-callers`, all `applies_to: []`, no `prefilter`) plan a
 /// site over EVERY hunk in the diff, not just their own targeted one — so
 /// 5 rules covering the SAME 1-hunk diff summed to "5 covered" against a
@@ -373,7 +373,7 @@ struct StepScan {
     /// (#2361 item 2) `(rule, unit id)` for every `crawl.unit` step that
     /// reached `Complete` — the ONLY units whose planned windows count as
     /// covered. Both halves come off the step's own config, which the
-    /// grown task stamps (`rule`/`unit` in `review-v2.json`'s and
+    /// grown task stamps (`rule`/`unit` in `review.json`'s and
     /// `crawl.json`'s `grow.config`).
     completed_units: std::collections::BTreeSet<(String, String)>,
 }
@@ -398,7 +398,7 @@ struct StepScan {
 /// "nobody taught the scan this kind's name", and `deliver.github_review`
 /// renders the resulting scope line as fact.
 ///
-/// Left literal deliberately: two configs use it (`review-v2.json`,
+/// Left literal deliberately: two configs use it (`review.json`,
 /// `crawl.json`), the fields it reads (`config.rule`, `config.unit`,
 /// `output`'s `findings_rejected`) are conventions of those two kinds
 /// rather than of any registered interface, and inventing a `StepKind`
@@ -495,8 +495,8 @@ mod tests {
         }
     }
 
-    const MISSION: &str = "review-v2-2310";
-    const PHASE: &str = "review-v2-2310-deliver";
+    const MISSION: &str = "review-2310";
+    const PHASE: &str = "review-2310-deliver";
 
     fn save_phase() {
         crate::lifecycle::save_phase(&Phase {
@@ -601,7 +601,7 @@ mod tests {
             })).collect::<Vec<_>>(),
         }]);
         let config: crate::mission_config::MissionConfig = serde_json::from_value(serde_json::json!({
-            "id": "review-v2", "name": "Review v2", "phases": phases,
+            "id": "review", "name": "Review v2", "phases": phases,
         }))
         .unwrap();
         crate::lifecycle::save_config_snapshot(MISSION, &config).unwrap();
@@ -907,7 +907,7 @@ mod tests {
         .unwrap();
     }
 
-    /// (#2361 item 2, PROVEN live on mission `review-v2-1788566897-9c149e`)
+    /// (#2361 item 2, PROVEN live on the 2026-09-05 live review run)
     /// FOUR of five units errored and the scope line still said "review
     /// ran: 5 rule(s), 5/5 hunks covered" — a plain false claim of
     /// coverage, because both numbers came from what was PLANNED. A plan is

@@ -1,7 +1,8 @@
 //! (#2112) Mission/crawl pre-flight — power-posture warnings + the
 //! thermal-state refusal, called once from each long-mission entry point
-//! (`mission_launch::launch`, `mission_launch_review::launch`) before any real work
-//! starts.
+//! (`mission_launch::launch`, which the now-deleted dedicated review
+//! launcher used to call separately before it was folded into the same
+//! generic path — #2310 P4d) before any real work starts.
 //!
 //! Reads through the SAME probe `darkmux doctor`'s "power posture" check
 //! reads (`crates/darkmux-doctor/src/checks_power.rs` →
@@ -230,34 +231,35 @@ mod tests {
         assert!(msg.contains("mission propose --start"), "{msg}");
     }
 
-    // ── #2112 review finding 1 (+ second-pass finding A): the
-    //    long-running entry points (`mission_launch::launch`,
-    //    `mission_launch_review::launch` — the LATTER is reached via
-    //    `mission_launch::launch`'s OWN dedicated-launcher routing for
-    //    `config_uses_review_kinds`, BEFORE `mission_launch::launch`'s own
-    //    #2112 call site, so review needs its own call) must each still
-    //    call `check_power_posture` AND hold a `SleepAssertion` — wiring
-    //    a behavioral test can't reach without spawning a real
-    //    dispatch/crawl/review (forbidden for this pass), so this is a
-    //    physical source check instead (same posture as CLAUDE.md's
-    //    StepKind-tiering enforcement: a fact a fresh reader — human OR
-    //    test — can verify directly, not just a comment that can
-    //    silently drift). Deleting either call at any entry point makes
-    //    THIS go red. ──
+    // ── #2112 review finding 1 (+ second-pass finding A): every
+    //    long-running entry point must call `check_power_posture` AND hold
+    //    a `SleepAssertion` — wiring a behavioral test can't reach without
+    //    spawning a real dispatch/crawl/review (forbidden for this pass),
+    //    so this is a physical source check instead (same posture as
+    //    CLAUDE.md's StepKind-tiering enforcement: a fact a fresh reader —
+    //    human OR test — can verify directly, not just a comment that can
+    //    silently drift). Deleting the call makes THIS go red. Originally
+    //    two separate entry points (`mission_launch::launch` and the
+    //    bespoke review launcher, reached via `mission_launch::launch`'s
+    //    own dedicated-launcher routing for `config_uses_review_kinds`,
+    //    BEFORE `mission_launch::launch`'s own #2112 call site) had to be
+    //    checked separately; both the crawl launcher (#2301) and the
+    //    review launcher (#2310 P4d) have since folded onto the generic
+    //    path, so one file carries it now. ──
     #[test]
     fn all_long_running_entry_points_call_the_preflight_and_hold_a_sleep_assertion() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        // (#2301) `src/crawl_launch.rs` was the third entry point until
-        // the crawl folded onto the generic path; a crawl now reaches the
-        // pre-flight through `mission_launch::launch` like every other
-        // config, so there is no third file to check.
-        for path in ["src/mission_launch.rs", "src/mission_launch_review.rs"] {
-            let text = std::fs::read_to_string(root.join(path)).expect("read source");
-            assert!(
-                text.contains("preflight::check_power_posture(params)"),
-                "{path} must call the power-posture pre-flight"
-            );
-            assert!(text.contains("SleepAssertion::hold("), "{path} must hold a sleep assertion");
-        }
+        // (#2301) `src/crawl_launch.rs` was the second entry point until the
+        // crawl folded onto the generic path, and (#2310 P4d) the bespoke
+        // review launcher was the third until it was deleted. Both now reach
+        // the pre-flight through `mission_launch::launch` like every other
+        // config, so ONE file carries it.
+        let path = "src/mission_launch.rs";
+        let text = std::fs::read_to_string(root.join(path)).expect("read source");
+        assert!(
+            text.contains("preflight::check_power_posture(params)"),
+            "{path} must call the power-posture pre-flight"
+        );
+        assert!(text.contains("SleepAssertion::hold("), "{path} must hold a sleep assertion");
     }
 }

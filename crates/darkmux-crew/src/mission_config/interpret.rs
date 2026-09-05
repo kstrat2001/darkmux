@@ -87,12 +87,12 @@ pub struct LaunchParams {
     /// `TaskConfig.id` → override — see [`TaskOverride`].
     pub task_overrides: BTreeMap<String, TaskOverride>,
     /// `StepConfig.id` → replacement `config` value. REPLACES, never
-    /// merges, the document's own `config` — e.g. the review launcher
-    /// overriding `review-judge-step`'s `concurrency` with the operator's
-    /// resolved `config_access::review_judge_concurrency()`, never the
-    /// document's own static default (see `CLAUDE.md`'s judge_concurrency
-    /// decision for why the static JSON value is a documented default
-    /// only, never load-bearing at launch).
+    /// merges, the document's own `config` — a launcher's way of handing a
+    /// step an operator-resolved value in place of the document's own
+    /// static default at launch time (the now-deleted dedicated review
+    /// launcher's judge step once used this for its bounded-concurrency
+    /// cap, before #2310 P4d; the mechanism itself is generic and outlives
+    /// that one caller).
     pub step_config_overrides: BTreeMap<String, serde_json::Value>,
     /// (#2310 P4c-2 item 0) Every input the launch actually collected
     /// (`--input`/`--param`), keyed by name — the values [`super::
@@ -280,7 +280,7 @@ pub fn real_task_ids(
 /// here (growth is a separate, earlier substitution pass over a different
 /// namespace), so what's left to resolve is exactly the declared-input
 /// placeholders a grow template's static keys may also carry (e.g.
-/// `review-v2.json`'s `unit-<rule>` tasks wiring `{{intent_file}}` into
+/// `review.json`'s `unit-<rule>` tasks wiring `{{intent_file}}` into
 /// every grown unit's config).
 pub fn interpret_grown(
     grown: &[super::TaskConfig],
@@ -349,14 +349,13 @@ pub fn interpret_grown(
 /// reference something that actually EXISTS in the document — a typo'd key
 /// silently matching nothing is worse than an error, because the launch
 /// proceeds with the document's static value instead of the operator's
-/// resolved one. The concrete hazard that motivated this: the
-/// `"review-judge-step"` literal lives UNLINKED in both `review.rs` (the
-/// launcher's `step_config_overrides` key) and `review.json` (the step id)
-/// — if either side drifts, the judge's concurrency silently reverts to
-/// the document's static `1`, discarding the operator's
-/// `config.review.judge_concurrency`. `interpret` holds the whole document,
-/// so the cross-check is cheap; drift now fails the launch loudly, naming
-/// the dangling key.
+/// resolved one. The hazard that motivated this (from the since-retired
+/// review funnel, #2310 P4d): a step-id literal lived UNLINKED in the
+/// launcher's `step_config_overrides` key and in the document's own step
+/// id — if either side drifted, the operator's resolved value silently
+/// reverted to the document's static one. `interpret` holds the whole
+/// document, so the cross-check is cheap; drift now fails the launch
+/// loudly, naming the dangling key.
 fn check_params_reference_the_document(config: &MissionConfig, params: &LaunchParams) -> Result<()> {
     let phase_ids: std::collections::BTreeSet<&str> =
         config.phases.iter().map(|p| p.id.as_str()).collect();
@@ -581,7 +580,7 @@ mod tests {
         // though the launcher supplies a DIFFERENT real phase id.
         let cfg = doc(vec![phase(
             "investigate",
-            vec![task("review-bundle-task", &[], None, vec![step("review-bundle-step", "review.bundle", serde_json::Value::Null)])],
+            vec![task("review-bundle-task", &[], None, vec![step("review-bundle-step", "example.bundle", serde_json::Value::Null)])],
         )]);
         let mut phase_ids = Map::new();
         phase_ids.insert("investigate".to_string(), "pr-review-123-investigate".to_string());
@@ -591,7 +590,7 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "review-bundle-task", "fixed ids stay verbatim");
         assert_eq!(tasks[0].phase_id, "pr-review-123-investigate", "Task.phase_id is still the REAL phase id");
-        assert_eq!(steps["review-bundle-step"].kind, "review.bundle");
+        assert_eq!(steps["review-bundle-step"].kind, "example.bundle");
     }
 
     #[test]
@@ -708,18 +707,18 @@ mod tests {
         let cfg = doc(vec![phase(
             "adjudicate",
             vec![task(
-                "review-judge-task",
+                "judge-task",
                 &[],
                 None,
-                vec![step("review-judge-step", "review.judge", serde_json::json!({"concurrency": 1}))],
+                vec![step("judge-step", "dispatch.map", serde_json::json!({"concurrency": 1}))],
             )],
         )]);
         let mut step_config_overrides = Map::new();
-        step_config_overrides.insert("review-judge-step".to_string(), serde_json::json!({"concurrency": 5}));
+        step_config_overrides.insert("judge-step".to_string(), serde_json::json!({"concurrency": 5}));
         let params = LaunchParams { step_config_overrides, ..Default::default() };
 
         let (_tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
-        assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 5}));
+        assert_eq!(steps["judge-step"].config, serde_json::json!({"concurrency": 5}));
     }
 
     #[test]
@@ -727,16 +726,16 @@ mod tests {
         let cfg = doc(vec![phase(
             "adjudicate",
             vec![task(
-                "review-judge-task",
+                "judge-task",
                 &[],
                 None,
-                vec![step("review-judge-step", "review.judge", serde_json::json!({"concurrency": 1}))],
+                vec![step("judge-step", "dispatch.map", serde_json::json!({"concurrency": 1}))],
             )],
         )]);
         let params = LaunchParams::default();
 
         let (_tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
-        assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 1}));
+        assert_eq!(steps["judge-step"].config, serde_json::json!({"concurrency": 1}));
     }
 
     // (#1550 cluster item 2) The expansion primitive's tests
@@ -757,17 +756,17 @@ mod tests {
         let cfg = doc(vec![
             phase(
                 "investigate",
-                vec![task("review-dedup-task", &[], None, vec![step("review-dedup-step", "review.dedup", serde_json::Value::Null)])],
+                vec![task("review-dedup-task", &[], None, vec![step("review-dedup-step", "example.dedup", serde_json::Value::Null)])],
             ),
             phase(
                 "report",
                 vec![
-                    task("review-verify-task", &["review-dedup-task"], None, vec![step("review-verify-step", "review.verify", serde_json::Value::Null)]),
+                    task("review-verify-task", &["review-dedup-task"], None, vec![step("review-verify-step", "example.verify", serde_json::Value::Null)]),
                     task(
                         "review-synthesis-task",
                         &["review-dedup-task", "review-verify-task"],
                         None,
-                        vec![step("review-synthesis-step", "review.synthesis", serde_json::Value::Null)],
+                        vec![step("review-synthesis-step", "example.synthesis", serde_json::Value::Null)],
                     ),
                 ],
             ),

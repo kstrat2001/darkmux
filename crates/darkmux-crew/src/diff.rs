@@ -290,7 +290,7 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
 /// ```
 ///
 /// A patch in either prefixless dialect parsed to ZERO files, so a
-/// review-v2 run over it completed green with a noop payload — the
+/// review run over it completed green with a noop payload — the
 /// operator read "the PR is clean" off a diff that was never parsed. The
 /// `-Naur` shape parsed the tab and timestamp INTO the path, which then
 /// matched no file in the tree (`hunks_total:5, covered:0` → noop).
@@ -534,7 +534,7 @@ mod tests {
     /// (#2310 fix-loop B1, S3-1 — PROVEN live) The parser used to bind a
     /// file ONLY via a literal `+++ b/` prefix, so a `git diff
     /// --no-prefix` or a plain `diff -u`/`diff -Naur` patch parsed to ZERO
-    /// files — a review-v2 run over such a diff completed green with a
+    /// files — a review run over such a diff completed green with a
     /// noop payload and the operator read that as "the PR is clean". Every
     /// dialect below is the SAME logical change and must parse to the same
     /// path, hunk count and line sets.

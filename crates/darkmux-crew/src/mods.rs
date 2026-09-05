@@ -194,7 +194,7 @@ pub struct GateOutcome {
     /// SKIP, never a false "the mod's change is bad" answer).
     pub passed: bool,
     /// The command that ran, verbatim, so a gated mod is self-describing —
-    /// a reader never has to go find `review-v2.json`'s own `test_command`
+    /// a reader never has to go find `review.json`'s own `test_command`
     /// input to know what confirmed (or failed to confirm) this mod.
     pub command: String,
     /// The process's own exit code, when the command actually ran to
@@ -936,7 +936,7 @@ pub fn decode_b64(s: &str) -> Result<Vec<u8>> {
 /// CHECKOUT, and `deliver.github_review` anchors a suggestion by the diff's
 /// own repo-relative path — so a kit in container coordinates applies to
 /// nothing and anchors to nothing. Proven live: every gated mod on mission
-/// `review-v2-1788566897-9c149e` recorded "kit did not apply".
+/// `review-1788566897-9c149e` recorded "kit did not apply".
 ///
 /// Only header forms are touched — `diff --git`, `---`, `+++`, and (#2310
 /// fix-loop E2) the bare-path family `rename from`/`rename to`/`copy from`/
@@ -1534,7 +1534,7 @@ mod tests {
         findings::materialize(root, &rec).unwrap();
     }
 
-    /// (#2361, PROVEN live on mission `review-v2-1788566897-9c149e`) The
+    /// (#2361, PROVEN live on the 2026-09-05 live review run) The
     /// mod's kit came back with the CONTAINER's headers — `--- a/app/src/
     /// auth.ts` / `+++ b/app/src/auth.ts`, where `app` is the workspace
     /// source id — while `mods.gate` applies the kit inside a copy of the

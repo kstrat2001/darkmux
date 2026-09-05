@@ -621,7 +621,7 @@ mod tests {
         assert!(format!("{shape:#}").contains("<dispatch>/<seq>"), "{shape:#}");
     }
 
-    /// (#2361, PROVEN live on mission `review-v2-1788566897-9c149e`) The
+    /// (#2361, PROVEN live on the 2026-09-05 live review run) The
     /// stored finding's `emitted.file` was `/workspace/app/src/auth.ts` —
     /// the CONTAINER's view (`/workspace/<source-id>/…`), while the diff,
     /// the gate's scratch checkout and `deliver.github_review` all speak

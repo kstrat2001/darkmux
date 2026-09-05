@@ -350,7 +350,7 @@ const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `create_findin
 /// is real; before this parameter existed, nothing ever supplied it, so
 /// that rule was structurally inert regardless of the seat. `None` for
 /// every crawl.json task (which never sets `config.intent_file`) and for
-/// a review-v2 launch with no `intent_file` param — the block is omitted
+/// a review launch with no `intent_file` param — the block is omitted
 /// entirely rather than rendered empty, so a unit's message is unchanged
 /// from before this parameter existed whenever there is nothing to say.
 pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: Option<&str>) -> Result<String> {
@@ -778,12 +778,12 @@ pub struct UnitStepConfig {
     pub timeout_seconds: Option<u32>,
     /// (#2310 P4c review round 2, item (e); wired P4c-2 item 0) Path to the
     /// diff's stated intent (a PR body or intent file). Optional.
-    /// `review-v2.json`'s `unit-<rule>` tasks grow `"intent_file":
+    /// `review.json`'s `unit-<rule>` tasks grow `"intent_file":
     /// "{{intent_file}}"` into every unit's config, and `mission_config::
     /// substitute_step_config` resolves it from the launch's own
     /// `intent_file` input (same generic mechanism `plan.sites`'s
     /// `{{workspace}}` resolves through). `crawl.json`'s tasks never set
-    /// this, and a review-v2 launch with no `intent_file` param leaves it
+    /// this, and a review launch with no `intent_file` param leaves it
     /// `None` too (an unset optional input's placeholder key is omitted at
     /// mint, not substituted as an empty string). When present, its
     /// content is read at dispatch time and rendered into the unit's
@@ -973,10 +973,10 @@ fn single_rule_id(rule_ids: &[String]) -> Option<String> {
 /// units from `u-0001`, so two different rules' plans routinely mint the
 /// SAME unit id in one mission — the rule component is what keeps their
 /// on-disk homes from colliding (live evidence: mission
-/// `review-v2-1788566897-9c149e`, 2026-09-05, 4 of 5 units errored with
+/// the 2026-09-05 live review run: 4 of 5 units errored with
 /// "caller-provided out-dir already exists"). Prefers the step's OWN
 /// `config.rule` — set on every grown unit task in both `crawl.json` and
-/// `review-v2.json` (see `UnitStepConfig::rule`), and already checked a
+/// `review.json` (see `UnitStepConfig::rule`), and already checked a
 /// few lines above `run`'s own call site to agree with the plan — over
 /// re-deriving it from the plan unit's rule id(s), so the two never
 /// silently disagree. Falls back to the plan unit's own rule ids only
@@ -1163,7 +1163,7 @@ impl StepKind for CrawlUnitStepKind {
 
         // (#2310 P4c) The Task's OWN `role_id` — `"crawler"` for every
         // crawl.json task, unchanged from before this generalization; a
-        // review-v2.json task instead declares `"role_id": "reviewer"`,
+        // review.json task instead declares `"role_id": "reviewer"`,
         // which is what makes this ONE step kind ("Units. Already
         // generic: a map step over units with a role that carries the
         // finding tool" — DESIGN.md) actually reusable rather than only
@@ -1571,7 +1571,7 @@ pub struct CrawlSummary {
     /// (#2310 P4c-2b PR #2357 round-2 review item 5) Rule ids (falling
     /// back to the step id when a rule can't be named) whose `crawl.plan`
     /// step did NOT reach `Complete` this run. `crawl.json` shares
-    /// `src/mission_launch.rs::grow_phase` with `review-v2.json`: since
+    /// `src/mission_launch.rs::grow_phase` with `review.json`: since
     /// that function stopped `bail!`ing the whole launch on an errored
     /// grow producer (#2310 P4c-2b MUST FIX C) and instead grows zero
     /// units from the affected rule, a crawl whose plan step failed now
@@ -1705,7 +1705,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         stopped_by: if units_errored > 0 { "error".into() } else { "done".into() },
         est_tokens,
         model: rows.iter().find_map(|r| r.model.clone()),
-        // (#2310 P4c) `crawl.summary` is not reused by review-v2 (its own
+        // (#2310 P4c) `crawl.summary` is not reused by review (its own
         // phase declares no summary task) — hardcoded "crawler" here is
         // unchanged behavior, not a gap.
         profile: resolve_crawler_seat("crawler").profile_name,

@@ -1,6 +1,6 @@
 ---
 name: darkmux-mod-create
-description: Write the mod a darkmux finding describes, from the frontier tier. darkmux's local seats detect (a `create_finding` tool call); this skill is the other half — a frontier subagent reads the finding, opens the tree it was observed in, writes the smallest applying unified diff, and records it with `darkmux mod create`. Invoke it when a hooks receiver (or `finding list`) shows findings with no mod, when a `review-v2` run is waiting on `mod_wait_seconds`, or when the operator says "write the mods for <mission>". darkmux never calls a frontier model itself — this skill is how the frontier reaches it. (#2310)
+description: Write the mod a darkmux finding describes, from the frontier tier. darkmux's local seats detect (a `create_finding` tool call); this skill is the other half — a frontier subagent reads the finding, opens the tree it was observed in, writes the smallest applying unified diff, and records it with `darkmux mod create`. Invoke it when a hooks receiver (or `finding list`) shows findings with no mod, when a `review` run is waiting on `mod_wait_seconds`, or when the operator says "write the mods for <mission>". darkmux never calls a frontier model itself — this skill is how the frontier reaches it. (#2310)
 user_invocable: true
 allowed-tools: "Bash(darkmux:*),Bash(jq:*),Bash(git:*),Bash(cat:*),Bash(ls:*),Bash(grep:*),Bash(sed:*),Bash(diff:*),Read,Task"
 ---
@@ -226,9 +226,9 @@ darkmux mod list --mission "$MISSION" --json | jq -r '.mods[].for[]' | sort -u >
 comm -23 /tmp/f /tmp/m      # findings with no mod yet
 ```
 
-## Running inside a `review-v2` run's wait window
+## Running inside a `review` run's wait window
 
-`review-v2`'s `create-mods` phase does not dispatch a coder. Its first step is a
+`review`'s `create-mods` phase does not dispatch a coder. Its first step is a
 bounded shell poll of `darkmux mod list --for <key>`, so a mod you record while
 the run is waiting is picked up on the next ~5s cycle, gated, and delivered as an
 inline suggestion.

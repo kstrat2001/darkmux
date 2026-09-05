@@ -1474,7 +1474,7 @@ pub(crate) enum LabCmd {
         /// (the original `review-bench` behavior). The scorer is role-agnostic
         /// — it matches the role's emitted `{verdict, findings}` JSON against
         /// the ground-truth labels. The experimental condition flags below
-        /// (`--freeform`/`--agentic`/`--dialectic`/`--funnel`) are
+        /// (`--freeform`/`--agentic`/`--dialectic`) are
         /// `pr-reviewer`-specific and ignore this positional (they dispatch
         /// fixed reviewer variant roles / pipelines); a follow-up moves those
         /// behind per-role config (#1465).
@@ -1517,17 +1517,7 @@ pub(crate) enum LabCmd {
         /// agentic, so this requires --workdirs.
         #[arg(long, conflicts_with_all = ["freeform", "agentic"])]
         dialectic: bool,
-        /// (#1222 Phase B packet 7) Dispatch the review funnel (bundles →
-        /// probe roles → dedup → double-confirm judge) instead of a single
-        /// reviewer or the dialectic pipeline — the release-guard validation
-        /// mode: recall/precision scored EXACTLY like every other mode. Requires
-        /// --workdirs (the probe/judge seats read the case's repo tree, like
-        /// --agentic/--dialectic); every review seat is pinned to one profile
-        /// (--roster-profile, else --profile, else the registry's
-        /// default_profile) via the role→profile resolver (#1475).
-        #[arg(long, conflicts_with_all = ["freeform", "agentic", "dialectic"])]
-        funnel: bool,
-        /// Evidence root for --agentic / --dialectic / --funnel: one
+        /// Evidence root for --agentic / --dialectic: one
         /// subdirectory per case id holding that case's repo tree
         /// (`git archive <commit> | tar -x -C <root>/<id>`).
         #[arg(long)]
@@ -1549,12 +1539,12 @@ pub(crate) enum LabCmd {
         /// verify) to for a controlled funnel run — via the per-run role→profile
         /// override. Falls back to --profile, else the registry's
         /// `default_profile`.
-        #[arg(long = "roster-profile", requires = "funnel")]
+        #[arg(long = "roster-profile")]
         roster_profile: Option<String>,
         /// (#1222) Funnel model-cycling mode: "sequential" | "parallel" |
         /// "auto" (default: auto — resolved once per run against the local
         /// hardware tier).
-        #[arg(long = "exec-mode", requires = "funnel")]
+        #[arg(long = "exec-mode")]
         exec_mode: Option<String>,
         /// (#1475, RETIRED as a multiplier #1512/#1513 review) Historically
         /// the probe draw BREADTH per probe role. Draw multiplication no
@@ -1565,12 +1555,15 @@ pub(crate) enum LabCmd {
         /// multiplier happened, a dishonest artifact). To change probe
         /// recall breadth, edit the SET of probe roles the "review" mission
         /// config declares instead (add/remove a probe task).
-        #[arg(long, requires = "funnel", value_parser = clap::value_parser!(u32).range(1..))]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         k: Option<u32>,
         /// (#1222) Run an external bundler
         /// (`<cmd> --worktree <dir> --diff <file>`) per case instead of the
-        /// built-in Rust bundler.
-        #[arg(long, requires = "funnel")]
+        /// built-in Rust bundler. This flag belongs to `lab eval` itself
+        /// (the bench harness) — it is unrelated to the `review` mission
+        /// config's own `bundler` input, which was deleted entirely along
+        /// with the funnel (#2310 P4d); this flag survives unchanged.
+        #[arg(long)]
         bundler: Option<String>,
     },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and

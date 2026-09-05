@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.21",
+  "schema_version": "1.22",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -48,10 +48,6 @@
   },
   "mission": {
     "stale_active_days": 14
-  },
-  "review": {
-    "judge_concurrency": 1,
-    "judge_fail_on_any_skip": false
   },
   "radio": {
     "router_profile": "",

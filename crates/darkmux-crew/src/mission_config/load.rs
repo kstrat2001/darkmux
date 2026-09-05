@@ -24,13 +24,6 @@ use std::path::{Path, PathBuf};
 /// restriction.
 const EMBEDDED_MISSION_CONFIGS: &[(&str, &str)] = &[
     (
-        "review",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../templates/builtin/mission-configs/review.json"
-        )),
-    ),
-    (
         "coder-phase",
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -49,16 +42,15 @@ const EMBEDDED_MISSION_CONFIGS: &[(&str, &str)] = &[
             "/../../templates/builtin/mission-configs/crawl.json"
         )),
     ),
-    // (#2310 P4c) The rebuilt review, as a second config on the crawl's
-    // building blocks. `id: "review-v2"` — deliberately NOT `"review"`,
-    // which stays the frozen, byte-identical CLI surface until P4d swaps
-    // them. Runs through the generic launcher exactly like `crawl` (no
-    // bespoke launcher, no literal routing).
+    // (#2310 P4d) `review` — the code review, built on the crawl's shared
+    // building blocks. The bespoke funnel launcher it replaced is deleted;
+    // this document runs through the generic launcher exactly like `crawl`
+    // (no bespoke launcher, no literal routing).
     (
-        "review-v2",
+        "review",
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../templates/builtin/mission-configs/review-v2.json"
+            "/../../templates/builtin/mission-configs/review.json"
         )),
     ),
 ];

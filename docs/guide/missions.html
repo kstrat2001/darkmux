@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Missions, phases, and dispatch: darkmux user guide</title>
-<meta name="description" content="Structured agentic work in darkmux: dispatch local-AI roles, track multi-step plans as missions and phases, drive QA via the review funnel.">
+<meta name="description" content="Structured agentic work in darkmux: dispatch local-AI roles, track multi-step plans as missions and phases, drive QA via the review mission.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -32,7 +32,7 @@
   <div class="wrap">
     <div class="label">04 <span class="dot">·</span> advanced</div>
     <h1>Missions, phases, and dispatch</h1>
-    <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, scribe), track multi-step work as <em>missions</em> made of <em>phases</em>, and run structured QA via the review funnel (<code>mission launch review</code>). Optional: everything in earlier sections works without these concepts.</p>
+    <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, scribe), track multi-step work as <em>missions</em> made of <em>phases</em>, and run structured QA via the review mission (<code>mission launch review</code>). Optional: everything in earlier sections works without these concepts.</p>
   </div>
 </header>
 
@@ -44,7 +44,7 @@
     <ul>
       <li><strong>Named local-AI roles</strong> with specific tool palettes and system prompts (a "coder" that can edit files; a "code-reviewer" that can only read; a "scribe" that drafts prose).</li>
       <li><strong>Multi-step plans with structure</strong>: missions that contain phases, dependencies, lifecycle state (planned/running/complete/abandoned).</li>
-      <li><strong>QA-by-default discipline</strong>: every implementation phase should pass through the review funnel (<code>mission launch review</code>), which dispatches a code-reviewer crew against the diff.</li>
+      <li><strong>QA-by-default discipline</strong>: every implementation phase should pass through the review mission (<code>mission launch review</code>), which dispatches a reviewer crew against the diff.</li>
       <li><strong>Visible orchestration in the viewer</strong>: mission start, phase transitions, dispatch start/complete, verdict, all rendered as a timeline in <code>/flow</code>.</li>
     </ul>
   </div>
@@ -194,7 +194,7 @@ next: <code>darkmux mission launch draft-blog-post</code> to begin (or pass <cod
     <pre><code>darkmux mission config list</code></pre>
     <p><code>darkmux mission config show &lt;id&gt;</code> prints the whole graph — every phase, task, and step, the step kind each step names and whether THIS binary can construct it (the identical check <code>mission launch</code> exits <code>4</code> against, surfaced before launch instead of at it) — and, for every task with a <code>role_id</code>, the profile and model that role resolves to <strong>right now</strong>: a launch override, the <code>role_profiles</code> map, or the <code>default_profile</code> fallback (the operator never has to wonder where the decision came from), plus whether that model is currently loaded. Pass <code>--param &lt;role&gt;=&lt;profile&gt;</code> (repeatable) to preview a planned override exactly as <code>mission launch &lt;id&gt; --param &lt;role&gt;=&lt;profile&gt;</code> would apply it — <strong>on the review route</strong>: <code>review</code> and any variant whose graph uses the review step kinds. On any other config (e.g. <code>coder-phase</code>), <code>mission launch</code> ignores <code>--param &lt;role&gt;=&lt;profile&gt;</code> entirely (a coder-phase <code>--param role=&lt;id&gt;</code> is a DIFFERENT knob — it rebinds the task's own <code>role_id</code>, not a role→profile binding), and <code>show</code> mirrors that: the override is neutered and a warning names why, rather than claiming a parity that doesn't hold.</p>
     <pre><code>darkmux mission config show review
-darkmux mission config show review --param review-judge=review-mid</code></pre>
+darkmux mission config show review --param reviewer=review-mid</code></pre>
     <p>Both verbs are strictly READ-ONLY and take <code>--json</code> for machine consumption. Neither resolves any NEW data or logic beyond what <code>mission launch</code>/<code>dispatch</code> already resolve silently at run time — this is that same resolution, surfaced ahead of time. A missing profiles registry or an unreachable LMStudio never fails the command: the affected fields report "unavailable" inline instead.</p>
 
     <h3>Mission JSON shape</h3>
@@ -348,15 +348,15 @@ darkmux mission add-phase &lt;mission-id&gt; \
       <tr>
         <td>2 · reusable patterns</td>
         <td><code>crates/darkmux-crew/src/step_kinds/patterns/</code></td>
-        <td>Reusable control-flow SHAPES (<code>dedup</code>, <code>multi_pass_confirm</code>) with the domain-specific algorithm plugged in per caller. Not directly nameable in a <code>kind</code> field; they're Rust-level building blocks a Tier 3 kind wraps (e.g. <code>review.dedup</code>'s implementation calls the Tier 2 <code>dedup</code> pattern internally).</td>
+        <td>Reusable control-flow SHAPES (<code>dedup</code>, <code>multi_pass_confirm</code>) with the domain-specific algorithm plugged in per caller. Not directly nameable in a <code>kind</code> field; they're Rust-level building blocks a Tier 3 kind wraps (a bespoke dedup step's implementation calls the Tier 2 <code>dedup</code> pattern internally).</td>
       </tr>
       <tr>
         <td>3 · bespoke</td>
-        <td>Co-located with the owning mission module: <code>crates/darkmux-lab/src/lab/review.rs</code> (review's <code>review.*</code> kinds) and <code>src/coder_phase.rs</code> (coder-phase's <code>mission.*</code> kinds)</td>
+        <td>Co-located with the owning mission module: <code>crates/darkmux-lab/src/crawl/</code> (the crawl/review planning + unit kinds) and <code>src/coder_phase.rs</code> (coder-phase's <code>mission.*</code> kinds)</td>
         <td>Single-purpose, genuinely new control flow. Never lives in <code>darkmux-crew</code>.</td>
       </tr>
     </table>
-    <p><code>darkmux mission launch</code> resolves every kind it can construct (Tier 1 plus both pipelines' Tier 3 kinds) against one shared registry. A config naming a kind outside that set still loads and mints an instance (lenient-on-read), but the launch can't execute the step.</p>
+    <p><code>darkmux mission launch</code> resolves every kind it can construct (Tier 1 plus the launch-owned Tier 3 kinds) against one shared registry. A config naming a kind outside that set still loads and mints an instance (lenient-on-read), but the launch can't execute the step.</p>
 
     <h3>Naming contracts that are load-bearing</h3>
     <p>Both built-in graphs are located by their launchers before execution, and the two pipelines take different (and, as of the #1530 arc, converging) approaches; worth knowing before you copy either one.</p>
@@ -365,22 +365,24 @@ darkmux mission add-phase &lt;mission-id&gt; \
     <p>The pre-gate steps are found by a fixed naming CONVENTION composed from the real phase id: <code>&lt;phase-id&gt;-worktree-step</code> (kind <code>mission.worktree</code>) and <code>&lt;phase-id&gt;-coder-step</code> (kind <code>mission.coder</code>). The sign-off gate step is instead resolved by DECLARATION: the launcher asks every registered kind whether it's the gate (<code>StepKind::is_gate()</code>; <code>mission.verify</code> is the one kind that answers yes today), falling back to the fixed <code>&lt;phase-id&gt;-verify-step</code> id only if no kind claims the role. Separately, the operator-facing overrides (<code>--param role=</code>/<code>image=</code>/<code>workdir=</code>) attach to whichever task DECLARES the <code>mission.coder</code>/<code>mission.verify</code> step kind, not to a literal task id, so a copied, renamed config still receives them. Net effect: match the built-in's step-id convention for the worktree/coder steps, give your coder/verify steps the right kinds, and a renamed copy keeps working end-to-end.</p>
 
     <h4>review</h4>
-    <p>The launcher (<code>build_review_graph_from_config</code> in <code>crates/darkmux-lab/src/lab/review.rs</code>) locates four steps by FIXED id (<code>review-bundle-step</code>, <code>review-judge-step</code>, <code>review-verify-step</code>, <code>review-verify-render-step</code>), where it stamps run-time config (the bundle source, judge concurrency, the verify seat's identity). Rename any of these four and the launch fails outright. It locates two others STRUCTURALLY, by kind: the dedup step (kind <code>review.dedup</code>) and the synthesis step (kind <code>review.synthesis</code>), specifically so a hand-edited user-tier <code>review.json</code> that renames those steps still builds and runs. Probe roles are discovered the same structural way: <em>any</em> role-bearing task the document declares is classified as a probe UNLESS its step kind marks it as the judge (<code>review.judge</code>) or verify (<code>review.verify-render</code>) task, so adding or removing a probe role is a config edit (a new task with its own <code>role_id</code>, depending only on the bundle task), never a Rust change.</p>
+    <p><code>review</code> has no launcher of its own: it is a mission config on the same building blocks the crawl uses, run by the generic launcher. Its <code>plan-&lt;rule&gt;</code> tasks are <code>plan.sites</code> steps with <code>"source": "diff"</code>, each <code>unit-&lt;rule&gt;</code> task grows one dispatch per planned site, and the <code>deliver</code> phase gathers the run's own finding/mod records and renders a GitHub review payload. Nothing is located by a fixed step id, so renaming a task or step in a copy is safe. Two things ARE load-bearing: a plan step needs either a <code>workspace</code> spec or both <code>github</code> and <code>head_sha</code> (from which it derives a one-source spec at that sha), and the phase named by <code>outcome_from</code> is what the run's exit code reads.</p>
 
     <h3>Named config variants</h3>
-    <p>Routing to a launcher is structural (which step KINDS a graph declares, not what its <code>id</code> is), so you can save a differently-named variant of either built-in and launch it directly; darkmux dispatches it to the same launcher because it still carries the review (or coder-phase) kinds. Copy the built-in JSON to <code>~/.darkmux/mission-configs/&lt;new-id&gt;.json</code>, edit its <code>id</code> field and whatever else you're tuning (probe role count, a different coder role default, judge concurrency), then launch by the new name:</p>
+    <p>Routing to a launcher is structural (which step KINDS a graph declares, not what its <code>id</code> is), so you can save a differently-named variant of any built-in and launch it directly. Copy the built-in JSON to <code>~/.darkmux/mission-configs/&lt;new-id&gt;.json</code>, edit its <code>id</code> field and whatever else you're tuning (which rules to plan, a different coder role default, the draws per unit), then launch by the new name:</p>
     <pre><code>cp templates/builtin/mission-configs/review.json ~/.darkmux/mission-configs/review-lean.json
-<span class="comment"># edit review-lean.json: trim to two probe tasks, set "id": "review-lean"</span>
-darkmux mission launch review-lean --param diff_file=...  <span class="comment"># routes to the review launcher — same kinds, different id</span></code></pre>
+<span class="comment"># edit review-lean.json: trim to two plan/unit rule pairs, set "id": "review-lean"</span>
+darkmux mission launch review-lean --param diff_file=...  <span class="comment"># same kinds, different id</span></code></pre>
     <p><code>darkmux doctor</code> validates every discoverable mission config (user tier, then on-disk templates, then the embedded built-ins). Structural findings (dangling <code>depends_on</code>, duplicate or empty ids) and schema-version drift surface there before you launch, not mid-run.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Standalone QA: the review funnel</h2>
-    <p><code>darkmux mission launch review</code> runs a code review against the current branch's diff vs. base. It's a full funnel (bundle → probe → dedup → judge → verify → synthesis) that dispatches the <code>code-reviewer</code> role and emits a verdict. This is the standalone form of the same QA the <code>coder-phase</code> pipeline runs automatically at its sign-off gate.</p>
+    <h2>Standalone QA: the review pipeline</h2>
+    <p><code>darkmux mission launch review</code> runs a code review against the current branch's diff vs. base. It is an ordinary on-disk mission config — no bespoke pipeline code, just the same generic launcher every other mission runs through — with five phases: <code>plan</code>, <code>review</code>, <code>summarize</code>, <code>create-mods</code>, and <code>deliver</code>. This is the standalone form of the same QA the <code>coder-phase</code> pipeline runs automatically at its sign-off gate.</p>
     <pre><code>darkmux mission launch review     <span class="comment"># review the current branch's diff vs. the base branch</span></code></pre>
+
+    <p><code>plan</code> mints one planning task per review rule (intent-vs-diff, existing-solution, shared-symbol-callers, union-vs-enum, test-gap, swallowed-error, unnamed-predicate), each scoped to the diff. <code>review</code> dispatches the <code>reviewer</code> role once per planned site to actually look for that rule's finding shape. <code>summarize</code> collapses the run's findings into one pass. <code>create-mods</code> gates each finding: it waits (bounded, off by default via <code>--param mod_wait_seconds=&lt;N&gt;</code> for an attended run where an orchestrator session is watching for the finding hook) for a frontier-written fix, then runs the mod's own test command against a patched copy of the checkout. <code>deliver</code> renders the result as a GitHub review — a finding whose mod passed the gate becomes an inline suggestion; everything else (no mod, or a mod that failed the gate) renders as a question instead of a silent drop.</p>
 
     <p>Verdict bucket reflects the worst severity found:</p>
     <ul>
@@ -390,16 +392,7 @@ darkmux mission launch review-lean --param diff_file=...  <span class="comment">
     </ul>
     <p>Output is structured JSON with the full findings list. Gate CI or pre-commit scripts on the verdict bucket when you need to require clean reviews.</p>
 
-    <p>The review emits its own flow records (Review category, frontier-tier for the orchestrator narrative, local-tier for the actual reviewer dispatch). Watch the viewer during a review-funnel run to see the full cascade.</p>
-
-<figure class="shot">
-  <img src="../media/mission-graph.png" alt="The darkmux mission graph lens showing a finalized review mission: three phases arranged top to bottom — Investigate with Bundle, Probe high, Probe low, Probe mid and Dedup tasks; Adjudicate with a Judge task; and Report with Verify and Synthesis tasks — alongside an event log and payload detail panel, pan/zoom controls, and a minimap." loading="lazy">
-  <figcaption>The review funnel's task graph, live in the viewer. Every box is one <code>Task</code>; the rows inside are its <code>Step</code>s, the same bundle → probe → dedup → judge → verify → synthesis stages described above, rendered from the actual scheduler run rather than drawn by hand.</figcaption>
-</figure>
-<figure class="shot">
-  <img src="../media/mission-graph-detail.png" alt="A zoomed view of the Investigate phase: Bundle feeding three parallel Probe tasks (high, low, mid), each showing its dispatch-map step with a truncated model identifier and token count, converging on a Dedup task." loading="lazy">
-  <figcaption>Zoomed on Investigate: the bundle step fans out into the probe tasks, one per configured seat, each dispatching to its own model at its own token budget before dedup collapses the overlapping findings.</figcaption>
-</figure>
+    <p>The review emits its own flow records (Review category, frontier-tier for the orchestrator narrative, local-tier for the actual reviewer dispatch). Watch the viewer during a review run to see the plan → review → summarize → create-mods → deliver phases progress.</p>
   </div>
 </section>
 

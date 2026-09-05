@@ -13,9 +13,10 @@
 //! every future mission-type driver can reuse, while the mission-specific
 //! payload rides untouched in [`MissionEnvelope::payload`].
 //!
-//! **Producers and consumers.** A mission driver (today: `run_review_graph`
-//! via `src/pr_review.rs`'s conversion; future: any config-launched mission,
-//! #1284 Packet 3+) builds a `MissionEnvelope` at the end of its run and
+//! **Producers and consumers.** A mission driver (originally: the retired
+//! review funnel's `run_review_graph` via the long-retired `src/pr_review.rs`'s
+//! conversion; today: any config-launched mission, #1284 Packet 3+) builds a
+//! `MissionEnvelope` at the end of its run and
 //! hands it to [`finalize_mission`], which drives the phase/mission
 //! terminal transitions in [`crate::lifecycle`]. The SAME envelope is the
 //! natural artifact for the mission board (`darkmux mission status`) and
@@ -50,9 +51,10 @@
 //! # `outcome` — the typed source `status` derives from (#1877 item 2)
 //!
 //! [`MissionEnvelope::outcome`] carries a [`crate::run_outcome::RunOutcome`]
-//! when the mission driver has one — today, only the PR-review pipeline
-//! (`src/mission_launch_review.rs`'s `review_result_to_mission_envelope`)
-//! does. Before this field existed, "a run was partially covered" lived as
+//! when the mission driver has one — the PR-review pipeline (the
+//! now-deleted dedicated review launcher's `review_result_to_mission_envelope`)
+//! was the only one that did, before that launcher was deleted (#2310 P4d).
+//! Before this field existed, "a run was partially covered" lived as
 //! a CONVENTION: review pushed a warning string into `warnings` and this
 //! module's own status derivation read "non-empty warnings" as `Degraded`.
 //! That convention still decides `Degraded` today (see the table below),

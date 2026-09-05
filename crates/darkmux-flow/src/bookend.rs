@@ -7,9 +7,10 @@
 //! per-step ones; originally `funnel.rs`'s `FunnelBookendGuard`, later the
 //! review driver's run-guard — since RETIRED in #1434, when the review path
 //! folded onto one generic `step result` vocabulary and dropped its
-//! per-run bookend entirely), and `src/mission_launch_review.rs`'s
-//! `with_dispatch_bookends` (flat, bridging a review-pipeline run into the
-//! `dispatch *` vocabulary). Same shape every time: emit a `started`
+//! per-run bookend entirely), and the now-deleted dedicated review
+//! launcher's `with_dispatch_bookends` (flat, bridging a review-pipeline
+//! run into the `dispatch *` vocabulary — that launcher is gone too,
+//! #2310 P4d). Same shape every time: emit a `started`
 //! record, arm a guard, and guarantee a matching terminal record fires no
 //! matter how the covered code exits — clean return, early `?`-return, or
 //! panic. A flat one-shot guard is just a stack of depth ≤ 1, so one type
@@ -25,7 +26,8 @@
 //! module's `BookendGuard`) still emitted competing vocabulary from
 //! INSIDE `run_review_graph`, nested inside `with_dispatch_bookends`'s
 //! own already-correct outer wrap — retired in favor of that outer wrap
-//! alone (see `run_review_graph`'s doc in `darkmux-lab::lab::review`).
+//! alone (`run_review_graph` and the review funnel that owned it were
+//! themselves later deleted outright in #2310 P4d).
 //!
 //! This module intentionally knows nothing about `FlowRecord`'s domain
 //! meaning beyond its existence — callers build every `started`/`finished`/
@@ -202,7 +204,7 @@ pub fn remote_route_label(host: &str, model_id: &str) -> String {
     //
     // It was previously by remembering, and two of three callers forgot:
     // `dispatch_internal::remote_endpoint_label` (the dispatch path) and
-    // `mission_launch_review::crew_route_label` both handed over a raw
+    // the now-deleted dedicated review launcher both handed over a raw
     // authority. Only `review.rs`'s `seat_endpoint_host` stripped it, and
     // its comment spells out why: nothing stops an operator pasting
     // `https://tok@proxy/v1` into a profile's `url` — some LiteLLM/proxy

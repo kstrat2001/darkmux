@@ -1207,7 +1207,7 @@ impl StepKind for DeliverGithubReviewStepKind {
         // (#2310 fix-loop E2, from the C2 post-merge review) The step's
         // output is a JSON OBJECT, not the emit path.
         //
-        // `review-v2.json` declares `outcome_from: "deliver"`, which
+        // `review.json` declares `outcome_from: "deliver"`, which
         // promotes this step's output into the run's `mission close`
         // payload — and a bare path is not a JSON object, so
         // `promoted_step_body` promoted NOTHING. A run whose whole point is
@@ -1983,7 +1983,7 @@ mod tests {
         let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
         // (#2310 fix-loop E2, from the C2 post-merge review) The step's own
         // output is a promotable JSON object — `{mode, summary, emit}` —
-        // NOT the bare emit path it used to be. `review-v2.json` declares
+        // NOT the bare emit path it used to be. `review.json` declares
         // `outcome_from: "deliver"`, and a bare path promoted nothing, so
         // the run closed with a null payload. The emit destination is still
         // carried, as a field.
@@ -2548,14 +2548,13 @@ mod tests {
     }
 
     /// (#2310 P4b review, CONSIDER — renamed to what it actually asserts)
-    /// `emit: "-"` resolves to the SAME `Path::new("-")` convention
-    /// `review_render::emit_rendered` uses (reimplemented independently —
-    /// see this module's doc for why it cannot depend on that one) and the
-    /// step reports `"-"` as its own output marker rather than a file
-    /// path. This does NOT capture actual stdout bytes (`println!` isn't
-    /// trivially interceptable from a plain `#[test]`) — it proves the
-    /// DESTINATION decision, not the byte-for-byte "one JSON line and
-    /// nothing else" purity claim the old name implied.
+    /// `emit: "-"` is this step's own stdout convention: `Path::new("-")`
+    /// is treated as "print to stdout, not a file", and the step reports
+    /// `"-"` as its own output marker rather than a file path. This does
+    /// NOT capture actual stdout bytes (`println!` isn't trivially
+    /// interceptable from a plain `#[test]`) — it proves the DESTINATION
+    /// decision, not the byte-for-byte "one JSON line and nothing else"
+    /// purity claim the old name implied.
     #[test]
     fn emit_dash_step_output_names_stdout_not_a_path() {
         let step = Step {

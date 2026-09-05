@@ -13,10 +13,8 @@
 //! real CI review exercise the identical path.
 
 use crate::providers::prompt::extract_reply_text;
-use anyhow::{anyhow, bail, Context, Result};
-use darkmux_profiles::profiles::RoleBinding;
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -216,16 +214,6 @@ pub enum BenchMode {
     /// charges become the review, scored by the same matcher as every other
     /// mode — the dialectic is entirely upstream of scoring.
     Dialectic,
-    /// (#1222 Phase B packet 7) The review funnel as a bench condition — the
-    /// release-guard validation mode: bundles → probe seats ×k draws → dedup
-    /// → double-confirm judge (`lab::review::run_review`, fed real bundles
-    /// via `ReviewInputs::bundles`), over the SAME labeled corpus every
-    /// other mode scores against. `Confirmed`
-    /// tier flags become the review's findings (`NeedsCheck`/`Archived`
-    /// don't count toward recall/precision, but are recorded in the
-    /// per-case `funnels.json` artifact) — scoring is entirely downstream of
-    /// the funnel, same discipline as `Dialectic`.
-    Funnel,
 }
 
 impl BenchMode {
@@ -238,11 +226,6 @@ impl BenchMode {
             // per-case loop branches to `run_debate` before ever asking the
             // mode for a single role id.
             BenchMode::Dialectic => unreachable!("dialectic dispatches per-seat roles"),
-            // The funnel dispatches `review-probe`/`review-judge` seats
-            // directly via `single_shot_chat` (no container dispatch, no
-            // single role id) — the per-case loop branches to
-            // `run_funnel_case` before ever asking the mode for one.
-            BenchMode::Funnel => unreachable!("funnel dispatches review-probe/review-judge seats"),
         }
     }
 
@@ -252,7 +235,6 @@ impl BenchMode {
             BenchMode::FreeForm => "freeform",
             BenchMode::Agentic => "agentic",
             BenchMode::Dialectic => "dialectic",
-            BenchMode::Funnel => "funnel",
         }
     }
 }
@@ -376,7 +358,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     let workdir_for = |case_id: &str| -> Option<PathBuf> {
         opts.workdirs.as_ref().map(|root| root.join(case_id))
     };
-    if matches!(opts.mode, BenchMode::Agentic | BenchMode::Dialectic | BenchMode::Funnel) {
+    if matches!(opts.mode, BenchMode::Agentic | BenchMode::Dialectic) {
         let root = opts.workdirs.as_ref().ok_or_else(|| {
             anyhow!(
                 "--{} requires --workdirs <root> (one repo tree per case id)",
@@ -399,31 +381,18 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
         }
     } else if opts.workdirs.is_some() {
         return Err(anyhow!(
-            "--workdirs only applies to --agentic / --dialectic / --funnel (diff-only \
+            "--workdirs only applies to --agentic / --dialectic (diff-only \
              modes never read a repo tree; passing one would silently measure nothing)"
         ));
     }
-    // (#1222 Phase B packet 7) Funnel mode's preflight: resolve the crew +
-    // seat prompts + exec mode ONCE, before any dispatch spends a token —
-    // same "fail loud before spending tokens" discipline as the workdirs
-    // check above.
-    let funnel_ctx: Option<FunnelCtx> = if opts.mode == BenchMode::Funnel {
-        Some(resolve_funnel_ctx(&opts)?)
-    } else {
-        None
-    };
     // (#1198 + #1247 Part 2) Resolve the scores artifact's path + the run's
-    // ts_ms ONCE, up front — both the per-case incremental funnels.json
-    // snapshots below AND the end-of-run `write_scores_artifact` write to
-    // the SAME path, and `RunProvenance::run_id` shares the same ts_ms, so
+    // ts_ms ONCE, up front — the end-of-run `write_scores_artifact` writes to
+    // this path, and `RunProvenance::run_id` shares the same ts_ms, so
     // resolving early (rather than recomputing at end-of-run, the prior
     // behavior) keeps that coupling intact while additionally letting the
     // run_id reflect when the run STARTED, not when it finished.
     let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let scores_path = opts.scores_out.clone().unwrap_or_else(|| default_scores_path(ts_ms));
-    // (#1247 Part 1) Funnel mode's per-run-local flow-event sink — see
-    // `LocalJsonlEmitter`'s doc for why this is NOT the fleet flow stream.
-    let mut funnel_emitter = LocalJsonlEmitter::new(scores_path.with_file_name("funnel-events.jsonl"));
     // (#1465) Operator-facing console line reads `lab eval` (the current verb);
     // the internal run_id / run-dir (`review-bench-<ts>`) + scores `bench` key
     // stay `review-bench` — self-consistent internal identifiers, a declared
@@ -442,10 +411,6 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // case, written beside scores.json — the dispatches stay atomic; the
     // debate exists as an artifact, not a flow shape.
     let mut debates: Vec<super::dialectic::DebateEnvelope> = Vec::new();
-    // (#1222 Phase B packet 7) Funnel mode's composite artifacts: one
-    // envelope per case, written beside scores.json — same discipline as
-    // `debates` above.
-    let mut funnels: Vec<super::review::ReviewEnvelope> = Vec::new();
     for c in &cases {
         let review = if opts.mode == BenchMode::Dialectic {
             use super::dialectic::Seat;
@@ -493,31 +458,6 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                 total_tokens: total,
             });
             debates.push(debate);
-            review
-        } else if opts.mode == BenchMode::Funnel {
-            let ctx = funnel_ctx
-                .as_ref()
-                .expect("preflight resolves the funnel context before the loop");
-            let workdir = workdir_for(&c.id)
-                .expect("--funnel preflight requires --workdirs and validates every case's tree");
-            let (review, env) =
-                run_funnel_case(c, &workdir, ctx, opts.timeout_seconds, &mut funnel_emitter)
-                    .with_context(|| format!("funneling case {}", c.id))?;
-            let total_tokens: u64 = env.members.iter().map(|m| m.total_tokens).sum();
-            meta.push(EnvelopeMeta {
-                model: env.members.first().map(|m| m.model.clone()),
-                total_tokens: Some(total_tokens),
-            });
-            funnels.push(env);
-            // (#1247 Part 2) Stream funnels.json to disk AS THIS CASE
-            // COMPLETES — a killed run (crash, timeout, ctrl-C) keeps every
-            // completed case's envelope, not just whatever the last write
-            // captured. Best-effort: a snapshot failure is a warning, never
-            // a bench failure — the operator still gets the console report
-            // and (if the process survives to the end) the final write.
-            if let Err(e) = write_funnels_snapshot(&scores_path, &funnels) {
-                eprintln!("funnels: WARNING — incremental snapshot not written: {e:#}");
-            }
             review
         } else {
             let prompt = build_prompt(c, opts.mode);
@@ -573,25 +513,13 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                 },
             );
         }
-        if let (BenchMode::Funnel, Some(env)) = (opts.mode, funnels.last()) {
-            println!(
-                "{:<34}↳ bundles {} · flags {}→{} · confirmed {} · needs_check {} · archived {}",
-                "",
-                env.bundles,
-                env.raw_flags,
-                env.deduped_flags,
-                env.confirmed,
-                env.needs_check,
-                env.archived,
-            );
-        }
         scored.push((c, s));
     }
     print_summary(&scored, &meta, &opts);
     // (#1198) Persist the run as a scores.json artifact — the bench suite's
     // dual-key score substrate (#1197). Failure to persist is a WARNING, not
     // a bench failure: the operator already has the stdout report.
-    match write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_path, ts_ms) {
+    match write_scores_artifact(&scored, &meta, &debates, &opts, &scores_path, ts_ms) {
         Ok(path) => eprintln!("scores: {}", path.display()),
         Err(e) => eprintln!("scores: WARNING — artifact not written: {e:#}"),
     }
@@ -692,9 +620,6 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
         // Dialectic never reaches build_prompt — the per-case loop hands the
         // case to `lab::dialectic::run_debate`, which builds per-seat prompts.
         BenchMode::Dialectic => unreachable!("dialectic builds per-seat prompts"),
-        // Funnel never reaches build_prompt either — the per-case loop hands
-        // the case to `run_funnel_case`, which builds the probe/judge prompts.
-        BenchMode::Funnel => unreachable!("funnel builds probe/judge prompts"),
     };
     // The evidence sentence is the mode's load-bearing difference: the
     // diff-only modes must SAY the diff is all there is (an honest reviewer
@@ -711,7 +636,6 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
              verify your hypotheses before concluding."
         }
         BenchMode::Dialectic => unreachable!("dialectic builds per-seat prompts"),
-        BenchMode::Funnel => unreachable!("funnel builds probe/judge prompts"),
     };
     format!(
         "PR review request: {title}\n\n\
@@ -785,509 +709,6 @@ fn dispatch_case(
     };
     let r = dispatch(d).context("pr-review-bench internal-runtime dispatch")?;
     Ok(r.stdout)
-}
-
-// ─── funnel mode (#1222 Phase B packet 7) ──────────────────────────────
-
-/// `Funnel` mode's resolved, per-run context — computed ONCE in
-/// [`resolve_funnel_ctx`] before the per-case loop (fail loud before any
-/// dispatch spends a token, same discipline as the `--workdirs` preflight).
-struct FunnelCtx {
-    roles: darkmux_crew::resourcing::ResolvedReviewRoles,
-    exec_mode: super::review::ExecMode,
-    probe_system: String,
-    /// (#1530 follow-on) Per-seat probe prompt resolution, mirroring
-    /// `src/mission_launch_review.rs`'s own map — keeps the bench's
-    /// dispatch parity with production (a bench measuring the SAME engine
-    /// production uses, per this file's module doc, must resolve prompts
-    /// the same way production does or the two would silently diverge).
-    probe_role_prompts: BTreeMap<String, String>,
-    judge_system: String,
-    /// (#1260) The verify seat's persona — resolved unconditionally (the
-    /// role is embedded); only dispatched when the crew declares the seat.
-    verify_system: String,
-    bundler_cmd: Option<String>,
-}
-
-/// Parse `--exec-mode`'s string value into `review::ExecMode`. `None` (the
-/// flag omitted) and the literal `"auto"` both resolve to `Auto` — the
-/// funnel's own `resolve_mode` then decides `Sequential` vs `Parallel`
-/// against the local hardware tier at run time.
-fn parse_exec_mode(s: Option<&str>) -> Result<super::review::ExecMode> {
-    match s.map(str::to_ascii_lowercase).as_deref() {
-        None | Some("auto") => Ok(super::review::ExecMode::Auto),
-        Some("sequential") => Ok(super::review::ExecMode::Sequential),
-        Some("parallel") => Ok(super::review::ExecMode::Parallel),
-        Some(other) => Err(anyhow!(
-            "--exec-mode must be \"sequential\", \"parallel\", or \"auto\" (got \"{other}\")"
-        )),
-    }
-}
-
-/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, staff
-/// every review role via the ONE generic per-task resolver the operator
-/// path uses (`darkmux_crew::resourcing::resolve_review_roles` — #1475,
-/// #1512, #1513 review — its own resolution loop already enforces the
-/// review's shape rules, so there is no separate "validate the crew"
-/// step), reject `--k > 1` (RETIRED as a multiplier, #1513 review M1),
-/// parse `--exec-mode`, and resolve the seat system prompts. Every failure
-/// here is loud and happens BEFORE any dispatch.
-///
-/// (#1475, #1512, #1513 review) The bench is a CONTROLLED comparison: it
-/// pins EVERY review role to one profile — `--roster-profile` (else
-/// `--profile`, else the registry's `default_profile`) — via an override
-/// binding that answers `Overridden(roster)` for ANY role_id asked, so the
-/// funnel measures that one profile across every role deterministically
-/// (never whatever the machine's `role_profiles` map happens to hold).
-/// Which roles exist (however many probe roles `review.json` declares,
-/// plus judge, plus the optional verify) is `resolve_review_roles`'s own
-/// discovery — never enumerated here.
-fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
-    use darkmux_crew::resourcing::ReviewRoleStaffing;
-    let loaded = darkmux_profiles::profiles::load_registry(opts.config_path.as_deref())
-        .context("loading profile registry for --funnel")?;
-    // The one profile every seat is pinned to for this controlled run.
-    let roster = opts
-        .roster_profile
-        .clone()
-        .or_else(|| opts.profile_name.clone())
-        .or_else(|| loaded.registry.default_profile.clone())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            let available: Vec<&str> =
-                loaded.registry.profiles.keys().map(String::as_str).collect();
-            let listed = if available.is_empty() { "(none)".to_string() } else { available.join(", ") };
-            anyhow!(
-                "darkmux: --funnel needs a roster profile — pass --roster-profile <name> (or \
-                 --profile <name>), or set a `default_profile` in the registry. \
-                 Available: {listed}."
-            )
-        })?;
-    // A roster naming a profile the registry doesn't have fails LOUD here,
-    // naming the roster ONCE (get_profile's "not found. Available:" message) —
-    // cleaner than the per-role override error that would otherwise name the
-    // first probe role. Every seat is pinned to this same roster, so one check
-    // suffices.
-    darkmux_profiles::profiles::get_profile(&loaded.registry, &roster)
-        .context("resolving the --funnel roster profile")?;
-    let review_config = darkmux_crew::mission_config::load("review")
-        .context("loading mission config \"review\" for --funnel")?;
-    // (#1685 QA CONSIDER 3) `mission_config::load("review")` resolves the
-    // SAME user-tier-overridable lookup `darkmux mission launch`/`darkmux
-    // acp` use, and `build_review_graph_from_config` (downstream of this
-    // function) constructs its registry from `StepKindRegistry::
-    // with_builtins()`, which includes `procedural.shell` — so a user-tier
-    // `~/.darkmux/mission-configs/review.json` override that pairs a
-    // declared `cmd` with a shell step would run through `--funnel`
-    // completely unchecked without this. `check_cmd`'s own doc claims
-    // "Both entry points that can execute a config's graph call it"; this
-    // is the third, so the check belongs here too rather than leaving that
-    // doc comment quietly false.
-    if let Some(reason) = darkmux_crew::mission_config::check_cmd(&review_config.config) {
-        bail!("darkmux: --funnel: {reason}");
-    }
-    // Every role, whichever `resolve_review_roles` discovers, resolves to
-    // the SAME pinned roster — the override binding ignores the role_id it's
-    // asked about entirely.
-    let roles = darkmux_crew::resourcing::resolve_review_roles(
-        &loaded.registry,
-        &review_config.config,
-        &ReviewRoleStaffing::default(),
-        &|_role| RoleBinding::Overridden(roster.clone()),
-    )
-    .context("resolving review staffing for --funnel")?;
-    // (#1512, #1513 review M1) `--k` no longer stamps anything — one role
-    // is one task is one dispatch, always, so a k>1 request can no longer
-    // be honored. Silently stamping `seat.k = k` (the pre-#1513 behavior)
-    // would produce a run whose envelope/artifact CLAIM a draw multiplier
-    // that never actually fired — a dishonest self-description (a `--k
-    // 1/3/5` sweep would fire the SAME dispatches every time while the
-    // artifacts diverge). Reject loudly instead; `--k 1` (or omitted)
-    // stays a no-op for back-compat.
-    if let Some(k) = opts.k_override {
-        if k > 1 {
-            bail!(
-                "darkmux: --k {k} is retired (#1512, #1513 review) — one probe role now maps to \
-                 exactly one dispatch, so there is no draw multiplier left to apply. Vary the SET \
-                 of probe roles \"review\" mission config declares instead (add/remove a probe \
-                 task) to change recall breadth. --k 1 (or omitting --k) is accepted as a no-op."
-            );
-        }
-    }
-    let exec_mode = parse_exec_mode(opts.exec_mode.as_deref())?;
-    let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
-        anyhow!("darkmux: role \"review-probe\" has no system prompt (missing review-probe.md)")
-    })?;
-    let judge_system = darkmux_crew::loader::role_prompt("review-judge").ok_or_else(|| {
-        anyhow!("darkmux: role \"review-judge\" has no system prompt (missing review-judge.md)")
-    })?;
-    let verify_system = darkmux_crew::loader::role_prompt("review-verify").ok_or_else(|| {
-        anyhow!("darkmux: role \"review-verify\" has no system prompt (missing review-verify.md)")
-    })?;
-    // (#1530 follow-on) Per-seat probe prompt resolution — mirrors
-    // `src/mission_launch_review.rs`'s own map exactly (same fallback to
-    // `probe_system` when a seat's specific role has no `.md` of its own),
-    // so the bench dispatches through the SAME prompt-resolution rule
-    // production uses.
-    let mut probe_role_prompts: BTreeMap<String, String> = BTreeMap::new();
-    for seat in &roles.probes {
-        if let Some(role_id) = &seat.role_id {
-            let prompt = darkmux_crew::loader::role_prompt(role_id).unwrap_or_else(|| probe_system.clone());
-            probe_role_prompts.insert(role_id.clone(), prompt);
-        }
-    }
-    Ok(FunnelCtx {
-        roles,
-        exec_mode,
-        probe_system,
-        probe_role_prompts,
-        judge_system,
-        verify_system,
-        bundler_cmd: opts.bundler_cmd.clone(),
-    })
-}
-
-/// Write `diff` to a uniquely-named temp file — `bundle::external_bundles`
-/// needs a diff FILE path (its `<cmd> --worktree <dir> --diff <file>`
-/// contract), not diff text. Best-effort; a leftover file on an early
-/// return is harmless scratch, not user state.
-fn write_temp_diff(case_id: &str, diff: &str) -> Result<PathBuf> {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "darkmux-review-bench-{case_id}-{}-{ts}.diff",
-        std::process::id()
-    ));
-    fs::write(&path, diff).with_context(|| format!("writing temp diff for case {case_id}"))?;
-    Ok(path)
-}
-
-/// Map a funnel envelope's judged flags into the SAME `Review{verdict,
-/// findings}` shape every other mode scores through, so `score()` /
-/// `finding_matches_expected` applies UNCHANGED. Only `Tier::Confirmed`
-/// flags become findings — `NeedsCheck` is the non-blocking tier (recorded
-/// in the envelope artifact, never counted toward recall/precision) and
-/// `Archived` is a ruled-out flag. `anchor` is the flag's own anchor (empty
-/// when dedup found none); `title` folds the judge's `note_for_author`
-/// (author-facing) and `decisive_evidence` (the cited code/claim) together
-/// so both are available to the anchor/title substring matcher. A
-/// degenerate envelope (zero bundles or zero raw flags) OR a PARTIAL one
-/// (#1876/#1877 QA follow-up: the judge stage's remote budget exhausted
-/// before the whole docket was judged) maps to `parsed: false` — scored
-/// distinctly from a real pass, same as every other mode's degenerate
-/// case. Before this, a partial-coverage run's `env.degenerate` was
-/// already `None` (the whole point of #1876's fix — the run isn't a
-/// verdict-level failure), so `parsed: env.degenerate.is_none()` alone
-/// would have scored it as a COMPLETE pass — a case whose judge never
-/// ruled on some of the docket silently deflating recall with no marker
-/// distinguishing "the model missed it" from "the judge never got to
-/// rule on it." `review_outcome(env).is_complete()` is `false` for BOTH
-/// Empty and Partial, matching the old degenerate-only behavior on Empty
-/// and extending the same "don't let an incomplete run masquerade as a
-/// real pass/fail" honesty to Partial.
-fn review_from_funnel(env: &super::review::ReviewEnvelope) -> Review {
-    let findings: Vec<Finding> = env
-        .judged
-        .iter()
-        .filter(|j| j.tier == super::review::Tier::Confirmed)
-        .map(|j| {
-            let note = j.pass1.note_for_author.trim();
-            let evidence = j.pass1.decisive_evidence.trim();
-            let title = match (note.is_empty(), evidence.is_empty()) {
-                (false, false) => format!("{note} — {evidence}"),
-                (false, true) => note.to_string(),
-                (true, false) => evidence.to_string(),
-                (true, true) => String::new(),
-            };
-            Finding {
-                severity: "high".to_string(),
-                anchor: j.flag.anchor.clone().unwrap_or_default(),
-                title,
-            }
-        })
-        .collect();
-    let outcome = super::review::review_outcome(env);
-    Review {
-        verdict: if findings.is_empty() { "pass".to_string() } else { "flag".to_string() },
-        parsed: outcome.is_complete(),
-        partial: outcome.is_partial(),
-        findings,
-    }
-}
-
-/// (#1247 Part 1, lab-vs-fleet scope boundary) Per-run-local JSONL sink for
-/// the funnel driver's observability records — `review-bench --funnel`'s
-/// wiring of `review::ReviewEmitter`. Deliberately NOT `darkmux_flow::record`
-/// (the real, engagement-scoped flow stream `darkmux mission launch review`
-/// writes through): a bench run dispatches many cases in one process and can emit
-/// hundreds of per-flag ruling records, and that volume must never spam an
-/// operator's real engagement flow stream — see the "lab vs fleet scope
-/// boundary" project memory. `path` is `funnel-events.jsonl`, written beside
-/// `funnels.json`/`scores.json`; a future "lab observer view" tails it
-/// directly. Every record is the SAME [`darkmux_flow::FlowRecord`] shape the
-/// fleet sink writes, so a future consumer renders identical vocabulary
-/// regardless of which sink produced it.
-///
-/// Appends one JSON line per record, holding the file handle open for the
-/// emitter's lifetime — the parent dir is created and the file opened ONCE,
-/// on the first emit (lazily, not at construction: `run_review_bench`
-/// constructs the emitter for every mode but only Funnel mode ever emits,
-/// and a strict/freeform run must not leave an empty `funnel-events.jsonl`
-/// behind), then each record is one `write` + `flush` — enough for a live
-/// `tail -f` to see progress in real time, without the per-record
-/// mkdir/open/fsync churn of reopening (~hundreds of records per case;
-/// review-round item on the #1247 PR). Best-effort throughout: an open or
-/// write failure (disk full, a permissions problem) is swallowed rather
-/// than aborting the bench — flow observability must never be the reason a
-/// bench run fails. A failed open is not retried (`opened` latches), so a
-/// persistently-broken path costs one attempt total, not one per record.
-struct LocalJsonlEmitter {
-    path: PathBuf,
-    file: Option<fs::File>,
-    /// Latched after the first emit's open attempt — success or failure.
-    opened: bool,
-}
-
-impl LocalJsonlEmitter {
-    fn new(path: PathBuf) -> Self {
-        Self { path, file: None, opened: false }
-    }
-}
-
-impl super::review::ReviewEmitter for LocalJsonlEmitter {
-    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
-        use std::io::Write;
-        if !self.opened {
-            self.opened = true;
-            if let Some(parent) = self.path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            self.file = fs::OpenOptions::new().create(true).append(true).open(&self.path).ok();
-        }
-        let Some(f) = self.file.as_mut() else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(&record) else {
-            return;
-        };
-        if writeln!(f, "{line}").is_ok() {
-            let _ = f.flush();
-        }
-    }
-}
-
-/// Run the review funnel for one case: build bundles (the built-in Rust
-/// bundler, or `--bundler <cmd>` when set) over the case's mounted repo
-/// tree, feed them into `review::run_review` via the `ReviewInputs::bundles`
-/// injection seam (#1222 Phase B packet 5 reconciliation), wired to
-/// `darkmux_crew::single_shot::single_shot_chat` + [`review::LmsCycler`],
-/// and map the resulting envelope into a scoreable `Review`. Mirrors
-/// `super::dialectic::run_debate`'s split: this function owns dispatch +
-/// mapping; the caller owns console output + artifact bookkeeping.
-fn run_funnel_case(
-    c: &Case,
-    workdir: &Path,
-    ctx: &FunnelCtx,
-    timeout_seconds: u32,
-    emitter: &mut dyn super::review::ReviewEmitter,
-) -> Result<(Review, super::review::ReviewEnvelope)> {
-    use super::review;
-
-    // (#1530) Bench does NOT bundle eagerly. It stamps the same
-    // `BundleBuildSpec` production stamps and lets `ReviewBundleStepKind`
-    // do the work inside the graph — so the bundling code bench measures IS
-    // the bundling code production runs, reconstruction and all.
-    //
-    // Bench is the release gate for review recall/FP parity, which makes it
-    // the LAST place that should take a shortcut around a production path:
-    // a bench that skips production's bundling can't catch a regression in
-    // it, and the numbers would silently stop describing production. This
-    // also keeps this function's own #1355 promise ("what bench measures is
-    // finally what production actually executes") true for data production,
-    // not just for orchestration.
-    //
-    // The temp diff file must OUTLIVE the graph run (the external bundler
-    // reads it at step-run time, not here), so it is cleaned up after
-    // `run_review_graph` returns rather than immediately. Written
-    // unconditionally so the stamped spec is VALID even on the built-in
-    // bundler path, where the step reads `ctx.diff` instead — a spec whose
-    // fields are only conditionally meaningful is how a "never read" dummy
-    // value becomes a live bug the day something does read it.
-    let diff_path = write_temp_diff(&c.id, &c.diff)?;
-
-    // (#1355 follow-up) Dispatches through the SAME `build_review_graph` +
-    // `run_review_graph` engine `darkmux mission launch review` uses in
-    // production — not the old sequential `run_review`/`run_review_impl` driver. Bench
-    // was already doing REAL dispatch (its retired `chat` closure was a
-    // byte-for-byte duplicate of `dispatch_chat`, per its own "Texts
-    // identical either way (contract 6)" comment) — the only thing this
-    // migration changes is which orchestration code runs the dispatches,
-    // so what bench measures is finally what production actually executes.
-    // (#1512, #1513 review) `ctx.roles` is already the validated, resolved
-    // shape — no separate crew-validation step.
-    let probes = ctx.roles.probes.clone();
-    let judge = ctx.roles.judge.clone();
-    let verify = ctx.roles.verify.clone();
-    let judge_identifier = review::seat_identifier(&judge.pm);
-
-    // (#1530) The same spec production stamps — every field real and read.
-    let bundle_spec = review::BundleBuildSpec {
-        source: review::BundleSourceSpec::Worktree { path: workdir.to_path_buf() },
-        bundler: ctx.bundler_cmd.clone(),
-        diff_file: diff_path.clone(),
-    };
-    let step_ctx = std::sync::Arc::new(review::ReviewStepContext {
-        case_id: c.id.clone(),
-        roles: ctx.roles.clone(),
-        // Passed through raw — `judge_prompt` does the per-field
-        // default/strip itself now (byte-matching judge-runner.py's
-        // `judge_one`, #1256), so this caller no longer pre-joins
-        // title+body or pre-defaults the body.
-        intent_title: c.label.intent_title.clone(),
-        intent_body: c.label.intent_body.clone(),
-        diff: c.diff.clone(),
-        probe_system: ctx.probe_system.clone(),
-        probe_role_prompts: ctx.probe_role_prompts.clone(),
-        judge_system: ctx.judge_system.clone(),
-        verify_system: ctx.verify_system.clone(),
-        // (#1260) Per-execution remote token allowance, resolved through the
-        // one precedence home (`env > config.remote.* > 500000`).
-        remote_max_tokens_per_execution: darkmux_types::config_access::remote_max_tokens_per_execution(),
-        // (#1876/#1877) Same accessor, same resolution point — see the
-        // production launcher's identical wiring in `mission_launch_review.rs`.
-        judge_exhaustion_strict: darkmux_types::config_access::review_judge_fail_on_any_skip(),
-        timeout_seconds,
-        chat_override: None,
-        // (#1530) None — bench bundles through the step, like production.
-        // The override survives for HERMETIC UNIT TESTS only.
-        bundle_override: None,
-        // (#1641) A bench run is per-run-local (lab/fleet sink boundary) —
-        // no Mission is ever minted for it, so `None` here matches the
-        // `--charges-file` path's own honest `None`.
-        mission_id: None,
-        // (#2310 P2) `run_review_graph` overlays these four onto its OWN
-        // bus-seeded copy from its own `crew_name`/`mode`/`fingerprint_val`/
-        // `staffing` parameters (below) before any step reads them — same
-        // "always overwritten by the caller-seed" contract `mission_id`
-        // above never needed but these four do; this initializer's values
-        // are never read.
-        crew_name: None,
-        mode_label: None,
-        fingerprint: None,
-        staffing: None,
-        interpret_warnings: Vec::new(),
-        // (#2310 P1 review finding I4) Bench already writes the diff to a
-        // real temp file (`diff_path`, above — the external bundler needs
-        // one) — hand its path to `review-context-step` too, instead of
-        // stamping the whole diff TEXT into `Step.config` a second time.
-        // No `intent_file` equivalent exists on the bench harness's own
-        // `Case`/`CaseLabel` data model (`intent_title`/`intent_body` are
-        // already plain strings, no backing file) — `None` there stays
-        // correct.
-        diff_file: Some(diff_path.clone()),
-        intent_file: None,
-        // (#2310 P1 fix) Bench never overrides `review.context`'s
-        // resolution — it resolves for real, the same as production.
-        context_test_overrides: Default::default(),
-    });
-
-    let mut graph = review::build_review_graph(
-        step_ctx.clone(),
-        &bundle_spec,
-        judge.clone(),
-        verify.clone(),
-        &probes,
-        "investigate",
-        "adjudicate",
-        "report",
-        darkmux_types::config_access::review_judge_concurrency(),
-    )
-    .with_context(|| format!("building review graph for case {}", c.id))?;
-    // (#2310 P1) `review.context`'s production default (`default_context_
-    // path`) resolves the mission that owns the step's phase — but a bench
-    // run mints no real Mission (lab-vs-fleet boundary, same reasoning as
-    // `mission_id: None` a few lines above), so that lookup has nothing to
-    // find here. Stamp an explicit `context_out` under the OS temp dir
-    // instead — the same "harmless scratch, not user state" scoping
-    // `write_temp_diff` already uses for this bench harness's diff file.
-    // (minor, #2310 P1 review) Hoisted out of the `if let` below (not
-    // reused elsewhere in that block) so it's still in scope for cleanup
-    // after the run — same shape as `diff_path`'s own hoist, and the same
-    // leak class: unlike `diff_path`, this file used to have NO removal at
-    // all.
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let context_out = std::env::temp_dir().join(format!(
-        "darkmux-review-bench-{}-{}-{ts}-context.json",
-        c.id,
-        std::process::id()
-    ));
-    if let Some(context_step) = graph.steps.get_mut("review-context-step") {
-        let mut cfg = context_step.config.clone();
-        cfg["context_out"] = serde_json::json!(context_out.display().to_string());
-        context_step.config = cfg;
-    }
-    let fingerprint_val = review::fingerprint(&judge_identifier, &step_ctx.judge_system);
-    let staffing_snapshot =
-        review::staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
-    let crew_name = ctx.roles.distinct_profile_names();
-
-    // (#1397) A bench run mints no real Mission — lab-vs-fleet boundary —
-    // so there is nothing to persist a Step to; `persist` is a no-op here,
-    // same as `run_review_graph`'s own tests.
-    let graph_run = review::run_review_graph(
-        &step_ctx,
-        &crew_name,
-        ctx.exec_mode,
-        fingerprint_val,
-        staffing_snapshot,
-        graph,
-        emitter,
-        &mut |_step| {},
-    );
-    // (#1530) The bundle step read this inside the graph, so cleanup waits
-    // until the run is over — and happens on the error path too, before the
-    // `?`, so a failed case doesn't leak a temp diff per retry.
-    let _ = fs::remove_file(&diff_path);
-    // (minor, #2310 P1 review) The context step's own temp output — same
-    // "cleanup after the run, error path included" shape as `diff_path`
-    // above. This one used to be a straight leak: `write_temp_diff`'s
-    // file was always removed, but nothing ever removed this one.
-    let _ = fs::remove_file(&context_out);
-    let (mut env, steps) = graph_run.with_context(|| format!("running review graph for case {}", c.id))?;
-
-    // (#1530) BUNDLING FAILURE IS STILL A LOUD PER-CASE ERROR.
-    //
-    // Moving bundling into the graph changed its failure SHAPE: a bundler
-    // that errors now fails a step, which the graph reports as a DEGENERATE
-    // envelope rather than an `Err`. For production that is the right
-    // behavior (an honest degraded review gets posted). For the BENCH it is
-    // not: a degenerate case still scores, so a misconfigured `--bundler`
-    // would quietly land as a zero-recall row and corrupt the corpus numbers
-    // instead of stopping the run. A measurement tool must never silently
-    // absorb a setup failure into its own score.
-    //
-    // So the bench re-raises exactly this one class, restoring the loud
-    // per-case failure the eager call used to give (same `external bundler
-    // for case <id>` context), while everything else keeps the graph's
-    // degenerate semantics untouched.
-    if let Some(bundle_step) = steps.get("review-bundle-step") {
-        if bundle_step.status == darkmux_crew::types::NodeStatus::Error {
-            let detail = bundle_step.output.as_deref().unwrap_or("(no error detail recorded)");
-            anyhow::bail!("external bundler for case {}: {detail}", c.id);
-        }
-    }
-    // (#1513 review C3) Fold `resolve_review_roles`'s own resolution-time
-    // warnings (today, just the "verify task present but roleless" case)
-    // into the case envelope — resolved once in `resolve_funnel_ctx` and
-    // carried on `ctx.roles`, never threaded through
-    // `build_review_graph`'s signature (the pure-refactor gate keeps that
-    // byte-identical).
-    env.warnings.extend(ctx.roles.warnings.iter().cloned());
-    let review = review_from_funnel(&env);
-    Ok((review, env))
 }
 
 /// Extract the model's review JSON (verdict + findings) from `final_assistant`
@@ -1986,7 +1407,6 @@ fn write_scores_artifact(
     scored: &[(&Case, CaseScore)],
     meta: &[EnvelopeMeta],
     debates: &[super::dialectic::DebateEnvelope],
-    funnels: &[super::review::ReviewEnvelope],
     opts: &ReviewBenchOpts,
     scores_path: &Path,
     ts_ms: u128,
@@ -2007,7 +1427,7 @@ fn write_scores_artifact(
     let rows = build_score_rows(scored, meta, &artifact);
     // ts_ms / scores_path are resolved ONCE by the caller, up front (before
     // the per-case loop) — see `run_review_bench`'s comment — so the run_id
-    // below and the incremental funnels.json snapshots share the same
+    // below shares the same
     // identity/location this final write uses.
     let machine_id = darkmux_types::config_access::machine_id()
         .unwrap_or_else(|| "(unknown)".to_string());
@@ -2037,29 +1457,6 @@ fn write_scores_artifact(
         "role".to_string(),
         serde_json::Value::String(opts.role.clone()),
     );
-    // (#1222 Phase B packet 7 / #1475) Funnel-mode provenance: roster profile +
-    // resolved exec mode — the cell-identity fields a future comparison
-    // needs to know two funnel runs are the same condition. The `"crew"`
-    // envelope KEY is unchanged (the serve daemon + viewer consume it — a
-    // schema field, out of scope here); its source is the `--roster-profile`
-    // flag (the one profile every seat was pinned to for this run).
-    // (#1512, #1513 review) The `"k"` field RETIRED — draw multiplication no
-    // longer exists (one role, one task, one dispatch), so a `k` value in
-    // the artifact would be a dishonest, unobservable claim (`--k` is
-    // rejected above whenever it would have meant anything other than a
-    // no-op). Recall-breadth provenance now lives in the staffing snapshot
-    // itself (however many probe roles actually resolved).
-    if opts.mode == BenchMode::Funnel {
-        doc.extras.insert(
-            "crew".to_string(),
-            serde_json::Value::String(opts.roster_profile.clone().unwrap_or_default()),
-        );
-        let exec_mode_label = funnels
-            .first()
-            .map(|e| e.mode.clone())
-            .unwrap_or_else(|| opts.exec_mode.clone().unwrap_or_else(|| "auto".to_string()));
-        doc.extras.insert("exec_mode".to_string(), serde_json::Value::String(exec_mode_label));
-    }
     let path = scores_path.to_path_buf();
     if !debates.is_empty() {
         let dpath = path.with_file_name("debates.json");
@@ -2076,45 +1473,8 @@ fn write_scores_artifact(
             Err(e) => eprintln!("debates: WARNING — artifact not written: {e:#}"),
         }
     }
-    // (#1222 Phase B packet 7 / #1247 Part 2) Funnel envelopes — written
-    // FIRST, beside scores.json, and independently of the scores write
-    // succeeding, same discipline as `debates` above: the per-flag judge
-    // evidence chain is the higher-value audit artifact and must never be
-    // dropped because the scores serialization failed. This is the
-    // idempotent FINAL state — `run_review_bench`'s per-case loop already
-    // streamed every completed case's envelope here via the same
-    // `write_funnels_snapshot` helper as each case finished, so a healthy
-    // run's last incremental write and this one are identical.
-    if !funnels.is_empty() {
-        match write_funnels_snapshot(&path, funnels) {
-            Ok(()) => eprintln!("funnels: {}", path.with_file_name("funnels.json").display()),
-            Err(e) => eprintln!("funnels: WARNING — artifact not written: {e:#}"),
-        }
-    }
     scores::write_scores(&path, &doc)?;
     Ok(path)
-}
-
-/// (#1247 Part 2) Write `funnels.json` beside `scores_path`, ATOMICALLY —
-/// serialize to a sibling `.tmp` file, then `rename` it into place. A
-/// rename replacing an existing destination is atomic on POSIX, so a
-/// concurrent reader (a live `darkmux lab inspect`, a tailing viewer) never
-/// observes a partially-written file. Called after EVERY completed
-/// Funnel-mode case (not just at end-of-run) so a killed bench — crash,
-/// `--timeout`, ctrl-C — keeps every completed case's envelope on disk, not
-/// just whatever the last successful write captured.
-fn write_funnels_snapshot(scores_path: &Path, funnels: &[super::review::ReviewEnvelope]) -> Result<()> {
-    let fpath = scores_path.with_file_name("funnels.json");
-    if let Some(parent) = fpath.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {} for the funnels snapshot", parent.display()))?;
-    }
-    let tmp = fpath.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(funnels).context("serializing funnels snapshot")?;
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing temp snapshot {}", tmp.display()))?;
-    std::fs::rename(&tmp, &fpath)
-        .with_context(|| format!("renaming snapshot into place at {}", fpath.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -85,8 +85,9 @@
 //! **The vocabulary question is resolved by NOT merging.** The scheduler's
 //! own companion record is `action: "step timing"`, deliberately never
 //! `"step result"`, the action a cooperating `StepKind` (`dispatch.map`'s
-//! per-item/aggregate records, review's `review.bundle`/`review.judge`/
-//! etc.) already emits for the steps that know their own `items_in`/
+//! per-item/aggregate records — the now-deleted dedicated review
+//! launcher's own step kinds emitted it too, before #2310 P4d) already
+//! emits for the steps that know their own `items_in`/
 //! `items_out`. Reusing `"step result"` for the scheduler's own thinner,
 //! uniform-coverage record would put two records under the same action for
 //! the SAME step with non-overlapping payload shapes, genuinely ambiguous
@@ -225,9 +226,12 @@ pub fn seat_endpoint(pm: &ProfileModel) -> Option<&ModelEndpoint> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeatStaffingSnapshot {
     pub name: String,
-    /// (#1475 packet 2) The task ROLE this seat was staffed for (review's
-    /// `review-probe-high`/`-mid`/`-low`, `review-judge`, `review-verify`)
-    /// when the role→profile flip produced it — so the snapshot names WHICH
+    /// (#1475 packet 2) The task ROLE this seat was staffed for (the retired
+    /// review funnel's `review-probe-high`/`-mid`/`-low`, `review-judge`,
+    /// `review-verify` roles — no producer populates this field since the
+    /// #2310 P4d funnel retirement, kept for lenient-on-read deserialization
+    /// of old records) when the role→profile flip produced it — so the
+    /// snapshot names WHICH
     /// role bound this seat's profile+model, the truthful record of the
     /// task→role→profile→model rollup (operator sovereignty #44). `Option` +
     /// `#[serde(default)]`: absent on the legacy roster-scoring staffings and
@@ -284,12 +288,15 @@ pub struct SeatStaffingSnapshot {
     pub provenance: Option<StaffingProvenance>,
 }
 
-/// Per-seat resolved staffing snapshot — review's `review-probe` (one or
-/// more staffings) + `review-judge` (exactly one) + the optional
-/// `review-verify` seat (#1260) is the shape this was built against; any
-/// mission with a probe/judge/verify-shaped seat set reuses it as-is. See
-/// `darkmux_lab::lab::review::ReviewEnvelope::staffing` for the first
-/// consumer's own envelope field.
+/// Per-seat resolved staffing snapshot — the retired review funnel's
+/// `review-probe` (one or more staffings) + `review-judge` (exactly one) +
+/// the optional `review-verify` seat (#1260) was the shape this was built
+/// against. No producer constructs a populated one since the #2310 P4d
+/// funnel retirement — `review.json`'s `reviewer`/`coder` roles have no
+/// probe/judge/verify seat structure to snapshot — so `ReviewEnvelope::
+/// staffing` (`darkmux_lab::lab::review`) is `None` on every run this
+/// pipeline produces today; the type stays for lenient-on-read
+/// deserialization of old envelope records.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StaffingSnapshot {
     pub probes: Vec<SeatStaffingSnapshot>,
