@@ -129,8 +129,36 @@ pub struct DeliverScope {
 /// as complete, and a reader who sees "7 of 7 rules reviewed, 12/12 hunks
 /// covered" has been told nothing about the whole class of problems a
 /// rule-shaped review cannot see.
+/// (PR #2398 review, item 4 follow-through) Every sentence of darkmux's
+/// OWN voice in the rendered review, named so the vocabulary conformance
+/// test can check them EXHAUSTIVELY. Checking only a fixture's rendered
+/// output tests the paths that fixture happens to take: a mutation putting
+/// "the kit did not parse as a unified diff" back into the unparseable-
+/// patch reason survived the fixture check, because no fixture has an
+/// unparseable patch. Anything model-authored is still checked through the
+/// rendered output; this array is for the words darkmux itself chooses.
+#[cfg(test)]
+const AUTHORED_PROSE: [&str; 8] = [
+    STANDING_NARROWNESS,
+    REASON_NOT_A_PATCH,
+    REASON_DID_NOT_PARSE,
+    REASON_INSERTION,
+    REASON_OUTSIDE_DIFF,
+    SUGGESTION_ATTACHED_ONE,
+    SUGGESTION_ATTACHED_MANY,
+    DOUBLE_CHECK_HEADING,
+];
+
+const REASON_NOT_A_PATCH: &str = "The change is written out rather than as a patch, so it is quoted here";
+const REASON_DID_NOT_PARSE: &str = "The change did not read as a patch, so it is quoted here";
+const REASON_INSERTION: &str = "The change adds lines rather than replacing them, so it cannot be attached to a line";
+const REASON_OUTSIDE_DIFF: &str = "The change touches lines outside this diff";
+const SUGGESTION_ATTACHED_ONE: &str = "A suggested change is attached to that line.";
+const SUGGESTION_ATTACHED_MANY: &str = "Suggested changes are attached to those lines.";
+const DOUBLE_CHECK_HEADING: &str = "**Worth a double check** (not merge-blocking):";
+
 const STANDING_NARROWNESS: &str =
-    "This is a rule-shaped review; architectural breadth stays with the frontier gate.";
+    "This review checks a fixed set of rules; it is not a full design review.";
 
 impl DeliverScope {
     /// The denominator for "N of M rules reviewed". `rules_total` when the
@@ -196,6 +224,48 @@ pub struct GithubReviewPayload {
 pub struct DeliverOutcome {
     pub mode: String,
     pub review: Option<GithubReviewPayload>,
+    /// (PR #2398 review, item 5) What was delivered, one row per rendered
+    /// entry — the operator's index back from a posted review to the
+    /// records behind it, now that the finding KEY no longer renders in
+    /// the author-facing body (and must not: it is darkmux's own record
+    /// id, meaningless to the author).
+    ///
+    /// `#[serde(skip)]` on purpose: this is provenance for the OPERATOR,
+    /// carried in the step's promoted output beside `mode`/`summary`/
+    /// `emit` (`DeliverGithubReviewStepKind::run`), never in the GitHub
+    /// payload written to `emit` — which stays exactly the bytes that get
+    /// posted, and nothing else.
+    #[serde(skip)]
+    pub entries: Vec<DeliveredEntry>,
+}
+
+/// One rendered entry's provenance — the row `DeliverOutcome::entries`
+/// carries. `rendered_as` is the SHAPE the entry took (`"suggestion"`,
+/// `"patch"`, `"question"`, `"double_check"`), one row per rendered
+/// artifact: a change whose patch spanned two hunks, one inside the diff
+/// and one outside, is two rows, because that is two things a reader sees.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeliveredEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub key: String,
+    pub rendered_as: String,
+}
+
+impl DeliveredEntry {
+    fn of(window: &FindingWindow, rule: Option<&str>, rendered_as: &str) -> Self {
+        Self {
+            rule: rule.map(str::to_string),
+            path: window.file.clone(),
+            line: window.line,
+            key: window.key.clone(),
+            rendered_as: rendered_as.to_string(),
+        }
+    }
 }
 
 // ─── Model text is untrusted markdown (#2310 fix loop A, S5-4) ──────────
@@ -353,25 +423,45 @@ fn code_span(content: &str) -> String {
 
 /// Render findings + mods + a diff + a scope summary into a
 /// [`DeliverOutcome`]. Pure — no I/O, no model dispatch — so this is what
-/// this packet's golden tests call directly.
+/// this packet's golden tests call directly. `rule_titles` maps a rule id
+/// to its author-facing title (`Rule::title`); [`rule_titles`] is how the
+/// step kind builds one, and a caller with none may pass an empty map.
 ///
-/// Delivery-form rule (DESIGN.md "Confirmation is a mod, a search, or a
-/// question", read off each finding's `context.form` — `"search"` |
-/// `"question"` | absent/anything else means `"mod"`, the default):
+/// (#2310 delivery rewrite) **Every entry is headed by the RULE it came
+/// from, never by how it was found.** The author of a pull request does
+/// not care which internal procedure surfaced a problem — but the rule
+/// itself is useful to them the way a lint rule name is: it names what was
+/// violated and is the handle for re-running the same check after a fix.
+/// So the body groups entries under the rule's own title, tagged with the
+/// rule id, and an entry reads: the location (`path:line`), the finding's
+/// own claim (`why`), then whichever applies —
 ///
-/// - **mod-form, a mod names this finding's key, `gate_passed == Some(true)`,
-///   and the mod's window sits inside the diff's touched lines** — an
-///   INLINE `comments[]` entry with a ` ```suggestion ` block.
-/// - **mod-form, same gate, but outside the diff's lines** — a general
-///   `body` bullet carrying the mod's kit as a fenced patch, not a
-///   suggestion block (GitHub suggestions only resolve inside a diff).
-/// - **mod-form, no mod names this finding, or the naming mod's gate is
-///   `Some(false)`/`None`** — a "worth a double check" `body` bullet:
-///   finding key, window, claim (`why`), what to check (`evidence`).
-/// - **search-form** — a `body` bullet listing the instances, which
-///   DESIGN.md says live in the finding's own `evidence` field.
-/// - **question-form** — a `body` bullet phrased as a question, with
-///   candidates (also `evidence`).
+/// - **a gate-passed mod whose hunk sits inside the diff** — the change
+///   rides as an inline `comments[]` suggestion on that line, and the body
+///   entry says so. This is true WHATEVER the rule's confirmation form:
+///   a passed change is a passed change, and dropping one because the rule
+///   happened to be confirmed by searching is what shipped a review with a
+///   ready patch nobody saw.
+/// - **a gate-passed mod outside the diff (or one that is not an
+///   applicable patch)** — the change quoted as a fenced block, with a
+///   plain-words reason.
+/// - **a question the finding answers** — the claim as a question, with
+///   any candidates the finding recorded.
+///
+/// Everything else is a lead, not a headline: a finding with no passed
+/// change lands in the single cross-rule tail section, **Worth a double
+/// check**, still headed by its rule inside it. That deliberately includes
+/// a search-shaped finding with no change proposed. The reason is
+/// evidential: a finding whose search came back "nothing to change here"
+/// (`shared-symbol-callers`' "all callers already match") is
+/// indistinguishable, MECHANICALLY, from one that found a real problem —
+/// `create_finding`'s tool arguments are fixed at `{file, line, pattern,
+/// evidence, why}` (`runtime/src/tools/mod.rs`) with no severity/holds/
+/// action field to read, and prose-matching a model's `why` for
+/// all-clear-ness is exactly the kind of guess this module refuses to
+/// make. Widening the FINDING contract is a separate change; until then
+/// the honest placement for "somebody looked, nothing was patched" is the
+/// thread-to-pull section, never a headline that reads as a defect.
 ///
 /// Refused/rejected findings never reach this function at all (see
 /// [`DeliverScope::refused`]'s doc) — only their count feeds the summary
@@ -382,70 +472,64 @@ pub fn render_github_review(
     diff: &str,
     scope: &DeliverScope,
     attribution: Option<&str>,
+    rule_titles: &BTreeMap<String, String>,
 ) -> DeliverOutcome {
     let touched = diff_touched_lines(diff);
 
     let mut comments: Vec<GithubReviewComment> = Vec::new();
-    let mut mod_bullets: Vec<String> = Vec::new();
-    let mut search_bullets: Vec<String> = Vec::new();
-    let mut question_bullets: Vec<String> = Vec::new();
-    let mut double_check_bullets: Vec<String> = Vec::new();
+    let mut headline: Vec<RuleGroup> = Vec::new();
+    let mut double_check: Vec<RuleGroup> = Vec::new();
+    let mut entries: Vec<DeliveredEntry> = Vec::new();
 
     for finding in findings {
         let window = FindingWindow::from(finding);
+        let rule = rule_id_of(finding);
+        // (#2310 P4b review, CONSIDER) Prefer a GATE-PASSED mod over an
+        // earlier gate-failed one naming the same finding: without this, a
+        // coder's second (successful) attempt at a finding could lose to
+        // its own first failed one just because it landed later in `mods`.
+        let gated = mods
+            .iter()
+            .filter(|m| m.record.r#for.iter().any(|k| k == &finding.key))
+            .find(|m| m.gate_passed == Some(true));
+        if let Some(m) = gated {
+            // (#2310 delivery rewrite, rule 2) The FORM does not gate this
+            // branch — a passed change renders as a change no matter which
+            // way its rule is confirmed. The form decides only what to
+            // render when there is no passed change at all.
+            let bullets = group_for(&mut headline, rule.as_deref(), rule_titles);
+            let rendered = render_gated_mod(m, &window, &touched, &mut comments, bullets);
+            for _ in 0..rendered.suggestions {
+                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "suggestion"));
+            }
+            for _ in 0..rendered.patches {
+                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "patch"));
+            }
+            continue;
+        }
         match delivery_form(finding) {
-            DeliveryForm::Search => {
-                search_bullets.push(format!(
-                    "- {} — {}",
-                    window.span(),
-                    inline_text(window.evidence.as_deref().unwrap_or("(no instances recorded)"))
-                ));
-            }
             DeliveryForm::Question => {
-                question_bullets.push(format!(
-                    "- {} — {}? Candidates: {}",
-                    window.span(),
-                    inline_text(window.why.as_deref().unwrap_or("did you check whether this already exists")),
-                    inline_text(window.evidence.as_deref().unwrap_or("(none recorded)"))
-                ));
+                let bullets = group_for(&mut headline, rule.as_deref(), rule_titles);
+                bullets.push(question_bullet(&window));
+                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "question"));
             }
-            DeliveryForm::Mod => {
-                // (#2310 P4b review, CONSIDER) Prefer a GATE-PASSED mod
-                // over an earlier gate-failed one naming the same
-                // finding: without this, a coder's second (successful)
-                // attempt at a finding could lose to its own first
-                // failed one just because it landed later in `mods`.
-                // Falls back to the first match at all (any gate state)
-                // so the double-check branch below still has something
-                // to describe when nothing passed.
-                let matches: Vec<&GatedMod> =
-                    mods.iter().filter(|m| m.record.r#for.iter().any(|k| k == &finding.key)).collect();
-                let gated =
-                    matches.iter().find(|m| m.gate_passed == Some(true)).copied().or_else(|| matches.first().copied());
-                match gated {
-                    Some(m) if m.gate_passed == Some(true) => {
-                        render_gated_mod(m, &window, &touched, &mut comments, &mut mod_bullets);
-                    }
-                    _ => {
-                        double_check_bullets.push(format!(
-                            "- {} — {} _Worth checking: {}_",
-                            window.span(),
-                            inline_text(window.why.as_deref().unwrap_or("(no claim recorded)")),
-                            inline_text(window.evidence.as_deref().unwrap_or("the cited line"))
-                        ));
-                    }
-                }
+            // (#2310 delivery rewrite, rule 3) A search-shaped finding with
+            // no passed change is a lead, not a headline — see this
+            // function's own doc for why the all-clear case cannot be
+            // detected mechanically today.
+            DeliveryForm::Search | DeliveryForm::Mod => {
+                let bullets = group_for(&mut double_check, rule.as_deref(), rule_titles);
+                bullets.push(double_check_bullet(&window));
+                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "double_check"));
             }
         }
     }
 
-    // Captured before `body` takes ownership of each bullet list below —
-    // whether there was anything to say at all decides `mode`.
-    let nothing_to_say = comments.is_empty()
-        && mod_bullets.is_empty()
-        && search_bullets.is_empty()
-        && question_bullets.is_empty()
-        && double_check_bullets.is_empty();
+    let unresolved = unresolved_rule_titles(findings, rule_titles);
+
+    // Captured before `body` takes ownership below — whether there was
+    // anything to say at all decides `mode`.
+    let nothing_to_say = comments.is_empty() && headline.is_empty() && double_check.is_empty();
     if nothing_to_say {
         // (#2310 fix loop A, S3-2 — PROVEN) "Nothing was found" only means
         // a clean run when the run actually LOOKED. A scope of
@@ -460,7 +544,7 @@ pub fn render_github_review(
             // A genuinely CLEAN run — nothing to say because nothing went
             // wrong, nothing was found, and the whole diff was looked at.
             // The only `mode` this applies to.
-            return DeliverOutcome { mode: "noop".to_string(), review: None };
+            return DeliverOutcome { mode: "noop".to_string(), review: None, entries };
         }
         // (#2310 P4c-2b PR #2357 review MUST FIX D, proven live) Before
         // this fix, an errored run with zero findings ALSO rendered
@@ -470,7 +554,8 @@ pub fn render_github_review(
         // even with nothing to say about findings: the scope line (with
         // its own `Errored:` section, `scope_line`'s own doc) IS the
         // payload.
-        let mut body = vec!["### darkmux review".to_string(), String::new(), scope_line(scope, findings.len())];
+        let mut body =
+            vec!["### darkmux review".to_string(), String::new(), scope_line(scope, findings.len(), &unresolved)];
         if let Some(a) = attribution.filter(|a| !a.trim().is_empty()) {
             body.push(String::new());
             body.push(format!("_{a}_"));
@@ -478,30 +563,25 @@ pub fn render_github_review(
         return DeliverOutcome {
             mode: "degraded".to_string(),
             review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments: Vec::new() }),
+            entries,
         };
     }
 
     let mut body = vec!["### darkmux review".to_string(), String::new()];
-    body.push(scope_line(scope, findings.len()));
-    if !mod_bullets.is_empty() {
+    body.push(scope_line(scope, findings.len(), &unresolved));
+    for group in &headline {
         body.push(String::new());
-        body.push("**Proposed changes outside the diff:**".to_string());
-        body.extend(mod_bullets);
+        body.push(group.heading("**"));
+        body.extend(group.bullets.iter().cloned());
     }
-    if !search_bullets.is_empty() {
+    if !double_check.is_empty() {
         body.push(String::new());
-        body.push("**Worth enumerating (search-confirmed):**".to_string());
-        body.extend(search_bullets);
-    }
-    if !question_bullets.is_empty() {
-        body.push(String::new());
-        body.push("**Questions:**".to_string());
-        body.extend(question_bullets);
-    }
-    if !double_check_bullets.is_empty() {
-        body.push(String::new());
-        body.push("**Worth a double check** (not merge-blocking):".to_string());
-        body.extend(double_check_bullets);
+        body.push(DOUBLE_CHECK_HEADING.to_string());
+        for group in &double_check {
+            body.push(String::new());
+            body.push(group.heading("_"));
+            body.extend(group.bullets.iter().cloned());
+        }
     }
     if let Some(a) = attribution.filter(|a| !a.trim().is_empty()) {
         body.push(String::new());
@@ -511,13 +591,164 @@ pub fn render_github_review(
     DeliverOutcome {
         mode: "review".to_string(),
         review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments }),
+        entries,
     }
+}
+
+/// One rule's entries, in the order their findings arrived. The rule — not
+/// the confirmation procedure — is what heads a group: see
+/// [`render_github_review`]'s own doc.
+struct RuleGroup {
+    rule_id: Option<String>,
+    /// The rule's author-facing title, when one resolved. `None` falls the
+    /// heading back to the rule id itself (and the scope line names the
+    /// rule whose title was missing).
+    title: Option<String>,
+    bullets: Vec<String>,
+}
+
+impl RuleGroup {
+    /// `emphasis` is the markdown wrapper for the rule's NAME — `**` for a
+    /// headline group, `_` for a group nested inside the double-check
+    /// tail. The rule id rides as a code span beside it: the author's
+    /// handle for re-running this exact check after a fix.
+    fn heading(&self, emphasis: &str) -> String {
+        match (&self.rule_id, &self.title) {
+            (Some(id), Some(title)) => format!("{emphasis}{title}{emphasis} {}", code_span(id)),
+            (Some(id), None) => format!("{emphasis}{}{emphasis}", inline_text(id)),
+            (None, _) => format!("{emphasis}Other findings{emphasis}"),
+        }
+    }
+}
+
+/// The rule a finding names — `context.rule` (host-stamped by the crawl
+/// unit's own dispatch: `crawl::unit_step::run`'s `record_context`), or
+/// the first entry of `context.rules` when a run stamped only the list.
+fn rule_id_of(finding: &FindingRecord) -> Option<String> {
+    if let Some(id) = finding.context.get("rule").and_then(|v| v.as_str()) {
+        return Some(id.to_string());
+    }
+    finding
+        .context
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// The rules these findings name that `rule_titles` could not title —
+/// surfaced in the scope line so a heading that fell back to a bare rule
+/// id is explained rather than just odd.
+fn unresolved_rule_titles(findings: &[FindingRecord], rule_titles: &BTreeMap<String, String>) -> BTreeSet<String> {
+    findings.iter().filter_map(rule_id_of).filter(|id| resolved_title(rule_titles, id).is_none()).collect()
+}
+
+/// A rule's title, iff one is actually there. (PR #2398 review, item 3) A
+/// rule declaring `"title": ""` is a rule with NO title — rendering it
+/// produced a heading of two bare emphasis markers (`****`), which is both
+/// meaningless to a reader and invisible to the scope line's own
+/// "titles unavailable" notice. The heading falls back to the rule id and
+/// the notice names it, exactly as an absent title does. Both the group
+/// heading and that notice read titles through here, so the two can never
+/// disagree about what counts as resolved.
+fn resolved_title<'t>(rule_titles: &'t BTreeMap<String, String>, id: &str) -> Option<&'t str> {
+    rule_titles.get(id).map(String::as_str).filter(|t| !t.trim().is_empty())
+}
+
+/// The group for `rule`, appended if this is its first entry — so groups
+/// render in the order their first finding arrived, not in id order.
+fn group_for<'g>(
+    groups: &'g mut Vec<RuleGroup>,
+    rule: Option<&str>,
+    rule_titles: &BTreeMap<String, String>,
+) -> &'g mut Vec<String> {
+    let key = rule.map(str::to_string);
+    if let Some(i) = groups.iter().position(|g| g.rule_id == key) {
+        return &mut groups[i].bullets;
+    }
+    let title = key.as_ref().and_then(|id| resolved_title(rule_titles, id)).map(inline_text);
+    groups.push(RuleGroup { rule_id: key, title, bullets: Vec::new() });
+    let last = groups.len() - 1;
+    &mut groups[last].bullets
+}
+
+/// Author-facing rule titles, read from the SAME registry
+/// `crawl::unit_step::run` resolves a rule from (`crate::rules`, embedded
+/// built-ins plus the `<darkmux root>/rules` user tier). Lenient by
+/// construction: [`crate::rules::load_all`] never fails, and a rule that
+/// declares no `title` simply has no entry here, which
+/// [`render_github_review`] renders as the bare rule id.
+pub fn rule_titles() -> BTreeMap<String, String> {
+    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("rules");
+    let (rules, _warnings) = crate::rules::load_all(Some(&user_dir));
+    titles_of(rules)
+}
+
+/// The titled subset of a rule registry. (PR #2398 review, item 3) A
+/// blank `title` is dropped HERE, at the source, as well as being treated
+/// as absent by [`resolved_title`] at the sink — a user rule tier is
+/// hand-edited, and `"title": ""` (or `"   "`) is a rule someone started
+/// naming and did not finish, not a name.
+fn titles_of(rules: BTreeMap<String, crate::rules::Rule>) -> BTreeMap<String, String> {
+    rules
+        .into_iter()
+        .filter_map(|(id, rule)| rule.title.filter(|t| !t.trim().is_empty()).map(|t| (id, t)))
+        .collect()
+}
+
+/// The finding's own claim, folded onto one line.
+fn claim(window: &FindingWindow) -> String {
+    inline_text(window.why.as_deref().unwrap_or("(no claim recorded)"))
+}
+
+/// The claim with sentence punctuation, for the entries that follow it
+/// with a sentence of darkmux's own. A model writes `why` as a fragment as
+/// often as not, and "reimplements clamp() The change touches lines…" runs
+/// the two voices together.
+fn claim_sentence(window: &FindingWindow) -> String {
+    let claim = claim(window);
+    if claim.ends_with(['.', '!', '?', ':', ';', ',']) {
+        claim
+    } else {
+        format!("{claim}.")
+    }
+}
+
+/// The body entry for a change that rode out as inline suggestion(s): the
+/// location and the claim, plus where the change itself went.
+fn suggestion_bullet(window: &FindingWindow, suggested: usize) -> String {
+    let tail = if suggested == 1 { SUGGESTION_ATTACHED_ONE } else { SUGGESTION_ATTACHED_MANY };
+    format!("- {} — {} {tail}", window.span(), claim_sentence(window))
+}
+
+/// A finding whose rule asks a question: the claim IS the answer plus its
+/// reasoning (the crawl unit instructs the model to put both at the start
+/// of `why`), so it renders as the question, with any candidates the
+/// finding recorded.
+fn question_bullet(window: &FindingWindow) -> String {
+    let claim = claim(window);
+    let question = if claim.ends_with('?') { claim } else { format!("{claim}?") };
+    match window.evidence.as_deref().map(inline_text).filter(|e| !e.is_empty()) {
+        Some(candidates) => format!("- {} — {question} Candidates: {candidates}", window.span()),
+        None => format!("- {} — {question}", window.span()),
+    }
+}
+
+/// A lead, not a headline — the tail section's entry shape.
+fn double_check_bullet(window: &FindingWindow) -> String {
+    format!(
+        "- {} — {} _Worth checking: {}_",
+        window.span(),
+        claim_sentence(window),
+        inline_text(window.evidence.as_deref().unwrap_or("the cited line"))
+    )
 }
 
 /// DESIGN.md "rules run, hunks covered / total, findings by delivery form,
 /// refused count, and what the review did not attempt. Never reads as
 /// complete."
-fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
+fn scope_line(scope: &DeliverScope, findings_considered: usize, unresolved_rules: &BTreeSet<String>) -> String {
     // (#2310 fix-loop E2) "N of M rules reviewed" — loop D made the VALUES
     // honest (a rule with no completed unit no longer counts as run); the
     // wording still said "2 rule(s)", which reads as the whole review
@@ -546,6 +777,13 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
     if !scope.errored.is_empty() {
         line.push_str(&format!(" Errored: {}.", joined(&scope.errored)));
     }
+    // (#2310 delivery rewrite, rule 1) A heading that fell back to a bare
+    // rule id says so here, rather than leaving a reader to wonder why one
+    // section is named differently from the rest.
+    if !unresolved_rules.is_empty() {
+        let names = unresolved_rules.iter().map(|e| inline_text(e)).collect::<Vec<_>>().join(", ");
+        line.push_str(&format!(" Titles unavailable for these rules: {names}."));
+    }
     // (#2310 fix-loop E2, S1-6) Appended ONCE, unconditionally, last — see
     // `STANDING_NARROWNESS`. Unconditional because it is a property of the
     // mechanism, not of the run: the cleanest possible run is exactly when
@@ -555,13 +793,13 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
     line
 }
 
-/// (#2310 P4b review, M-B) A gate-passed mod's kit becomes either inline
-/// GitHub suggestion(s) or a fenced-patch body bullet — NEVER a
-/// suggestion for an opaque kit. DESIGN.md: "darkmux never opens a kit".
-/// Pasting an opaque kit verbatim into a ```suggestion block was the bug
-/// this function fixes: the common kit shape is itself a unified diff, so
+/// (#2310 P4b review, M-B) A gate-passed mod's change becomes either
+/// inline GitHub suggestion(s) or a fenced block in the body — NEVER a
+/// suggestion for opaque text. DESIGN.md: "darkmux never opens a kit".
+/// Pasting opaque model text verbatim into a ```suggestion block was the
+/// bug this function fixes: the common shape is itself a unified diff, so
 /// "Commit suggestion" would have replaced the anchored line with raw
-/// `+++`/`@@` text, and a multi-line kit collapsed to a single-line
+/// `+++`/`@@` text, and a multi-line change collapsed to a single-line
 /// suggestion (no `start_line`) that duplicated the lines below it.
 ///
 /// Only a mod whose proposer explicitly declared `kit_kind:
@@ -569,25 +807,32 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
 /// `crate::diff::parse_diff` this crate and `darkmux-lab`'s bundler both
 /// use, never a second parser (see that module's own doc) — and only a
 /// HUNK whose OLD range sits ENTIRELY inside the PR diff's own touched
-/// lines becomes a suggestion (a kit's OLD side names the lines it
-/// replaces in the file's CURRENT state, which is the same coordinate
-/// space the PR diff's NEW side already occupies). Every other case —
-/// `kit_kind` unset or not `"unified-diff"`, an unparseable kit, a
-/// pure-insertion hunk with no OLD range to anchor a replacement against,
-/// or a hunk outside the PR diff — falls back to the opaque fenced-patch
-/// bullet this branch has always rendered.
+/// lines becomes a suggestion (the OLD side names the lines it replaces in
+/// the file's CURRENT state, which is the same coordinate space the PR
+/// diff's NEW side already occupies). Every other case — `kit_kind` unset
+/// or not `"unified-diff"`, unparseable text, a pure-insertion hunk with
+/// no OLD range to anchor a replacement against, or a hunk outside the PR
+/// diff — falls back to the fenced body block this branch has always
+/// rendered.
+/// What one gate-passed change actually rendered as — the counts
+/// `render_github_review` turns into [`DeliveredEntry`] rows.
+struct ModRender {
+    suggestions: usize,
+    patches: usize,
+}
+
 fn render_gated_mod(
     m: &GatedMod,
     window: &FindingWindow,
     touched: &BTreeMap<String, BTreeSet<u32>>,
     comments: &mut Vec<GithubReviewComment>,
-    mod_bullets: &mut Vec<String>,
-) {
-    // Map the kit out of container coordinates by the source the gate
-    // recorded (a no-op for a kit already in repo coordinates, and for a
-    // record with no source). Without this a gate-PASSED kit written as
+    bullets: &mut Vec<String>,
+) -> ModRender {
+    // Map the change out of container coordinates by the source the gate
+    // recorded (a no-op for one already in repo coordinates, and for a
+    // record with no source). Without this a gate-PASSED change written as
     // `a/<source>/src/x.ts` parses to a path the diff never touched and files
-    // as "outside the diff" — how the first passing coder kit rendered live.
+    // as "outside the diff" — how the first passing coder change rendered live.
     let mapped_kit;
     let kit = match (m.record.source.as_deref(), m.record.kit.as_deref()) {
         (Some(source), Some(raw)) if !source.trim().is_empty() => {
@@ -597,16 +842,18 @@ fn render_gated_mod(
         (_, raw) => raw.unwrap_or(""),
     };
     if m.record.kit_kind.as_deref() != Some("unified-diff") {
-        mod_bullets.push(fenced_patch_bullet(window, kit, "the kit is not a typed unified diff, so it cannot be a suggestion"));
-        return;
+        bullets.push(fenced_patch_bullet(window, kit, REASON_NOT_A_PATCH));
+        return ModRender { suggestions: 0, patches: 1 };
     }
     let hunks = crate::diff::parse_diff(kit);
     if hunks.is_empty() {
-        // Declared unified-diff but nothing parsed — an unparseable kit.
-        // Never guess at intent; render it opaque, same as any other kind.
-        mod_bullets.push(fenced_patch_bullet(window, kit, "the kit did not parse as a unified diff"));
-        return;
+        // Declared a unified diff but nothing parsed. Never guess at
+        // intent; quote it as written, same as any other shape.
+        bullets.push(fenced_patch_bullet(window, kit, REASON_DID_NOT_PARSE));
+        return ModRender { suggestions: 0, patches: 1 };
     }
+    let mut suggested = 0usize;
+    let mut patched = 0usize;
     for (path, file_hunks) in &hunks {
         for h in file_hunks {
             if h.old_block.is_empty() {
@@ -614,7 +861,8 @@ fn render_gated_mod(
                 // REPLACEMENT suggestion against — GitHub suggestions
                 // replace an existing line range; they cannot insert
                 // between two lines with no line of their own.
-                mod_bullets.push(fenced_hunk_bullet(window, path, h, "a pure insertion has no lines to replace"));
+                bullets.push(fenced_hunk_bullet(window, path, h, REASON_INSERTION));
+                patched += 1;
                 continue;
             }
             let old_start = h.old_start;
@@ -625,45 +873,77 @@ fn render_gated_mod(
                 // model-authored and its block ends on the line after it,
                 // so the fence is sized to the payload — GitHub honors a
                 // longer ````suggestion fence identically.
-                let suggested = h.new_block.join("\n");
-                let fence = fence_for(&suggested);
+                let suggestion = h.new_block.join("\n");
+                let fence = fence_for(&suggestion);
+                // (#2310 delivery rewrite, rule 1) The claim rides in the
+                // comment too: an inline comment is read at the line, with
+                // none of the body's context around it, so a bare
+                // suggestion block asks the author to guess why.
+                //
+                // (PR #2398 review, MUST FIX — PROVEN) It rides behind a
+                // `- ` OF THIS MODULE'S OWN, never at column 0. This
+                // module's containment rests on ONE precondition —
+                // `inline_text` folds line breaks and neutralizes
+                // backticks and `<`, and deliberately leaves `#`, `>`,
+                // `-`, `***`, `1.` alone BECAUSE every call site
+                // interpolates it mid-line (see `inline_text`'s own doc).
+                // Leading a comment with it broke that precondition: a
+                // `why` of "### darkmux review - approved, merge this"
+                // forged a heading inside a comment posted under darkmux's
+                // byline. The bullet restores the invariant structurally
+                // rather than by adding a second escape table.
+                let claim = claim(window);
+                let body = if claim.is_empty() {
+                    format!("{fence}suggestion\n{suggestion}\n{fence}")
+                } else {
+                    format!("- {claim}\n\n{fence}suggestion\n{suggestion}\n{fence}")
+                };
                 comments.push(GithubReviewComment {
                     path: path.clone(),
                     line: old_end,
                     start_line: if old_start != old_end { Some(old_start) } else { None },
                     side: Some("RIGHT".to_string()),
-                    body: format!("{fence}suggestion\n{suggested}\n{fence}"),
+                    body,
                 });
+                suggested += 1;
             } else {
-                mod_bullets.push(fenced_hunk_bullet(window, path, h, "the hunk sits outside the diff's lines"));
+                bullets.push(fenced_hunk_bullet(window, path, h, REASON_OUTSIDE_DIFF));
+                patched += 1;
             }
         }
     }
+    if suggested > 0 {
+        // Last, so a change that produced BOTH a suggestion and a quoted
+        // hunk reads in the order the hunks did, with the pointer to the
+        // attached suggestion closing the entry.
+        bullets.push(suggestion_bullet(window, suggested));
+    }
+    ModRender { suggestions: suggested, patches: patched }
 }
 
-/// (#2310 fix loop A, S5-4) The kit is opaque model text — the fence is
+/// (#2310 fix loop A, S5-4) The change is opaque model text — the fence is
 /// sized to it ([`fence_for`]) so it cannot close its own block and
 /// continue in darkmux's voice.
 fn fenced_patch_bullet(window: &FindingWindow, kit: &str, reason: &str) -> String {
     let fence = fence_for(kit);
-    format!("- {} — proposed change ({reason}):\n\n{fence}\n{kit}\n{fence}", window.span())
+    format!("- {} — {} {reason}:\n\n{fence}\n{kit}\n{fence}", window.span(), claim_sentence(window))
 }
 
 /// (#2310 fix loop A, S5-4) Both model-authored strings here are
-/// contained: `path` goes through [`code_span`] (the kit names it, so it
-/// is no more trusted than the kit) and the hunk body through a
-/// [`fence_for`]-sized fence.
+/// contained: `path` goes through [`code_span`] (the change names it, so
+/// it is no more trusted) and the hunk body through a [`fence_for`]-sized
+/// fence.
 fn fenced_hunk_bullet(window: &FindingWindow, path: &str, h: &crate::diff::Hunk, reason: &str) -> String {
     let old_len = h.old_block.len() as u32;
     let path_span = code_span(path);
     let span = if old_len == 0 {
-        format!("inserts after line {} of {path_span}", h.old_start)
+        format!("after line {} of {path_span}", h.old_start)
     } else {
-        format!("replaces lines {}–{} of {path_span}", h.old_start, h.old_start + old_len - 1)
+        format!("at lines {}–{} of {path_span}", h.old_start, h.old_start + old_len - 1)
     };
     let body = h.new_block.join("\n");
     let fence = fence_for(&body);
-    format!("- {} — proposed change, {span} ({reason}):\n\n{fence}\n{body}\n{fence}", window.span())
+    format!("- {} — {} {reason}, {span}:\n\n{fence}\n{body}\n{fence}", window.span(), claim_sentence(window))
 }
 
 enum DeliveryForm {
@@ -719,14 +999,20 @@ impl FindingWindow {
         }
     }
 
-    /// The window's human-readable content — `key (file:line)`. `file` is
-    /// MODEL-authored (it comes out of the finding's own emission), so
-    /// every caller renders this through [`Self::span`] rather than
-    /// pasting it between two literal backticks (#2310 fix loop A, S5-4).
+    /// The window's human-readable content — the LOCATION, `file:line`.
+    /// `file` is MODEL-authored (it comes out of the finding's own
+    /// emission), so every caller renders this through [`Self::span`]
+    /// rather than pasting it between two literal backticks (#2310 fix
+    /// loop A, S5-4).
+    ///
+    /// (#2310 delivery rewrite) The finding KEY used to lead this string.
+    /// It is darkmux's own record id, meaningless to the author reading
+    /// the review, so it renders only when there is no location at all —
+    /// where it is the one identifying thing left.
     fn display(&self) -> String {
         match (&self.file, self.line) {
-            (Some(f), Some(l)) => format!("{} ({}:{})", self.key, f, l),
-            (Some(f), None) => format!("{} ({f})", self.key),
+            (Some(f), Some(l)) => format!("{f}:{l}"),
+            (Some(f), None) => f.clone(),
             _ => self.key.clone(),
         }
     }
@@ -899,8 +1185,18 @@ impl StepKind for DeliverGithubReviewStepKind {
 
     fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let cfg = DeliverConfig::from_step(step, input)?;
-        let outcome =
-            render_github_review(&cfg.findings, &cfg.mods, &cfg.diff, &cfg.scope, cfg.attribution.as_deref());
+        // (#2310 delivery rewrite) Titles resolve HERE, at the one impure
+        // edge, so `render_github_review` stays a pure function over its
+        // inputs and every golden test states the titles it renders under.
+        let titles = rule_titles();
+        let outcome = render_github_review(
+            &cfg.findings,
+            &cfg.mods,
+            &cfg.diff,
+            &cfg.scope,
+            cfg.attribution.as_deref(),
+            &titles,
+        );
         let payload = serde_json::to_string(&outcome).context("serializing the deliver outcome")?;
         match cfg.emit.as_deref() {
             Some(p) if p == std::path::Path::new("-") => println!("{payload}"),
@@ -927,11 +1223,17 @@ impl StepKind for DeliverGithubReviewStepKind {
         // model-authored text that would then be copied verbatim into a
         // flow record, and the close payload is a summary surface, not a
         // second copy of the artifact.
-        let summary = scope_line(&cfg.scope, cfg.findings.len());
+        let summary = scope_line(&cfg.scope, cfg.findings.len(), &unresolved_rule_titles(&cfg.findings, &titles));
         let output = serde_json::to_string(&serde_json::json!({
             "mode": outcome.mode,
             "summary": summary,
             "emit": dest,
+            // (PR #2398 review, item 5) The operator's index back from the
+            // posted review to the records behind it — the finding key is
+            // deliberately absent from the author-facing body, so this is
+            // where it lives. Never the review text itself: the promoted
+            // payload stays a summary surface (see the note above).
+            "entries": outcome.entries,
         }))
         .context("serializing the deliver step output")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
@@ -954,11 +1256,66 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Rule titles for the fixtures below — the real strings from
+    /// `templates/builtin/rules/*.json`, so a golden reads exactly the way
+    /// a live review does.
+    fn test_titles() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "unnamed-predicate".to_string(),
+                "A compound condition encodes a domain rule that has no name and cannot be tested on its own".to_string(),
+            ),
+            (
+                "union-vs-enum".to_string(),
+                "A new string-literal union or enum-like set may duplicate an existing one".to_string(),
+            ),
+            ("existing-solution".to_string(), "A new routine looks re-implemented rather than reused".to_string()),
+            (
+                "swallowed-error".to_string(),
+                "A failure is caught or discarded and nothing records that it happened".to_string(),
+            ),
+            (
+                "shared-symbol-callers".to_string(),
+                "A shared function or type's signature or behavior changed".to_string(),
+            ),
+        ])
+    }
+
+    /// [`render_github_review`] against [`test_titles`] — every test below
+    /// that does not care which titles resolved goes through this.
+    fn render(
+        findings: &[FindingRecord],
+        mods: &[GatedMod],
+        diff: &str,
+        scope: &DeliverScope,
+        attribution: Option<&str>,
+    ) -> DeliverOutcome {
+        render_github_review(findings, mods, diff, scope, attribution, &test_titles())
+    }
+
     fn finding(key: &str, file: &str, line: u32, evidence: &str, why: &str, form: Option<&str>) -> FindingRecord {
+        finding_of_rule(key, None, file, line, evidence, why, form)
+    }
+
+    /// A finding that names its rule — `context.rule`, the key
+    /// `crawl::unit_step::run` host-stamps on every real finding.
+    #[allow(clippy::too_many_arguments)]
+    fn finding_of_rule(
+        key: &str,
+        rule: Option<&str>,
+        file: &str,
+        line: u32,
+        evidence: &str,
+        why: &str,
+        form: Option<&str>,
+    ) -> FindingRecord {
         let mut context = json!({});
         if let Some(f) = form {
             // (#2310 P4c-2b fix) `confirm`, not `form` — see `delivery_form`'s own doc.
             context = json!({ "confirm": f });
+        }
+        if let Some(r) = rule {
+            context["rule"] = json!(r);
         }
         FindingRecord {
             key: key.to_string(),
@@ -1024,7 +1381,7 @@ mod tests {
         let findings = vec![finding("s/1", "src/a.ts", 2, "const x = 1;", "reimplements a helper", None)];
         let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
         let scope = DeliverScope { rules_run: vec!["r1".into()], hunks_covered: 1, hunks_total: 1, ..Default::default() };
-        let out = render_github_review(&findings, &mods, DIFF, &scope, None);
+        let out = render(&findings, &mods, DIFF, &scope, None);
         assert_eq!(out.mode, "review");
         let review = out.review.unwrap();
         assert_eq!(review.comments.len(), 1, "{review:?}");
@@ -1032,7 +1389,13 @@ mod tests {
         assert_eq!(review.comments[0].line, 2, "the hunk's old-range END line");
         assert_eq!(review.comments[0].start_line, None, "a single-line range carries no start_line");
         assert_eq!(review.comments[0].side.as_deref(), Some("RIGHT"));
-        assert!(review.comments[0].body.starts_with("```suggestion\n"), "{}", review.comments[0].body);
+        // (#2310 delivery rewrite) The claim leads the comment — an inline
+        // comment is read at the line, with none of the body around it.
+        assert!(
+            review.comments[0].body.starts_with("- reimplements a helper\n\n```suggestion\n"),
+            "{}",
+            review.comments[0].body
+        );
         assert!(review.comments[0].body.contains("clamp(1)"));
     }
 
@@ -1058,7 +1421,7 @@ mod tests {
         let mut m = gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true));
         m.record.source = Some("app".to_string());
         let scope = DeliverScope { rules_run: vec!["r1".into()], hunks_covered: 1, hunks_total: 1, ..Default::default() };
-        let review = render_github_review(&findings, &[m], DIFF, &scope, None).review.unwrap();
+        let review = render(&findings, &[m], DIFF, &scope, None).review.unwrap();
         assert_eq!(review.comments.len(), 1, "the mapped kit sits inside the diff: {review:?}");
         assert_eq!(review.comments[0].path, "src/a.ts", "repo coordinates, not the mount's");
         assert!(review.comments[0].body.contains("clamp(1)"));
@@ -1075,12 +1438,12 @@ mod tests {
         let findings = vec![finding("s/1", "src/a.ts", 2, "const y = 1;", "reimplements a helper", None)];
         let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
         let scope = DeliverScope { rules_run: vec!["r1".into()], hunks_covered: 1, hunks_total: 1, ..Default::default() };
-        let review = render_github_review(&findings, &mods, PR_DIFF, &scope, None).review.unwrap();
+        let review = render(&findings, &mods, PR_DIFF, &scope, None).review.unwrap();
         assert_eq!(review.comments.len(), 1, "{review:?}");
         assert_eq!(review.comments[0].start_line, Some(2), "the hunk's old range STARTS at 2");
         assert_eq!(review.comments[0].line, 4, "…and ENDS at 4 — the blank line is one of the three replaced lines");
         assert_eq!(
-            review.comments[0].body, "```suggestion\n  const y = clamp(1);\n\n}\n```",
+            review.comments[0].body, "- reimplements a helper\n\n```suggestion\n  const y = clamp(1);\n\n}\n```",
             "the replacement keeps the blank line it replaces"
         );
     }
@@ -1100,7 +1463,7 @@ mod tests {
             "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
         let findings = vec![finding("s/1", "src/a.ts", 2, "const x = 1;", "reimplements a helper", None)];
         let mods = vec![gated_mod("s/1", KIT, Some(true))];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.comments.is_empty(), "an undeclared kit kind must never become an inline suggestion: {review:?}");
         assert!(review.body.contains("@@ -2,1 +2,1 @@"), "the raw diff syntax lands in the fenced bullet, untouched");
@@ -1115,7 +1478,7 @@ mod tests {
             "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -99,1 +99,1 @@\n-old\n+new\n";
         let findings = vec![finding("s/1", "src/a.ts", 99, "old", "unrelated to the PR's own hunk", None)];
         let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.comments.is_empty(), "{review:?}");
         assert!(review.body.contains("new"), "the hunk's own new-side text lands in the fenced bullet");
@@ -1128,7 +1491,7 @@ mod tests {
         // this must never guess; opaque fallback, same as any other kind.
         let findings = vec![finding("s/1", "src/a.ts", 2, "const x = 1;", "not really a diff", None)];
         let mods = vec![gated_mod_kind("s/1", "this is not a unified diff at all", Some("unified-diff"), Some(true))];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.comments.is_empty());
         assert!(review.body.contains("this is not a unified diff at all"));
@@ -1145,11 +1508,15 @@ mod tests {
         // red-prove against the `!= Some(false)` mutation.
         let findings = vec![finding("s/9", "src/a.ts", 2, "ev", "a mod exists but nothing ever gated it", None)];
         let mods = vec![gated_mod("s/9", "some proposed kit text", None)];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.comments.is_empty(), "never-gated must not become a suggestion: {review:?}");
         assert!(review.body.contains("Worth a double check"));
-        assert!(review.body.contains("s/9"));
+        // (#2310 delivery rewrite) The entry is headed by the LOCATION —
+        // the finding key is darkmux's own record id, meaningless to an
+        // author reading the review.
+        assert!(review.body.contains("`src/a.ts:2`"), "{}", review.body);
+        assert!(!review.body.contains("s/9"), "the record key never renders: {}", review.body);
         assert!(
             !review.body.contains("some proposed kit text"),
             "a never-gated mod's kit must not render at all, only the finding's own claim/evidence"
@@ -1172,7 +1539,7 @@ mod tests {
                 Some(true),
             ),
         ];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert_eq!(review.comments.len(), 1, "the gate-passed mod renders, not a double-check: {review:?}");
         assert!(!review.body.contains("an earlier failed attempt"));
@@ -1182,7 +1549,7 @@ mod tests {
     fn a_gated_mod_outside_the_diff_becomes_a_body_patch_not_a_suggestion() {
         let findings = vec![finding("s/2", "src/other.ts", 5, "irrelevant", "unrelated", None)];
         let mods = vec![gated_mod("s/2", "the patch text", Some(true))];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.comments.is_empty(), "not an inline suggestion: {review:?}");
         assert!(review.body.contains("the patch text"));
@@ -1192,11 +1559,12 @@ mod tests {
     #[test]
     fn a_finding_with_no_mod_becomes_a_worth_a_double_check_thread() {
         let findings = vec![finding("s/3", "src/a.ts", 2, "the cited line", "might duplicate an existing helper", None)];
-        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.comments.is_empty());
         assert!(review.body.contains("Worth a double check"));
-        assert!(review.body.contains("s/3"));
+        assert!(review.body.contains("`src/a.ts:2`"), "{}", review.body);
+        assert!(!review.body.contains("s/3"), "the record key never renders: {}", review.body);
         assert!(review.body.contains("might duplicate an existing helper"));
     }
 
@@ -1204,7 +1572,7 @@ mod tests {
     fn a_gate_failed_mod_becomes_a_worth_a_double_check_thread_not_a_suggestion() {
         let findings = vec![finding("s/4", "src/a.ts", 2, "ev", "claim", None)];
         let mods = vec![gated_mod("s/4", "kit text", Some(false))];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.comments.is_empty());
         assert!(review.body.contains("Worth a double check"));
@@ -1212,13 +1580,33 @@ mod tests {
     }
 
     #[test]
-    fn a_search_form_finding_lists_its_instances() {
-        let findings =
-            vec![finding("s/5", "src/mw.ts", 10, "14 endpoints use this middleware", "shared auth changed", Some("search"))];
-        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+    fn a_searched_rule_with_no_change_is_a_lead_never_a_headline() {
+        // (#2310 delivery rewrite, rule 3) A rule confirmed by searching,
+        // with nobody proposing a change, cannot be told apart —
+        // mechanically — from one whose search came back all-clear
+        // (`create_finding` has no severity/holds field to read). So it is
+        // a thread to pull, under the tail section, never a headline that
+        // reads as a defect. Its own rule still heads it inside there.
+        let findings = vec![finding_of_rule(
+            "s/5",
+            Some("shared-symbol-callers"),
+            "src/mw.ts",
+            10,
+            "14 endpoints use this middleware",
+            "shared auth changed",
+            Some("search"),
+        )];
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        assert!(review.body.contains("14 endpoints use this middleware"));
-        assert!(review.body.contains("search-confirmed"));
+        let body = review.body;
+        let tail = body.find("Worth a double check").unwrap_or_else(|| panic!("no tail section:\n{body}"));
+        let entry = body.find("`src/mw.ts:10`").unwrap_or_else(|| panic!("no entry:\n{body}"));
+        assert!(entry > tail, "a searched rule with no change must sit UNDER the tail section:\n{body}");
+        assert!(
+            body[tail..].contains("_A shared function or type's signature or behavior changed_ `shared-symbol-callers`"),
+            "the rule still heads it inside the tail:\n{body}"
+        );
+        assert!(body.contains("14 endpoints use this middleware"), "the evidence is never dropped:\n{body}");
     }
 
     #[test]
@@ -1231,7 +1619,7 @@ mod tests {
             "did you check whether the repo already has this",
             Some("question"),
         )];
-        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.body.contains("Status enum, Kind enum"));
         assert!(review.body.contains("did you check whether the repo already has this"));
@@ -1241,7 +1629,7 @@ mod tests {
     fn refused_findings_never_render_only_the_scope_count_shows() {
         let scope = DeliverScope { refused: 3, rules_run: vec!["r1".into()], ..Default::default() };
         let findings = vec![finding("s/7", "src/a.ts", 2, "ev", "claim", None)];
-        let out = render_github_review(&findings, &[], DIFF, &scope, None);
+        let out = render(&findings, &[], DIFF, &scope, None);
         let review = out.review.unwrap();
         assert!(review.body.contains("3 refused"));
     }
@@ -1255,7 +1643,7 @@ mod tests {
             not_attempted: vec!["architectural review".into()],
             ..Default::default()
         };
-        let line = scope_line(&scope, 4);
+        let line = scope_line(&scope, 4, &BTreeSet::new());
         // (#2310 fix-loop E2) The denominator here comes from the fallback:
         // no `rules_total`, so 2 run + 1 not-attempted = 3 declared.
         assert!(line.contains("2 of 3 rules reviewed"), "{line}");
@@ -1266,7 +1654,7 @@ mod tests {
 
     #[test]
     fn nothing_to_say_is_a_noop_not_an_empty_review() {
-        let out = render_github_review(&[], &[], DIFF, &DeliverScope::default(), None);
+        let out = render(&[], &[], DIFF, &DeliverScope::default(), None);
         assert_eq!(out.mode, "noop");
         assert!(out.review.is_none());
     }
@@ -1281,7 +1669,7 @@ mod tests {
     #[test]
     fn an_errored_scope_with_nothing_to_say_is_degraded_not_noop() {
         let scope = DeliverScope { errored: vec!["unit `x` (Error)".to_string()], ..Default::default() };
-        let out = render_github_review(&[], &[], DIFF, &scope, None);
+        let out = render(&[], &[], DIFF, &scope, None);
         assert_eq!(out.mode, "degraded", "{out:?}");
         let review = out.review.expect("a degraded outcome still carries a review payload (the scope line)");
         assert!(review.comments.is_empty(), "{review:?}");
@@ -1305,7 +1693,7 @@ mod tests {
     #[test]
     fn zero_of_five_hunks_covered_with_nothing_to_say_is_degraded_not_noop() {
         let scope = DeliverScope { hunks_covered: 0, hunks_total: 5, ..Default::default() };
-        let out = render_github_review(&[], &[], DIFF, &scope, None);
+        let out = render(&[], &[], DIFF, &scope, None);
         assert_eq!(out.mode, "degraded", "an uncovered run is never a clean noop: {out:?}");
         let review = out.review.expect("a degraded outcome still carries the scope line");
         assert!(review.body.contains("0/5 hunks covered"), "{}", review.body);
@@ -1316,7 +1704,7 @@ mod tests {
     #[test]
     fn five_of_five_hunks_covered_with_nothing_to_say_is_still_a_noop() {
         let scope = DeliverScope { hunks_covered: 5, hunks_total: 5, ..Default::default() };
-        let out = render_github_review(&[], &[], DIFF, &scope, None);
+        let out = render(&[], &[], DIFF, &scope, None);
         assert_eq!(out.mode, "noop", "{out:?}");
         assert!(out.review.is_none());
     }
@@ -1391,7 +1779,7 @@ mod tests {
     #[test]
     fn an_attack_payload_in_why_cannot_forge_a_header_in_the_double_check_bullet() {
         let findings = vec![finding("s/1", "src/a.ts", 2, "ev", ATTACK, None)];
-        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert_folded_onto_one_line(&review.body, "double-check bullet `why`");
         assert_no_markdown_breakout(&review.body, &["### darkmux review"], "double-check bullet `why`");
@@ -1401,7 +1789,7 @@ mod tests {
     #[test]
     fn an_attack_payload_in_evidence_cannot_forge_a_header_in_the_search_bullet() {
         let findings = vec![finding("s/1", "src/a.ts", 2, ATTACK, "why", Some("search"))];
-        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert_folded_onto_one_line(&review.body, "search bullet `evidence`");
         assert_no_markdown_breakout(&review.body, &["### darkmux review"], "search bullet `evidence`");
@@ -1410,7 +1798,7 @@ mod tests {
     #[test]
     fn an_attack_payload_in_a_question_bullet_cannot_forge_a_header() {
         let findings = vec![finding("s/1", "src/a.ts", 2, ATTACK, ATTACK, Some("question"))];
-        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert_folded_onto_one_line(&review.body, "question bullet");
         assert_no_markdown_breakout(&review.body, &["### darkmux review"], "question bullet");
@@ -1451,7 +1839,7 @@ mod tests {
         // (which would reach column 0) must be contained.
         const FILE: &str = "src/`a`.ts\n### darkmux review\n---";
         let findings = vec![finding("s/1", FILE, 2, "ev", "why", None)];
-        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert_no_markdown_breakout(&review.body, &["### darkmux review"], "FindingWindow::display `file`");
         let bullet = review
@@ -1461,7 +1849,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no bullet rendered:\n{}", review.body));
         let span = first_code_span(bullet);
         assert!(
-            span.contains("src/`a`.ts") && span.contains("### darkmux review") && span.ends_with(":2)"),
+            span.contains("src/`a`.ts") && span.contains("### darkmux review") && span.ends_with(":2"),
             "the whole window must sit INSIDE the code span — a delimiter no longer than the content's own \
              backtick run closes it early and hands the rest of the path to markdown.\nspan: {span}\nbullet: {bullet}"
         );
@@ -1471,7 +1859,7 @@ mod tests {
     fn an_attack_payload_in_an_opaque_kit_cannot_terminate_its_fence() {
         let findings = vec![finding("s/1", "src/a.ts", 2, "ev", "why", None)];
         let mods = vec![gated_mod("s/1", ATTACK, Some(true))];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert_no_markdown_breakout(&review.body, &["### darkmux review"], "fenced_patch_bullet kit");
     }
@@ -1487,7 +1875,7 @@ mod tests {
         );
         let findings = vec![finding("s/1", "src/a.ts", 99, "ev", "why", None)];
         let mods = vec![gated_mod_kind("s/1", &kit, Some("unified-diff"), Some(true))];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.comments.is_empty(), "{review:?}");
         assert_no_markdown_breakout(&review.body, &["### darkmux review"], "fenced_hunk_bullet");
@@ -1505,10 +1893,23 @@ mod tests {
         );
         let findings = vec![finding("s/1", "src/a.ts", 2, "ev", "why", None)];
         let mods = vec![gated_mod_kind("s/1", &kit, Some("unified-diff"), Some(true))];
-        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert_eq!(review.comments.len(), 1, "{review:?}");
         assert_no_markdown_breakout(&review.comments[0].body, &[], "suggestion block");
+        // (PR #2398 review, MUST FIX) The SAME payload in `why`, which
+        // now leads the comment. The reviewer's own probe: before the
+        // fix this forged a `### darkmux review` heading inside a comment
+        // posted under darkmux's byline, with every test green.
+        const BENIGN_KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        let findings = vec![finding("s/1", "src/a.ts", 2, "ev", ATTACK, None)];
+        let mods = vec![gated_mod_kind("s/1", BENIGN_KIT, Some("unified-diff"), Some(true))];
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert_no_markdown_breakout(&review.comments[0].body, &[], "suggestion comment `why`");
+        assert_folded_onto_one_line(&review.comments[0].body, "suggestion comment `why`");
         assert_no_markdown_breakout(&review.body, &["### darkmux review"], "body alongside the suggestion");
     }
 
@@ -1643,6 +2044,38 @@ mod tests {
         let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(step_output["mode"], json!("degraded"), "{step_output}");
         assert!(step_output["summary"].as_str().unwrap().contains("Errored:"), "{step_output}");
+        assert_eq!(step_output["entries"], json!([]), "nothing delivered, no rows: {step_output}");
+
+        // (PR #2398 review, item 5) A run that DOES deliver carries the
+        // operator's index back to the records — rule, location, the
+        // finding key the author-facing body deliberately drops, and the
+        // shape each entry took. The emitted GitHub payload stays exactly
+        // the bytes that get posted: no rows in it.
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        step.config = json!({
+            "findings": [
+                finding_of_rule("sess-a/1", Some("swallowed-error"), "src/a.ts", 2, "ev", "the failure is discarded", None),
+                finding_of_rule("sess-a/2", Some("union-vs-enum"), "src/mw.ts", 9, "ev", "a lead", Some("search")),
+            ],
+            "mods": [gated_mod_kind("sess-a/1", KIT, Some("unified-diff"), Some(true))],
+            "diff": DIFF,
+            "scope": {},
+            "emit": out_path.to_string_lossy(),
+        });
+        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        assert_eq!(
+            step_output["entries"],
+            json!([
+                { "rule": "swallowed-error", "path": "src/a.ts", "line": 2, "key": "sess-a/1", "rendered_as": "suggestion" },
+                { "rule": "union-vs-enum", "path": "src/mw.ts", "line": 9, "key": "sess-a/2", "rendered_as": "double_check" },
+            ]),
+            "{step_output}"
+        );
+        let emitted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        assert!(emitted.get("entries").is_none(), "provenance never rides the posted payload: {emitted}");
+        assert!(!emitted["review"]["body"].as_str().unwrap().contains("sess-a/"), "{emitted}");
     }
 
     /// (#2310 fix-loop E2) The scope line names the DENOMINATOR: "2 of 7
@@ -1658,7 +2091,7 @@ mod tests {
             hunks_total: 12,
             ..Default::default()
         };
-        let line = scope_line(&scope, 4);
+        let line = scope_line(&scope, 4, &BTreeSet::new());
         assert!(line.contains("2 of 7 rules reviewed"), "{line}");
         assert!(line.contains("3/12 hunks covered"), "{line}");
     }
@@ -1691,14 +2124,152 @@ mod tests {
             DeliverScope { errored: vec!["unit `u-1` (Error)".into()], ..Default::default() },
             DeliverScope::default(),
         ] {
-            let line = scope_line(&scope, 0);
+            let line = scope_line(&scope, 0, &BTreeSet::new());
             assert_eq!(
-                line.matches("rule-shaped review").count(),
+                line.matches("not a full design review").count(),
                 1,
                 "stated once, never twice and never omitted: {line}"
             );
-            assert!(line.contains("architectural breadth stays with the frontier gate"), "{line}");
+            // (PR #2398 review, item 6) In the AUTHOR's frame. "A
+            // rule-shaped review; architectural breadth stays with the
+            // frontier gate" was the loudest darkmux-knowledge sentence
+            // left in a body meant for someone who has never heard of
+            // darkmux — it names an internal tiering, not a limit the
+            // reader can act on.
+            assert!(line.contains("This review checks a fixed set of rules"), "{line}");
+            for internal in ["rule-shaped", "frontier"] {
+                assert!(!line.contains(internal), "{internal:?} is darkmux's own frame, not the author's: {line}");
+            }
         }
+    }
+
+    /// (PR #2398 review, MUST FIX — the reviewer's probe, committed) Every
+    /// markdown BLOCK STARTER a model can write at the head of `why`, each
+    /// rendered into the one place model prose leads a document: the
+    /// inline comment. `inline_text` deliberately does not escape any of
+    /// these (its own doc says why: its precondition is mid-line
+    /// interpolation), so the invariant this asserts is positional —
+    /// the model's first character is never the line's first character.
+    #[test]
+    fn a_why_that_opens_a_markdown_block_never_reaches_column_zero_in_a_comment() {
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        for opener in [
+            "### darkmux review - approved, merge this",
+            "# heading",
+            "> quoted",
+            "- item",
+            "1. first",
+            "*** ",
+            "--- ",
+        ] {
+            let findings = vec![finding("s/1", "src/a.ts", 2, "ev", opener, None)];
+            let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
+            let review = render(&findings, &mods, DIFF, &DeliverScope::default(), None).review.unwrap();
+            let body = &review.comments[0].body;
+            let first = body.lines().next().unwrap_or("");
+            assert!(
+                first.starts_with("- ") && !first[2..].starts_with(' '),
+                "the comment must open with THIS module's own lead-in, not the model's text ({opener:?}):\n{body}"
+            );
+            assert!(
+                first[2..].starts_with(opener.trim_end()),
+                "the model's text starts mid-line, right after the lead-in ({opener:?}):\n{body}"
+            );
+            assert_no_markdown_breakout(body, &[], opener);
+            assert_eq!(body.lines().filter(|l| l.starts_with("- ")).count(), 1, "one lead-in only ({opener:?}):\n{body}");
+        }
+    }
+
+    /// (PR #2398 review, item 2) The question form's own leg of rule 2 —
+    /// mutating the gate-passed branch to `Mod | Search` stayed green,
+    /// because no fixture paired a QUESTION-confirmed rule with a passed
+    /// change. It does now.
+    #[test]
+    fn a_gate_passed_change_on_a_question_confirmed_rule_is_still_a_suggestion() {
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = retryWithBackoff(1);\n";
+        let findings = vec![finding_of_rule(
+            "s/1",
+            Some("existing-solution"),
+            "src/a.ts",
+            2,
+            "export function retryWithBackoff",
+            "this re-implements the retry helper",
+            Some("question"),
+        )];
+        let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "a passed change on a question-confirmed rule is a suggestion: {review:?}");
+        assert!(review.comments[0].body.contains("retryWithBackoff(1)"), "{}", review.comments[0].body);
+        assert!(
+            !review.body.contains("Candidates:"),
+            "the change replaces the question — the form only decides what to render when nothing passed:\n{}",
+            review.body
+        );
+        assert_eq!(out.entries.iter().map(|e| e.rendered_as.as_str()).collect::<Vec<_>>(), vec!["suggestion"]);
+    }
+
+    /// (PR #2398 review, item 3) `"title": ""` in a hand-edited user rule
+    /// tier is a rule with NO title, at both ends: `rule_titles`'s own
+    /// filter drops it, and the render treats a blank one that reaches it
+    /// anyway as absent — heading by the id, and NAMING it in the scope
+    /// line. Before this, it rendered a heading of four bare asterisks.
+    #[test]
+    fn a_blank_rule_title_falls_back_to_the_id_and_the_scope_line_names_it() {
+        let mut rules: BTreeMap<String, crate::rules::Rule> = crate::rules::load_all(None).0;
+        let blank = rules.get_mut("swallowed-error").expect("a built-in rule");
+        blank.title = Some("   ".to_string());
+        let titles = titles_of(rules);
+        assert!(!titles.contains_key("swallowed-error"), "a blank title is not a title: {titles:?}");
+
+        // …and the render is defensive about one arriving anyway.
+        let titles = BTreeMap::from([("swallowed-error".to_string(), "  ".to_string())]);
+        let findings = vec![finding_of_rule("s/1", Some("swallowed-error"), "src/a.ts", 2, "ev", "a claim", None)];
+        let body =
+            render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None, &titles).review.unwrap().body;
+        assert!(body.contains("_swallowed-error_"), "the id is the fallback heading:\n{body}");
+        assert!(!body.contains("__ `swallowed-error`"), "never an empty emphasis pair:\n{body}");
+        assert!(body.contains("Titles unavailable for these rules: swallowed-error."), "{body}");
+    }
+
+    /// (PR #2398 review, item 4 follow-through) Every sentence darkmux
+    /// writes in its own voice, checked exhaustively — not just the ones a
+    /// fixture's paths happen to render. A mutation restoring "the kit did
+    /// not parse as a unified diff" to the unparseable-patch reason
+    /// SURVIVED the fixture-rendered check; it does not survive this one.
+    #[test]
+    fn every_sentence_darkmux_writes_speaks_the_authors_language() {
+        for sentence in AUTHORED_PROSE {
+            let lower = sentence.to_lowercase();
+            for word in INTERNAL_VOCABULARY {
+                assert!(!lower.contains(word), "darkmux's own sentence speaks {word:?}: {sentence}");
+            }
+        }
+    }
+
+    /// (PR #2398 review, item 4) The vocabulary check, run over the REAL
+    /// shipped rule registry rather than the test's own fixture titles —
+    /// a rule title is model-facing prose written by whoever authors the
+    /// rule, and it reaches the author's screen as a heading.
+    #[test]
+    fn the_shipped_rule_titles_speak_the_authors_language_too() {
+        let titles = titles_of(crate::rules::load_all(None).0);
+        assert!(titles.len() >= 9, "every shipped rule should be titled: {titles:?}");
+        for (id, title) in &titles {
+            let lower = title.to_lowercase();
+            for word in INTERNAL_VOCABULARY {
+                assert!(!lower.contains(word), "rule {id}'s title speaks darkmux's own procedure word {word:?}: {title}");
+            }
+        }
+        // …and the fixture rendered against those real titles, not the
+        // test's own copies of them.
+        let (findings, mods, scope) = every_form_fixture();
+        let review = render_github_review(&findings, &mods, DIFF, &scope, Some("Advisory, not a merge gate."), &titles)
+            .review
+            .unwrap();
+        assert_no_internal_vocabulary(&review);
     }
 
     /// (#2310 P4b) The golden the brief asks for: one fixture set of
@@ -1717,18 +2288,41 @@ mod tests {
     /// `DARKMUX_DELIVER_GOLDEN_UPDATE=1 cargo test -p darkmux-crew --lib \
     ///  step_kinds::deliver_github_review::tests::golden_rendered_payload_covers_every_delivery_form`
     /// then review the diff before committing.
-    #[test]
-    fn golden_rendered_payload_covers_every_delivery_form() {
+    /// The fixture every delivery shape is read off — shared by the
+    /// golden and by the vocabulary conformance test below so the two can
+    /// never drift apart.
+    fn every_form_fixture() -> (Vec<FindingRecord>, Vec<GatedMod>, DeliverScope) {
         const CLAMP_KIT: &str =
             "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        // (#2310 delivery rewrite, rule 2) A gate-passed change on a rule
+        // that is confirmed by SEARCHING — the shape that was dropped live.
+        const UNION_KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,1 @@\n-function f() {\n+function f(): Status {\n";
         let findings = vec![
-            finding("sess-a/1", "src/a.ts", 2, "const x = 1;", "reimplements clamp()", None),
-            finding("sess-a/2", "src/other.ts", 5, "irrelevant", "unrelated change", None),
-            finding("sess-a/3", "src/a.ts", 2, "the cited line", "might duplicate an existing helper", None),
-            finding("sess-a/4", "src/a.ts", 2, "ev", "a gate-failed claim", None),
-            finding("sess-a/5", "src/mw.ts", 10, "14 endpoints use this middleware", "shared auth changed", Some("search")),
-            finding(
+            finding_of_rule("sess-a/1", Some("swallowed-error"), "src/a.ts", 2, "const x = 1;", "reimplements clamp()", None),
+            finding_of_rule("sess-a/2", Some("unnamed-predicate"), "src/other.ts", 5, "irrelevant", "unrelated change", None),
+            finding_of_rule(
+                "sess-a/3",
+                Some("unnamed-predicate"),
+                "src/a.ts",
+                2,
+                "the cited line",
+                "might duplicate an existing helper",
+                None,
+            ),
+            finding_of_rule("sess-a/4", Some("union-vs-enum"), "src/a.ts", 2, "ev", "a gate-failed claim", Some("search")),
+            finding_of_rule(
+                "sess-a/5",
+                Some("shared-symbol-callers"),
+                "src/mw.ts",
+                10,
+                "14 endpoints use this middleware",
+                "shared auth changed",
+                Some("search"),
+            ),
+            finding_of_rule(
                 "sess-a/6",
+                Some("existing-solution"),
                 "src/x.ts",
                 1,
                 "Status enum, Kind enum",
@@ -1739,7 +2333,24 @@ mod tests {
             // None` — planted so this golden isn't vacuous against the
             // `== Some(true)` -> `!= Some(false)` mutation (see the
             // packet report's mutation self-check).
-            finding("sess-a/7", "src/a.ts", 2, "ev", "a mod exists but nothing ever gated it", None),
+            finding_of_rule(
+                "sess-a/7",
+                Some("swallowed-error"),
+                "src/a.ts",
+                2,
+                "ev",
+                "a mod exists but nothing ever gated it",
+                None,
+            ),
+            finding_of_rule(
+                "sess-a/8",
+                Some("union-vs-enum"),
+                "src/a.ts",
+                1,
+                "function f() {",
+                "this union duplicates the Status enum",
+                Some("search"),
+            ),
         ];
         let mods = vec![
             // (#2310 P4b review, M-B) A REAL unified-diff kit, declared
@@ -1750,6 +2361,7 @@ mod tests {
             gated_mod("sess-a/2", "the patch text", Some(true)),
             gated_mod("sess-a/4", "kit text nobody sees", Some(false)),
             gated_mod("sess-a/7", "never-gated kit text nobody sees either", None),
+            gated_mod_kind("sess-a/8", UNION_KIT, Some("unified-diff"), Some(true)),
         ];
         let scope = DeliverScope {
             rules_run: vec!["unnamed-predicate".into(), "existing-solution".into()],
@@ -1760,8 +2372,131 @@ mod tests {
             not_attempted: vec!["architectural review".into()],
             errored: Vec::new(),
         };
+        (findings, mods, scope)
+    }
 
-        let outcome = render_github_review(&findings, &mods, DIFF, &scope, Some("Advisory, not a merge gate."));
+    /// (#2310 delivery rewrite, rule 1) Entries are grouped and headed by
+    /// the RULE — its title, tagged with its id — never by how the finding
+    /// was confirmed. The three procedure-shaped section headings this
+    /// module used to print are gone as organizers.
+    #[test]
+    fn entries_are_headed_by_the_rules_title_and_tagged_with_its_id() {
+        let findings = vec![
+            finding_of_rule(
+                "s/1",
+                Some("existing-solution"),
+                "src/x.ts",
+                1,
+                "Status enum",
+                "did you check whether the repo already has this",
+                Some("question"),
+            ),
+            finding_of_rule("s/2", Some("unnamed-predicate"), "src/a.ts", 2, "ev", "the condition has no name", None),
+        ];
+        let body = render(&findings, &[], DIFF, &DeliverScope::default(), None).review.unwrap().body;
+        assert!(
+            body.contains("**A new routine looks re-implemented rather than reused** `existing-solution`"),
+            "the rule's title heads its group, tagged with the id:\n{body}"
+        );
+        assert!(
+            body.contains("cannot be tested on its own_ `unnamed-predicate`"),
+            "a rule inside the tail section is headed the same way:\n{body}"
+        );
+        for gone in ["Worth enumerating", "**Questions:**", "Proposed changes outside the diff"] {
+            assert!(!body.contains(gone), "{gone:?} must not organize the review any more:\n{body}");
+        }
+    }
+
+    /// (#2310 delivery rewrite, rule 2) A gate-passed change renders as a
+    /// change whatever the rule's confirmation shape — a passed patch on a
+    /// SEARCH-confirmed rule was dropped entirely by the old form-first
+    /// branch, live.
+    #[test]
+    fn a_gate_passed_change_renders_whatever_shape_its_rule_is_confirmed_by() {
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x: Status = 1;\n";
+        let findings = vec![finding_of_rule(
+            "s/1",
+            Some("union-vs-enum"),
+            "src/a.ts",
+            2,
+            "const x = 1;",
+            "this union duplicates the Status enum",
+            Some("search"),
+        )];
+        let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "the passed change must ride out as a suggestion: {review:?}");
+        assert!(review.comments[0].body.contains("const x: Status = 1;"), "{}", review.comments[0].body);
+        let body = review.body;
+        let head = body
+            .find("**A new string-literal union or enum-like set may duplicate an existing one** `union-vs-enum`")
+            .unwrap_or_else(|| panic!("the rule heads a HEADLINE group:\n{body}"));
+        let entry = body.find("`src/a.ts:2`").unwrap_or_else(|| panic!("no entry:\n{body}"));
+        assert!(entry > head, "the entry sits under its rule's headline group:\n{body}");
+        assert!(!body.contains("Worth a double check"), "a passed change is never demoted to a lead:\n{body}");
+    }
+
+    /// (#2310 delivery rewrite, rule 1) A rule whose title cannot be
+    /// resolved falls back to its own id, and the scope line says so
+    /// rather than leaving one oddly-named section unexplained.
+    #[test]
+    fn an_unresolvable_rule_heads_its_group_by_id_and_the_scope_line_says_so() {
+        let findings =
+            vec![finding_of_rule("s/1", Some("a-rule-nobody-shipped"), "src/a.ts", 2, "ev", "a claim", None)];
+        let body = render(&findings, &[], DIFF, &DeliverScope::default(), None).review.unwrap().body;
+        assert!(body.contains("_a-rule-nobody-shipped_"), "the id is the fallback heading:\n{body}");
+        assert!(
+            body.contains("Titles unavailable for these rules: a-rule-nobody-shipped."),
+            "the scope line names it:\n{body}"
+        );
+    }
+
+    /// (PR #2398 review, item 4) darkmux's own procedure words, in their
+    /// UNAMBIGUOUS compound forms. The earlier list checked bare English
+    /// substrings — `unit`, `kit`, `confirm`, `dispatch` — which a
+    /// perfectly good author-facing sentence can contain honestly ("the
+    /// unit test", "a starter kit", "confirm the range"), so the check
+    /// would have failed on innocent prose and taught the next author to
+    /// weaken it. What is actually forbidden is darkmux naming its own
+    /// machinery to someone who has never heard of darkmux.
+    const INTERNAL_VOCABULARY: [&str; 7] =
+        ["search-confirmed", "mod-form", "question-form", "confirm form", "crawl unit", "the kit", "dispatch session"];
+
+    /// The rendered review — body AND inline comments — against
+    /// [`INTERNAL_VOCABULARY`].
+    fn assert_no_internal_vocabulary(review: &GithubReviewPayload) {
+        let mut spoken = review.body.clone();
+        for c in &review.comments {
+            spoken.push('\n');
+            spoken.push_str(&c.body);
+        }
+        let spoken = spoken.to_lowercase();
+        for word in INTERNAL_VOCABULARY {
+            assert!(!spoken.contains(word), "the review speaks darkmux's own procedure word {word:?}:\n{spoken}");
+        }
+    }
+
+    /// (#2310 delivery rewrite, rule 4) The rendered review — body AND
+    /// inline comments — speaks the AUTHOR's language. darkmux's own
+    /// procedure words never appear; the rule ID does, because it is the
+    /// author's handle for re-running the same check after a fix.
+    #[test]
+    fn the_rendered_review_carries_no_internal_procedure_vocabulary() {
+        let (findings, mods, scope) = every_form_fixture();
+        let review = render(&findings, &mods, DIFF, &scope, Some("Advisory, not a merge gate.")).review.unwrap();
+        assert_no_internal_vocabulary(&review);
+        assert!(review.body.contains("`union-vs-enum`"), "the rule id IS author-facing — it names what was violated");
+        assert!(review.body.contains("rules reviewed"), "the scope line's own author-meaningful counts stay");
+        assert!(review.body.contains("hunks covered"));
+    }
+
+    #[test]
+    fn golden_rendered_payload_covers_every_delivery_form() {
+        let (findings, mods, scope) = every_form_fixture();
+
+        let outcome = render(&findings, &mods, DIFF, &scope, Some("Advisory, not a merge gate."));
         let actual = serde_json::to_string_pretty(&outcome).unwrap();
 
         let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1789,8 +2524,17 @@ mod tests {
         // could pass this golden vacuously.
         assert_eq!(outcome.mode, "review");
         let review = outcome.review.unwrap();
-        assert_eq!(review.comments.len(), 1, "exactly one in-diff suggestion");
-        assert_eq!(review.comments[0].side.as_deref(), Some("RIGHT"));
+        assert_eq!(review.comments.len(), 2, "two in-diff suggestions — one on a mod-confirmed rule, one on a searched rule");
+        assert!(review.comments.iter().all(|c| c.side.as_deref() == Some("RIGHT")));
+        // (#2310 delivery rewrite, rule 2) The searched rule's passed
+        // change rides out as a suggestion, and heads its own group in the
+        // body — the shape the old form-first branch dropped entirely.
+        assert!(review.comments.iter().any(|c| c.body.contains("function f(): Status {")), "{review:?}");
+        assert!(
+            review.body.contains("**A new string-literal union or enum-like set may duplicate an existing one** `union-vs-enum`"),
+            "{}",
+            review.body
+        );
         assert!(review.body.contains("the patch text"), "mod-outside-diff");
         assert!(review.body.contains("might duplicate"), "no-mod double-check");
         assert!(review.body.contains("a gate-failed claim"), "gate-failed double-check");
@@ -1878,7 +2622,7 @@ mod tests {
             "<img src=x onerror=1>",
             None,
         )];
-        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert!(review.comments.is_empty(), "no mod, so nothing is inline: {review:?}");
         assert!(
@@ -1908,7 +2652,7 @@ mod tests {
             not_attempted: vec!["architectural review\n### also forged".to_string()],
             ..Default::default()
         };
-        let out = render_github_review(&[], &[], DIFF, &scope, None);
+        let out = render(&[], &[], DIFF, &scope, None);
         assert_eq!(out.mode, "degraded");
         let body = out.review.unwrap().body;
         assert_eq!(
@@ -1934,7 +2678,7 @@ mod tests {
         let findings = vec![finding("/1", "", 0, "ev", "claim", None)];
         // `finding()` splits the key on `/`, so this is the empty-key
         // shape reaching `display()` through the real path.
-        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let body = out.review.unwrap().body;
         assert!(!body.contains("``"), "no bare double-backtick artifact in a posted body:\n{body}");
     }
