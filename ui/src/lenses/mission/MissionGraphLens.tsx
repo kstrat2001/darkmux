@@ -59,6 +59,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
+import { useDay } from "../../hooks/useDay";
 import { getSource } from "../../lib/source";
 import { WorkStatus, workStatusKind } from "../../components/WorkStatus";
 import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
@@ -389,6 +390,38 @@ export function MissionGraphLens({
   // one liveness indicator.
   const flowTailQuery = useQuery<FlowRecord[]>({ queryKey: queryKeys.flowTail(today), queryFn: skipToken });
 
+  // (C2) The static-build record source. All three queries above are
+  // `enabled: daemonBacked`, so on a daemon-less build this lens folded an
+  // EMPTY record set: the graph rendered from the committed fixture map
+  // while the shared events column beside it read "0 EVENTS" — for a day
+  // the page had already downloaded whole. That is the same defect U4-1
+  // fixed for `#lens=runs`/`machine`/`console`, and it survived there
+  // because this lens carries its own record plumbing rather than going
+  // through `useRouteRecords`.
+  //
+  // One rule, the same one U4-1 settled on: a static build has ONE
+  // committed file and it is the answer on EVERY route. `useDay(null)`
+  // resolves it off `queryKeys.staticFlowSrc`, the cache slot `App.tsx`
+  // already fills, so this costs no extra request; on a daemon build it
+  // returns `null` and this source contributes nothing.
+  //
+  // Keyed on a cheap SIGNATURE, never on the array's identity — the same
+  // rule `usePlaybackTransport` states for its own range memo, and here it
+  // is load-bearing rather than tidy. `useDay`'s memo lists `source` in its
+  // dependencies and `getSource()` builds a fresh object literal on every
+  // call, so `staticDay.records` is a NEW array on every render even when
+  // the day has not changed. Feeding that identity into `allRecords` fed a
+  // new `events` into `onEvents`, which set state in `App.tsx`, which
+  // re-rendered this lens — an infinite loop that pinned a core at 100% and
+  // hung the suite with no failing assertion anywhere. (The root cause is
+  // `useDay`'s unstable return; fixing that touches every consumer and is
+  // its own change.)
+  const staticDay = useDay(null);
+  const staticDayRaw = daemonBacked ? null : staticDay.records;
+  const staticDaySig = staticDayRaw ? `${staticDayRaw.length}:${staticDayRaw[0]?.ts ?? ""}:${staticDayRaw[staticDayRaw.length - 1]?.ts ?? ""}` : "";
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- the signature IS the dependency; see above.
+  const staticDayRecords = useMemo(() => staticDayRaw, [staticDaySig]);
+
   const [ownedBy, setOwnedBy] = useState<string | null>(null);
   useEffect(() => {
     setOwnedBy(null);
@@ -440,6 +473,7 @@ export function MissionGraphLens({
     if (flowMissionQuery.data?.ok) sources.push(...asRecordArray(flowMissionQuery.data.data));
     if (flowTodayQuery.data?.ok) sources.push(...asRecordArray(flowTodayQuery.data.data));
     if (flowTailQuery.data?.length) sources.push(...flowTailQuery.data);
+    if (staticDayRecords?.length) sources.push(...staticDayRecords);
     const seen = new Set<string>();
     const out: FlowRecord[] = [];
     for (const r of sources) {
@@ -450,7 +484,7 @@ export function MissionGraphLens({
       out.push(r);
     }
     return out;
-  }, [flowMissionQuery.data, flowTodayQuery.data, flowTailQuery.data]);
+  }, [flowMissionQuery.data, flowTodayQuery.data, flowTailQuery.data, staticDayRecords]);
 
   // Whether the SERVER capped its own `/flow-mission/:id` response
   // (`MAX_CATALOG_RECORDS`) — see `bodyTruncated`'s own doc. `/flow/<today>`

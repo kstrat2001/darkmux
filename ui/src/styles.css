@@ -78,10 +78,70 @@
   --severe: #f97316;
   --bad: #f56565;
   --accent-dim: #3aa89f;
+
+  /* (U2-3) Panel shades, promoted. `--panel` existed only as a FALLBACK —
+     `var(--panel, #12141c)` and `var(--line, #232838)` on
+     `.eventlog__collapse`, referencing two custom properties this sheet
+     never defined. A fallback that is always taken is not a fallback; it is
+     a literal wearing a token's name, and it reads as "this token exists"
+     to everyone who greps for it. `--line`'s own fallback was
+     byte-identical to `--border`, so that reference now names `--border`
+     directly rather than a second token meaning the same thing.
+
+     `--panel-2`/`-3`/`-4` are the three panel shades this sheet repeated as
+     literals — 11, 6 and 4 times — ordered light-to-dark-neutral rather
+     than named for any one consumer, because each is used across several
+     unrelated lenses. */
+  --panel: #12141c;
+  --panel-2: #131826;
+  --panel-3: #1c1c22;
+  --panel-4: #1a2030;
+
+  /* (U2-3) IN-FLIGHT, and deliberately not `--warn`. There were three
+     ambers outside this block: `#ffd166` (a session bar that is RUNNING,
+     plus the mission lens's own `--ml-run`), `#ffb86b` (stale panels,
+     canceled bars, lab warnings) and `--warn` itself. The last two are the
+     same concept and are now one; the first is not — a run in progress is
+     not a warning, and collapsing it would say so on every fleet screen. */
+  --run: #ffd166;
+
+  /* (U2-3) The one raw rgba outside this block (`.phasegroup.s-complete`'s
+     border). Promoted as-is rather than mixed from `--good`: its hue is a
+     few points off (126,231,135 vs 74,222,128) and a silent correction is
+     a visual change hiding inside a refactor. Named here so the next person
+     can decide that on purpose. */
+  --good-soft: rgba(126, 231, 135, 0.45);
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* (U3-6) ONE mechanism for "this number's subject is ambiguous against a
+   number on another surface". The mission graph's per-step badge is the STEP
+   SPAN (setup + model work + gate); the session drill-in's WALL CLOCK is the
+   dispatch's own `wall_ms`. The same step read 10:36 on one and 10:07 on the
+   other, unlabeled, and an operator had no way to know they described
+   different things.
+
+   Generated content rather than a text node, on purpose: the parity goldens
+   (`tests/parity/lib/extract-graph.js` reads `.mn-step-meter`'s textContent;
+   `goldens/session-task-list.txt` compares the session stage's innerText
+   byte-for-byte) are a FROZEN spec, and the session lens's own pane labels
+   already established the CSS-generated form as this project's answer to
+   "a label that should be seen but must not enter the golden".
+
+   `attr()` reads only the ORIGINATING element's own attribute, so
+   `data-hint` sits on the element whose pseudo renders it — the badge itself
+   in the graph, the `.ml` metric label in the session tile. Both places pair
+   it with a `title` carrying the long form. */
+[data-hint]::after {
+  content: " " attr(data-hint);
+  margin-left: 4px;
+  opacity: 0.62;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
 }
 
 html,
@@ -805,9 +865,9 @@ body {
   height: 20px;
   padding: 0;
   line-height: 1;
-  background: var(--panel, #12141c);
+  background: var(--panel);
   color: var(--dim);
-  border: 1px solid var(--line, #232838);
+  border: 1px solid var(--border);
   border-radius: 4px;
   cursor: pointer;
   font: 600 12px/1 var(--font-mono);
@@ -1201,7 +1261,7 @@ body {
    strip had before it did anything on tap (the operator's own finding:
    "tapping it flashes the active style but does nothing" — now it does
    something, and the flash is a deliberate response to that, not a
-   leftover). Distinct from `.sel`'s own `#1a2030` background so a tap
+   leftover). Distinct from `.sel`'s own `var(--panel-4)` background so a tap
    reads as a discrete press, not a re-selection. */
 .eventlog__rec.eventlog__rec--stripback:active {
   background: #232a3d;
@@ -1452,7 +1512,7 @@ body {
   outline-offset: -2px;
 }
 .eventlog__rec.sel {
-  background: #1a2030;
+  background: var(--panel-4);
   border-left: 2px solid var(--accent);
   color: var(--fg);
 }
@@ -1476,7 +1536,7 @@ body {
    were absent from the port until the operator noticed — an inline SVG adds
    no text to `innerText`, so the parity goldens matched with them missing. */
 .preview-text {
-  color: var(--muted);
+  color: var(--dim);
   font-style: italic;
 }
 .eventlog__rec.sel .preview-text {
@@ -1488,7 +1548,7 @@ body {
   width: 13px;
   height: 13px;
   margin-right: 2px;
-  color: var(--muted);
+  color: var(--dim);
 }
 .aico svg {
   width: 13px;
@@ -1497,7 +1557,7 @@ body {
 .aico.act-tool-call { color: var(--accent); }
 .aico.act-reasoning { color: #8ab4f8; }
 .aico.act-dispatch-start,
-.aico.act-dispatch-end { color: #4ade80; }
+.aico.act-dispatch-end { color: var(--good); }
 .aico.act-dispatch-error { color: var(--bad); }
 .aico.act-compaction { color: #c084fc; }
 .aico.act-checkpoint { color: #c084fc; }
@@ -1505,7 +1565,7 @@ body {
 .aico.act-note { color: var(--accent); }
 .aico.act-feedback { color: #8ab4f8; }
 .aico.act-machine-online,
-.aico.act-machine-offline { color: var(--muted); }
+.aico.act-machine-offline { color: var(--dim); }
 
 .eventlog__empty {
   color: var(--dim);
@@ -1596,7 +1656,7 @@ body {
   border-radius: 8px;
   padding: 12px 16px;
   min-width: 200px;
-  background: #131826;
+  background: var(--panel-2);
 }
 
 .fleet-card__name {
@@ -1666,8 +1726,8 @@ body {
 }
 .labnotice {
   font: calc(12px * var(--fs-scale))/1.5 var(--font-mono);
-  color: #ffb86b;
-  border: 1px solid #ffb86b;
+  color: var(--warn);
+  border: 1px solid var(--warn);
   border-radius: 6px;
   padding: 9px 12px;
   margin-top: 10px;
@@ -1686,7 +1746,7 @@ body {
   padding: 6px 10px;
   border-radius: 14px;
   border: 1px solid var(--border);
-  background: #131826;
+  background: var(--panel-2);
   color: var(--dim);
   cursor: pointer;
 }
@@ -1701,7 +1761,7 @@ body {
 .runchip.on {
   border-color: var(--accent);
   color: var(--accent);
-  background: #1c1c22;
+  background: var(--panel-3);
 }
 .runchipn {
   opacity: 0.7;
@@ -1726,8 +1786,8 @@ body {
   color: var(--fg);
 }
 .runkind.lab {
-  color: #5af0a3;
-  border-color: #5af0a3;
+  color: var(--good);
+  border-color: var(--good);
 }
 .labrunrow {
   display: flex;
@@ -1736,7 +1796,7 @@ body {
   padding: 10px 11px;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: #131826;
+  background: var(--panel-2);
   cursor: pointer;
   margin-bottom: 6px;
 }
@@ -1767,7 +1827,7 @@ body {
   position: absolute;
   right: 11px;
   top: 10px;
-  color: var(--dim, #6b7590);
+  color: var(--dim);
   font-size: calc(15px * var(--fs-scale));
   line-height: 1;
   transition: transform 120ms ease, color 120ms ease;
@@ -1816,15 +1876,15 @@ body {
 }
 .labdiffline {
   font: calc(11px * var(--fs-scale))/1.4 var(--font-mono);
-  color: #5af0a3;
+  color: var(--good);
   padding: 2px 0 8px 6px;
-  border-left: 2px solid #5af0a3;
+  border-left: 2px solid var(--good);
   margin: -2px 0 6px 4px;
   overflow-wrap: anywhere;
 }
 .labdiffline.warn {
-  color: #ffb86b;
-  border-left-color: #ffb86b;
+  color: var(--warn);
+  border-left-color: var(--warn);
 }
 .labdiffline.dim {
   color: var(--dim);
@@ -1848,7 +1908,14 @@ body {
   color: var(--dim);
   white-space: nowrap;
 }
-.wstatus.is-running { color: var(--run, var(--accent)); border-color: var(--run, var(--accent)); }
+/* (U2-3) `var(--accent)` directly. This named `--run`, which THIS SHEET
+   NEVER DEFINED, so the chip has always rendered the accent fallback.
+   Naming what it renders is the whole fix — and it is deliberately NOT
+   pointed at the new `--run` token, because that would silently repaint
+   every running chip amber. Flagged rather than changed: a running session
+   is a teal CHIP here and an amber BAR on the activity lane, which is a
+   real inconsistency and an operator call, not a refactor's to make. */
+.wstatus.is-running { color: var(--accent); border-color: var(--accent); }
 .wstatus.is-done { color: var(--good); border-color: var(--good); }
 .wstatus.is-error { color: var(--bad); border-color: var(--bad); }
 .wstatus.is-stopped { color: var(--warn); border-color: var(--warn); }
@@ -1888,7 +1955,7 @@ body {
   outline-offset: 1px;
 }
 .labtaskcard {
-  background: #1c1c22;
+  background: var(--panel-3);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px 14px;
@@ -1964,7 +2031,7 @@ body {
   padding: 4px 8px;
   border-radius: 6px;
   border: 1px solid var(--border);
-  background: #131826;
+  background: var(--panel-2);
   color: var(--dim);
   cursor: pointer;
 }
@@ -1982,7 +2049,7 @@ body {
 .pc-tok.on {
   border-color: var(--accent);
   color: var(--accent);
-  background: #1c1c22;
+  background: var(--panel-3);
 }
 /* `.pc-tok-anchor` is the enum token's positioning context — same
    anchor-wraps-trigger-and-popup shape `CatalogPanel.tsx`'s own
@@ -2020,7 +2087,7 @@ body {
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: #131826;
+  background: var(--panel-2);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
 }
 .pc-tok-menu-option {
@@ -2036,7 +2103,7 @@ body {
 }
 .pc-tok-menu-option:hover,
 .pc-tok-menu-option:focus-visible {
-  background: #1c1c22;
+  background: var(--panel-3);
   color: var(--fg);
   outline: none;
 }
@@ -2063,10 +2130,43 @@ body {
   opacity: 0.55;
 }
 
+/* (U2-4) On a sparse day the console panel ended a third of the way down a
+   1456px viewport and left the rest of the column blank, beside an events
+   column that stretches the full height — which reads as a broken layout
+   rather than as "there is not much output today".
+
+   The panel GROWS to fill the stage instead. `flex: 1 1 auto` with the
+   default `min-height: auto` means it can still never be SHORTER than its
+   content, so a long `doctor` run expands the stage and scrolls the page
+   exactly as it does today; only the short case changes. Scoped by
+   `:has(> .panelwrap)` because the console lens is the only one that
+   renders a panel as a direct child of the stage (its siblings there are
+   just the panel chips), so no other lens's layout is touched.
+
+   Desktop only: below 768px `.app-shell__content` is `display: block`, the
+   events column stacks underneath, and there is no empty column to fill. */
+@media (min-width: 769px) {
+  .app-shell__stage:has(> .panelwrap) {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .app-shell__stage > .panelwrap {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+  }
+  .app-shell__stage > .panelwrap > .panelout,
+  .app-shell__stage > .panelwrap > .panelerr,
+  .app-shell__stage > .panelwrap > .panelwarn {
+    flex: 1 1 auto;
+  }
+}
+
 .panelwrap {
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: #131826;
+  background: var(--panel-2);
   margin-top: 10px;
   overflow: hidden;
 }
@@ -2077,7 +2177,7 @@ body {
   gap: 10px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
-  background: #1c1c22;
+  background: var(--panel-3);
   font: calc(11px * var(--fs-scale)) var(--font-mono);
   color: var(--dim);
 }
@@ -2089,7 +2189,7 @@ body {
   flex: 1 1 auto;
 }
 .panelchrome .pc-stale {
-  color: #ffb86b;
+  color: var(--warn);
 }
 .panelchrome .pc-manual {
   color: #2a8a96;
@@ -2097,7 +2197,7 @@ body {
 .pcbtn {
   font: 600 calc(11px * var(--fs-scale)) var(--font-mono);
   color: var(--dim);
-  background: #131826;
+  background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 4px 9px;
@@ -2260,7 +2360,7 @@ body {
   top: calc(100% + 6px);
   left: 0;
   z-index: 60;
-  background: #131826;
+  background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 5px;
@@ -2391,7 +2491,7 @@ body {
      fit only when there is not, so this can never overflow again regardless
      of how large the totals get. */
   font: 700 min(calc(48px * var(--fs-scale)), 13vw)/1 var(--font-mono);
-  color: #5af0a3;
+  color: var(--good);
   letter-spacing: 0.01em;
 }
 .savlead.cloud .savnum {
@@ -2549,7 +2649,7 @@ body {
   color: var(--fg);
 }
 .savc.gen .scv {
-  color: #5af0a3;
+  color: var(--good);
 }
 .savc.uncls .scv {
   color: var(--dim);
@@ -2566,7 +2666,7 @@ body {
   padding-top: 8px;
   border-top: 1px solid var(--border);
   font: calc(12px * var(--fs-scale)) var(--font-mono);
-  color: #5af0a3;
+  color: var(--good);
 }
 .hybnote .hybpre {
   color: var(--fg);
@@ -2600,7 +2700,7 @@ body {
   width: 248px;
   display: flex;
   flex-direction: column;
-  background: #131826;
+  background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 16px;
@@ -2860,7 +2960,7 @@ body {
   position: relative;
   flex: 1;
   height: 28px;
-  background: #131826;
+  background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 4px;
   overflow: hidden;
@@ -2882,15 +2982,39 @@ body {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* (U1-3) A tap floor for the activity lane's session bars on a phone. These
+   are absolutely positioned by PERCENT inside their lane's track, so a
+   sub-minute session on a 24-hour window painted a 2px sliver — and it is a
+   `role="button"` that navigates to `#dispatch=<sid>`. 2px is not a tap
+   target at any precision a thumb has.
+
+   The bar's own painted box, not a `::after` extension: the track is
+   `overflow: hidden` (so a vertical extension is clipped) and every bar in a
+   lane is a sibling in the same stacking context (so a horizontal extension
+   would paint OVER the neighbor it was meant to sit beside, and steal its
+   taps). Widening the box keeps the drawing and the hit region the same
+   shape, which is what makes the result predictable.
+
+   The residual, named: two back-to-back sub-minute sessions in one lane
+   still overlap once both are widened, and the later one paints on top. What
+   this guarantees is that every bar owns its own START — the point a finger
+   aims at — which `tests/e2e/phone-tap-targets.spec.js` measures directly.
+   Phone-only: on a desktop pointer the sliver is already hittable, and
+   widening there would distort a density read the operator uses at a glance. */
+@media (max-width: 768px) {
+  .sbar {
+    min-width: 24px;
+  }
+}
 .sbar.run {
-  background-color: #ffd166;
-  box-shadow: 0 0 6px #ffd166;
+  background-color: var(--run);
+  box-shadow: 0 0 6px var(--run);
 }
 .sbar.done {
-  background-color: #5af0a3;
+  background-color: var(--good);
 }
 .sbar.canceled {
-  background-color: #ffb86b;
+  background-color: var(--warn);
 }
 .sbar.err {
   background-color: var(--error);
@@ -3024,7 +3148,14 @@ body {
    capped at 45% so a pathological key can never squeeze `.rv__val` out of
    the row. Short keys are unaffected: they still occupy exactly 116px, so
    the column stays aligned for every ordinary record. */
-.rv__key { flex: 0 0 auto; min-width: 116px; max-width: 45%; color: var(--dim); font-size: calc(11px * var(--fs-scale));
+/* (C1) `flex: 0 0 116px`, not `0 0 auto` + `min-width`. With `auto` a key
+   between 116px and the 45% cap sized its OWN column — `cpu speed limit pct`
+   measured 148px and put its value at +158 while every neighbor sat at +126,
+   so the "column" was a column only for keys that happened to be short. The
+   basis is now fixed and `overflow-wrap: anywhere` wraps the long name
+   INSIDE it. `max-width: 45%` survives as the narrow-panel guard it was
+   written to be (it binds only below ~258px of panel, where 45% < 116px). */
+.rv__key { flex: 0 0 116px; max-width: 45%; color: var(--dim); font-size: calc(11px * var(--fs-scale));
            white-space: normal; overflow-wrap: anywhere; }
 .rv__val { flex: 1; min-width: 0; word-break: break-word; }
 
@@ -3034,7 +3165,7 @@ body {
 .rv__nil  { color: var(--dim); }
 .rv__time { color: var(--fg); }
 .rv__bool { color: var(--dim); }
-.rv__bool.on { color: var(--good, #4ade80); }
+.rv__bool.on { color: var(--good); }
 .rv__chip { display: inline-block; padding: 0 6px; border-radius: 4px;
             background: rgba(255,255,255,.06); color: var(--fg); font-size: calc(11px * var(--fs-scale)); }
 
@@ -3057,6 +3188,13 @@ body {
     width: auto;
     flex: 1 1 100%;
     white-space: normal;
+    /* (M1) The stack above only happens if the key can actually TAKE the
+       row. #2367 added `max-width: 45%` to the desktop rule for its own
+       clip and this block did not revisit it, so `flex: 1 1 100%` resolved
+       against a 45% cap: the key stayed beside its value on a phone and
+       `session id` wrapped mid-token. Overriding flex without overriding
+       every constraint that feeds the same axis is the whole bug. */
+    max-width: none;
   }
 }
 
@@ -3074,9 +3212,9 @@ body {
    machine icon was absent entirely, invisible to the goldens because neither
    a class nor an SVG contributes text. See ReadyHeadline.tsx. */
 .rdot { font-weight: 700; }
-.rdot.ok { color: var(--good, #4ade80); }
+.rdot.ok { color: var(--good); }
 .mco { white-space: nowrap; }
-.mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim, var(--accent)); }
+.mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim); }
 
 /* (#238, ported) Reduced-motion drops the pulse. Live stays distinguishable
    WITHOUT motion — the badge keeps its color, the ● glyph and the word. */
@@ -3364,7 +3502,7 @@ body {
    is "everything else" (#1821): derived, never drawn as a band, visible as the
    difference. */
 .mm-gauge-inner-track {
-  stroke: #1a2030;
+  stroke: var(--panel-4);
 }
 .mm-gauge-inner-val {
   stroke: var(--fg);
@@ -3832,7 +3970,7 @@ body {
 .mm-row-track {
   position: relative;
   height: 20px;
-  border: 1px solid #1a2030;
+  border: 1px solid var(--panel-4);
   border-radius: 5px;
   overflow: hidden;
   background:
@@ -4142,7 +4280,7 @@ body {
   flex: 0 0 auto;
 }
 .labfeedtag {
-  color: var(--accent-dim, var(--accent));
+  color: var(--accent-dim);
   flex: 0 0 auto;
   font-weight: 600;
 }
@@ -4551,7 +4689,7 @@ body {
   max-width: 92vw;
   max-height: 84vh;
   overflow: auto;
-  background: #131826;
+  background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 18px 20px;
@@ -4790,8 +4928,8 @@ body {
    no analog here. */
 .missionlens {
   --ml-bg2: #131316;
-  --ml-panel: #1c1c22;
-  --ml-run: #ffd166;
+  --ml-panel: var(--panel-3);
+  --ml-run: var(--run);
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -5145,7 +5283,7 @@ body {
   color: var(--ml-run);
 }
 .missionlens .phasegroup.s-complete {
-  border-color: rgba(126, 231, 135, 0.45);
+  border-color: var(--good-soft);
 }
 .missionlens .phasegroup.s-error {
   border-color: var(--bad);
@@ -5339,7 +5477,7 @@ body {
   border-radius: 3px;
 }
 .missionlens .steprow.selected {
-  background: #1a2030;
+  background: var(--panel-4);
   border-radius: 4px;
   color: var(--fg);
 }
@@ -5564,6 +5702,19 @@ body {
      never clips; the clip is the wide-viewport backstop only. */
   overflow: hidden;
 }
+/* (U3-6) The generated "step" label is suppressed INSIDE a canvas node's own
+   step row, and only there. `.mnode` cards are laid out at a measured fixed
+   width and their `.mn-step-meter` already ellipsizes (`overflow: hidden`),
+   so the label was not free — it cost the badge beside it: `40k tok` clipped
+   to `40k t`, `10.0k tok` to `10.0`. Trading a real measurement for a label
+   about a different measurement is a worse screen than the one the label was
+   fixing. The `title` still carries the full distinction on this surface,
+   and the TIMELINE renderer (`.tlt-step` — the phone's own view of the same
+   rows, and the one with a full-width row to spend) keeps the visible
+   label, as does the session lens's WALL CLOCK tile. */
+.missionlens .mnode .steprow .mn-step-meter [data-hint]::after {
+  content: none;
+}
 /* (#2269) A finished step's (or task's) wall time — the pulse is gone, the
    number stays, muted so the live pulse still reads as the loud one. */
 .missionlens .mn-step-meter .wall {
@@ -5652,14 +5803,14 @@ body {
    who can read what broke can file something useful; a blank page cannot be
    reported at all. */
 .lenscrash {
-  border: 1px solid var(--bad, #e5484d);
+  border: 1px solid var(--bad);
   border-radius: 6px;
   padding: 16px;
   max-width: 70ch;
   font: calc(12px * var(--fs-scale))/1.6 var(--font-mono);
 }
 .lenscrash__title {
-  color: var(--bad, #e5484d);
+  color: var(--bad);
   font-weight: 700;
   margin-bottom: 8px;
 }
@@ -5711,7 +5862,7 @@ body {
   display: block;
 }
 .mm-gauge-fill-compact {
-  stroke: var(--accent, var(--good));
+  stroke: var(--accent);
 }
 /* (#2122) Band-threshold coloring for a compact gauge's fill — one class
    per severity (`Meter.tsx`'s `bandLevelClass`), overriding whatever
@@ -5818,7 +5969,7 @@ body {
   max-height: min(75vh, 620px);
   display: flex;
   flex-direction: column;
-  background: var(--bg, #0b0b0d);
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 16px;
@@ -6376,7 +6527,7 @@ body {
     background: var(--dim);
   }
   .phone-drawer__dot--live {
-    background: var(--accent, var(--good));
+    background: var(--accent);
   }
   .phone-drawer__dot--reconnecting {
     background: var(--warn);

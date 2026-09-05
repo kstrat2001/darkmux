@@ -118,6 +118,36 @@ describe("SessionReplay", () => {
     expect(document.querySelector('[data-act="disclose-prompt"]')).not.toBeInTheDocument();
   });
 
+  it("(U3-6) names WALL CLOCK as MODEL time, so it cannot be read as the mission step's span", async () => {
+    // The mission graph's per-step badge is the STEP SPAN (setup + the
+    // model's work + the gate); this tile is the dispatch's own `wall_ms`.
+    // On a real mission the same step read 10:36 there and 10:07 here, and
+    // neither screen said why. `StepRow.test.tsx` asserts the other half.
+    //
+    // Same mechanism on both surfaces: a `data-hint` short label rendered by
+    // one CSS rule (so it never enters `textContent`, and
+    // `goldens/session-task-list.txt` stays byte-identical) plus a `title`
+    // spelling the span out.
+    stubSession();
+    renderReplay("s-disc");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    const tiles = [...document.querySelectorAll('.metrics[data-scope="system"] .met')];
+    const wall = tiles.find((t) => t.querySelector(".ml")?.textContent === "WALL CLOCK");
+    expect(wall, "the WALL CLOCK tile").toBeTruthy();
+    expect(wall?.querySelector(".ml")?.getAttribute("data-hint")).toBe("model time");
+    const title = wall?.getAttribute("title") ?? "";
+    expect(title).toContain("model time");
+    // It has to name what it EXCLUDES, or the label is just another word.
+    expect(title).toContain("step");
+
+    // No other tile borrowed the hint — this is a distinction, not decoration.
+    expect(tiles.filter((t) => t.querySelector(".ml")?.hasAttribute("data-hint")).length).toBe(1);
+
+    // And the golden's text is untouched.
+    expect(wall?.textContent).not.toContain("model time");
+  });
+
   it("(#1973) separates MODEL metrics from SYSTEM metrics into distinct panes", async () => {
     // The operator question that produced this: reading `model (lms)` beside
     // TURNS/TOKENS/WALL CLOCK, it was not knowable which numbers described the

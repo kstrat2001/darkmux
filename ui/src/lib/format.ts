@@ -14,7 +14,7 @@
  */
 
 /** THE duration formatter — `M:SS`, rolling over to `H:MM:SS` past an hour.
- * Floored, never negative.
+ * Floored, never negative, and {@link MISSING} for a non-finite input.
  *
  * (U3-7/U5-2) There were TWO: this one (`fmtElapsed`, from
  * `lenses/mission/graph.ts`, itself `mission-graph.html`'s own) and a
@@ -28,7 +28,19 @@
  * Kept HERE rather than in `graph.ts` because it is not mission-graph
  * vocabulary — the run detail, the scrubber clock and the step rows all
  * format the same concept. */
+export const MISSING = "\u2014";
+
 export function fmtElapsed(ms: number): string {
+  // (C4) A duration that could not be COMPUTED is not a duration of zero.
+  // `NaN` reaches here from production: `lenses/session/sessionRun.ts`'s
+  // `runWallMs` falls back to `T(close.ts) - startTs`, and an unparsable
+  // `ts` subtracts to NaN — which used to render "0:00", asserting that a
+  // run took no time. The rest of that same tile row (TURNS, TOKENS IN,
+  // CTX) already renders "—" for an absent number; this joins it.
+  // A NEGATIVE duration still clamps to 0:00: it is computable, just skewed
+  // (a terminal timestamped before its own start), and the surrounding code
+  // already treats that as zero rather than unknown.
+  if (!Number.isFinite(ms)) return MISSING;
   const clamped = !ms || ms < 0 ? 0 : ms;
   const s = Math.floor(clamped / 1000);
   const m = Math.floor(s / 60);

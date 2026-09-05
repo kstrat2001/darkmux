@@ -16,12 +16,27 @@ import { fmtElapsed } from "../../lib/format";
  * the aggregate level — see that type's own doc. */
 type MeterLike = Omit<StepMeter, "tools" | "wallMs"> & { tools?: number; wallMs?: number };
 
+/** (U3-6) What this badge's duration actually measures, spelled out. The
+ * number here is the STEP SPAN — `stepStartMs` → `stepEndMs`, which brackets
+ * setup, the model's own work, and the gate around it. The session drill-in's
+ * WALL CLOCK tile is a NARROWER quantity, the dispatch's own `wall_ms`, so
+ * the same step legitimately reads 10:36 here and 10:07 there. Neither screen
+ * used to say so; both do now, through the same `data-hint` + `title` pair.
+ *
+ * `data-hint` rather than a text node on purpose: `tests/parity/lib/
+ * extract-graph.js` reads `.mn-step-meter`'s `textContent` into the frozen
+ * `goldens/mission-graph-*.txt`, and the session lens's own pane labels
+ * already establish the CSS-generated form as this project's answer to
+ * "a label that should be seen but not enter the golden". */
+const STEP_TIME_HINT = "step";
+const STEP_TIME_TITLE = "step time — the whole step span: setup, model work and gate. The session drill-in's WALL CLOCK is the model's own run, and reads shorter.";
+
 export function StepMeterEl({ meter }: { meter: MeterLike | undefined }) {
   if (!meter || !meter.show) return null;
   const children: ReactNode[] = [];
   if (meter.generating) {
     children.push(
-      <span key="g" className="gen">
+      <span key="g" className="gen" data-hint={STEP_TIME_HINT} title={STEP_TIME_TITLE}>
         <span className="genpulse" />
         {meter.elapsedMs ? fmtElapsed(meter.elapsedMs) : "live"}
       </span>,
@@ -30,7 +45,7 @@ export function StepMeterEl({ meter }: { meter: MeterLike | undefined }) {
   if (!meter.generating && meter.wallMs) {
     // (#2269) Finished: the pulse is gone, so the wall time stands alone.
     children.push(
-      <span key="w" className="wall" title="wall time">
+      <span key="w" className="wall" data-hint={STEP_TIME_HINT} title={STEP_TIME_TITLE}>
         {fmtElapsed(meter.wallMs)}
       </span>,
     );

@@ -205,7 +205,27 @@ export function MissionCanvas({
     if (!el) return;
     const fit = () => {
       const top = el.getBoundingClientRect().top + window.scrollY;
-      const h = Math.max(240, window.innerHeight - top);
+      // (operator, 2026-09-05) The viewport's bottom is not the CONTENT's
+      // bottom on a phone: the last 58px belong to the collapsed phone
+      // drawer's tab bar, which is fixed. #2058 already knew the canvas must
+      // not run past the fold and stopped exactly one bar short of being
+      // right — the zoom controls and the minimap, which React Flow pins to
+      // the canvas's own bottom edge, ended up half under "Machine info |
+      // Events" with no scroll position that could free them (an absolutely
+      // positioned control cannot be scrolled out from under a fixed bar,
+      // which is what separates this from an ordinary flow element that
+      // happens to sit low on screen).
+      //
+      // The inset is READ from `.app-shell`'s own resolved `padding-bottom`
+      // rather than restated here. That padding is the ONE rule every other
+      // lens already sizes to (`styles.css`'s phone block, `calc(58px +
+      // env(safe-area-inset-bottom))`), and `getComputedStyle` resolves the
+      // `calc` and the safe-area inset to real pixels — so this cannot drift
+      // from the bar's actual height, and it is exactly `0` on a desktop
+      // where that rule does not apply, leaving desktop untouched.
+      const shell = el.closest(".app-shell");
+      const inset = shell ? parseFloat(getComputedStyle(shell).paddingBottom) || 0 : 0;
+      const h = Math.max(240, window.innerHeight - top - inset);
       el.style.height = `${h}px`;
     };
     fit();
