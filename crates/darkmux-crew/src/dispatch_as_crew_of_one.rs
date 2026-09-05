@@ -588,7 +588,7 @@ mod tests {
     /// the "dispatch() itself failed" harness path) — mirroring exactly
     /// what `DispatchInternalStepKind::run` produces when
     /// `config.preserve_dispatch_result` is set (which `build_graph` always
-    /// sets). `residency()` returns a FIXED `Placement` (independent of
+    /// sets). `seat()` returns a FIXED `Placement` (independent of
     /// role/profile resolution — that machinery is `resolve_local_placement`'s
     /// own, unit-tested implicitly by every existing mission/coder-phase/
     /// review caller of the REAL `DispatchInternalStepKind`; this fake
@@ -633,14 +633,17 @@ mod tests {
             Ok(StepOutcome { output, flow_records: Vec::new() })
         }
 
-        fn residency(
+        /// (#2394) A LOCAL model seat, said explicitly — this fixture
+        /// stands in for a real `dispatch.internal` and must be wave-planned
+        /// like one.
+        fn seat(
             &self,
             _step: &crate::types::Step,
             _task: &crate::types::Task,
             _input: &BTreeMap<String, String>,
             _ctx: &crate::step_kinds::StepRunCtx,
-        ) -> Option<Placement> {
-            Some(self.placement.clone())
+        ) -> crate::step_kinds::SeatClaim {
+            crate::step_kinds::SeatClaim::LocalModel(self.placement.clone())
         }
     }
 

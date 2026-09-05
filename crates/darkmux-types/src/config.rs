@@ -142,7 +142,19 @@ use std::path::Path;
 //           whose absence is a real behavior this one always has a value.
 //           `Option<u64>`, lenient-on-read: an older binary ignores it and
 //           runs unbounded, exactly as it did before.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.20";
+//   1.21 (#2394): additive `runtime.dispatch_free_concurrency` — how many
+//           DISPATCH-FREE steps (`procedural.shell`, `procedural.noop`,
+//           `mods.gate`, `records.gather`, `deliver.github_review`) the
+//           scheduler runs at once. These used to ride the hosted-endpoint
+//           track and queue behind `remote.concurrent_cap`, which a
+//           mission launch sets to 1 — six independent shell waits ran
+//           strictly one at a time. They now have their own track and
+//           their own ceiling. Written VISIBLY by `init` at its default of
+//           8, like its `step_command_timeout_seconds` sibling, because
+//           this one always has a value (absence is not a distinct
+//           behavior). `Option<u32>`, lenient-on-read: an older binary
+//           ignores the field and keeps its old serialized behavior.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.21";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -313,6 +325,16 @@ pub struct RuntimeBehaviorConfig {
     /// it. Sibling of `model_load_timeout_seconds`, which bounds a host
     /// model load the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub step_command_timeout_seconds: Option<u64>,
+    /// (#2394) How many DISPATCH-FREE steps the scheduler runs
+    /// concurrently — `procedural.shell`, `procedural.noop`, `mods.gate`,
+    /// `records.gather`, `deliver.github_review`, every step whose
+    /// `StepKind::seat` claims `SeatClaim::NoModel`. Its own ceiling
+    /// because these consume no model: `remote.concurrent_cap` exists to
+    /// protect a hosted endpoint's rate limit and a shell command is not
+    /// one. Not unbounded, though — `mods.gate` runs a `test_command` per
+    /// mod, and each such step is individually bounded by
+    /// `step_command_timeout_seconds` above, not by anything global.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub dispatch_free_concurrency: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens: Option<u32>,
     /// (#1221) Per-CALL completion-token cap (reasoning + content of one
@@ -1016,6 +1038,7 @@ impl DarkmuxConfig {
                 inactivity_timeout_seconds: Some(600),
                 model_load_timeout_seconds: Some(600),
                 step_command_timeout_seconds: Some(600),
+                dispatch_free_concurrency: Some(8),
                 max_turns: None,
                 max_tokens: None,
                 max_tokens_per_call: None,

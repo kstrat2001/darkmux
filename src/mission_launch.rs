@@ -2919,7 +2919,7 @@ fn launch_session_id(mission_id: &str, real_phase_id: &str) -> String {
 /// `CODER_CONTEXT_ARTIFACT`) before calling `run_step_graph` —
 /// `MissionWorktreeStepKind`/`MissionCoderStepKind`/`MissionVerifyStepKind`
 /// read/write them via `StepRunCtx::artifact` inside `run_streaming` (and,
-/// for `context`, `residency()` too), and this struct's fields are simply
+/// for `context`, `seat()` too), and this struct's fields are simply
 /// the caller's own clone of that hand-off, read directly (no bus access
 /// needed post-run — `run_step_graph` exposes none; see `coder_phase.rs`'s
 /// artifact-name doc for the full reasoning). `coder_slot`/`verify_slot`'s
@@ -3210,7 +3210,7 @@ fn coder_branch_terminal_bookend(
 ///
 /// Falls back to `default_id` (the historical `"<phase>-verify-step"`
 /// convention) when no step's kind resolves to `is_gate() == true` —
-/// best-effort, fails open, the same shape `StepKind::residency`'s own doc
+/// best-effort, fails open, the same shape `StepKind::seat`'s own doc
 /// documents for a structurally analogous lookup. This covers a
 /// hand-scripted test graph that never registers a real kind (this
 /// module's own `scripted_gate_fixture` uses a placeholder `"mission.test"`
@@ -7223,7 +7223,7 @@ mod tests {
     /// bespoke kinds stay physically co-located with the mission module
     /// that owns them, never duplicated for a test), exercised against a
     /// real temp git repo. `git worktree add` genuinely runs; there is no
-    /// mock and no dispatch, because this kind's `residency()` needs
+    /// mock and no dispatch, because this kind's `seat()` needs
     /// neither, proven directly by the panicking host factory below. This
     /// bypasses `launch()`'s own `register_coder_phase_kinds` (which needs
     /// a full `coder-phase` config plus a resolvable default profile,

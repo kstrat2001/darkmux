@@ -406,6 +406,71 @@ pub struct StepOutcome {
     pub flow_records: Vec<FlowRecord>,
 }
 
+/// (#2394) What ONE step consumes — the exhaustive classification
+/// [`StepKind::seat`] returns and the scheduler dispatches on. This is the
+/// polymorphic replacement for `residency() -> Option<Placement>`, whose
+/// default `None` conflated three unrelated facts and, being the DEFAULT,
+/// applied to every kind that had never thought about the question.
+///
+/// **Exhaustive on purpose, and matched with no `_` arm anywhere.** Adding
+/// a variant here is a compile error at every site that classifies one —
+/// [`crate::concurrent_dispatch::run_bounded`]'s partition and the
+/// scheduler's observability stamp — which is exactly the property the old
+/// `Option` did not have. Extension is a new variant plus the compiler
+/// naming every place that must handle it.
+pub enum SeatClaim {
+    /// A LOCAL model this step needs resident before it can run. Wave-
+    /// planned by gestalt and #1487 lease-protected: the wave loader makes
+    /// this [`darkmux_gestalt::Placement`] resident first, and the run's
+    /// residency lease keeps a concurrent darkmux command's `Exclusive`
+    /// reconcile from evicting it mid-generation.
+    LocalModel(darkmux_gestalt::Placement),
+    /// A HOSTED endpoint seat. Consumes zero local pool (#1177/#1260),
+    /// never reaches gestalt's planner, bounded only by
+    /// `remote.concurrent_cap` — which is what that cap is FOR.
+    RemoteEndpoint,
+    /// This step runs NO model at all: `procedural.shell`,
+    /// `procedural.noop`, `mods.gate`, `records.gather`,
+    /// `deliver.github_review`, the crawl planners, every render/collect
+    /// half that only shuffles data. Bounded by its own
+    /// `runtime.dispatch_free_concurrency`, never by the endpoint cap —
+    /// each such step is already individually bounded by
+    /// `runtime.step_command_timeout_seconds`.
+    ///
+    /// This variant is the whole point of #2394: before it existed, a
+    /// dispatch-free step was indistinguishable from a hosted-endpoint
+    /// dispatch, so six independent `procedural.shell` waits ran strictly
+    /// one at a time.
+    NoModel,
+    /// A LOCAL seat whose [`darkmux_gestalt::Placement`] could NOT be
+    /// resolved — an unresolvable role, an unloadable profile registry, no
+    /// active profile, a local model with no declared `n_ctx`. #1509's
+    /// fail-open, now NAMED instead of silent.
+    ///
+    /// Scheduled like a remote seat (its historical behavior, unchanged),
+    /// but never quietly: the scheduler `eprintln!`s and emits a `Warn`
+    /// flow record naming the step and `reason`, because this dispatch
+    /// meant to be local and just lost its #1487 lease protection — a
+    /// concurrent command's reconcile can evict its model mid-generation
+    /// with no warning at all otherwise.
+    LocalModelUnresolved { reason: String },
+}
+
+impl SeatClaim {
+    /// The stable wire label stamped onto the `step start` flow record's
+    /// `payload.seat_class` (FLOW 1.41.0). Kept next to the variants so a
+    /// new one cannot ship without a label — the `match` here is exhaustive
+    /// with no `_` arm, same discipline as every other consumer.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SeatClaim::LocalModel(_) => "local_model",
+            SeatClaim::RemoteEndpoint => "remote_endpoint",
+            SeatClaim::NoModel => "no_model",
+            SeatClaim::LocalModelUnresolved { .. } => "local_model_unresolved",
+        }
+    }
+}
+
 /// One registered step-kind implementation. `run` is synchronous and
 /// blocking (matches every other dispatch primitive in darkmux — see
 /// `workloads::types::WorkloadProvider`'s own doc: "darkmux is a single-
@@ -523,63 +588,71 @@ pub trait StepKind: Send + Sync {
         Some(darkmux_types::session_id::step(&step.id))
     }
 
-    /// (#1230 Packet 3) Which local model, if any, this step needs
-    /// resident before it can run — feeds `run_step_graph`'s per-step
-    /// `Residency::Local(Placement)` vs `Residency::Remote` classification
-    /// (`concurrent_dispatch::run_bounded`'s wave-safety mechanism).
+    /// (#2394) What this step CONSUMES — the seat it claims. **Required:
+    /// there is no default body, on purpose.** The compiler is the
+    /// completeness check: a new `StepKind` cannot compile without saying
+    /// what it consumes, and a new [`SeatClaim`] variant cannot compile
+    /// until every place that dispatches on one handles it.
     ///
-    /// `None` (the default — every kind's behavior before this hook
-    /// existed, and every step kind that isn't a local-model dispatch,
-    /// e.g. `procedural.*`) classifies the step `Residency::Remote`:
-    /// cap-bounded concurrency only, no RAM-safety wave reasoning. A
-    /// dispatch-shaped local kind overrides this to resolve a real
-    /// `Placement` from its own config/role/Task assignment.
+    /// This replaced `residency() -> Option<Placement>`, whose DEFAULT
+    /// `None` was a lie. `None` meant BOTH "a hosted endpoint, cap-bounded"
+    /// AND "no model at all" AND "a local seat whose placement would not
+    /// resolve" — three genuinely different things collapsed into one
+    /// silence, and the silence was the default, so a kind that never said
+    /// anything was classified as a remote model dispatch. #2394 is what
+    /// that cost live: six independent `procedural.shell` waits, none of
+    /// which speaks to a model, executed strictly one at a time behind a
+    /// `remote_cap: 1` meant to protect a hosted endpoint — up to 54
+    /// minutes for a 9-minute window.
     ///
-    /// **Best-effort, fails open.** This is a SCHEDULING CLASSIFICATION
-    /// hint, not the dispatch's own model resolution — the step's `run`
-    /// method (and whatever it wraps, e.g. `dispatch::dispatch`'s own
-    /// preflight) still does its own full, strict resolution when it
-    /// actually executes. If this can't cleanly resolve a placement (no
-    /// role, unknown role, quarantined profile, remote endpoint, …) it
-    /// returns `None` rather than erroring — worst case the step is
-    /// scheduled as `Remote` (today's behavior for every kind), never a
-    /// hard failure purely from misclassification.
+    /// The four claims, and what the scheduler does with each:
+    ///
+    /// - [`SeatClaim::LocalModel`] — gestalt-wave-planned and #1487
+    ///   lease-protected; the wave loader makes the [`darkmux_gestalt::
+    ///   Placement`] resident before the step runs.
+    /// - [`SeatClaim::RemoteEndpoint`] — a hosted endpoint; consumes zero
+    ///   local pool, never reaches gestalt's planner, bounded by
+    ///   `remote.concurrent_cap`.
+    /// - [`SeatClaim::NoModel`] — dispatch-free. Bounded by its OWN
+    ///   `runtime.dispatch_free_concurrency` (these are shell/store
+    ///   operations, already bounded individually by
+    ///   `runtime.step_command_timeout_seconds`), never by the endpoint cap.
+    /// - [`SeatClaim::LocalModelUnresolved`] — a local seat whose placement
+    ///   could not be resolved (#1509's fail-open). Runs under the remote
+    ///   cap as it always has, but LOUDLY: the scheduler `eprintln!`s and
+    ///   emits a `Warn` flow record naming the step and the reason, because
+    ///   this dispatch just lost its residency-lease protection.
+    ///
+    /// **Still best-effort for the LOCAL case, in the same sense as before**
+    /// — this is a SCHEDULING CLASSIFICATION, not the dispatch's own model
+    /// resolution. The step's `run` method (and whatever it wraps) does its
+    /// own full, strict resolution when it actually executes. What changed
+    /// is that "I could not resolve" is now a NAMED claim rather than an
+    /// unmarked fallthrough.
     ///
     /// `input` is the SAME gathered dependency-output map `run` will
     /// receive (the scheduler computes it once per ready step, before
-    /// residency classification — see `scheduler::run_step_graph`). A kind
-    /// whose model need is DATA-DEPENDENT can inspect it and return `None`
-    /// when the inputs make its dispatch a guaranteed no-op, so the wave
-    /// loader never loads a model the step is certain not to use (#1426
-    /// ship-2 operator decision — the review verify seat with an empty
-    /// confirmed docket is the first consumer). Kinds with static needs
-    /// ignore it.
+    /// classification — see `scheduler::run_step_graph`). A kind whose
+    /// model need is DATA-DEPENDENT can inspect it and claim
+    /// [`SeatClaim::NoModel`] when the inputs make its dispatch a
+    /// guaranteed no-op, so the wave loader never loads a model the step is
+    /// certain not to use (#1426 ship-2 operator decision — the review
+    /// verify seat with an empty confirmed docket is the first consumer).
+    /// Kinds with static needs ignore it.
     ///
     /// `ctx` (#1530 Packet 3a) is the SAME [`StepRunCtx`] `run_streaming`
-    /// receives — most callers ignore it (every Tier 1 builtin's residency
-    /// hint resolves purely from `step`/`task`), but a kind whose residency
-    /// decision depends on run-scoped [`ArtifactBus`] state can read it here
-    /// via [`StepRunCtx::artifact`]. The review pipeline's judge kind is the
-    /// first consumer: its skip-load optimization (no wave load when the
-    /// probe stage's bundle set is empty — see `darkmux-lab`'s
-    /// `ReviewJudgeStepKind::residency`) used to read a constructor-held
-    /// `Arc<ReviewStepContext>`; now that context lives on the bus (the
-    /// `Arc<ReviewStepContext>` constructor field this hook once justified is
-    /// gone), so residency needs the SAME bus access `run_streaming` already
-    /// has to keep that optimization alive. The scheduler passes the
-    /// run-scoped bus materialized before its wave loop starts (see
-    /// `scheduler::run_step_graph`'s pre-scan) — `residency()` runs on the
-    /// main thread, one call ahead of `run_streaming`'s own ctx.
-    fn residency(
+    /// receives — most callers ignore it, but a kind whose decision depends
+    /// on run-scoped [`ArtifactBus`] state reads it here via
+    /// [`StepRunCtx::artifact`]. The scheduler passes the run-scoped bus
+    /// materialized before its wave loop starts; `seat()` runs on the main
+    /// thread, one call ahead of `run_streaming`'s own ctx.
+    fn seat(
         &self,
         step: &Step,
         task: &Task,
         input: &std::collections::BTreeMap<String, String>,
         ctx: &StepRunCtx,
-    ) -> Option<darkmux_gestalt::Placement> {
-        let _ = (step, task, input, ctx);
-        None
-    }
+    ) -> SeatClaim;
 
     /// (#1530 Packet 0) The [`Port`]s this kind PRODUCES — what a future
     /// consumer (a graph validator, the viewer's port-wiring annotation)

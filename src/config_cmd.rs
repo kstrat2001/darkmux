@@ -111,6 +111,9 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2361) The bound on a step's own shell command — mods.gate's
     // test_command, procedural.shell.
     ("runtime.step_command_timeout_seconds", Ty::Uint),
+    // (#2394) How many dispatch-free steps run at once — its own ceiling,
+    // never the hosted-endpoint cap.
+    ("runtime.dispatch_free_concurrency", Ty::Uint),
     ("runtime.max_turns", Ty::Uint),
     ("runtime.max_tokens", Ty::Uint),
     ("runtime.max_tokens_per_call", Ty::Uint),

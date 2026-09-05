@@ -16,7 +16,7 @@
 //! CONFIG on one of these four kinds. See `step_kinds::patterns`'s module
 //! doc for the full three-tier picture.
 
-use super::types::{MapDispatchOverride, OverrideDispatchCall, StepKind, StepOutcome, StepRunCtx};
+use super::types::{MapDispatchOverride, OverrideDispatchCall, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use super::MIN_VIABLE_MAP_GRANT;
 use crate::remote_budget::RemoteBudget;
 use crate::types::{Step, Task};
@@ -63,88 +63,66 @@ fn require_config_str<'a>(step: &'a Step, kind_id: &str, key: &str) -> Result<&'
     })
 }
 
-/// (#1230 Packet 3) Best-effort role→profile→model resolution for
-/// `StepKind::residency()` implementations — NOT the dispatch's own strict
-/// preflight (that still runs in full, separately, inside `dispatch::
-/// dispatch`/`dispatch_internal::dispatch` when the step actually
-/// executes). This is purely a scheduling-classification hint: resolve
-/// `role_id` against the named (or default) profile via the same
-/// `select_model` scoring every dispatch preflight uses, and — if the
-/// winning model is local (not endpoint-bearing) — return the `Placement`
-/// gestalt's wave planner should reason about for it.
+/// (#1230 Packet 3, reshaped by #2394) Best-effort role→profile→model
+/// resolution for [`crate::step_kinds::StepKind::seat`] implementations —
+/// NOT the dispatch's own strict preflight (that still runs in full,
+/// separately, inside `dispatch::dispatch`/`dispatch_internal::dispatch`
+/// when the step actually executes). This is purely a scheduling
+/// classification: resolve `role_id` against the named (or default) profile
+/// via the same `select_model` scoring every dispatch preflight uses, and
+/// report what the winning seat actually IS.
 ///
-/// Fails open to `None` (→ `Residency::Remote`, today's behavior for every
-/// kind) on ANY resolution hiccup: unresolvable role, unloadable registry,
-/// no active profile, a remote-endpoint model, or a local model missing
-/// `n_ctx`. A misclassification here costs a missed RAM-safety
-/// optimization, never a hard failure — see the trait doc on `residency`.
+/// Returns a [`SeatClaim`], never an `Option`. That is the whole #2394
+/// change at this layer: the three genuinely different outcomes below used
+/// to collapse into one `None`, which the scheduler then read as "remote".
 ///
-/// **The fail-open is not free (#1509 review finding).** `Residency::Remote`
-/// means `run_step_graph` never calls `ensure_wave_loaded` for this step —
-/// no wave load, and (load-bearing) **no #1487 residency lease written**, so
-/// the dispatch runs completely UNPROTECTED against a concurrent command's
-/// `Exclusive` reconcile, which can evict its model mid-generation with zero
-/// warning. That's the correct, silent behavior for a GENUINELY remote
-/// (endpoint-bearing) model — it was never going to touch local residency.
-/// It is a SILENT SAFETY GAP for every other fail-open cause (unresolvable
-/// role, unloadable registry, no active profile, a local model missing
-/// `n_ctx`) — those mean "this SHOULD have been a local, lease-protected
-/// dispatch, but resolution broke," and voiding the #1487 protection with no
-/// signal is exactly the "loud beats quiet" anti-pattern `CLAUDE.md` names.
-/// [`resolve_local_placement_or_warn`] is that distinction made real: it
-/// classifies WHICH fail-open reason fired and `eprintln!`s a named warning
-/// for every cause except the legitimate remote-model one.
-pub fn resolve_local_placement(
+/// - a LOCAL model resolved → [`SeatClaim::LocalModel`], wave-planned and
+///   #1487 lease-protected;
+/// - the winning model is ENDPOINT-BEARING → [`SeatClaim::RemoteEndpoint`],
+///   which is correct and SILENT: it was never going to touch local
+///   residency;
+/// - resolution BROKE (unresolvable role, unloadable registry, no active
+///   profile, a local model missing `n_ctx`) →
+///   [`SeatClaim::LocalModelUnresolved`], which the scheduler surfaces
+///   loudly.
+///
+/// **Why that last one has to be named (#1509 review finding).** A seat that
+/// does not reach gestalt gets no `ensure_wave_loaded` call — no wave load,
+/// and (load-bearing) **no #1487 residency lease written** — so the dispatch
+/// runs completely UNPROTECTED against a concurrent command's `Exclusive`
+/// reconcile, which can evict its model mid-generation with zero warning.
+/// Correct for a genuinely remote model; a real safety gap for every other
+/// cause. Before #2394 the distinction lived in a private
+/// `resolve_local_placement_or_warn` that `eprintln!`d from down here, where
+/// it knew a seat label but not the step, the run, or the flow stream. Now
+/// the CLAIM carries the reason up to the scheduler, which owns all three —
+/// see `scheduler::run_step_graph`'s classification block.
+pub fn resolve_local_seat(
     role_id: &str,
     profile_name: Option<&str>,
     config_path: Option<&str>,
     seat: &str,
-) -> Option<darkmux_gestalt::Placement> {
-    resolve_local_placement_or_warn(role_id, profile_name, config_path, seat)
+) -> SeatClaim {
+    match resolve_local_placement_inner(role_id, profile_name, config_path, seat) {
+        Ok(placement) => SeatClaim::LocalModel(placement),
+        Err(PlacementMiss::Remote) => SeatClaim::RemoteEndpoint,
+        Err(PlacementMiss::ResolutionFailed(reason)) => SeatClaim::LocalModelUnresolved { reason },
+    }
 }
 
-/// Why [`resolve_local_placement_inner`] returned no `Placement` — see that
-/// function's doc. `Remote` is the legitimate, silent case (an
+/// Why [`resolve_local_placement_inner`] returned no `Placement` — see
+/// [`resolve_local_seat`]'s doc. `Remote` is the legitimate, silent case (an
 /// endpoint-bearing model was never going to need local residency);
-/// `ResolutionFailed` is the loud one (see [`resolve_local_placement`]'s own
-/// doc on why fail-open silence there is a real safety gap).
+/// `ResolutionFailed` is the loud one.
 enum PlacementMiss {
     Remote,
     ResolutionFailed(String),
 }
 
-/// [`resolve_local_placement`]'s actual body, classified per [`PlacementMiss`]
-/// instead of collapsing every miss to a bare `None`. `eprintln!`s a named
-/// warning on every `ResolutionFailed` cause (never on the legitimate
-/// `Remote` case) before falling open to `None`, same return contract as
-/// before.
-fn resolve_local_placement_or_warn(
-    role_id: &str,
-    profile_name: Option<&str>,
-    config_path: Option<&str>,
-    seat: &str,
-) -> Option<darkmux_gestalt::Placement> {
-    match resolve_local_placement_inner(role_id, profile_name, config_path, seat) {
-        Ok(placement) => Some(placement),
-        Err(PlacementMiss::Remote) => None,
-        Err(PlacementMiss::ResolutionFailed(reason)) => {
-            eprintln!(
-                "darkmux: step `{seat}` (role `{role_id}`) could not resolve a LOCAL residency \
-                 placement ({reason}) — classifying this dispatch Remote. If this role/profile IS \
-                 meant to run a local model, this dispatch just lost the #1487 residency-lease \
-                 protection: a concurrent darkmux command's Exclusive reconcile could evict its \
-                 model mid-generation with no further warning. (This is a best-effort SCHEDULING \
-                 classification, not the dispatch's own strict preflight — that still runs \
-                 separately and may itself fail loud.)"
-            );
-            None
-        }
-    }
-}
-
-/// The classified resolution chain — see [`PlacementMiss`] and
-/// [`resolve_local_placement_or_warn`]. Pure logic, no `eprintln!` here (the
-/// caller owns deciding which `Err` variant is worth surfacing).
+/// [`resolve_local_seat`]'s body, classified per [`PlacementMiss`] instead
+/// of collapsing every miss to a bare `None`. Pure logic, no `eprintln!`
+/// here — the caller owns deciding which miss is worth surfacing, and
+/// (#2394) the caller that can say it usefully is the scheduler.
 fn resolve_local_placement_inner(
     role_id: &str,
     profile_name: Option<&str>,
@@ -566,20 +544,30 @@ impl StepKind for DispatchInternalStepKind {
         })
     }
 
-    fn residency(
+    /// (#2394) A local-model dispatch, unless resolution says otherwise —
+    /// `resolve_local_seat` reports which of the three it actually is.
+    /// The one case this kind decides for itself: no `role_id` at all, on
+    /// the Task OR in config. There is nothing to resolve then, so it
+    /// claims `LocalModelUnresolved` naming that — `run` will fail on the
+    /// same missing field, and the seat says so first.
+    fn seat(
         &self,
         step: &Step,
         task: &Task,
         _input: &std::collections::BTreeMap<String, String>,
         _ctx: &StepRunCtx,
-    ) -> Option<darkmux_gestalt::Placement> {
-        let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id")?;
+    ) -> SeatClaim {
+        let Some(role_id) = task_or_config_str(task.role_id.as_ref(), step, "role_id") else {
+            return SeatClaim::LocalModelUnresolved {
+                reason: "no role_id on the task or in step config".to_string(),
+            };
+        };
         let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
         let config_path = config_str(step, "config_path").map(str::to_string);
         // NOTE: `step:{id}` here is a gestalt SEAT LABEL (placement-plan
         // diagnostics), NOT a flow-record session id — exempt from the #1436
         // hyphen convention; future colon sweeps should skip it.
-        resolve_local_placement(&role_id, profile_name.as_deref(), config_path.as_deref(), &format!("step:{}", step.id))
+        resolve_local_seat(&role_id, profile_name.as_deref(), config_path.as_deref(), &format!("step:{}", step.id))
     }
 }
 
@@ -657,6 +645,49 @@ impl StepKind for DispatchSingleShotStepKind {
         Some(darkmux_types::session_id::task(&step.task_id))
     }
 
+
+    /// (#2394) A single call against ONE named model: hosted when
+    /// `config.endpoint` is present, local otherwise. The local arm claims
+    /// [`SeatClaim::LocalModel`] only when this step carries the residency
+    /// hints a wave load needs (`model` + `n_ctx`); a launcher that stamped
+    /// neither leaves nothing to place, so the claim is
+    /// [`SeatClaim::LocalModelUnresolved`] naming the missing field rather
+    /// than a silent fall-through onto the hosted track.
+    ///
+    /// Local seats are stamped by every production launcher; a bare
+    /// hand-written `dispatch.single_shot` step with only `model` set is
+    /// the case that warns, and it warns because it genuinely runs
+    /// unleased.
+    fn seat(
+        &self,
+        step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        if step.config.get("endpoint").is_some() {
+            return SeatClaim::RemoteEndpoint;
+        }
+        let Some(model) = config_str(step, "model") else {
+            return SeatClaim::LocalModelUnresolved { reason: "no config.model".to_string() };
+        };
+        let Some(min_ctx) = step.config.get("n_ctx").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok())
+        else {
+            return SeatClaim::LocalModelUnresolved {
+                reason: format!("local model `{model}` has no usable config.n_ctx"),
+            };
+        };
+        let identifier = config_str(step, "identifier")
+            .map(str::to_string)
+            .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None));
+        let model_key = config_str(step, "model_key").unwrap_or(model);
+        SeatClaim::LocalModel(darkmux_gestalt::Placement {
+            model_key: model_key.to_string(),
+            identifier,
+            min_ctx,
+            seat: format!("step:{}", step.id),
+        })
+    }
 
     fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         use crate::single_shot::{
@@ -2137,34 +2168,47 @@ impl StepKind for DispatchMapStepKind {
         self.run_map(step, task, input, Some(ctx))
     }
 
-    /// (#1442) LOCAL residency hint. Returns `None` — no wave load — when:
-    /// the step is HOSTED (`endpoint` present, nothing local to load); the
-    /// collection is EMPTY (the short-circuit: a guaranteed no-op needs no
-    /// model, ported generically from the review verify seat, #1442); or the
-    /// residency hints (`n_ctx`) are absent (fail-open, like
-    /// `resolve_local_placement` — a missed RAM-safety optimization, never a
-    /// hard failure). The empty-collection `None` is the mechanism by which
-    /// an empty map performs ZERO model loads — the property the block-level
-    /// short-circuit guarantees.
-    fn residency(
+    /// (#1442, restated as a seat claim by #2394) Four genuinely different
+    /// answers this kind can give, which the old `Option<Placement>` had to
+    /// squeeze into one `None`:
+    ///
+    /// - `endpoint` present → [`SeatClaim::RemoteEndpoint`]. Nothing local
+    ///   to load; the hosted cap is exactly the right bound for it.
+    /// - the collection is EMPTY → [`SeatClaim::NoModel`]. The
+    ///   short-circuit: a guaranteed no-op needs no model (ported
+    ///   generically from the review verify seat, #1442), and this claim is
+    ///   the mechanism by which an empty map performs ZERO model loads.
+    ///   Being NoModel rather than "remote" also means it no longer
+    ///   occupies a hosted-endpoint slot to do nothing.
+    /// - a malformed collection, or absent residency hints (`model`,
+    ///   `n_ctx`) → [`SeatClaim::LocalModelUnresolved`]. `run` owns
+    ///   surfacing the real failure; the seat must never mask it, and now
+    ///   says so loudly instead of failing open in silence.
+    /// - otherwise → [`SeatClaim::LocalModel`].
+    fn seat(
         &self,
         step: &Step,
         task: &Task,
         input: &BTreeMap<String, String>,
         _ctx: &StepRunCtx,
-    ) -> Option<darkmux_gestalt::Placement> {
+    ) -> SeatClaim {
         if step.config.get("endpoint").is_some() {
-            return None;
+            return SeatClaim::RemoteEndpoint;
         }
         match resolve_map_collection(step, task, input) {
-            Ok(items) if items.is_empty() => return None,
+            Ok(items) if items.is_empty() => return SeatClaim::NoModel,
             Ok(_) => {}
-            // `run` owns surfacing a malformed collection; residency stays a
-            // best-effort classification that must never mask it.
-            Err(_) => return None,
+            Err(e) => {
+                return SeatClaim::LocalModelUnresolved { reason: format!("collection: {e:#}") }
+            }
         }
-        let model = config_str(step, "model")?;
-        let min_ctx = u32::try_from(step.config.get("n_ctx").and_then(|v| v.as_u64())?).ok()?;
+        let Some(model) = config_str(step, "model") else {
+            return SeatClaim::LocalModelUnresolved { reason: "no config.model".to_string() };
+        };
+        let Some(min_ctx) = step.config.get("n_ctx").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok())
+        else {
+            return SeatClaim::LocalModelUnresolved { reason: "no usable config.n_ctx".to_string() };
+        };
         let identifier = config_str(step, "identifier")
             .map(str::to_string)
             .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None));
@@ -2175,12 +2219,12 @@ impl StepKind for DispatchMapStepKind {
         // key; without this override the loader would try to load the
         // namespaced string as if it were a model key.
         let model_key = config_str(step, "model_key").unwrap_or(model);
-        Some(darkmux_gestalt::Placement {
+        SeatClaim::LocalModel(darkmux_gestalt::Placement {
             model_key: model_key.to_string(),
             identifier,
             min_ctx,
             // (#1442 gate C7) "step:<id>", consistent with the placement
-            // provenance `dispatch.internal`'s residency uses.
+            // provenance `dispatch.internal`'s seat claim uses.
             seat: format!("step:{}", step.id),
         })
     }
@@ -2199,6 +2243,22 @@ impl StepKind for DispatchMapStepKind {
 pub struct ProceduralShellStepKind;
 
 impl StepKind for ProceduralShellStepKind {
+    /// (#2394) [`SeatClaim::NoModel`] — this kind runs an operator-supplied shell command and
+    /// speaks to no model at all. Before this hook it said nothing, and
+    /// silence classified it as a hosted-endpoint dispatch: a wave of these
+    /// queued one at a time behind `remote.concurrent_cap`, which a mission
+    /// launch sets to 1. They now run on the dispatch-free track under
+    /// `runtime.dispatch_free_concurrency`.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "procedural.shell"
     }
@@ -2321,6 +2381,22 @@ fn sanitize_env_key(id: &str) -> String {
 pub struct ProceduralNoopStepKind;
 
 impl StepKind for ProceduralNoopStepKind {
+    /// (#2394) [`SeatClaim::NoModel`] — this kind returns a fixed string and
+    /// speaks to no model at all. Before this hook it said nothing, and
+    /// silence classified it as a hosted-endpoint dispatch: a wave of these
+    /// queued one at a time behind `remote.concurrent_cap`, which a mission
+    /// launch sets to 1. They now run on the dispatch-free track under
+    /// `runtime.dispatch_free_concurrency`.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "procedural.noop"
     }
@@ -2391,9 +2467,9 @@ mod tests {
     }
 
     /// (#1530 Packet 3a) A bare `StepRunCtx` — no emitter/bucket/override,
-    /// an empty `ArtifactBus` — for tests that call `residency()` directly
+    /// an empty `ArtifactBus` — for tests that call `seat()` directly
     /// (bypassing the scheduler, which is the only production caller that
-    /// materializes a real bus). None of `residency()`'s Tier 1 builtin
+    /// materializes a real bus). None of `seat()`'s Tier 1 builtin
     /// implementations read the bus, so an empty one is sufficient here.
     fn bare_ctx() -> StepRunCtx {
         StepRunCtx::new(None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
@@ -2857,12 +2933,18 @@ mod tests {
         assert!(payload["short_circuit"].as_str().unwrap().contains("empty collection"));
     }
 
+    /// (#2394) The four `dispatch.map` seat outcomes, each asserted as its
+    /// OWN class. These four tests all used to assert `seat().is_none()`
+    /// — the same assertion for an empty collection, a hosted endpoint, and a
+    /// missing `n_ctx`, three facts with nothing in common. That shared
+    /// `None` was the bug: whatever the scheduler did with it, it did to all
+    /// three.
     #[test]
-    fn dispatch_map_empty_collection_residency_is_none_so_no_model_loads() {
+    fn dispatch_map_empty_collection_claims_no_model_so_nothing_loads() {
         // The no-load property: even with a full local residency config
-        // (model + n_ctx present), an EMPTY collection makes residency return
-        // None, so the wave loader is never asked to load a model the map
-        // won't use. This is the #1442 empty-docket short-circuit, generic.
+        // (model + n_ctx present), an EMPTY collection is a guaranteed no-op,
+        // so the wave loader is never asked to load a model the map won't
+        // use. This is the #1442 empty-docket short-circuit, generic.
         let s = map_step(json!({
             "model": "some-local-model",
             "user_template": "check {item}",
@@ -2870,20 +2952,28 @@ mod tests {
             "collection": [],
         }));
         assert!(
-            DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()).is_none(),
-            "an empty collection must declare no residency need (no load)"
+            matches!(
+                DispatchMapStepKind.seat(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()),
+                SeatClaim::NoModel
+            ),
+            "an empty collection consumes no model at all — not a remote seat, not an \
+             unresolved local one"
         );
     }
 
     #[test]
-    fn dispatch_map_local_residency_resolves_a_placement_for_a_non_empty_collection() {
+    fn dispatch_map_local_seat_resolves_a_placement_for_a_non_empty_collection() {
         let s = map_step(json!({
             "model": "qwen3.6-35b-a3b",
             "user_template": "check {item}",
             "n_ctx": 8192,
             "collection": ["a"],
         }));
-        let placement = DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()).unwrap();
+        let SeatClaim::LocalModel(placement) =
+            DispatchMapStepKind.seat(&s, &empty_task(), &BTreeMap::new(), &bare_ctx())
+        else {
+            panic!("a local model with full residency hints must claim LocalModel");
+        };
         assert_eq!(placement.model_key, "qwen3.6-35b-a3b");
         assert_eq!(placement.min_ctx, 8192);
         assert!(placement.identifier.starts_with("darkmux:"), "default identifier is namespaced: {}", placement.identifier);
@@ -2893,8 +2983,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_map_hosted_residency_is_none() {
-        // An endpoint-bearing (remote) map loads nothing locally.
+    fn dispatch_map_hosted_claims_a_remote_endpoint() {
+        // An endpoint-bearing (remote) map loads nothing locally — and says
+        // REMOTE, which is what `remote.concurrent_cap` is for.
         let s = map_step(json!({
             "model": "gpt-5.1",
             "user_template": "check {item}",
@@ -2902,16 +2993,20 @@ mod tests {
             "collection": ["a"],
             "endpoint": { "url": "https://example.com" },
         }));
-        assert!(DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()).is_none());
+        assert!(matches!(
+            DispatchMapStepKind.seat(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()),
+            SeatClaim::RemoteEndpoint
+        ));
     }
 
     #[test]
-    fn dispatch_map_residency_none_without_n_ctx_fails_open() {
+    fn dispatch_map_without_n_ctx_claims_local_unresolved_and_names_why() {
         let s = map_step(json!({ "model": "m", "user_template": "u {item}", "collection": ["a"] }));
-        assert!(
-            DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()).is_none(),
-            "no n_ctx hint -> None (fail open to Remote scheduling), never a hard failure"
-        );
+        let claim = DispatchMapStepKind.seat(&s, &empty_task(), &BTreeMap::new(), &bare_ctx());
+        let SeatClaim::LocalModelUnresolved { reason } = claim else {
+            panic!("a local seat missing its n_ctx hint is UNRESOLVED, never silently remote");
+        };
+        assert!(reason.contains("n_ctx"), "the reason names the missing field: {reason}");
     }
 
     #[test]

@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.40.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.41.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -839,6 +839,35 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.40.0";
 //               otherwise the output itself. Renamed rather than aliased:
 //               1.38.0 is days old, unreleased, and had no consumers
 //               outside this repo.
+//
+//   1.41.0 (#2394): every scheduler-emitted `step start` record gains
+//           `payload.seat_class` — what that step CONSUMES, as declared by
+//           its own `StepKind::seat` hook. One of exactly four values:
+//           `"local_model"` (gestalt-wave-planned, residency-lease
+//           protected), `"remote_endpoint"` (a hosted seat, bounded by
+//           `remote.concurrent_cap`), `"no_model"` (dispatch-free —
+//           `procedural.shell`, `mods.gate`, `records.gather`,
+//           `deliver.github_review`, the crawl planners — bounded by
+//           `runtime.dispatch_free_concurrency`), or
+//           `"local_model_unresolved"` (a local seat whose placement could
+//           not be resolved; it still runs, without a wave load or a
+//           residency lease).
+//
+//           ADDITIVE, and the record's action/level/handle/session are
+//           unchanged: a reader that does not know the key ignores it, and
+//           `step start` records written before 1.41.0 simply have a `null`
+//           payload — absence means "this darkmux did not record it", never
+//           a class.
+//
+//           A NEW ACTION rides along: `"step seat unresolved"`, at
+//           `level: Warn`, emitted ONCE for a step claiming
+//           `local_model_unresolved`, immediately before that step's
+//           `step start`. Payload: `step_id`, `kind`, `seat_class`,
+//           `reason` (the resolver's own text, verbatim), `lost` (what the
+//           misclassification cost — the wave load and the #1487 residency
+//           lease). It is NOT a lifecycle bookend and is not in
+//           `STEP_LIFECYCLE_ACTIONS`; a consumer folding step lifecycle
+//           already ignores unknown actions.
 //
 //   1.40.0 (#2310 swarm F / S2-2): `mission.grow`'s payload gains TWO
 //           keys and one of its existing keys gets ONE meaning.

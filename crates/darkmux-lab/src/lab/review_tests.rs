@@ -8951,10 +8951,15 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             workdir: None,
             image: None,
         };
+        // (#2394) The claim is now `NoModel`, not a bare `None` — an empty
+        // bundle set genuinely consumes no model, which is a different fact
+        // from "hosted endpoint" and from "could not resolve".
+        let claim = judge_kind.seat(&judge_step, &judge_task, &input, &run_ctx);
         assert!(
-            judge_kind.residency(&judge_step, &judge_task, &input, &run_ctx).is_none(),
+            matches!(claim, SeatClaim::NoModel),
             "an empty bundle set must still skip the judge model load, exactly like the retired \
-             ctx.bundles.is_empty() check did"
+             ctx.bundles.is_empty() check did — got {}",
+            claim.label()
         );
     }
 

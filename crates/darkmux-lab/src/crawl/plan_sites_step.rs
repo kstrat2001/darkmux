@@ -76,7 +76,7 @@ use crate::crawl::plan::{self, Plan, PlanParams};
 use crate::crawl::plan_step::{self, CRAWL_PLAN_OUTPUT_KIND};
 use anyhow::{anyhow, Context, Result};
 use darkmux_crew::rules;
-use darkmux_crew::step_kinds::{Port, StepKind, StepKindRegistry, StepOutcome};
+use darkmux_crew::step_kinds::{Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::types::{Step, Task};
 use darkmux_crew::workspace_spec::{materialize, MaterializeOptions, WorkspaceSpec};
 use std::collections::BTreeMap;
@@ -91,6 +91,17 @@ pub const PLAN_SITES_KIND: &str = "plan.sites";
 pub struct PlanSitesStepKind;
 
 impl StepKind for PlanSitesStepKind {
+    /// (#2394) Enumerates the sites to crawl. No model.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         PLAN_SITES_KIND
     }

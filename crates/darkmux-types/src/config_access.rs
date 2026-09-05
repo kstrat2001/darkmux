@@ -415,6 +415,29 @@ pub fn step_command_timeout_seconds() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.step_command_timeout_seconds);
     pick_parsed("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS", cfg, Some(600)).unwrap()
 }
+/// (#2394) How many DISPATCH-FREE steps `darkmux_crew::
+/// concurrent_dispatch::run_bounded` runs at once — every step whose
+/// `StepKind::seat` claims `SeatClaim::NoModel` (`procedural.shell`,
+/// `procedural.noop`, `mods.gate`, `records.gather`,
+/// `deliver.github_review`, the crawl planners). Resolves
+/// `env(DARKMUX_DISPATCH_FREE_CONCURRENCY) >
+/// config.runtime.dispatch_free_concurrency > 8` — mirrors
+/// [`remote_concurrent_cap`]'s wiring exactly, and is deliberately a
+/// SEPARATE knob from it: that cap protects a hosted endpoint's rate limit,
+/// which a shell command does not have. Before this existed, dispatch-free
+/// steps rode the remote track, and a mission launch's `remote_cap: 1` made
+/// six independent `procedural.shell` waits run strictly one at a time.
+///
+/// Not unbounded, which is the tempting default. `mods.gate` runs an
+/// operator-supplied `test_command` per mod; N of those at once is N test
+/// suites on one machine. 8 is generous relative to the bound each of these
+/// steps already has (`step_command_timeout_seconds`) without being "as
+/// many as the graph happens to contain". Clamped to >= 1: a literal `0`
+/// would mean "run nothing, forever".
+pub fn dispatch_free_concurrency() -> u32 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.dispatch_free_concurrency);
+    pick_parsed("DARKMUX_DISPATCH_FREE_CONCURRENCY", cfg, Some(8)).unwrap().max(1)
+}
 pub fn max_turns() -> Option<u32> {
     max_turns_with_source().0
 }
@@ -1563,6 +1586,30 @@ mod tests {
         assert_eq!(step_command_timeout_seconds(), 2, "env wins live");
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(step_command_timeout_seconds(), 600);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── dispatch_free_concurrency (#2394): env > config > 8 default,
+    //    mirroring remote_concurrent_cap exactly ──
+    #[serial_test::serial]
+    #[test]
+    fn dispatch_free_concurrency_env_overrides_then_default() {
+        let k = "DARKMUX_DISPATCH_FREE_CONCURRENCY";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        assert_eq!(dispatch_free_concurrency(), 8);
+        unsafe { std::env::set_var(k, "3") };
+        assert_eq!(dispatch_free_concurrency(), 3, "env wins live");
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(dispatch_free_concurrency(), 8, "an unparseable env value falls through, never panics");
+        // A 0 would mean "run nothing, forever" — clamped, never honored.
+        unsafe { std::env::set_var(k, "0") };
+        assert_eq!(dispatch_free_concurrency(), 1, "0 is clamped to 1, not taken literally");
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

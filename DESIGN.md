@@ -429,6 +429,31 @@ Three choices shape it:
 
 The schema is lenient on read (every field optional, unknown keys preserved), so a newer config never bricks an older binary and a hand-edited file never panics the CLI. Loud validation is `darkmux doctor`'s job, not the hot load path. Additive schema changes are a minor version bump; the operator's file keeps working across them.
 
+## Seat classes: every step says what it consumes
+
+A mission is a graph of steps, and the scheduler has to decide, for each one, how many of its siblings may run alongside it. That decision needs one fact: what does this step consume?
+
+For a long time the question was asked in a form that could not carry the answer. A step kind was asked for an *optional model placement*, and the default answer — the one every kind got for free by never implementing the hook — was "none". But "none" was three different facts wearing one word: *this seat is a hosted endpoint*, *this step speaks to no model at all*, and *this was supposed to be a local model and resolution broke*. The scheduler could only act on the word, so it treated all three as hosted endpoints and bounded them by the cap that exists to respect a hosted provider's rate limit.
+
+That cap is 1 on a mission launch. So six `procedural.shell` steps waiting for six independent things — none of which involves a model, a network call, or a rate limit — ran strictly one at a time, each waiting out the previous one's full timeout. A nine-minute window became fifty-four minutes, and nothing in the run's records said why: six steps with the same start second, and one `sleep` running at any moment.
+
+The fix is not a special case for shell steps. It is making the question answerable. A step kind now declares a **seat class**, and there are four:
+
+| Claim | What it means | How it is scheduled |
+|---|---|---|
+| `LocalModel(placement)` | needs this model resident locally | gestalt plans a wave for it; it holds a residency lease so a concurrent darkmux command cannot evict its model mid-generation |
+| `RemoteEndpoint` | a hosted endpoint | bounded by `remote.concurrent_cap` — consumes no local pool |
+| `NoModel` | dispatches nothing at all | bounded by `runtime.dispatch_free_concurrency` (default 8), and per command by `runtime.step_command_timeout_seconds` |
+| `LocalModelUnresolved { reason }` | meant to be local; the placement would not resolve | runs under the remote cap, exactly as before — but loudly, naming the step and the reason on stderr and in the flow stream |
+
+Three properties are worth stating, because each was chosen against an alternative.
+
+**There is no default.** The hook is required, with no body to inherit. A new step kind does not compile until its author says what it consumes. This is the same reason the fourth claim exists at all rather than folding back into the second: the old fail-open was *correct behavior* for a genuinely remote seat and a *silently lost safety guarantee* for a broken local one, and one return value could not tell an operator which had happened. Now the run's own records say.
+
+**Extension is a variant, and the compiler finds every site.** Adding a fifth class is a new enum variant; the places that must handle it — the executor's partition into tracks, the label stamped onto the record — are exhaustive matches with no catch-all arm, so they fail to compile until they are updated. The old shape had the opposite property: a new case fell into an existing arm and behaved like something it was not, which is exactly how this bug lived.
+
+**The caps stay separate.** It is tempting to make the dispatch-free track unbounded — nothing there is rate-limited by anyone. But `mods.gate` runs an operator-supplied test command per mod, and "as many test suites at once as the graph happens to contain" is a real machine load, not a free lunch. It gets a generous default and a visible knob, which is the same shape every other bound in darkmux has.
+
 ## The command gate: darkmux runs your shell-outs, not its own
 
 Some mission configs exist to run a command that changes something outside darkmux — approve a pull request, merge it, apply a deployment. They are ordinary `procedural.shell` graphs an operator wrote, shelling out to a tool the operator already has installed and signed in, exactly like the `lms` and `zed` shell-outs elsewhere in the binary.

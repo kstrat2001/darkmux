@@ -86,6 +86,7 @@
 //! concurrently against it.
 
 use anyhow::{anyhow, bail, Result};
+use crate::step_kinds::SeatClaim;
 use darkmux_flow::FlowRecord;
 use darkmux_gestalt::{
     plan_acquire, Action, AcquireOpts, AcquireScope, CallerIntent, Deadline, Facts,
@@ -111,25 +112,21 @@ pub type DispatchJob<T> = Box<dyn FnOnce() -> JobOutcome<T> + Send>;
 /// rather than spelled inline at every call site.
 type ResultsSink<T> = Mutex<Vec<(usize, JobOutcome<T>)>>;
 
-/// Where a job's model runs. `Local` names the exact
-/// [`darkmux_gestalt::Placement`] gestalt's wave scheduler should reason
-/// about for this job (the model it needs resident before it can run) —
-/// callers building this from a crew staffing typically use the same
-/// `model_key`/`identifier`/`min_ctx` they'd hand `ModelCycler`. `Remote`
-/// jobs carry no placement: a hosted-endpoint seat consumes zero local pool
-/// (#1177/#1260) and never reaches gestalt's planner.
-pub enum Residency {
-    Local(Placement),
-    Remote,
-}
-
 /// One job queued for [`run_bounded`]. `index` is the CALLER's own
 /// bookkeeping key (e.g. a future Step id's position) — results come back
 /// tagged with it rather than assuming the job list itself is
-/// index-addressable after it's been partitioned into local/remote tracks.
+/// index-addressable after it's been partitioned into the three tracks.
+///
+/// (#2394) `seat` was a two-variant `Residency` (`Local(Placement)` |
+/// `Remote`) whose `Remote` arm was reached both by a genuine hosted
+/// endpoint AND by every job that consumes no model at all, so a wave of
+/// `procedural.shell` steps queued behind a cap meant for hosted endpoints.
+/// It is now [`crate::step_kinds::SeatClaim`], the same exhaustive type the
+/// `StepKind::seat` hook returns — one vocabulary from the kind's
+/// declaration to this executor's partition, with no lossy step between.
 pub struct QueuedJob<T> {
     pub index: usize,
-    pub residency: Residency,
+    pub seat: SeatClaim,
     pub job: DispatchJob<T>,
 }
 
@@ -144,10 +141,20 @@ pub fn lms_host_factory() -> Box<dyn ModelHost> {
     Box::new(LmsHost::new())
 }
 
-/// Run `jobs` to completion, honoring gestalt's co-residency wave packing
-/// for every [`Residency::Local`] job and a separate `remote_cap`-bounded
-/// concurrent batch for every [`Residency::Remote`] job (see the module
-/// doc). Returns one entry per job, in COMPLETION order (not input order —
+/// Run `jobs` to completion on THREE independent, genuinely interleaved
+/// tracks (#2394), one per seat class:
+///
+/// - [`SeatClaim::LocalModel`] — gestalt's co-residency wave packing.
+/// - [`SeatClaim::RemoteEndpoint`] — a `remote_cap`-bounded concurrent
+///   batch. Also where [`SeatClaim::LocalModelUnresolved`] lands: #1509's
+///   fail-open behavior, unchanged, but the CALLER has already said so out
+///   loud (see `scheduler::run_step_graph`'s classification block).
+/// - [`SeatClaim::NoModel`] — a `dispatch_free_cap`-bounded concurrent
+///   batch of its OWN. A step that speaks to no model has no business
+///   queueing behind a cap that exists to protect a hosted endpoint's rate
+///   limit; #2394 is what that cost live.
+///
+/// Returns one entry per job, in COMPLETION order (not input order —
 /// the caller pairs a result back to its origin via the tagged `index`); a
 /// local job whose placement `plan_waves` could never fit any wave (see
 /// [`darkmux_gestalt::WaveRefusal`]) never runs at all and comes back as an
@@ -164,6 +171,11 @@ pub fn run_bounded<T: Send + 'static>(
     facts: &Facts,
     est: &(dyn FootprintEstimator + Sync),
     remote_cap: usize,
+    // (#2394) The concurrency ceiling for `SeatClaim::NoModel` jobs — the
+    // caller-resolved `config_access::dispatch_free_concurrency()`. Clamped
+    // to >= 1 here, same as `remote_cap` (a 0 cap would mean "run nothing,
+    // forever").
+    dispatch_free_cap: usize,
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
 ) -> Result<Vec<(usize, JobOutcome<T>)>> {
     // ── partition + stamp local placements with a job-unique seat label ──
@@ -176,6 +188,9 @@ pub fn run_bounded<T: Send + 'static>(
     let mut local_by_seat: HashMap<String, (usize, DispatchJob<T>)> = HashMap::new();
     let mut placements: Vec<Placement> = Vec::new();
     let mut remote_jobs: Vec<(usize, DispatchJob<T>)> = Vec::new();
+    // (#2394) The dispatch-free track. Its own vec, its own cap, its own
+    // sibling thread — never merged into `remote_jobs`.
+    let mut dispatch_free_jobs: Vec<(usize, DispatchJob<T>)> = Vec::new();
 
     // (#1452) Every queued index, captured BEFORE `jobs` is partitioned and
     // consumed below. A job whose body panics never pushes a result into
@@ -183,14 +198,24 @@ pub fn run_bounded<T: Send + 'static>(
     // `results` back to a terminal `Err` (see the join/reconcile block).
     let all_indices: Vec<usize> = jobs.iter().map(|q| q.index).collect();
 
+    // (#2394) Exhaustive, and deliberately WITHOUT a `_` arm: a new
+    // `SeatClaim` variant must fail to compile HERE, where the decision
+    // about which track it runs on actually lives, rather than silently
+    // inheriting whatever the catch-all happened to do. That silent
+    // inheritance is the entire bug this replaced.
     for q in jobs {
-        match q.residency {
-            Residency::Local(mut placement) => {
+        match q.seat {
+            SeatClaim::LocalModel(mut placement) => {
                 placement.seat = format!("{}#job{}", placement.seat, q.index);
                 local_by_seat.insert(placement.seat.clone(), (q.index, q.job));
                 placements.push(placement);
             }
-            Residency::Remote => remote_jobs.push((q.index, q.job)),
+            SeatClaim::RemoteEndpoint => remote_jobs.push((q.index, q.job)),
+            // #1509's fail-open, unchanged: a local seat we could not place
+            // still runs, just without a wave load or a residency lease. The
+            // caller has already surfaced it loudly by the time it gets here.
+            SeatClaim::LocalModelUnresolved { .. } => remote_jobs.push((q.index, q.job)),
+            SeatClaim::NoModel => dispatch_free_jobs.push((q.index, q.job)),
         }
     }
 
@@ -206,7 +231,13 @@ pub fn run_bounded<T: Send + 'static>(
         let local_track = (!local_by_seat.is_empty() || !schedule.refusals.is_empty())
             .then(|| scope.spawn(|| run_local_waves(schedule, local_by_seat, &results, est, host_factory)));
         let remote_track =
-            (!remote_jobs.is_empty()).then(|| scope.spawn(|| run_remote_batches(remote_jobs, remote_cap.max(1), &results)));
+            (!remote_jobs.is_empty()).then(|| scope.spawn(|| run_capped_batches(remote_jobs, remote_cap.max(1), &results)));
+        // (#2394) The third sibling. Same batching mechanism as the remote
+        // track, a DIFFERENT cap — and running on its own thread means a
+        // long dispatch-free wait never occupies a hosted-endpoint slot.
+        let dispatch_free_track = (!dispatch_free_jobs.is_empty()).then(|| {
+            scope.spawn(|| run_capped_batches(dispatch_free_jobs, dispatch_free_cap.max(1), &results))
+        });
 
         // (#1452) Join each track EXPLICITLY. A track thread panics when one
         // of its jobs panics — the job's own wave `thread::scope` re-panics
@@ -224,6 +255,9 @@ pub fn run_bounded<T: Send + 'static>(
             let _ = h.join();
         }
         if let Some(h) = remote_track {
+            let _ = h.join();
+        }
+        if let Some(h) = dispatch_free_track {
             let _ = h.join();
         }
     });
@@ -550,14 +584,21 @@ fn ensure_wave_loaded(
     }
 }
 
-/// The remote track: chunk `remote_jobs` into `cap`-sized batches (in input
-/// order — no wave-style co-residency arithmetic applies to remote seats,
-/// so a simple fixed-size batch is the whole mechanism) and run each batch
+/// The batching mechanism BOTH cap-bounded tracks use (#2394 — this was
+/// `run_remote_batches` when the remote track was the only one): chunk
+/// `jobs` into `cap`-sized batches (in input order — no wave-style
+/// co-residency arithmetic applies to a seat with no local placement, so a
+/// simple fixed-size batch is the whole mechanism) and run each batch
 /// concurrently via a nested `thread::scope`, moving to the next batch once
-/// the current one finishes. `cap` is the caller-resolved
-/// `config_access::remote_concurrent_cap()`, already clamped to >= 1 by
-/// [`run_bounded`] (a 0 cap would otherwise mean "run nothing, forever").
-fn run_remote_batches<T: Send + 'static>(
+/// the current one finishes.
+///
+/// `cap` is the caller-resolved ceiling for THAT track —
+/// `config_access::remote_concurrent_cap()` for the hosted-endpoint track,
+/// `config_access::dispatch_free_concurrency()` for the dispatch-free one —
+/// already clamped to >= 1 by [`run_bounded`] (a 0 cap would otherwise mean
+/// "run nothing, forever"). The two tracks share this code and share
+/// nothing else: separate vecs, separate caps, separate threads.
+fn run_capped_batches<T: Send + 'static>(
     mut remote_jobs: Vec<(usize, DispatchJob<T>)>,
     cap: usize,
     results: &ResultsSink<T>,
@@ -889,11 +930,11 @@ mod tests {
         let facts = Facts { budget: Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let marker = Arc::new(AtomicU32::new(0));
         let jobs = vec![
-            QueuedJob { index: 0, residency: Residency::Local(placement("small-a", 8_000)), job: ok_job(0, marker.clone()) },
-            QueuedJob { index: 1, residency: Residency::Local(placement("small-b", 8_000)), job: ok_job(1, marker.clone()) },
-            QueuedJob { index: 2, residency: Residency::Local(placement("big-c", 8_000)), job: ok_job(2, marker.clone()) },
+            QueuedJob { index: 0, seat: SeatClaim::LocalModel(placement("small-a", 8_000)), job: ok_job(0, marker.clone()) },
+            QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("small-b", 8_000)), job: ok_job(1, marker.clone()) },
+            QueuedJob { index: 2, seat: SeatClaim::LocalModel(placement("big-c", 8_000)), job: ok_job(2, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 3, "every job ran (none refused — pool-less budget-only case never blocks)");
         assert_eq!(marker.load(Ordering::SeqCst), 3, "every job's body actually executed");
         let mut indices: Vec<usize> = results.iter().map(|(i, _)| *i).collect();
@@ -918,10 +959,10 @@ mod tests {
         let facts = Facts { budget: Budget { max_darkmux_bytes: Some(10_000_000_000) }, ..Default::default() };
         let marker = Arc::new(AtomicU32::new(0));
         let jobs = vec![
-            QueuedJob { index: 0, residency: Residency::Local(placement("fits", 8_000)), job: ok_job(0, marker.clone()) },
-            QueuedJob { index: 1, residency: Residency::Local(placement("too-big", 8_000)), job: ok_job(1, marker.clone()) },
+            QueuedJob { index: 0, seat: SeatClaim::LocalModel(placement("fits", 8_000)), job: ok_job(0, marker.clone()) },
+            QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("too-big", 8_000)), job: ok_job(1, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2);
         assert_eq!(marker.load(Ordering::SeqCst), 1, "only the fitting job's body ran");
         let refused = results.iter().find(|(i, _)| *i == 1).expect("index 1 present");
@@ -952,10 +993,10 @@ mod tests {
         };
         let marker = Arc::new(AtomicU32::new(0));
         let jobs = vec![
-            QueuedJob { index: 0, residency: Residency::Local(placement("shared", 8_000)), job: ok_job(0, marker.clone()) },
-            QueuedJob { index: 1, residency: Residency::Local(placement("shared", 8_000)), job: ok_job(1, marker.clone()) },
+            QueuedJob { index: 0, seat: SeatClaim::LocalModel(placement("shared", 8_000)), job: ok_job(0, marker.clone()) },
+            QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("shared", 8_000)), job: ok_job(1, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2);
         assert_eq!(marker.load(Ordering::SeqCst), 2, "both jobs ran despite sharing one resident placement");
     }
@@ -969,14 +1010,132 @@ mod tests {
         let facts = Facts::default();
         let marker = Arc::new(AtomicU32::new(0));
         let jobs = (0..5)
-            .map(|i| QueuedJob { index: i, residency: Residency::Remote, job: ok_job(i, marker.clone()) })
+            .map(|i| QueuedJob { index: i, seat: SeatClaim::RemoteEndpoint, job: ok_job(i, marker.clone()) })
             .collect();
-        let results = run_bounded(jobs, &facts, &est, 2, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 2, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 5);
         assert_eq!(marker.load(Ordering::SeqCst), 5);
         let mut indices: Vec<usize> = results.iter().map(|(i, _)| *i).collect();
         indices.sort_unstable();
         assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// (#2394) The two cap-bounded tracks are INDEPENDENT: a
+    /// `SeatClaim::NoModel` job is bounded by `dispatch_free_cap`, and
+    /// `remote_cap` — even at 1, the mission-launch value — does not touch
+    /// it. Timed, because the whole bug was a timing one: four jobs each
+    /// sleeping 200ms under `remote_cap: 1` must finish in ~200ms, not
+    /// ~800ms.
+    ///
+    /// **Red before the fix**: there was no third track. Every dispatch-free
+    /// job was a `Residency::Remote` job, so this ran in four sequential
+    /// 200ms batches. The scheduler-level twin of this
+    /// (`dispatch_free_siblings_do_not_serialize_behind_the_remote_cap`)
+    /// measured 12.16s against a 3s expectation on the real
+    /// `procedural.shell` kind.
+    #[test]
+    fn dispatch_free_jobs_are_bounded_by_their_own_cap_not_the_remote_one() {
+        let est = FixedEstimator::default();
+        let facts = Facts::default();
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = (0..4)
+            .map(|i| QueuedJob {
+                index: i,
+                seat: SeatClaim::NoModel,
+                job: {
+                    let marker = marker.clone();
+                    Box::new(move || {
+                        std::thread::sleep(Duration::from_millis(200));
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        Ok((i, vec![]))
+                    })
+                },
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        // remote_cap = 1 (a mission launch's value); dispatch_free_cap = 4.
+        let results = run_bounded(jobs, &facts, &est, 1, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let elapsed = t0.elapsed();
+        assert_eq!(results.len(), 4);
+        assert_eq!(marker.load(Ordering::SeqCst), 4);
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "four dispatch-free jobs at 200ms each must overlap under their OWN cap, never \
+             serialize behind remote_cap=1 — got {elapsed:?}"
+        );
+    }
+
+    /// (#2394) And the dispatch-free cap is a REAL bound, not decoration: at
+    /// `dispatch_free_cap: 1` the same four jobs serialize. Without this,
+    /// the test above would pass equally well against an unbounded track,
+    /// and `mods.gate` running a `test_command` per mod would have no
+    /// ceiling at all.
+    #[test]
+    fn the_dispatch_free_cap_actually_bounds() {
+        let est = FixedEstimator::default();
+        let facts = Facts::default();
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = (0..4)
+            .map(|i| QueuedJob {
+                index: i,
+                seat: SeatClaim::NoModel,
+                job: {
+                    let marker = marker.clone();
+                    Box::new(move || {
+                        std::thread::sleep(Duration::from_millis(120));
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        Ok((i, vec![]))
+                    })
+                },
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        let results = run_bounded(jobs, &facts, &est, 8, 1, &mock_host_factory).expect("planning never fails under Auto");
+        let elapsed = t0.elapsed();
+        assert_eq!(results.len(), 4);
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "dispatch_free_cap=1 must serialize all four (~480ms) — a track that ignored its \
+             cap would finish in ~120ms; got {elapsed:?}"
+        );
+        assert_eq!(marker.load(Ordering::SeqCst), 4);
+    }
+
+    /// (#2394 / #1509) An UNRESOLVED local seat keeps its historical
+    /// behavior — it rides the remote track, cap and all — rather than
+    /// silently gaining the dispatch-free track's much wider ceiling. The
+    /// class is new; the scheduling of this case is not.
+    #[test]
+    fn an_unresolved_local_seat_still_rides_the_remote_cap() {
+        let est = FixedEstimator::default();
+        let facts = Facts::default();
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = (0..3)
+            .map(|i| QueuedJob {
+                index: i,
+                seat: SeatClaim::LocalModelUnresolved { reason: "no active profile".to_string() },
+                job: {
+                    let marker = marker.clone();
+                    Box::new(move || {
+                        std::thread::sleep(Duration::from_millis(120));
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        Ok((i, vec![]))
+                    })
+                },
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        // remote_cap=1 serializes them; dispatch_free_cap=8 would not — so a
+        // finish under ~240ms would prove they took the wrong track.
+        let results = run_bounded(jobs, &facts, &est, 1, 8, &mock_host_factory).expect("planning never fails under Auto");
+        let elapsed = t0.elapsed();
+        assert_eq!(results.len(), 3);
+        assert_eq!(marker.load(Ordering::SeqCst), 3);
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "an unresolved LOCAL seat must stay on the remote track (serialized at \
+             remote_cap=1, ~360ms), never fall through to the dispatch-free one — got {elapsed:?}"
+        );
     }
 
     /// (#1452) A REMOTE job whose body PANICS must not vanish. Before the
@@ -991,10 +1150,10 @@ mod tests {
         let est = FixedEstimator::default();
         let facts = Facts::default();
         let jobs: Vec<QueuedJob<()>> = vec![
-            QueuedJob { index: 0, residency: Residency::Remote, job: Box::new(|| panic!("boom in a remote job")) },
-            QueuedJob { index: 1, residency: Residency::Remote, job: Box::new(|| Ok(((), vec![]))) },
+            QueuedJob { index: 0, seat: SeatClaim::RemoteEndpoint, job: Box::new(|| panic!("boom in a remote job")) },
+            QueuedJob { index: 1, seat: SeatClaim::RemoteEndpoint, job: Box::new(|| Ok(((), vec![]))) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2, "both indices accounted for — the panicked one is not dropped");
         let panicked = results.iter().find(|(i, _)| *i == 0).expect("index 0 present despite the panic");
         assert!(panicked.1.is_err(), "the panicked job's index comes back as a terminal Err");
@@ -1016,12 +1175,12 @@ mod tests {
         let jobs: Vec<QueuedJob<usize>> = vec![
             QueuedJob {
                 index: 0,
-                residency: Residency::Local(placement("m", 8_000)),
+                seat: SeatClaim::LocalModel(placement("m", 8_000)),
                 job: Box::new(|| panic!("boom in a local wave job")),
             },
-            QueuedJob { index: 1, residency: Residency::Local(placement("m2", 8_000)), job: ok_job(1, marker.clone()) },
+            QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("m2", 8_000)), job: ok_job(1, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2, "both local indices accounted for — the panicked one is not dropped");
         let panicked = results.iter().find(|(i, _)| *i == 0).expect("index 0 present despite the panic");
         assert!(panicked.1.is_err(), "the panicked local job's index comes back as a terminal Err");
@@ -1035,10 +1194,10 @@ mod tests {
         let facts = Facts::default();
         let jobs = vec![QueuedJob::<()> {
             index: 0,
-            residency: Residency::Remote,
+            seat: SeatClaim::RemoteEndpoint,
             job: Box::new(|| Err(anyhow!("boom"))),
         }];
-        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 1);
         let (idx, outcome) = &results[0];
         assert_eq!(*idx, 0);
