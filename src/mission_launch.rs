@@ -191,7 +191,15 @@ pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
 ///         (gate banner printed, phase left Running for `mission finalize`);
 ///         or a gate-less generic graph finished Clean/Degraded.
 ///   `1` — coder dispatch error (phase stays Running, worktree kept for
-///         inspection); or a gate-less generic graph ended Error.
+///         inspection); or a gate-less generic graph ended Error; or
+///         (#2310 fix-loop C5) a gate-less generic graph whose config
+///         declares `outcome_from` and whose named DELIVERY task itself
+///         ended `Error`/`Abandoned` — a run that delivered nothing is not
+///         a success, however much upstream work completed, so this
+///         overrides the `Degraded` -> `0` row above. See
+///         [`delivery_failed`] for why the per-step aggregate cannot see
+///         this on its own, and `crew::envelope`'s module doc for the same
+///         rule stated next to the status it overrides.
 ///   `2` — QA found blocker(s) — resolve before shipping (phase Running).
 ///   `3` — QA could not run — manual review required (phase Running).
 ///   `4` — instance minted but NOT executed: the graph references step
@@ -772,6 +780,32 @@ pub fn launch(
             eprintln!("{}", style::dim(&format!("mission launch: task persist warning: {e:#}")));
         }
     }
+    // (#2310 fix-loop C2 / S4-1) Persist every MINTED step, `Planned`, at
+    // mint time — the same moment its owning task record is written, and
+    // the same thing the growth path already does for grown steps (see the
+    // `grown_steps` save in the phase loop below).
+    //
+    // Until this, a step's file appeared only at its FIRST transition, so
+    // `load_steps_for_phase` returned a PARTIAL set for any phase whose
+    // steps had not all run — and `lazy_close_prior_phases`, which judges a
+    // prior phase from exactly that call, read "every step on disk is
+    // terminal" and closed the phase `Complete` while never-transitioned
+    // steps were still `Planned` in memory. The end-of-run bulk save then
+    // wrote those `Planned` steps into the now-`Complete` phase, and
+    // `phase_abandon` refuses a `Complete` phase, so finalize could not
+    // reconcile: envelope, disk and `mission status` all disagreed, and the
+    // board reported "clean". A phase is now always judged from its FULL
+    // step set, structurally, rather than from whichever subset happened to
+    // have transitioned by that instant.
+    for step in all_steps.values() {
+        let Some(phase_id) = tasks.iter().find(|t| t.step_ids.contains(&step.id)).map(|t| &t.phase_id)
+        else {
+            continue;
+        };
+        if let Err(e) = crew::lifecycle::save_step(&mission_id, phase_id, step) {
+            eprintln!("{}", style::dim(&format!("mission launch: step persist warning (mint): {e:#}")));
+        }
+    }
     // (#2300) The phase record names the tasks it owns. The generic
     // launcher never wrote it, so the field used to mean different things
     // depending on which launcher minted the run — the precondition #2301
@@ -1340,6 +1374,20 @@ pub fn launch(
             tasks_by_id.insert(task.id.clone(), task.clone());
         }
 
+        // (#2310 fix-loop C1 / S4-2) PHASE ENTRY: run the #2350 cascade over
+        // the whole minted graph so far, now that THIS phase's tasks are
+        // visible in `tasks_by_id`. `run_step_graph`'s own in-pass cascade
+        // (`apply_step_terminal` -> `cascade_abandon`) can only reach tasks
+        // the map held at the time the failure landed, which since #2300 is
+        // "the phases entered so far" — so a dependent in a LATER phase was
+        // never reached, and both halves of the `run_on` contract went inert
+        // across every phase boundary. The rule stays in the scheduler; this
+        // is only the moment it is applied. See
+        // `crew::scheduler::cascade_dead_dependents`.
+        crew::scheduler::cascade_dead_dependents(&tasks_by_id, &mut steps, &mut |step| {
+            persist_step_for_phase(&mission_id, &tasks_by_id, step);
+        });
+
         let phase_has_work = steps.values().any(|s| {
             s.status == crew::types::NodeStatus::Planned
                 && tasks_by_id.get(&s.task_id).is_some_and(|t| t.phase_id == real_phase_id)
@@ -1443,6 +1491,27 @@ pub fn launch(
         if graph_result.is_err() {
             break;
         }
+
+        // (#2310 fix-loop C2 / S4-1) PHASE EXIT: this phase's scheduler pass
+        // has returned, so any step of it still `Planned` can never run —
+        // its own task errored (its later steps are stranded by
+        // `step_is_ready`'s intra-task rule, deliberately outside the
+        // cascade's domain) or its dependency chain holds a status its
+        // `run_on` refuses. Roll them to `Abandoned` HERE, in memory and on
+        // disk together, so the phase-close rule below judges a fully
+        // terminal phase and the end-of-run bulk save can no longer write a
+        // stale `Planned` back over it.
+        let phase_task_ids: Vec<String> = tasks_by_id
+            .values()
+            .filter(|t| t.phase_id == real_phase_id)
+            .map(|t| t.id.clone())
+            .collect();
+        crew::scheduler::abandon_stranded_steps(
+            phase_task_ids,
+            &tasks_by_id,
+            &mut steps,
+            &mut |step| persist_step_for_phase(&mission_id, &tasks_by_id, step),
+        );
     }
 
     // (#2300) Growth happens long after the mint, so `graph-report.json`
@@ -1634,7 +1703,17 @@ pub fn launch(
     // which already exits 0 here — a mission driver that adopts
     // `RunOutcome` for its Partial case inherits this exit code for free,
     // with no match arm to add.
+    // (#2310 fix-loop C5 / S4-C1) The delivery override, applied on top of
+    // the status mapping below: a `Degraded` run whose DELIVERING task (the
+    // one `outcome_from` names, else the positional last) itself ended
+    // `Error`/`Abandoned` delivered nothing, and exits 1. `Clean` can never
+    // reach this (no errored steps at all, so the delivering task cannot be
+    // dead), and every failing status already exits 1 — so this only ever
+    // flips the one case the per-step aggregate genuinely cannot see. See
+    // `delivery_failed`'s own doc for why the aggregate cannot.
+    let delivery_failed = delivery_failed(config, &real_phase_ids, &tasks, &steps);
     let exit_code = match status {
+        _ if delivery_failed => 1,
         MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => 0,
         // (#1881) `status` here is `build_envelope`'s OWN freshly-computed
         // value, never a deserialized one, so `Unknown` (a
@@ -2366,6 +2445,37 @@ fn run_summary_payload(
     tasks: &[crew::types::Task],
     steps: &BTreeMap<String, Step>,
 ) -> Result<Option<serde_json::Value>> {
+    let task = outcome_task(config, real_phase_ids, tasks)?;
+    let Some(task) = task else { return Ok(None) };
+    let Some(last_step_id) = task.step_ids.last() else { return Ok(None) };
+    let Some(step) = steps.get(last_step_id) else { return Ok(None) };
+    if step.status != crew::types::NodeStatus::Complete {
+        return Ok(None);
+    }
+    let Some(output) = step.output.as_deref() else { return Ok(None) };
+    Ok(match serde_json::from_str::<serde_json::Value>(output.trim()) {
+        Ok(v) => promoted_step_body(v),
+        Err(_) => None,
+    })
+}
+
+/// (#2310 P3, extracted for fix-loop C5) The task whose last step carries
+/// THIS run's outcome: `config.outcome_from` when set (the operator-named
+/// delivery/report task), else the positional default — the last phase's
+/// last task. `Ok(None)` means there is nothing to promote and nothing to
+/// judge (a config with no tasks in its last phase); the `Err` arms are
+/// [`run_summary_payload`]'s own documented config-authoring failures,
+/// unchanged.
+///
+/// Two consumers, one resolution: `run_summary_payload` reads this task's
+/// OUTPUT for the `mission close` payload, and `launch`'s exit-code match
+/// reads its STATUS (#2310 fix-loop C5 / S4-C1) — a run whose delivery task
+/// itself failed must not exit 0 just because earlier steps completed.
+fn outcome_task<'a>(
+    config: &MissionConfig,
+    real_phase_ids: &BTreeMap<String, String>,
+    tasks: &'a [crew::types::Task],
+) -> Result<Option<&'a crew::types::Task>> {
     let task: Option<&crew::types::Task> = match &config.outcome_from {
         Some(doc_task_id) => {
             // A minimal `LaunchParams` — `real_task_ids` reads only
@@ -2419,17 +2529,48 @@ fn run_summary_payload(
             real_phase_id.and_then(|real_phase_id| tasks.iter().rfind(|t| &t.phase_id == real_phase_id))
         }
     };
-    let Some(task) = task else { return Ok(None) };
-    let Some(last_step_id) = task.step_ids.last() else { return Ok(None) };
-    let Some(step) = steps.get(last_step_id) else { return Ok(None) };
-    if step.status != crew::types::NodeStatus::Complete {
-        return Ok(None);
+    Ok(task)
+}
+
+/// (#2310 fix-loop C5 / S4-C1) Did THIS run's delivering task — the one
+/// [`outcome_task`] resolves — end dead (`Error`, or cascade-`Abandoned`)?
+///
+/// A run that delivered nothing is not a success, however much work
+/// happened upstream. `build_envelope`'s run-level status is a per-STEP
+/// aggregate (some completed + some errored => `Degraded` => exit 0), which
+/// is the honest verdict for a partially-constrained run — but it cannot
+/// tell "the report shipped, minus three findings" from "the report step
+/// itself failed and nothing shipped at all". The delivering task's own
+/// terminal status is what separates them, and it is the thing a workflow
+/// consumer (a CI job, `gh workflow run`) actually keys on.
+///
+/// **Scoped to an EXPLICIT `outcome_from`**, never to [`outcome_task`]'s
+/// positional fallback. `outcome_from` is a config author naming "this
+/// task is what this run delivers"; the positional "last phase's last
+/// task" rule is only a convenience guess about where a summary usually
+/// sits, and a run with two independent sibling tasks in its final phase
+/// has no delivery semantics at all — one of them merely sorts last.
+/// Reading that guess as a delivery verdict would flip the exit code of
+/// every `Degraded` panel-style run, which #1893 pins at `0` and rightly
+/// so: a partially-constrained run is not a failed one. Declaring
+/// `outcome_from` is how a config opts into the stricter rule.
+///
+/// Best-effort: an unresolvable `outcome_from` is already a loud `Err` at
+/// `run_summary_payload`, so this returns `false` rather than raising the
+/// same failure twice.
+fn delivery_failed(
+    config: &MissionConfig,
+    real_phase_ids: &BTreeMap<String, String>,
+    tasks: &[crew::types::Task],
+    steps: &BTreeMap<String, Step>,
+) -> bool {
+    if config.outcome_from.is_none() {
+        return false;
     }
-    let Some(output) = step.output.as_deref() else { return Ok(None) };
-    Ok(match serde_json::from_str::<serde_json::Value>(output.trim()) {
-        Ok(v) => promoted_step_body(v),
-        Err(_) => None,
-    })
+    let Ok(Some(task)) = outcome_task(config, real_phase_ids, tasks) else { return false };
+    let statuses: Vec<NodeStatus> =
+        task.step_ids.iter().filter_map(|id| steps.get(id)).map(|s| s.status).collect();
+    statuses.iter().any(|s| matches!(s, NodeStatus::Error | NodeStatus::Abandoned))
 }
 
 /// (#2301, extracted #2310 P3) A typed output rides in a
@@ -3294,6 +3435,26 @@ pub(crate) fn load_phase_for_brief(mission_id: &str, phase_id: &str) -> Result<P
 /// the caller's cue that the bands BEFORE it are over (#1620, see
 /// [`lazy_close_prior_phases`]). `false` on every later step of an
 /// already-started phase, so the advance fires exactly once per band.
+/// (#2310 fix-loop C1/C2) Persist one step under its owning task's phase,
+/// best-effort. The scheduler-driven persist hook in `launch` ALSO does
+/// phase lifecycle bookkeeping (`lazy_start_phase_for_step`); this one
+/// deliberately does not — the two callers it serves (the phase-entry
+/// cascade and the phase-exit stranded sweep) only ever write TERMINAL
+/// statuses, and a step reaching `Abandoned` must not start a phase.
+fn persist_step_for_phase(
+    mission_id: &str,
+    tasks_by_id: &BTreeMap<String, crew::types::Task>,
+    step: &crew::types::Step,
+) {
+    let phase_id = tasks_by_id.get(&step.task_id).map(|t| t.phase_id.as_str()).unwrap_or_default();
+    if let Err(e) = crew::lifecycle::save_step(mission_id, phase_id, step) {
+        eprintln!(
+            "{}",
+            style::dim(&format!("mission launch: step persist warning (reconcile): {e:#}"))
+        );
+    }
+}
+
 pub(crate) fn lazy_start_phase_for_step(
     mission_id: &str,
     phase_id: &str,
@@ -3343,10 +3504,16 @@ pub(crate) fn lazy_start_phase_for_step(
 /// [`phase_finalization`] rules `finalize` would apply later, so closing early
 /// yields the identical verdict, just sooner.
 ///
-/// Deliberately conservative in one place: a prior phase with any step still
-/// non-terminal is LEFT ALONE rather than abandoned. Concurrency could in
+/// Deliberately conservative in one place: a prior phase with a step still
+/// RUNNING is LEFT ALONE rather than abandoned. Concurrency could in
 /// principle overlap bands, and an early wrong `Abandoned` is far worse than a
 /// late-but-correct one — finalize still reconciles whatever this skips.
+///
+/// (#2310 fix-loop C2 / S4-1) A still-`PLANNED` step is NOT that case and is
+/// no longer deferred on: it means the phase did not finish, so the phase
+/// cannot be `Complete` — and deferring instead is precisely how a
+/// `Complete` phase came to hold `Planned` steps that `phase_abandon` could
+/// then never reconcile. See the check itself for the full argument.
 pub(crate) fn lazy_close_prior_phases(
     mission_id: &str,
     phase_order: &[String],
@@ -3377,11 +3544,24 @@ pub(crate) fn lazy_close_prior_phases(
         // Caught by `advancing_a_phase_closes_the_ones_before_it`, which
         // abandoned a healthy phase on the first advance.
         //
-        // Likewise a phase with any step still live is not ours to close.
-        // Both cases defer to finalize, which reconciles with full information.
-        if steps.is_empty()
-            || steps.iter().any(|s| matches!(s.status, NodeStatus::Planned | NodeStatus::Running))
-        {
+        // Likewise a phase with a step still RUNNING is not ours to close —
+        // that is genuinely live work, and an early wrong verdict on it is
+        // far worse than a late-but-correct one; finalize reconciles it.
+        //
+        // (#2310 fix-loop C2 / S4-1) A still-`PLANNED` step is a different
+        // thing and is no longer a reason to defer: since every minted step
+        // is persisted at mint (see `launch`) this slice is the phase's FULL
+        // step set, and the phase-exit sweep
+        // (`crew::scheduler::abandon_stranded_steps`) has already rolled the
+        // unreachable ones to `Abandoned` by the time a LATER phase's first
+        // step triggers this close. A `Planned` step surviving both is
+        // therefore a phase that did not finish — and `phase_finalization`
+        // below already refuses `Complete` for exactly that, so the phase
+        // closes `Abandoned` and `phase_abandon`'s own #1504 reconcile
+        // terminalizes the leftovers on disk. Deferring instead is what left
+        // a Finalized mission holding `Planned` steps under a `Complete`
+        // phase that `phase_abandon` could no longer touch.
+        if steps.is_empty() || steps.iter().any(|s| s.status == NodeStatus::Running) {
             closed.remove(prior);
             continue;
         }

@@ -308,6 +308,21 @@ pub struct RemoteBudgetRow {
 /// The standard output contract every mission emits (#1284 Packet 2). See
 /// the module doc for the status-decision rules and who consumes each
 /// field.
+///
+/// **`status` is not the whole exit-code rule (#2310 fix-loop C5 /
+/// S4-C1).** `MissionOutcomeStatus` is a per-STEP aggregate: some
+/// completed and some errored reads `Degraded`, which the generic
+/// launcher exits `0` for, because a partially-constrained run is not a
+/// failed one (#1893 pins that). What the aggregate structurally cannot
+/// see is WHICH step failed — "the report shipped, minus three findings"
+/// and "the report step itself failed and nothing shipped" are the same
+/// `Degraded`. So a config that names its delivering task with
+/// `outcome_from` gets a second rule layered on top at
+/// `mission_launch::launch`: if THAT task ended `Error` or cascade-
+/// `Abandoned`, the run exits `1` regardless of `status`. The envelope
+/// itself is unchanged — this is an exit-code rule for the workflow
+/// consumer, not a fourth status — and a config that declares no
+/// `outcome_from` is unaffected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionEnvelope {
     pub mission_id: String,

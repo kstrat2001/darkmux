@@ -7,6 +7,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::collections::BTreeMap;
 use std::fs;
 use tempfile::TempDir;
 
@@ -6953,4 +6954,417 @@ fn mission_launch_fails_loudly_when_the_producer_output_is_not_a_json_path() {
         combined.contains("unit-task") && combined.contains("/nope/not-a-plan.json"),
         "the error must name the task and the path, got:\n{combined}"
     );
+}
+
+// ── (#2310 fix-loop packet C) scheduler semantics under failure ─────────
+//
+// The probe config the #2310 backend review (findings S4-1/S4-2/S4-3,
+// C1/C4) reproduced its end state from, as a fixture. Three phases, a
+// deliberate failure in the first, and dependents in the SECOND that reach
+// back across the phase boundary into it — the shape every built-in config
+// (`review-v2.json`, `crawl.json`) actually has, and the one the per-phase
+// scheduler split (#2300) broke. Everything is `procedural.shell` /
+// `procedural.noop`: no model, no container, no network.
+//
+//   p1  t-fail    s-fail (`exit 3`) → s-after            (two steps)
+//   p2  t-dep     depends_on t-fail                       (default run_on)
+//       t-chain   depends_on t-dep                        (default run_on)
+//       t-dep2    depends_on t-fail, run_on complete+error
+//       t-chain-err depends_on t-dep2 AND t-chain, run_on complete+error
+//   p3  t-deliver (no depends_on)
+//
+// Expected AFTER the packet: t-chain-err RUNS; s-dep/s-chain are Abandoned
+// naming s-fail; s-dep2 receives s-fail's reason as its input; no step is
+// left Planned/Running under a terminal mission; p1/p2 close Abandoned on
+// disk AND in the envelope.
+
+/// `deliver_command` is the shell body of p3's delivering step — `"true"`
+/// for the ordinary probe, `"exit 1"` for the C5 exit-code case.
+fn fail_probe_fixture(deliver_command: &str) -> (TempDir, TempDir) {
+    fail_probe_fixture_with(deliver_command, "")
+}
+
+/// `deliver_extra` is spliced into p3's `t-deliver` object — the
+/// review-v2 shape is `"depends_on": [...], "run_on": ["complete","error"],`
+/// naming a task in an EARLIER phase.
+fn fail_probe_fixture_with(deliver_command: &str, deliver_extra: &str) -> (TempDir, TempDir) {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = format!(
+        r#"{{
+        "id": "fail-probe",
+        "name": "Fail Probe",
+        "schema_version": "3.4",
+        "outcome_from": "t-deliver",
+        "phases": [
+          {{
+            "id": "p1",
+            "tasks": [{{
+              "id": "t-fail",
+              "steps": [
+                {{ "id": "s-fail", "kind": "procedural.shell", "config": {{ "command": "echo boom >&2; exit 3" }} }},
+                {{ "id": "s-after", "kind": "procedural.noop", "config": {{}} }}
+              ]
+            }}]
+          }},
+          {{
+            "id": "p2",
+            "tasks": [
+              {{ "id": "t-dep", "depends_on": ["t-fail"],
+                 "steps": [{{ "id": "s-dep", "kind": "procedural.noop", "config": {{}} }}] }},
+              {{ "id": "t-chain", "depends_on": ["t-dep"],
+                 "steps": [{{ "id": "s-chain", "kind": "procedural.noop", "config": {{}} }}] }},
+              {{ "id": "t-dep2", "depends_on": ["t-fail"], "run_on": ["complete", "error"],
+                 "steps": [{{ "id": "s-dep2", "kind": "procedural.shell",
+                              "config": {{ "command": "echo dep2-saw:${{DARKMUX_STEP_INPUT_T_FAIL:-none}}" }} }}] }},
+              {{ "id": "t-chain-err", "depends_on": ["t-dep2", "t-chain"], "run_on": ["complete", "error"],
+                 "steps": [{{ "id": "s-chain-err", "kind": "procedural.shell",
+                              "config": {{ "command": "echo chain-err-ran" }} }}] }}
+            ]
+          }},
+          {{
+            "id": "p3",
+            "tasks": [{{
+              "id": "t-deliver", {deliver_extra}
+              "steps": [{{ "id": "s-deliver", "kind": "procedural.shell",
+                           "config": {{ "command": "{deliver}" }} }}]
+            }}]
+          }}
+        ]
+    }}"#,
+        deliver = deliver_command,
+        deliver_extra = deliver_extra,
+    );
+    fs::write(config_dir.join("fail-probe.json"), config_json).unwrap();
+    (home, flows)
+}
+
+fn launch_fail_probe(home: &TempDir, flows: &TempDir) -> std::process::Output {
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "fail-probe"])
+        .output()
+        .unwrap()
+}
+
+/// Every persisted step of the mission, keyed by step id (ids are unique
+/// across phases in this fixture), as `(status, output)`.
+fn probe_steps(dir: &std::path::Path) -> BTreeMap<String, (String, String)> {
+    let mut out = BTreeMap::new();
+    let steps_root = dir.join("steps");
+    for phase_dir in fs::read_dir(&steps_root).unwrap().filter_map(|e| e.ok()) {
+        if !phase_dir.path().is_dir() {
+            continue;
+        }
+        for f in fs::read_dir(phase_dir.path()).unwrap().filter_map(|e| e.ok()) {
+            let Ok(text) = fs::read_to_string(f.path()) else { continue };
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            out.insert(
+                v["id"].as_str().unwrap().to_string(),
+                (
+                    v["status"].as_str().unwrap_or("?").to_string(),
+                    v["output"].as_str().unwrap_or("").to_string(),
+                ),
+            );
+        }
+    }
+    out
+}
+
+fn probe_mission_and_phases(
+    home: &TempDir,
+) -> (std::path::PathBuf, String, serde_json::Value, BTreeMap<String, String>) {
+    let dir = one_mission_dir(home);
+    let mission_id = dir.file_name().unwrap().to_string_lossy().to_string();
+    let mission: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("mission.json")).unwrap()).unwrap();
+    let mut phases = BTreeMap::new();
+    for p in ["p1", "p2", "p3"] {
+        let path = dir.join("phases").join(format!("{mission_id}-{p}.json"));
+        if let Ok(text) = fs::read_to_string(&path) {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            phases.insert(p.to_string(), v["status"].as_str().unwrap_or("?").to_string());
+        }
+    }
+    (dir, mission_id, mission, phases)
+}
+
+/// (#2310 fix-loop C1 / S4-2) A later phase's task that declares
+/// `run_on: ["complete","error"]` on a dependency that errored in an
+/// EARLIER phase RUNS, and its default-`run_on` siblings are
+/// cascade-abandoned with the originating step named. Before this packet
+/// `run_step_graph` ran once per phase over only the phases entered so
+/// far, so `cascade_abandon` never reached p2 and
+/// `dependency_satisfies_run_on` saw a still-`Planned` t-fail: s-dep,
+/// s-chain, s-dep2 and s-chain-err all sat `Planned` forever (s-dep2 ran
+/// only because its OWN readiness came from a Planned dependency it never
+/// waited on — and t-chain-err never ran at all).
+#[test]
+fn fail_probe_cross_phase_cascade_and_run_on_error() {
+    let (home, flows) = fail_probe_fixture("true");
+    let out = launch_fail_probe(&home, &flows);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (_dir, _mid, _mission, _phases) = probe_mission_and_phases(&home);
+    let steps = probe_steps(&one_mission_dir(&home));
+
+    assert_eq!(steps["s-fail"].0, "error", "steps: {steps:#?}");
+    // The run_on-error chain gets a real chance to run, across the phase
+    // boundary, both hops.
+    assert_eq!(steps["s-dep2"].0, "complete", "s-dep2 must run\n{stdout}\n{stderr}");
+    assert_eq!(
+        steps["s-chain-err"].0, "complete",
+        "t-chain-err must run once its own run_on-error dependency reaches a terminal \
+         status\nsteps: {steps:#?}\n{stdout}\n{stderr}"
+    );
+    // The errored task's OWN later step is stranded, never abandoned by the
+    // cascade (that is deliberately outside its domain — see
+    // `cascade_abandon`'s doc) — the phase-exit sweep terminalizes it, and
+    // names the task's own failure so the operator reads the cause off the
+    // step itself rather than a bare "never started".
+    assert_eq!(steps["s-after"].0, "abandoned", "steps: {steps:#?}");
+    assert!(
+        steps["s-after"].1.contains("s-fail"),
+        "the stranded step must name its own task's failure: {:?}",
+        steps["s-after"].1
+    );
+
+    // The default-run_on chain is abandoned, naming the ORIGINATING step.
+    for id in ["s-dep", "s-chain"] {
+        assert_eq!(steps[id].0, "abandoned", "{id} must be Abandoned\nsteps: {steps:#?}");
+        assert!(
+            steps[id].1.contains("s-fail"),
+            "{id}'s output must name the originating step: {:?}",
+            steps[id].1
+        );
+    }
+}
+
+/// (#2310 fix-loop C3 / S4-3 / #2352 item 2) An errored MULTI-step task
+/// forwards the output of the step that made it terminal — not
+/// `step_ids.last()`, which for `t-fail` is the never-run `s-after`.
+#[test]
+fn fail_probe_forwards_the_errored_steps_output_to_a_run_on_error_dependent() {
+    let (home, flows) = fail_probe_fixture("true");
+    let out = launch_fail_probe(&home, &flows);
+    let steps = probe_steps(&one_mission_dir(&home));
+    let dep2_output = &steps["s-dep2"].1;
+    assert!(
+        dep2_output.contains("exited with") || dep2_output.contains("boom"),
+        "s-dep2 must receive s-fail's own failure text as its `t-fail` input, got {dep2_output:?}\n\
+         stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// (#2310 fix-loop C2 / S4-1) The whole-run invariant: a terminal mission
+/// never persists a non-terminal step, and the envelope's per-phase
+/// outcomes equal the phase records on disk.
+#[test]
+fn fail_probe_terminal_mission_has_no_non_terminal_step_and_envelope_matches_disk() {
+    let (home, flows) = fail_probe_fixture("true");
+    let _ = launch_fail_probe(&home, &flows);
+    let (dir, _mid, mission, phases) = probe_mission_and_phases(&home);
+    let steps = probe_steps(&dir);
+
+    assert_eq!(mission["status"], serde_json::json!("finalized"), "mission: {mission}");
+    let live: Vec<_> = steps
+        .iter()
+        .filter(|(_, (status, _))| status == "planned" || status == "running")
+        .collect();
+    assert!(live.is_empty(), "terminal mission still holds non-terminal steps: {live:#?}");
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("envelope.json")).unwrap()).unwrap();
+    for phase in envelope["phases"].as_array().unwrap() {
+        let real_id = phase["phase_id"].as_str().unwrap();
+        let short = real_id.rsplit('-').next().unwrap().to_string();
+        let want = match phase["outcome"].as_str().unwrap() {
+            "Complete" | "complete" => "complete",
+            _ => "abandoned",
+        };
+        assert_eq!(
+            phases.get(&short).map(String::as_str),
+            Some(want),
+            "envelope says {want} for `{short}` but disk says {:?}\nenvelope: {envelope}",
+            phases.get(&short)
+        );
+    }
+    // p1 errored and p2's default chain was abandoned: neither is Complete.
+    assert_eq!(phases.get("p1").map(String::as_str), Some("abandoned"), "{phases:#?}");
+    assert_eq!(phases.get("p2").map(String::as_str), Some("abandoned"), "{phases:#?}");
+
+    // …and the BOARD agrees. `mission status` reported "board is clean,
+    // drift: []" through the whole S4-1/S4-2 class because every rule
+    // stopped at the phase; now that the step-level rules exist (#2310
+    // fix-loop C4), a clean board is evidence rather than a blind spot —
+    // this assertion is red the moment either half regresses.
+    let board = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--json", "--all"])
+        .output()
+        .unwrap();
+    let board_json: serde_json::Value =
+        serde_json::from_slice(&board.stdout).expect("mission status --json must be JSON");
+    let drift = &board_json["missions"][0]["drift"];
+    assert_eq!(
+        drift.as_array().map(Vec::len),
+        Some(0),
+        "the board must be genuinely clean after a failed-but-fully-reconciled run, \
+         got {drift}"
+    );
+}
+
+/// (#2310 fix-loop, S4-4 — NOT this packet) The SIGKILL / hang shape: a
+/// `procedural.shell` step running `sleep` has no deadline and no child
+/// registration today, so SIGTERM/SIGINT do nothing until the command
+/// returns and a SIGKILL leaves the mission Active, the phase running, an
+/// orphan `sh`/`sleep`, and — before C4 — a board that called that clean.
+///
+/// `#[ignore]`d because the bounded-execution helper it asserts against
+/// belongs to fix-loop packet D (`mods.gate` + `procedural.shell` timeout +
+/// child registration) and has not merged. The assertions are written
+/// against the shape D will produce, so the test flips to live by deleting
+/// the attribute once D lands rather than being invented from scratch then
+/// — the "assertion written now and skipped, naming what is missing and who
+/// owns it" discipline. What THIS packet already guarantees, and what the
+/// test therefore also asserts, is the C4 half: whatever state the kill
+/// leaves behind, the board NAMES it instead of reporting clean.
+#[test]
+#[ignore = "needs fix-loop packet D: procedural.shell bounded deadline + child registration (S4-4)"]
+fn hung_shell_step_is_bounded_and_the_board_names_what_the_kill_left() {
+    let (home, flows) = fail_probe_fixture("sleep 600");
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        // Packet D's knob: the per-step bounded-execution deadline.
+        .env("DARKMUX_STEP_EXEC_TIMEOUT_SECONDS", "2")
+        .args(["mission", "launch", "fail-probe"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("timeout") || stderr.contains("deadline"),
+        "the hung step must be killed at its deadline and say so, got:\n{stderr}"
+    );
+
+    // Whatever the kill left, no step stays non-terminal under a terminal
+    // mission — and if one somehow does, the board says so rather than
+    // reporting clean (#2310 fix-loop C4).
+    let dir = one_mission_dir(&home);
+    let steps = probe_steps(&dir);
+    let live: Vec<_> = steps
+        .iter()
+        .filter(|(_, (status, _))| status == "planned" || status == "running")
+        .collect();
+    let board = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--json", "--all"])
+        .output()
+        .unwrap();
+    let board_json: serde_json::Value = serde_json::from_slice(&board.stdout).unwrap();
+    let kinds: Vec<&str> = board_json["missions"][0]["drift"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["kind"].as_str())
+        .collect();
+    if live.is_empty() {
+        assert!(!kinds.iter().any(|k| k.ends_with("live-step")), "{kinds:?}");
+    } else {
+        assert!(
+            kinds.iter().any(|k| k.ends_with("live-step")),
+            "steps left live by the kill ({live:#?}) must be NAMED on the board, got {kinds:?}"
+        );
+    }
+}
+
+/// (#2310 fix-loop C5 / S4-C1) A run whose DELIVERING task — the one
+/// `outcome_from` names — itself ended Error exits non-zero, even though
+/// earlier steps completed and the run-level status is therefore
+/// `Degraded`. Nothing was delivered; a workflow consumer must not read
+/// that as success.
+#[test]
+fn fail_probe_errored_delivery_task_exits_non_zero() {
+    let (home, flows) = fail_probe_fixture("exit 1");
+    let out = launch_fail_probe(&home, &flows);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a run whose delivery task errored must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// (#2310 fix-loop C1 / S4-2) The review-v2 / crawl shape specifically: a
+/// DELIVERY task in the last phase whose `depends_on` reaches back into an
+/// earlier phase (`deliver` ← `create-mod` / `records-gather`) and which
+/// declares `run_on: ["complete","error"]` so it survives an upstream
+/// failure. Every edge in both built-in configs crosses a phase boundary,
+/// which is exactly the set the per-phase scheduler split (#2300) made the
+/// `run_on` contract inert over: `deliver` works there today only because
+/// it happens to declare NO `depends_on`. Wire one up and, before this
+/// packet, it never ran at all — its dependency sat `Planned` forever
+/// instead of reaching the `Abandoned` its `run_on` accepts.
+#[test]
+fn fail_probe_cross_phase_delivery_task_runs_on_an_upstream_error() {
+    let (home, flows) = fail_probe_fixture_with(
+        "echo delivered:${DARKMUX_STEP_INPUT_T_DEP:-none}",
+        r#""depends_on": ["t-dep"], "run_on": ["complete", "error"],"#,
+    );
+    let out = launch_fail_probe(&home, &flows);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = one_mission_dir(&home);
+    let steps = probe_steps(&dir);
+
+    assert_eq!(
+        steps["s-deliver"].0, "complete",
+        "the delivery task must still run when its cross-phase dependency died\n\
+         steps: {steps:#?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // …and it delivers KNOWING WHY: the cascade's origin text reaches it
+    // through `t-dep`, two hops and two phase boundaries from `s-fail`.
+    assert!(
+        steps["s-deliver"].1.contains("s-fail"),
+        "the delivery task must receive the ORIGINATING failure's reason as its input, \
+         got {:?}",
+        steps["s-deliver"].1
+    );
+    // And the whole-run invariant holds on this shape too.
+    let live: Vec<_> = steps
+        .iter()
+        .filter(|(_, (status, _))| status == "planned" || status == "running")
+        .collect();
+    assert!(live.is_empty(), "terminal mission still holds non-terminal steps: {live:#?}");
+}
+
+/// (#2310 fix-loop C2 / S4-1) The same whole-run invariant on a CLEAN run:
+/// persisting every minted step at mint time must not leave a `Planned`
+/// file behind on a run where everything completed.
+#[test]
+fn clean_generic_run_leaves_no_non_terminal_step_behind() {
+    let (home, flows, _plan) = grow_fixture(r#"{"units":[{"id":"u-1","rule":"r"}]}"#, "");
+    let out = launch_grow(&home, &flows);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let steps = probe_steps(&one_mission_dir(&home));
+    let live: Vec<_> = steps
+        .iter()
+        .filter(|(_, (status, _))| status != "complete")
+        .collect();
+    assert!(live.is_empty(), "a clean run must persist only Complete steps: {live:#?}");
 }
