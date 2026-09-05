@@ -1,10 +1,10 @@
 :root {
-  /* The phone drawer's COLLAPSED height (handle 24px + tab row 44px). The
+  /* The phone drawer's COLLAPSED height (handle 32px + tab row 44px). The
      drawer's own closed-height rule and `.app-shell`'s bottom reservation
      both read this ONE value; `MissionCanvas.tsx` reads the shell's
      resolved padding. A change here moves all three together (PR #2407's
      round 2 shipped a 10px mismatch by editing one of two literals). */
-  --phone-drawer-closed-h: 68px;
+  --phone-drawer-closed-h: 76px;
   color-scheme: dark;
   /* ONE mono stack, because there were three and they disagreed (#2001).
      Measured with CDP on macOS Chrome, what each of the old ones actually
@@ -6578,10 +6578,10 @@ body {
     justify-content: center;
     /* (#2107 follow-up, operator finding on a real phone: "hard to drag")
        The visible bar is 4px; the HIT target was 6+4+4 = 14px, well under
-       a fingertip. 12px above / 8px below makes the target 24px without
-       moving the bar visually much. The closed-height rule on
-       `--phone-drawer-closed-h` on `:root` sums this (24 + 44 tab row = 68px). */
-    padding: 12px 0 8px;
+       a fingertip. Round 2 made it 24px; the operator still missed "now and
+       then" on a real phone, so 16px above / 12px below makes it 32px.
+       `--phone-drawer-closed-h` on `:root` sums this (32 + 44 tab row = 76px). */
+    padding: 16px 0 12px;
     cursor: pointer;
     touch-action: none;
     /* A held finger on the handle must not raise iOS's selection/callout
