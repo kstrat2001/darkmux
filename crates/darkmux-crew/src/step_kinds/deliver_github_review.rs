@@ -173,7 +173,7 @@ pub struct DeliverOutcome {
 // and verdict, and a second one-click `suggestion` block, all in
 // darkmux's voice under darkmux's byline.
 //
-// Three rules, applied at every sink below, so the containment is
+// Four rules, applied at every sink below, so the containment is
 // structural rather than per-call-site care:
 //
 // 1. **A fenced block picks a fence LONGER than anything in its payload**
@@ -181,11 +181,20 @@ pub struct DeliverOutcome {
 //    least as long as its opener. GitHub honors ````suggestion the same as
 //    ```suggestion, so this covers suggestion blocks too.
 // 2. **Text interpolated into a one-line bullet is folded onto that line**
-//    ([`inline_text`]) — newlines become spaces, so model text can never
-//    reach column 0 and therefore can never open a fence or start a `#`
-//    heading, a `---`/`***` break, or a `>` quote. Folding (rather than
-//    prefixing every line) is what keeps a bullet a bullet.
-// 3. **Text shown as code picks a code-span delimiter longer than any
+//    ([`inline_text`]) — every RUN of newlines becomes ONE space, so
+//    model text can never reach column 0 and therefore can never open a
+//    fence or start a `#` heading, a `---`/`***` break, or a `>` quote.
+//    Folding (rather than prefixing every line) is what keeps a bullet a
+//    bullet.
+// 3. **`<` in that same text becomes `&lt;`** ([`inline_text`], #2310 fix
+//    loop E1-1) — the one rule here that is a security property rather
+//    than a rendering one. GitHub renders raw inline HTML in comment
+//    bodies and permits `<img src=…>`, so an unescaped `<` would let a
+//    review posted under darkmux's byline fetch an attacker-chosen URL
+//    from every reader of it. `&` and `>` are deliberately NOT escaped —
+//    [`inline_text`]'s own doc says why, and `inline_text_probe_table`
+//    pins both decisions.
+// 4. **Text shown as code picks a code-span delimiter longer than any
 //    backtick run inside it** ([`code_span`]) — the inline analogue of
 //    rule 1, which preserves the text EXACTLY (a path is evidence; a
 //    look-alike substitution there would be a lie). Prose has no such
@@ -221,16 +230,49 @@ fn fence_for(payload: &str) -> String {
 /// backticks exactly.
 const BACKTICK_LOOKALIKE: char = '\u{02cb}';
 
-/// Model prose on its way into a one-line bullet: every line break becomes
-/// a space and every backtick becomes [`BACKTICK_LOOKALIKE`]. The text
-/// stays readable and complete — nothing is dropped or truncated — it just
-/// loses the two characters that let it act as markdown structure.
+/// Model prose on its way into a one-line bullet: every RUN of line breaks
+/// becomes ONE space, every backtick becomes [`BACKTICK_LOOKALIKE`], and
+/// every `<` becomes `&lt;`. The text stays readable and complete —
+/// nothing is dropped or truncated — it just loses the characters that let
+/// it act as markdown structure or as raw HTML.
+///
+/// Three deliberate non-substitutions, each load-bearing enough to have
+/// its own row in `inline_text_probe_table` (#2310 fix loop E1):
+///
+/// - **`>` and `&` are left alone.** `&` decodes to a literal CHARACTER in
+///   CommonMark's text stream, never to markup — a model writing `&lt;`
+///   gets a visible `<` on the page, not a tag — so escaping it would only
+///   mangle prose. `>` opens a block quote at column 0 only, and this
+///   function's whole job is that model text never reaches column 0.
+/// - **`#`, `-`, `>`, `1.` are left alone** for the same reason: every
+///   call site interpolates the result mid-line.
+/// - **U+2028 / U+2029 are left alone.** CommonMark's "line endings" are
+///   LF, CR and CRLF; cmark-gfm does not break a line on the Unicode
+///   separators, so they cannot carry text to column 0 either.
+///
+/// (#2310 fix loop E1-1) The `<` escape is the one that is a security
+/// property rather than a rendering one: GitHub renders raw inline HTML in
+/// comment bodies and permits `<img src=…>`, so an unescaped `<` in model
+/// prose would let a review posted under darkmux's byline fetch an
+/// attacker-chosen URL from every reader.
 fn inline_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    // (#2310 fix loop E1-4) A CRLF is ONE line break and a blank line is
+    // still one break; mapping each break character to its own space left
+    // `a\r\nb` reading `a  b`.
+    let mut in_break = false;
     for c in s.chars() {
+        if c == '\n' || c == '\r' {
+            if !in_break {
+                out.push(' ');
+                in_break = true;
+            }
+            continue;
+        }
+        in_break = false;
         match c {
-            '\n' | '\r' => out.push(' '),
             '`' => out.push(BACKTICK_LOOKALIKE),
+            '<' => out.push_str("&lt;"),
             _ => out.push(c),
         }
     }
@@ -242,8 +284,22 @@ fn inline_text(s: &str) -> String {
 /// one padding space on each side when the content itself starts or ends
 /// with a backtick). The content is preserved byte-for-byte inside the
 /// span — a file path is evidence a reader may need to paste.
+///
+/// Two rules that differ from [`inline_text`]'s on purpose: a line break
+/// maps to exactly one space PER CHARACTER (a CRLF stays two spaces), so a
+/// pathological path stays visibly pathological rather than being tidied
+/// away; and `<` is left alone, because inside a code span it is inert and
+/// escaping it would corrupt the evidence.
 fn code_span(content: &str) -> String {
     let flat: String = content.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    // (#2310 fix loop E1-3) Empty content would otherwise render as two
+    // adjacent backticks — an UNCLOSED backtick string, which CommonMark
+    // prints literally. Not a breakout, but a visible artifact in a
+    // posted review, and reachable: `FindingWindow::display` returns a
+    // bare `key`, so a finding with an empty key lands here.
+    if flat.trim().is_empty() {
+        return "`(empty)`".to_string();
+    }
     let mut longest = 0usize;
     let mut run = 0usize;
     for c in flat.chars() {
@@ -434,14 +490,20 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize) -> String {
         findings_considered,
         scope.refused,
     );
+    // (#2310 fix loop E1-2) Both lists go through `inline_text` per entry.
+    // They are host-authored today, but this is COLUMN-0 text on the
+    // degraded path — where the scope line is the entire payload — so the
+    // module's "nothing interpolated here can reach column 0" claim has to
+    // hold as WRITTEN, not because of who currently happens to call it.
+    let joined = |entries: &[String]| entries.iter().map(|e| inline_text(e)).collect::<Vec<_>>().join(", ");
     if !scope.not_attempted.is_empty() {
-        line.push_str(&format!(" Not attempted: {}.", scope.not_attempted.join(", ")));
+        line.push_str(&format!(" Not attempted: {}.", joined(&scope.not_attempted)));
     }
     // (#2310 P4c-2b PR #2357 review MUST FIX D) Named so a `"degraded"`
     // run's scope line (its whole payload, when there is nothing else to
     // say) actually names what broke, not just that something did.
     if !scope.errored.is_empty() {
-        line.push_str(&format!(" Errored: {}.", scope.errored.join(", ")));
+        line.push_str(&format!(" Errored: {}.", joined(&scope.errored)));
     }
     line
 }
@@ -1072,7 +1134,13 @@ mod tests {
         let review = out.review.expect("a degraded outcome still carries a review payload (the scope line)");
         assert!(review.comments.is_empty(), "{review:?}");
         assert!(review.body.contains("review ran:"), "the scope line must be present: {}", review.body);
-        assert!(review.body.contains("Errored: unit `x` (Error)."), "{}", review.body);
+        // (#2310 fix loop E1-2) The entry now goes through `inline_text`,
+        // so its backticks become the look-alike. That is a deliberate
+        // cost: `DeliverScope::errored` has no production producer yet
+        // (grep — it is filled only by this module's own tests), so no
+        // shipped text loses its code styling, while the containment
+        // claim becomes true as written for whoever fills it first.
+        assert!(review.body.contains("Errored: unit \u{02cb}x\u{02cb} (Error)."), "{}", review.body);
     }
 
     // ─── (#2310 fix loop A / S3-2) coverage is never discarded ──────────
@@ -1511,5 +1579,257 @@ mod tests {
         };
         let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
         assert_eq!(outcome.output, "-", "the step's own output names stdout, not a path");
+    }
+
+    // ---------------------------------------------------------------
+    // (#2310 fix loop E1) The containment primitives' own probe tables.
+    // The #2365 review ran these by hand against a scratch binary; the
+    // operator's rule is that a reviewer probe becomes a NAMED COMMITTED
+    // test, so every row below is one of that review's probes with its
+    // expectation recomputed here rather than transcribed.
+    // ---------------------------------------------------------------
+
+    /// (#2310 fix loop E1-1) A `<` in model prose must not be able to open
+    /// an HTML tag. GitHub's markdown renders raw inline HTML, and it
+    /// allows `<img src=…>` — so an unescaped `<` in a `why` lets a model
+    /// (or a repo whose content a model quotes) fetch an attacker-chosen
+    /// URL from every reader of a review posted under darkmux's byline,
+    /// and render an attacker-chosen image/link there. The double-check
+    /// path this exercises emits NO fenced block, so the assertion can be
+    /// the strongest available: not one `<` survives anywhere in the body.
+    #[test]
+    fn a_model_supplied_angle_bracket_cannot_open_an_html_tag() {
+        let findings = vec![finding(
+            "s/1",
+            "src/a.ts",
+            2,
+            "<a href=\"https://evil.example/track\">click</a>",
+            "<img src=x onerror=1>",
+            None,
+        )];
+        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert!(review.comments.is_empty(), "no mod, so nothing is inline: {review:?}");
+        assert!(
+            !review.body.contains('<'),
+            "a raw `<` reached the posted body — an <img src> would load from every reader:\n{}",
+            review.body
+        );
+        // `>` is deliberately NOT escaped (see `inline_text`'s doc): it
+        // only means anything at column 0, which this function's folding
+        // already makes unreachable. Asserting the exact surviving `>`
+        // pins that decision rather than leaving it implied.
+        assert!(review.body.contains("&lt;img src=x onerror=1>"), "{}", review.body);
+        assert!(review.body.contains("&lt;a href=\"https://evil.example/track\">click&lt;/a>"), "{}", review.body);
+    }
+
+    /// (#2310 fix loop E1-2) `scope_line`'s `not_attempted` / `errored`
+    /// entries are column-0 text on the DEGRADED path, where the scope
+    /// line is the entire payload. They are host-authored today, but the
+    /// module's containment claim ("model text can never reach column 0")
+    /// has to be true AS WRITTEN, not true because of who happens to call
+    /// it — a future caller filling `errored` from an agent's own error
+    /// string is the obvious next step.
+    #[test]
+    fn a_forged_heading_in_a_scope_entry_folds_onto_the_scope_line() {
+        let scope = DeliverScope {
+            errored: vec!["unit `x` (Error)\n### forged heading\nand a second line".to_string()],
+            not_attempted: vec!["architectural review\n### also forged".to_string()],
+            ..Default::default()
+        };
+        let out = render_github_review(&[], &[], DIFF, &scope, None);
+        assert_eq!(out.mode, "degraded");
+        let body = out.review.unwrap().body;
+        assert_eq!(
+            body.lines().filter(|l| l.trim_start().starts_with('#')).count(),
+            1,
+            "only darkmux's own `### darkmux review` may sit at column 0:\n{body}"
+        );
+        assert_eq!(body.lines().count(), 3, "heading, blank, one scope line:\n{body}");
+        assert!(body.contains("### forged heading and a second line"), "{body}");
+        assert!(body.contains("### also forged"), "{body}");
+    }
+
+    /// (#2310 fix loop E1-3) `code_span("")` used to render ` `` ` — two
+    /// adjacent backticks, which CommonMark reads as an UNCLOSED backtick
+    /// string and prints literally. Not a breakout (the bullet after it
+    /// survives), but it is a visible artifact in a posted review, and
+    /// the input is reachable: `FindingWindow::display` returns a bare
+    /// `key`, and a finding with an empty key renders exactly this.
+    #[test]
+    fn an_empty_code_span_names_itself_instead_of_rendering_two_backticks() {
+        assert_eq!(code_span(""), "`(empty)`");
+        assert_eq!(code_span("   "), "`(empty)`", "an all-whitespace span is invisible, so it names itself too");
+        let findings = vec![finding("/1", "", 0, "ev", "claim", None)];
+        // `finding()` splits the key on `/`, so this is the empty-key
+        // shape reaching `display()` through the real path.
+        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let body = out.review.unwrap().body;
+        assert!(!body.contains("``"), "no bare double-backtick artifact in a posted body:\n{body}");
+    }
+
+    /// (#2310 fix loop E1-4) A CRLF is ONE line break, and a blank line is
+    /// still one break. Mapping each break character to its own space
+    /// left `a\r\nb` reading `a  b` and a paragraph gap reading `a   b`.
+    #[test]
+    fn a_run_of_line_breaks_folds_to_exactly_one_space() {
+        assert_eq!(inline_text("a\r\nb"), "a b");
+        assert_eq!(inline_text("a\n\nb"), "a b");
+        assert_eq!(inline_text("a\r\n\r\n\r\nb"), "a b");
+        assert_eq!(inline_text("a\n\r\n\rb"), "a b");
+    }
+
+    /// (#2310 fix loop E1-5) `fence_for`'s probe table. The rule under
+    /// test is CommonMark's: a closing fence must be at least as long as
+    /// its opener and must be made of the SAME character, so the fence
+    /// only ever has to out-run backticks.
+    #[test]
+    fn fence_for_probe_table() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("", "```", "an empty payload still gets the three-backtick minimum"),
+            ("plain text", "```", "no backticks at all"),
+            ("a ` b `` c", "```", "longest run is 2, so 3 still clears it"),
+            ("```", "````", "a three-backtick fence inside the payload"),
+            ("````", "`````", "a four-backtick fence inside the payload"),
+            ("```````", "````````", "a seven-backtick fence inside the payload"),
+            (
+                "   ```\nnested\n   ```",
+                "````",
+                "an INDENTED closing fence is still a valid closer in CommonMark \
+                 (up to three spaces), so indentation must not exempt a run from the scan",
+            ),
+            (
+                "~~~\nnested\n~~~",
+                "```",
+                "a tilde fence cannot close a backtick fence, so it must NOT lengthen ours",
+            ),
+            ("`", "```", "a lone backtick is under the minimum"),
+            ("``ends here``", "```", "runs of 2 at both ends"),
+        ];
+        for (payload, expected, why) in cases {
+            assert_eq!(&fence_for(payload).as_str(), expected, "fence_for({payload:?}): {why}");
+        }
+    }
+
+    /// (#2310 fix loop E1-5) `inline_text`'s probe table — what it
+    /// changes, and (just as load-bearing) what it deliberately leaves
+    /// alone.
+    #[test]
+    fn inline_text_probe_table() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("a\nb", "a b", "LF"),
+            ("a\rb", "a b", "lone CR"),
+            ("a\r\nb", "a b", "CRLF is ONE break"),
+            (
+                "a\u{2028}b",
+                "a\u{2028}b",
+                "U+2028 LINE SEPARATOR is NOT a line ending to cmark-gfm \
+                 (CommonMark 'Line endings' names only LF, CR and CRLF), so it \
+                 cannot reach column 0 and is left alone",
+            ),
+            ("a\u{2029}b", "a\u{2029}b", "U+2029 PARAGRAPH SEPARATOR, same reasoning"),
+            ("# not a heading", "# not a heading", "left alone: every call site interpolates mid-line"),
+            ("- not a list item", "- not a list item", "same"),
+            ("> not a block quote", "> not a block quote", "same"),
+            ("1. not an ordered item", "1. not an ordered item", "same"),
+            ("--- not a thematic break", "--- not a thematic break", "same"),
+            ("`code`", "\u{02cb}code\u{02cb}", "prose has no delimiter to lengthen, so a backtick becomes its look-alike"),
+            ("<img src=x onerror=1>", "&lt;img src=x onerror=1>", "E1-1: `<` can open raw HTML on GitHub"),
+            (
+                "&lt;img src=x&gt;",
+                "&lt;img src=x&gt;",
+                "`&` is NOT escaped: CommonMark decodes an entity reference to a literal \
+                 CHARACTER in the text stream, never to markup — `&lt;` renders as a visible \
+                 `<`, and re-escaping the output of a decode is not a thing GitHub does",
+            ),
+            ("  padded  ", "padded", "the result is trimmed"),
+            ("\n\nleading and trailing breaks\n\n", "leading and trailing breaks", "folded then trimmed"),
+        ];
+        for (input, expected, why) in cases {
+            assert_eq!(&inline_text(input).as_str(), expected, "inline_text({input:?}): {why}");
+        }
+    }
+
+    /// (#2310 fix loop E1-5) `code_span`'s probe table. Its contract is
+    /// the opposite of `inline_text`'s: the content is EVIDENCE (a path a
+    /// reader may need to paste), so nothing inside is substituted — the
+    /// delimiter grows instead.
+    #[test]
+    fn code_span_probe_table() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("plain", "`plain`", "no backticks, no padding"),
+            (
+                "`x`",
+                "`` `x` ``",
+                "backticks at BOTH ends: the delimiter grows to 2 and one padding space \
+                 goes on each side, which CommonMark strips back off",
+            ),
+            ("`leading", "`` `leading ``", "a backtick at the start alone still needs both pads"),
+            ("trailing`", "`` trailing` ``", "and at the end"),
+            ("``", "``` `` ```", "content that is ONLY backticks: delimiter 3, padded"),
+            ("a`b", "``a`b``", "an interior backtick needs no padding"),
+            ("a``b", "```a``b```", "interior run of 2"),
+            ("a\nb", "`a b`", "an embedded newline is flattened"),
+            (
+                "a\r\nb",
+                "`a  b`",
+                "a CRLF becomes TWO spaces here on purpose: unlike prose, a span's content is \
+                 evidence, and one output character per input character keeps the mangling \
+                 of a pathological path visible rather than tidied away",
+            ),
+            ("<img src=x>", "`<img src=x>`", "a `<` inside a code span is inert, and altering it would corrupt the evidence"),
+            ("", "`(empty)`", "E1-3: never a bare backtick pair"),
+        ];
+        for (input, expected, why) in cases {
+            assert_eq!(&code_span(input).as_str(), expected, "code_span({input:?}): {why}");
+        }
+    }
+
+    /// (#2310 fix loop E1-6) The hardening above is a NO-OP on benign
+    /// text. `golden_rendered_payload_covers_every_delivery_form` already
+    /// enforces byte-identity against the committed golden — this test
+    /// says WHY that golden did not have to be regenerated, by proving
+    /// the committed bytes contain nothing any of E1-1..E1-4 would have
+    /// touched. If a future golden legitimately needs a `<`, this test is
+    /// the place that decision gets made rather than silently absorbed
+    /// into a regenerated file.
+    #[test]
+    fn the_committed_golden_contains_nothing_the_containment_hardening_would_change() {
+        let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/deliver-github-review");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&golden_path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(!text.contains('<'), "{} carries a raw `<`, which E1-1 now escapes", path.display());
+            assert!(!text.contains("\\r"), "{} carries a CR, which E1-4 now folds", path.display());
+            // An empty code span is a MAXIMAL run of exactly two
+            // backticks. A substring test can't tell one from the tail of
+            // a ``` fence, so scan maximal runs instead. Today's golden
+            // has runs of 1 (spans) and 3 (fences) only. A future golden
+            // whose content legitimately needs a padded two-backtick
+            // delimiter (a span whose own content starts or ends with a
+            // backtick) trips this deliberately — that is the decision
+            // point, not a silent regeneration.
+            let mut run = 0usize;
+            for c in text.chars().chain(std::iter::once('\n')) {
+                if c == '`' {
+                    run += 1;
+                    continue;
+                }
+                assert_ne!(
+                    run,
+                    2,
+                    "{} carries a two-backtick run — either an empty code span (which E1-3 now \
+                     names `(empty)`) or a padded delimiter that needs a deliberate decision",
+                    path.display()
+                );
+                run = 0;
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no golden files found under {} — this test would pass vacuously", golden_path.display());
     }
 }
