@@ -3040,7 +3040,11 @@ mod tests {
         //           rendering; `source` narrows to ONE meaning — the
         //           producing step's id, never an absolute host path
         //           (#2310 swarm F / S2-2).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.40.0");
+        //   1.41.0: every scheduler `step start` gains `payload.seat_class`
+        //           (one of `local_model` | `remote_endpoint` | `no_model` |
+        //           `local_model_unresolved`), plus a new `step seat
+        //           unresolved` Warn action for the last of those (#2394).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.41.0");
     }
 
     #[test]

@@ -425,6 +425,15 @@ Two rules worth carrying without looking anything up:
   `test_command`, `procedural.shell`'s `command`), on whose expiry the
   command's whole process group is killed and the step reports the timeout.
   `darkmux doctor` prints the resolved value and which reading it got.
+- **Two concurrency caps, and they are not interchangeable (#2394).**
+  `DARKMUX_REMOTE_CONCURRENT_CAP` → `remote.concurrent_cap` bounds HOSTED
+  endpoint dispatches; `DARKMUX_DISPATCH_FREE_CONCURRENCY` →
+  `runtime.dispatch_free_concurrency` (default `8`) bounds steps that speak to
+  no model at all (`procedural.shell`, `mods.gate`, `records.gather`,
+  `deliver.github_review`). They were one cap only because a dispatch-free step
+  had no way to say what it consumed; a mission launch sets the remote cap to
+  1, so six independent shell waits ran strictly one at a time. See "Seat
+  classes" in `DESIGN.md`.
 
 
 ## Where things live

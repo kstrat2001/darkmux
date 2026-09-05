@@ -71,7 +71,7 @@ mod types;
 pub(crate) const MIN_VIABLE_MAP_GRANT: u32 = 512;
 
 pub use builtins::{
-    parse_failed_verifiers, resolve_local_placement, DispatchInternalStepKind,
+    parse_failed_verifiers, resolve_local_seat, DispatchInternalStepKind,
     DispatchMapStepKind, DispatchSingleShotStepKind, FailedVerifier, MapItemResult,
     ProceduralNoopStepKind, ProceduralShellStepKind, RawDispatchOutcome,
 };
@@ -87,7 +87,7 @@ pub use records_gather::{
 };
 pub use registry::StepKindRegistry;
 pub use types::{
-    ArtifactBus, MapDispatchOverride, OverrideDispatchCall, Port, PortKind, StepKind,
+    ArtifactBus, MapDispatchOverride, OverrideDispatchCall, Port, PortKind, SeatClaim, StepKind,
     StepOutcome, StepRunCtx, WaveSignal,
 };
 // (#1877) `RemoteBudget`'s canonical home is `crate::remote_budget` (a

@@ -162,6 +162,7 @@ pub fn run() -> DoctorReport {
         check_gh_allowlist(),
         check_review_judge_exhaustion_policy(),
         check_step_command_timeout(),
+        check_dispatch_free_concurrency(),
         check_turn_delay(),
         check_reasoning_checkpoint_interval(),
         check_max_stall_recoveries(),
@@ -1784,6 +1785,47 @@ fn check_step_command_timeout() -> Check {
         message: format!(
             "{seconds}s ({provenance}) — a step's shell command (mods.gate's test_command, \
              procedural.shell) is killed at this bound, process group and all"
+        ),
+        hint: None,
+    }
+}
+
+/// (#2394) Informational: how many DISPATCH-FREE steps the scheduler runs
+/// at once — every step whose `StepKind::seat` claims `SeatClaim::NoModel`
+/// (`procedural.shell`, `procedural.noop`, `mods.gate`, `records.gather`,
+/// `deliver.github_review`). Always `Pass` (a preference, not a health
+/// signal); surfaces the resolved value with provenance so an operator
+/// watching a wave of shell steps can see which tier set that number
+/// without reading `config.json`. Mirrors `check_step_command_timeout`'s
+/// provenance-display shape exactly.
+///
+/// Said out loud in the message: this is NOT `remote.concurrent_cap`. The
+/// two were the same number before #2394 only because dispatch-free steps
+/// had no seat class of their own, which is the bug.
+fn check_dispatch_free_concurrency() -> Check {
+    let name = "runtime.dispatch_free_concurrency";
+    let env_set = std::env::var("DARKMUX_DISPATCH_FREE_CONCURRENCY")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .runtime
+        .and_then(|r| r.dispatch_free_concurrency)
+        .is_some();
+    let provenance = if env_set {
+        "from DARKMUX_DISPATCH_FREE_CONCURRENCY env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    let n = darkmux_types::config_access::dispatch_free_concurrency();
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "{n} ({provenance}) — dispatch-free steps (procedural.shell/noop, mods.gate, \
+             records.gather, deliver.github_review) run this many at a time, on their own \
+             track; the hosted-endpoint cap (remote.concurrent_cap) does not govern them"
         ),
         hint: None,
     }
@@ -6472,6 +6514,80 @@ mod tests {
         assert!(!check.message.contains("env"), "the env tier is absent here: {}", check.message);
     }
 
+    // ─── (#2394) check_dispatch_free_concurrency — resolved state + provenance ─
+
+    /// Scopes `DARKMUX_DISPATCH_FREE_CONCURRENCY` for one check and restores
+    /// the prior value — the same shape `step_command_timeout_check_with`
+    /// above uses.
+    fn dispatch_free_concurrency_check_with(env: Option<&str>) -> Check {
+        let k = "DARKMUX_DISPATCH_FREE_CONCURRENCY";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            match env {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let check = check_dispatch_free_concurrency();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        check
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_dispatch_free_concurrency_default_is_pass_and_names_8() {
+        let check = dispatch_free_concurrency_check_with(None);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains('8'), "{}", check.message);
+        assert!(check.message.contains("default"), "provenance named: {}", check.message);
+        assert!(
+            check.message.contains("remote.concurrent_cap"),
+            "the message must say WHICH cap does not govern these steps — that confusion IS \
+             the #2394 bug: {}",
+            check.message
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_dispatch_free_concurrency_env_override_names_the_value_and_its_provenance() {
+        let check = dispatch_free_concurrency_check_with(Some("3"));
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains('3'), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+    }
+
+    /// The middle tier — see `check_step_command_timeout_reads_config_json_
+    /// when_env_is_unset`'s own doc for why only the PROVENANCE is asserted
+    /// here and not the resolved value.
+    #[serial_test::serial]
+    #[test]
+    fn check_dispatch_free_concurrency_reads_config_json_when_env_is_unset() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"schema_version":"1.21","runtime":{"dispatch_free_concurrency":3}}"#,
+        )
+        .unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = dispatch_free_concurrency_check_with(None);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("from config.json"), "provenance named: {}", check.message);
+        assert!(!check.message.contains("env"), "the env tier is absent here: {}", check.message);
+    }
+
     // ─── (#2111) check_telemetry_record_every_samples — resolved state + provenance ─
 
     #[serial_test::serial]
@@ -7726,10 +7842,11 @@ mod tests {
         // rules [#1959] + host-probe [#2107] + power-posture [#2112,
         // battery/Low-Power-Mode/thermal-state/thermal-emergency] +
         // max-stall-recoveries [#2190] +
-        // step-command-timeout [#2361]) + one per active eureka rule.
+        // step-command-timeout [#2361] +
+        // dispatch-free-concurrency [#2394]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 51 + darkmux_eureka::all_rules().len();
+        let expected = 52 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

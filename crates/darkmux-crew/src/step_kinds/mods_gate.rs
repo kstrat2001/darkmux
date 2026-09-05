@@ -105,7 +105,7 @@
 
 use crate::mods::{self, GateOutcome, ModRecord};
 use crate::step_kinds::registry::StepKindRegistry;
-use crate::step_kinds::types::{StepKind, StepOutcome};
+use crate::step_kinds::types::{SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -130,6 +130,22 @@ struct GateSummary {
 pub struct ModsGateStepKind;
 
 impl StepKind for ModsGateStepKind {
+    /// (#2394) [`SeatClaim::NoModel`] — this kind runs an operator-supplied `test_command` per mod; it
+    /// dispatches nothing. Bounded by `runtime.dispatch_free_concurrency`
+    /// and, per command, by `runtime.step_command_timeout_seconds` — never
+    /// by the hosted-endpoint cap.
+    /// The `test_command` per mod is why the dispatch-free cap is a real
+    /// number and not "unbounded": N of these at once is N test suites.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         MODS_GATE_KIND
     }

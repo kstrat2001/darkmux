@@ -1524,15 +1524,18 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(actual, coder_brief(&p, &m, &[], &[], &[]), "no sources → the bare description: {actual:?}");
     }
 
-    /// `resolve_local_placement` — the best-effort role→profile→model
-    /// classification `StepKind::residency` implementations use. A local
-    /// model resolves to `Some(Placement)`; a remote (endpoint-bearing)
-    /// model, or an unresolvable role/profile, fails OPEN to `None` (never
-    /// an error — see the function's own doc). Uses an explicit
-    /// `--profiles`-equivalent temp file path, so this never touches the
-    /// real `~/.darkmux/profiles.json`.
+    /// `resolve_local_seat` — the best-effort role→profile→model
+    /// classification `StepKind::seat` implementations use.
+    ///
+    /// (#2394) The three outcomes are now three DIFFERENT claims, and this
+    /// test asserts each one by name. It used to assert `.is_none()` twice
+    /// — once for a legitimately remote model, once for an unresolvable
+    /// role — which is precisely the conflation #2394 removed: the first is
+    /// correct and silent, the second is a lost residency lease that has to
+    /// be surfaced. Uses an explicit `--profiles`-equivalent temp file path,
+    /// so this never touches the real `~/.darkmux/profiles.json`.
     #[test]
-    fn resolve_local_placement_classifies_local_vs_remote_vs_unresolvable() {
+    fn resolve_local_seat_classifies_local_vs_remote_vs_unresolvable() {
         let tmp = tempfile::TempDir::new().unwrap();
         let profiles_path = tmp.path().join("profiles.json");
         std::fs::write(
@@ -1555,8 +1558,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         // A known role ("coder" — built-in) on the default profile's
         // default (local) model resolves to a real Placement.
-        let placement = resolve_local_placement("coder", None, Some(path_str), "test-seat");
-        let placement = placement.expect("a local default model must resolve");
+        let SeatClaim::LocalModel(placement) = resolve_local_seat("coder", None, Some(path_str), "test-seat")
+        else {
+            panic!("a local default model must claim LocalModel");
+        };
         assert_eq!(placement.model_key, "local-model");
         assert_eq!(placement.min_ctx, 32000);
         assert_eq!(placement.seat, "test-seat");
@@ -1564,7 +1569,8 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         // An explicit request for the remote-endpoint model — swap the
         // default so `select_model`'s no-vectors fallback picks it — must
-        // classify `None` (Remote), never a Placement.
+        // classify RemoteEndpoint, never a Placement. This is the CORRECT
+        // silent case: it was never going to touch local residency.
         std::fs::write(
             &profiles_path,
             r#"{
@@ -1581,12 +1587,22 @@ edit loop detected on src/widget.rs in an earlier dispatch
         )
         .unwrap();
         assert!(
-            resolve_local_placement("coder", None, Some(path_str), "test-seat").is_none(),
-            "a remote-endpoint model must classify Remote (None), not a Placement"
+            matches!(
+                resolve_local_seat("coder", None, Some(path_str), "test-seat"),
+                SeatClaim::RemoteEndpoint
+            ),
+            "a remote-endpoint model must classify RemoteEndpoint, not a Placement"
         );
 
-        // An unresolvable role fails open to None, not a panic/error.
-        assert!(resolve_local_placement("no-such-role-xyz", None, Some(path_str), "seat").is_none());
+        // An unresolvable role still fails OPEN (no panic, no error) — but
+        // as its OWN claim, so the scheduler can say so out loud. Sharing
+        // the remote arm with the case above is what made a broken local
+        // dispatch indistinguishable from a healthy hosted one.
+        let claim = resolve_local_seat("no-such-role-xyz", None, Some(path_str), "seat");
+        let SeatClaim::LocalModelUnresolved { reason } = claim else {
+            panic!("an unresolvable role must claim LocalModelUnresolved, got {}", claim.label());
+        };
+        assert!(reason.contains("no-such-role-xyz"), "the reason names the role: {reason}");
     }
 
     // ── (#1426 ship-4 / #1433) ship/abort honest-finalize + workdir align ──

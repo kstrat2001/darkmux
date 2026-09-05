@@ -11,17 +11,28 @@
 //! of concurrently-runnable work), flush results, recompute readiness,
 //! repeat until nothing is ready and nothing is left `Planned`.
 //!
-//! # Residency (resolved for real in Packet 3)
+//! # Seat classes (#1230 Packet 3; made exhaustive in #2394)
 //!
-//! `run_bounded` wants to know, per job, whether it needs a local model
-//! resident (`Residency::Local(Placement)`, gestalt-wave-planned) or is
-//! remote/unbound (`Residency::Remote`, cap-bounded only). Packet 2 shipped
-//! this hardcoded to `Residency::Remote` for every step (storage + scheduler
-//! only, no production caller wiring a real dispatch chain through the
-//! graph yet) — Packet 3 resolves it for real via `StepKind::residency`
-//! (`step_kinds::types`): each ready step's registered kind is asked which
-//! local model (if any) it needs, best-effort (see that trait method's
-//! doc — a resolution miss fails OPEN to `Remote`, never a hard error).
+//! `run_bounded` wants to know, per job, what that job CONSUMES, because
+//! that is what decides which track it runs on and under which ceiling.
+//! Each ready step's registered kind is asked exactly that, through the
+//! required `StepKind::seat` hook (`step_kinds::types`), which returns one
+//! of four `SeatClaim`s:
+//!
+//! - `LocalModel(Placement)` — gestalt-wave-planned, residency-lease
+//!   protected.
+//! - `RemoteEndpoint` — a hosted seat, bounded by `remote_cap`.
+//! - `NoModel` — dispatch-free, bounded by `dispatch_free_cap`.
+//! - `LocalModelUnresolved { reason }` — a local seat whose placement would
+//!   not resolve. Still fails OPEN (it runs, under `remote_cap`, as it
+//!   always has), never a hard error — but LOUDLY, via an `eprintln!` and a
+//!   `Warn` flow record naming the step and the reason.
+//!
+//! Packet 2 shipped this hardcoded to "remote" for every step (storage +
+//! scheduler only, no production caller wiring a real dispatch chain through
+//! the graph yet); Packet 3 resolved it for real; #2394 made it exhaustive
+//! and removed the default, after the two-valued shape swept every
+//! dispatch-free step onto the hosted-endpoint track.
 //! `DispatchInternalStepKind` implements it via `step_kinds::
 //! resolve_local_placement` (role→profile→`select_model`, mirroring the
 //! dispatch preflight's own resolution); `coder_phase`'s own
@@ -498,7 +509,7 @@ pub struct SchedulerReport {
 /// Walk `steps` to completion: each iteration computes every currently-
 /// ready node, marks them `Running`, fans them out through Packet 1's
 /// `run_bounded` (one call = one wave — see the module doc's Residency
-/// section for why every job here is `Residency::Remote`), flushes each
+/// section for why each job's track is the kind's own declaration), flushes each
 /// job's `StepOutcome` onto its Step (status + `output` + timestamps),
 /// emits step-lifecycle bookend records through `emit`, and recomputes
 /// readiness. Stops when nothing is ready (either the graph finished, or
@@ -830,8 +841,12 @@ pub fn run_step_graph(
             let step = steps.get_mut(id).expect("id came from `steps` itself");
             step.status = NodeStatus::Running;
             step.started_ts = Some(now);
-            emit(step_lifecycle_record(step, "step start"));
-            persist(step);
+            // (#2394) The `step start` record + `persist` moved DOWN into the
+            // classification loop below, so the record can carry
+            // `payload.seat_class` — what this step actually consumes. It is
+            // still emitted before anything runs, still paired immediately
+            // with its `persist`, and still carries this same post-flip state
+            // (the loop below emits from its own owned snapshot of it).
         }
         // (#1442 gate C3, streaming) One channel per wave: every job's
         // `StepRunCtx` holds a `Sender` clone, and the main thread drains the
@@ -914,19 +929,42 @@ pub fn run_step_graph(
                 dispatch_override.clone(),
                 bus.clone(),
             );
-            // (#1230 Packet 3) Per-step residency classification — see the
-            // trait doc on `StepKind::residency` and the module doc above.
-            // Best-effort: `None` (every kind's behavior before this hook
-            // existed, and every non-dispatch kind today) schedules Remote.
-            // (#1530 Packet 3a) `ctx` is built ABOVE this call (moved up from
-            // its original place after residency) so `residency()` can read
-            // the same run-scoped `ArtifactBus` `run_streaming` uses below —
-            // see `StepKind::residency`'s doc. The borrow here ends before
-            // `ctx` moves into the job closure past this point.
-            let residency = match kind.residency(&step_snapshot, &task_snapshot, &input, &ctx) {
-                Some(placement) => crate::concurrent_dispatch::Residency::Local(placement),
-                None => crate::concurrent_dispatch::Residency::Remote,
-            };
+            // (#1230 Packet 3, reshaped by #2394) Per-step seat
+            // classification — see the trait doc on `StepKind::seat` and the
+            // module doc above. Every kind DECLARES what it consumes; there
+            // is no default and no catch-all, so a dispatch-free step is
+            // never mistaken for a hosted-endpoint dispatch again.
+            // (#1530 Packet 3a) `ctx` is built ABOVE this call so `seat()`
+            // can read the same run-scoped `ArtifactBus` `run_streaming` uses
+            // below. The borrow here ends before `ctx` moves into the job
+            // closure past this point.
+            let seat = kind.seat(&step_snapshot, &task_snapshot, &input, &ctx);
+            // (#2394 / #1509) A local seat we could not place still runs —
+            // fail-open, unchanged — but never quietly. It has just lost its
+            // #1487 residency-lease protection, so a concurrent darkmux
+            // command's `Exclusive` reconcile can evict its model
+            // mid-generation with no other signal at all. Both channels: the
+            // operator's terminal AND the durable flow stream, each naming
+            // the step and the reason.
+            if let crate::step_kinds::SeatClaim::LocalModelUnresolved { reason } = &seat {
+                eprintln!(
+                    "darkmux: step `{}` (kind `{}`) claims a LOCAL model seat but its placement \
+                     could not be resolved ({reason}) — running it under the remote cap, with NO \
+                     wave load and NO #1487 residency lease. A concurrent darkmux command's \
+                     reconcile could evict its model mid-generation.",
+                    step_snapshot.id, step_snapshot.kind
+                );
+                emit(seat_unresolved_record(&step_snapshot, reason));
+            }
+            // (#2394) The step's own start bookend, stamped with what it
+            // consumes. Paired with `persist` exactly as it was when both
+            // lived in the status-flip loop above.
+            emit(step_lifecycle_record_with_payload(
+                &step_snapshot,
+                "step start",
+                Some(serde_json::json!({ "seat_class": seat.label() })),
+            ));
+            persist(&step_snapshot);
             // (#1483 Bug 3) The job wrapper's OWN handle on the wave channel,
             // used to stream this step's terminal transition the instant its
             // dispatch finishes. Distinct from the `ctx` clone (which carries
@@ -986,7 +1024,7 @@ pub fn run_step_graph(
                 });
             jobs.push(crate::concurrent_dispatch::QueuedJob {
                 index: idx,
-                residency,
+                seat,
                 job,
             });
         }
@@ -1013,7 +1051,18 @@ pub fn run_step_graph(
         let mut applied: HashSet<usize> = HashSet::new();
         let results = std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
-                crate::concurrent_dispatch::run_bounded(jobs, facts, est, remote_cap, host_factory)
+                crate::concurrent_dispatch::run_bounded(
+                    jobs,
+                    facts,
+                    est,
+                    remote_cap,
+                    // (#2394) Dispatch-free steps get their OWN ceiling.
+                    // Resolved here (not inside `run_bounded`) so the executor
+                    // stays a pure function of its arguments, exactly like
+                    // `remote_cap`, which this caller also resolves.
+                    darkmux_types::config_access::dispatch_free_concurrency() as usize,
+                    host_factory,
+                )
             });
             for sig in rx.iter() {
                 match sig {
@@ -1603,6 +1652,55 @@ fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
     step_lifecycle_record_with_payload(step, action, None)
 }
 
+/// (#2394) The action a `SeatClaim::LocalModelUnresolved` warning carries.
+/// Its own action string, not a `"step start"` at `Warn`: a consumer folding
+/// step lifecycle bookends must not have to inspect `level` to know whether
+/// a record is one.
+pub const SEAT_UNRESOLVED_ACTION: &str = "step seat unresolved";
+
+/// (#2394 / #1509) The DURABLE half of the loud surface for a local seat
+/// whose placement could not be resolved — the `eprintln!` beside it reaches
+/// an attended operator, this reaches the flow stream, an unattended run's
+/// artifact, and the viewer.
+///
+/// `Warn`, because it names a real lost guarantee rather than a preference:
+/// this dispatch meant to run a local model, so it SHOULD have had a #1487
+/// residency lease, and it does not. The `reason` is the resolver's own
+/// (`role \`x\` not found`, `no active profile`, `model \`m\` has no declared
+/// n_ctx`) — carried verbatim so the operator fixes the actual cause rather
+/// than guessing from a category.
+fn seat_unresolved_record(step: &Step, reason: &str) -> FlowRecord {
+    FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level: Level::Warn,
+        category: Category::Work,
+        tier: Tier::Local,
+        stage: Stage::Dispatch,
+        action: SEAT_UNRESOLVED_ACTION.to_string(),
+        handle: step.id.clone(),
+        phase_id: None,
+        session_id: Some(darkmux_types::session_id::task(&step.task_id)),
+        source: Some("scheduler".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(serde_json::json!({
+            "step_id": step.id,
+            "kind": step.kind,
+            "seat_class": "local_model_unresolved",
+            "reason": reason,
+            // Said in the record, not only in the docs: what was LOST.
+            "lost": "wave load + #1487 residency lease",
+        })),
+        work_id: None,
+        attempt: None,
+    }
+}
+
 /// (#1959) Payload-carrying variant, exported so a Tier-3 bespoke driver
 /// that mints its own `Step`s outside `run_step_graph` (the crawl
 /// launcher — see `CLAUDE.md`'s StepKind tiering doc for why it's Tier 3)
@@ -1720,7 +1818,7 @@ fn step_timing_record(step: &Step, rec: &StepRecord) -> FlowRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::step_kinds::StepKindRegistry;
+    use crate::step_kinds::{SeatClaim, StepKindRegistry};
     use darkmux_gestalt::{mock::MockHost, FixedEstimator};
     use serde_json::json;
 
@@ -2944,6 +3042,16 @@ mod tests {
 
         struct PanicKind;
         impl StepKind for PanicKind {
+            /// (#2394) This fixture runs no model.
+            fn seat(
+                &self,
+                _step: &Step,
+                _task: &Task,
+                _input: &BTreeMap<String, String>,
+                _ctx: &StepRunCtx,
+            ) -> SeatClaim {
+                SeatClaim::NoModel
+            }
             fn id(&self) -> &'static str {
                 "test.panic"
             }
@@ -3359,6 +3467,16 @@ mod tests {
         log: Arc<Mutex<Vec<(String, bool, bool)>>>,
     }
     impl StepKind for BucketProbeKind {
+        /// (#2394) This fixture runs no model.
+        fn seat(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> SeatClaim {
+            SeatClaim::NoModel
+        }
         fn id(&self) -> &'static str {
             "test.bucket-probe"
         }
@@ -3479,6 +3597,16 @@ mod tests {
     /// before the wave loop starts.
     struct ArtifactWriterKind;
     impl StepKind for ArtifactWriterKind {
+        /// (#2394) This fixture runs no model.
+        fn seat(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> SeatClaim {
+            SeatClaim::NoModel
+        }
         fn id(&self) -> &'static str {
             "test.artifact-writer"
         }
@@ -3514,6 +3642,16 @@ mod tests {
     /// completed step's persisted output.
     struct ArtifactReaderKind;
     impl StepKind for ArtifactReaderKind {
+        /// (#2394) This fixture runs no model.
+        fn seat(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> SeatClaim {
+            SeatClaim::NoModel
+        }
         fn id(&self) -> &'static str {
             "test.artifact-reader"
         }
@@ -3583,6 +3721,20 @@ mod tests {
     /// observable.
     struct SleepKind;
     impl StepKind for SleepKind {
+        /// (#2394) Declares a HOSTED seat explicitly, so the tests built on it keep
+    /// exercising what they were written to exercise: `remote_cap`
+    /// serializing genuinely remote dispatches. Before #2394 this kind
+    /// reached the remote track by SAYING NOTHING, which is precisely the
+    /// silence that also swept every dispatch-free step onto that track.
+        fn seat(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> SeatClaim {
+            SeatClaim::RemoteEndpoint
+        }
         fn id(&self) -> &'static str {
             "test.sleep"
         }
@@ -3911,6 +4063,221 @@ mod tests {
         );
     }
 
+    /// (#2394) A wave of DISPATCH-FREE siblings must run CONCURRENTLY —
+    /// `remote_cap` protects hosted endpoints and has no business governing
+    /// a step that never speaks to a model. Four independent
+    /// `procedural.shell` steps, each sleeping 3s, land in ONE wave under
+    /// `remote_cap: 1`; the whole graph must finish in roughly one sleep,
+    /// not four.
+    ///
+    /// **Red before the fix**: `procedural.shell` had no seat class of its
+    /// own, so the pre-#2394 `residency() -> None` default classified it
+    /// as a remote seat and `run_bounded` ran the four in `remote_cap`-
+    /// sized (i.e. one-at-a-time) batches. Measured ~12.0s against the
+    /// ceiling of 8s below; ~3.0s after.
+    #[test]
+    fn dispatch_free_siblings_do_not_serialize_behind_the_remote_cap() {
+        const N: usize = 4;
+        const SLEEP_SECS: u64 = 3;
+        let pairs: Vec<_> = (0..N)
+            .map(|i| {
+                kinded_step(
+                    &format!("sh-{i}"),
+                    "procedural.shell",
+                    json!({ "command": format!("sleep {SLEEP_SECS}") }),
+                    &[],
+                )
+            })
+            .collect();
+        let (tasks, mut steps) = graph(pairs);
+
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let t0 = Instant::now();
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            // The mission-launch value (#2394's live reproduction): one
+            // hosted-endpoint call at a time. It must not reach these.
+            1,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let elapsed = t0.elapsed();
+
+        assert_eq!(report.completed.len(), N, "every shell step completes: {report:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(SLEEP_SECS * 2 + 2),
+            "{N} independent dispatch-free steps each sleeping {SLEEP_SECS}s must overlap \
+             (~{SLEEP_SECS}s total), never serialize behind remote_cap=1 (~{}s) — got {elapsed:?}",
+            SLEEP_SECS * N as u64
+        );
+    }
+
+    /// (#2394) A kind whose seat claim is fixed at construction — the
+    /// fixture behind the seat-class observability tests below. Runs nothing
+    /// but a no-op, so what is under test is the CLASSIFICATION, not any
+    /// dispatch behavior.
+    struct DeclaredSeatKind(fn() -> SeatClaim);
+    impl StepKind for DeclaredSeatKind {
+        fn id(&self) -> &'static str {
+            "test.declared-seat"
+        }
+        fn seat(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> SeatClaim {
+            (self.0)()
+        }
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            Ok(StepOutcome { output: "declared".to_string(), flow_records: vec![] })
+        }
+    }
+
+    /// Run ONE `test.declared-seat` step whose kind claims `claim`, and
+    /// return every flow record the scheduler emitted.
+    fn records_for_seat(claim: fn() -> SeatClaim) -> Vec<FlowRecord> {
+        let (t, st) = kinded_step("seat", "test.declared-seat", json!({}), &[]);
+        let (tasks, mut steps) = graph(vec![(t, st)]);
+        let kinds = StepKindRegistry::new();
+        kinds.register(Arc::new(DeclaredSeatKind(claim))).unwrap();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut emitted = Vec::new();
+        run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            4,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |_s| {},
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        emitted
+    }
+
+    fn start_seat_class(records: &[FlowRecord]) -> String {
+        records
+            .iter()
+            .find(|r| r.action == "step start")
+            .and_then(|r| r.payload.as_ref())
+            .and_then(|p| p.get("seat_class"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("<missing>")
+            .to_string()
+    }
+
+    /// (#2394) Every seat class reaches the durable stream on the step's own
+    /// start bookend. Without this an operator reading a run's records can
+    /// see that a step ran and how long it took, but not WHY it was
+    /// scheduled the way it was — which was exactly the position #2394's
+    /// investigation started from (six identical `started_ts`, and nothing
+    /// in the artifact saying they shared one slot).
+    ///
+    /// **Proved failing first**: dropped the `payload` argument back to
+    /// `None` at the `step start` emission in `run_step_graph` (i.e. the
+    /// pre-#2394 `step_lifecycle_record(step, "step start")` call). All four
+    /// legs failed with `<missing>`. Restored before committing.
+    #[test]
+    #[serial_test::serial]
+    fn step_start_record_carries_the_seat_class_for_every_class() {
+        assert_eq!(start_seat_class(&records_for_seat(|| SeatClaim::NoModel)), "no_model");
+        assert_eq!(start_seat_class(&records_for_seat(|| SeatClaim::RemoteEndpoint)), "remote_endpoint");
+        assert_eq!(
+            start_seat_class(&records_for_seat(|| SeatClaim::LocalModelUnresolved {
+                reason: "no active profile".to_string()
+            })),
+            "local_model_unresolved"
+        );
+        assert_eq!(
+            start_seat_class(&records_for_seat(|| SeatClaim::LocalModel(darkmux_gestalt::Placement {
+                model_key: "m".into(),
+                identifier: "darkmux:m".into(),
+                min_ctx: 8_000,
+                seat: "step:seat".into(),
+            }))),
+            "local_model"
+        );
+    }
+
+    /// (#2394 / #1509) A local seat that could not be placed is LOUD. It
+    /// still runs — fail-open, unchanged — but it has silently lost its
+    /// #1487 residency lease, so a concurrent darkmux command's `Exclusive`
+    /// reconcile can evict its model mid-generation with no other signal.
+    /// The durable half of that warning is asserted here (the `eprintln!`
+    /// beside it reaches an attended operator; this reaches the artifact).
+    ///
+    /// **Proved failing first**: deleted the `emit(seat_unresolved_record(
+    /// ..))` line from `run_step_graph`'s classification block, leaving the
+    /// `eprintln!` in place, and reran this test. It failed:
+    /// ```text
+    /// an unresolvable local seat must emit a Warn record naming the step:
+    /// ["step start", "step complete", "step timing"]
+    /// ```
+    /// Restored before committing.
+    #[test]
+    #[serial_test::serial]
+    fn unresolvable_local_seat_emits_a_loud_warning_record() {
+        let records = records_for_seat(|| SeatClaim::LocalModelUnresolved {
+            reason: "role `ghost` not found".to_string(),
+        });
+        let warn = records.iter().find(|r| r.action == SEAT_UNRESOLVED_ACTION).unwrap_or_else(|| {
+            panic!(
+                "an unresolvable local seat must emit a Warn record naming the step: {:?}",
+                records.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
+            )
+        });
+        assert!(
+            matches!(warn.level, Level::Warn),
+            "a lost residency lease is a warning, not info"
+        );
+        assert_eq!(warn.handle, "seat-step", "the record names the step it is about");
+        let payload = warn.payload.as_ref().expect("the warning carries a payload");
+        assert_eq!(payload["reason"], "role `ghost` not found", "the resolver's own reason, verbatim");
+        assert_eq!(payload["seat_class"], "local_model_unresolved");
+        assert!(
+            payload["lost"].as_str().is_some_and(|s| s.contains("lease")),
+            "the record says what was lost, not only that something was: {payload}"
+        );
+    }
+
+    /// (#2394) The other side of the same coin: a seat that resolved cleanly
+    /// emits NO warning. Without this, the test above would still pass if
+    /// the scheduler warned on every step.
+    #[test]
+    #[serial_test::serial]
+    fn a_resolved_seat_emits_no_warning() {
+        for claim in [
+            (|| SeatClaim::NoModel) as fn() -> SeatClaim,
+            || SeatClaim::RemoteEndpoint,
+        ] {
+            let records = records_for_seat(claim);
+            assert!(
+                !records.iter().any(|r| r.action == SEAT_UNRESOLVED_ACTION),
+                "a cleanly-classified seat must not warn: {:?}",
+                records.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// (#1877 item 3) A step that never dispatched at all (its operator-sign-
     /// off gate declined it before `run_streaming` ever ran) gets NO
     /// `StepRecord` — there is nothing real to time, and this module never
@@ -3976,6 +4343,20 @@ mod tests {
     fn errored_step_that_actually_ran_still_gets_a_record_with_real_duration() {
         struct FailingSleepKind;
         impl StepKind for FailingSleepKind {
+            /// (#2394) Declares a HOSTED seat explicitly, so the tests built on it keep
+    /// exercising what they were written to exercise: `remote_cap`
+    /// serializing genuinely remote dispatches. Before #2394 this kind
+    /// reached the remote track by SAYING NOTHING, which is precisely the
+    /// silence that also swept every dispatch-free step onto that track.
+            fn seat(
+                &self,
+                _step: &Step,
+                _task: &Task,
+                _input: &BTreeMap<String, String>,
+                _ctx: &StepRunCtx,
+            ) -> SeatClaim {
+                SeatClaim::RemoteEndpoint
+            }
             fn id(&self) -> &'static str {
                 "test.fail-sleep"
             }
@@ -4073,7 +4454,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn local_wave_load_failure_gets_no_fabricated_record() {
-        /// A kind whose `residency()` always resolves a Local placement for
+        /// A kind whose `seat()` always resolves a Local placement for
         /// a model no test host will ever successfully load — reaches
         /// `run_local_waves`'s `ensure_wave_loaded` failure path without
         /// depending on `dispatch.map`'s own collection-shaped residency.
@@ -4082,14 +4463,17 @@ mod tests {
             fn id(&self) -> &'static str {
                 "test.local-model"
             }
-            fn residency(
+            /// (#2394) Explicitly a LOCAL model seat — that is the whole
+            /// point of this fixture: it must reach `run_local_waves`'s
+            /// `ensure_wave_loaded` failure path.
+            fn seat(
                 &self,
                 _step: &Step,
                 _task: &Task,
                 _input: &BTreeMap<String, String>,
                 _ctx: &StepRunCtx,
-            ) -> Option<darkmux_gestalt::Placement> {
-                Some(darkmux_gestalt::Placement {
+            ) -> SeatClaim {
+                SeatClaim::LocalModel(darkmux_gestalt::Placement {
                     model_key: "unfittable-model".into(),
                     identifier: "darkmux:unfittable-model".into(),
                     min_ctx: 8_000,
@@ -4208,6 +4592,16 @@ mod tests {
         report_ms_override: Option<u64>,
     }
     impl StepKind for SelfTimedKind {
+        /// (#2394) This fixture runs no model.
+        fn seat(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> SeatClaim {
+            SeatClaim::NoModel
+        }
         fn id(&self) -> &'static str {
             "test.self-timed"
         }
@@ -4378,6 +4772,16 @@ mod tests {
         n: usize,
     }
     impl StepKind for StreamingKind {
+        /// (#2394) This fixture runs no model.
+        fn seat(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> SeatClaim {
+            SeatClaim::NoModel
+        }
         fn id(&self) -> &'static str {
             "test.streaming"
         }
@@ -4441,6 +4845,16 @@ mod tests {
     /// as its single dependency input).
     struct EmitCollectionKind;
     impl StepKind for EmitCollectionKind {
+        /// (#2394) This fixture runs no model.
+        fn seat(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> SeatClaim {
+            SeatClaim::NoModel
+        }
         fn id(&self) -> &'static str {
             "test.emit-collection"
         }
@@ -4499,7 +4913,7 @@ mod tests {
     fn dispatch_map_empty_dependency_collection_loads_no_model_at_the_wave_loader() {
         // Upstream produces an EMPTY collection; the downstream dispatch.map
         // (a LOCAL model with an n_ctx residency hint) must load NOTHING —
-        // its `residency()` returns `None` on the empty input, so the wave
+        // its `seat()` claims `NoModel` on the empty input, so the wave
         // loader is never asked for the model. Proven at the ACTUAL loader via
         // the recording host.
         let loads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -4538,7 +4952,7 @@ mod tests {
     #[serial_test::serial]
     fn dispatch_map_nonempty_dependency_collection_wave_loads_the_right_model() {
         // Upstream produces a NON-EMPTY collection; the dispatch.map step's
-        // `residency()` now resolves a Local placement, so the wave loader
+        // `seat()` now resolves a Local placement, so the wave loader
         // loads "map-model" before running it. The dispatch itself is pointed
         // at an unroutable URL so no real model is contacted — per-item error
         // isolation captures the connect failure; the LOAD is what we assert.
@@ -4594,6 +5008,16 @@ mod tests {
     /// an ordinary thing an operator does.
     struct NeedsArtifactKind;
     impl StepKind for NeedsArtifactKind {
+        /// (#2394) This fixture runs no model.
+        fn seat(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> SeatClaim {
+            SeatClaim::NoModel
+        }
         fn id(&self) -> &'static str {
             "test.needs-artifact"
         }

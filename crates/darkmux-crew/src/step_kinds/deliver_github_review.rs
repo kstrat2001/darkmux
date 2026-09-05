@@ -41,7 +41,7 @@
 use crate::findings::FindingRecord;
 use crate::mods::ModRecord;
 use crate::step_kinds::registry::StepKindRegistry;
-use crate::step_kinds::types::{Port, StepKind, StepOutcome};
+use crate::step_kinds::types::{Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -864,6 +864,20 @@ impl DeliverConfig {
 pub struct DeliverGithubReviewStepKind;
 
 impl StepKind for DeliverGithubReviewStepKind {
+    /// (#2394) [`SeatClaim::NoModel`] — this kind renders and posts a GitHub review from records already gathered; it
+    /// dispatches nothing. Bounded by `runtime.dispatch_free_concurrency`
+    /// and, per command, by `runtime.step_command_timeout_seconds` — never
+    /// by the hosted-endpoint cap.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         DELIVER_GITHUB_REVIEW_KIND
     }

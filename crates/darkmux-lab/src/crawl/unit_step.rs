@@ -44,7 +44,7 @@ use crate::crawl::plan::{Plan, ReadFileEntry, Site, Unit};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, DispatchResult};
 use darkmux_crew::rules::{self, Rule};
-use darkmux_crew::step_kinds::{Port, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
+use darkmux_crew::step_kinds::{Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::types::{Step, Task};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -1062,14 +1062,14 @@ impl StepKind for CrawlUnitStepKind {
     /// model the dispatch will actually use. A registry that cannot resolve
     /// yields `None` (one stderr warning per unit) and the units fall back to
     /// the remote queue; the dispatch then surfaces the real error itself.
-    fn residency(
+    fn seat(
         &self,
         step: &Step,
         task: &Task,
         _input: &BTreeMap<String, String>,
         _ctx: &StepRunCtx,
-    ) -> Option<darkmux_crew::step_kinds::Placement> {
-        darkmux_crew::step_kinds::resolve_local_placement(
+    ) -> SeatClaim {
+        darkmux_crew::step_kinds::resolve_local_seat(
             task.role_id.as_deref().unwrap_or("crawler"),
             None,
             None,
@@ -1464,6 +1464,17 @@ fn dedup_across_draws(draws: usize, refs: Vec<(usize, FindingRef)>) -> Vec<Findi
 pub struct CrawlSummaryStepKind;
 
 impl StepKind for CrawlSummaryStepKind {
+    /// (#2394) Folds the units' outcomes into the run summary. No model.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         CRAWL_SUMMARY_KIND
     }

@@ -424,7 +424,7 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
 // `run_step_graph` returns — `Step.output` still carries a plain-text
 // summary for consistency with every other step kind's convention.
 
-use crew::step_kinds::{resolve_local_placement, Port, StepKind, StepOutcome, StepRunCtx};
+use crew::step_kinds::{resolve_local_seat, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
@@ -486,7 +486,7 @@ fn make_coder_verify_result_artifact() -> Arc<dyn Any + Send + Sync> {
 // the run's identity now lives on the run-scoped `ArtifactBus` under
 // [`CODER_CONTEXT_ARTIFACT`], and all three kinds are stateless (unit)
 // structs that read it via `StepRunCtx::artifact` inside `run_streaming`
-// (and `residency()`, which gained a `&StepRunCtx` parameter in Packet 3a
+// (and `seat()`, which gained a `&StepRunCtx` parameter in Packet 3a
 // for exactly this kind of read).
 //
 // Data used by only ONE of the three kinds does NOT move onto this shared
@@ -559,6 +559,21 @@ fn make_coder_context_artifact() -> Arc<dyn Any + Send + Sync> {
 pub(crate) struct MissionWorktreeStepKind;
 
 impl StepKind for MissionWorktreeStepKind {
+    /// (#2394) [`SeatClaim::NoModel`] — this kind runs `git worktree add`
+    /// and stamps the run's context artifact. It has always needed no model
+    /// residency (the test harness's host factory panics if it is ever
+    /// consulted); now it SAYS so, so it also stops queueing behind the
+    /// hosted-endpoint cap.
+    fn seat(
+        &self,
+        _step: &crew::types::Step,
+        _task: &crew::types::Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "mission.worktree"
     }
@@ -957,15 +972,22 @@ impl StepKind for MissionCoderStepKind {
         })
     }
 
-    fn residency(
+    /// (#2394) A local coder dispatch. The run's identity comes off the
+    /// `ArtifactBus`; without it there is no role to resolve, so the claim
+    /// names that rather than falling through as if this step ran no model.
+    fn seat(
         &self,
         _step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
-    ) -> Option<crew::step_kinds::Placement> {
-        let ctx = run_ctx.artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)?;
-        resolve_local_placement(&ctx.role, None, None, &format!("mission-coder:{}", ctx.phase_id))
+    ) -> SeatClaim {
+        let Some(ctx) = run_ctx.artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT) else {
+            return SeatClaim::LocalModelUnresolved {
+                reason: format!("no `{CODER_CONTEXT_ARTIFACT}` on the run's artifact bus"),
+            };
+        };
+        resolve_local_seat(&ctx.role, None, None, &format!("mission-coder:{}", ctx.phase_id))
     }
 }
 
@@ -985,7 +1007,7 @@ impl StepKind for MissionCoderStepKind {
 /// (#1530 Packet 3b-1) A stateless singleton — no `wt_path`/`base`/
 /// `phase_id` constructor fields. The run's identity comes off the
 /// `ArtifactBus` (`CODER_CONTEXT_ARTIFACT`, readable from BOTH
-/// `run_streaming` and `residency()` — see `StepKind::residency`'s own doc,
+/// `run_streaming` and `seat()` — see `StepKind::seat`'s own doc,
 /// #1530 Packet 3a).
 // (#1284 Packet 4a) `pub(crate)` — see `MissionWorktreeStepKind`'s doc.
 pub(crate) struct MissionVerifyStepKind;
@@ -1094,18 +1116,24 @@ impl StepKind for MissionVerifyStepKind {
         }
     }
 
-    fn residency(
+    /// (#2394) A local `code-reviewer` dispatch — see
+    /// `MissionCoderStepKind::seat` for the missing-artifact case.
+    fn seat(
         &self,
         _step: &crew::types::Step,
         // (#1550 cluster item 5) Same decorative `role_id` as `run_streaming`
-        // above — the residency hint below is computed for `code-reviewer`
+        // above — the seat below is computed for `code-reviewer`
         // unconditionally, never `_task.role_id`.
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
-    ) -> Option<crew::step_kinds::Placement> {
-        let ctx = run_ctx.artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)?;
-        resolve_local_placement("code-reviewer", None, None, &format!("mission-verify:{}", ctx.phase_id))
+    ) -> SeatClaim {
+        let Some(ctx) = run_ctx.artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT) else {
+            return SeatClaim::LocalModelUnresolved {
+                reason: format!("no `{CODER_CONTEXT_ARTIFACT}` on the run's artifact bus"),
+            };
+        };
+        resolve_local_seat("code-reviewer", None, None, &format!("mission-verify:{}", ctx.phase_id))
     }
 }
 

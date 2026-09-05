@@ -139,9 +139,25 @@ mod tests {
     use crate::types::{Step, Task};
     use std::collections::BTreeMap;
 
+    use super::super::types::{SeatClaim, StepRunCtx};
+
     struct StubKind(&'static str);
     impl StepKind for StubKind {
-        fn id(&self) -> &'static str {
+        /// (#2394) [`SeatClaim::NoModel`] — this kind is a test stub; it
+    /// dispatches nothing. Bounded by `runtime.dispatch_free_concurrency`
+    /// and, per command, by `runtime.step_command_timeout_seconds` — never
+    /// by the hosted-endpoint cap.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
+    fn id(&self) -> &'static str {
             self.0
         }
         fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {

@@ -1489,9 +1489,11 @@ fn a_unit_declares_the_crawler_seats_residency_so_siblings_wave_pack() {
     .unwrap();
     let kind = CrawlUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("residency never dispatches"))));
     let ctx = darkmux_crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
-    let placement = kind
-        .residency(&unit_step(serde_json::json!({})), &unit_task(), &BTreeMap::new(), &ctx)
-        .expect("a local crawler dispatch declares where it will run");
+    let SeatClaim::LocalModel(placement) =
+        kind.seat(&unit_step(serde_json::json!({})), &unit_task(), &BTreeMap::new(), &ctx)
+    else {
+        panic!("a local crawler dispatch claims a LOCAL model seat");
+    };
     assert_eq!(placement.model_key, "m-local");
     assert_eq!(placement.min_ctx, 8192);
     assert_eq!(placement.seat, "step:unit-step");
@@ -1550,20 +1552,32 @@ fn residency_resolves_the_tasks_own_role_not_a_hardcoded_crawler() {
     let mut task = unit_task();
     task.role_id = Some("crawler".to_string());
     assert!(
-        kind.residency(&unit_step(serde_json::json!({})), &task, &BTreeMap::new(), &ctx).is_some(),
+        matches!(
+            kind.seat(&unit_step(serde_json::json!({})), &task, &BTreeMap::new(), &ctx),
+            SeatClaim::LocalModel(_)
+        ),
         "a Task declaring a real, registered role must resolve"
     );
 
     // The actual proof: a role no manifest exists for must FAIL to
-    // resolve — which is only possible if `residency()` is reading this
-    // Task's own `role_id` rather than substituting a hardcoded, always-
-    // valid `"crawler"`.
+    // resolve — which is only possible if `seat()` is reading this Task's
+    // own `role_id` rather than substituting a hardcoded, always-valid
+    // `"crawler"`.
+    //
+    // (#2394) And the failure is now NAMED: `LocalModelUnresolved` carrying
+    // the reason, not an `Option::None` the scheduler read as "hosted seat".
     task.role_id = Some("no-such-role-in-the-registry".to_string());
-    let placement = kind.residency(&unit_step(serde_json::json!({})), &task, &BTreeMap::new(), &ctx);
+    let claim = kind.seat(&unit_step(serde_json::json!({})), &task, &BTreeMap::new(), &ctx);
+    let SeatClaim::LocalModelUnresolved { reason } = claim else {
+        panic!(
+            "a Task naming a role the registry has no manifest for must not silently resolve as \
+             if it were \"crawler\" — expected LocalModelUnresolved, got {}",
+            claim.label()
+        );
+    };
     assert!(
-        placement.is_none(),
-        "a Task naming a role the registry has no manifest for must not silently resolve as if \
-         it were \"crawler\": {placement:?}"
+        reason.contains("no-such-role-in-the-registry"),
+        "the reason names the role that could not be found: {reason}"
     );
 }
 

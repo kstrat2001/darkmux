@@ -3749,10 +3749,11 @@ pub fn run_judge_only(
 use darkmux_crew::scheduler::run_step_graph;
 use darkmux_crew::single_shot::{single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest, SingleShotRequest};
 use darkmux_crew::step_kinds::{
-    MapDispatchOverride, MapItemResult, OverrideDispatchCall, Port, StepKind, StepKindRegistry,
-    StepOutcome, StepRunCtx, MAP_BUDGET_SKIP_ERROR,
+    MapDispatchOverride, MapItemResult, OverrideDispatchCall, Port, SeatClaim, StepKind,
+    StepKindRegistry, StepOutcome, StepRunCtx, MAP_BUDGET_SKIP_ERROR,
 };
 use darkmux_crew::types::{Step, Task};
+use std::collections::BTreeMap;
 use std::any::Any;
 use std::sync::Mutex as StdMutex;
 // (#1530) The real bundler — `review-bundle-step`'s `run_streaming` now
@@ -3798,11 +3799,11 @@ use std::path::{Path, PathBuf};
 // (#1530 Packet 3a) The context (`ReviewStepContext`, diff/prompts/bundles/…)
 // USED to stay a plain constructor field on every kind below — Packet 1's
 // own doc note (superseded here) explained why: `ReviewJudgeStepKind::
-// residency()` reads `ctx.bundles` to decide whether to skip loading a model
-// (#1426 ship-2), and `StepKind::residency` had NO `StepRunCtx` parameter at
+// seat()` reads `ctx.bundles` to decide whether to skip loading a model
+// (#1426 ship-2), and `StepKind::seat` had NO `StepRunCtx` parameter at
 // all, so a bus-only context would have silently broken that optimization.
 // Packet 3a closes that gap at the ROOT instead of working around it:
-// `StepKind::residency` now takes the SAME `&StepRunCtx` `run_streaming`
+// `StepKind::seat` now takes the SAME `&StepRunCtx` `run_streaming`
 // does (see that trait method's own doc), so the context can move onto the
 // bus, under `REVIEW_CONTEXT_ARTIFACT`, exactly like the three accumulators
 // above — `make_review_context_artifact` builds a context-free
@@ -3817,14 +3818,14 @@ use std::path::{Path, PathBuf};
 // constructor field; everything comes from `step.config` or this bus.
 //
 // (#1530, bundling-becomes-runtime-work follow-on) The paragraph above
-// describes why `residency()` gained a `&StepRunCtx` — at the time, THAT
+// describes why `seat()` gained a `&StepRunCtx` — at the time, THAT
 // was the only reason: `ctx.bundles` was a build-time snapshot, resolved
 // before the graph ever ran, that just needed a bus seam to reach a trait
 // method with no `StepRunCtx` parameter yet. `ReviewStepContext` no longer
 // carries `bundles` at all — bundling itself is now `review-bundle-step`'s
 // own run-time work (`ReviewBundleStepKind::run_streaming`), published onto
 // its OWN artifact ([`REVIEW_BUNDLES_ARTIFACT`]) rather than folded into the
-// context. `ReviewJudgeStepKind::residency()` now reads that artifact
+// context. `ReviewJudgeStepKind::seat()` now reads that artifact
 // directly instead of `ctx.bundles`.
 // (#2310 P2) `REVIEW_ENVELOPE_ARTIFACT`/`REVIEW_MEMBERS_ARTIFACT`/
 // `REVIEW_WARNINGS_ARTIFACT`/`REVIEW_PROBE_SELECTION_ARTIFACT`/
@@ -3858,7 +3859,7 @@ fn make_review_context_artifact() -> Arc<dyn Any + Send + Sync> {
 /// `Arc` clone. Mirrors `ReviewInputs` field-for-field, minus the injected
 /// `chat`/`cycler`: dispatch routes through `dispatch_chat` (below), and
 /// model residency is the scheduler's job — `run_step_graph`'s
-/// `host_factory` + each step kind's `residency()` placement, via gestalt's
+/// `host_factory` + each step kind's `seat()` placement, via gestalt's
 /// wave planner — so no step kind constructs a cycler of its own (there is
 /// no `ModelCycler` anywhere in the graph's dispatch path; `LmsCycler`
 /// survives only for `run_judge_only`'s sequential path).
@@ -3979,8 +3980,9 @@ pub struct ReviewStepContext {
     /// coverage for `run_review_graph`, and two real bugs (dropped member
     /// attribution, a missing degenerate gate) shipped through the resulting
     /// blind spot. Test fixtures also set `n_ctx: None` on every seat's
-    /// `ProfileModel` so `StepKind::residency()` reports `Residency::Remote`
-    /// (see `graph_pm`/`graph_staffing` below) — `run_bounded`'s Remote
+    /// `ProfileModel` so `StepKind::seat()` cannot PLACE the seat and claims
+    /// `SeatClaim::LocalModelUnresolved` (#2394 — the same cap-bounded track
+    /// the old `None` took; see `graph_pm`/`graph_staffing` below) — that
     /// track never touches `host_factory` (the real `lms` CLI) at all, so a
     /// mocked graph test stays fully hermetic without needing to inject the
     /// scheduler's own `host_factory` parameter too.
@@ -4356,6 +4358,17 @@ fn write_review_context(path: &Path, wrapped: &darkmux_crew::step_output::Output
 pub struct ReviewContextStepKind;
 
 impl StepKind for ReviewContextStepKind {
+    /// (#2394) Stamps the run's context artifact. No model.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         REVIEW_CONTEXT_KIND
     }
@@ -5020,6 +5033,17 @@ fn probe_flags_from_inputs(
 pub struct ReviewBundleStepKind;
 
 impl StepKind for ReviewBundleStepKind {
+    /// (#2394) Slices the diff into bundles. Pure computation, no model.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "review.bundle"
     }
@@ -5212,6 +5236,18 @@ impl StepKind for ReviewBundleStepKind {
 pub struct ReviewProbeRenderStepKind;
 
 impl StepKind for ReviewProbeRenderStepKind {
+    /// (#2394) Renders the probe prompts; the DISPATCHING is done by the
+    /// `dispatch.map` steps this grows, each of which declares its own seat.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "review.probe-render"
     }
@@ -5621,6 +5657,17 @@ pub(crate) fn fold_probe_seats(
 pub struct ReviewProbeCollectStepKind;
 
 impl StepKind for ReviewProbeCollectStepKind {
+    /// (#2394) Folds the probe steps' outputs. No model.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "review.probe-collect"
     }
@@ -5798,6 +5845,18 @@ fn dedup_config_from_step(config: &serde_json::Value) -> Result<Vec<ProbeSeatSpe
 }
 
 impl StepKind for ReviewDedupStepKind {
+    /// (#2394) Collapses candidates by a pluggable match strategy. Pure
+    /// computation, no model.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "review.dedup"
     }
@@ -5931,7 +5990,7 @@ impl StepKind for ReviewDedupStepKind {
 /// (#1530 Packet 3a) A stateless singleton — no `Arc<ReviewStepContext>` and
 /// no `ResolvedSeatStaffing` constructor field. The context comes off the
 /// `ArtifactBus` (`REVIEW_CONTEXT_ARTIFACT`, readable from BOTH
-/// `run_streaming` and `residency()` now that the latter takes a
+/// `run_streaming` and `seat()` now that the latter takes a
 /// `&StepRunCtx` — see that trait method's own doc); the judge seat's
 /// model/passes/max_tokens/endpoint come off `step.config`, stamped once by
 /// `build_review_graph_from_config` the same way it already stamps the
@@ -5964,7 +6023,7 @@ impl StepKind for ReviewJudgeStepKind {
     /// (#2310 P2) `requires()` — the typed deduped-flags output, the review
     /// context (both artifact seam + data port), and, new this packet, the
     /// bundle set's typed data port (`review-judge-task` now `reads:
-    /// ["review-bundle-task", ...]` directly — `residency()` needs it off
+    /// ["review-bundle-task", ...]` directly — `seat()` needs it off
     /// `input`, which only a declared `reads`/`depends_on` edge delivers;
     /// see that method's own doc for why the transitive dependency through
     /// dedup was no longer enough once the bus artifact retired).
@@ -6291,10 +6350,12 @@ impl StepKind for ReviewJudgeStepKind {
     /// `self.judge` constructor field, and the run-scoped bus `run_ctx`
     /// carries instead of a `self.ctx` constructor field — the ONLY reason
     /// this hook gained a `&StepRunCtx` parameter in #1530 Packet 3a (see
-    /// `StepKind::residency`'s own doc). The skip-load decision logic below
-    /// is otherwise BYTE-IDENTICAL to the pre-Packet-3a version: same two
-    /// early-outs, same order, same `Placement` fields — see this method's
-    /// original doc (preserved below) for the empty-bundle-set reasoning.
+    /// `StepKind::seat`'s own doc). The skip-load decision logic below is
+    /// otherwise the pre-Packet-3a version with #2394's classification
+    /// applied: same early-outs, same order, same `Placement` fields — see
+    /// this method's original doc (preserved below) for the empty-bundle-set
+    /// reasoning, and note that the empty case is now `SeatClaim::NoModel`
+    /// rather than a `None` indistinguishable from a hosted seat.
     ///
     /// (#1530 bundling-becomes-runtime-work follow-on, superseded by
     /// #2310 P2 below) The empty-bundle-set check no longer reads
@@ -6303,7 +6364,7 @@ impl StepKind for ReviewJudgeStepKind {
     /// used to need is gone too. Safe by construction, not by luck:
     /// `review-judge-task` depends (transitively, via dedup + the probe
     /// tasks) on `review-bundle-task`, so by the time THIS step's wave
-    /// runs — the only time `residency()` is ever called for it — the
+    /// runs — the only time `seat()` is ever called for it — the
     /// bundle step has already run and produced its typed output for real
     /// (see the #2310 P2 comment just below for the CURRENT mechanism —
     /// `input`, never a bus artifact — and why this ordering is
@@ -6317,31 +6378,30 @@ impl StepKind for ReviewJudgeStepKind {
     /// is empty, dedup's output is guaranteed empty too, transitively — no
     /// seat's selector matters. Skips loading a model this step is certain
     /// not to use.
-    fn residency(
+    fn seat(
         &self,
         step: &Step,
         _task: &Task,
         input: &std::collections::BTreeMap<String, String>,
         _run_ctx: &StepRunCtx,
-    ) -> Option<darkmux_gestalt::Placement> {
+    ) -> SeatClaim {
         if step.config.get("endpoint").is_some() {
-            return None;
+            return SeatClaim::RemoteEndpoint;
         }
         // (#2310 P2) The bundle set now arrives through `input` (this
         // task's own `reads: ["review-bundle-task", ...]` — see
         // `requires()`'s doc) rather than the retired
-        // `REVIEW_BUNDLES_ARTIFACT` bus artifact. `residency()` runs on the
+        // `REVIEW_BUNDLES_ARTIFACT` bus artifact. `seat()` runs on the
         // main thread BEFORE this step's wave, once `review-bundle-task`
         // has already completed (an earlier wave), so `gather_inputs` has
         // already populated this entry by the time this runs.
-        // (#2310 P2 review finding I3) `find_by_kind` now returns
-        // `Result<Option<_>>` — this residency planner has no `Result` to
-        // propagate (its own contract is `Option<Placement>`, a best-effort
-        // hint), so a genuine body-deserialize failure here is silently
-        // treated the same as "not found yet" via `.ok()`. That is safe
-        // ONLY because this function only ever SKIPS a preload on `None`
-        // (falling through to the ordinary on-demand load path below) —
-        // never trusts a malformed body's contents.
+        // (#2310 P2 review finding I3, reclassified by #2394) `find_by_kind`
+        // returns `Result<Option<_>>` and this planner has no `Result` to
+        // propagate, so a body-deserialize failure collapses into "not found"
+        // via `.ok()`. It never trusts a malformed body's CONTENTS — but
+        // "not found" is no longer silent: it resolves to
+        // `SeatClaim::LocalModelUnresolved` below, which the scheduler
+        // surfaces, rather than to a `None` that read as "hosted seat".
         let bundles = find_by_kind::<BundleSetOutput>(
             self.id(),
             &step.id,
@@ -6349,16 +6409,30 @@ impl StepKind for ReviewJudgeStepKind {
             review_outputs::BUNDLE_SET_OUTPUT_KIND,
         )
         .ok()
-        .flatten()?
-        .body
-        .bundles;
-        if bundles.is_empty() {
-            return None;
+        .flatten();
+        // (#2394) No bundle-set output READABLE yet is not the same fact as
+        // an EMPTY one. The first can only mean this step's own dependency
+        // ordering is not what its doc above says it is (or a body that will
+        // not deserialize) — a resolution failure, surfaced. The second is a
+        // real, expected outcome that genuinely needs no model.
+        let Some(found) = bundles else {
+            return SeatClaim::LocalModelUnresolved {
+                reason: "the bundle-set output is not readable from this step's input".to_string(),
+            };
+        };
+        if found.body.bundles.is_empty() {
+            return SeatClaim::NoModel;
         }
-        let model_key = step.config.get("model_key").and_then(|v| v.as_str())?;
-        let identifier = step.config.get("identifier").and_then(|v| v.as_str())?;
-        let n_ctx = step.config.get("n_ctx").and_then(|v| v.as_u64())? as u32;
-        Some(darkmux_gestalt::Placement {
+        let Some(model_key) = step.config.get("model_key").and_then(|v| v.as_str()) else {
+            return SeatClaim::LocalModelUnresolved { reason: "no config.model_key".to_string() };
+        };
+        let Some(identifier) = step.config.get("identifier").and_then(|v| v.as_str()) else {
+            return SeatClaim::LocalModelUnresolved { reason: "no config.identifier".to_string() };
+        };
+        let Some(n_ctx) = step.config.get("n_ctx").and_then(|v| v.as_u64()).map(|n| n as u32) else {
+            return SeatClaim::LocalModelUnresolved { reason: "no config.n_ctx".to_string() };
+        };
+        SeatClaim::LocalModel(darkmux_gestalt::Placement {
             model_key: model_key.to_string(),
             identifier: identifier.to_string(),
             min_ctx: n_ctx,
@@ -6378,7 +6452,7 @@ impl StepKind for ReviewJudgeStepKind {
 ///
 /// The verify stage's three dispatch gates all collapse into "the rendered
 /// collection is EMPTY" (which makes the map step a completed no-op with
-/// `residency() == None` — zero model loads, the #1438 property, now held
+/// `seat() == None` — zero model loads, the #1438 property, now held
 /// by the generic block):
 /// - no verify seat staffed (byte-identical passthrough to today);
 /// - the run is already degenerate (#1373 gate d — the judge task always
@@ -6404,6 +6478,18 @@ impl StepKind for ReviewJudgeStepKind {
 pub struct ReviewVerifyRenderStepKind;
 
 impl StepKind for ReviewVerifyRenderStepKind {
+    /// (#2394) Renders the verify prompts; the dispatching belongs to the
+    /// `dispatch.map` steps it grows.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "review.verify-render"
     }
@@ -6711,6 +6797,17 @@ pub(crate) fn apply_verify_records(judged: &mut [JudgedFlag], records: &[VerifyR
 pub struct ReviewVerifyCollectStepKind;
 
 impl StepKind for ReviewVerifyCollectStepKind {
+    /// (#2394) Folds the verify steps' outputs. No model.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "review.verify-collect"
     }
@@ -6965,6 +7062,18 @@ fn fold_review_outputs_into_envelope(
 pub struct ReviewSynthesisStepKind;
 
 impl StepKind for ReviewSynthesisStepKind {
+    /// (#2394) Assembles the final docket from records already produced. No
+    /// model.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "review.synthesis"
     }
@@ -7369,6 +7478,17 @@ pub fn render_and_emit_review(
 }
 
 impl StepKind for ReviewReportStepKind {
+    /// (#2394) Renders and posts the report. No model.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         "review.report"
     }

@@ -51,7 +51,7 @@ use crate::findings::{self, FindingRecord};
 use crate::mods;
 use crate::step_kinds::deliver_github_review::{DeliverScope, GatedMod};
 use crate::step_kinds::registry::StepKindRegistry;
-use crate::step_kinds::types::{Port, StepKind, StepOutcome};
+use crate::step_kinds::types::{Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,20 @@ pub struct GatherOutput {
 pub struct RecordsGatherStepKind;
 
 impl StepKind for RecordsGatherStepKind {
+    /// (#2394) [`SeatClaim::NoModel`] — this kind reads records out of the flow store; it
+    /// dispatches nothing. Bounded by `runtime.dispatch_free_concurrency`
+    /// and, per command, by `runtime.step_command_timeout_seconds` — never
+    /// by the hosted-endpoint cap.
+    fn seat(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> SeatClaim {
+        SeatClaim::NoModel
+    }
+
     fn id(&self) -> &'static str {
         RECORDS_GATHER_KIND
     }

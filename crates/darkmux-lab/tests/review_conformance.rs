@@ -24,9 +24,11 @@
 //!   review.json`, since both are sourced from that same file).
 //! - Every probe/judge/verify seat is a LOCAL-shaped `ResolvedSeatStaffing`
 //!   (a bare `ProfileModel { id, .. Default::default() }` — no `n_ctx`, no
-//!   `endpoint`). No `n_ctx` reports `Residency::Remote` to the scheduler
-//!   (see `ReviewStepContext::chat_override`'s own doc), so `run_bounded`'s
-//!   Remote track never touches the real `host_factory` (`lms`) at all —
+//!   `endpoint`). No `n_ctx` means the seat cannot be PLACED, so (#2394)
+//!   it claims `SeatClaim::LocalModelUnresolved` — which still rides the
+//!   cap-bounded track, exactly as the old `None` did (see
+//!   `ReviewStepContext::chat_override`'s own doc), so that track never
+//!   touches the real `host_factory` (`lms`) at all —
 //!   the exact hermeticity trick `review_tests.rs`'s own `graph_pm`/
 //!   `graph_staffing` helpers use. No `endpoint` also means every
 //!   `MemberRecord::remote` comes back `false`, so zero remote budget is
@@ -111,7 +113,7 @@ impl Drop for HomeGuard {
 //                      `crew()`'s `verify_seat` below), the hermetic
 //                      "remote" trick `review_tests.rs`'s own
 //                      `remote_pm`/`remote_staffing` use: an endpoint with
-//                      no `n_ctx` reports `Residency::Remote`, but
+//                      no `n_ctx` rides the cap-bounded track, but
 //                      `chat_override` still intercepts the call, so
 //                      `MemberRecord::remote == true` and a `remote_budgets`
 //                      row appear WITHOUT ever touching a real network.
@@ -425,8 +427,8 @@ fn step_ctx(
 // builds a SECOND graph (never run — `run_review_graph` hardcodes the real
 // `lms_host_factory`, so running an n_ctx-bearing local seat would try to
 // touch a real host) with such seats, and pins the five dispatching steps'
-// stamped `config` objects as their own golden. `residency()`
-// (`ReviewJudgeStepKind::residency`, review.rs:5653, and the generic
+// stamped `config` objects as their own golden. `seat()`
+// (`ReviewJudgeStepKind::seat`, review.rs:5653, and the generic
 // `dispatch.map` builtin's own residency read for probe/verify) reads
 // exactly `model_key`/`identifier`/`n_ctx` off these configs — this golden
 // is the byte-level proof those three keys are actually stamped from the
@@ -506,7 +508,7 @@ fn graph_config_stamps_residency_hints_from_n_ctx_bearing_seats() {
     let actual = canonicalize_graph_config(serde_json::to_value(&configs).expect("configs serialize"));
 
     // Sanity, before the golden compare: every one of the five configs must
-    // actually carry the three residency-hint keys `residency()` reads.
+    // actually carry the three residency-hint keys `seat()` reads.
     for id in step_ids {
         let cfg = &configs[id];
         assert!(cfg.get("model_key").is_some(), "step `{id}` config missing model_key: {cfg}");
