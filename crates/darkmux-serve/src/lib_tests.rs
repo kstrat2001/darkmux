@@ -2601,6 +2601,168 @@
             assert_eq!(records.last().unwrap()["n"].as_u64().unwrap(), (total - 1) as u64);
         }
 
+        /// (#2409) Cross-system contract 2 (dispatch liveness): the
+        /// `dispatch.start`/`dispatch.complete`/`dispatch.error` bookends
+        /// must never be evicted by the newest-N ring, no matter how far
+        /// back in the file they sit. This is the exact shape that went
+        /// blank live: a `dispatch.start` above the cap, a wall of
+        /// `telemetry.process` filling the newest 10k window, and the
+        /// matching `dispatch.complete` at the very end.
+        #[tokio::test]
+        async fn flow_file_read_caps_the_bookend_ring_too() {
+            // (#2410 review) The bookend keep-list is a ring under the same
+            // cap, not an unbounded Vec — a crash-looping producer that fires
+            // a bookend per second must not scale this read with the file.
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            let total = MAX_FLOW_FILE_RECORDS + 50;
+            let mut buf = String::with_capacity(total * 70);
+            for i in 0..total {
+                buf.push_str(&format!(
+                    r#"{{"ts":"{today}T00:00:00Z","action":"dispatch.start","session_id":"s{i}","n":{i}}}"#
+                ));
+                buf.push('\n');
+            }
+            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+
+            let records = read_flow_records_from_file(&today, tmp.path()).await;
+
+            assert_eq!(records.len(), MAX_FLOW_FILE_RECORDS, "bookends alone must respect the cap");
+            assert_eq!(
+                records.first().unwrap()["n"].as_u64(),
+                Some(50),
+                "the NEWEST bookends are the ones kept: {:?}",
+                records.first()
+            );
+            assert_eq!(records.last().unwrap()["n"].as_u64(), Some((total - 1) as u64));
+        }
+
+        #[tokio::test]
+        async fn flow_file_read_keeps_dispatch_start_above_the_cap() {
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            let telemetry_count = MAX_FLOW_FILE_RECORDS;
+            let total = telemetry_count + 2; // start + N telemetry + complete
+            let mut buf = String::with_capacity(total * 60);
+            buf.push_str(&format!(
+                r#"{{"ts":"{today}T00:00:00Z","action":"dispatch.start","session_id":"s1"}}"#
+            ));
+            buf.push('\n');
+            for i in 0..telemetry_count {
+                buf.push_str(&format!(
+                    r#"{{"ts":"{today}T00:00:01Z","action":"telemetry.process","n":{i}}}"#
+                ));
+                buf.push('\n');
+            }
+            buf.push_str(&format!(
+                r#"{{"ts":"{today}T23:59:59Z","action":"dispatch.complete","session_id":"s1"}}"#
+            ));
+            buf.push('\n');
+            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+
+            let records = read_flow_records_from_file(&today, tmp.path()).await;
+
+            assert_eq!(
+                records.len(),
+                telemetry_count + 2,
+                "both bookends plus every telemetry record must survive"
+            );
+            assert_eq!(
+                records.first().unwrap()["action"].as_str(),
+                Some("dispatch.start"),
+                "the start bookend, pinned above the cap, must still be first: {:?}",
+                records.first()
+            );
+            assert_eq!(
+                records.last().unwrap()["action"].as_str(),
+                Some("dispatch.complete"),
+                "the complete bookend must still be last: {:?}",
+                records.last()
+            );
+            let telemetry_between = &records[1..records.len() - 1];
+            assert_eq!(telemetry_between.len(), telemetry_count);
+            assert!(
+                telemetry_between
+                    .iter()
+                    .all(|r| r["action"].as_str() == Some("telemetry.process")),
+                "everything between the bookends must be the telemetry ring, in file order"
+            );
+            for (i, r) in telemetry_between.iter().enumerate() {
+                assert_eq!(
+                    r["n"].as_u64().unwrap(),
+                    i as u64,
+                    "telemetry ring must stay in file (chronological) order"
+                );
+            }
+        }
+
+        /// (#2409) The legacy SPACED bookend spelling (`"dispatch start"`,
+        /// pre-dating the dotted `darkmux-lab`/runtime lineage) must be
+        /// preserved above the cap exactly like the dotted form — both
+        /// spellings are the SAME contract, per
+        /// `darkmux_flow::is_dispatch_start`.
+        #[tokio::test]
+        async fn flow_file_read_keeps_legacy_spaced_dispatch_start_above_the_cap() {
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            let telemetry_count = MAX_FLOW_FILE_RECORDS;
+            let mut buf = String::new();
+            buf.push_str(&format!(
+                r#"{{"ts":"{today}T00:00:00Z","action":"dispatch start","session_id":"s1"}}"#
+            ));
+            buf.push('\n');
+            for i in 0..telemetry_count {
+                buf.push_str(&format!(
+                    r#"{{"ts":"{today}T00:00:01Z","action":"telemetry.process","n":{i}}}"#
+                ));
+                buf.push('\n');
+            }
+            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+
+            let records = read_flow_records_from_file(&today, tmp.path()).await;
+
+            assert_eq!(records.len(), telemetry_count + 1);
+            assert_eq!(
+                records.first().unwrap()["action"].as_str(),
+                Some("dispatch start"),
+                "the legacy-spelled start bookend must survive the cap: {:?}",
+                records.first()
+            );
+        }
+
+        /// (#2409) A file under the cap is unaffected — no regression to the
+        /// common case (the vast majority of days never approach 10k lines).
+        #[tokio::test]
+        async fn flow_file_read_under_cap_returns_everything_unchanged() {
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            let mut buf = String::new();
+            buf.push_str(&format!(
+                r#"{{"ts":"{today}T00:00:00Z","action":"dispatch.start","session_id":"s1"}}"#
+            ));
+            buf.push('\n');
+            for i in 0..50 {
+                buf.push_str(&format!(
+                    r#"{{"ts":"{today}T00:00:01Z","action":"telemetry.process","n":{i}}}"#
+                ));
+                buf.push('\n');
+            }
+            buf.push_str(&format!(
+                r#"{{"ts":"{today}T00:01:00Z","action":"dispatch.complete","session_id":"s1"}}"#
+            ));
+            buf.push('\n');
+            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+
+            let records = read_flow_records_from_file(&today, tmp.path()).await;
+
+            assert_eq!(records.len(), 52, "under the cap: nothing dropped, nothing duplicated");
+            assert_eq!(records.first().unwrap()["action"].as_str(), Some("dispatch.start"));
+            assert_eq!(records.last().unwrap()["action"].as_str(), Some("dispatch.complete"));
+            for (i, r) in records[1..51].iter().enumerate() {
+                assert_eq!(r["n"].as_u64().unwrap(), i as u64);
+            }
+        }
+
         #[tokio::test]
         async fn flow_file_read_skips_a_pathological_oversize_line() {
             // (#925) A single line larger than MAX_FLOW_LINE_BYTES (a corrupt

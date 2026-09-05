@@ -230,7 +230,8 @@ export function App() {
   // filtering `dayRecords`. The first cut of this fix DID filter
   // `dayRecords`, and it passed every test because every test fixture's day
   // happened to contain the open session. A real daemon's `/flow/<date>` is
-  // a CAPPED, TIME-WINDOWED slice (10,002 records, sliding), and a
+  // a CAPPED, TIME-WINDOWED slice (10,002 records, sliding — plus every
+  // dispatch bookend of the day regardless of the cap, #2410), and a
   // long-running dispatch that started hours before the window's current
   // floor has ZERO records inside it — `dayRecords`-filtering silently
   // found nothing and fell back to the whole-day range, reproducing the

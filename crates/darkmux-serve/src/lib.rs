@@ -3645,6 +3645,21 @@ fn read_flow_records_from_redis(
     // cap-saturation cut the OLDEST entries instead, which the date filter
     // below mostly discards anyway. Entries are reversed after parsing so
     // callers still see chronological order.
+    //
+    // (#2409) This `COUNT 10000` has the SAME dispatch-liveness-bookend hole
+    // `read_flow_records_from_file` had — a busy stream can push a
+    // `dispatch.start` below this cap the same way a busy day file could,
+    // and cross-system contract 2 (dispatch liveness) applies here too. NOT
+    // fixed in this pass: unlike the local file (a plain sequential scan
+    // that can special-case `action`), a Redis stream has no server-side
+    // filter-by-field read, so keeping every bookend here means an
+    // unbounded or separately-capped second read of the stream — a real
+    // design decision, not a drop-in mirror of the file-path fix. Tracked as
+    // #2409's own follow-up (the local-file union in
+    // `aggregate_flow_records_for_date` already means a client hitting the
+    // Redis-configured path still gets the file path's bookend guarantee
+    // for records durable on THIS machine; only the Redis-only view of a
+    // remote peer's history is still exposed to this cap).
     let raw: redis::Value = redis::cmd("XREVRANGE")
         .arg(&stream)
         .arg("+")
@@ -3690,21 +3705,54 @@ fn read_flow_records_from_redis(
 }
 
 /// The most records `GET /flow/:date` returns from the local day-file —
-/// the newest `MAX_FLOW_FILE_RECORDS`, matching the Redis path's
-/// `XREVRANGE … COUNT 10000` cap (#900). The file path previously read the
-/// WHOLE file into memory + parsed every line into a `Vec`, so a large
-/// day-file under concurrent requests could OOM the daemon (the Redis path
-/// was already bounded; the snapshot path wasn't).
+/// the newest `MAX_FLOW_FILE_RECORDS` for everything EXCEPT the dispatch
+/// liveness bookends, matching the Redis path's `XREVRANGE … COUNT 10000`
+/// cap (#900). The file path previously read the WHOLE file into memory +
+/// parsed every line into a `Vec`, so a large day-file under concurrent
+/// requests could OOM the daemon (the Redis path was already bounded; the
+/// snapshot path wasn't).
+///
+/// (#2409) The cap applies to the supplementary-vocabulary ring only.
+/// `dispatch.start`/`dispatch.complete`/`dispatch.error` (both dotted and
+/// legacy spaced spellings — `darkmux_flow::is_dispatch_start` et al.) are
+/// ALWAYS kept regardless of this count: cross-system contract 2 (dispatch
+/// liveness) requires that liveness surfaces key on these bookends, and
+/// that supplementary vocabularies (here, high-cadence `telemetry.process`
+/// / `dispatch.turn.heartbeat` / `machine.telemetry`) never evict them. A
+/// live day file measured ~118 bookends against 56,829 total records. The
+/// bookend keep-list is its OWN ring under this same cap (newest kept), so
+/// the read stays constant-bounded even when a crash-looping producer emits
+/// a `dispatch error` bookend every second — #900's bound, not a second
+/// unbounded read.
 const MAX_FLOW_FILE_RECORDS: usize = 10_000;
 
-/// Parse `<flows_dir>/<date>.jsonl` into a Vec of JSON values, keeping only
-/// the newest `MAX_FLOW_FILE_RECORDS` (chronological order preserved).
-/// Missing file = empty Vec (not an error).
+/// Parse `<flows_dir>/<date>.jsonl` into a Vec of JSON values, keeping every
+/// dispatch-liveness bookend PLUS the newest `MAX_FLOW_FILE_RECORDS` of
+/// everything else (chronological order preserved throughout). Missing file
+/// = empty Vec (not an error).
 ///
 /// (#900) Streams the file line-by-line and holds a bounded ring of parsed
 /// records, so transient memory is ~one line + the cap regardless of the
 /// day-file's size — instead of an unbounded `tokio::fs::read` + full-DOM
 /// parse. Mirrors the Redis path's newest-first `COUNT 10000` semantics.
+///
+/// (#2409) The ring alone reproduced the exact failure the fleet lens hit
+/// live: a busy day's `telemetry.process` volume fills the whole 10k window,
+/// so every `dispatch.start` sitting further back than that gets dropped and
+/// every activity bar built from it goes blank — cross-system contract 2
+/// (dispatch liveness) says a route serving liveness surfaces must never do
+/// that. This function now tracks bookends (`is_dispatch_start` /
+/// `is_dispatch_complete` / `is_dispatch_error`, both spellings) in a
+/// separate always-kept list alongside the capped ring, carries each kept
+/// record's file-order line index, and merges the two lists by index at the
+/// end — so the cap still bounds memory for the high-cadence vocabulary
+/// while liveness records are never evicted, and the response stays in
+/// file (chronological) order either way.
+///
+/// The Redis path (`read_flow_records_from_redis`, `XREVRANGE … COUNT
+/// 10000`) has the same hole and is NOT fixed here — a stream can't be
+/// filtered server-side by `action` the way a local file scan can; see
+/// #2409's own follow-up note on that function.
 async fn read_flow_records_from_file(
     date: &str,
     flows_dir: &std::path::Path,
@@ -3716,8 +3764,23 @@ async fn read_flow_records_from_file(
         Err(_) => return Vec::new(), // missing file = empty (not an error)
     };
     let mut reader = tokio::io::BufReader::new(file);
-    let mut ring: std::collections::VecDeque<serde_json::Value> =
+    let mut ring: std::collections::VecDeque<(u64, serde_json::Value)> =
         std::collections::VecDeque::with_capacity(MAX_FLOW_FILE_RECORDS.min(1024));
+    // (#2409) Every dispatch-liveness bookend, kept unconditionally
+    // regardless of the ring's cap — see the function doc comment above.
+    // (#2410 review) A SECOND ring, not an unbounded Vec: a crash-looping
+    // producer fires the `dispatch error` RAII bookend on every abnormal
+    // exit (~86k/day at one restart per second), and #900's whole point was
+    // that this read must not scale with the day file. Same cap, same
+    // pop-front rule — a real day has a few hundred bookends and never
+    // notices.
+    let mut bookends: std::collections::VecDeque<(u64, serde_json::Value)> =
+        std::collections::VecDeque::new();
+    // (#2409) Monotonic file-order position of each successfully-parsed
+    // line, so the ring and the bookend list — each individually sorted by
+    // construction — can be merged back into one file-order sequence
+    // without a second pass over the raw lines.
+    let mut next_index: u64 = 0;
 
     // (#925) Bounded line read: accumulate bytes up to MAX_FLOW_LINE_BYTES; a
     // line that exceeds the cap (a corrupt/adversarial no-newline flows file)
@@ -3735,7 +3798,7 @@ async fn read_flow_records_from_file(
         for &b in &chunk[..n] {
             if b == b'\n' {
                 if !over_cap {
-                    push_flow_line(&line, &mut ring);
+                    push_flow_line(&line, &mut ring, &mut bookends, &mut next_index);
                 }
                 line.clear();
                 over_cap = false;
@@ -3756,15 +3819,30 @@ async fn read_flow_records_from_file(
     }
     // A final line with no trailing newline.
     if !over_cap && !line.is_empty() {
-        push_flow_line(&line, &mut ring);
+        push_flow_line(&line, &mut ring, &mut bookends, &mut next_index);
     }
-    ring.into()
+    merge_ring_and_bookends(ring, bookends)
 }
 
-/// (#925) Parse one flow-record line and push it into the bounded ring
-/// (newest-`MAX_FLOW_FILE_RECORDS`). Non-UTF-8, empty, or non-JSON lines are
-/// dropped silently — the same tolerance the old `.lines()` loop had.
-fn push_flow_line(line: &[u8], ring: &mut std::collections::VecDeque<serde_json::Value>) {
+/// (#925, #2409) Parse one flow-record line and route it either into the
+/// always-kept bookend list or the bounded ring (newest-`MAX_FLOW_FILE_RECORDS`).
+/// Non-UTF-8, empty, or non-JSON lines are dropped silently — the same
+/// tolerance the old `.lines()` loop had.
+///
+/// (#2409) A `dispatch.start`/`dispatch.complete`/`dispatch.error` record
+/// (either spelling — `darkmux_flow::is_dispatch_start` et al. are the ONE
+/// Rust-side hedge for that, per that module's doc comment) goes to
+/// `bookends` and never touches the ring's cap. Everything else keeps the
+/// prior newest-`MAX_FLOW_FILE_RECORDS` ring behavior. `next_index` is
+/// advanced only for lines that actually parse, so the index each kept
+/// record carries is a dense, monotonic file-order position the caller can
+/// merge on.
+fn push_flow_line(
+    line: &[u8],
+    ring: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
+    bookends: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
+    next_index: &mut u64,
+) {
     let s = match std::str::from_utf8(line) {
         Ok(s) => s.trim(),
         Err(_) => return,
@@ -3772,12 +3850,57 @@ fn push_flow_line(line: &[u8], ring: &mut std::collections::VecDeque<serde_json:
     if s.is_empty() {
         return;
     }
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-        if ring.len() == MAX_FLOW_FILE_RECORDS {
-            ring.pop_front();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return;
+    };
+    let index = *next_index;
+    *next_index += 1;
+
+    let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
+    if darkmux_flow::is_dispatch_start(action)
+        || darkmux_flow::is_dispatch_complete(action)
+        || darkmux_flow::is_dispatch_error(action)
+    {
+        if bookends.len() >= MAX_FLOW_FILE_RECORDS {
+            bookends.pop_front();
         }
-        ring.push_back(v);
+        bookends.push_back((index, v));
+        return;
     }
+
+    if ring.len() == MAX_FLOW_FILE_RECORDS {
+        ring.pop_front();
+    }
+    ring.push_back((index, v));
+}
+
+/// (#2409) Merge the capped ring and the always-kept bookend list back into
+/// one file-order (chronological) sequence. Both inputs are already sorted
+/// by their line index — the ring by FIFO construction, the bookend list by
+/// append order — so this is a linear merge (like mergesort's merge step),
+/// not a full re-sort.
+fn merge_ring_and_bookends(
+    ring: std::collections::VecDeque<(u64, serde_json::Value)>,
+    bookends: std::collections::VecDeque<(u64, serde_json::Value)>,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(ring.len() + bookends.len());
+    let mut ring_iter = ring.into_iter().peekable();
+    let mut bookend_iter = bookends.into_iter().peekable();
+    loop {
+        match (ring_iter.peek(), bookend_iter.peek()) {
+            (Some((ri, _)), Some((bi, _))) => {
+                if ri <= bi {
+                    out.push(ring_iter.next().unwrap().1);
+                } else {
+                    out.push(bookend_iter.next().unwrap().1);
+                }
+            }
+            (Some(_), None) => out.push(ring_iter.next().unwrap().1),
+            (None, Some(_)) => out.push(bookend_iter.next().unwrap().1),
+            (None, None) => break,
+        }
+    }
+    out
 }
 
 /// Tail a `.jsonl` file from `start_offset`, yielding each new complete
