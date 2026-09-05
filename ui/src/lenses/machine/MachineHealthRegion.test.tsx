@@ -1049,3 +1049,48 @@ describe("MachineHealthRegion — #1854 a resident holding more than darkmux pri
     expect(hints.some((t) => /more than priced/.test(t || ""))).toBe(false);
   });
 });
+
+// ── (operator finding, 2026-09-05) the snapshot age is READ, not counted ──
+//
+// The at-rest footer read "snapshot 553169s ago" on the demo fixture. Raw
+// seconds stop being readable somewhere around a minute; past that the
+// operator is doing arithmetic to answer "is this reading current?", which
+// is the one question the line exists to answer at a glance.
+//
+// Fixed by REUSING `lib/format.ts`'s `relAgoFrom` — the same coarse
+// past-only formatter the fleet strip and the run list already render their
+// "N min ago" text with — rather than minting a second one. The local
+// `relSecondsAgo` helper this region carried is gone; a page with two
+// relative-time formatters eventually shows two different answers for the
+// same instant.
+describe("MachineHealthRegion — the snapshot age reads in human units", () => {
+  /** The demo fixture's own age at the time of the finding: 553169 seconds,
+   * which is 6 days. The number is the point — a bucket no seconds-only
+   * formatter renders readably. */
+  const SIX_DAYS_MS = 553_169_000;
+
+  it("renders a coarse age, never a raw second count, in the at-rest footer", () => {
+    const { container } = renderRegion(BASE, { nowMs: BASE.generated_at_ms + SIX_DAYS_MS });
+    const foot = [...container.querySelectorAll(".memfoot")].find((f) => f.textContent?.startsWith("snapshot"))!;
+    expect(foot).toBeTruthy();
+    expect(foot.textContent).toBe("snapshot 6d ago");
+    expect(foot.textContent).not.toContain("553169");
+  });
+
+  it("the stale banner's age uses the same formatter — one page, one answer for one instant", () => {
+    const { container } = renderRegion(BASE, {
+      resourcesErrored: true,
+      nowMs: BASE.generated_at_ms + SIX_DAYS_MS,
+    });
+    expect(container.querySelector(".mm-stalebanner")?.textContent).toContain("snapshot 6d ago");
+  });
+
+  // The inverted case: a genuinely fresh reading must still say so in
+  // seconds. A formatter that answered "6d ago" for everything would pass
+  // the assertions above and be useless.
+  it("a seconds-old snapshot still reads in seconds", () => {
+    const { container } = renderRegion(BASE, { nowMs: BASE.generated_at_ms + 42_000 });
+    const foot = [...container.querySelectorAll(".memfoot")].find((f) => f.textContent?.startsWith("snapshot"))!;
+    expect(foot.textContent).toBe("snapshot 42s ago");
+  });
+});

@@ -3354,6 +3354,27 @@ body {
   font-size: calc(10px * var(--fs-scale));
   overflow-wrap: anywhere;
 }
+/* The health region's one "how this was measured" disclosure — the
+   attribution note and the observer-cost stamp, off the default render
+   (operator, 2026-09-05: "is all the prose necessary?"). Sized as the
+   footer it sits beside, so the closed state reads as one more dim footer
+   line rather than a control competing with the instruments above it. */
+.machine-lens__health .mm-about > summary {
+  color: var(--dim);
+  font-size: calc(10px * var(--fs-scale));
+  cursor: pointer;
+  list-style: none;
+  width: fit-content;
+}
+.machine-lens__health .mm-about > summary::-webkit-details-marker {
+  display: none;
+}
+.machine-lens__health .mm-about > summary::before {
+  content: "▸ ";
+}
+.machine-lens__health .mm-about[open] > summary::before {
+  content: "▾ ";
+}
 .machine-lens__health .none {
   color: var(--dim);
   font-size: calc(11px * var(--fs-scale));

@@ -159,7 +159,16 @@ test('machine lens renders the ledger inertly — gauge, lamps, odometer, rows, 
   // The per-model shrink hint (judge's row) also renders (escaped) —
   // distinct from the machine-level one above.
   await expect(page.locator('.mm-hint').last()).toContainText('reload judge at ctx 32768');
-  // Observer-cost stamp line (#1286 constraint 3) is visible.
+  // Observer-cost stamp line (#1286 constraint 3) is REACHABLE — one tap,
+  // never hidden. (operator, 2026-09-05: "is all the prose necessary?") It
+  // moved off the default render into the region's single "how this was
+  // measured" disclosure alongside the attribution note; the payload still
+  // carries `gather_ms`/`cache_ttl_ms` unchanged. Expanded here rather than
+  // asserted through the closed `<details>` on purpose: a text matcher reads
+  // `textContent` and would pass on an element nobody can see, which is the
+  // vacuous green this assertion exists to avoid.
+  await page.locator('.machine-lens__health .mm-about > summary').click();
+  await expect(page.locator('#memstamp')).toBeVisible();
   await expect(page.locator('#memstamp')).toContainText('gather 42 ms');
   // The hostile per-model state string degraded to the unknown class.
   expect(await page.locator('.mm-row-cur.is-unknown').count()).toBe(1);

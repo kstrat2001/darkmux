@@ -1362,3 +1362,181 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     expect(document.querySelector('[data-act="inline-or-cells"]')).toBeNull();
   });
 });
+
+// ── (operator rule, 2026-09-05) the drawer shows HOST stats only ──
+//
+// Verbatim: "Don't put model info in the machine drawer tabs though. Keep
+// all lms calls in the dedicated machine lens."
+//
+// The drawer and the machine lens read the SAME endpoint
+// (`/machine/resources`) but must not read the same FIELDS of it. The lens
+// is the residency room — the `models[]` array, per-model residency, loaded
+// context sizes, every figure derived from an `lms` shell-out. The drawer
+// (desktop dialog and phone Machine tab alike) answers "what is this box
+// doing right now", which is the `load` block: cpu/gpu/mem/thermal/power,
+// sampled by the daemon's own host probe with zero model dispatches.
+//
+// Today that separation holds by construction — `useDaemonLoad` returns
+// `resources.load` and nothing else, and `machineStatsContent` never sees
+// `resources.models` at all. This test PINS it, because "by construction"
+// is one convenient `?? resources.models` away from being false, and the
+// failure would be invisible: a model row in the drawer looks like a
+// feature, not a boundary violation.
+describe("MachineDrawer — host stats only, never lms-derived model data", () => {
+  /** A payload carrying FOUR loaded models alongside the host load block —
+   * the shape a real machine with residents actually returns. If the drawer
+   * ever starts reading `models[]`, one of these identifiers renders. */
+  const RESOURCES_WITH_MODELS = {
+    schema_version: "1",
+    generated_at_ms: 1,
+    gather_ms: 303,
+    limit_bytes: 274877906944,
+    limit_source: "physical_pool",
+    pool: { capacity_bytes: 274877906944, used_bytes: 176093659136, available_bytes: 98784247808, free_bytes: 21474836480 },
+    pressure: { swap_used_bytes: 0, compressor_bytes: 3221225472, margin_percent: 84, red: false },
+    attribution: "per_process",
+    messages: [],
+    cache_ttl_ms: 2000,
+    load: {
+      now: {
+        sampled_at_ms: 4000,
+        sampler_cost_ms: 4.2,
+        cpu_pct: 12,
+        cpu_clusters: null,
+        mem_pct: 34,
+        gpu_pct: 56,
+        gpu_mhz: null,
+        gpu_mem_bytes: null,
+        thermal: null,
+        power_mw: null,
+      },
+      window: {
+        samples: 3,
+        interval_ms: 2000,
+        span_ms: 90_000,
+        cpu_pct: { mean: 10, p95: 15, max: 20 },
+        mem_pct: { mean: 30, p95: 35, max: 40 },
+        gpu_pct: { mean: 50, p95: 55, max: 60 },
+        power_mw: null,
+        thermal: null,
+        energy_mwh: null,
+      },
+    },
+    models: [
+      {
+        identifier: "darkmux:qwen3.5-122b-a10b",
+        model_key: "qwen3.5-122b-a10b",
+        owner: "darkmux",
+        loaded_ctx: 131072,
+        weights_bytes: 69793218560,
+        kv_per_token_bytes: 40960,
+        kv_bytes_at_ctx: 5368709120,
+        potential_bytes: 75161927680,
+        current_bytes: 71463178240,
+        state: "green",
+      },
+      {
+        identifier: "user:phi-4",
+        model_key: "phi-4",
+        owner: "user",
+        loaded_ctx: 16384,
+        weights_bytes: 9663676416,
+        kv_per_token_bytes: 65536,
+        kv_bytes_at_ctx: 1073741824,
+        potential_bytes: 10737418240,
+        current_bytes: 9931964416,
+        state: "amber",
+      },
+    ],
+    machine: {
+      potential_bytes: 85899345920,
+      unpriced_models: 1,
+      estimated_models: 1,
+      current_bytes: 81395142656,
+      state: "amber",
+    },
+  };
+
+  /** The identifiers, model keys and per-model figures that must NOT appear
+   * anywhere in the drawer's rendered text. `loaded_ctx` is in here because
+   * a context size is the most tempting single field to borrow — it reads
+   * like a host fact and is not one. */
+  const FORBIDDEN = [
+    "qwen3.5-122b-a10b",
+    "phi-4",
+    "131072",
+    "16384",
+    "kv@ctx",
+    "potential",
+    "unpriced",
+    "resident",
+  ];
+
+  function stubDaemonFetchForPin(payload: unknown) {
+    const fetchMock = vi.fn((url: string) => {
+      if (String(url) === "/machine/resources") {
+        return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }));
+      }
+      return Promise.reject(new Error(`unexpected fetch in this test: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  function assertNoModelData(rootText: string) {
+    for (const needle of FORBIDDEN) {
+      expect(rootText.toLowerCase()).not.toContain(needle.toLowerCase());
+    }
+  }
+
+  it("the desktop dialog renders host load and no model identifier", async () => {
+    stubDaemonFetchForPin(RESOURCES_WITH_MODELS);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        isMobileOverride={false}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    // The inverted case FIRST: prove the payload actually reached the
+    // component. Without this, a drawer that rendered NOTHING would satisfy
+    // every "does not contain" assertion below and the pin would be vacuous.
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog.textContent).toContain("CPU"));
+    assertNoModelData(dialog.textContent ?? "");
+  });
+
+  it("the phone Machine tab renders host load and no model identifier", async () => {
+    stubDaemonFetchForPin(RESOURCES_WITH_MODELS);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        isMobileOverride={true}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    fireEvent.click(document.querySelector('[data-act="phone-drawer-tab-machine"]')!);
+    const panel = await waitFor(() => {
+      const el = document.querySelector('[data-act="phone-drawer-panel-machine"]');
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    await waitFor(() => expect(panel.textContent).toContain("CPU"));
+    assertNoModelData(panel.textContent ?? "");
+  });
+});

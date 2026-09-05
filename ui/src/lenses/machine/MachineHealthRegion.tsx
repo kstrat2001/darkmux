@@ -25,7 +25,7 @@ import {
   redlineLit,
   type ResidencyRowView,
 } from "./machineGauge";
-import { memBytes, reclaimableNote } from "../../lib/format";
+import { memBytes, reclaimableNote, relAgoFrom } from "../../lib/format";
 import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import { Meter, CX, type MeterBand, type MeterTick } from "../../components/Meter";
 import { useIsMobile } from "../../hooks/useIsMobile";
@@ -451,10 +451,18 @@ function Odometer({ resources }: { resources: MachineResources }) {
 
 // ── Model rows ───────────────────────────────────────────────────────────
 
-function relSecondsAgo(nowMs: number, thenMs: number): string {
-  const s = Math.max(0, Math.round((nowMs - thenMs) / 1000));
-  return `${s}s ago`;
-}
+/* A local `relSecondsAgo()` (`round((now-then)/1000)` + "s ago", unbucketed)
+ * lived here and fed all three of this region's ages. It rendered the demo
+ * fixture's own footer as "snapshot 553169s ago" (operator, 2026-09-05): past
+ * about a minute a raw second count stops answering "is this reading current?"
+ * and starts asking the reader to do arithmetic.
+ *
+ * Deleted rather than fixed in place. `lib/format.ts`'s `relAgoFrom` is the
+ * SAME coarse past-only formatter the fleet strip and the run list already
+ * render their ages with (`just now` / `Ns` / `Nm` / `Nh` / `Nd`), and it
+ * covers every bucket this region needs — including the seconds bucket the
+ * NEW chip lives in. Two relative-time formatters on one page is two answers
+ * for one instant waiting to happen. */
 
 function ModelRow({
   row,
@@ -500,7 +508,7 @@ function ModelRow({
           </span>
         )}
         {isGhost && <span className="mm-row-chip is-warn">DEPARTED · last seen {new Date(row.lastSeenMs).toLocaleTimeString([], { hour12: false })}</span>}
-        {isNew && <span className="mm-row-chip is-new">NEW · first seen {relSecondsAgo(nowMs, row.firstSeenMs ?? row.lastSeenMs)}</span>}
+        {isNew && <span className="mm-row-chip is-new">NEW · first seen {relAgoFrom(nowMs, row.firstSeenMs ?? row.lastSeenMs)}</span>}
         {!isGhost && pot == null && <span className="mm-row-chip is-warn">UNPRICED · potential unknown</span>}
         {/* #1819: a row IS priced (pot != null) but by the size-based
             fallback, not a measurement — neither a severity verdict (it
@@ -555,21 +563,32 @@ function ModelRow({
         </div>
       </div>
       {isGhost ? (
+        // "row retires after the next successful poll" was cut (operator,
+        // 2026-09-05): the DEPARTED chip above already carries a timestamp,
+        // and how long a row lingers is the component's own bookkeeping, not
+        // a fact about the machine.
         <div className="mm-row-kv">
-          no longer resident — last observed current <b>{memBytes(cur)}</b> · row retires after the next successful poll
+          no longer resident — last observed current <b>{memBytes(cur)}</b>
         </div>
       ) : (
         <div className="mm-row-kv">{modelKvLine(m)}</div>
       )}
+      {/* (operator finding, 2026-09-05) Both hints below were trimmed to the
+          one fact the row does NOT already state. The chip beside the name
+          already says UNPRICED / ESTIMATED, and its `title` carries the full
+          caveat verbatim (which weights reader failed, which attention
+          assumption the figure rests on, which architectures it over- and
+          under-reserves). What survives here is the CONSEQUENCE — the part a
+          reader cannot derive from the chip: that the machine total is short
+          by this model, and that this row's potential is a guess rather than
+          a measurement. The estimated hint was 52 words of the same content
+          the chip title, the lamp title and the server's own `messages` entry
+          each carry; the same sentence in four places is furniture. */}
       {!isGhost && pot == null && (
-        <div className="mm-hint">
-          ↳ unpriceable: no readable arch facts or catalog size — machine committed total undercounts by this model's commitment
-        </div>
+        <div className="mm-hint">↳ unpriceable — machine committed total undercounts by this model</div>
       )}
       {!isGhost && isEstimatedRow(m) && (
-        <div className="mm-hint">
-          ↳ estimated: no readable config.json and no readable GGUF header — priced from catalog size + a size-tiered dense-attention KV rate (every layer assumed to hold a KV cache). Set at or above every modern GQA architecture in its size class; it over-reserves hybrid-attention models, and under-reserves pre-GQA multi-head models like Llama-2-13B
-        </div>
+        <div className="mm-hint">↳ estimated: priced from catalog size at a dense-attention rate, not measured</div>
       )}
       {/* #1854 — the row this is ABOUT carries the fact (which resident, by
           how much, what the projection now counts); the machine caption one
@@ -689,7 +708,7 @@ export function MachineHealthRegion({
     <>
       {stale && (
         <div className="mm-stalebanner">
-          {STALE_BANNER_TEXT} — snapshot {relSecondsAgo(nowMs, b.generated_at_ms)}
+          {STALE_BANNER_TEXT} — snapshot {relAgoFrom(nowMs, b.generated_at_ms)}
         </div>
       )}
 
@@ -870,10 +889,32 @@ export function MachineHealthRegion({
         </div>
       )}
 
-      <div className="memfoot">{attributionLine(b)}</div>
-      <div className="memfoot" id="memstamp">
-        snapshot {relSecondsAgo(nowMs, b.generated_at_ms)} · {stampLine(b)}
-      </div>
+      {/* (operator finding, 2026-09-05: "is all the prose necessary?") The
+          region's ONE disclosure. Freshness stays on screen — "how old is
+          this reading" is asked at a glance, and it is three words.
+          Everything else in this footer answers "where did the reading come
+          from, and what did taking it cost": the attribution note (26 words
+          on a real machine) and the observer-cost stamp (gather ms, server
+          cache TTL, poll cadence). Those are asked once a month, and they
+          were permanent furniture under every figure on the page.
+
+          #1286 constraint 3 — "samplers stamp their own cost into the
+          artifact" — is about the PAYLOAD and is untouched: `gather_ms` and
+          `cache_ttl_ms` ride every `/machine/resources` response, and
+          `#memstamp` still renders them verbatim, one tap away. Record
+          exhaustively, display selectively.
+
+          A `<details>` rather than a `title` for the same reason the
+          odometer's note is a button and not a tooltip: this page is read
+          on a phone over the tailnet, where hover does not exist. */}
+      <div className="memfoot">snapshot {relAgoFrom(nowMs, b.generated_at_ms)}</div>
+      <details className="mm-about">
+        <summary>how this was measured</summary>
+        <div className="memfoot">{attributionLine(b)}</div>
+        <div className="memfoot" id="memstamp">
+          {stampLine(b)}
+        </div>
+      </details>
     </>
   );
 }
