@@ -1057,12 +1057,16 @@ describe("MachineHealthRegion — #1854 a resident holding more than darkmux pri
 // operator is doing arithmetic to answer "is this reading current?", which
 // is the one question the line exists to answer at a glance.
 //
-// Fixed by REUSING `lib/format.ts`'s `relAgoFrom` — the same coarse
-// past-only formatter the fleet strip and the run list already render their
-// "N min ago" text with — rather than minting a second one. The local
-// `relSecondsAgo` helper this region carried is gone; a page with two
-// relative-time formatters eventually shows two different answers for the
-// same instant.
+// Fixed by REUSING `lib/format.ts`'s `relAgoFrom` — the coarse past-only
+// formatter the notes dialog, the machine drawer's last-sample line and the
+// fleet meta line already render their ages with — rather than minting
+// another one. (An earlier version of this note claimed the RUN LIST used it
+// too; it does not. The run list has its own `lenses/runs/format.ts::runsAgo`
+// and the record panel a third, `components/RecordView.tsx::relTime`. Three
+// age formatters, one per surface — a count `lib/format.test.ts` now pins,
+// so a fourth cannot arrive quietly.) The local `relSecondsAgo` helper this
+// region carried is gone; a page with two relative-time formatters
+// eventually shows two different answers for the same instant.
 describe("MachineHealthRegion — the snapshot age reads in human units", () => {
   /** The demo fixture's own age at the time of the finding: 553169 seconds,
    * which is 6 days. The number is the point — a bucket no seconds-only
@@ -1092,5 +1096,35 @@ describe("MachineHealthRegion — the snapshot age reads in human units", () => 
     const { container } = renderRegion(BASE, { nowMs: BASE.generated_at_ms + 42_000 });
     const foot = [...container.querySelectorAll(".memfoot")].find((f) => f.textContent?.startsWith("snapshot"))!;
     expect(foot.textContent).toBe("snapshot 42s ago");
+  });
+
+  // ── two clocks, not one ──
+  //
+  // `nowMs` is the READING browser's clock; `generated_at_ms` is the daemon
+  // HOST's. This lens is read off-box over the tailnet by design (#1286
+  // constraint 2: "the display renders off-machine"), so those are two
+  // machines' clocks and nothing keeps them in step. A reader whose clock
+  // sits behind the host makes the delta negative, and `relAgoFrom` renders
+  // a negative delta as the EMPTY STRING — which is how the footer came out
+  // as a bare "snapshot" and the banner as "… — snapshot": a line that
+  // answers nothing, at the exact moment the reader asked "is this current?".
+  //
+  // Clamped at the two call sites rather than inside `relAgoFrom` (see that
+  // function's callers), so an unknowable-but-small skew reads as the
+  // freshest thing it could honestly be.
+  const SKEW_MS = 30_000;
+
+  it("a client clock 30s BEHIND the host still reads an age, not a bare 'snapshot'", () => {
+    const { container } = renderRegion(BASE, { nowMs: BASE.generated_at_ms - SKEW_MS });
+    const foot = [...container.querySelectorAll(".memfoot")].find((f) => f.textContent?.startsWith("snapshot"))!;
+    expect(foot.textContent).toBe("snapshot just now");
+  });
+
+  it("the stale banner survives the same skew", () => {
+    const { container } = renderRegion(BASE, {
+      resourcesErrored: true,
+      nowMs: BASE.generated_at_ms - SKEW_MS,
+    });
+    expect(container.querySelector(".mm-stalebanner")?.textContent).toMatch(/\u2014 snapshot just now$/);
   });
 });

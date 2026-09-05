@@ -102,6 +102,28 @@ afterEach(() => {
   document.head.querySelectorAll("meta[name^='darkmux-']").forEach((e) => e.remove());
 });
 
+/** The demo fixture's healthy machine plus one UNPRICED and one ESTIMATED
+ * resident — the two rows that used to carry a 52-word and an 18-word
+ * paragraph each, and the reason this file has a second fixture at all.
+ *
+ * `messages` is a PARAMETER because the server's own caveats are a separate
+ * axis from the rows: `/machine/resources` computes `messages[]` itself, and
+ * whether it emitted any is not something the row shapes decide. */
+function unpricedEstimatedMachine(messages: { severity: string; text: string }[] = []) {
+  const models = (DEMO_MACHINE.resources.models as Record<string, unknown>[]).slice();
+  const unpriced = { ...models[3], identifier: "user:mystery-13b", model_key: "mystery-13b", owner: "user", potential_bytes: null, potential_source: null };
+  const estimated = { ...models[3], identifier: "user:phi-4", model_key: "phi-4", owner: "user", potential_source: "estimated" };
+  return {
+    ...DEMO_MACHINE,
+    resources: {
+      ...DEMO_MACHINE.resources,
+      models: [...models, unpriced, estimated],
+      messages,
+      machine: { ...(DEMO_MACHINE.resources.machine as object), unpriced_models: 1, estimated_models: 1, state: "unknown" },
+    },
+  };
+}
+
 describe("machine lens — at-rest prose budget", () => {
   it("the demo fixture's healthy machine renders under the at-rest word ceiling", async () => {
     const { container } = mount(DEMO_MACHINE);
@@ -116,18 +138,7 @@ describe("machine lens — at-rest prose budget", () => {
   });
 
   it("an unpriced + estimated resident adds a short hint each, not two paragraphs", async () => {
-    const models = (DEMO_MACHINE.resources.models as Record<string, unknown>[]).slice();
-    const unpriced = { ...models[3], identifier: "user:mystery-13b", model_key: "mystery-13b", owner: "user", potential_bytes: null, potential_source: null };
-    const estimated = { ...models[3], identifier: "user:phi-4", model_key: "phi-4", owner: "user", potential_source: "estimated" };
-    const machine = {
-      ...DEMO_MACHINE,
-      resources: {
-        ...DEMO_MACHINE.resources,
-        models: [...models, unpriced, estimated],
-        machine: { ...(DEMO_MACHINE.resources.machine as object), unpriced_models: 1, estimated_models: 1, state: "unknown" },
-      },
-    };
-    const { container } = mount(machine);
+    const { container } = mount(unpricedEstimatedMachine());
     await waitFor(() => expect(screen.getByText(/user:phi-4/)).toBeInTheDocument());
 
     // The facts themselves survive the trim — this is a prose budget, not a
@@ -140,5 +151,51 @@ describe("machine lens — at-rest prose budget", () => {
     // Measured 423 before the trim, 338 after — the two row hints alone
     // were 70 words of it, now 20.
     expect(words).toBeLessThanOrEqual(345);
+  });
+
+  // (fix-loop 4) The trim leaned on a REDUNDANCY that nothing pinned.
+  //
+  // Each row hint could shrink to a few words because the server already
+  // states the full caveat: `/machine/resources` computes `messages[]`
+  // itself (`darkmux_profiles::model_ledger::gather`), and the region renders
+  // every entry unconditionally, in the open, above the footer. The short
+  // hint MARKS the row; the message EXPLAINS it. Take the second away and
+  // the first is the only statement left, and the page is quietly less
+  // honest than it was before the trim — which is the failure mode a word
+  // ceiling actively rewards, since folding these into the existing
+  // `how this was measured` disclosure would score BETTER on the two tests
+  // above while deleting the explanation from the screen.
+  //
+  // So: the messages render, and they render OUTSIDE any `<details>`.
+  it("the server's own unpriced/estimated messages render in the open, never behind a disclosure", async () => {
+    const UNPRICED_TEXT =
+      "1 loaded model reports no memory commitment — the machine total below is a floor, not a ceiling.";
+    const ESTIMATED_TEXT =
+      "1 loaded model's commitment is ESTIMATED from its weights, not reported by LMStudio.";
+    const { container } = mount(
+      unpricedEstimatedMachine([
+        { severity: "warn", text: UNPRICED_TEXT },
+        { severity: "info", text: ESTIMATED_TEXT },
+      ]),
+    );
+    await waitFor(() => expect(screen.getByText(/user:phi-4/)).toBeInTheDocument());
+
+    for (const text of [UNPRICED_TEXT, ESTIMATED_TEXT]) {
+      const el = screen.getByText(text, { exact: false });
+      expect(el.closest("details")).toBeNull();
+      // Not merely present in the DOM: present in the text the word counter
+      // above treats as ON SCREEN (it skips a closed disclosure's body), so
+      // this pin and the ceilings measure the same surface.
+      expect(el.className).toContain("memmsg");
+    }
+
+    // The inverted case, same fixture family: with NO server messages, no
+    // `.memmsg` renders at all. Without this, a region that painted the two
+    // strings unconditionally — regardless of payload — would satisfy the
+    // loop above and pin nothing.
+    const { container: bare } = mount(unpricedEstimatedMachine());
+    await waitFor(() => expect(bare.querySelector(".mm-row")).not.toBeNull());
+    expect(bare.querySelectorAll(".memmsg").length).toBe(0);
+    expect(container.querySelectorAll(".memmsg").length).toBe(2);
   });
 });

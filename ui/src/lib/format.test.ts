@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { MISSING, clkrange, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 // `memStateCls` was ported (format.ts) ahead of its first consumer; #1806
 // Stage 1, then Stage 2/3's `MachineHealthRegion.tsx`, is that consumer —
@@ -218,6 +221,79 @@ describe("fmtElapsed — the one duration formatter", () => {
     const retired = (ms: number) => Math.floor(ms / 60000) + ":" + String(Math.floor(ms / 1000) % 60).padStart(2, "0");
     for (let ms = 0; ms < 3_600_000; ms += 17) {
       if (fmtElapsed(ms) !== retired(ms)) throw new Error(`fmtElapsed(${ms}) = ${fmtElapsed(ms)}, retired = ${retired(ms)}`);
+    }
+  });
+});
+
+// ── (fix-loop 4) how many relative-age formatters does this app have? ──
+//
+// `MachineHealthRegion.tsx` deleted a local `relSecondsAgo` in favor of
+// `relAgoFrom`, and the comment justifying that deletion asserted a fact
+// about the rest of the app ("the SAME formatter the fleet strip and the run
+// list already render their ages with") that was FALSE for the run list. A
+// prose claim about how many of a thing exist rots the moment somebody adds
+// one, and nothing goes red.
+//
+// So the claim is a test. THREE surfaces format an age, each for a stated
+// reason, and a fourth has to argue with this file to arrive:
+//   `lib/format.ts::relAgoFrom`            the shared one — ms epochs, and
+//                                          the only one with a "just now"
+//                                          bucket
+//   `lenses/runs/format.ts::runsAgo`       the run list — SECOND-resolution
+//                                          timestamps, no "just now"; a
+//                                          3s-old run reads "3s ago", so it
+//                                          is not a byte-identical fold
+//   `components/RecordView.tsx::relTime`   the record panel — parses an ISO
+//                                          string, returns `null` (not text)
+//                                          when it cannot
+//
+// The detector is the bucket ladder itself, the one thing every such
+// formatter must contain to be one: a `}m ago`/`}h ago`/`}d ago` template
+// tail. Copying an existing formatter — the actual failure mode — carries
+// the ladder along with it, so the copy is counted.
+describe("age formatters — three surfaces, and a fourth cannot arrive quietly", () => {
+  const AGE_LADDER = /\}[mhd] ago`/;
+  const SRC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+  /** Every non-test source file under `ui/src`, as a `src`-relative path.
+   * Same walk `src/no-danger.test.ts` uses for the same reason — the
+   * invariant is about the SOURCE TREE, so it has to read the tree. */
+  function sourceFiles(dir: string = SRC_DIR, prefix = ""): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir)) {
+      const full = path.join(dir, entry);
+      if (statSync(full).isDirectory()) {
+        if (entry === "types" || entry === "node_modules") continue;
+        out.push(...sourceFiles(full, prefix ? `${prefix}/${entry}` : entry));
+        continue;
+      }
+      if (/\.(ts|tsx)$/.test(entry) && !/\.test\.(ts|tsx)$/.test(entry)) {
+        out.push(prefix ? `${prefix}/${entry}` : entry);
+      }
+    }
+    return out.sort();
+  }
+
+  const HOMES = ["components/RecordView.tsx", "lenses/runs/format.ts", "lib/format.ts"];
+
+  it("exactly three source files declare a relative-age formatter", () => {
+    const files = sourceFiles();
+    // The inverted case FIRST: prove the walk actually reached the source
+    // tree. A walk that found nothing would satisfy any "no fourth formatter"
+    // phrasing forever, and read exactly as green as this does.
+    expect(files.length).toBeGreaterThan(50);
+    expect(files).toContain("lib/format.ts");
+
+    const found = files.filter((f) => AGE_LADDER.test(readFileSync(path.join(SRC_DIR, f), "utf8")));
+    expect(found).toEqual(HOMES);
+  });
+
+  it("and none of the three has quietly grown a SECOND one", () => {
+    for (const f of HOMES) {
+      const ladders = (readFileSync(path.join(SRC_DIR, f), "utf8").match(/\}d ago`/g) ?? []).length;
+      // The filename rides in the assertion so a failure names the file
+      // rather than reporting `2 !== 1` with no address.
+      expect(`${f}: ${ladders}`).toBe(`${f}: 1`);
     }
   });
 });
