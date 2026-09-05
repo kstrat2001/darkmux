@@ -864,9 +864,28 @@ pub fn decode_b64(s: &str) -> Result<Vec<u8>> {
 /// Only header forms are touched — `diff --git`, `---`, `+++`, and (#2310
 /// fix-loop E2) the bare-path family `rename from`/`rename to`/`copy from`/
 /// `copy to` — and only the `<source-id>` prefix (with or without git's
-/// `a/`/`b/` marker, and with or without the `/workspace/` root). The hunk
-/// body is never read: a `-`/`+` line that happens to contain a path is
-/// content, not a header. `/dev/null` is left exactly as it is.
+/// `a/`/`b/` marker, and with or without the `/workspace/` root).
+/// `/dev/null` is left exactly as it is.
+///
+/// **How hunk bodies stay out of it, stated honestly.** EVERY line of the
+/// kit is examined against those prefixes. There is no hunk parser here,
+/// no state machine tracking whether we are inside a `@@` range, and
+/// nothing that identifies a header STRUCTURALLY — so a body line is not
+/// safe because it was recognized as a body line. It is safe because the
+/// unified-diff format prefixes it: every body line carries a leading
+/// `' '` (context), `'+'` (added), `'-'` (removed) or `'\'` (the
+/// no-newline marker), which shifts its own content one column right so
+/// it cannot begin `diff --git `, `rename from `, `copy to `, and so on.
+///
+/// That guard is not total, and the gap is worth naming rather than
+/// papering over: a REMOVED line whose own content begins `-- ` renders
+/// as `--- ` and is byte-identical to a `---` header (likewise content
+/// beginning `++ ` under `+`). Nothing short of walking `@@` ranges can
+/// tell those apart. What keeps it harmless is that the mapping below is
+/// a no-op unless the path begins with THIS run's `<source-id>`, so a
+/// collision must also start with that id before one byte changes. If
+/// that ever stops being narrow enough, the fix is a real range walk, not
+/// a longer comment.
 ///
 /// **Idempotent for the MARKED forms, not for the bare ones.** An
 /// `a/`/`b/`-prefixed header (what `git diff` emits, and what every kit

@@ -1685,10 +1685,32 @@ fn unit_message_golden_dir() -> PathBuf {
 /// the regenerate env var is set. Compared as BYTES (via `String`) — this
 /// is prose, so whitespace and ordering ARE the artifact.
 fn assert_text_golden(name: &str, actual: &str) {
-    let path = unit_message_golden_dir().join(name);
-    if std::env::var(UNIT_MESSAGE_GOLDEN_UPDATE).is_ok() {
+    assert_text_golden_at(
+        &unit_message_golden_dir(),
+        name,
+        actual,
+        std::env::var(UNIT_MESSAGE_GOLDEN_UPDATE).ok().as_deref(),
+    );
+}
+
+/// The body of [`assert_text_golden`], with the golden directory and the
+/// raw regenerate-var value passed IN so the gate itself is testable
+/// without mutating this process's environment.
+///
+/// (F2, from #2374's review) The gate was `env::var(..).is_ok()`, so ANY
+/// value — including the empty string an `export
+/// DARKMUX_UNIT_MESSAGE_GOLDEN_UPDATE=` or a CI `env:` block with no
+/// value leaves behind — silently rewrote all six goldens and turned the
+/// whole freeze into a no-op that still reported green. It is the literal
+/// `"1"` now, the value the regenerate recipe in this module's header
+/// actually documents, and each rewrite says so on stderr so a
+/// regeneration run is never silent.
+fn assert_text_golden_at(dir: &Path, name: &str, actual: &str, update_raw: Option<&str>) {
+    let path = dir.join(name);
+    if update_raw == Some("1") {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, actual).unwrap();
+        eprintln!("{UNIT_MESSAGE_GOLDEN_UPDATE}=1: rewrote golden {}", path.display());
         return;
     }
     let expected = fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -1705,6 +1727,41 @@ fn assert_text_golden(name: &str, actual: &str) {
          not a rebase: read the change, and if it is intended regenerate with\n  \
          {UNIT_MESSAGE_GOLDEN_UPDATE}=1 cargo test -p darkmux-lab --lib crawl::unit_step::tests::the_\n",
         path.display()
+    );
+}
+
+/// (F2, from #2374's review) The regenerate gate is the VALUE `"1"`, not
+/// "the variable is set". Red-proved by reverting the gate to
+/// `update_raw.is_some()`: the empty-string case then rewrites the golden
+/// and this test fails on the `must not rewrite` assertion.
+///
+/// Every non-`"1"` form must COMPARE — and the comparison must actually
+/// fire, which is what the drifted `actual` proves (a gate that compared
+/// but always passed would be just as silent).
+#[test]
+fn the_golden_gate_only_regenerates_on_the_literal_one() {
+    let dir = TempDir::new().unwrap();
+    let golden = dir.path().join("probe.txt");
+    fs::write(&golden, "committed").unwrap();
+
+    for raw in [Some(""), Some("0"), Some("true"), None] {
+        let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_text_golden_at(dir.path(), "probe.txt", "drifted", raw);
+        }))
+        .is_err();
+        assert!(fired, "`{raw:?}` must compare, and a drifted `actual` must fail that comparison");
+        assert_eq!(
+            fs::read_to_string(&golden).unwrap(),
+            "committed",
+            "`{raw:?}` must not rewrite the golden — only the documented `1` regenerates",
+        );
+    }
+
+    assert_text_golden_at(dir.path(), "probe.txt", "drifted", Some("1"));
+    assert_eq!(
+        fs::read_to_string(&golden).unwrap(),
+        "drifted",
+        "the documented `1` must still regenerate",
     );
 }
 
@@ -1873,6 +1930,84 @@ fn one_draw_keeps_two_distinct_findings_that_share_a_file_and_line() {
         parsed.finding_refs.len(),
         2,
         "a single draw never dedups — both findings must reach create-mods: {:?}",
+        parsed.finding_refs
+    );
+}
+
+/// (F2, from #2374's review) The same guarantee, at the draw counts the
+/// knob actually exists for. E2 gated the dedup on `draws > 1`, which left
+/// the exact bug it fixed alive at `draws: 2`: two DISTINCT findings draw 0
+/// reported on one line were still collapsed, because the flat union had no
+/// way to tell "same window, same draw" (two real problems) from "same
+/// window, different draw" (one problem, seen twice).
+///
+/// Draw 0 reports two different problems at `a.ts:7`. Draw 1 re-observes
+/// `a.ts:7` and finds one NEW window at `b.ts:9`. Three refs must survive:
+/// both of draw 0's, plus draw 1's new window. Red-proved by restoring the
+/// untagged `dedup_finding_refs` over the flat union — it yields 2.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn two_draws_dedup_only_across_draws_never_within_one() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+
+    let write_out = |name: &str, lines: &str| -> std::path::PathBuf {
+        let out = ws.path().join(name);
+        let rt = out.join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("findings.jsonl"), lines).unwrap();
+        out
+    };
+    // Draw 0: two genuinely different problems on one line.
+    let out0 = write_out(
+        "out-draw0",
+        "{\"file\":\"/workspace/app/src/a.ts\",\"line\":7,\"pattern\":\"unnamed-predicate\",\"evidence\":\"if (a && b)\",\"why\":\"first problem\"}\n\
+         {\"file\":\"/workspace/app/src/a.ts\",\"line\":7,\"pattern\":\"unnamed-predicate\",\"evidence\":\"if (a && b)\",\"why\":\"second, different problem\"}\n",
+    );
+    // Draw 1: one re-observation of draw 0's window, one new window.
+    let out1 = write_out(
+        "out-draw1",
+        "{\"file\":\"/workspace/app/src/a.ts\",\"line\":7,\"pattern\":\"unnamed-predicate\",\"evidence\":\"if (a && b)\",\"why\":\"the same problem again\"}\n\
+         {\"file\":\"/workspace/app/src/b.ts\",\"line\":9,\"pattern\":\"unnamed-predicate\",\"evidence\":\"if (c && d)\",\"why\":\"only draw 1 saw this\"}\n",
+    );
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_opts: DispatchOpts| {
+        let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let out = if n == 0 { out0.clone() } else { out1.clone() };
+        ok_result(envelope("stop", 50, 10, 1_000), out)
+    }));
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate", "draws": 2
+    }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+
+    assert_eq!(parsed.findings, 4, "the store holds every draw's findings: {parsed:?}");
+    let mut windows: Vec<(String, Option<u64>)> =
+        parsed.finding_refs.iter().map(|r| (r.file.clone().unwrap_or_default(), r.line)).collect();
+    windows.sort();
+    assert_eq!(
+        windows.len(),
+        3,
+        "draw 0's two distinct findings both survive and draw 1 contributes only its NEW window: {:?}",
+        parsed.finding_refs
+    );
+    assert_eq!(
+        windows.iter().filter(|(f, l)| f.ends_with("a.ts") && *l == Some(7)).count(),
+        2,
+        "within ONE draw, two problems on one line are two findings: {:?}",
+        parsed.finding_refs
+    );
+    assert_eq!(
+        windows.iter().filter(|(f, l)| f.ends_with("b.ts") && *l == Some(9)).count(),
+        1,
+        "the window only draw 1 saw must survive: {:?}",
         parsed.finding_refs
     );
 }

@@ -891,6 +891,16 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.40.0";
 //           (audited: no viewer, serve or doctor code reads it; the
 //           readers are `mission status`'s `grown_line`, which prints
 //           `from`/`minted` only, and this repo's own tests).
+//
+//           IT IS STILL A BOUNDARY — the same rule 1.22.0 states above.
+//           Records written before 1.40.0 carry the OLD `source`
+//           meanings (an absolute host path, the prose "the step's own
+//           output", or `""`) and cannot be rewritten; the audit file
+//           header stamps its writer's schema version, so the boundary
+//           is locatable per file. A reader that resolves `source` as a
+//           step id must do it per-side, never across: on the old side
+//           the value may be a filesystem path belonging to whichever
+//           machine wrote it, which joins to no step record anywhere.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

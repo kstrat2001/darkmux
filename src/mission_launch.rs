@@ -3718,6 +3718,71 @@ fn phase_finalization(phase_steps: &[&crew::types::Step]) -> (crew::envelope::Ph
 /// after this call site, for why this function still constructs `status`
 /// directly and the real (not "different shape") reason it hasn't adopted
 /// `RunOutcome` yet.
+///
+/// (#2310 swarm F, from the C2 post-merge review; factored out in F2) The
+/// three buckets a finalized run reports — completed, errored, and
+/// declared work that NEVER RAN — in one place, so the happy path
+/// ([`build_envelope`]) and the failure path
+/// ([`reconcile_and_finalize_on_error`]) cannot disagree about what a
+/// step that neither completed nor failed counts as. They did disagree:
+/// the failure path emitted `completed_steps`/`errored_steps` and no
+/// `abandoned_steps` at all, so the key an operator's tooling could read
+/// on a clean-ish run vanished on the path where never-ran steps are MOST
+/// common (everything downstream of the error).
+///
+/// A never-ran step is one the CONFIG asked for and the run did not do —
+/// a cascade off an errored dependency, a `run_on` whose condition could
+/// not be met, a task the phase-exit sweep found unreachable. It is not
+/// an error (nothing failed) and it is emphatically not a success, and
+/// before #2374 it was neither: it fell out of BOTH vectors, so a run
+/// could report `clean` with `0 errored` while its own phase records read
+/// `abandoned`.
+///
+/// The rule is "not terminal-with-work" rather than `== Abandoned` on
+/// purpose, and it is the SAME rule [`derive_phase_outcomes`] applies one
+/// level up ("any step left non-terminal → Abandoned"). Two statuses
+/// reach the end of a run meaning the same thing: `Abandoned` (the sweep
+/// or the cascade got to it) and `Planned`/`Running` (nothing did, and
+/// the #1504 finalize backstop will abandon it on disk moments later,
+/// AFTER the envelope is built). Counting only the first left the
+/// run-level status disagreeing with the per-phase outcomes in the same
+/// envelope — exactly the drift the C2 invariant test exists to catch,
+/// arriving through the run-level door instead.
+fn partition_step_outcomes(
+    steps: &BTreeMap<String, crew::types::Step>,
+) -> (Vec<&str>, Vec<&str>, Vec<&str>) {
+    let (mut completed, mut errored, mut never_ran) = (Vec::new(), Vec::new(), Vec::new());
+    for step in steps.values() {
+        // Exhaustive on purpose: a new `NodeStatus` must be classified
+        // here rather than falling into a `_` arm that guesses.
+        match step.status {
+            NodeStatus::Complete => completed.push(step.id.as_str()),
+            NodeStatus::Error => errored.push(step.id.as_str()),
+            NodeStatus::Planned | NodeStatus::Running | NodeStatus::Abandoned => {
+                never_ran.push(step.id.as_str())
+            }
+        }
+    }
+    (completed, errored, never_ran)
+}
+
+/// (#2310 swarm F, F2) The one-line launch warning, written so the COMMON
+/// case does not lead with a zero. A run that simply abandoned work read
+/// "0 of 2 step(s) errored and 1 never ran (abandoned)…", which invites
+/// the eye to the `0` and buries the fact that anything went wrong at
+/// all. Each clause appears only when its count is non-zero; both appear
+/// when both are.
+fn launch_outcome_warning(errored: usize, never_ran: usize, total: usize) -> Option<String> {
+    match (errored, never_ran) {
+        (0, 0) => None,
+        (0, n) => Some(format!("{n} of {total} step(s) never ran (abandoned) during launch execution")),
+        (e, 0) => Some(format!("{e} of {total} step(s) errored during launch execution")),
+        (e, n) => Some(format!(
+            "{e} of {total} step(s) errored and {n} never ran (abandoned) during launch execution"
+        )),
+    }
+}
+
 fn build_envelope(
     mission_id: &str,
     config: &MissionConfig,
@@ -3727,41 +3792,7 @@ fn build_envelope(
 ) -> crew::envelope::MissionEnvelope {
     use crew::envelope::{MissionEnvelope, MissionOutcomeStatus};
 
-    let errored: Vec<&str> = steps
-        .values()
-        .filter(|s| s.status == NodeStatus::Error)
-        .map(|s| s.id.as_str())
-        .collect();
-    let completed: Vec<&str> = steps
-        .values()
-        .filter(|s| s.status == NodeStatus::Complete)
-        .map(|s| s.id.as_str())
-        .collect();
-    // (#2310 swarm F, from the C2 post-merge review) Declared work that
-    // never ran. A step the CONFIG asked for and the run did not do — a
-    // cascade off an errored dependency, a `run_on` whose condition could
-    // not be met, a task the phase-exit sweep found unreachable. It is not
-    // an error (nothing failed) and it is emphatically not a success, and
-    // before this it was neither: it fell out of BOTH vectors, so a run
-    // could report `clean` with `0 errored` while its own phase records
-    // read `abandoned`.
-    //
-    // The filter is "not terminal-with-work" rather than
-    // `== NodeStatus::Abandoned` on purpose, and it is the SAME rule
-    // `derive_phase_outcomes` already applies one level up ("any step left
-    // non-terminal → Abandoned"). Two statuses reach the end of a run
-    // meaning the same thing: `Abandoned` (the sweep or the cascade got to
-    // it) and `Planned`/`Running` (nothing did, and the #1504 finalize
-    // backstop will abandon it on disk moments later, AFTER this envelope
-    // is built). Counting only the first left the run-level status
-    // disagreeing with the per-phase outcomes in the same envelope — which
-    // is exactly the drift the C2 invariant test exists to catch, arriving
-    // through the run-level door instead.
-    let never_ran: Vec<&str> = steps
-        .values()
-        .filter(|s| !matches!(s.status, NodeStatus::Complete | NodeStatus::Error))
-        .map(|s| s.id.as_str())
-        .collect();
+    let (completed, errored, never_ran) = partition_step_outcomes(steps);
 
     let status = if errored.is_empty() && never_ran.is_empty() {
         MissionOutcomeStatus::Clean
@@ -3801,14 +3832,10 @@ fn build_envelope(
     // (#2310 swarm F) One line, counting BOTH ways a declared step failed
     // to produce work. Emitted whenever either count is non-zero — the
     // old guard also required a completed step, so a run that errored
-    // everything carried no warning at all.
-    if !errored.is_empty() || !never_ran.is_empty() {
-        envelope.warnings = vec![format!(
-            "{} of {} step(s) errored and {} never ran (abandoned) during launch execution",
-            errored.len(),
-            steps.len(),
-            never_ran.len(),
-        )];
+    // everything carried no warning at all. (F2) Only the non-zero halves
+    // are named; see `launch_outcome_warning`.
+    if let Some(warning) = launch_outcome_warning(errored.len(), never_ran.len(), steps.len()) {
+        envelope.warnings = vec![warning];
     }
     envelope.payload = serde_json::json!({
         "completed_steps": completed,
@@ -3891,13 +3918,18 @@ fn reconcile_and_finalize_on_error(
         envelope.warnings =
             vec![format!("{reconciled} running step(s) reconciled to error on the failure path")];
     }
-    let completed: Vec<&str> =
-        steps.values().filter(|s| s.status == NodeStatus::Complete).map(|s| s.id.as_str()).collect();
-    let errored: Vec<&str> =
-        steps.values().filter(|s| s.status == NodeStatus::Error).map(|s| s.id.as_str()).collect();
+    // (F2, from #2374's review) The SAME three buckets the happy path
+    // reports, off the same helper. This path omitted `abandoned_steps`
+    // entirely, which is backwards: a mission-level `Err` mid-run is
+    // precisely where declared steps never start, so the key was missing
+    // exactly where it carries the most. Everything the failure did not
+    // interrupt and never reached is here, named, rather than dropped
+    // from the tally.
+    let (completed, errored, never_ran) = partition_step_outcomes(steps);
     envelope.payload = serde_json::json!({
         "completed_steps": completed,
         "errored_steps": errored,
+        "abandoned_steps": never_ran,
     });
     crew::envelope::finalize_mission(&envelope);
 }
@@ -6430,6 +6462,80 @@ mod tests {
         use crew::envelope::MissionOutcomeStatus;
         let persisted = crew::lifecycle::load_envelope(mid).unwrap().expect("envelope.json persisted");
         assert_eq!(persisted.status, MissionOutcomeStatus::Error, "a hard scheduler Err finalizes to Error status");
+    }
+
+    /// (F2, from #2374's review) The failure path's envelope must name the
+    /// steps that NEVER RAN, same as the happy path. `p3-step` is
+    /// `Planned` when the scheduler `Err`s — a step the config declared
+    /// that no process ever touched — and it is the single most common
+    /// thing a mission-level error leaves behind. Red-proved by dropping
+    /// `abandoned_steps` from `reconcile_and_finalize_on_error`'s payload:
+    /// the `as_array()` expect below fires with "no abandoned_steps key".
+    #[test]
+    #[serial_test::serial]
+    fn reconcile_and_finalize_on_error_names_the_steps_that_never_ran() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
+        let mid = "gen3errab";
+        let real = derive_phase_ids(mid, &config);
+        let (rp1, rp2, rp3) = (real["p1"].clone(), real["p2"].clone(), real["p3"].clone());
+        seed_mission_with_phases(
+            mid,
+            &[(&rp1, PhaseStatus::Running), (&rp2, PhaseStatus::Running), (&rp3, PhaseStatus::Planned)],
+        );
+        let tasks =
+            vec![task_with_step(&rp1, "p1-step"), task_with_step(&rp2, "p2-step"), task_with_step(&rp3, "p3-step")];
+        let mut steps = BTreeMap::new();
+        steps.insert("p1-step".to_string(), scripted_step("p1-step", NodeStatus::Complete));
+        steps.insert("p2-step".to_string(), scripted_step("p2-step", NodeStatus::Running));
+        steps.insert("p3-step".to_string(), scripted_step("p3-step", NodeStatus::Planned));
+
+        let err = anyhow::anyhow!("step kind `mission.bogus` is not registered");
+        reconcile_and_finalize_on_error(mid, &config, &real, &tasks, &mut steps, &err);
+
+        let persisted = crew::lifecycle::load_envelope(mid).unwrap().expect("envelope.json persisted");
+        let payload = persisted.payload;
+        let abandoned: Vec<&str> = payload["abandoned_steps"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no abandoned_steps key on the failure path: {payload}"))
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            abandoned,
+            vec!["p3-step"],
+            "the step that never started must be named, not dropped from the tally: {payload}"
+        );
+        // The other two buckets stay honest: the reconcile flipped the
+        // Running step into `errored`, and nothing leaked between vectors.
+        let ids = |k: &str| -> Vec<String> {
+            payload[k].as_array().unwrap().iter().filter_map(|v| v.as_str()).map(String::from).collect()
+        };
+        assert_eq!(ids("completed_steps"), vec!["p1-step".to_string()], "{payload}");
+        assert_eq!(ids("errored_steps"), vec!["p2-step".to_string()], "{payload}");
+    }
+
+    /// (F2, from #2374's review) The warning names only the halves that
+    /// happened. Leading with "0 of 2 step(s) errored" on the COMMON
+    /// abandoned-only case pointed the eye at a zero.
+    #[test]
+    fn the_launch_warning_omits_a_zero_clause() {
+        assert_eq!(launch_outcome_warning(0, 0, 3), None, "a clean run carries no warning");
+        assert_eq!(
+            launch_outcome_warning(0, 1, 2).unwrap(),
+            "1 of 2 step(s) never ran (abandoned) during launch execution",
+            "no errors — the errored clause must not appear at all",
+        );
+        assert_eq!(
+            launch_outcome_warning(2, 0, 5).unwrap(),
+            "2 of 5 step(s) errored during launch execution",
+            "nothing abandoned — the never-ran clause must not appear at all",
+        );
+        assert_eq!(
+            launch_outcome_warning(1, 3, 6).unwrap(),
+            "1 of 6 step(s) errored and 3 never ran (abandoned) during launch execution",
+            "both non-zero — both clauses, unchanged from #2374",
+        );
     }
 
     // ── #1877 — telemetry + the whole-run dispatch bookend, prescribed ──
