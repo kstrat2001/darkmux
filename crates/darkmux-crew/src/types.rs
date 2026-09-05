@@ -544,6 +544,45 @@ pub enum NodeStatus {
     Error,
 }
 
+impl NodeStatus {
+    /// (#2310 swarm F / S2-2) Every variant, so a caller that must handle
+    /// all of them ITERATES rather than re-lists. Kept honest by
+    /// [`Self::as_str`]'s exhaustive `match` (a new variant breaks that at
+    /// compile time) plus this module's own round-trip test, which walks
+    /// this array and compares each entry against `serde`.
+    pub const ALL: [NodeStatus; 5] = [
+        NodeStatus::Planned,
+        NodeStatus::Running,
+        NodeStatus::Complete,
+        NodeStatus::Abandoned,
+        NodeStatus::Error,
+    ];
+
+    /// The STABLE wire string for this status — byte-identical to what
+    /// `serde` writes for it, and the only form that may leave the
+    /// process.
+    ///
+    /// (#2310 swarm F / S2-2) `mission.grow`'s `producer_status` was
+    /// `format!("{:?}", status)`: a `Debug` rendering used as a wire
+    /// value. That couples the flow stream's contents to a derive no
+    /// schema governs — a variant rename, or swapping the derive for a
+    /// manual impl, changes what every consumer reads with no
+    /// `FLOW_SCHEMA_VERSION` bump to warn them, and it disagrees with the
+    /// persisted `Step.status` (`"error"`) for the same value
+    /// (`"Error"`). This is the explicit mapping instead: exhaustive, and
+    /// pinned variant-by-variant against `serde` in tests, so a record's
+    /// status string and a step record's status string are one vocabulary.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeStatus::Planned => "planned",
+            NodeStatus::Running => "running",
+            NodeStatus::Complete => "complete",
+            NodeStatus::Abandoned => "abandoned",
+            NodeStatus::Error => "error",
+        }
+    }
+}
+
 /// (#1230 Packet 2, revised #1341) The smallest executable unit in the flow
 /// graph — one dispatch, one native function, or one shell command. `kind`
 /// names a registered `step_kinds::StepKind` id (e.g. `"dispatch.internal"`,
@@ -1179,5 +1218,46 @@ mod tests {
             assert!(m.spec.is_none());
             assert!(!m.is_minted_run(), "`{id}` must read as operator-named");
         }
+    }
+
+    /// (#2310 swarm F / S2-2) `NodeStatus::as_str` is a WIRE contract —
+    /// `mission.grow`'s `producer_status` carries it — so it is pinned
+    /// variant by variant against `serde`, over EVERY variant, not a
+    /// sampled one. `NodeStatus::ALL` is asserted complete by the
+    /// exhaustive `match` below: adding a variant fails to compile here
+    /// before it can reach the stream unnamed.
+    #[test]
+    fn every_node_status_has_the_same_stable_string_serde_writes() {
+        for status in NodeStatus::ALL {
+            let serde_value = serde_json::to_value(status).unwrap();
+            assert_eq!(
+                serde_json::Value::String(status.as_str().to_string()),
+                serde_value,
+                "`{status:?}`'s wire string must be exactly what serde writes for it — a \
+                 `producer_status` that disagrees with a persisted `Step.status` is two \
+                 vocabularies for one value",
+            );
+        }
+    }
+
+    /// The completeness half: `ALL` must hold every variant. The `match`
+    /// is exhaustive, so a new variant breaks compilation here; the
+    /// assertion catches the other direction (a variant dropped from
+    /// `ALL` while the enum still declares it).
+    #[test]
+    fn node_status_all_holds_every_variant() {
+        for status in NodeStatus::ALL {
+            // Exhaustive by construction — the compiler enforces it.
+            let _: () = match status {
+                NodeStatus::Planned
+                | NodeStatus::Running
+                | NodeStatus::Complete
+                | NodeStatus::Abandoned
+                | NodeStatus::Error => (),
+            };
+        }
+        let distinct: std::collections::BTreeSet<&str> =
+            NodeStatus::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(distinct.len(), NodeStatus::ALL.len(), "two variants share one wire string");
     }
 }

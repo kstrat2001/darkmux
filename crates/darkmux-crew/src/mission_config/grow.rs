@@ -64,13 +64,21 @@ pub struct Grown {
     pub task_template: String,
     /// The `grow.from` task id whose output was read.
     pub from: String,
-    /// (#2301) What the producing step's output NAMED — the path when it
-    /// named one (a `ref`, or a bare path), otherwise the output itself.
-    /// Renamed from `source_path` in #2301: a producer that wraps its
-    /// output (`step_output::Output`) emits a `{"ref": {"path": …}}`
-    /// pointer, so the raw output string stopped being a path and a field
-    /// called `source_path` started holding JSON. This holds the RESOLVED
-    /// name, which is a path whenever there was one.
+    /// (#2310 swarm F / S2-2) The PRODUCING STEP's id — the last step of
+    /// the `from` task, whose output this growth read. **One meaning, in
+    /// every arm, on every surface** (`mission.grow`'s payload and
+    /// `graph-report.json` alike): a growth that minted copies, one that
+    /// found zero items, and one whose producer errored all name the same
+    /// kind of thing here.
+    ///
+    /// Deliberately NOT the artifact's path. This field rides the FLEET
+    /// stream, which crosses machines, and #2301's "resolved name" was an
+    /// ABSOLUTE host path whenever the producer wrote a file (the prose
+    /// `"the step's own output"` when it wrote inline JSON, and `""` on
+    /// the producer-errored arm) — three meanings, one of them a host
+    /// filesystem layout on a shared stream (contract 3, the lab/fleet
+    /// boundary). The artifact is not lost: it is the named step's own
+    /// `output`, on that step's record in this run.
     pub source: String,
     /// How many items the artifact's `items` array held.
     pub items: usize,

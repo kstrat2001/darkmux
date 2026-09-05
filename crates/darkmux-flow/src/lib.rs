@@ -3033,7 +3033,14 @@ mod tests {
         //           drops the retired launcher's crawl keys, the bespoke
         //           per-unit step payloads are gone, and `mission.grow`'s
         //           `source_path` is renamed `source` (#2301).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.39.0");
+        //   1.40.0: `mission.grow` gains `producer_step` +
+        //           `producer_status` and a third `reason` value
+        //           (`producer_errored`); `producer_status` is the stable
+        //           lowercase `NodeStatus` vocabulary, never a `Debug`
+        //           rendering; `source` narrows to ONE meaning — the
+        //           producing step's id, never an absolute host path
+        //           (#2310 swarm F / S2-2).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.40.0");
     }
 
     #[test]
@@ -4879,6 +4886,52 @@ mod tests {
             note.contains("legacy") || note.contains("not re-verifiable"),
             "wording must say why, honestly; got {note:?}"
         );
+    }
+
+
+    /// (#2310 swarm F / S2-2) The leniency half of the 1.40.0 bump: a
+    /// reader built against an OLDER schema must still parse a
+    /// `mission.grow` record carrying 1.40.0's new payload keys, and a
+    /// reader built against 1.40.0 must still parse a record from a
+    /// FUTURE writer. `payload` is a free-form `Value` and every
+    /// consumer-facing field is either required-and-unchanged or
+    /// `Option`, so this holds structurally — pinned here because
+    /// "consumers are lenient-on-read, loud in doctor" (contract 5) is
+    /// exactly the promise a schema bump is allowed to lean on, and an
+    /// unpinned promise is one refactor from being false.
+    #[test]
+    fn a_mission_grow_record_from_a_newer_writer_still_parses() {
+        let raw = serde_json::json!({
+            "ts": "2026-09-05T00:00:00Z",
+            "level": "info",
+            "category": "mission",
+            "tier": "local",
+            "stage": "dispatch",
+            "action": "mission.grow",
+            "handle": "review-v2",
+            "schema_version": "1.41.0",
+            "an_unknown_top_level_key": 7,
+            "payload": {
+                "phase": "m-review",
+                "task_template": "unit-swallowed-error",
+                "from": "plan-swallowed-error",
+                "source": "m-plan-swallowed-error-step",
+                "items": 0,
+                "minted": [],
+                "reason": "producer_errored",
+                "producer_step": "m-plan-swallowed-error-step",
+                "producer_status": "error",
+                "a_key_no_reader_knows": true
+            }
+        });
+        let rec: FlowRecord = serde_json::from_value(raw).expect(
+            "an older/newer reader must still parse a mission.grow record — the payload is \
+             free-form and every added field is optional",
+        );
+        assert_eq!(rec.action, "mission.grow");
+        let payload = rec.payload.expect("the record carries its payload");
+        assert_eq!(payload["producer_status"], serde_json::json!("error"));
+        assert_eq!(payload["reason"], serde_json::json!("producer_errored"));
     }
 
 }

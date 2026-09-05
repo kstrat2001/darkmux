@@ -304,6 +304,26 @@ struct StepScan {
 /// planning). An unreadable phase/step list is skipped, not an error — a
 /// mission this step cannot fully inspect still delivers what it CAN see,
 /// the same descriptive-not-refusing posture `plan_totals` takes.
+///
+/// **The scan keys on LITERAL kind ids** (#2310 swarm F): `"crawl.unit"`,
+/// and `"plan.sites"`/`"crawl.plan"`. This is a closed list, matched by
+/// string, and there is no generic property ("this kind declares
+/// residency") behind it — so a THIRD config that reviews work through a
+/// step kind named anything else produces an EMPTY scope here, silently:
+/// zero rejected findings, zero un-planned rules, zero completed units.
+/// Empty, not unknown — the caller cannot tell "nothing to report" from
+/// "nobody taught the scan this kind's name", and `deliver.github_review`
+/// renders the resulting scope line as fact.
+///
+/// Left literal deliberately: two configs use it (`review-v2.json`,
+/// `crawl.json`), the fields it reads (`config.rule`, `config.unit`,
+/// `output`'s `findings_rejected`) are conventions of those two kinds
+/// rather than of any registered interface, and inventing a `StepKind`
+/// trait method for one consumer is the extension-point drift #1352
+/// exists to stop. The obligation this doc creates instead: **a new
+/// review-shaped step kind must be added to this match at the same time
+/// it is written**, or its work is invisible to every scope line the
+/// delivery renders.
 fn scan_unit_and_plan_steps(mission_id: &str) -> StepScan {
     let mut scan = StepScan::default();
     let Ok(phases) = crate::loader::load_phases() else { return scan };

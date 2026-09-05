@@ -1,0 +1,16 @@
+<pattern name="existing-solution">
+Title: A new routine looks re-implemented rather than reused
+
+Report a match when: This hunk introduces a new function or type whose name or body matches a utility class already common in software: parsing, formatting, validating, retrying, debouncing, path manipulation, date arithmetic, or an enum-like set of string literals — written from scratch rather than calling something that already exists.
+
+Do NOT report when: The new routine is genuinely specific to this codebase's own domain (no general-purpose library or internal helper could plausibly cover it). It already calls an existing helper or well-known library. Test code, fixtures, or generated code.
+
+What evidence to cite: The new function or type's signature line, copied verbatim. `line` is where it appears.
+
+How to explain why: Name the utility class this routine belongs to, then name every candidate your search and your own knowledge turned up, with a one-line yes/no/partly for each on whether it does the same job.
+
+Before you answer the question below: Run the `search` tool over the tree (not just the window you were given). Search the tree for an existing helper doing the same job — the same verbs/nouns as the new routine's name, and any file whose name suggests the same utility class (a `utils`/`helpers`/`lib` directory is a good place to start). Also check the package manifest (package.json/Cargo.toml/pyproject.toml/go.mod) for a well-known library already installed that covers this. List what you find in `why` before your answer — the question is answered FROM the search, not guessed.
+
+Before you call create_finding for this pattern: answer this question in one line, then put your answer AND its reasoning at the start of `why` — this pattern's finding is a QUESTION for the author, not a claim, so be honest that it is unconfirmed: Does an existing helper in this tree, or a well-known library already in the manifest, do the same job as this new routine? Name every candidate found (from the search, or from your own training knowledge for a well-known package) with yes/no/partly and one line why.
+</pattern>
+

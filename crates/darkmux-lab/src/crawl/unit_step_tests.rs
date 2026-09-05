@@ -1653,3 +1653,136 @@ fn pattern_block_question_confirm_renders_the_compare_question_and_an_optional_s
         "the search instruction must precede the question instruction: {block}"
     );
 }
+
+// ── the FROZEN model-facing text (#2310 swarm F / S2-6) ─────────────────
+//
+// The dispatched unit message is measured model-facing text, so contract 6
+// binds it: "frozen means ONE HASH, not one intention." Before this it was
+// pinned by exactly two NEGATIVE substring assertions, which is why a
+// mutation injecting a whole paragraph into `pattern_block`'s `Mod` arm
+// left 858/858 green — the text could drift arbitrarily as long as it did
+// not contain the two forbidden words.
+//
+// These goldens are GENERATED from the reference implementation and
+// committed, so a change to the text is a reviewable diff instead of an
+// invisible one. Every rule below is a BUILT-IN loaded through
+// `rules::resolve_default`, not a hand-built fixture: a fixture would
+// freeze the renderer while leaving the shipped prose (which is what
+// actually reaches a model) unpinned.
+//
+// To regenerate after a deliberate, reviewed change to the text:
+//   DARKMUX_UNIT_MESSAGE_GOLDEN_UPDATE=1 cargo test -p darkmux-lab --lib \
+//     crawl::unit_step::tests::the_
+// then READ the diff — this is the text a model is given.
+
+const UNIT_MESSAGE_GOLDEN_UPDATE: &str = "DARKMUX_UNIT_MESSAGE_GOLDEN_UPDATE";
+
+fn unit_message_golden_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/unit-message")
+}
+
+/// Compare `actual` against the committed golden `name`, or write it when
+/// the regenerate env var is set. Compared as BYTES (via `String`) — this
+/// is prose, so whitespace and ordering ARE the artifact.
+fn assert_text_golden(name: &str, actual: &str) {
+    let path = unit_message_golden_dir().join(name);
+    if std::env::var(UNIT_MESSAGE_GOLDEN_UPDATE).is_ok() {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, actual).unwrap();
+        return;
+    }
+    let expected = fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "read {} ({e}) — run with {UNIT_MESSAGE_GOLDEN_UPDATE}=1 to generate it",
+            path.display()
+        )
+    });
+    assert_eq!(
+        actual,
+        expected,
+        "\nthe model-facing text at {} drifted.\n\
+         This is measured prose a model is dispatched with, so a diff here is a REVIEW item, \
+         not a rebase: read the change, and if it is intended regenerate with\n  \
+         {UNIT_MESSAGE_GOLDEN_UPDATE}=1 cargo test -p darkmux-lab --lib crawl::unit_step::tests::the_\n",
+        path.display()
+    );
+}
+
+/// The one built-in rule named, resolved through the real loader.
+fn builtin_rule(id: &str) -> Rule {
+    let (rules, _warnings) = darkmux_crew::rules::resolve_default(&[id.to_string()])
+        .unwrap_or_else(|e| panic!("built-in rule `{id}` must resolve: {e}"));
+    rules.into_iter().next().unwrap()
+}
+
+/// (#2310 swarm F / S2-6) `pattern_block`, once per `confirm` form, from
+/// the shipped built-in that uses it. `swallowed-error` is `mod` (no
+/// appended instruction at all — the arm a prose injection sailed
+/// through), `shared-symbol-callers` is `search` with FIXED patterns,
+/// `intent-vs-diff` is `question`, and `existing-solution` is the
+/// `question`-plus-`search` composition whose recipe declares NO patterns
+/// (the other half of `search_instruction`).
+#[test]
+fn the_pattern_block_text_is_frozen_per_confirm_form() {
+    for (rule_id, golden) in [
+        ("swallowed-error", "pattern-block-confirm-mod.txt"),
+        ("shared-symbol-callers", "pattern-block-confirm-search.txt"),
+        ("intent-vs-diff", "pattern-block-confirm-question.txt"),
+        ("existing-solution", "pattern-block-confirm-question-with-search.txt"),
+    ] {
+        assert_text_golden(golden, &pattern_block(&builtin_rule(rule_id)));
+    }
+}
+
+/// The forms must actually DIFFER, or the four goldens above could all be
+/// the same block and the per-form freeze would be vacuous.
+#[test]
+fn the_pattern_block_forms_are_distinguishable() {
+    let mod_form = pattern_block(&builtin_rule("swallowed-error"));
+    let search_form = pattern_block(&builtin_rule("shared-symbol-callers"));
+    let question_form = pattern_block(&builtin_rule("intent-vs-diff"));
+    assert!(
+        !mod_form.contains("Before you call create_finding"),
+        "the `mod` form appends no confirmation instruction: {mod_form}"
+    );
+    assert!(search_form.contains("Run the `search` tool"), "{search_form}");
+    assert!(question_form.contains("answer this question"), "{question_form}");
+}
+
+/// (#2310 swarm F / S2-6) The WHOLE dispatched message for one crawl
+/// built-in unit, with and without `intent`. The two goldens differ by
+/// exactly the intent block, which is the only thing `intent: Some(..)`
+/// is allowed to change — an `intent` that silently reworded the rest
+/// would be caught here.
+#[test]
+fn the_unit_dispatch_message_is_frozen_with_and_without_intent() {
+    let rule = builtin_rule("swallowed-error");
+    let mut rules_by_id = BTreeMap::new();
+    rules_by_id.insert(rule.id.clone(), rule.clone());
+    let unit = Unit::Site {
+        id: "u-golden-1".into(),
+        rule: rule.id.clone(),
+        source: "app".into(),
+        sites: vec![
+            Site { file: "src/orders.ts".into(), line: 41, start: 30, end: 55, hits: vec![41] },
+            Site { file: "src/util.ts".into(), line: 7, start: 1, end: 20, hits: vec![7] },
+        ],
+        est_tokens: 120,
+    };
+
+    let plain = build_message(&rules_by_id, &unit, None).unwrap();
+    assert_text_golden("build-message-site-no-intent.txt", &plain);
+
+    let with_intent =
+        build_message(&rules_by_id, &unit, Some("Tighten error handling in the orders path.")).unwrap();
+    assert_text_golden("build-message-site-with-intent.txt", &with_intent);
+
+    // The intent block is ADDITIVE and nothing else moves: the no-intent
+    // message must be a suffix of the with-intent one.
+    assert!(
+        with_intent.ends_with(&plain),
+        "`intent` must only PREPEND its block — the rest of the message is unchanged",
+    );
+    assert_ne!(plain, with_intent, "the intent block must actually render");
+}
+

@@ -660,9 +660,9 @@ fn crew_of_one_shape(mission: &Mission, phases_by_id: &HashMap<String, Phase>) -
 /// already pay.
 fn collect_mission_step_sessions(mission: &Mission) -> HashSet<String> {
     let mut out = HashSet::new();
-    // Built once per mission, not per step — `with_builtins` allocates five
-    // `Arc`s and a map.
-    let registry = StepKindRegistry::with_builtins();
+    // Built once per mission, not per step — the registry allocates a
+    // handful of `Arc`s and a map.
+    let registry = attribution_registry();
     for phase_id in &mission.phase_ids {
         let Ok(steps) = darkmux_crew::lifecycle::load_steps_for_phase(&mission.id, phase_id) else {
             continue;
@@ -674,6 +674,35 @@ fn collect_mission_step_sessions(mission: &Mission) -> HashSet<String> {
         }
     }
     out
+}
+
+/// (#2310 swarm F / S2-1) The registry [`step_session_id`] asks.
+///
+/// `with_builtins()` alone is not enough. `records.gather`, `mods.gate`
+/// and `deliver.github_review` are Tier-3 kinds registered per-launch by
+/// `mission launch` (`src/mission_launch.rs::all_step_kinds`), so they are
+/// absent here — and an ABSENT kind falls through to the trait DEFAULT,
+/// which is step-scoped. Each of those three declares
+/// `dispatch_session_id -> None` because it never dispatches a model at
+/// all; without registering them, this module claimed a session per
+/// gather/gate/deliver step that no record will ever carry, which is the
+/// exact "two files encoding one convention" failure #1979 set out to
+/// end, running in the other direction.
+///
+/// Only the kinds that live in `darkmux-crew` are registrable here — the
+/// review pipeline's own kinds live in `darkmux-lab` and coder-phase's in
+/// the binary, neither of which this crate may depend on. Those still
+/// take the documented default, which is the safe direction (over-claiming
+/// a session that never appears costs nothing; under-claiming one that
+/// does produces a phantom run on the board).
+fn attribution_registry() -> StepKindRegistry {
+    let registry = StepKindRegistry::with_builtins();
+    // Best-effort: a duplicate-id error here is a programming bug in the
+    // registrars, not a reason to fail a read-only board query.
+    let _ = darkmux_crew::step_kinds::register_records_gather_kind(&registry);
+    let _ = darkmux_crew::step_kinds::register_mods_gate_kind(&registry);
+    let _ = darkmux_crew::step_kinds::register_deliver_kind(&registry);
+    registry
 }
 
 /// A `Step`'s dispatch session_id — **asked of the kind, never re-derived
@@ -2068,6 +2097,51 @@ mod tests {
         let mut step = minimal_step("s-proc", "t1", None);
         step.kind = "procedural.noop".to_string();
         assert_eq!(step_session_id(&step, &StepKindRegistry::with_builtins()), None);
+    }
+
+    /// (#2310 swarm F / S2-1) `records.gather` and `mods.gate` declare
+    /// `dispatch_session_id -> None` — neither dispatches a model — and
+    /// the run view's step→session attribution must HONOR that
+    /// declaration, not fall through to the step-scoped default because
+    /// the kind happens to be registered per-launch rather than in
+    /// `with_builtins`. A session claimed for a step that emits no record
+    /// is a claim on nothing; `deliver.github_review` is the third kind
+    /// with the same contract and is pinned alongside them.
+    ///
+    /// Mutate any of those three kinds' `dispatch_session_id` to
+    /// `Some(..)`, or drop its registration from `attribution_registry`,
+    /// and this goes red.
+    #[test]
+    fn step_session_id_excludes_the_non_dispatching_review_v2_kinds() {
+        let registry = attribution_registry();
+        for kind in ["records.gather", "mods.gate", "deliver.github_review"] {
+            let mut step = minimal_step("s-nd", "t-nd", None);
+            step.kind = kind.to_string();
+            assert_eq!(
+                step_session_id(&step, &registry),
+                None,
+                "`{kind}` never dispatches a model, so the run view must claim no session for it",
+            );
+        }
+    }
+
+    /// The other half: those three must actually BE in the attribution
+    /// registry. Without this, the test above would still pass the day
+    /// someone dropped a registration — an unregistered kind resolves
+    /// through the trait default, which is `Some(..)`, so it would go red
+    /// there; but if a kind's own override were ALSO deleted the two
+    /// failures could cancel. Pin the registration itself.
+    #[test]
+    fn the_attribution_registry_knows_the_crew_side_tier3_kinds() {
+        let registry = attribution_registry();
+        for kind in ["records.gather", "mods.gate", "deliver.github_review"] {
+            assert!(
+                registry.get(kind).is_ok(),
+                "`{kind}` must be registered here or its `None` declaration is never consulted",
+            );
+        }
+        // And the builtins are still all present.
+        assert!(registry.get("dispatch.internal").is_ok());
     }
 
     #[test]

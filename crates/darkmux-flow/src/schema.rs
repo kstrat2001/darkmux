@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.39.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.40.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -839,6 +839,58 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.39.0";
 //               otherwise the output itself. Renamed rather than aliased:
 //               1.38.0 is days old, unreleased, and had no consumers
 //               outside this repo.
+//
+//   1.40.0 (#2310 swarm F / S2-2): `mission.grow`'s payload gains TWO
+//           keys and one of its existing keys gets ONE meaning.
+//           (a) `reason` gains a THIRD value, `"producer_errored"`,
+//               alongside 1.38.0's `"grew_nothing"` and its absence.
+//               It says the template grew zero copies because the
+//               producing step did not reach `complete` — distinct from
+//               `grew_nothing`, which is a producer that ran fine and
+//               legitimately found zero items. A reader that knows only
+//               1.38.0's vocabulary sees an unfamiliar string in a
+//               free-form field, which the schema's own leniency rule
+//               already covers; it must NOT read it as `grew_nothing`.
+//           (b) `producer_step` — present ONLY on a `producer_errored`
+//               record: the step id that did not complete. Absent
+//               otherwise (never null).
+//           (c) `producer_status` — present ONLY on a `producer_errored`
+//               record: that step's terminal status, as the STABLE
+//               lowercase vocabulary `crew::types::NodeStatus`
+//               serializes to (`planned` | `running` | `complete` |
+//               `abandoned` | `error`) — the SAME strings a persisted
+//               `Step.status` carries, so the two join without a
+//               translation table. Emitted through
+//               `NodeStatus::as_str`, not `format!("{:?}")`: the arc
+//               shipped a `Debug` rendering (`"Error"`) as a wire value,
+//               which both disagreed with the step record for the same
+//               value and coupled the stream to a derive no schema
+//               governs. Only `abandoned` and `error` are reachable in
+//               practice (a `planned`/`running` producer is not
+//               terminal, a `complete` one is not an error), but the
+//               vocabulary is the whole enum and is pinned variant by
+//               variant in `darkmux-crew`'s own tests.
+//           (d) `source` — NOT a new key, a narrowed one. Since 1.39.0
+//               it held "the resolved name" of the producer's output,
+//               which in practice was an ABSOLUTE HOST PATH whenever the
+//               producer wrote a file, the prose "the step's own output"
+//               when it wrote inline JSON, and `""` on the
+//               producer-errored arm: three meanings, one of them a host
+//               filesystem layout on a stream that crosses machines
+//               (contract 3, the lab/fleet boundary). It now always
+//               holds the PRODUCING STEP's id — the same value
+//               `producer_step` carries on the errored arm — and never a
+//               path. The artifact is still reachable: it is that step's
+//               own `output` on its step record. `graph-report.json`'s
+//               `grown[]` carries the identical change (one struct,
+//               `mission_config::grow::Grown`).
+//           Additive except (d), which is a value-shape narrowing inside
+//           an existing key. Renamed-in-place rather than aliased for
+//           the same reason 1.39.0 gave for `source_path`: the key is
+//           days old, unreleased, and has no consumers outside this repo
+//           (audited: no viewer, serve or doctor code reads it; the
+//           readers are `mission status`'s `grown_line`, which prints
+//           `from`/`minted` only, and this repo's own tests).
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

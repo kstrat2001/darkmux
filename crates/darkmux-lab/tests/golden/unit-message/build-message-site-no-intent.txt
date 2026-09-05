@@ -1,0 +1,19 @@
+<pattern name="swallowed-error">
+Title: A failure is caught or discarded and nothing records that it happened
+
+Report a match when: The site is a `catch` clause, a `.catch(...)` handler, or a `void somePromise()` statement, AND the failure that reaches it is neither rethrown, nor returned as an error value the caller checks, nor logged, nor counted, nor recorded anywhere the surrounding lines show. The operation looks like it succeeded to everything downstream.
+
+Do NOT report when: The handler rethrows or wraps and throws. The handler logs (any logger call, `console.*`, a metrics call, an error reporter). The handler returns or resolves a value that plainly encodes the failure (`null`/`undefined`/`false`/an error object) AND the immediate caller visibly checks it. A comment in the surrounding lines you were given says why ignoring this failure is safe. Test code, generated code, or a `.d.ts`.
+
+What evidence to cite: The `catch`/`.catch`/`void` line, copied verbatim. `line` is where it appears.
+
+How to explain why: Say what operation failed silently and what downstream code assumes about it. Do not speculate past what the surrounding lines you were given show; if the consequence is outside them, say 'consequence not visible in the surrounding lines you were given'.
+</pattern>
+
+Your scope is these sites in `/workspace/app`. For each, read lines noted below and decide whether the cited line matches the pattern. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: ` — do not count lines. Cite it as `file:line`. Sites:
+- /workspace/app/src/orders.ts:41 (read lines 30-55)
+- /workspace/app/src/util.ts:7 (read lines 1-20)
+
+For each match, call `create_finding` with these five keys exactly: `file`, `line`, `pattern`, `evidence`, `why`. `file` must be the full path exactly as listed above, starting with `/workspace/`. `evidence` must be the source line copied verbatim, and `line` must be where it appears.
+
+When you are done, say which files or sites you examined, which you did not get to, and whether you covered the whole scope.
