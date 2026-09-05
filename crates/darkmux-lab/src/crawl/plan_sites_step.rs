@@ -251,8 +251,18 @@ fn plan_diff(cfg: &SitesStepConfig) -> Result<Plan> {
     let diff_text = std::fs::read_to_string(diff_file)
         .with_context(|| format!("reading diff file {}", diff_file.display()))?;
 
-    plan::plan_diff_rule(&materialized, &rule, &diff_text, cfg.params)
-        .with_context(|| format!("planning rule '{}' over a diff against workspace '{}'", rule.id, spec.effective_name()))
+    // (#2310 fix-loop B1) The diff FILE is named in this context line so
+    // `plan_diff_rule`'s zero-files refusal — whose message talks about
+    // diff dialects — points the operator at the exact file to inspect,
+    // not just at the rule and the workspace.
+    plan::plan_diff_rule(&materialized, &rule, &diff_text, cfg.params).with_context(|| {
+        format!(
+            "planning rule '{}' over the diff at {} against workspace '{}'",
+            rule.id,
+            diff_file.display(),
+            spec.effective_name()
+        )
+    })
 }
 
 /// Register `plan.sites` beside `crawl.plan`/`crawl.unit`/`crawl.summary` —

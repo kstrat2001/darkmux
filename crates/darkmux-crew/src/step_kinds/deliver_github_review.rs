@@ -935,6 +935,35 @@ mod tests {
         assert!(review.comments[0].body.contains("clamp(1)"));
     }
 
+    /// (#2310 fix-loop B2, S3-3) `render_gated_mod`'s anchor math is
+    /// `old_end = old_start + old_block.len() - 1` and its body is
+    /// `new_block.join("\n")` — BOTH are wrong by a whole line if the
+    /// parser silently drops a bare blank line inside the kit's hunk.
+    /// Concretely: the suggestion would anchor lines 2–3 while carrying
+    /// the replacement for 2–4 and would have LOST the blank line, so
+    /// "Commit suggestion" deletes a real line of the operator's file.
+    /// This pins the whole span and the body.
+    #[test]
+    fn a_kit_with_a_bare_blank_line_anchors_and_replaces_the_full_span() {
+        // The PR diff touches lines 1–4; its own blank context line is
+        // space-prefixed, the shape git actually emits.
+        const PR_DIFF: &str = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,4 +1,4 @@\n function f() {\n-  const x = 1;\n+  const y = 1;\n \n }\n";
+        // The KIT's blank line is BARE — the shape that survives a
+        // trailing-whitespace stripper anywhere on the path to here.
+        const KIT: &str = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,3 +2,3 @@\n-  const y = 1;\n+  const y = clamp(1);\n\n }\n";
+        let findings = vec![finding("s/1", "src/a.ts", 2, "const y = 1;", "reimplements a helper", None)];
+        let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
+        let scope = DeliverScope { rules_run: vec!["r1".into()], hunks_covered: 1, hunks_total: 1, ..Default::default() };
+        let review = render_github_review(&findings, &mods, PR_DIFF, &scope, None).review.unwrap();
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert_eq!(review.comments[0].start_line, Some(2), "the hunk's old range STARTS at 2");
+        assert_eq!(review.comments[0].line, 4, "…and ENDS at 4 — the blank line is one of the three replaced lines");
+        assert_eq!(
+            review.comments[0].body, "```suggestion\n  const y = clamp(1);\n\n}\n```",
+            "the replacement keeps the blank line it replaces"
+        );
+    }
+
     #[test]
     fn an_opaque_kit_is_never_pasted_into_a_suggestion_block() {
         // (#2310 P4b review, M-B — the bug this fix removes) The EXACT
