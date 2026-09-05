@@ -46,7 +46,7 @@
  * wrapper is always mounted — this is what keeps `EventLogColumn` (and the
  * machine stats panel's own daemon polling, gated separately via
  * `onMachineOpenChange` below) from rendering/fetching while the sheet is
- * closed (68px tall — there is no room to show it anyway).
+ * closed (76px tall — there is no room to show it anyway).
  *
  * **Modal while open, at ANY height (operator finding, phone install
  * review):** the page behind is unusable while the drawer is open — body
@@ -598,7 +598,7 @@ export function PhoneDrawer({
             section (`flex: 1`) inside the ONE sliding sheet rather than a
             second independently-animated element. The CONTENT inside
             stays gated on `open` so nothing renders/polls/fetches while
-            the sheet is closed (68px tall — there is no room for it
+            the sheet is closed (76px tall — there is no room for it
             anyway). */}
         <div
           className="phone-drawer__body"
