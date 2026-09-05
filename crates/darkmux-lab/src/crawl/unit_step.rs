@@ -1049,19 +1049,22 @@ impl StepKind for CrawlUnitStepKind {
         &PORTS
     }
 
-    /// (#2321) Declare where the unit will run, in the terms the scheduler's
-    /// wave packer reads. A kind that stays silent here is queued as a REMOTE
-    /// job under `remote_cap` (1 on the launch path), which is how sibling
-    /// units of one plan ran strictly one at a time on an already-resident
-    /// model — 3× the wall-clock of the same three units wave-packed. The
-    /// dispatch below runs the Task's OWN `role_id` (#2310 P4c — see `run`'s
-    /// own doc on the same generalization) with no explicit profile
-    /// (`profile_name: None`), which the dispatch resolves as `role_profiles.
-    /// <role>` first, `default_profile` second — and `resolve_local_placement`
-    /// now resolves the very same way (#2329 review), so the wave leases the
-    /// model the dispatch will actually use. A registry that cannot resolve
-    /// yields `None` (one stderr warning per unit) and the units fall back to
-    /// the remote queue; the dispatch then surfaces the real error itself.
+    /// (#2321, #2394) Declare what the unit consumes, in the terms the
+    /// scheduler's wave packer reads. Before #2394 a kind could stay silent
+    /// here and was queued as a REMOTE job under `remote_cap` (1 on the launch
+    /// path), which is how sibling units of one plan ran strictly one at a
+    /// time on an already-resident model — 3× the wall-clock of the same three
+    /// units wave-packed; `seat` is now required, so silence is a compile
+    /// error. The dispatch below runs the Task's OWN `role_id` (#2310 P4c —
+    /// see `run`'s own doc) with no explicit profile (`profile_name: None`),
+    /// which the dispatch resolves as `role_profiles.<role>` first,
+    /// `default_profile` second — and `resolve_local_seat` resolves the very
+    /// same way (#2329 review), so the wave leases the model the dispatch will
+    /// actually use. An endpoint-bearing profile is `RemoteEndpoint`; a
+    /// registry that cannot resolve yields `LocalModelUnresolved { reason }`,
+    /// which the scheduler reports loudly (a `step seat unresolved` record)
+    /// and runs under the remote cap; the dispatch then surfaces the real
+    /// error itself.
     fn seat(
         &self,
         step: &Step,
