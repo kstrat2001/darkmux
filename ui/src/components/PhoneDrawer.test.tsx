@@ -272,6 +272,127 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     expect(parseFloat(sheet.style.height)).toBeCloseTo(107.52, 5);
   });
 
+  /** Drives the handle with CONTROLLED clock samples so the drag's
+   * velocity estimate is deterministic: `steps` are [clientY, ms] pairs
+   * after the pointerdown at (startY, 0ms). */
+  function dragTimed(handle: Element, startY: number, steps: Array<[number, number]>) {
+    // A stepped clock, not a queue: React's scheduler reads
+    // `performance.now()` too, so a shift-per-call queue drains out of
+    // order under it and every sample collapses to dt=1ms.
+    let now = 0;
+    const spy = vi.spyOn(performance, "now").mockImplementation(() => now);
+    try {
+      fireEvent.pointerDown(handle, { clientY: startY, pointerId: 1 });
+      for (const [y, t] of steps) {
+        now = t;
+        fireEvent.pointerMove(handle, { clientY: y, pointerId: 1 });
+      }
+      const last = steps[steps.length - 1][0];
+      fireEvent.pointerUp(handle, { clientY: last, pointerId: 1 });
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("a fast upward flick snaps the sheet to its max height instead of stopping where the finger lifted", () => {
+    // (operator finding on a real iPhone, 2026-09-05: "fast swipe doesn't
+    // send to max") Stored 30%, then a flick that travels only 120px in
+    // 60ms (2 px/ms, far over FLING_PX_PER_MS) — a drag-and-place would
+    // land at 30 + 120/768*100 ≈ 45.6%; the flick lands at MAX (90%):
+    // openHeightPx(90, 768, 64) = min(691.2, 696) = 691.2.
+    window.localStorage.setItem("dmux.phone-drawer.height", "30");
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    const handle = document.querySelector('[data-act="phone-drawer-handle"]')!;
+    dragTimed(handle, 600, [[560, 20], [520, 40], [480, 60]]);
+    const sheet = document.querySelector(
+      '[data-act="phone-drawer"]',
+    ) as HTMLElement;
+    expect(parseFloat(sheet.style.height)).toBeCloseTo(691.2, 5);
+    expect(window.localStorage.getItem("dmux.phone-drawer.height")).toBe("90");
+  });
+
+  it("a slow drag of the same distance stays where the finger lifted (no flick)", () => {
+    window.localStorage.setItem("dmux.phone-drawer.height", "30");
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    const handle = document.querySelector('[data-act="phone-drawer-handle"]')!;
+    // 120px over 1200ms = 0.1 px/ms, well under the flick threshold.
+    dragTimed(handle, 600, [[560, 400], [520, 800], [480, 1200]]);
+    const sheet = document.querySelector(
+      '[data-act="phone-drawer"]',
+    ) as HTMLElement;
+    // 30% + 120/768*100 = 45.625% of 768 = 350.4px
+    expect(parseFloat(sheet.style.height)).toBeCloseTo(350.4, 5);
+  });
+
+  it("a fast downward flick closes the sheet even when the finger lifts above the close-snap floor", () => {
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    const handle = document.querySelector('[data-act="phone-drawer-handle"]')!;
+    // Open at 88%; flick DOWN 120px in 60ms — still ~72% tall at release,
+    // far above CLOSE_SNAP_PCT, but the flick closes it.
+    dragTimed(handle, 200, [[240, 20], [280, 40], [320, 60]]);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("a pointercancel mid-drag finishes the drag instead of leaving the sheet frozen in its dragging state", () => {
+    // (operator finding, real iPhone: "it loses control") iOS Safari
+    // cancels the pointer when it claims a fast touch as a pan; the sheet
+    // must settle (transition re-enabled, height committed), not hang.
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    const handle = document.querySelector('[data-act="phone-drawer-handle"]')!;
+    fireEvent.pointerDown(handle, { clientY: 600, pointerId: 1 });
+    fireEvent.pointerMove(handle, { clientY: 500, pointerId: 1 });
+    let sheet = document.querySelector('[data-act="phone-drawer"]') as HTMLElement;
+    expect(sheet.className).toContain("phone-drawer--dragging");
+    fireEvent.pointerCancel(handle, { clientY: 500, pointerId: 1 });
+    sheet = document.querySelector('[data-act="phone-drawer"]') as HTMLElement;
+    expect(sheet.className).not.toContain("phone-drawer--dragging");
+    expect(screen.queryByRole("dialog")).not.toBeNull();
+    // An un-moved cancel is NOT a tap: it must not toggle the sheet.
+    fireEvent.pointerDown(handle, { clientY: 600, pointerId: 2 });
+    fireEvent.pointerCancel(handle, { clientY: 600, pointerId: 2 });
+    expect(screen.queryByRole("dialog")).not.toBeNull();
+  });
+
   it("re-opening EITHER tab restores the ONE shared persisted height", () => {
     window.localStorage.setItem("dmux.phone-drawer.height", "30");
     render(
