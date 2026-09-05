@@ -129,8 +129,36 @@ pub struct DeliverScope {
 /// as complete, and a reader who sees "7 of 7 rules reviewed, 12/12 hunks
 /// covered" has been told nothing about the whole class of problems a
 /// rule-shaped review cannot see.
+/// (PR #2398 review, item 4 follow-through) Every sentence of darkmux's
+/// OWN voice in the rendered review, named so the vocabulary conformance
+/// test can check them EXHAUSTIVELY. Checking only a fixture's rendered
+/// output tests the paths that fixture happens to take: a mutation putting
+/// "the kit did not parse as a unified diff" back into the unparseable-
+/// patch reason survived the fixture check, because no fixture has an
+/// unparseable patch. Anything model-authored is still checked through the
+/// rendered output; this array is for the words darkmux itself chooses.
+#[cfg(test)]
+const AUTHORED_PROSE: [&str; 8] = [
+    STANDING_NARROWNESS,
+    REASON_NOT_A_PATCH,
+    REASON_DID_NOT_PARSE,
+    REASON_INSERTION,
+    REASON_OUTSIDE_DIFF,
+    SUGGESTION_ATTACHED_ONE,
+    SUGGESTION_ATTACHED_MANY,
+    DOUBLE_CHECK_HEADING,
+];
+
+const REASON_NOT_A_PATCH: &str = "The change is written out rather than as a patch, so it is quoted here";
+const REASON_DID_NOT_PARSE: &str = "The change did not read as a patch, so it is quoted here";
+const REASON_INSERTION: &str = "The change adds lines rather than replacing them, so it cannot be attached to a line";
+const REASON_OUTSIDE_DIFF: &str = "The change touches lines outside this diff";
+const SUGGESTION_ATTACHED_ONE: &str = "A suggested change is attached to that line.";
+const SUGGESTION_ATTACHED_MANY: &str = "Suggested changes are attached to those lines.";
+const DOUBLE_CHECK_HEADING: &str = "**Worth a double check** (not merge-blocking):";
+
 const STANDING_NARROWNESS: &str =
-    "This is a rule-shaped review; architectural breadth stays with the frontier gate.";
+    "This review checks a fixed set of rules; it is not a full design review.";
 
 impl DeliverScope {
     /// The denominator for "N of M rules reviewed". `rules_total` when the
@@ -196,6 +224,48 @@ pub struct GithubReviewPayload {
 pub struct DeliverOutcome {
     pub mode: String,
     pub review: Option<GithubReviewPayload>,
+    /// (PR #2398 review, item 5) What was delivered, one row per rendered
+    /// entry — the operator's index back from a posted review to the
+    /// records behind it, now that the finding KEY no longer renders in
+    /// the author-facing body (and must not: it is darkmux's own record
+    /// id, meaningless to the author).
+    ///
+    /// `#[serde(skip)]` on purpose: this is provenance for the OPERATOR,
+    /// carried in the step's promoted output beside `mode`/`summary`/
+    /// `emit` (`DeliverGithubReviewStepKind::run`), never in the GitHub
+    /// payload written to `emit` — which stays exactly the bytes that get
+    /// posted, and nothing else.
+    #[serde(skip)]
+    pub entries: Vec<DeliveredEntry>,
+}
+
+/// One rendered entry's provenance — the row `DeliverOutcome::entries`
+/// carries. `rendered_as` is the SHAPE the entry took (`"suggestion"`,
+/// `"patch"`, `"question"`, `"double_check"`), one row per rendered
+/// artifact: a change whose patch spanned two hunks, one inside the diff
+/// and one outside, is two rows, because that is two things a reader sees.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeliveredEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub key: String,
+    pub rendered_as: String,
+}
+
+impl DeliveredEntry {
+    fn of(window: &FindingWindow, rule: Option<&str>, rendered_as: &str) -> Self {
+        Self {
+            rule: rule.map(str::to_string),
+            path: window.file.clone(),
+            line: window.line,
+            key: window.key.clone(),
+            rendered_as: rendered_as.to_string(),
+        }
+    }
 }
 
 // ─── Model text is untrusted markdown (#2310 fix loop A, S5-4) ──────────
@@ -409,6 +479,7 @@ pub fn render_github_review(
     let mut comments: Vec<GithubReviewComment> = Vec::new();
     let mut headline: Vec<RuleGroup> = Vec::new();
     let mut double_check: Vec<RuleGroup> = Vec::new();
+    let mut entries: Vec<DeliveredEntry> = Vec::new();
 
     for finding in findings {
         let window = FindingWindow::from(finding);
@@ -427,13 +498,20 @@ pub fn render_github_review(
             // way its rule is confirmed. The form decides only what to
             // render when there is no passed change at all.
             let bullets = group_for(&mut headline, rule.as_deref(), rule_titles);
-            render_gated_mod(m, &window, &touched, &mut comments, bullets);
+            let rendered = render_gated_mod(m, &window, &touched, &mut comments, bullets);
+            for _ in 0..rendered.suggestions {
+                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "suggestion"));
+            }
+            for _ in 0..rendered.patches {
+                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "patch"));
+            }
             continue;
         }
         match delivery_form(finding) {
             DeliveryForm::Question => {
                 let bullets = group_for(&mut headline, rule.as_deref(), rule_titles);
                 bullets.push(question_bullet(&window));
+                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "question"));
             }
             // (#2310 delivery rewrite, rule 3) A search-shaped finding with
             // no passed change is a lead, not a headline — see this
@@ -442,6 +520,7 @@ pub fn render_github_review(
             DeliveryForm::Search | DeliveryForm::Mod => {
                 let bullets = group_for(&mut double_check, rule.as_deref(), rule_titles);
                 bullets.push(double_check_bullet(&window));
+                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "double_check"));
             }
         }
     }
@@ -465,7 +544,7 @@ pub fn render_github_review(
             // A genuinely CLEAN run — nothing to say because nothing went
             // wrong, nothing was found, and the whole diff was looked at.
             // The only `mode` this applies to.
-            return DeliverOutcome { mode: "noop".to_string(), review: None };
+            return DeliverOutcome { mode: "noop".to_string(), review: None, entries };
         }
         // (#2310 P4c-2b PR #2357 review MUST FIX D, proven live) Before
         // this fix, an errored run with zero findings ALSO rendered
@@ -484,6 +563,7 @@ pub fn render_github_review(
         return DeliverOutcome {
             mode: "degraded".to_string(),
             review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments: Vec::new() }),
+            entries,
         };
     }
 
@@ -496,7 +576,7 @@ pub fn render_github_review(
     }
     if !double_check.is_empty() {
         body.push(String::new());
-        body.push("**Worth a double check** (not merge-blocking):".to_string());
+        body.push(DOUBLE_CHECK_HEADING.to_string());
         for group in &double_check {
             body.push(String::new());
             body.push(group.heading("_"));
@@ -511,6 +591,7 @@ pub fn render_github_review(
     DeliverOutcome {
         mode: "review".to_string(),
         review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments }),
+        entries,
     }
 }
 
@@ -560,7 +641,19 @@ fn rule_id_of(finding: &FindingRecord) -> Option<String> {
 /// surfaced in the scope line so a heading that fell back to a bare rule
 /// id is explained rather than just odd.
 fn unresolved_rule_titles(findings: &[FindingRecord], rule_titles: &BTreeMap<String, String>) -> BTreeSet<String> {
-    findings.iter().filter_map(rule_id_of).filter(|id| !rule_titles.contains_key(id)).collect()
+    findings.iter().filter_map(rule_id_of).filter(|id| resolved_title(rule_titles, id).is_none()).collect()
+}
+
+/// A rule's title, iff one is actually there. (PR #2398 review, item 3) A
+/// rule declaring `"title": ""` is a rule with NO title — rendering it
+/// produced a heading of two bare emphasis markers (`****`), which is both
+/// meaningless to a reader and invisible to the scope line's own
+/// "titles unavailable" notice. The heading falls back to the rule id and
+/// the notice names it, exactly as an absent title does. Both the group
+/// heading and that notice read titles through here, so the two can never
+/// disagree about what counts as resolved.
+fn resolved_title<'t>(rule_titles: &'t BTreeMap<String, String>, id: &str) -> Option<&'t str> {
+    rule_titles.get(id).map(String::as_str).filter(|t| !t.trim().is_empty())
 }
 
 /// The group for `rule`, appended if this is its first entry — so groups
@@ -574,7 +667,7 @@ fn group_for<'g>(
     if let Some(i) = groups.iter().position(|g| g.rule_id == key) {
         return &mut groups[i].bullets;
     }
-    let title = key.as_ref().and_then(|id| rule_titles.get(id)).map(|t| inline_text(t));
+    let title = key.as_ref().and_then(|id| resolved_title(rule_titles, id)).map(inline_text);
     groups.push(RuleGroup { rule_id: key, title, bullets: Vec::new() });
     let last = groups.len() - 1;
     &mut groups[last].bullets
@@ -589,7 +682,19 @@ fn group_for<'g>(
 pub fn rule_titles() -> BTreeMap<String, String> {
     let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("rules");
     let (rules, _warnings) = crate::rules::load_all(Some(&user_dir));
-    rules.into_iter().filter_map(|(id, rule)| rule.title.map(|t| (id, t))).collect()
+    titles_of(rules)
+}
+
+/// The titled subset of a rule registry. (PR #2398 review, item 3) A
+/// blank `title` is dropped HERE, at the source, as well as being treated
+/// as absent by [`resolved_title`] at the sink — a user rule tier is
+/// hand-edited, and `"title": ""` (or `"   "`) is a rule someone started
+/// naming and did not finish, not a name.
+fn titles_of(rules: BTreeMap<String, crate::rules::Rule>) -> BTreeMap<String, String> {
+    rules
+        .into_iter()
+        .filter_map(|(id, rule)| rule.title.filter(|t| !t.trim().is_empty()).map(|t| (id, t)))
+        .collect()
 }
 
 /// The finding's own claim, folded onto one line.
@@ -613,11 +718,7 @@ fn claim_sentence(window: &FindingWindow) -> String {
 /// The body entry for a change that rode out as inline suggestion(s): the
 /// location and the claim, plus where the change itself went.
 fn suggestion_bullet(window: &FindingWindow, suggested: usize) -> String {
-    let tail = if suggested == 1 {
-        "A suggested change is attached to that line."
-    } else {
-        "Suggested changes are attached to those lines."
-    };
+    let tail = if suggested == 1 { SUGGESTION_ATTACHED_ONE } else { SUGGESTION_ATTACHED_MANY };
     format!("- {} — {} {tail}", window.span(), claim_sentence(window))
 }
 
@@ -713,13 +814,20 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize, unresolved_rules
 /// no OLD range to anchor a replacement against, or a hunk outside the PR
 /// diff — falls back to the fenced body block this branch has always
 /// rendered.
+/// What one gate-passed change actually rendered as — the counts
+/// `render_github_review` turns into [`DeliveredEntry`] rows.
+struct ModRender {
+    suggestions: usize,
+    patches: usize,
+}
+
 fn render_gated_mod(
     m: &GatedMod,
     window: &FindingWindow,
     touched: &BTreeMap<String, BTreeSet<u32>>,
     comments: &mut Vec<GithubReviewComment>,
     bullets: &mut Vec<String>,
-) {
+) -> ModRender {
     // Map the change out of container coordinates by the source the gate
     // recorded (a no-op for one already in repo coordinates, and for a
     // record with no source). Without this a gate-PASSED change written as
@@ -734,17 +842,18 @@ fn render_gated_mod(
         (_, raw) => raw.unwrap_or(""),
     };
     if m.record.kit_kind.as_deref() != Some("unified-diff") {
-        bullets.push(fenced_patch_bullet(window, kit, "The change is written out rather than as a patch, so it is quoted here"));
-        return;
+        bullets.push(fenced_patch_bullet(window, kit, REASON_NOT_A_PATCH));
+        return ModRender { suggestions: 0, patches: 1 };
     }
     let hunks = crate::diff::parse_diff(kit);
     if hunks.is_empty() {
         // Declared a unified diff but nothing parsed. Never guess at
         // intent; quote it as written, same as any other shape.
-        bullets.push(fenced_patch_bullet(window, kit, "The change did not read as a patch, so it is quoted here"));
-        return;
+        bullets.push(fenced_patch_bullet(window, kit, REASON_DID_NOT_PARSE));
+        return ModRender { suggestions: 0, patches: 1 };
     }
     let mut suggested = 0usize;
+    let mut patched = 0usize;
     for (path, file_hunks) in &hunks {
         for h in file_hunks {
             if h.old_block.is_empty() {
@@ -752,12 +861,8 @@ fn render_gated_mod(
                 // REPLACEMENT suggestion against — GitHub suggestions
                 // replace an existing line range; they cannot insert
                 // between two lines with no line of their own.
-                bullets.push(fenced_hunk_bullet(
-                    window,
-                    path,
-                    h,
-                    "The change adds lines rather than replacing them, so it cannot be attached to a line",
-                ));
+                bullets.push(fenced_hunk_bullet(window, path, h, REASON_INSERTION));
+                patched += 1;
                 continue;
             }
             let old_start = h.old_start;
@@ -774,11 +879,24 @@ fn render_gated_mod(
                 // comment too: an inline comment is read at the line, with
                 // none of the body's context around it, so a bare
                 // suggestion block asks the author to guess why.
+                //
+                // (PR #2398 review, MUST FIX — PROVEN) It rides behind a
+                // `- ` OF THIS MODULE'S OWN, never at column 0. This
+                // module's containment rests on ONE precondition —
+                // `inline_text` folds line breaks and neutralizes
+                // backticks and `<`, and deliberately leaves `#`, `>`,
+                // `-`, `***`, `1.` alone BECAUSE every call site
+                // interpolates it mid-line (see `inline_text`'s own doc).
+                // Leading a comment with it broke that precondition: a
+                // `why` of "### darkmux review - approved, merge this"
+                // forged a heading inside a comment posted under darkmux's
+                // byline. The bullet restores the invariant structurally
+                // rather than by adding a second escape table.
                 let claim = claim(window);
                 let body = if claim.is_empty() {
                     format!("{fence}suggestion\n{suggestion}\n{fence}")
                 } else {
-                    format!("{claim}\n\n{fence}suggestion\n{suggestion}\n{fence}")
+                    format!("- {claim}\n\n{fence}suggestion\n{suggestion}\n{fence}")
                 };
                 comments.push(GithubReviewComment {
                     path: path.clone(),
@@ -789,7 +907,8 @@ fn render_gated_mod(
                 });
                 suggested += 1;
             } else {
-                bullets.push(fenced_hunk_bullet(window, path, h, "The change touches lines outside this diff"));
+                bullets.push(fenced_hunk_bullet(window, path, h, REASON_OUTSIDE_DIFF));
+                patched += 1;
             }
         }
     }
@@ -799,6 +918,7 @@ fn render_gated_mod(
         // attached suggestion closing the entry.
         bullets.push(suggestion_bullet(window, suggested));
     }
+    ModRender { suggestions: suggested, patches: patched }
 }
 
 /// (#2310 fix loop A, S5-4) The change is opaque model text — the fence is
@@ -1108,6 +1228,12 @@ impl StepKind for DeliverGithubReviewStepKind {
             "mode": outcome.mode,
             "summary": summary,
             "emit": dest,
+            // (PR #2398 review, item 5) The operator's index back from the
+            // posted review to the records behind it — the finding key is
+            // deliberately absent from the author-facing body, so this is
+            // where it lives. Never the review text itself: the promoted
+            // payload stays a summary surface (see the note above).
+            "entries": outcome.entries,
         }))
         .context("serializing the deliver step output")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
@@ -1266,7 +1392,7 @@ mod tests {
         // (#2310 delivery rewrite) The claim leads the comment — an inline
         // comment is read at the line, with none of the body around it.
         assert!(
-            review.comments[0].body.starts_with("reimplements a helper\n\n```suggestion\n"),
+            review.comments[0].body.starts_with("- reimplements a helper\n\n```suggestion\n"),
             "{}",
             review.comments[0].body
         );
@@ -1317,7 +1443,7 @@ mod tests {
         assert_eq!(review.comments[0].start_line, Some(2), "the hunk's old range STARTS at 2");
         assert_eq!(review.comments[0].line, 4, "…and ENDS at 4 — the blank line is one of the three replaced lines");
         assert_eq!(
-            review.comments[0].body, "reimplements a helper\n\n```suggestion\n  const y = clamp(1);\n\n}\n```",
+            review.comments[0].body, "- reimplements a helper\n\n```suggestion\n  const y = clamp(1);\n\n}\n```",
             "the replacement keeps the blank line it replaces"
         );
     }
@@ -1771,6 +1897,19 @@ mod tests {
         let review = out.review.unwrap();
         assert_eq!(review.comments.len(), 1, "{review:?}");
         assert_no_markdown_breakout(&review.comments[0].body, &[], "suggestion block");
+        // (PR #2398 review, MUST FIX) The SAME payload in `why`, which
+        // now leads the comment. The reviewer's own probe: before the
+        // fix this forged a `### darkmux review` heading inside a comment
+        // posted under darkmux's byline, with every test green.
+        const BENIGN_KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        let findings = vec![finding("s/1", "src/a.ts", 2, "ev", ATTACK, None)];
+        let mods = vec![gated_mod_kind("s/1", BENIGN_KIT, Some("unified-diff"), Some(true))];
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert_no_markdown_breakout(&review.comments[0].body, &[], "suggestion comment `why`");
+        assert_folded_onto_one_line(&review.comments[0].body, "suggestion comment `why`");
         assert_no_markdown_breakout(&review.body, &["### darkmux review"], "body alongside the suggestion");
     }
 
@@ -1905,6 +2044,38 @@ mod tests {
         let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(step_output["mode"], json!("degraded"), "{step_output}");
         assert!(step_output["summary"].as_str().unwrap().contains("Errored:"), "{step_output}");
+        assert_eq!(step_output["entries"], json!([]), "nothing delivered, no rows: {step_output}");
+
+        // (PR #2398 review, item 5) A run that DOES deliver carries the
+        // operator's index back to the records — rule, location, the
+        // finding key the author-facing body deliberately drops, and the
+        // shape each entry took. The emitted GitHub payload stays exactly
+        // the bytes that get posted: no rows in it.
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        step.config = json!({
+            "findings": [
+                finding_of_rule("sess-a/1", Some("swallowed-error"), "src/a.ts", 2, "ev", "the failure is discarded", None),
+                finding_of_rule("sess-a/2", Some("union-vs-enum"), "src/mw.ts", 9, "ev", "a lead", Some("search")),
+            ],
+            "mods": [gated_mod_kind("sess-a/1", KIT, Some("unified-diff"), Some(true))],
+            "diff": DIFF,
+            "scope": {},
+            "emit": out_path.to_string_lossy(),
+        });
+        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        assert_eq!(
+            step_output["entries"],
+            json!([
+                { "rule": "swallowed-error", "path": "src/a.ts", "line": 2, "key": "sess-a/1", "rendered_as": "suggestion" },
+                { "rule": "union-vs-enum", "path": "src/mw.ts", "line": 9, "key": "sess-a/2", "rendered_as": "double_check" },
+            ]),
+            "{step_output}"
+        );
+        let emitted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        assert!(emitted.get("entries").is_none(), "provenance never rides the posted payload: {emitted}");
+        assert!(!emitted["review"]["body"].as_str().unwrap().contains("sess-a/"), "{emitted}");
     }
 
     /// (#2310 fix-loop E2) The scope line names the DENOMINATOR: "2 of 7
@@ -1955,12 +2126,150 @@ mod tests {
         ] {
             let line = scope_line(&scope, 0, &BTreeSet::new());
             assert_eq!(
-                line.matches("rule-shaped review").count(),
+                line.matches("not a full design review").count(),
                 1,
                 "stated once, never twice and never omitted: {line}"
             );
-            assert!(line.contains("architectural breadth stays with the frontier gate"), "{line}");
+            // (PR #2398 review, item 6) In the AUTHOR's frame. "A
+            // rule-shaped review; architectural breadth stays with the
+            // frontier gate" was the loudest darkmux-knowledge sentence
+            // left in a body meant for someone who has never heard of
+            // darkmux — it names an internal tiering, not a limit the
+            // reader can act on.
+            assert!(line.contains("This review checks a fixed set of rules"), "{line}");
+            for internal in ["rule-shaped", "frontier"] {
+                assert!(!line.contains(internal), "{internal:?} is darkmux's own frame, not the author's: {line}");
+            }
         }
+    }
+
+    /// (PR #2398 review, MUST FIX — the reviewer's probe, committed) Every
+    /// markdown BLOCK STARTER a model can write at the head of `why`, each
+    /// rendered into the one place model prose leads a document: the
+    /// inline comment. `inline_text` deliberately does not escape any of
+    /// these (its own doc says why: its precondition is mid-line
+    /// interpolation), so the invariant this asserts is positional —
+    /// the model's first character is never the line's first character.
+    #[test]
+    fn a_why_that_opens_a_markdown_block_never_reaches_column_zero_in_a_comment() {
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        for opener in [
+            "### darkmux review - approved, merge this",
+            "# heading",
+            "> quoted",
+            "- item",
+            "1. first",
+            "*** ",
+            "--- ",
+        ] {
+            let findings = vec![finding("s/1", "src/a.ts", 2, "ev", opener, None)];
+            let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
+            let review = render(&findings, &mods, DIFF, &DeliverScope::default(), None).review.unwrap();
+            let body = &review.comments[0].body;
+            let first = body.lines().next().unwrap_or("");
+            assert!(
+                first.starts_with("- ") && !first[2..].starts_with(' '),
+                "the comment must open with THIS module's own lead-in, not the model's text ({opener:?}):\n{body}"
+            );
+            assert!(
+                first[2..].starts_with(opener.trim_end()),
+                "the model's text starts mid-line, right after the lead-in ({opener:?}):\n{body}"
+            );
+            assert_no_markdown_breakout(body, &[], opener);
+            assert_eq!(body.lines().filter(|l| l.starts_with("- ")).count(), 1, "one lead-in only ({opener:?}):\n{body}");
+        }
+    }
+
+    /// (PR #2398 review, item 2) The question form's own leg of rule 2 —
+    /// mutating the gate-passed branch to `Mod | Search` stayed green,
+    /// because no fixture paired a QUESTION-confirmed rule with a passed
+    /// change. It does now.
+    #[test]
+    fn a_gate_passed_change_on_a_question_confirmed_rule_is_still_a_suggestion() {
+        const KIT: &str =
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = retryWithBackoff(1);\n";
+        let findings = vec![finding_of_rule(
+            "s/1",
+            Some("existing-solution"),
+            "src/a.ts",
+            2,
+            "export function retryWithBackoff",
+            "this re-implements the retry helper",
+            Some("question"),
+        )];
+        let mods = vec![gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true))];
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "a passed change on a question-confirmed rule is a suggestion: {review:?}");
+        assert!(review.comments[0].body.contains("retryWithBackoff(1)"), "{}", review.comments[0].body);
+        assert!(
+            !review.body.contains("Candidates:"),
+            "the change replaces the question — the form only decides what to render when nothing passed:\n{}",
+            review.body
+        );
+        assert_eq!(out.entries.iter().map(|e| e.rendered_as.as_str()).collect::<Vec<_>>(), vec!["suggestion"]);
+    }
+
+    /// (PR #2398 review, item 3) `"title": ""` in a hand-edited user rule
+    /// tier is a rule with NO title, at both ends: `rule_titles`'s own
+    /// filter drops it, and the render treats a blank one that reaches it
+    /// anyway as absent — heading by the id, and NAMING it in the scope
+    /// line. Before this, it rendered a heading of four bare asterisks.
+    #[test]
+    fn a_blank_rule_title_falls_back_to_the_id_and_the_scope_line_names_it() {
+        let mut rules: BTreeMap<String, crate::rules::Rule> = crate::rules::load_all(None).0;
+        let blank = rules.get_mut("swallowed-error").expect("a built-in rule");
+        blank.title = Some("   ".to_string());
+        let titles = titles_of(rules);
+        assert!(!titles.contains_key("swallowed-error"), "a blank title is not a title: {titles:?}");
+
+        // …and the render is defensive about one arriving anyway.
+        let titles = BTreeMap::from([("swallowed-error".to_string(), "  ".to_string())]);
+        let findings = vec![finding_of_rule("s/1", Some("swallowed-error"), "src/a.ts", 2, "ev", "a claim", None)];
+        let body =
+            render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None, &titles).review.unwrap().body;
+        assert!(body.contains("_swallowed-error_"), "the id is the fallback heading:\n{body}");
+        assert!(!body.contains("__ `swallowed-error`"), "never an empty emphasis pair:\n{body}");
+        assert!(body.contains("Titles unavailable for these rules: swallowed-error."), "{body}");
+    }
+
+    /// (PR #2398 review, item 4 follow-through) Every sentence darkmux
+    /// writes in its own voice, checked exhaustively — not just the ones a
+    /// fixture's paths happen to render. A mutation restoring "the kit did
+    /// not parse as a unified diff" to the unparseable-patch reason
+    /// SURVIVED the fixture-rendered check; it does not survive this one.
+    #[test]
+    fn every_sentence_darkmux_writes_speaks_the_authors_language() {
+        for sentence in AUTHORED_PROSE {
+            let lower = sentence.to_lowercase();
+            for word in INTERNAL_VOCABULARY {
+                assert!(!lower.contains(word), "darkmux's own sentence speaks {word:?}: {sentence}");
+            }
+        }
+    }
+
+    /// (PR #2398 review, item 4) The vocabulary check, run over the REAL
+    /// shipped rule registry rather than the test's own fixture titles —
+    /// a rule title is model-facing prose written by whoever authors the
+    /// rule, and it reaches the author's screen as a heading.
+    #[test]
+    fn the_shipped_rule_titles_speak_the_authors_language_too() {
+        let titles = titles_of(crate::rules::load_all(None).0);
+        assert!(titles.len() >= 9, "every shipped rule should be titled: {titles:?}");
+        for (id, title) in &titles {
+            let lower = title.to_lowercase();
+            for word in INTERNAL_VOCABULARY {
+                assert!(!lower.contains(word), "rule {id}'s title speaks darkmux's own procedure word {word:?}: {title}");
+            }
+        }
+        // …and the fixture rendered against those real titles, not the
+        // test's own copies of them.
+        let (findings, mods, scope) = every_form_fixture();
+        let review = render_github_review(&findings, &mods, DIFF, &scope, Some("Advisory, not a merge gate."), &titles)
+            .review
+            .unwrap();
+        assert_no_internal_vocabulary(&review);
     }
 
     /// (#2310 P4b) The golden the brief asks for: one fixture set of
@@ -2144,6 +2453,31 @@ mod tests {
         );
     }
 
+    /// (PR #2398 review, item 4) darkmux's own procedure words, in their
+    /// UNAMBIGUOUS compound forms. The earlier list checked bare English
+    /// substrings — `unit`, `kit`, `confirm`, `dispatch` — which a
+    /// perfectly good author-facing sentence can contain honestly ("the
+    /// unit test", "a starter kit", "confirm the range"), so the check
+    /// would have failed on innocent prose and taught the next author to
+    /// weaken it. What is actually forbidden is darkmux naming its own
+    /// machinery to someone who has never heard of darkmux.
+    const INTERNAL_VOCABULARY: [&str; 7] =
+        ["search-confirmed", "mod-form", "question-form", "confirm form", "crawl unit", "the kit", "dispatch session"];
+
+    /// The rendered review — body AND inline comments — against
+    /// [`INTERNAL_VOCABULARY`].
+    fn assert_no_internal_vocabulary(review: &GithubReviewPayload) {
+        let mut spoken = review.body.clone();
+        for c in &review.comments {
+            spoken.push('\n');
+            spoken.push_str(&c.body);
+        }
+        let spoken = spoken.to_lowercase();
+        for word in INTERNAL_VOCABULARY {
+            assert!(!spoken.contains(word), "the review speaks darkmux's own procedure word {word:?}:\n{spoken}");
+        }
+    }
+
     /// (#2310 delivery rewrite, rule 4) The rendered review — body AND
     /// inline comments — speaks the AUTHOR's language. darkmux's own
     /// procedure words never appear; the rule ID does, because it is the
@@ -2152,15 +2486,7 @@ mod tests {
     fn the_rendered_review_carries_no_internal_procedure_vocabulary() {
         let (findings, mods, scope) = every_form_fixture();
         let review = render(&findings, &mods, DIFF, &scope, Some("Advisory, not a merge gate.")).review.unwrap();
-        let mut text = review.body.clone();
-        for c in &review.comments {
-            text.push('\n');
-            text.push_str(&c.body);
-        }
-        let text = text.to_lowercase();
-        for word in ["search-confirmed", "confirm", "kit", "mod-form", "question-form", "dispatch", "unit"] {
-            assert!(!text.contains(word), "the review speaks darkmux's own procedure word {word:?}:\n{text}");
-        }
+        assert_no_internal_vocabulary(&review);
         assert!(review.body.contains("`union-vs-enum`"), "the rule id IS author-facing — it names what was violated");
         assert!(review.body.contains("rules reviewed"), "the scope line's own author-meaningful counts stay");
         assert!(review.body.contains("hunks covered"));

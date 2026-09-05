@@ -3770,7 +3770,7 @@ line two
             status: darkmux_crew::types::NodeStatus::Planned,
             config: serde_json::json!({
                 "emit": emit_path.to_string_lossy(),
-                "attribution": "darkmux review-v2 — advisory, not a merge gate."
+                "attribution": "darkmux — advisory, not a merge gate."
             }),
             started_ts: None,
             completed_ts: None,
@@ -3788,7 +3788,11 @@ line two
         // no config snapshot, so `rules_total` is 0 and the denominator
         // falls back to what the lists prove: 5 run, none not-attempted.
         assert!(review.body.contains("review ran: 5 of 5 rules reviewed"), "{}", review.body);
-        assert!(review.body.contains("rule-shaped review"), "the standing narrowness: {}", review.body);
+        assert!(
+            review.body.contains("This review checks a fixed set of rules; it is not a full design review."),
+            "the standing narrowness, in the author's frame: {}",
+            review.body
+        );
         // (#2310 delivery rewrite) Every entry is headed by its RULE — the
         // title from `templates/builtin/rules/<id>.json`, tagged with the
         // id the author re-runs the check by — and located by `path:line`.
@@ -3825,7 +3829,11 @@ line two
             spoken.push_str(&c.body);
         }
         let spoken = spoken.to_lowercase();
-        for word in ["search-confirmed", "confirm", "kit", "mod-form", "question-form", "dispatch", "unit"] {
+        // (PR #2398 review, item 4) The UNAMBIGUOUS compound forms — the
+        // bare substrings (`unit`, `kit`, `confirm`, `dispatch`) appear in
+        // honest author-facing English and would have made this check
+        // fail on good prose.
+        for word in ["search-confirmed", "mod-form", "question-form", "confirm form", "crawl unit", "the kit", "dispatch session"] {
             assert!(!spoken.contains(word), "the review speaks darkmux's own procedure word {word:?}: {spoken}");
         }
 

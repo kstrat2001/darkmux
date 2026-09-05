@@ -2,19 +2,19 @@
   "mode": "review",
   "review": {
     "event": "COMMENT",
-    "body": "### darkmux review\n\nreview ran: 2 of 3 rules reviewed, 3/4 hunks covered, 8 finding(s) considered, 2 refused. Not attempted: architectural review. This is a rule-shaped review; architectural breadth stays with the frontier gate.\n\n**A failure is caught or discarded and nothing records that it happened** `swallowed-error`\n- `src/a.ts:2` — reimplements clamp(). A suggested change is attached to that line.\n\n**A compound condition encodes a domain rule that has no name and cannot be tested on its own** `unnamed-predicate`\n- `src/other.ts:5` — unrelated change. The change is written out rather than as a patch, so it is quoted here:\n\n```\nthe patch text\n```\n\n**A new routine looks re-implemented rather than reused** `existing-solution`\n- `src/x.ts:1` — did you check whether the repo already has this? Candidates: Status enum, Kind enum\n\n**A new string-literal union or enum-like set may duplicate an existing one** `union-vs-enum`\n- `src/a.ts:1` — this union duplicates the Status enum. A suggested change is attached to that line.\n\n**Worth a double check** (not merge-blocking):\n\n_A compound condition encodes a domain rule that has no name and cannot be tested on its own_ `unnamed-predicate`\n- `src/a.ts:2` — might duplicate an existing helper. _Worth checking: the cited line_\n\n_A new string-literal union or enum-like set may duplicate an existing one_ `union-vs-enum`\n- `src/a.ts:2` — a gate-failed claim. _Worth checking: ev_\n\n_A shared function or type's signature or behavior changed_ `shared-symbol-callers`\n- `src/mw.ts:10` — shared auth changed. _Worth checking: 14 endpoints use this middleware_\n\n_A failure is caught or discarded and nothing records that it happened_ `swallowed-error`\n- `src/a.ts:2` — a mod exists but nothing ever gated it. _Worth checking: ev_\n\n_Advisory, not a merge gate._",
+    "body": "### darkmux review\n\nreview ran: 2 of 3 rules reviewed, 3/4 hunks covered, 8 finding(s) considered, 2 refused. Not attempted: architectural review. This review checks a fixed set of rules; it is not a full design review.\n\n**A failure is caught or discarded and nothing records that it happened** `swallowed-error`\n- `src/a.ts:2` — reimplements clamp(). A suggested change is attached to that line.\n\n**A compound condition encodes a domain rule that has no name and cannot be tested on its own** `unnamed-predicate`\n- `src/other.ts:5` — unrelated change. The change is written out rather than as a patch, so it is quoted here:\n\n```\nthe patch text\n```\n\n**A new routine looks re-implemented rather than reused** `existing-solution`\n- `src/x.ts:1` — did you check whether the repo already has this? Candidates: Status enum, Kind enum\n\n**A new string-literal union or enum-like set may duplicate an existing one** `union-vs-enum`\n- `src/a.ts:1` — this union duplicates the Status enum. A suggested change is attached to that line.\n\n**Worth a double check** (not merge-blocking):\n\n_A compound condition encodes a domain rule that has no name and cannot be tested on its own_ `unnamed-predicate`\n- `src/a.ts:2` — might duplicate an existing helper. _Worth checking: the cited line_\n\n_A new string-literal union or enum-like set may duplicate an existing one_ `union-vs-enum`\n- `src/a.ts:2` — a gate-failed claim. _Worth checking: ev_\n\n_A shared function or type's signature or behavior changed_ `shared-symbol-callers`\n- `src/mw.ts:10` — shared auth changed. _Worth checking: 14 endpoints use this middleware_\n\n_A failure is caught or discarded and nothing records that it happened_ `swallowed-error`\n- `src/a.ts:2` — a mod exists but nothing ever gated it. _Worth checking: ev_\n\n_Advisory, not a merge gate._",
     "comments": [
       {
         "path": "src/a.ts",
         "line": 2,
         "side": "RIGHT",
-        "body": "reimplements clamp()\n\n```suggestion\n  const x = clamp(1);\n```"
+        "body": "- reimplements clamp()\n\n```suggestion\n  const x = clamp(1);\n```"
       },
       {
         "path": "src/a.ts",
         "line": 1,
         "side": "RIGHT",
-        "body": "this union duplicates the Status enum\n\n```suggestion\nfunction f(): Status {\n```"
+        "body": "- this union duplicates the Status enum\n\n```suggestion\nfunction f(): Status {\n```"
       }
     ]
   }
