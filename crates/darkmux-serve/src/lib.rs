@@ -3261,7 +3261,23 @@ fn join_host_samples_into_session_records(
     let Some(start_ms) = records.iter().filter(|r| is_start(r)).filter_map(ts_ms).min() else {
         return;
     };
-    let end_ms = records.iter().filter(|r| is_terminal(r)).filter_map(ts_ms).max().unwrap_or(u64::MAX);
+    // (#2413 round 3 CONSIDER 1) An open/abandoned run (no terminal
+    // record yet) used to fall back to `u64::MAX` here, which would join
+    // EVERY machine-scoped sample written after this run's start, on this
+    // machine, forever — including ones sampled long after the dispatch
+    // actually died. Clamp instead to this session's own last-seen record
+    // ts plus the SAME staleness allowance `any_dispatch_live_locally`
+    // uses to decide a bookend counts as abandoned (`runs::stale_after_ms`,
+    // 2x the inactivity timeout) — a run this function has no OTHER record
+    // of activity from beyond that point has no business claiming samples
+    // from beyond it either.
+    let end_ms = match records.iter().filter(|r| is_terminal(r)).filter_map(ts_ms).max() {
+        Some(t) => t,
+        None => {
+            let last_own_ts = records.iter().filter_map(ts_ms).max().unwrap_or(start_ms);
+            last_own_ts.saturating_add(runs::stale_after_ms())
+        }
+    };
     let mut joined: Vec<serde_json::Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for v in fleet {

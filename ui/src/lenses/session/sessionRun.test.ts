@@ -336,6 +336,29 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(labels).not.toContain("HOST");
   });
 
+  it("(#2413 round 3 CONSIDER 3) a machine-scoped sample from a DIFFERENT machine is never rendered", () => {
+    // A multi-machine playback fixture (records from more than one
+    // machine's day file) must not let this run's SYSTEM pane render
+    // another machine's samples just because they land in the same time
+    // window — only `machine_uid === this run's own machine_uid` counts.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", machine_uid: "m-1" } as FlowRecord,
+      {
+        ts: "2026-01-01T00:00:30Z",
+        action: "machine.telemetry",
+        machine_uid: "m-2",
+        category: "machinery",
+        source: "host",
+        payload: { cpu_pct: 40, mem_pct: 60, gpu_pct: 10 },
+      } as unknown as FlowRecord,
+      { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const labels = view.metricScope.system.map((i) => view.metrics[i].label);
+    expect(labels).not.toContain("CPU");
+    expect(labels).toContain("HOST");
+  });
+
   it("(#1973) a unit that did NO model work has no model pane and no loaded-models track", () => {
     // A `procedural.shell` step compiles, moves files or runs a command. It
     // will never have turns, tokens, a context window or a compaction, so

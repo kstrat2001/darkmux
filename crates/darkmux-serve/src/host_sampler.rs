@@ -432,20 +432,18 @@ pub(crate) fn spawn(
                 let _ = darkmux_flow::record(rec);
             }
 
-            // (#2413, C2) Opportunistically (re)acquire the singleton
-            // lock every tick this thread doesn't already hold it — a
-            // dispatch process that held it may have exited (releasing it
-            // via its own `Drop`) since our last attempt, freeing the
-            // machine up for the daemon to take over as the steady-state
-            // emitter. `_quiet`: a fresh, alive lock declining this call
-            // is the CORRECT, expected steady state whenever a dispatch
-            // legitimately holds the sampler role — not a race — so this
-            // must not feed `darkmux doctor`'s "two live pids" contention
-            // marker, or that check would fire constantly during ordinary
-            // healthy operation (a daemon idly deferring to a live
-            // dispatch, every tick, for as long as the dispatch runs).
+            // (#2413, C2, and round 3 MF1) Opportunistically (re)acquire
+            // the singleton lock every tick this thread doesn't already
+            // hold it — a dispatch process that held it may have exited
+            // (releasing it via its own `Drop`) since our last attempt,
+            // freeing the machine up for the daemon to take over as the
+            // steady-state emitter. A fresh, alive lock declining this
+            // call is the CORRECT, expected steady state whenever a
+            // dispatch legitimately holds the sampler role, not a race —
+            // `try_acquire` never records that as contention (the channel
+            // is retired, see `host_sampler_lock`'s module doc).
             if sampler_lock.is_none() {
-                sampler_lock = darkmux_crew::host_sampler_lock::try_acquire_quiet("daemon", interval_ms);
+                sampler_lock = darkmux_crew::host_sampler_lock::try_acquire("daemon", interval_ms);
             }
             if let Some(guard) = sampler_lock.as_ref() {
                 if guard.heartbeat(interval_ms) {

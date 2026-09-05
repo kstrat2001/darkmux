@@ -5374,14 +5374,16 @@ const TAILER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TELEMETRY_SAMPLE_INTERVAL: Duration = Duration::from_millis(TELEMETRY_SAMPLE_INTERVAL_MS);
 /// Same cadence as [`TELEMETRY_SAMPLE_INTERVAL`], as a plain `u64` — feeds
 /// `reduce_host_extras`'s sleep-gap cap (#2108 review finding), which wants
-/// milliseconds, not a `Duration`, and [`telemetry_emission_due`]'s tests
-/// (#2413 M2). (#2413 C7) The doctor check this constant's `pub`
-/// visibility originally served, `check_telemetry_record_every_samples`,
-/// is retired along with the config knob it surfaced — `pub` stays
-/// because this module's own test file (`dispatch_internal_tests.rs`,
-/// `super::*`) and callers elsewhere in this crate still read it, not
-/// because a doctor check derives a message from it any more.
-pub const TELEMETRY_SAMPLE_INTERVAL_MS: u64 = 2000;
+/// milliseconds, not a `Duration`, and the sampler-loop tests in
+/// `dispatch_internal_tests.rs` (that file is `include!`'d as this
+/// module's own `mod tests` via `super::*`, so it reads this constant
+/// without `pub` at all). (#2413 C7, corrected round 3 MF2) The doctor
+/// check this constant's `pub` visibility used to serve, `check_
+/// telemetry_record_every_samples`, is retired along with the config knob
+/// it surfaced, and — checked directly — nothing outside this file reads
+/// this constant either. `pub` was never actually load-bearing for
+/// anything beyond this module; dropped.
+const TELEMETRY_SAMPLE_INTERVAL_MS: u64 = 2000;
 
 /// (#2413 M2, review round 2) Whether a machine-scoped `machine.telemetry`
 /// emission is due on this tick. The dispatch-owned sampler's outer loop
@@ -5398,6 +5400,41 @@ pub(crate) fn telemetry_emission_due(last_emit_at_ms: Option<u64>, now_at_ms: u6
         None => true,
         Some(last) => now_at_ms.saturating_sub(last) >= interval_ms,
     }
+}
+
+/// (#2413 round 3 MF2) Decide whether THIS tick emits a `machine.telemetry`
+/// record, and if so, build it — extracted out of the sampler loop's
+/// `if telemetry_emission_due(...) { ... }` block so that CALL SITE is
+/// directly testable with a fake clock, not just its dependency
+/// (`telemetry_emission_due`) in isolation. A prior review round's
+/// mutation of the real loop's `if` (swapped for `if true`) stayed green
+/// against the existing suite — nothing exercised the wiring, only the
+/// pure gate function. This function's own test drives it across a
+/// sequence of `at_ms` ticks and counts emissions; swapping ITS internal
+/// `if telemetry_emission_due(...)` for `if true` must turn that count
+/// wrong.
+///
+/// Stamps the MEASURED gap since the last emission as `interval_ms`
+/// (`at_ms - last_emit_at_ms`), not the configured knob verbatim — a tick
+/// that runs late (a slow probe, a paused thread) reports what actually
+/// happened. The very first emission (`last_emit_at_ms: None`) has no
+/// prior gap to measure, so it stamps the knob itself.
+fn maybe_build_machine_telemetry_record(
+    last_emit_at_ms: Option<u64>,
+    at_ms: u64,
+    sampled_at_epoch_ms: u64,
+    interval_ms: u64,
+    sample: &crate::host_probe::HostSampleFull,
+) -> Option<(darkmux_flow::FlowRecord, u64)> {
+    if !telemetry_emission_due(last_emit_at_ms, at_ms, interval_ms) {
+        return None;
+    }
+    let effective_interval_ms = match last_emit_at_ms {
+        Some(last) => at_ms.saturating_sub(last),
+        None => interval_ms,
+    };
+    let rec = crate::host_probe::build_machine_scoped_telemetry_record(sample, sampled_at_epoch_ms, effective_interval_ms);
+    Some((rec, at_ms))
 }
 
 /// Granularity at which the sampler re-checks its stop flag while waiting
@@ -6071,7 +6108,7 @@ fn run_telemetry_sampler(
         // whoever won be the sole emitter, per the "at most one" rule).
         if let Some(guard) = sampler_lock.as_ref() {
             if guard.heartbeat(machine_sampler_interval_ms) {
-                // (#2413 M2, review round 2) The outer loop ticks every
+                // (#2413 M2 / round 3 MF2) The outer loop ticks every
                 // `TELEMETRY_SAMPLE_INTERVAL_MS` (2s) — right for the lms
                 // diffs and thermal governor above, which want fine-grained
                 // sampling, but wrong for the `machine.telemetry` curve,
@@ -6080,8 +6117,11 @@ fn run_telemetry_sampler(
                 // emits ~2.5x more records than its own `interval_ms` field
                 // claims. The heartbeat above still runs every tick (cheap,
                 // keeps the lock's staleness window nowhere near tripping);
-                // only the flow-record emission itself is gated.
-                if telemetry_emission_due(last_telemetry_emit_at_ms, at_ms, machine_sampler_interval_ms) {
+                // only the flow-record emission itself is gated — decided
+                // and built by `maybe_build_machine_telemetry_record`
+                // (extracted so this call site is directly testable with a
+                // fake clock; see that function's own test).
+                //
                 // (#2111 review finding, kept) `at_ms` above is RELATIVE to
                 // this sampler's own start (`started.elapsed()`) — correct
                 // for the reduction math and the thermal governor's gap
@@ -6092,26 +6132,28 @@ fn run_telemetry_sampler(
                 // of them on a chart. `epoch_ms_now()` is the one shared
                 // wall-clock read every `sampled_at_ms` producer uses.
                 let sampled_at_epoch_ms = crate::host_probe::epoch_ms_now();
-                let mut rec = crate::host_probe::build_machine_scoped_telemetry_record(
-                    &sample,
+                if let Some((mut rec, new_last_emit_at_ms)) = maybe_build_machine_telemetry_record(
+                    last_telemetry_emit_at_ms,
+                    at_ms,
                     sampled_at_epoch_ms,
                     machine_sampler_interval_ms,
-                );
-                // (CLAUDE.md "samplers stamp their own cost") This
-                // record's OWN write hasn't happened yet — it can't
-                // honestly report its own cost — so it carries the
-                // PREVIOUS emission's measured write duration instead.
-                // `None` on the first emission (no previous write to
-                // report).
-                if let (Some(ms), Some(obj)) =
-                    (prev_record_write_ms, rec.payload.as_mut().and_then(|p| p.as_object_mut()))
-                {
-                    obj.insert("prev_record_write_ms".into(), serde_json::json!(ms));
-                }
-                let write_start = Instant::now();
-                let _ = darkmux_flow::record(rec);
-                prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
-                last_telemetry_emit_at_ms = Some(at_ms);
+                    &sample,
+                ) {
+                    // (CLAUDE.md "samplers stamp their own cost") This
+                    // record's OWN write hasn't happened yet — it can't
+                    // honestly report its own cost — so it carries the
+                    // PREVIOUS emission's measured write duration instead.
+                    // `None` on the first emission (no previous write to
+                    // report).
+                    if let (Some(ms), Some(obj)) =
+                        (prev_record_write_ms, rec.payload.as_mut().and_then(|p| p.as_object_mut()))
+                    {
+                        obj.insert("prev_record_write_ms".into(), serde_json::json!(ms));
+                    }
+                    let write_start = Instant::now();
+                    let _ = darkmux_flow::record(rec);
+                    prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
+                    last_telemetry_emit_at_ms = Some(new_last_emit_at_ms);
                 }
             } else {
                 sampler_lock = None;
@@ -6125,15 +6167,14 @@ fn run_telemetry_sampler(
             // machine going emitter-less until this dispatch happens to
             // restart. `0` (disabled) never retries, matching the initial
             // acquire's own `> 0` gate above.
-            // (#2413 C2) `_quiet`: this is the SAME "opportunistic,
+            // (#2413 C2, and round 3 MF1) This is the SAME "opportunistic,
             // usually-declined" shape as the daemon's own per-tick retry
             // (see `darkmux-serve::host_sampler`'s identical comment) —
-            // recording contention on every routine decline here would
-            // spam `darkmux doctor`'s "two live pids" marker for the
-            // entire duration of any dispatch that starts while the
-            // daemon (or another dispatch) already legitimately holds
-            // the lock, which is the common, correct case.
-            sampler_lock = crate::host_sampler_lock::try_acquire_quiet("dispatch", machine_sampler_interval_ms);
+            // `try_acquire` never records a routine decline as contention
+            // (the channel is retired; see `host_sampler_lock`'s module
+            // doc), so this call is exactly as quiet as the initial
+            // acquire above.
+            sampler_lock = crate::host_sampler_lock::try_acquire("dispatch", machine_sampler_interval_ms);
             if sampler_lock.is_some() {
                 // Fresh acquisition: the next tick's heartbeat branch
                 // above will find `last_telemetry_emit_at_ms` still

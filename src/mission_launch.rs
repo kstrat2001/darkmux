@@ -1110,23 +1110,33 @@ pub fn launch(
         None
     };
 
-    // (#1877 "no blind runs" — telemetry + the whole-run dispatch bookend
-    // are PRESCRIBED here, not opt-in) Constructed unconditionally, for
-    // EVERY config that reaches this point — regardless of whether its
-    // graph declares a model-dispatching step kind or is Tier-1-only
-    // procedural/shell work (a `cmd` panel config gets telemetry too; the
-    // "was anything actually sampled" question is answered by the run's
-    // real wall-clock against the production cadence below). `review`
-    // reaches this line too, the same as any other config (#2310 P4d — the
-    // funnel deletion): before that, `config_uses_review_kinds` branched
-    // it out far above, before this function's own `--input`/`--param`
-    // collection even ran, because review built its own telemetry sampler
-    // and its own `with_dispatch_bookends` privately (the now-deleted
-    // dedicated review launcher / `darkmux_lab::lab::review::
-    // run_review_graph`, itself since removed), already satisfying the
-    // mandate on its own. With that private construction gone, `review`'s
-    // telemetry rides this same shared construction — no double-sampling
-    // risk to guard against, since there is only one construction left.
+    // (#1877 "no blind runs" — the whole-run dispatch bookend is
+    // PRESCRIBED here, not opt-in) Opened unconditionally below, for EVERY
+    // config that reaches this point — regardless of whether its graph
+    // declares a model-dispatching step kind or is Tier-1-only
+    // procedural/shell work. `review` reaches this line too, the same as
+    // any other config (#2310 P4d — the funnel deletion): before that,
+    // `config_uses_review_kinds` branched it out far above, before this
+    // function's own `--input`/`--param` collection even ran, because
+    // review opened its own bookend privately (the now-deleted dedicated
+    // review launcher / `darkmux_lab::lab::review::run_review_graph`,
+    // itself since removed). With that private construction gone,
+    // `review`'s bookend rides this same shared construction — no
+    // double-bookend risk to guard against, since there is only one
+    // construction left.
+    //
+    // (#2413 round 2 M3) This function used to ALSO construct a per-run
+    // `HostTelemetrySampler` right here, draining it into `telemetry.
+    // process` records at every emission point below. That construction
+    // is deleted: host cpu/ram/gpu samples now come from the ONE
+    // machine-scoped sampler (`darkmux_crew::host_sampler_lock`,
+    // `dispatch_internal.rs`'s always-on sampler thread, or `darkmux
+    // serve`'s daemon ring), and a consumer joins them to this run by
+    // `machine_uid` + a time window (`darkmux-serve`'s `join_host_samples_
+    // into_session_records`) rather than this function draining a sampler
+    // of its own. There is nothing left for this function to construct,
+    // drain, or forward for telemetry — only the bookend below is still
+    // this function's job.
     let mut dispatch_sink = |record: flow::FlowRecord| {
         let _ = flow::record(record);
     };
@@ -1141,19 +1151,16 @@ pub fn launch(
     // calls `bookend.close(...)` explicitly with the real outcome; this is
     // strictly the backstop for the unexpected case.
     //
-    // (#1877 QA should-fix, accepted gap — named here, not silently) `on_
-    // abort` builds exactly ONE record; it has no way to also drain and
-    // forward whatever `telemetry` has buffered since the last explicit
-    // drain (`BookendGuard`'s `on_abort` signature is `Fn(&str, &str) ->
-    // FlowRecord`, not `FnMut(&mut dyn BookendSink)`). `RunObs` (used by
-    // review's sequential path) narrows this to "at most one final-tick
-    // sample" because it drains before every record it emits; this bare-
-    // sampler construction only drains at the 3 known exit points, so an
-    // abort via this backstop loses everything buffered since the last of
-    // those — up to one telemetry interval's worth on a run that panics
-    // mid-dispatch. Best-effort telemetry on an already-exceptional path;
-    // the bookend's own liveness record (the actual contract-2 obligation)
-    // is unaffected either way.
+    // (#2413 round 2 M3, correcting round 3 MF3) The paragraph that used
+    // to sit here named a gap in a per-run telemetry drain this function
+    // no longer has: `on_abort` builds exactly one record and had no way
+    // to also flush a `HostTelemetrySampler`'s buffered samples on the
+    // panic/early-return backstop path. That sampler construction is
+    // deleted (#2413 M3) — host samples come from the machine-scoped
+    // sampler now, joined to this run by time after the fact, not drained
+    // by this function at all — so there is nothing left for `on_abort`
+    // to lose. The bookend's own liveness record (the actual contract-2
+    // obligation) is unaffected either way.
     let mut bookend = flow::BookendGuard::new(&mut dispatch_sink, move |_id, _kind| {
         mission_bookend_record(
             flow::Level::Error,
@@ -1514,16 +1521,19 @@ pub fn launch(
         // "running" by the other mission's heartbeat.
         &mut |mut record| {
             record.mission_id.get_or_insert_with(|| mission_id.clone());
-            // (#1877) Drain before emit — same interleaving discipline
-            // `run_review_graph`'s own emit closure uses, so telemetry
-            // streams alongside the run's other records rather than
-            // batching at the end (CLAUDE.md's "no blind runs" mandate).
-            // Calls `flow::record` directly here (not `bookend.emit_now`)
-            // because `bookend` isn't reachable from inside this closure
-            // (it's constructed on the outer scope, and this closure is
-            // handed to `run_step_graph` by itself) — same underlying sink
-            // either way (`dispatch_sink` IS `flow::record`), so this is a
-            // borrow-driven split, not two different destinations.
+            // (#1877, corrected #2413 round 3 MF3) Calls `flow::record`
+            // directly here (not `bookend.emit_now`) because `bookend`
+            // isn't reachable from inside this closure (it's constructed
+            // on the outer scope, and this closure is handed to `run_
+            // step_graph` by itself) — same underlying sink either way
+            // (`dispatch_sink` IS `flow::record`), so this is a
+            // borrow-driven split, not two different destinations. This
+            // used to ALSO drain a per-run `HostTelemetrySampler` right
+            // before this write, interleaving its buffered samples with
+            // the run's other records; that construction is deleted
+            // (#2413 M3) — host samples now come from the machine-scoped
+            // sampler and are joined to this run by time after the fact,
+            // so there is nothing left to drain here.
             let _ = flow::record(record);
         },
         &mut |step| {
@@ -3118,10 +3128,12 @@ fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
 /// dispatch to produce).
 ///
 /// Returns `(reached_gate, record)` — `launch` still owns EMITTING it
-/// (`bookend.close`, the telemetry drain immediately before, and the
-/// command-gate audit call after), this function owns only the DECISION: same
-/// split responsibility `mission_bookend_record` itself already has
-/// relative to its callers.
+/// (`bookend.close`, and the command-gate audit call after — the per-run
+/// telemetry drain that used to sit immediately before `bookend.close`
+/// here is gone, #2413 M3: host samples now come from the machine-scoped
+/// sampler joined to this run by time, not a drain this function performs),
+/// this function owns only the DECISION: same split responsibility
+/// `mission_bookend_record` itself already has relative to its callers.
 ///
 /// The complete-vs-error split is `reached_gate`
 /// (`!gate_outcome_reached_no_gate(outcome)`), NOT `outcome == Ok(0)` —

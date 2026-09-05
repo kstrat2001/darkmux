@@ -61,16 +61,26 @@
 //! fail-safe direction as `residency_lease`: the failure mode is a brief
 //! double-emission window, never a wrongful mutual exclusion.
 //!
-//! # Contention marker (for `darkmux doctor`)
+//! # Contention marker — RETIRED (#2413 round 3, MF1)
 //!
-//! Every time `try_acquire` is DECLINED because a fresh, alive lock is
-//! already held by a different pid, it best-effort overwrites a sibling
-//! file, `host-sampler.contention.json`, naming the pid that was declined
-//! and the pid that held the lock at that moment. `darkmux doctor`'s `host
-//! sampler` check reads this to Warn "two live pids" — see that check's
-//! own doc for the honesty limit: this can only ever record that a SECOND
-//! acquisition attempt happened recently, never that a second emitter is
-//! CURRENTLY also active (the loser, by construction, never emits).
+//! `try_acquire` used to best-effort record every declined attempt (a
+//! `host-sampler.contention.json` sibling file naming the two pids) for
+//! `darkmux doctor`'s "two live pids" Warn. That measured the WRONG thing:
+//! a decline against a fresh, alive lock held by the DESIGNED sole emitter
+//! (a daemon steadily holding it, or a dispatch that got there first) is
+//! the correct, healthy steady state, not contention — and every
+//! acquisition attempt, including a caller's very first one, is exactly
+//! that in ordinary operation whenever a daemon already runs. Recording it
+//! anyway meant every dispatch start under a running daemon wrote the
+//! marker and doctor warned for the next 3x interval, reading a healthy
+//! install as faulty. There is no cheap way to tell "an attempt declined
+//! by the designed holder" apart from "a genuine race between two
+//! processes that both think they should be the emitter" from the
+//! declined side alone — the file-based lock can only ever show ONE
+//! current holder either way, so the marker was never able to prove a
+//! SECOND emitter was active regardless. The channel is deleted rather
+//! than kept half-working; `darkmux doctor`'s `host sampler` check is
+//! Pass / Warn(stale) / Warn(dead pid) only now.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -109,16 +119,6 @@ pub struct LockState {
     /// `"daemon"` or `"dispatch"` — which kind of process holds it, for
     /// `darkmux doctor`'s message.
     pub owner: String,
-}
-
-/// The contention side-channel's shape — see the module doc's "Contention
-/// marker" section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContentionInfo {
-    pub declined_pid: u32,
-    pub declined_owner: String,
-    pub observed_holder_pid: u32,
-    pub ts_ms: u64,
 }
 
 /// RAII guard for a held lock. Dropping it releases the lock (best-effort,
@@ -182,22 +182,11 @@ fn lock_path() -> PathBuf {
     darkmux_types::config_access::host_sampler_lock_path()
 }
 
-fn contention_path() -> PathBuf {
-    lock_path().with_file_name("host-sampler.contention.json")
-}
-
 /// Best-effort read of the current lock state. `None` on a missing,
 /// unreadable, or malformed file — every caller treats absence as "no
 /// sampler active," never as an error.
 pub fn read_lock() -> Option<LockState> {
     let text = fs::read_to_string(lock_path()).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-/// Best-effort read of the contention marker. `None` when no acquisition
-/// attempt has ever been declined (or the marker is missing/malformed).
-pub fn read_contention() -> Option<ContentionInfo> {
-    let text = fs::read_to_string(contention_path()).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -259,25 +248,6 @@ pub fn write_lock_state_for_test(state: &LockState) {
     let _ = write_lock_state(state);
 }
 
-/// Best-effort overwrite of the contention marker. Failures are swallowed
-/// — this is a diagnostic side-channel for `darkmux doctor`, never
-/// load-bearing for correctness.
-fn record_contention(declined_pid: u32, declined_owner: &str, observed_holder_pid: u32) {
-    let info = ContentionInfo {
-        declined_pid,
-        declined_owner: declined_owner.to_string(),
-        observed_holder_pid,
-        ts_ms: epoch_ms(),
-    };
-    if let Ok(json) = serde_json::to_string_pretty(&info) {
-        let path = contention_path();
-        if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
-        let _ = fs::write(path, json);
-    }
-}
-
 /// Attempt to become the machine's sole host-sampler emitter. `owner` is
 /// `"daemon"` or `"dispatch"` (used only for `darkmux doctor`'s message).
 /// `interval_ms` is the caller's OWN resolved cadence, stamped into the
@@ -287,36 +257,19 @@ fn record_contention(declined_pid: u32, declined_owner: &str, observed_holder_pi
 /// Returns `Some(guard)` on success (lock was absent, stale, or the named
 /// pid is dead) — release it via `Drop` when this process stops sampling.
 /// Returns `None` when a different, alive, fresh-heartbeat pid already
-/// holds it (and best-effort records contention for `darkmux doctor`).
+/// holds it. (#2413 round 3 MF1) Every call — a caller's first attempt AND
+/// its later opportunistic retries — is equally silent on decline: the
+/// module doc's retired "Contention marker" section explains why a decline
+/// here is the correct, healthy steady state rather than something worth
+/// flagging.
 pub fn try_acquire(owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
-    try_acquire_named(owner, interval_ms, true)
-}
-
-/// (#2413 C2) Same as [`try_acquire`], but for an OPPORTUNISTIC per-tick
-/// retry that already expects to be declined most of the time — the
-/// daemon's own steady-state loop re-probes every tick purely to notice
-/// when a dispatch that held the lock has since exited, and a dispatch's
-/// own C1 retry does the same when it doesn't currently hold it. Neither
-/// case is a genuine race worth flagging: a fresh, alive lock declining
-/// this call is the CORRECT, expected steady state whenever something
-/// else legitimately holds the sampler role, not contention. Recording it
-/// anyway would make `darkmux doctor`'s "two live pids" check fire
-/// constantly during ordinary, healthy operation. Only a caller's
-/// FIRST/explicit acquisition attempt (plain [`try_acquire`]) still
-/// records contention — that one genuinely does indicate two things
-/// wanting the role at the same moment.
-pub fn try_acquire_quiet(owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
-    try_acquire_named(owner, interval_ms, false)
-}
-
-fn try_acquire_named(owner: &str, interval_ms: u64, record_on_decline: bool) -> Option<SamplerLockGuard> {
     // Claim the process-local slot FIRST (#2413 M1) — a second thread in
     // this same process must be declined before it ever touches the file,
     // matching the file-lock's own "decline, don't merge" semantics.
     if PROCESS_OWNS_LOCK.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return None;
     }
-    match try_acquire_with_pid(std::process::id(), owner, interval_ms, record_on_decline) {
+    match try_acquire_with_pid(std::process::id(), owner, interval_ms) {
         Some(mut guard) => {
             guard.owns_process_flag = true;
             Some(guard)
@@ -346,27 +299,15 @@ pub fn try_acquire_as_for_test(my_pid: u32, owner: &str, interval_ms: u64) -> Op
     // DIFFERENT process (a distinct simulated pid) sharing the real test
     // binary's pid, so the real process's in-process singleton must not
     // apply to it.
-    try_acquire_with_pid(my_pid, owner, interval_ms, true)
+    try_acquire_with_pid(my_pid, owner, interval_ms)
 }
 
-/// Test-only: the quiet (non-contention-recording) counterpart of
-/// [`try_acquire_as_for_test`] — exercises [`try_acquire_quiet`]'s file-
-/// level behavior with an explicit simulated pid, same rationale as its
-/// contention-recording sibling.
-#[cfg(any(test, feature = "test-support"))]
-pub fn try_acquire_quiet_as_for_test(my_pid: u32, owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
-    try_acquire_with_pid(my_pid, owner, interval_ms, false)
-}
-
-fn try_acquire_with_pid(my_pid: u32, owner: &str, interval_ms: u64, record_on_decline: bool) -> Option<SamplerLockGuard> {
+fn try_acquire_with_pid(my_pid: u32, owner: &str, interval_ms: u64) -> Option<SamplerLockGuard> {
     if let Some(existing) = read_lock() {
         if existing.pid != my_pid {
             let alive = pid_alive(existing.pid);
             let stale = is_stale(&existing, epoch_ms());
             if alive && !stale {
-                if record_on_decline {
-                    record_contention(my_pid, owner, existing.pid);
-                }
                 return None;
             }
         }
@@ -472,20 +413,47 @@ mod tests {
     }
 
     #[test]
-    fn a_second_acquire_against_a_fresh_lock_is_declined_and_records_contention() {
+    fn mf1_a_dispatch_first_attempt_against_a_daemon_held_fresh_lock_writes_no_contention_marker() {
+        // (#2413 round 3 MF1) A decline by the DESIGNED holder (a daemon
+        // steadily emitting) is the correct, healthy steady state — not
+        // contention. Before this fix, the dispatch's very FIRST acquire
+        // attempt (not just its opportunistic retry) used the recording
+        // `try_acquire`, so every dispatch start under a running daemon
+        // wrote a contention marker and `darkmux doctor` warned "two live
+        // pids" for the next 3x interval, reading a healthy install as
+        // faulty. `try_acquire` no longer records contention at all — the
+        // channel is retired, per this issue's own "or retire the
+        // channel" option — so the marker file must never appear.
+        with_isolated_home(|| {
+            let daemon_guard = try_acquire("daemon", 5000).expect("daemon acquires first");
+            let dispatch_pid = std::process::id().wrapping_add(1);
+            let declined = try_acquire_as_for_test(dispatch_pid, "dispatch", 5000);
+            assert!(declined.is_none(), "a fresh daemon-held lock is not stealable by a live dispatch");
+            let contention_marker = lock_path().with_file_name("host-sampler.contention.json");
+            assert!(
+                !contention_marker.exists(),
+                "the contention channel is retired — a routine decline must never write it"
+            );
+            drop(daemon_guard);
+        });
+    }
+
+    #[test]
+    fn a_second_acquire_against_a_fresh_lock_is_declined_and_writes_no_contention_marker() {
+        // (#2413 round 3 MF1) The contention channel is retired — see
+        // `mf1_a_dispatch_first_attempt_against_a_daemon_held_fresh_lock_
+        // writes_no_contention_marker` for the full rationale. This test
+        // now just pins that a decline stays a plain `None`, nothing more.
         with_isolated_home(|| {
             let guard = try_acquire("daemon", 5000).expect("first acquire succeeds");
-            assert!(read_contention().is_none(), "no contention yet");
             // Simulate a SECOND process (distinct pid) attempting to
             // acquire the same fresh lock — see `try_acquire_as_for_test`'s
             // doc for why a real second pid can't be produced in-process.
             let other_pid = std::process::id().wrapping_add(1);
             let second = try_acquire_as_for_test(other_pid, "dispatch", 5000);
             assert!(second.is_none(), "a fresh lock held by a different (alive) pid is not stealable");
-            let c = read_contention().expect("contention recorded");
-            assert_eq!(c.declined_pid, other_pid);
-            assert_eq!(c.declined_owner, "dispatch");
-            assert_eq!(c.observed_holder_pid, std::process::id());
+            let contention_marker = lock_path().with_file_name("host-sampler.contention.json");
+            assert!(!contention_marker.exists(), "the retired channel must never write this file");
             drop(guard);
         });
     }
@@ -585,25 +553,6 @@ mod tests {
             drop(guard);
             let after = read_lock().expect("a lock still exists");
             assert_eq!(after.pid, 424_242, "the other process's lock must survive our Drop");
-        });
-    }
-
-    #[test]
-    fn quiet_acquire_declined_by_a_live_holder_does_not_record_contention() {
-        // (#2413 C2) The daemon's opportunistic per-tick retry (and the
-        // dispatch-side C1 retry) probes every tick regardless of whether
-        // anything else holds the lock — that is the CORRECT, expected
-        // steady state whenever a dispatch legitimately holds it, not a
-        // genuine race. Recording contention on every one of those
-        // routine declines would make `darkmux doctor`'s "two live pids"
-        // check fire constantly during ordinary, healthy operation.
-        with_isolated_home(|| {
-            let holder = try_acquire("daemon", 5000).expect("first holder acquires");
-            let other_pid = std::process::id().wrapping_add(1);
-            let declined = try_acquire_quiet_as_for_test(other_pid, "dispatch", 5000);
-            assert!(declined.is_none(), "a fresh lock held by a different alive pid is still not stealable");
-            assert!(read_contention().is_none(), "the quiet path must not record contention on decline");
-            drop(holder);
         });
     }
 

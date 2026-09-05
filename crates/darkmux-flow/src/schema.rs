@@ -863,12 +863,15 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.42.0";
 //           `mission_id`, and `phase_id` are ALWAYS absent on a
 //           `machine.telemetry` record written at this version — a reader
 //           joins it to a run by `machine_uid` + a time window instead of
-//           by session. The payload gains `interval_ms`: the EFFECTIVE
-//           emission cadence for that record (the configured
-//           `runtime.host_sampler_interval_ms` while a dispatch is live
-//           anywhere on the machine, 10x that while idle — the daemon
-//           sampler only; a dispatch-owned sampler is definitionally live
-//           and always uses the base cadence). Every other payload key
+//           by session. The payload gains `interval_ms`: the MEASURED gap
+//           since the PREVIOUS emission (round 3 MF2 — not the configured
+//           knob stamped verbatim, which drifted from reality whenever a
+//           tick ran late), except the very first emission on a fresh
+//           sampler, which has no prior gap to measure and stamps the
+//           configured `runtime.host_sampler_interval_ms` (10x that while
+//           idle — the daemon sampler only; a dispatch-owned sampler is
+//           definitionally live and always targets the base cadence).
+//           Every other payload key
 //           (`sampled_at_ms`, `sampler_cost_ms`, `cpu_pct`, `mem_pct`,
 //           `gpu_pct`, `thermal`, `power_mw`, etc.) is UNCHANGED —
 //           `host_probe::sample_full_json`'s shape. A reader keyed to the

@@ -2114,22 +2114,22 @@ fn check_host_sampler_interval() -> Check {
 /// keeps exactly one machine.telemetry emitter alive per machine (the
 /// daemon, or a dispatch process when no daemon runs).
 ///
-/// Three outcomes, checked in this order:
+/// Two outcomes, checked in this order:
 /// 1. No lock file at all → Pass: nothing has sampled yet on this machine
 ///    (fresh install, or no daemon/dispatch has started one).
-/// 2. A RECENT contention marker (see `host_sampler_lock::read_contention`)
-///    → Warn "two live pids": a second process attempted to acquire the
-///    lock while another held a fresh one. **Honesty limit, stated
-///    plainly:** this file-based lock can only ever record ONE current
-///    holder — a genuine second emitter is observable ONLY at the instant
-///    a loser's acquisition attempt writes the contention marker. A race
-///    that resolved with the loser correctly backing off leaves exactly
-///    this trace; a race that somehow left two active emitters (a bug in
-///    the acquire path) would NOT be distinguishable from a clean loss by
-///    this check alone — it can name "a second pid tried," never "a second
-///    pid is currently also emitting."
-/// 3. Otherwise: stale (heartbeat older than 3x its own declared interval,
+/// 2. Otherwise: stale (heartbeat older than 3x its own declared interval,
 ///    or its pid is dead) → Warn; else → Pass, naming the live holder.
+///
+/// (#2413 round 3 MF1) A THIRD outcome — Warn "two live pids", fed by a
+/// contention marker every declined `try_acquire` used to write — is
+/// RETIRED. It measured the wrong thing: a decline against a fresh lock
+/// held by the DESIGNED sole emitter is the correct, healthy steady state,
+/// not contention, and every acquisition attempt (including a caller's
+/// very first one) is exactly that whenever a daemon already runs — so
+/// the Warn fired on every dispatch start under a running daemon, reading
+/// a healthy install as faulty. The file-based lock could only ever show
+/// ONE current holder either way, so the marker never actually proved a
+/// second emitter was active; deleting the channel loses no real signal.
 fn check_host_sampler() -> Check {
     let name = "host sampler";
     let now_ms = darkmux_crew::host_sampler_lock::epoch_ms_now();
@@ -2141,27 +2141,6 @@ fn check_host_sampler() -> Check {
             hint: None,
         };
     };
-    if let Some(c) = darkmux_crew::host_sampler_lock::read_contention() {
-        let recent_window_ms = state.interval_ms.max(1).saturating_mul(3);
-        if now_ms.saturating_sub(c.ts_ms) <= recent_window_ms {
-            return Check {
-                name: name.into(),
-                status: Status::Warn,
-                message: format!(
-                    "two live pids recently claimed the host-sampler lock: pid {} ({}) holds it; \
-                     pid {} ({}) was declined at a recent acquisition attempt. This can only be seen \
-                     AT the moment a second process attempts to acquire while another holds a fresh \
-                     lock — it names that a second pid tried, not whether it is still emitting.",
-                    state.pid, state.owner, c.declined_pid, c.declined_owner
-                ),
-                hint: Some(
-                    "If this recurs, check whether both a `darkmux serve` daemon and a dispatch \
-                     process are starting a sampler on this machine at the same time."
-                        .into(),
-                ),
-            };
-        }
-    }
     let dead = !darkmux_crew::host_sampler_lock::pid_alive(state.pid);
     let stale = dead || darkmux_crew::host_sampler_lock::is_stale(&state, now_ms);
     if stale {
@@ -7107,21 +7086,27 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn check_host_sampler_recent_contention_is_warn_two_live_pids() {
+    fn check_host_sampler_a_declined_dispatch_first_attempt_against_a_daemon_held_lock_is_pass() {
+        // (#2413 round 3 MF1) A daemon-owned fresh lock, then a dispatch's
+        // FIRST acquisition attempt against it — the exact scenario that
+        // used to warn "two live pids" for the healthy steady state (every
+        // dispatch start under a running daemon). The contention channel
+        // is retired; this must read Pass, naming the daemon as the live
+        // holder, not Warn.
         with_isolated_liveness_dir(|| {
             let guard = darkmux_crew::host_sampler_lock::try_acquire("daemon", 5000)
                 .expect("nothing else holds the lock");
-            // A second acquisition attempt against the same fresh lock
-            // records contention and declines. A distinct (simulated) pid
-            // is required — one test binary is one real OS process, so two
-            // `try_acquire` calls here would otherwise share a pid and
-            // never exercise the "a DIFFERENT process holds it" branch.
+            // A distinct (simulated) pid is required — one test binary is
+            // one real OS process, so two `try_acquire` calls here would
+            // otherwise share a pid and never exercise the "a DIFFERENT
+            // process holds it" branch.
             let other_pid = std::process::id().wrapping_add(1);
-            let second = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 5000);
-            assert!(second.is_none(), "a fresh lock is not stealable");
+            let declined = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 5000);
+            assert!(declined.is_none(), "a fresh daemon-held lock is not stealable by a live dispatch");
             let check = check_host_sampler();
-            assert_eq!(check.status, Status::Warn, "{}", check.message);
-            assert!(check.message.contains("two live pids"), "{}", check.message);
+            assert_eq!(check.status, Status::Pass, "{}", check.message);
+            assert!(check.message.contains("daemon"), "names the live holder: {}", check.message);
+            assert!(!check.message.to_lowercase().contains("two live pids"), "{}", check.message);
             drop(guard);
         });
     }

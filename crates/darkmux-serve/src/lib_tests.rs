@@ -5784,3 +5784,52 @@ fn join_host_samples_is_a_noop_when_the_session_carries_no_machine_uid() {
     join_host_samples_into_session_records(tmp.path(), &[], &mut records);
     assert_eq!(records, before, "no machine_uid on any session record — nothing to join against");
 }
+
+#[test]
+fn join_host_samples_clamps_an_open_run_window_to_last_record_plus_staleness_allowance() {
+    // (#2413 round 3 CONSIDER 1) An open/abandoned run (no terminal yet)
+    // must NOT join every later machine-scoped sample forever — before
+    // this, `end_ms` fell back to `u64::MAX` on a missing terminal,
+    // which would collect every sample ever written after this run's
+    // start, on this machine, for the rest of time.
+    let tmp = TempDir::new().unwrap();
+    let day = "2026-01-01";
+    // Comfortably inside the staleness allowance after the run's last
+    // seen record (00:00:30).
+    let soon_after = serde_json::json!({
+        "ts": "2026-01-01T00:00:40Z",
+        "action": "machine.telemetry",
+        "machine_uid": "m-1",
+        "payload": {"cpu": 11},
+    });
+    // Far beyond ANY reasonable staleness allowance.
+    let long_after = serde_json::json!({
+        "ts": "2026-01-02T12:00:00Z",
+        "action": "machine.telemetry",
+        "machine_uid": "m-1",
+        "payload": {"cpu": 22},
+    });
+    let contents = format!("{soon_after}\n{long_after}\n");
+    fs::write(tmp.path().join(format!("{day}.jsonl")), contents).unwrap();
+
+    let mut records = vec![
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:00Z",
+            "action": "dispatch.start",
+            "session_id": "s-open",
+            "machine_uid": "m-1",
+        }),
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:30Z",
+            "action": "dispatch.turn.heartbeat",
+            "session_id": "s-open",
+            "machine_uid": "m-1",
+        }),
+    ];
+    join_host_samples_into_session_records(tmp.path(), &[], &mut records);
+
+    let telemetry: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
+    assert_eq!(telemetry.len(), 1, "only the sample within the staleness allowance joins: {records:#?}");
+    assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(11));
+}

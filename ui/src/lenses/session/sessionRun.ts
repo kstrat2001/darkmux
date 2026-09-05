@@ -402,8 +402,19 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // `telemetry.process` records with this session's own `session_id`
   // still match via the `tel`/`source==="process"` half below —
   // lenient-on-read, both curves render.
+  // (#2413 round 3 CONSIDER 3) `d`'s own `machine_uid` (the dispatch.start
+  // record — falls back to the session's first record for the same reason
+  // `startTs` does above) gates the join client-side too: without it, a
+  // multi-machine playback fixture (records from more than one machine's
+  // day file, e.g. a fleet view) would render every machine's samples
+  // on every run's SYSTEM pane, not just the run's own machine's.
+  const runMachineUid = d?.machine_uid ?? firstSessRec?.machine_uid ?? null;
   const hostSamples = visible.filter(
-    (r) => r.action === "machine.telemetry" && T(r.ts) >= startTs && (closeTs == null || T(r.ts) <= closeTs),
+    (r) =>
+      r.action === "machine.telemetry" &&
+      (runMachineUid == null || r.machine_uid === runMachineUid) &&
+      T(r.ts) >= startTs &&
+      (closeTs == null || T(r.ts) <= closeTs),
   );
   const procs = [...tel.filter((r) => r.source === "process"), ...hostSamples];
   const rt = tel.filter((r) => r.source === "runtime").slice(-1)[0] ?? null;
