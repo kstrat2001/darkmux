@@ -700,10 +700,13 @@ body {
   }
 }
 
-/* (Mobile fix pass) Below ~560px the masthead's non-negotiable content
-   (brand + the catalog/live status group) plus the topnav no longer fit in
-   4 rows worth of wrapping — measured at 402px CSS width: brand alone /
-   ver+TODAY+LIVE / refresh alone / nav, 119px tall. Two controls drop here:
+/* (Mobile fix pass; rewritten for #2412 — the "TODAY badge"/"live badge"
+   this comment used to describe as two separate elements are one pill now,
+   see `Masthead.tsx`'s own doc) Below ~560px the masthead's non-negotiable
+   content (brand + the pill) plus the topnav no longer fit in comfortable
+   wrapping — measured at 402px CSS width: brand alone / ver+pill / refresh
+   alone / nav, 119px tall, back when the pill and the badge were still two
+   elements sharing that middle row. Two controls drop here:
 
    - `.masthead__refresh` (operator-approved): the view already polls every
      5s, the SSE tail pushes live changes, and iOS Safari provides
@@ -714,25 +717,18 @@ body {
      named here rather than done quietly): the build-identifier chip
      (`v<semver> (<sha>) · schema <n>  ⓘ`) measures 200-225px wide on a
      real daemon — wider than the brand text itself, and ALONE it already
-     exceeds the ~354px content budget left after the brand + TODAY badge +
-     live badge share a row. It is the single blocker standing between 3
-     rows and the 2-row target: with it gone, brand + TODAY + live-badge
-     fit on one line and nav owns the other. It is informational only
-     (never interactive, no touch-target concern) and untested by every
-     parity golden today (`Masthead.tsx`'s own doc: no harness in this repo
-     injects `darkmux-version`, so `#verbadge` renders empty in every
-     recorded golden) — hiding it here changes zero committed text. A build
-     check on the phone is a real, if occasional, want; a tap-to-reveal (or
-     folding it into an about surface) is the natural follow-up if the
-     operator wants it back, not reproduced here.
+     exceeds the content budget left after the brand + pill share a row. It
+     is informational only (never interactive, no touch-target concern) and
+     untested by every parity golden today (`Masthead.tsx`'s own doc: no
+     harness in this repo injects `darkmux-version`, so `#verbadge` renders
+     empty in every recorded golden) — hiding it here changes zero
+     committed text. A build check on the phone is a real, if occasional,
+     want; a tap-to-reveal (or folding it into an about surface) is the
+     natural follow-up if the operator wants it back, not reproduced here.
 
    Update: the topnav itself is now hidden at the 768px breakpoint above
-   (not just wrapped onto its own row), so the "nav owns the other [row]"
-   line is historical — the row-count math that justified dropping
-   `.masthead__refresh`/`.masthead__ver` below 560px was measured with the
-   topnav still present and wrapping, and still holds on its own terms
-   (ver+today+live alone already exceeds the 354px budget), but there is no
-   longer a nav row competing for space at this width either. */
+   (not just wrapped onto its own row), so there is no nav row competing
+   for space at this width either — brand + pill are the whole budget now. */
 @media (max-width: 560px) {
   .masthead__refresh {
     display: none;
@@ -742,6 +738,32 @@ body {
   }
   .masthead {
     gap: 8px 6px;
+  }
+  /* (#2412 round 2, reviewer finding) A long mission id (44 chars measured:
+     `acp-ephemeral-pr-ship-1786152707367180000-5`) rendered the pill 435px
+     wide with nothing to stop it — wider than the viewport itself, which
+     wrapped the masthead onto a SECOND row and shifted the tab strip and
+     `#stage` down by the extra row's height. One row, truncated, is the
+     fix: the text ellipsizes, the replay glyph (a sibling, not a child of
+     this span — see `Masthead.tsx`'s own doc) stays fully visible, and
+     `title` on that same span carries the untruncated value. The 190px
+     subtracted is measured at 390px CSS width, not guessed: brand ~106px +
+     the masthead's own horizontal padding (2 × 12px) + the inter-item gap
+     (6px) + the pill's own non-text chrome (padding/border/dot-or-glyph/
+     caret, ~46px) = 182px, rounded up for a small safety margin against
+     font-rendering variance across engines. See the Playwright geometry
+     proof in `tests/e2e/catalog.spec.js` (asserts the masthead's height
+     with a long id equals its height on a plain live route — one row, not
+     two — plus the pill's own right edge never crossing the viewport).
+     Desktop has no matching rule: this is `.masthead__pilltext`'s ONLY
+     `max-width`, scoped to this breakpoint. */
+  .masthead__pilltext {
+    display: inline-block;
+    max-width: calc(100vw - 190px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
   }
 }
 

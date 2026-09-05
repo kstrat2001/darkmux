@@ -93,6 +93,11 @@ describe("CatalogPanel", () => {
   });
 
   it("live row navigates via location.hash, not a full page navigation, and closes the panel", async () => {
+    // (#2412 round 2, reviewer finding) jsdom's `location.hash` already
+    // defaults to `""` — asserting `toBe("")` after the click proved
+    // nothing, since a `goLive` that never ran would look identical. Start
+    // on a REAL, non-empty hash so only an actual navigation clears it.
+    window.location.hash = "#2026-08-07";
     stubFetch({});
     renderPanel();
     screen.getByRole("button", { name: /browse history/i }).click();

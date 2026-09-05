@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Masthead } from "./Masthead";
+import { Masthead, RECONNECTING_ANNOUNCE_DELAY_MS } from "./Masthead";
 import type { Route } from "../lib/route";
 import { closeOpenModal, getOpenId } from "../lib/dialogManager";
 
@@ -276,6 +276,11 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
   });
 
   it("(b) live + reconnecting: the dot carries the reconnecting class, no pulse class, and announces via aria-live", () => {
+    // (#2412 round 2) The DOT is instant; the aria-live TEXT debounces
+    // `RECONNECTING_ANNOUNCE_DELAY_MS` before it says so — the visual and
+    // the announcement are deliberately on different clocks (see
+    // `useAnnouncedLiveStatus`'s own doc).
+    vi.useFakeTimers();
     const { container } = renderMasthead({ kind: "fleet" } as Route, "reconnecting");
     const toggle = container.querySelector(".catalog-toggle")!;
     expect(toggle.textContent).toContain("LIVE");
@@ -283,8 +288,36 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
     expect(dot.className).toContain("stale");
     expect(dot.className).not.toContain(" live");
     expect(dot.getAttribute("title")).toBe("reconnecting");
+    act(() => {
+      vi.advanceTimersByTime(RECONNECTING_ANNOUNCE_DELAY_MS);
+    });
     const live = toggle.querySelector('[aria-live="polite"]')!;
     expect(live.textContent).toBe("reconnecting");
+    vi.useRealTimers();
+  });
+
+  it("(b2) live + reconnecting: aria-live stays \"live\" until the delay has held, and never announces reconnecting for a hiccup that self-heals first", () => {
+    vi.useFakeTimers();
+    const { container, rerender } = renderMasthead({ kind: "fleet" } as Route, "reconnecting");
+    const readAnnounced = () => container.querySelector(".catalog-toggle")!.querySelector('[aria-live="polite"]')!.textContent;
+
+    // Before the hold elapses: still "live", never a flash of "reconnecting".
+    act(() => {
+      vi.advanceTimersByTime(RECONNECTING_ANNOUNCE_DELAY_MS - 1);
+    });
+    expect(readAnnounced()).toBe("live");
+
+    // A self-healed hiccup: back to "live" before the hold ever elapses.
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <Masthead route={{ kind: "fleet" } as Route} liveStatus="live" replayDate={null} />
+      </QueryClientProvider>,
+    );
+    act(() => {
+      vi.advanceTimersByTime(RECONNECTING_ANNOUNCE_DELAY_MS + 1000);
+    });
+    expect(readAnnounced()).toBe("live");
+    vi.useRealTimers();
   });
 
   it("(c) mission replay: the pill shows the mission id and the replay glyph, no dot", () => {
@@ -298,6 +331,21 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
     expect(toggle.querySelector(".masthead__pilldot.live")).toBeNull();
     expect(toggle.querySelector(".masthead__pilldot.stale")).toBeNull();
     expect(toggle.querySelector(".masthead__pilldot--replay")?.textContent).toBe("▣");
+  });
+
+  it("(c2) mission replay: the truncating span's title carries the FULL, untruncated mission id — #2412 round 2, reviewer finding on a 44-char id", () => {
+    const longId = "acp-ephemeral-pr-ship-1786152707367180000-5";
+    const { container } = renderMasthead(
+      { kind: "mission", missionId: longId, stepId: null } as Route,
+      "live",
+      "2026-08-07",
+    );
+    const text = container.querySelector(".catalog-toggle .masthead__pilltext")!;
+    expect(text.getAttribute("title")).toBe(longId);
+    expect(text.textContent).toBe(longId);
+    // The glyph is a SIBLING, never inside the truncating span, so it can
+    // never itself be clipped by the phone-width `max-width`/ellipsis.
+    expect(container.querySelector(".masthead__pilldot--replay")!.contains(text)).toBe(false);
   });
 
   it("(d) date replay: the pill shows the date and the replay glyph", () => {

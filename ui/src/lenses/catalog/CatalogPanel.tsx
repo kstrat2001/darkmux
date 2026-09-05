@@ -150,8 +150,8 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
         title="browse history"
         // (Chrome packet) `aria-label` is a CONSTANT "browse history"
         // regardless of `label` below — legacy's own `#srcbadge` does
-        // exactly this split (visible text "today"/a date, `title`="browse
-        // history" — viewer.html:3909) when `<Masthead>` renders this
+        // exactly this split (visible text "LIVE"/a mission id/a date,
+        // `title`="browse history" — viewer.html:3909) when `<Masthead>` renders this
         // component in the source/date-badge slot: it passes the pill's own
         // content (`label={pillLabel(...)}`) so the VISIBLE text matches the masthead byte-for-byte
         // (`tests/parity/goldens/fleet.txt`'s `=== topbar ===` section), while
@@ -162,7 +162,7 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
         // `aria-label` wins the accessible-name computation over text content,
         // so this is a real (not just cosmetic) decoupling: a screen reader
         // always announces "browse history", a sighted user reading the
-        // masthead sees "TODAY".
+        // masthead sees "LIVE" (or a mission id, or a date).
         aria-label="browse history"
       >
         {label ?? "browse history"}

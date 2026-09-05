@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
 import { openModalEl } from "../lib/dialogManager";
@@ -116,19 +116,27 @@ export function Masthead({
   route: Route;
   liveStatus: LiveTailStatus;
   /** The day a daemon dispatch/mission page belongs to, once the shell has
-   * derived it from the records; `null` until then (the chip reads "TODAY"
+   * derived it from the records; `null` until then (the pill reads "LIVE"
    * meanwhile) and on every other route. */
   replayDate?: string | null;
 }) {
   const queryClient = useQueryClient();
   const [spinning, setSpinning] = useState(false);
-  // (header owns liveness, operator 2026-09-03) The badge is the ONE liveness
-  // indicator on every page: shown on every daemon-backed route that is not
-  // a replay. A dispatch/mission page whose day is known is a recording — the
-  // date chip (and, for a dispatch, the transport) carries the mode, and a
-  // "● live" beside it would be false. While the day is still unknown (the
-  // subject is running, chip reads TODAY) the page is live and says so.
+  // (header owns liveness, operator 2026-09-03; folded into the pill in #2412)
+  // The pill's own dot is the ONE liveness indicator on every page: it beats
+  // on every daemon-backed route that is not a replay. A dispatch/mission page
+  // whose day is known is a recording — the pill (and, for a dispatch, the
+  // transport) carries the mode via the replay glyph instead, and a live dot
+  // beside it would be false. While the day is still unknown (the subject is
+  // running, the pill reads LIVE) the page is live and says so.
   const live = isLiveRoute(route) && replayDate == null;
+  // (#2412 round 2, reviewer finding) A DROPPED stream announces
+  // "reconnecting" to screen readers only after it has HELD for
+  // `RECONNECTING_ANNOUNCE_DELAY_MS` — an SSE hiccup that self-heals inside
+  // that window never reaches assistive tech at all. "live" is never
+  // debounced: a screen reader should hear the good news the instant it
+  // happens, and only wait out the bad news in case it is not real.
+  const announcedLiveStatus = useAnnouncedLiveStatus(liveStatus);
 
   const verMeta = injectedMeta("darkmux-version");
   const schemaMeta = injectedMeta("darkmux-flow-schema");
@@ -213,14 +221,13 @@ export function Masthead({
           ⟳
         </button>
       ) : null}
-      {/* (operator, 2026-09-01) The day chip renders AFTER the status badge
-          and the refetch control, so the dropdown is the corner element in
-          EVERY state — `live` shows `● LIVE` then the chip, `reconnecting`
-          shows the badge, `⟳`, then the chip. Previously the chip came first
-          and whatever followed it took the corner, which moved with
-          connection state. It also reads in the right order now: "live,
-          today". Moving the refetch button up with the badge is not
-          incidental — it belongs beside the status it acts on. */}
+      {/* (operator, 2026-09-01; the badge itself retired in #2412) The
+          pill renders AFTER the refetch control, so the dropdown is the
+          corner element in EVERY state — `live` shows the pill's own `●
+          LIVE`, `reconnecting` shows `⟳` then the same pill with its dot
+          turned. Moving the refetch button up beside what it acts on (not
+          incidental) predates the merge and still holds now that the pill
+          is the only thing left in that corner. */}
 {getSource().kind === "static" ? (
         // (#1801) No `<CatalogPanel>` here — see this component's own doc
         // for why a static build gets inert text instead of a button that
@@ -229,7 +236,7 @@ export function Masthead({
           {srcbadgeText(route, replayDate)}
         </span>
       ) : (
-        <CatalogPanel label={pillLabel(route, replayDate, liveStatus)} />
+        <CatalogPanel label={pillLabel(route, replayDate, liveStatus, announcedLiveStatus)} />
       )}
       <nav className="masthead__nav">
         <a href="https://darkmux.com/" target="_blank" rel="noopener">
@@ -343,7 +350,36 @@ const REPLAY_GLYPH = "▣";
  *   date for everything else. No `aria-live` here — this is a static label,
  *   not a state that transitions while the page is open.
  */
-function pillLabel(route: Route, replayDate: string | null, liveStatus: LiveTailStatus): ReactNode {
+/** (#2412 round 2, reviewer finding) How long a DROPPED stream must hold
+ * before the sr-only text below announces "reconnecting" — an SSE hiccup
+ * that self-heals inside this window never reaches assistive tech. `live`
+ * is never delayed; only the bad news waits to be sure it is real. */
+export const RECONNECTING_ANNOUNCE_DELAY_MS = 1500;
+
+/** The `aria-live="polite"` text `pillLabel` announces, debounced against
+ * `RECONNECTING_ANNOUNCE_DELAY_MS` — see that constant's own doc. Starts
+ * optimistic ("live") on mount so a route that boots already-reconnecting
+ * gets the SAME hold a live-to-reconnecting transition gets, rather than a
+ * special-cased instant announcement nothing else in this function has. */
+function useAnnouncedLiveStatus(liveStatus: LiveTailStatus): "live" | "reconnecting" {
+  const [announced, setAnnounced] = useState<"live" | "reconnecting">("live");
+  useEffect(() => {
+    if (liveStatus === "live") {
+      setAnnounced("live");
+      return;
+    }
+    const timer = setTimeout(() => setAnnounced("reconnecting"), RECONNECTING_ANNOUNCE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [liveStatus]);
+  return announced;
+}
+
+function pillLabel(
+  route: Route,
+  replayDate: string | null,
+  liveStatus: LiveTailStatus,
+  announcedLiveStatus: "live" | "reconnecting",
+): ReactNode {
   if (isLiveRoute(route) && replayDate == null) {
     const connected = liveStatus === "live";
     return (
@@ -355,11 +391,11 @@ function pillLabel(route: Route, replayDate: string | null, liveStatus: LiveTail
             title={connected ? undefined : "reconnecting"}
           >
             {connected ? "●" : "◌"}
-          </span>
-          {` ${LIVE_CHIP}`}
+          </span>{" "}
+          <span className="masthead__pilltext">{LIVE_CHIP}</span>
         </span>
         <span className="mm-sr-only" aria-live="polite">
-          {connected ? "live" : "reconnecting"}
+          {announcedLiveStatus}
         </span>
       </>
     );
@@ -374,8 +410,17 @@ function pillLabel(route: Route, replayDate: string | null, liveStatus: LiveTail
     <>
       <span className="masthead__pilldot masthead__pilldot--replay" aria-hidden="true">
         {REPLAY_GLYPH}
+      </span>{" "}
+      {/* (#2412 round 2, reviewer finding) A 44-char mission id rendered
+          435px wide with nothing to stop it, wrapping the masthead onto a
+          second row on a 390px phone. `title` carries the untruncated id
+          for anyone who needs the whole thing; the glyph above stays OUTSIDE
+          this span so it is never itself clipped. Desktop has no matching
+          rule — `.masthead__pilltext` only gets a `max-width` under the
+          existing phone breakpoint in `styles.css`. */}
+      <span className="masthead__pilltext" title={name}>
+        {name}
       </span>
-      {` ${name}`}
     </>
   );
 }

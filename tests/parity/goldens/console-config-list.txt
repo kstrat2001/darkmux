@@ -2,7 +2,7 @@
 darkmux
 ⟳
 ◌ LIVE
-RECONNECTING
+LIVE
 home
 guide
 articles
