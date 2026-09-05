@@ -1049,8 +1049,9 @@ pub struct FlowRecord {
 }
 
 /// Resolve the flows directory. Precedence (#661 Slice 3):
-/// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > ~/.darkmux/flows`, with a
-/// `/tmp/darkmux/flows` HOME-less (CI / sandbox) fallback. Delegates to the
+/// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <darkmux root>/flows`, where the
+/// root is what `paths::resolve(Auto)` selects (`DARKMUX_HOME`, else a project-local
+/// `./.darkmux` when one exists, else `~/.darkmux`; #2359). Delegates to the
 /// single resolver in `darkmux_types::config_access` so the precedence — now
 /// including the config tier — lives in exactly one place.
 pub fn flows_dir() -> PathBuf {

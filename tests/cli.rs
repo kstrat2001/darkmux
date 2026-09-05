@@ -3615,6 +3615,129 @@ fn mission_launch_outcome_from_unknown_task_refused_before_minting() {
     );
 }
 
+/// (#2359) `mission launch` must never leak flow records into the *process*
+/// `HOME`'s `.darkmux/flows` — the actual incident (2026-09-05): four
+/// synthetic reviewer-probe missions landed in the operator's real
+/// `~/.darkmux/flows` because a `DARKMUX_HOME=<tmp>` launch with no
+/// `DARKMUX_FLOWS_DIR` override still resolved the flows default via
+/// `dirs::home_dir()` directly (`config_access::flows_dir_default`, fixed
+/// alongside this test to derive from `paths::resolve(Auto)` instead —
+/// see `crates/darkmux-types/src/config_access.rs`'s
+/// NOTE (#2363 review): `flows_dir_honors_darkmux_home` pins the cfg(test) twin body,
+/// not the production `flows_dir_default`; the production fix has NO automated pin here.
+/// Its evidence is the manual run of a non-test-support binary recorded in PR #2363;
+/// the available real pin is an `#[ignore]`d test (or a CI step) that builds and runs
+/// the release-cfg binary with DARKMUX_HOME set and a fake HOME.
+/// that fix). `HOME` is pointed at a SEPARATE tempdir here (never the
+/// operator's real home) so this test can prove the negative without ever
+/// touching a real machine's state.
+///
+/// This test runs the SAME hermetic launch twice, split into what each half
+/// can actually observe through a `cargo test`-compiled binary:
+///
+///   - **Half 1 (`DARKMUX_FLOWS_DIR` unset)** proves the negative this
+///     incident is about: nothing lands under the fake HOME's
+///     `.darkmux/flows`. It can't additionally assert records DO land
+///     under `<DARKMUX_HOME>/flows`, because `LocalFileSink::
+///     local_sink_dir()` has its OWN older, even more defensive test-cfg
+///     guard (#1355): when `DARKMUX_FLOWS_DIR` is unset, a `cfg(any(test,
+///     test-support))` build (which `cargo test`'s `CARGO_BIN_EXE_darkmux`
+///     always is, via feature unification with this crate's dev-deps)
+///     redirects LocalFileSink to a per-PID ephemeral temp dir and never
+///     calls `flows_dir()` at all — so the production default-resolution
+///     fix is provably unreachable from an integration test in this shape,
+///     by DESIGN, not by gap. That's *stronger* isolation than this issue
+///     needs, so it's a feature, not something to route around.
+///   - **Half 2 (`DARKMUX_FLOWS_DIR` explicitly set under `DARKMUX_HOME`)**
+///     forces `LocalFileSink` through the real `flows_dir()` resolution and
+///     proves records land exactly where told, end to end — the closest a
+///     subprocess test can get to exercising the real write path.
+///
+/// `procedural.noop` needs no model/network/Docker — both runs are
+/// hermetic and near-instant.
+#[test]
+fn mission_launch_flows_never_leak_into_process_home() {
+    fn write_flows_root_test_config(darkmux_home: &std::path::Path) {
+        let config_dir = darkmux_home.join("mission-configs");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_json = r#"{
+            "id": "flows-root-test",
+            "name": "Flows Root Test",
+            "schema_version": "3.4",
+            "phases": [{
+                "id": "p1",
+                "tasks": [{
+                    "id": "t1",
+                    "steps": [{ "id": "s1", "kind": "procedural.noop" }]
+                }]
+            }]
+        }"#;
+        fs::write(config_dir.join("flows-root-test.json"), config_json).unwrap();
+    }
+
+    // ── Half 1: DARKMUX_FLOWS_DIR unset — the actual incident shape ──
+    {
+        let darkmux_home = TempDir::new().unwrap();
+        let fake_home = TempDir::new().unwrap();
+
+        // The shape of the leak this test guards against: if `flows_dir`'s
+        // default ever reaches for `dirs::home_dir()` again (and the
+        // #1355 LocalFileSink test-cfg guard is ever weakened too),
+        // records land here.
+        let leak_target = fake_home.path().join(".darkmux").join("flows");
+        fs::create_dir_all(&leak_target).unwrap();
+
+        write_flows_root_test_config(darkmux_home.path());
+
+        Command::cargo_bin("darkmux")
+            .unwrap()
+            .env("DARKMUX_HOME", darkmux_home.path())
+            .env("HOME", fake_home.path())
+            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+            .env_remove("DARKMUX_FLOWS_DIR")
+            .args(["mission", "launch", "flows-root-test"])
+            .assert()
+            .success();
+
+        assert!(
+            fs::read_dir(&leak_target).unwrap().next().is_none(),
+            "no flow day-file may land under the process HOME's .darkmux/flows \
+             when DARKMUX_HOME scopes the root elsewhere"
+        );
+    }
+
+    // ── Half 2: DARKMUX_FLOWS_DIR set under DARKMUX_HOME — records land
+    // exactly where told, proving the write path end to end ──
+    {
+        let darkmux_home = TempDir::new().unwrap();
+        let fake_home = TempDir::new().unwrap();
+        let flows_dir = darkmux_home.path().join("flows");
+
+        write_flows_root_test_config(darkmux_home.path());
+
+        Command::cargo_bin("darkmux")
+            .unwrap()
+            .env("DARKMUX_HOME", darkmux_home.path())
+            .env("HOME", fake_home.path())
+            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+            .env("DARKMUX_FLOWS_DIR", &flows_dir)
+            .args(["mission", "launch", "flows-root-test"])
+            .assert()
+            .success();
+
+        assert!(
+            flows_dir.is_dir() && fs::read_dir(&flows_dir).unwrap().next().is_some(),
+            "flow records must land under DARKMUX_FLOWS_DIR, got: {}",
+            flows_dir.display()
+        );
+        let leak_target = fake_home.path().join(".darkmux").join("flows");
+        assert!(
+            !leak_target.exists(),
+            "no flow day-file may land under the process HOME's .darkmux/flows"
+        );
+    }
+}
+
 #[test]
 fn mission_launch_run_on_unknown_value_refused_before_minting() {
     // (#2310 P4a review M3) The CLI-refuse-before-mint twin of

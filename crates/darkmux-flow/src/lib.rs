@@ -211,14 +211,43 @@ impl FlowSink for LocalFileSink {
 // disk encryption + filesystem-level immutability for layered defense.
 
 /// Resolve the audit directory from env override (`DARKMUX_AUDIT_DIR`)
-/// or default (`~/.darkmux/audit/`). Symmetric with `flows_dir()` but
+/// or default (`<darkmux root>/audit/`). Symmetric with `flows_dir()` but
 /// deliberately separate so audit and casual records never share a path.
 pub fn audit_dir() -> PathBuf {
     // (#875) `env(DARKMUX_AUDIT_DIR) > config.audit.dir` via config_access, then
     // the built-in default — so a config-only operator's `audit.dir` is honored.
-    darkmux_types::config_access::audit_dir_override()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".darkmux").join("audit")))
-        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/audit"))
+    darkmux_types::config_access::audit_dir_override().unwrap_or_else(audit_dir_default)
+}
+
+/// (#2359) Same bug class as `flows_dir_default` before its fix, one
+/// directory over: this went straight to `dirs::home_dir()`, so a
+/// `DARKMUX_HOME`-scoped launch with no `DARKMUX_AUDIT_DIR`/`audit.dir`
+/// override would still (were `audit.enabled` on) write the hash-chained
+/// audit trail into the operator's REAL `~/.darkmux/audit`. Derived from the
+/// SAME root resolution every sibling darkmux directory resolves through —
+/// `darkmux_types::paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a
+/// project-local `./.darkmux` before `~/.darkmux`.
+#[cfg(not(any(test, feature = "test-support")))]
+fn audit_dir_default() -> PathBuf {
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+        .root
+        .join("audit")
+}
+
+/// Test / `test-support` builds must never default onto the operator's real
+/// `~/.darkmux/audit` — same isolation discipline as
+/// `darkmux_types::config_access`'s sibling `*_dir_default` test-build
+/// variants (findings/mods/lab/flows). A test that DID isolate itself (a
+/// `DARKMUX_HOME` tempdir, or a project-local `./.darkmux`) is honored
+/// verbatim, because a test that isolated itself means it.
+#[cfg(any(test, feature = "test-support"))]
+fn audit_dir_default() -> PathBuf {
+    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return PathBuf::from("/tmp/darkmux-test-isolated/audit");
+    }
+    resolved.root.join("audit")
 }
 
 /// (#877) Count `audit.write_failed` breadcrumbs in TODAY's local flow file.
@@ -3902,6 +3931,42 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_AUDIT_DIR"),
             }
         }
+    }
+
+    /// (#2359) `audit_dir`'s default must scope under `DARKMUX_HOME`, same
+    /// as `flows_dir` — mirrors
+    /// `darkmux_types::config_access::tests::flows_dir_honors_darkmux_home`.
+    /// Before this fix `audit_dir_default` went straight to
+    /// `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped install with
+    /// `audit.enabled` but no `DARKMUX_AUDIT_DIR`/`audit.dir` override would
+    /// still write the hash-chained audit trail to the operator's real
+    /// `~/.darkmux/audit`.
+    #[test]
+    #[serial_test::serial]
+    fn audit_dir_honors_darkmux_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_audit = std::env::var("DARKMUX_AUDIT_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_AUDIT_DIR");
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let dir = audit_dir();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_audit {
+                Some(v) => std::env::set_var("DARKMUX_AUDIT_DIR", v),
+                None => std::env::remove_var("DARKMUX_AUDIT_DIR"),
+            }
+        }
+        assert_eq!(
+            dir,
+            tmp.path().join("audit"),
+            "must scope under DARKMUX_HOME, not the real user home"
+        );
     }
 
     #[test]

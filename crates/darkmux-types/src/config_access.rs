@@ -929,9 +929,10 @@ pub fn mission_stale_active_days() -> u64 {
 // owns its dir's full precedence so the resolution lives in ONE place.
 
 /// The flows directory (the always-on LocalFileSink target):
-/// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > ~/.darkmux/flows >
-/// /tmp/darkmux/flows`. The last is the HOME-less CI/sandbox fallback (parity
-/// with the prior `flow::schema::flows_dir`, which this now backs).
+/// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <darkmux root>/flows`. The
+/// root comes from `paths::resolve(Auto)` (below), so a HOME-less
+/// environment falls back to `paths::resolve`'s own `/tmp` scoping rather
+/// than a separate literal here.
 pub fn flows_dir() -> std::path::PathBuf {
     pick_dir(
         env_str("DARKMUX_FLOWS_DIR"),
@@ -943,6 +944,22 @@ pub fn flows_dir() -> std::path::PathBuf {
 /// The built-in flows-dir default (third precedence tier), split out so it can
 /// be isolated in test builds.
 ///
+/// (#2359) Derived from the SAME root resolution every other darkmux
+/// directory resolves through — `paths::resolve(Auto)`, which honors
+/// `DARKMUX_HOME` and a project-local `./.darkmux` before `~/.darkmux` —
+/// mirroring `findings_dir_default`/`mods_dir_default`/`lab_dir_default`/
+/// `hooks_outbox_dir_default`. Before this fix the default went straight to
+/// `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped launch with no
+/// `DARKMUX_FLOWS_DIR` override still wrote flow records into the operator's
+/// REAL `~/.darkmux/flows` regardless — the same bug class #1585 fixed for
+/// `lab_dir` and #2265 fixed for `findings_dir`/`mods_dir`, one directory
+/// over. Four synthetic reviewer-probe missions leaked into the operator's
+/// real flow store exactly this way on 2026-09-05.
+#[cfg(not(any(test, feature = "test-support")))]
+fn flows_dir_default() -> std::path::PathBuf {
+    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("flows")
+}
+
 /// (#994) In test / `test-support` builds the default must NOT be the
 /// operator's real `~/.darkmux/flows`. Derived consumers now READ the flow
 /// stream during a rebuild — the crew index's `cautions` derive scans
@@ -950,19 +967,28 @@ pub fn flows_dir() -> std::path::PathBuf {
 /// would ingest live operator flow data (machine-dependent, and a ~50 MB scan
 /// on CI). Isolating the default to a throwaway path makes an un-set flows dir
 /// empty by construction; tests that need real content set `DARKMUX_FLOWS_DIR`
-/// (the env tier, which wins). Production is unaffected — `cfg`-gated, and the
-/// path still ends in `flows`. Same #811-style "empty operator state by
+/// (the env tier, which wins). Same #811-style "empty operator state by
 /// construction in test builds" move the empty `config()` tier already makes.
-#[cfg(not(any(test, feature = "test-support")))]
-fn flows_dir_default() -> std::path::PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".darkmux").join("flows"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/darkmux/flows"))
-}
-
+///
+/// (#2359) But a test that DID isolate itself — by pointing `DARKMUX_HOME` at
+/// a tempdir, or via a project-local `./.darkmux` — is honored verbatim, same
+/// isolation discipline as `lab_dir_default`'s own test-build variant: a test
+/// that isolated itself means it. Only a test that isolated NOTHING (so
+/// `paths::resolve` would otherwise land on the real user root) falls back to
+/// the throwaway path. This was previously unconditional, which is exactly
+/// why `mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl`'s
+/// own comment (tests/cli.rs) notes "flow records do NOT follow DARKMUX_HOME
+/// at all" and sets `DARKMUX_FLOWS_DIR` explicitly as a workaround — it no
+/// longer needs to, though existing explicit overrides remain harmless (env
+/// still wins).
 #[cfg(any(test, feature = "test-support"))]
 fn flows_dir_default() -> std::path::PathBuf {
-    std::path::PathBuf::from("/tmp/darkmux-test-isolated/flows")
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/flows");
+    }
+    resolved.root.join("flows")
 }
 
 /// (#2265) The finding-record store — `env(DARKMUX_FINDINGS_DIR) >
@@ -1648,6 +1674,43 @@ mod tests {
         // ~/.darkmux/flows default, or the /tmp fallback if HOME is absent).
         assert!(flows_dir().ends_with("flows"), "resolves to a flows dir");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", v); } }
+    }
+
+    /// (#2359) `flows_dir` must scope under `DARKMUX_HOME`, exactly as its
+    /// sibling dirs (`findings_dir`, `mods_dir`, `lab_dir`, `hooks_outbox_dir`)
+    /// already do — mirrors `hooks_outbox_dir_honors_darkmux_home` exactly.
+    /// Before this fix, `flows_dir_default` went straight to
+    /// `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped launch with no
+    /// `DARKMUX_FLOWS_DIR` override still wrote flow records into the
+    /// OPERATOR'S REAL `~/.darkmux/flows` — four synthetic reviewer-probe
+    /// missions leaked into the operator's store exactly this way on
+    /// 2026-09-05.
+    #[serial_test::serial]
+    #[test]
+    fn flows_dir_honors_darkmux_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_FLOWS_DIR");
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let dir = flows_dir();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        assert_eq!(
+            dir,
+            tmp.path().join("flows"),
+            "must scope under DARKMUX_HOME, not the real user home"
+        );
     }
 
     /// (#2265) `dirs.findings` resolves through the same three tiers as every
