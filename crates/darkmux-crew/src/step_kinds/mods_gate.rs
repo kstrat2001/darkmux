@@ -930,6 +930,29 @@ mod tests {
         assert_eq!(gate.reason.as_deref(), Some("kit did not apply"));
     }
 
+    /// The gate resolved the source checkout to apply the kit; a mod that
+    /// arrived with no `source` (every create-mod dispatch) gets that id
+    /// recorded, so the deliverer can map the kit the same way the gate did.
+    #[test]
+    #[serial_test::serial]
+    fn the_gate_records_the_source_id_it_resolved_on_a_sourceless_mod() {
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        let kit = one_line_kit("wrong", "right").replace("a/answer.txt", "a/app/answer.txt").replace("b/answer.txt", "b/app/answer.txt");
+        mods::materialize(mods_dir.path(), &a_mod_kit("mod-src", "sess-a/1", &kit, Some("unified-diff"))).unwrap();
+        ModsGateStepKind
+            .run(
+                &step(json!({ "for_key": "sess-a/1", "test_command": "true", "workdir": tree_root.to_string_lossy() })),
+                &task(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let rec = mods::load_at(mods_dir.path(), "mod-src").unwrap().unwrap();
+        assert_eq!(rec.source.as_deref(), Some("app"), "the resolved source id must be recorded: {rec:?}");
+        assert_eq!(rec.gate.as_ref().map(|g| g.applied), Some(Some(true)));
+    }
+
     #[test]
     #[serial_test::serial] // scopes DARKMUX_MODS_DIR, a process-global
     fn a_gate_command_doing_git_writes_cannot_reach_the_shared_mirror() {

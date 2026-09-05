@@ -650,6 +650,22 @@ pub fn record_gate(
     outcome: Option<GateOutcome>,
     skipped_reason: Option<&str>,
 ) -> Result<Materialized> {
+    record_gate_with_source(root, key, outcome, skipped_reason, None)
+}
+
+/// [`record_gate`], also recording the source id the gate resolved when the
+/// mod arrived without one. A create-mod dispatch carries no `context.source`,
+/// so its kit is stored in container coordinates and nothing downstream could
+/// map it: the gate is the first place the source is known (it is the
+/// directory the kit was applied in), and the deliverer maps the kit by this
+/// field before parsing. A `source` already on the record is never replaced.
+pub fn record_gate_with_source(
+    root: &Path,
+    key: &str,
+    outcome: Option<GateOutcome>,
+    skipped_reason: Option<&str>,
+    resolved_source: Option<&str>,
+) -> Result<Materialized> {
     anyhow::ensure!(is_safe_key(key), "refusing to gate a mod under an unsafe key {key:?}");
     let path = record_path_at(root, key);
     let raw = std::fs::read_to_string(&path).with_context(|| format!("reading mod {}", path.display()))?;
@@ -660,6 +676,9 @@ pub fn record_gate(
     }
     record.gate = outcome;
     record.gate_skipped_reason = skipped_reason.map(str::to_string);
+    if record.source.is_none() {
+        record.source = resolved_source.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    }
     let body = serde_json::to_string_pretty(&record)? + "\n";
     std::fs::write(&path, body).with_context(|| format!("writing gated mod {}", path.display()))?;
     Ok(Materialized::Created)

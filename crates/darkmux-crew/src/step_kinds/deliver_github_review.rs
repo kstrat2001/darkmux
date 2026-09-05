@@ -1018,6 +1018,26 @@ mod tests {
     /// the replacement for 2–4 and would have LOST the blank line, so
     /// "Commit suggestion" deletes a real line of the operator's file.
     /// This pins the whole span and the body.
+    /// (live proof pass 4, 2026-09-05) A create-mod dispatch writes its kit in
+    /// container coordinates (`a/app/src/a.ts`); the gate maps that to apply
+    /// it and records the source id it resolved. The deliverer must map the
+    /// same way before parsing, or a gate-PASSED kit files as "outside the
+    /// diff" under a path the diff never touched — which is exactly how the
+    /// first passing coder kit rendered live.
+    #[test]
+    fn a_gated_mod_in_container_coordinates_with_a_recorded_source_still_becomes_a_suggestion() {
+        const KIT: &str =
+            "--- a/app/src/a.ts\n+++ b/app/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        let findings = vec![finding("s/1", "src/a.ts", 2, "const x = 1;", "reimplements a helper", None)];
+        let mut m = gated_mod_kind("s/1", KIT, Some("unified-diff"), Some(true));
+        m.record.source = Some("app".to_string());
+        let scope = DeliverScope { rules_run: vec!["r1".into()], hunks_covered: 1, hunks_total: 1, ..Default::default() };
+        let review = render_github_review(&findings, &[m], DIFF, &scope, None).review.unwrap();
+        assert_eq!(review.comments.len(), 1, "the mapped kit sits inside the diff: {review:?}");
+        assert_eq!(review.comments[0].path, "src/a.ts", "repo coordinates, not the mount's");
+        assert!(review.comments[0].body.contains("clamp(1)"));
+    }
+
     #[test]
     fn a_kit_with_a_bare_blank_line_anchors_and_replaces_the_full_span() {
         // The PR diff touches lines 1–4; its own blank context line is
