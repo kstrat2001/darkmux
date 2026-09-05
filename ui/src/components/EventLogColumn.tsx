@@ -10,10 +10,12 @@ import {
   activityOf,
   computeFacets,
   createFacetSeen,
+  createStoredPicks,
   defaultFilterState,
   matchesFilters,
   type Facets,
   type FacetSeen,
+  type StoredPicks,
   type FilterState, activeFilterCount, restoreFilterState, persistFilterState, storedFilterPicks, applyStoredPicks } from "../lib/eventFilters";
 import { FiltersDialog, FiltersBody, onlyModelFacet } from "./FiltersDialog";
 import { useIsMobile } from "../hooks/useIsMobile";
@@ -296,7 +298,7 @@ export function EventLogColumn({
   // survive a refresh taken at any moment, not only one taken after tidily
   // dismissing the dialog.
   useEffect(() => {
-    persistFilterState(filters, undefined, scopeLabel);
+    persistFilterState(filters, facets, undefined, scopeLabel);
   }, [filters]);
 
   const seenRef = useRef<FacetSeen>(createFacetSeen());
@@ -309,12 +311,22 @@ export function EventLogColumn({
   // returns the stale filters, silently dropping a live-streamed record whose
   // facet value is brand new. Reading `filters` here costs a dependency on it,
   // and the identity guard below keeps that from looping.
-  // (#2027) The operator's STORED picks, held until there are facets to apply
-  // them to. `restoreFilterState` in the initializer above cannot do this: the
-  // component mounts before its records query resolves, so facets are empty,
-  // every intersection is empty, and the picks were silently discarded on
-  // every load. The feature looked implemented and did nothing.
-  const pendingPicksRef = useRef(storedFilterPicks(undefined, scopeLabel));
+  // (#2027, revised #2416) The operator's stored picks, read ONCE at mount and
+  // kept alive for the component's whole lifetime — not just until the first
+  // real `facets` arrive. `absorbNewFacetValues` needs this on EVERY later
+  // call too: a value like `heartbeat` that the operator excluded last
+  // session may not appear in `facets` until well after mount (an idle fleet
+  // has no heartbeat records until the first dispatch), and when it finally
+  // does, it is "brand new" to `seenRef` and must still come back OFF rather
+  // than falling back to `DEFAULT_ACTIVITIES`/absorb-on defaults.
+  const overridesRef = useRef<StoredPicks>(storedFilterPicks(undefined, scopeLabel) ?? createStoredPicks());
+  // Whether the one-time "apply the full stored snapshot" reconciliation
+  // below has already run. `restoreFilterState` in the initializer above
+  // cannot do this alone: the component mounts before its records query
+  // resolves, so facets are empty, nothing reconciles, and the picks were
+  // silently discarded on every load. The feature looked implemented and did
+  // nothing.
+  const appliedInitialRef = useRef(false);
 
   useEffect(() => {
     // First arrival of real facets: apply the stored picks INSTEAD of
@@ -322,18 +334,17 @@ export function EventLogColumn({
     // has not seen before, which is right for live traffic and exactly wrong
     // for a value the operator deliberately deselected last session. Applying
     // first, then letting the ledger mark everything seen, keeps both correct.
-    const pending = pendingPicksRef.current;
     const facetsHaveArrived = facets.act.length || facets.cat.length || facets.tier.length || facets.src.length;
-    if (pending && facetsHaveArrived) {
-      pendingPicksRef.current = null;
-      const restored = applyStoredPicks(pending, facets);
+    if (!appliedInitialRef.current && facetsHaveArrived) {
+      appliedInitialRef.current = true;
+      const restored = applyStoredPicks(overridesRef.current, facets);
       for (const k of ["act", "cat", "tier", "src"] as const) {
         for (const v of facets[k]) seenRef.current[k].add(v);
       }
       setFilters(restored);
       return;
     }
-    const next = absorbNewFacetValues(filters, facets, seenRef.current);
+    const next = absorbNewFacetValues(filters, facets, seenRef.current, overridesRef.current);
     if (next !== filters) setFilters(next);
   }, [facets, filters]);
   const [follow, setFollow] = useState(true);
