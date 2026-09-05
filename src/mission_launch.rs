@@ -199,10 +199,13 @@ pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
 /// `timeout_seconds` is the clap `--timeout` value, `None` when the
 /// operator omitted it — resolved PER CONFIG (#1284 Packet 4b review gate,
 /// must-fix 1): the generic/coder-phase path below resolves `None` -> 600
-/// (`mission run`'s own default); the `review` branch passes the `Option`
-/// through so the retired review funnel launcher can resolve `None` -> 3600
-/// (the retired `pr-review run`'s per-call default — a 600s ceiling would
-/// silently degrade any review whose judge pass runs long).
+/// (`mission run`'s own default). Before the funnel deletion (#2310 P4d),
+/// `review` had its own branch that passed the `Option` through so the
+/// dedicated review launcher could resolve `None` -> 3600 (the retired
+/// `pr-review run`'s per-call default, chosen so a 600s ceiling would not
+/// silently degrade a review whose judge pass ran long) — `review` now
+/// runs the same generic path as any other config and gets the same 600s
+/// default.
 /// (#1562) [`MissionConfigSource`] → the recorded [`MissionSpecOrigin`]:
 /// only the user tier is operator-owned; `OnDisk` is a repo/templates-dir
 /// copy of a SHIPPED config, so it classifies with `Embedded` as builtin.
@@ -285,12 +288,12 @@ fn emit_launch_cmd_audit(
 
 /// (#1877 — "no blind runs" is now PRESCRIBED for the generic launch path,
 /// not opt-in per config) Build a whole-run `dispatch *` bookend record —
-/// the same coarse liveness edge the retired review funnel launcher's own
-/// `review_bookend_record`/`with_dispatch_bookends` gives `review`
-/// privately, generalized here so every OTHER config `launch` runs gets
-/// it too, unconditionally (see the guard construction in `launch` for
-/// why `review` itself never reaches this — it branches out, and mints no
-/// `mission_id`, before this code is ever reached).
+/// the same coarse liveness edge the now-deleted dedicated review
+/// launcher's own `review_bookend_record`/`with_dispatch_bookends` used to
+/// give `review` privately, before it branched out and minted no
+/// `mission_id` of its own. Generalized here so every config `launch` runs
+/// gets it unconditionally — `review` reaches this function the same as
+/// any other config now (#2310 P4d — the funnel deletion).
 ///
 /// `source = "mission"` — distinct from the per-model-dispatch FROZEN
 /// `"crew_dispatch"` value (`build_dispatch_record_with_payload`'s own
@@ -331,10 +334,11 @@ pub(crate) fn mission_bookend_record(
 /// Drain every telemetry sample buffered since the last drain and
 /// backfill `mission_id` onto each — mirrors `run_step_graph`'s own emit
 /// closure's backfill discipline (`record.mission_id.get_or_insert_with`)
-/// below, applied to telemetry the same way the retired review funnel launcher's
-/// `FleetFlowEmitter` backfills it for `review`'s own samples, so a
-/// coder-phase run's telemetry is joinable to its mission in the viewer
-/// exactly like review's already is.
+/// below, applied to telemetry the same way the now-deleted dedicated
+/// review launcher's `FleetFlowEmitter` used to backfill it for `review`'s
+/// own samples, so a coder-phase run's telemetry is joinable to its
+/// mission in the viewer — `review` now gets the same joinability through
+/// this same generic path, since it runs through it too.
 ///
 /// `pub(crate)` (#1877 QA must-fix 1): shared with `acp_panel::
 /// run_ephemeral`'s own telemetry drain — same backfill discipline, keyed
@@ -730,19 +734,20 @@ pub fn launch(
 
     // (#2131 review round 4, F2) SIGINT + SIGTERM + SIGHUP — this launcher
     // (generic graphs + coder-phase) previously installed no signal
-    // handling at all, the gap #2124 fixed for the retired review funnel launcher
-    // and #1959 fixed (SIGINT only) for the retired crawl launcher. Installed HERE
-    // — ahead of `mint_run_id` below, matching the retired review funnel launcher's
-    // `run_dispatch`, which arms before ITS mint too — not merely ahead of
-    // the config-snapshot write / interpret / freeform-mint /
-    // executable-check work that follows the mint. `mint_run_id` itself is
-    // pure in-memory ID derivation (no disk I/O, so a signal caught inside
-    // it is harmless today regardless), but arming any later would make
-    // "is it safe to be here" a fact the reader has to re-derive from
-    // `mint_run_id`'s own implementation rather than something structurally
-    // true by placement — the SAME reasoning the retired review funnel launcher
-    // already applies. The flag is live well before the real-execution
-    // section (below) constructs this launcher's own `LaunchFinalizeGuard`.
+    // handling at all, the gap #2124 fixed for the now-deleted dedicated
+    // review launcher and #1959 fixed (SIGINT only) for the retired crawl
+    // launcher. Installed HERE — ahead of `mint_run_id` below, matching the
+    // review launcher's own `run_dispatch`, which armed before ITS mint too
+    // — not merely ahead of the config-snapshot write / interpret /
+    // freeform-mint / executable-check work that follows the mint.
+    // `mint_run_id` itself is pure in-memory ID derivation (no disk I/O, so
+    // a signal caught inside it is harmless today regardless), but arming
+    // any later would make "is it safe to be here" a fact the reader has
+    // to re-derive from `mint_run_id`'s own implementation rather than
+    // something structurally true by placement — the SAME reasoning the
+    // review launcher applied. The flag is live well before the
+    // real-execution section (below) constructs this launcher's own
+    // `LaunchFinalizeGuard`.
     crate::launch_guard::arm();
 
     // Run id: minted fresh for THIS launch, never derived from inputs
@@ -1009,7 +1014,7 @@ pub fn launch(
     });
     // (#2131) `run_step_graph` (below) is ONE blocking, synchronous call on
     // THIS thread, with no polling seam of its own — the same shape
-    // the retired review funnel launcher's dispatch had before #2124, which fixed
+    // the review launcher's dispatch had before #2124, which fixed
     // it there with a supervised worker thread. That shape doesn't collapse
     // cleanly onto this launcher's much larger surface (coder-phase's own
     // gate machinery, the generic-graph persist/emit closures, and the
@@ -1080,8 +1085,9 @@ pub fn launch(
     // actually names them, gated by `uses_coder_phase_kinds` below).
     //
     // Generic/coder-phase timeout default: `None` -> 600, matching
-    // `mission run`'s own default (see `launch`'s doc — `review` resolves
-    // its own 3600 default in the retired review funnel launcher instead).
+    // `mission run`'s own default (see `launch`'s doc — `review` used to
+    // resolve its own 3600 default in the now-deleted dedicated review
+    // launcher; it gets this same 600s default now).
     let timeout_seconds = timeout_seconds.unwrap_or(600);
     let uses_coder_phase_kinds = declared.values().any(|s| CODER_PHASE_TIER3_KINDS.contains(&s.kind.as_str()));
     let coder_handles = if uses_coder_phase_kinds {
@@ -1127,19 +1133,19 @@ pub fn launch(
     // are PRESCRIBED here, not opt-in) Constructed unconditionally, for
     // EVERY config that reaches this point — regardless of whether its
     // graph declares a model-dispatching step kind or is Tier-1-only
-    // procedural/shell work (a `cmd` panel config gets telemetry too;
-    // the "was anything actually sampled" question is answered by the
-    // run's real wall-clock against the production cadence below, same as
-    // it already is for `review`). `review` itself NEVER reaches this
-    // line: `config_uses_review_kinds` branches it out, and mints no
-    // `mission_id`, far above (before this function's own `--input`/
-    // `--param` collection even runs) — review builds its own telemetry
-    // sampler and its own `with_dispatch_bookends` privately
-    // (the retired review funnel launcher / `darkmux_lab::lab::review::
-    // run_review_graph`), already satisfying the mandate on its own. The
-    // two constructions are mutually exclusive by CONTROL FLOW, not by a
-    // runtime check — there is no code path that reaches both, so no
-    // double-sampling is possible by construction.
+    // procedural/shell work (a `cmd` panel config gets telemetry too; the
+    // "was anything actually sampled" question is answered by the run's
+    // real wall-clock against the production cadence below). `review`
+    // reaches this line too, the same as any other config (#2310 P4d — the
+    // funnel deletion): before that, `config_uses_review_kinds` branched
+    // it out far above, before this function's own `--input`/`--param`
+    // collection even ran, because review built its own telemetry sampler
+    // and its own `with_dispatch_bookends` privately (the now-deleted
+    // dedicated review launcher / `darkmux_lab::lab::review::
+    // run_review_graph`, itself since removed), already satisfying the
+    // mandate on its own. With that private construction gone, `review`'s
+    // telemetry rides this same shared construction — no double-sampling
+    // risk to guard against, since there is only one construction left.
     let telemetry = run_obs::HostTelemetrySampler::start(
         mission_id.clone(),
         config_id.to_string(),
@@ -2704,13 +2710,14 @@ fn delivery_failed(
 /// object passes through as-is (the pre-wrapper shape); anything that isn't
 /// a JSON object contributes nothing.
 ///
-/// **Shared with the retired review funnel launcher**
+/// **Was shared with the now-deleted dedicated review launcher**
 /// (#2310 P3) — the review launcher's own close-payload promotion. That
-/// caller never walks a persisted `Step.output` string the way
+/// caller never walked a persisted `Step.output` string the way
 /// [`run_summary_payload`] does (the bespoke launcher's `dispatch_worker`
-/// thread boundary drops `tasks`/`steps` after persisting them, keeping
-/// only the finished `ReviewEnvelope` — see that call site's own comment);
-/// it calls this SAME unwrap on `serde_json::to_value(&env)` instead.
+/// thread boundary dropped `tasks`/`steps` after persisting them, keeping
+/// only the finished `ReviewEnvelope`); it called this SAME unwrap on
+/// `serde_json::to_value(&env)` instead. That caller is gone (#2310 P4d),
+/// but this unwrap stays for the generic path's own consumers.
 ///
 /// (#2345 I1) **Provably identical ONLY on a CLEAN run** — the case above
 /// actually describes: when `review-synthesis-task` reaches
@@ -2980,8 +2987,8 @@ fn register_coder_phase_step_kinds(registry: &crew::step_kinds::StepKindRegistry
 /// run) is mutated in place to stamp the coder step's own
 /// `timeout_seconds`/`image`/`injected_budget_chars` onto its `Step.config`
 /// — the same "compute once, stamp, read back in `run_streaming`" pattern
-/// the retired review funnel's own launcher used for its judge seat's
-/// staffing (#1530 Packet 3a) before that pipeline was deleted (#2310 P4d).
+/// the dedicated review launcher used for its judge seat's staffing
+/// (#1530 Packet 3a) before that launcher was deleted (#2310 P4d).
 ///
 /// (#1546) `message` is no longer among the stamped fields — composing the
 /// brief text itself (the mission/phase disk load, the corrections/
@@ -3499,9 +3506,10 @@ fn load_mission_for_brief(mission_id: &str) -> Result<Mission> {
     serde_json::from_str(&text).context("parsing mission.json")
 }
 
-// `pub(crate)` — the retired review funnel launcher reuses this (and
-// `lazy_start_phase_for_step` below) rather than re-deriving the same
-// read.
+// `pub(crate)` — the now-deleted dedicated review launcher used to reuse
+// this (and `lazy_start_phase_for_step` below) rather than re-deriving the
+// same read; no external caller remains since that launcher's removal
+// (#2310 P4d), but the visibility is left as-is.
 pub(crate) fn load_phase_for_brief(mission_id: &str, phase_id: &str) -> Result<Phase> {
     let text = std::fs::read_to_string(crew::lifecycle::phase_path(mission_id, phase_id))
         .with_context(|| format!("reading phase JSON for `{phase_id}`"))?;
@@ -3928,8 +3936,8 @@ fn build_envelope(
 /// forever: the same stranded-Active drift class an operator hit at scale
 /// (10 Active missions whose phases were stranded `running` with no process
 /// behind them, mobile report 2026-07-16). This brings the failed run to an
-/// honest terminal state, the same discipline the retired review funnel
-/// launcher followed by always finalizing off its captured `Result` (never
+/// honest terminal state, the same discipline the (now-deleted) dedicated
+/// review launcher followed by always finalizing off its captured `Result` (never
 /// `?`-propagating past the finalize): flip every still-`Running` step to
 /// `Error` (persisting it),
 /// then finalize the mission with an Error-status envelope whose PER-PHASE
@@ -6936,9 +6944,10 @@ mod tests {
 
     /// `HostTelemetrySampler` itself never stamps `mission_id` (it doesn't
     /// know one — see its own doc). `drained_telemetry` is the one place
-    /// that backfill happens for the generic launch path, mirroring
-    /// the retired review funnel launcher's `FleetFlowEmitter`, which does the same
-    /// for `review`'s own samples. Fast injected cadence (5ms) — same
+    /// that backfill happens for the generic launch path, mirroring what
+    /// the now-deleted dedicated review launcher's `FleetFlowEmitter` used
+    /// to do for `review`'s own samples — `review` now gets the same
+    /// backfill through this same generic path. Fast injected cadence (5ms) — same
     /// discipline `crates/darkmux-crew/src/run_obs.rs`'s own tests use — so
     /// this doesn't race the real ~600-900ms `top`/`vm_stat`/`ioreg` shells
     /// against the production 2s cadence `launch` itself uses.
@@ -7054,9 +7063,10 @@ mod tests {
         // Built via `concat!` (not a plain string literal) so this test's
         // OWN source line — which necessarily names the exact call shape
         // it's counting — doesn't self-match and inflate the count by one,
-        // the same idiom `the retired review funnel launcher_and_review_bench_construct_
-        // graphs_through_the_same_launcher`'s `run_needle` uses for the
-        // identical reason.
+        // the same idiom `mission_launch_review_and_review_bench_construct_
+        // graphs_through_the_same_launcher`'s `run_needle` used for the
+        // identical reason, in the now-deleted `mission_launch_review.rs`
+        // (#2310 P4d-1).
         let needle = concat!("drained_telemetry(&telemetry, ", "&mission_id)");
         let count = SRC.matches(needle).count();
         assert_eq!(
@@ -7417,25 +7427,23 @@ mod tests {
     /// `ignored: true`, or read by this launcher itself
     /// (`LAUNCHER_CONSUMED_INPUTS`).
     ///
-    /// **The expected set is a CEILING, not an equality.** Three of
-    /// `review-v2.json`'s inputs are inert at the time of writing — its own
-    /// descriptions say so for two of them ("not yet read by any step",
-    /// "Still NOT consumed") — and that document is owned by a concurrent
-    /// packet. Asserting a subset means this test goes green the moment
-    /// those inputs are wired, ignored, or deleted, and red the moment a
-    /// NEW inert knob is added to any shipped config, which is the
-    /// regression this guards.
+    /// **The expected set is a CEILING, not an equality.** Asserting a
+    /// subset means this test goes green the moment an inert input is
+    /// wired, ignored, or deleted, and red the moment a NEW inert knob is
+    /// added to any shipped config, which is the regression this guards.
     ///
-    /// The frozen `review` config is skipped: it routes to
-    /// `mission_launch_review::launch` before this check runs, so its
-    /// inputs are that launcher's to account for.
+    /// `review` is no longer skipped (#2310 P4d — the funnel deletion):
+    /// it used to route to the now-deleted dedicated review launcher
+    /// before this check ran, so its inputs were that launcher's to
+    /// account for. It now runs the same generic path as every other
+    /// config, so it gets the same check as everything else — its own
+    /// `mode`/`envelope_out` inputs are marked `ignored: true` in the
+    /// document itself (CLI-surface parity with the retired funnel
+    /// launcher) rather than needing an exclusion here, and the empty
+    /// `expected` set below stays true only as long as that holds.
     #[test]
     fn no_shipped_config_declares_an_input_nothing_consumes() {
-        let expected: &[(&str, &str)] = &[
-            ("review-v2", "mode"),
-            ("review-v2", "envelope_out"),
-            ("review-v2", "review-probe-high"),
-        ];
+        let expected: &[(&str, &str)] = &[];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("templates/builtin/mission-configs");
         let mut seen: Vec<(String, String)> = Vec::new();
@@ -7449,9 +7457,6 @@ mod tests {
             let raw = std::fs::read_to_string(&path).expect("readable");
             let config: mission_config::MissionConfig =
                 serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            if config_uses_review_kinds(&config) {
-                continue;
-            }
             for name in mission_config::unreferenced_inputs(&config, LAUNCHER_CONSUMED_INPUTS) {
                 seen.push((config.id.clone(), name));
             }

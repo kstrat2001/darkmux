@@ -28,10 +28,11 @@
 //! `MissionOutcomeStatus` (`Clean`/`Degraded`/`Degenerate`/`Error`) is
 //! derived FROM `outcome` (`MissionOutcomeStatus::from_outcome`,
 //! `MissionEnvelope::from_outcome`) rather than hand-computed a second time.
-//! Review is the first (and, as of this PR, only) adopter —
-//! `review_result_to_mission_envelope` (the retired review funnel launcher)
-//! builds its `RunOutcome` via `darkmux_lab::lab::review::
-//! review_mission_outcome` and hands it straight to `MissionEnvelope::
+//! Review was the first (and, at the time, only) adopter —
+//! `review_result_to_mission_envelope`, in the now-deleted dedicated
+//! review launcher (#2310 P4d), built its `RunOutcome` via
+//! `darkmux_lab::lab::review::review_mission_outcome` and handed it
+//! straight to `MissionEnvelope::
 //! from_outcome`, so "partial" is a typed `RunOutcome::Partial { reasons }`
 //! on the envelope, not only an untyped warning string. See
 //! `crate::envelope`'s module doc (the "`outcome` — the typed source"

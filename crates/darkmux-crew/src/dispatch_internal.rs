@@ -1490,8 +1490,8 @@ fn inactivity_timeout_seconds() -> u64 {
 /// `darkmux_flow::BookendGuard` stack (one dispatch, one open unit) — the
 /// `open`/`close` bookkeeping and the Drop-time abort emission both live in
 /// `darkmux-flow` now, shared with the review→dispatch bridge
-/// (`darkmux-lab::lab::review` + the retired review funnel launcher's
-/// `with_dispatch_bookends`), which brackets a review run in the canonical
+/// (`darkmux-lab::lab::review` + the now-deleted dedicated review
+/// launcher's `with_dispatch_bookends`), which bracketed a review run in the canonical
 /// `dispatch start`/`dispatch complete`/`dispatch error` record — the review
 /// module retired its own per-run task/step/ruling vocabulary in #1349/#1434
 /// and now relies on that outer wrap for liveness. Emits through the
@@ -1657,8 +1657,8 @@ fn write_remote_auth_header_stdin(
 /// (the container path) chain through, so the two consumers can never disagree
 /// about which profile a role resolved to.
 ///
-/// Before this, `role_profiles` had exactly ONE production reader — the review
-/// launcher (the retired review funnel launcher) — so `darkmux config set
+/// Before this, `role_profiles` had exactly ONE production reader — the
+/// (now-deleted) dedicated review launcher — so `darkmux config set
 /// role_profiles.<role> <profile>` succeeded, `darkmux doctor` reported the
 /// binding as fine, and `darkmux dispatch <role>` / `lab run` / the coder-phase
 /// seat silently ignored it and ran on `default_profile` anyway. Wiring the map
@@ -1668,8 +1668,8 @@ fn write_remote_auth_header_stdin(
 /// "local" up front (via the old default-profile-only view) and only
 /// discovering the mismatch once the container path re-resolves.
 ///
-/// Precedence — matches the review launcher's existing precedence for the same
-/// map (the retired review funnel launcher, #1475):
+/// Precedence — matches the (now-deleted) dedicated review launcher's
+/// former precedence for the same map (#1475, launcher removed #2310 P4d):
 /// 1. `profile_override` — an explicit `--profile <p>` on THIS call always
 ///    wins. Unchanged #1054 soft-fallback semantics: a name undefined on this
 ///    machine warns (at the call site) and falls to `default_profile`, since a

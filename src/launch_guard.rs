@@ -5,8 +5,8 @@
 //! the shape needed to be shared rather than reinvented per launcher.
 //!
 //! **Why a closure-parameterized guard, not one hardcoded to a Mission
-//! envelope type.** The three launchers finalize completely differently —
-//! the retired review funnel launcher writes a `ReviewEnvelope`-derived
+//! envelope type.** The three launchers finalized completely differently —
+//! the now-deleted dedicated review launcher wrote a `ReviewEnvelope`-derived
 //! `MissionEnvelope`, the retired crawl launcher wrote a crawl summary + its own
 //! `mission_terminal_with_reasoning_and_payload` call, `mission_launch.rs`
 //! writes either a gate banner (coder-phase, no finalize at all on the

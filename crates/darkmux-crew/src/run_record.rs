@@ -85,8 +85,9 @@
 //! **The vocabulary question is resolved by NOT merging.** The scheduler's
 //! own companion record is `action: "step timing"`, deliberately never
 //! `"step result"`, the action a cooperating `StepKind` (`dispatch.map`'s
-//! per-item/aggregate records, the retired review funnel's own step
-//! etc.) already emits for the steps that know their own `items_in`/
+//! per-item/aggregate records — the now-deleted dedicated review
+//! launcher's own step kinds emitted it too, before #2310 P4d) already
+//! emits for the steps that know their own `items_in`/
 //! `items_out`. Reusing `"step result"` for the scheduler's own thinner,
 //! uniform-coverage record would put two records under the same action for
 //! the SAME step with non-overlapping payload shapes, genuinely ambiguous

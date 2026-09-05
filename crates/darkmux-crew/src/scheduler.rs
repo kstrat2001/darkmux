@@ -1641,8 +1641,9 @@ pub const STEP_LIFECYCLE_ACTIONS: [&str; 3] = ["step start", "step complete", "s
 /// instead: every production caller wraps `emit` so a record with no
 /// `mission_id` gets THIS run's id stamped on before it's written
 /// (`get_or_insert`-style — never overwrites a record that already carries
-/// one) — see `src/mission_launch.rs`'s and the retired review funnel launcher's
-/// (`FleetFlowEmitter`) `run_step_graph`/`run_review_graph` call sites.
+/// one) — see `src/mission_launch.rs`'s and the now-deleted dedicated
+/// review launcher's (`FleetFlowEmitter`) `run_step_graph`/`run_review_graph`
+/// call sites (the latter removed #2310 P4d).
 /// Without that wrap, `session_id` here is CONFIG-scoped
 /// (`session_id::task` hashes only `step.task_id`, a string straight out of
 /// the mission config, e.g. `task-review-probe-mid-task`) — identical

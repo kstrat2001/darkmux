@@ -1,7 +1,8 @@
 //! (#2112) Mission/crawl pre-flight — power-posture warnings + the
 //! thermal-state refusal, called once from each long-mission entry point
-//! (`mission_launch::launch`, the retired review funnel launcher) before any real work
-//! starts.
+//! (`mission_launch::launch`, which the now-deleted dedicated review
+//! launcher used to call separately before it was folded into the same
+//! generic path — #2310 P4d) before any real work starts.
 //!
 //! Reads through the SAME probe `darkmux doctor`'s "power posture" check
 //! reads (`crates/darkmux-doctor/src/checks_power.rs` →
@@ -230,20 +231,21 @@ mod tests {
         assert!(msg.contains("mission propose --start"), "{msg}");
     }
 
-    // ── #2112 review finding 1 (+ second-pass finding A): the
-    //    long-running entry points (`mission_launch::launch`,
-    //    the retired review funnel launcher — the LATTER is reached via
-    //    `mission_launch::launch`'s OWN dedicated-launcher routing for
-    //    `config_uses_review_kinds`, BEFORE `mission_launch::launch`'s own
-    //    #2112 call site, so review needs its own call) must each still
-    //    call `check_power_posture` AND hold a `SleepAssertion` — wiring
-    //    a behavioral test can't reach without spawning a real
-    //    dispatch/crawl/review (forbidden for this pass), so this is a
-    //    physical source check instead (same posture as CLAUDE.md's
-    //    StepKind-tiering enforcement: a fact a fresh reader — human OR
-    //    test — can verify directly, not just a comment that can
-    //    silently drift). Deleting either call at any entry point makes
-    //    THIS go red. ──
+    // ── #2112 review finding 1 (+ second-pass finding A): every
+    //    long-running entry point must call `check_power_posture` AND hold
+    //    a `SleepAssertion` — wiring a behavioral test can't reach without
+    //    spawning a real dispatch/crawl/review (forbidden for this pass),
+    //    so this is a physical source check instead (same posture as
+    //    CLAUDE.md's StepKind-tiering enforcement: a fact a fresh reader —
+    //    human OR test — can verify directly, not just a comment that can
+    //    silently drift). Deleting the call makes THIS go red. Originally
+    //    two separate entry points (`mission_launch::launch` and the
+    //    bespoke review launcher, reached via `mission_launch::launch`'s
+    //    own dedicated-launcher routing for `config_uses_review_kinds`,
+    //    BEFORE `mission_launch::launch`'s own #2112 call site) had to be
+    //    checked separately; both the crawl launcher (#2301) and the
+    //    review launcher (#2310 P4d) have since folded onto the generic
+    //    path, so one file carries it now. ──
     #[test]
     fn all_long_running_entry_points_call_the_preflight_and_hold_a_sleep_assertion() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

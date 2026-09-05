@@ -3839,7 +3839,7 @@ mod tests {
 
         // The run-level case-string bookend session — post-fix, carries
         // mission_id (see `review_bookend_record`'s doc in
-        // the retired review funnel launcher).
+        // the now-deleted dedicated review launcher, #2310 P4d).
         write_day_file(
             flows.path(),
             &today(),

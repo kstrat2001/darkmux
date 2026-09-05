@@ -388,9 +388,10 @@ pub(crate) fn load_role_prompt_for(role: &Role) -> Option<String> {
 
 /// Public accessor for [`load_role_prompt`] (#1222 Phase B packet 5
 /// reconciliation). `darkmux mission launch review` used to dispatch
-/// `review-probe`/`review-judge` through this via the retired review funnel
-/// launcher's own `darkmux_crew::single_shot::single_shot_chat` call, not
-/// `darkmux_crew::dispatch`/`dispatch_internal` — so it needs the raw
+/// `review-probe`/`review-judge` through this via the (now-deleted)
+/// dedicated review launcher's own `darkmux_crew::single_shot::
+/// single_shot_chat` call, not `darkmux_crew::dispatch`/`dispatch_internal`
+/// — so it needs the raw
 /// system-prompt text itself rather than a full role dispatch, and
 /// `load_role_prompt` is `pub(crate)`, invisible outside this crate.
 /// Same search order: user override (`<crew_root>/roles/<id>.md`), then

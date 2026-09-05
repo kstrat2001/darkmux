@@ -559,27 +559,29 @@ pub struct FleetConfig {
 }
 
 /// (#1260/#1177) Remote (hosted-endpoint) dispatch knobs — the config home
-/// for the per-execution token bucket the review pipeline enforces on
-/// endpoint-staffed seats. Unlike `redis{}`/`audit{}` there is NO `enabled`
+/// for the per-execution token bucket darkmux enforces on endpoint-staffed
+/// seats. Unlike `redis{}`/`audit{}` there is NO `enabled`
 /// gate: remote staffing is enabled by the profile itself (endpoint present
 /// on the staffing's model — contract 1, profile uniformity), so the block
 /// carries only the allowance knob. `darkmux init` writes it visible with
 /// the default populated, per the visible-defaults doctrine.
 ///
 /// **What an "execution" is (operator decision, 2026-07-10 design chat):**
-/// one pipeline stage — the review pipeline's probe pass, each judge pass, the
-/// verify pass; a bare `dispatch` is one execution. Each stage's
+/// one pipeline stage; a bare `dispatch` is one execution. Each stage's
 /// REMOTE calls draw from their own allowance, so a runaway stage is caught
 /// at the cap without starving later stages. Tokens only — never currency.
 ///
-/// **Which paths this meters (1.18.0 scope — be precise):** the review
-/// pipeline's remote seats (probe / judge-pass1 / judge-pass2 / verify) AND the
-/// tool-less single-shot remote `dispatch` path (`dispatch_remote`). The
-/// AGENTIC-remote container path (#1187 — a tool-granting role on an endpoint
-/// profile, driven by the multi-call container loop) is NOT metered by this
-/// bucket in 1.18.0; metering that loop is tracked as a follow-up. A path
-/// this bucket does not yet meter is documented as such, never silently
-/// counted "off the meter".
+/// **Which paths this meters, for the shipped `review` config (#2310 P4d
+/// — the funnel deletion; the old probe/judge-pass1/judge-pass2/verify
+/// funnel seats this doc used to name are gone):** any generic
+/// `dispatch.map`/`dispatch.internal` step staffed with an endpoint
+/// profile (`review`'s own `create-mod-dispatch` seat, when enabled, is
+/// the one shipped example) AND the tool-less single-shot remote
+/// `dispatch` path (`dispatch_remote`). The AGENTIC-remote container path
+/// (#1187 — a tool-granting role on an endpoint profile, driven by the
+/// multi-call container loop) is NOT metered by this bucket; metering
+/// that loop is tracked as a follow-up. A path this bucket does not yet
+/// meter is documented as such, never silently counted "off the meter".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteConfig {
     /// Max remote `total_tokens` one pipeline stage may spend (default

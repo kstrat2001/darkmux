@@ -15,8 +15,10 @@
 //!   "constructible" verdict here is the identical check `launch` exits `4`
 //!   against, not a re-derived approximation.
 //! - `darkmux_profiles::profiles::resolve_role_profile_with` — the SAME
-//!   role → profile → model resolution `the retired review funnel launcher` performs for
-//!   every review role, given the SAME `RoleBinding` precedence (`--param`
+//!   role → profile → model resolution `mission_launch::launch` performs for
+//!   every review role now that `review` runs the same generic path as any
+//!   other config (#2310 P4d — the dedicated review launcher that used to
+//!   perform this resolution separately is gone), given the SAME `RoleBinding` precedence (`--param`
 //!   override > `role_profiles` map > `default_profile` fallback). And the
 //!   same local-model gate every dispatch path applies before trusting a
 //!   `ProfileModel`: `ProfileModel::require_n_ctx` (see
@@ -36,9 +38,10 @@
 //!   now defers to `decide_residency` rather than adding a fourth.
 //!
 //! **`--param ROLE=PROFILE` applies only where `mission launch` would apply
-//! it.** Role→profile overrides are converted into launch bindings ONLY on
-//! the review route (the retired review funnel launcher, gated structurally by
-//! `mission_launch::config_uses_review_kinds`) — for any other config (e.g.
+//! it.** Role→profile overrides used to be converted into launch bindings
+//! ONLY on the review route (the now-deleted dedicated review launcher,
+//! gated structurally by the since-removed `mission_launch::
+//! config_uses_review_kinds`) — for any other config (e.g.
 //! `coder-phase`), `mission launch` ignores `--param <role>=<profile>`
 //! entirely (a coder-phase `--param role=<id>` instead REBINDS the task's
 //! `role_id`, a different knob `show` can't express). `show` mirrors this
@@ -865,9 +868,10 @@ fn effective_overrides_and_warnings(
 }
 
 /// `--param ROLE=PROFILE` overrides, exactly as `mission launch --param
-/// <role>=<profile>` parses them (mirrors `the retired review funnel launcher`'s own
-/// `collect_role_overrides`), except a malformed entry bails immediately
-/// with a copy-pasteable example rather than being silently dropped — a
+/// <role>=<profile>` parses them (mirrors the now-deleted dedicated review
+/// launcher's own `collect_role_overrides`), except a malformed entry bails
+/// immediately with a copy-pasteable example rather than being silently
+/// dropped — a
 /// `show` invocation with a typo'd override should never render as if the
 /// override were absent.
 fn parse_role_overrides(params: &[String]) -> Result<BTreeMap<String, String>> {

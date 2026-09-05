@@ -518,9 +518,10 @@ pub fn max_stall_recoveries_with_source() -> (Option<u32>, Source) {
 
 // ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
 /// The per-EXECUTION remote token allowance — an execution is one pipeline
-/// stage (the review pipeline's probe pass, each judge pass, the verify pass; a bare
-/// dispatch is one execution). Only REMOTE (endpoint-staffed) calls
-/// draw from it. Resolves `env(DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) >
+/// stage (any endpoint-staffed `dispatch.map`/`dispatch.internal` step —
+/// `review`'s own `create-mod-dispatch` seat is the shipped example, #2310
+/// P4d; a bare dispatch is one execution). Only REMOTE (endpoint-staffed)
+/// calls draw from it. Resolves `env(DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) >
 /// config.remote.max_tokens_per_execution > 500000` (operator decision on
 /// #1260 — tokens only, never currency).
 pub fn remote_max_tokens_per_execution() -> u64 {
@@ -988,9 +989,10 @@ fn flows_dir_default() -> std::path::PathBuf {
 /// that isolated itself means it. Only a test that isolated NOTHING (so
 /// `paths::resolve` would otherwise land on the real user root) falls back to
 /// the throwaway path. This was previously unconditional, which is exactly
-/// why `the retired review funnel launcher_sigterm_mid_probe_finalizes_and_reaps_curl`'s
-/// own comment (tests/cli.rs) notes "flow records do NOT follow DARKMUX_HOME
-/// at all" and sets `DARKMUX_FLOWS_DIR` explicitly as a workaround — it no
+/// why `mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl`'s
+/// own comment (tests/cli.rs, deleted along with the dedicated review
+/// launcher — #2310 P4d-1) noted "flow records do NOT follow DARKMUX_HOME
+/// at all" and set `DARKMUX_FLOWS_DIR` explicitly as a workaround — it no
 /// longer needs to, though existing explicit overrides remain harmless (env
 /// still wins).
 #[cfg(any(test, feature = "test-support"))]

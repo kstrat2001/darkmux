@@ -294,11 +294,18 @@ impl SitesStepConfig {
 /// repository, so a naive `git rev-parse <sha>` against a mirror that only
 /// fetched `+refs/heads/*` fails with git's opaque "Needed a single
 /// revision". That is solved one layer down instead: the mirror
-/// `workspace_spec::materialize` maintains ALWAYS fetches
-/// `+refs/pull/*/head` alongside the ordinary heads/tags refspecs, so a
-/// fork sha is reachable by the time anything tries to resolve it —
-/// verified live against a real fork PR (`git rev-parse
-/// <fork-sha>^{commit}` resolves after that fetch). Naming a `refs/pull/
+/// `workspace_spec::materialize` maintains no longer fetches
+/// `+refs/pull/*/head` unconditionally (#2404 P4d round 3 — the measured 739MB
+/// cost per mirror was not worth paying on every same-repo source that
+/// never needs the pull namespace) — a rev-parse miss against the
+/// ordinary heads+tags mirror triggers exactly ONE miss-recovery fetch of
+/// the pull-heads namespace instead, and (round 4) that recovery fetch is
+/// a one-shot `git fetch` ARGUMENT that never gets persisted into the
+/// mirror's own `remote.origin.fetch` config — so a fork sha is still
+/// reachable by the time anything tries to resolve it, without paying the
+/// cost again on every later ordinary fetch of that mirror. Verified live
+/// against a real fork PR (`git rev-parse <fork-sha>^{commit}` resolves
+/// after that miss-recovery fetch). Naming a `refs/pull/
 /// <pr>/head` literal here would pin this spec to a MOVING ref (the PR's
 /// head can force-push after this spec is minted, changing what materializes
 /// on a later re-run at the "same" spec); the bare sha stays a fixed point

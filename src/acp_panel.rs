@@ -339,6 +339,14 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
     let base = candidates
         .iter()
         .find_map(|r| git_out(cwd, &["merge-base", "HEAD", r]))
+        // Deliberate: when the checkout itself IS one of the base-branch
+        // candidates (e.g. running this panel command directly on `main`),
+        // `merge-base HEAD <candidate>` returns HEAD's own sha — a
+        // "diff against yourself" answer that would otherwise short-circuit
+        // to an empty diff below. Rejecting that case here (turning it back
+        // to `None`) falls through to the `HEAD~1` last resort instead, so
+        // the panel still reviews the most recent commit rather than
+        // silently reviewing nothing.
         .filter(|b| b != &head)
         .or_else(|| {
             let h1 = git_out(cwd, &["rev-parse", "HEAD~1"]);

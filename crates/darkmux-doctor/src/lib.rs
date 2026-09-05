@@ -161,7 +161,7 @@ pub fn run() -> DoctorReport {
         check_openai_base_url_conflict(),
         check_redis_config(),
         check_gh_allowlist(),
-        check_review_judge_exhaustion_policy(),
+        check_removed_review_config_block(),
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
@@ -1398,8 +1398,8 @@ fn check_gh_allowlist() -> Check {
 /// to the rule it names in the checks list itself, the same shape
 /// `eureka_checks()` already established for a check family with more
 /// than one member. Provenance distinguishes `env` / `config.json` /
-/// `default` (mirrors `check_review_judge_exhaustion_policy`'s own
-/// three-way provenance) — previously any non-`env` case was reported as
+/// `default` (mirrors `check_step_command_timeout`'s own three-way
+/// provenance) — previously any non-`env` case was reported as
 /// `config.json` even when NEITHER tier actually set it.
 fn check_hooks() -> Vec<Check> {
     let env_set = std::env::var("DARKMUX_HOOKS_ENABLED").ok().filter(|s| !s.trim().is_empty()).is_some();
@@ -1717,7 +1717,7 @@ fn build_hooks_check(
 /// the case `DarkmuxConfig::with_defaults()` must produce — a regression
 /// here is exactly what let the round-2 field survive one review pass).
 /// `Warn`, naming the key, when an old config still has it.
-fn check_review_judge_exhaustion_policy() -> Check {
+fn check_removed_review_config_block() -> Check {
     let name = "review.judge_* (removed)";
     let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
     if !cfg.extras.contains_key("review") {
@@ -1731,10 +1731,12 @@ fn check_review_judge_exhaustion_policy() -> Check {
     Check {
         name: name.into(),
         status: Status::Warn,
-        message: format!(
-            "config.json has a `review` key — removed in CONFIG {}; delete it from config.json",
-            darkmux_types::config::CONFIG_SCHEMA_VERSION
-        ),
+        // Hardcoded, not `CONFIG_SCHEMA_VERSION` — that constant marches
+        // forward with every future schema bump, but the `review` block
+        // was removed in ONE specific past version (1.22). Formatting the
+        // live constant here would make this message quietly lie about
+        // WHEN the removal happened the moment the schema bumps again.
+        message: "config.json has a `review` key — removed in CONFIG 1.22; delete it from config.json".into(),
         hint: Some(
             "the review funnel this block configured was deleted in #2310 P4d; remove the \
              `review` block from ~/.darkmux/config.json — it is read leniently but has no effect"
@@ -1748,8 +1750,7 @@ fn check_review_judge_exhaustion_policy() -> Check {
 /// `procedural.shell`'s `command`. Always `Pass` (a preference, not a
 /// health signal); surfaces the resolved value with provenance so an
 /// operator whose gate reported `test_command exceeded <n>s` can see which
-/// tier set that number without reading `config.json`. Mirrors
-/// `check_review_judge_exhaustion_policy`'s provenance-display shape.
+/// tier set that number without reading `config.json`.
 fn check_step_command_timeout() -> Check {
     let name = "runtime.step_command_timeout_seconds";
     let env_set = std::env::var("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS")
@@ -6781,7 +6782,7 @@ mod tests {
         assert!(!check.message.contains("env"), "the env tier is absent here: {}", check.message);
     }
 
-    // ─── (#2404 P4d round 3) check_review_judge_exhaustion_policy — removed field ─
+    // ─── (#2404 P4d round 3) check_removed_review_config_block — removed field ─
 
     #[serial_test::serial]
     #[test]
@@ -6790,7 +6791,7 @@ mod tests {
         std::fs::write(home.path().join("config.json"), r#"{"schema_version":"1.22"}"#).unwrap();
         let prev_home = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_review_judge_exhaustion_policy();
+        let check = check_removed_review_config_block();
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -6815,7 +6816,7 @@ mod tests {
         std::fs::write(home.path().join("config.json"), contents).unwrap();
         let prev_home = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_review_judge_exhaustion_policy();
+        let check = check_removed_review_config_block();
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -6841,7 +6842,7 @@ mod tests {
         .unwrap();
         let prev_home = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_review_judge_exhaustion_policy();
+        let check = check_removed_review_config_block();
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -6850,8 +6851,14 @@ mod tests {
         }
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("review"), "names the key: {}", check.message);
+        // The literal "1.22", not `CONFIG_SCHEMA_VERSION` — the `review`
+        // block was removed in that ONE specific past version, which never
+        // changes even as the live schema version marches forward with
+        // future bumps. Asserting against the live constant would pass
+        // today and silently start asserting the WRONG thing the moment
+        // the schema bumps again.
         assert!(
-            check.message.contains(darkmux_types::config::CONFIG_SCHEMA_VERSION),
+            check.message.contains("1.22"),
             "names the schema version it was removed in: {}",
             check.message
         );

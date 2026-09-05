@@ -1559,7 +1559,10 @@ pub(crate) enum LabCmd {
         k: Option<u32>,
         /// (#1222) Run an external bundler
         /// (`<cmd> --worktree <dir> --diff <file>`) per case instead of the
-        /// built-in Rust bundler.
+        /// built-in Rust bundler. This flag belongs to `lab eval` itself
+        /// (the bench harness) — it is unrelated to the `review` mission
+        /// config's own `bundler` input, which was deleted entirely along
+        /// with the funnel (#2310 P4d); this flag survives unchanged.
         #[arg(long)]
         bundler: Option<String>,
     },

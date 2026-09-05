@@ -52,10 +52,8 @@ comment launches it — still maintainer-only.
 2. **Prerequisites on the laptop** (the runner shells out to these):
    - A **Rust toolchain** (`cargo`) — the workflow now builds the `darkmux`
      binary itself, fresh, from the trusted `main` checkout on every run
-     (#1359), and separately builds the reference `--bundler` plugin
-     (`darkmux-bundler-rust`, #1319) from that same checkout, since darkmux's
-     own source is Rust and the built-in bundler is TypeScript-only. Install
-     one if the runner doesn't have it (`rustup` or `brew install rust`).
+     (#1359). Install one if the runner doesn't have it (`rustup` or
+     `brew install rust`).
      **You do NOT need `darkmux` pre-installed on PATH for this workflow** —
      it builds its own copy into the job's workspace
      (`target/release/darkmux`) and invokes that explicit path, never a

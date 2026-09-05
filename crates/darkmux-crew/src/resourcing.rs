@@ -14,8 +14,8 @@
 //! module enumerates. [`resolve_review_roles`] is the ONE generic
 //! resolution pass: it walks the "review" mission config's own declared
 //! tasks, classifies each role-bearing task STRUCTURALLY by which Tier-3
-//! step kind it carries (the retired review funnel classified its own
-//! judge/verify tasks that way; anything else with a
+//! step kind it carries (the now-deleted dedicated review launcher
+//! classified its own judge/verify tasks that way; anything else with a
 //! `role_id` ⇒ a probe task), and resolves every one of them through the
 //! SAME per-task primitive, [`resolve_task_role`]. There is no Rust-side
 //! enumeration of "the probe roles" (no array, no magic-string heuristic
@@ -79,11 +79,13 @@ impl StaffingProvenance {
 /// `Port::artifact`'s doc on why a factory can only build a context-free
 /// default). Never constructed as a real staffing anywhere else.
 ///
-/// (#2310 P1) `Serialize`/`Deserialize`/`PartialEq` added so this can ride
-/// as DATA on `darkmux-lab`'s `ReviewContext` step-output body — the
-/// the retired review funnel's context step config carried the resolved staffing as
-/// JSON and needs a round-trip, and the mutation test (drop a field, the
-/// typed read fails by name) needs `PartialEq` for the golden comparison.
+/// (#2310 P1) `Serialize`/`Deserialize`/`PartialEq` added so this could
+/// ride as DATA on `darkmux-lab`'s now-deleted `ReviewContext` step-output
+/// body — the now-deleted dedicated review launcher's context step config
+/// carried the resolved staffing as JSON and needed a round-trip (both
+/// `ReviewContext` and that launcher are gone, #2310 P4d; this type's own
+/// mutation test (drop a field, the typed read fails by name) still needs
+/// `PartialEq` for the golden comparison).
 /// Every field is itself `Serialize`/`Deserialize`/`PartialEq` already
 /// (`ProfileModel` gained `PartialEq` in the same packet).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]

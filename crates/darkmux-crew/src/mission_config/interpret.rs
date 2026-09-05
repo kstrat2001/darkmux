@@ -89,9 +89,10 @@ pub struct LaunchParams {
     /// `StepConfig.id` → replacement `config` value. REPLACES, never
     /// merges, the document's own `config` — a launcher's way of handing a
     /// step an operator-resolved value in place of the document's own
-    /// static default at launch time (the retired review funnel's judge
-    /// step once used this for its bounded-concurrency cap; the mechanism
-    /// itself is generic and outlives that one caller).
+    /// static default at launch time (the now-deleted dedicated review
+    /// launcher's judge step once used this for its bounded-concurrency
+    /// cap, before #2310 P4d; the mechanism itself is generic and outlives
+    /// that one caller).
     pub step_config_overrides: BTreeMap<String, serde_json::Value>,
     /// (#2310 P4c-2 item 0) Every input the launch actually collected
     /// (`--input`/`--param`), keyed by name — the values [`super::

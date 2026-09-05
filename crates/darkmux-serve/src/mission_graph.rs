@@ -954,12 +954,14 @@ fn backfill_step_finals_bounded(
 /// longer true of the generic launcher, which since #2368 persists every
 /// MINTED step, `Planned`, at mint time and then at each transition
 /// (`src/mission_launch.rs` — the only `lifecycle::save_step` caller on a
-/// production path; the coder-phase graph runs through it). The review
-/// driver (`darkmux-lab`'s `review.rs`) takes its `persist` hook from
-/// the retired review funnel launcher, which writes at TRANSITION only, so a
-/// step of its graph that has not transitioned yet still has no file.
-/// Synthesis therefore still matters — it just no longer describes every
-/// runner. Rather than
+/// production path; the coder-phase graph runs through it). Before the
+/// funnel deletion (#2310 P4d), the review driver (`darkmux-lab`'s
+/// `review.rs`) took its `persist` hook from the dedicated review
+/// launcher, which wrote at TRANSITION only, so a step of its graph that
+/// had not transitioned yet still had no file — `review` now runs through
+/// this same generic launcher and gets the same mint-time persistence.
+/// Synthesis still matters for whatever runner writes at transition-only
+/// going forward. Rather than
 /// omitting those rows (which would leave the SSE layer with no row to
 /// animate — the scheduler's `step start`/`step complete` records key on
 /// step id), every `step_ids` entry with no persisted file gets a

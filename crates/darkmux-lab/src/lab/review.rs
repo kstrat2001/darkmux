@@ -37,9 +37,10 @@ use serde::{Deserialize, Serialize};
 // argument (deciding sequential-vs-parallel residency cycling is a hardware
 // residency question gestalt already owns; this module used to ask gestalt
 // for a `WaveSchedule` and then re-derive the answer itself). Re-exported
-// under the SAME names so every existing reference in this crate and in
-// the retired review funnel launcher (the binary crate) keeps resolving
-// unchanged — `pub use` for `ExecMode` since it crosses that crate
+// under the SAME names so every existing reference in this crate keeps
+// resolving unchanged (the now-deleted dedicated review launcher in the
+// binary crate also referenced these before its removal — #2310 P4d) —
+// `pub use` for `ExecMode` since it crosses that crate
 // boundary; a plain `use` for `wave_schedule_to_exec_mode`, which was never
 // `pub` (no caller outside this module ever named it), so this import
 // keeps it at the exact same visibility it had before the move.
@@ -483,8 +484,10 @@ fn judge_budget_shortfall_reason(env: &ReviewEnvelope, r: &RemoteBudgetRecord) -
 }
 
 /// (#1877 item 2) Review's OWN predicate mapping from its envelope fields
-/// onto [`RunOutcome`], scoped for what the retired review funnel launcher's
-/// `review_result_to_mission_envelope` puts on `MissionEnvelope::outcome`.
+/// onto [`RunOutcome`], scoped for what the now-deleted dedicated review
+/// launcher's `review_result_to_mission_envelope` used to put on
+/// `MissionEnvelope::outcome` (that caller is gone — #2310 P4d — this
+/// function's own tests are its only remaining caller).
 /// **Deliberately a DIFFERENT function from [`review_outcome`] above**, not
 /// a thin wrapper around it, because the two answer different questions
 /// with different consumers:
