@@ -58,7 +58,7 @@
     },
     {
       "name": "test_command",
-      "description": "The gate command `create-mods` runs against a proposed mod before counting it confirmed (#2310 P4c — DESIGN.md \"the changed files name the test targets\"). Wired (#2310 P4c-2b): the `create-mod` task's `gate-step` (`mods.gate`) runs this command in `{{item.tree_root}}` against every mod naming the finding the task addresses, and records `gate_passed`/`gate_skipped_reason` on each. Leaving it unset means every mod is recorded `gate_skipped_reason: \"no test_command configured\"`, never gate-verified.",
+      "description": "The gate command `create-mods` runs against a proposed mod before counting it confirmed (#2310 P4c — DESIGN.md \"the changed files name the test targets\"). Wired (#2310 P4c-2b): the `create-mod` task's `gate-step` (`mods.gate`) runs this command in `{{item.tree_root}}` against every mod naming the finding the task addresses, and records `gate_passed`/`gate_skipped_reason` on each. Leaving it unset means every mod is recorded `gate_skipped_reason: \"no test_command configured\"`, never gate-verified — and the visible consequence in the delivered review (#2310 fix loop A, S1-5) is that NO suggestion block is ever rendered: `deliver.github_review` turns a mod into a one-click suggestion only when its gate PASSED, so with no `test_command` every mod-form finding delivers as a \"Worth a double check\" thread instead.",
       "required": false
     },
     {

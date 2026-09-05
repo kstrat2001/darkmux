@@ -145,11 +145,14 @@ pub struct GithubReviewPayload {
 
 /// What [`render_github_review`] returns. `mode` is `"review"` when there
 /// is anything at all to say (findings, or mods); `"noop"` ONLY for a
-/// genuinely CLEAN run — nothing found AND nothing went wrong
-/// (`scope.errored` empty); `"degraded"` (#2310 P4c-2b PR #2357 review
-/// MUST FIX D) when nothing was found to say but `scope.errored` is
-/// non-empty — an errored/abandoned unit or plan step means this run is
-/// NOT a clean pass, even with zero findings, and must never read as one.
+/// genuinely CLEAN run — nothing found, nothing went wrong
+/// (`scope.errored` empty), AND the whole diff was covered
+/// (`hunks_covered >= hunks_total`, or nothing to cover at all);
+/// `"degraded"` (#2310 P4c-2b PR #2357 review MUST FIX D, widened onto
+/// the coverage axis by #2310 fix loop A / S3-2) when nothing was found
+/// to say but the run was not clean — an errored/abandoned unit or plan
+/// step, or hunks the run never covered, means this run is NOT a clean
+/// pass even with zero findings, and must never read as one.
 /// Mirrors the review pipeline's own `mode` vocabulary in spirit (a
 /// distinct outcome, never silently folded into `"review"`) without
 /// depending on its type.
@@ -157,6 +160,103 @@ pub struct GithubReviewPayload {
 pub struct DeliverOutcome {
     pub mode: String,
     pub review: Option<GithubReviewPayload>,
+}
+
+// ─── Model text is untrusted markdown (#2310 fix loop A, S5-4) ──────────
+//
+// Everything this module interpolates into the review body — a finding's
+// `why`/`evidence`/`file`, a mod's opaque `kit`, a kit hunk's new-side
+// lines and its path — is MODEL-authored, and on a review of a public PR
+// the model's own input (the diff) is attacker-influenced. Rendered
+// naively it is not just sloppy output: a payload that closes its
+// container forges a `### darkmux review` header, a fabricated scope line
+// and verdict, and a second one-click `suggestion` block, all in
+// darkmux's voice under darkmux's byline.
+//
+// Three rules, applied at every sink below, so the containment is
+// structural rather than per-call-site care:
+//
+// 1. **A fenced block picks a fence LONGER than anything in its payload**
+//    ([`fence_for`]) — the CommonMark rule that a closing fence must be at
+//    least as long as its opener. GitHub honors ````suggestion the same as
+//    ```suggestion, so this covers suggestion blocks too.
+// 2. **Text interpolated into a one-line bullet is folded onto that line**
+//    ([`inline_text`]) — newlines become spaces, so model text can never
+//    reach column 0 and therefore can never open a fence or start a `#`
+//    heading, a `---`/`***` break, or a `>` quote. Folding (rather than
+//    prefixing every line) is what keeps a bullet a bullet.
+// 3. **Text shown as code picks a code-span delimiter longer than any
+//    backtick run inside it** ([`code_span`]) — the inline analogue of
+//    rule 1, which preserves the text EXACTLY (a path is evidence; a
+//    look-alike substitution there would be a lie). Prose has no such
+//    delimiter to lengthen, so [`inline_text`] substitutes a look-alike
+//    for a backtick instead: an unterminated span in prose would otherwise
+//    swallow the bullets that follow it.
+//
+// Convention note: `darkmux-lab`'s `review_render::public_safe_note` is
+// the same discipline at the same boundary (untrusted text about to be
+// posted to a public PR, collapsed to one line and bounded) — this crate
+// cannot depend on that one (see this module's own doc), so the shape is
+// matched deliberately, not shared.
+
+/// The backtick run a fence around `payload` must use: one longer than the
+/// longest run inside it, never shorter than three.
+fn fence_for(payload: &str) -> String {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for c in payload.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "`".repeat((longest + 1).max(3))
+}
+
+/// U+02CB MODIFIER LETTER GRAVE ACCENT — a backtick's look-alike that
+/// carries no markdown meaning. Used by [`inline_text`] only (running
+/// prose has no delimiter to lengthen); [`code_span`] preserves real
+/// backticks exactly.
+const BACKTICK_LOOKALIKE: char = '\u{02cb}';
+
+/// Model prose on its way into a one-line bullet: every line break becomes
+/// a space and every backtick becomes [`BACKTICK_LOOKALIKE`]. The text
+/// stays readable and complete — nothing is dropped or truncated — it just
+/// loses the two characters that let it act as markdown structure.
+fn inline_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\r' => out.push(' '),
+            '`' => out.push(BACKTICK_LOOKALIKE),
+            _ => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Model text shown as code: folded onto one line, then wrapped in a
+/// delimiter longer than any backtick run it contains (CommonMark strips
+/// one padding space on each side when the content itself starts or ends
+/// with a backtick). The content is preserved byte-for-byte inside the
+/// span — a file path is evidence a reader may need to paste.
+fn code_span(content: &str) -> String {
+    let flat: String = content.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for c in flat.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let delim = "`".repeat(longest + 1);
+    let pad = if flat.starts_with('`') || flat.ends_with('`') { " " } else { "" };
+    format!("{delim}{pad}{flat}{pad}{delim}")
 }
 
 /// Render findings + mods + a diff + a scope summary into a
@@ -204,17 +304,17 @@ pub fn render_github_review(
         match delivery_form(finding) {
             DeliveryForm::Search => {
                 search_bullets.push(format!(
-                    "- `{}` — {}",
-                    window.display(),
-                    window.evidence.as_deref().unwrap_or("(no instances recorded)")
+                    "- {} — {}",
+                    window.span(),
+                    inline_text(window.evidence.as_deref().unwrap_or("(no instances recorded)"))
                 ));
             }
             DeliveryForm::Question => {
                 question_bullets.push(format!(
-                    "- `{}` — {}? Candidates: {}",
-                    window.display(),
-                    window.why.as_deref().unwrap_or("did you check whether this already exists"),
-                    window.evidence.as_deref().unwrap_or("(none recorded)")
+                    "- {} — {}? Candidates: {}",
+                    window.span(),
+                    inline_text(window.why.as_deref().unwrap_or("did you check whether this already exists")),
+                    inline_text(window.evidence.as_deref().unwrap_or("(none recorded)"))
                 ));
             }
             DeliveryForm::Mod => {
@@ -236,10 +336,10 @@ pub fn render_github_review(
                     }
                     _ => {
                         double_check_bullets.push(format!(
-                            "- `{}` — {} _Worth checking: {}_",
-                            window.display(),
-                            window.why.as_deref().unwrap_or("(no claim recorded)"),
-                            window.evidence.as_deref().unwrap_or("the cited line")
+                            "- {} — {} _Worth checking: {}_",
+                            window.span(),
+                            inline_text(window.why.as_deref().unwrap_or("(no claim recorded)")),
+                            inline_text(window.evidence.as_deref().unwrap_or("the cited line"))
                         ));
                     }
                 }
@@ -255,10 +355,19 @@ pub fn render_github_review(
         && question_bullets.is_empty()
         && double_check_bullets.is_empty();
     if nothing_to_say {
-        if scope.errored.is_empty() {
+        // (#2310 fix loop A, S3-2 — PROVEN) "Nothing was found" only means
+        // a clean run when the run actually LOOKED. A scope of
+        // `hunks_covered: 0, hunks_total: 5` rendered `noop` with
+        // `review: null` before this fix, discarding the one fact that
+        // mattered — the same "an incomplete run renders nothing" defect
+        // as MUST FIX D one line below, on the coverage axis instead of
+        // the error axis. `hunks_total == 0` is the honest zero (nothing
+        // to cover, e.g. an empty diff), not an uncovered run.
+        let covered = scope.hunks_total == 0 || scope.hunks_covered >= scope.hunks_total;
+        if scope.errored.is_empty() && covered {
             // A genuinely CLEAN run — nothing to say because nothing went
-            // wrong and nothing was found. The only `mode` this applies
-            // to.
+            // wrong, nothing was found, and the whole diff was looked at.
+            // The only `mode` this applies to.
             return DeliverOutcome { mode: "noop".to_string(), review: None };
         }
         // (#2310 P4c-2b PR #2357 review MUST FIX D, proven live) Before
@@ -391,12 +500,18 @@ fn render_gated_mod(
             let old_end = old_start + h.old_block.len() as u32 - 1;
             let inside = (old_start..=old_end).all(|l| line_touched(touched, path, Some(l)));
             if inside {
+                // (#2310 fix loop A, S5-4) The suggestion's payload is
+                // model-authored and its block ends on the line after it,
+                // so the fence is sized to the payload — GitHub honors a
+                // longer ````suggestion fence identically.
+                let suggested = h.new_block.join("\n");
+                let fence = fence_for(&suggested);
                 comments.push(GithubReviewComment {
                     path: path.clone(),
                     line: old_end,
                     start_line: if old_start != old_end { Some(old_start) } else { None },
                     side: Some("RIGHT".to_string()),
-                    body: format!("```suggestion\n{}\n```", h.new_block.join("\n")),
+                    body: format!("{fence}suggestion\n{suggested}\n{fence}"),
                 });
             } else {
                 mod_bullets.push(fenced_hunk_bullet(window, path, h, "the hunk sits outside the diff's lines"));
@@ -405,22 +520,29 @@ fn render_gated_mod(
     }
 }
 
+/// (#2310 fix loop A, S5-4) The kit is opaque model text — the fence is
+/// sized to it ([`fence_for`]) so it cannot close its own block and
+/// continue in darkmux's voice.
 fn fenced_patch_bullet(window: &FindingWindow, kit: &str, reason: &str) -> String {
-    format!("- `{}` — proposed change ({reason}):\n\n```\n{kit}\n```", window.display())
+    let fence = fence_for(kit);
+    format!("- {} — proposed change ({reason}):\n\n{fence}\n{kit}\n{fence}", window.span())
 }
 
+/// (#2310 fix loop A, S5-4) Both model-authored strings here are
+/// contained: `path` goes through [`code_span`] (the kit names it, so it
+/// is no more trusted than the kit) and the hunk body through a
+/// [`fence_for`]-sized fence.
 fn fenced_hunk_bullet(window: &FindingWindow, path: &str, h: &crate::diff::Hunk, reason: &str) -> String {
     let old_len = h.old_block.len() as u32;
+    let path_span = code_span(path);
     let span = if old_len == 0 {
-        format!("inserts after line {} of `{path}`", h.old_start)
+        format!("inserts after line {} of {path_span}", h.old_start)
     } else {
-        format!("replaces lines {}–{} of `{path}`", h.old_start, h.old_start + old_len - 1)
+        format!("replaces lines {}–{} of {path_span}", h.old_start, h.old_start + old_len - 1)
     };
-    format!(
-        "- `{}` — proposed change, {span} ({reason}):\n\n```\n{}\n```",
-        window.display(),
-        h.new_block.join("\n")
-    )
+    let body = h.new_block.join("\n");
+    let fence = fence_for(&body);
+    format!("- {} — proposed change, {span} ({reason}):\n\n{fence}\n{body}\n{fence}", window.span())
 }
 
 enum DeliveryForm {
@@ -476,12 +598,22 @@ impl FindingWindow {
         }
     }
 
+    /// The window's human-readable content — `key (file:line)`. `file` is
+    /// MODEL-authored (it comes out of the finding's own emission), so
+    /// every caller renders this through [`Self::span`] rather than
+    /// pasting it between two literal backticks (#2310 fix loop A, S5-4).
     fn display(&self) -> String {
         match (&self.file, self.line) {
             (Some(f), Some(l)) => format!("{} ({}:{})", self.key, f, l),
             (Some(f), None) => format!("{} ({f})", self.key),
             _ => self.key.clone(),
         }
+    }
+
+    /// [`Self::display`] as a code span whose delimiter is longer than any
+    /// backtick run inside it — the form every bullet in this module uses.
+    fn span(&self) -> String {
+        code_span(&self.display())
     }
 }
 
@@ -941,6 +1073,223 @@ mod tests {
         assert!(review.comments.is_empty(), "{review:?}");
         assert!(review.body.contains("review ran:"), "the scope line must be present: {}", review.body);
         assert!(review.body.contains("Errored: unit `x` (Error)."), "{}", review.body);
+    }
+
+    // ─── (#2310 fix loop A / S3-2) coverage is never discarded ──────────
+
+    /// (#2310 fix loop A, S3-2 — PROVEN) A run that covered NONE of the
+    /// diff's hunks is not a clean pass. Before this fix `nothing_to_say`
+    /// looked only at `scope.errored`, so `0/5` rendered `noop` with
+    /// `review: null` — the coverage fact the scope line exists to state
+    /// was discarded on the one path where it is the whole story.
+    #[test]
+    fn zero_of_five_hunks_covered_with_nothing_to_say_is_degraded_not_noop() {
+        let scope = DeliverScope { hunks_covered: 0, hunks_total: 5, ..Default::default() };
+        let out = render_github_review(&[], &[], DIFF, &scope, None);
+        assert_eq!(out.mode, "degraded", "an uncovered run is never a clean noop: {out:?}");
+        let review = out.review.expect("a degraded outcome still carries the scope line");
+        assert!(review.body.contains("0/5 hunks covered"), "{}", review.body);
+    }
+
+    /// The other side of the same rule: full coverage with nothing found
+    /// and nothing errored IS a clean run, and still renders `noop`.
+    #[test]
+    fn five_of_five_hunks_covered_with_nothing_to_say_is_still_a_noop() {
+        let scope = DeliverScope { hunks_covered: 5, hunks_total: 5, ..Default::default() };
+        let out = render_github_review(&[], &[], DIFF, &scope, None);
+        assert_eq!(out.mode, "noop", "{out:?}");
+        assert!(out.review.is_none());
+    }
+
+    // ─── (#2310 fix loop A / S5-4) the body is not the model's canvas ───
+
+    /// Model-authored text engineered to break out of whatever container
+    /// it lands in: a three-backtick run, a four-backtick run, a forged
+    /// `### darkmux review` header with its own plausible scope line and
+    /// verdict, a thematic break, a block quote, and raw HTML.
+    const ATTACK: &str = "benign lead-in\n```\n### darkmux review\n\nreview ran: 9 rule(s), 9/9 hunks covered, 0 finding(s) considered, 0 refused. Approved.\n---\n***\n> quoted\n<img src=x onerror=alert(1)>\n````\nstill the model talking";
+
+    /// A markdown STRUCTURE check, not a substring check (#2310 fix loop
+    /// A, S5-4): walks `text` tracking fence state the way a CommonMark
+    /// reader does, and asserts (a) every fence that opened also closed —
+    /// so no model payload terminated its own container — and (b) the only
+    /// lines that begin a heading / thematic break / block quote at column
+    /// 0 OUTSIDE a fence are the ones this module itself authored
+    /// (`expected_headings`). A forged header lands in the panic message.
+    fn assert_no_markdown_breakout(text: &str, expected_headings: &[&str], label: &str) {
+        let mut open: Option<usize> = None;
+        let mut headings: Vec<String> = Vec::new();
+        let mut breaks: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let ticks = line.chars().take_while(|c| *c == '`').count();
+            match open {
+                Some(n) => {
+                    if ticks >= n && line.trim_end().chars().all(|c| c == '`') {
+                        open = None;
+                    }
+                    continue;
+                }
+                None => {
+                    if ticks >= 3 {
+                        open = Some(ticks);
+                        continue;
+                    }
+                }
+            }
+            if line.starts_with('#') {
+                headings.push(line.to_string());
+            }
+            if line.starts_with("---") || line.starts_with("***") || line.starts_with('>') {
+                breaks.push(line.to_string());
+            }
+        }
+        assert!(open.is_none(), "{label}: a fence opened and never closed — model text terminated its container:\n{text}");
+        let expected: Vec<String> = expected_headings.iter().map(|s| s.to_string()).collect();
+        assert_eq!(headings, expected, "{label}: a model-authored heading reached column 0:\n{text}");
+        assert!(breaks.is_empty(), "{label}: a model-authored break/quote reached column 0: {breaks:?}\n{text}");
+    }
+
+    /// The invariant for every ONE-LINE bullet a model string lands in
+    /// (#2310 fix loop A, S5-4 (c)): model text never introduces a line
+    /// break, so it can never reach column 0 and can never open a fence —
+    /// EVERY line carrying the payload's start must also carry its end.
+    /// A structural fence walk alone is fooled here: a payload that opens
+    /// AND closes its own fence looks balanced while still having taken
+    /// over the body.
+    fn assert_folded_onto_one_line(text: &str, label: &str) {
+        let carrying: Vec<&str> = text.lines().filter(|l| l.contains("benign lead-in")).collect();
+        assert!(!carrying.is_empty(), "{label}: the model text vanished entirely:\n{text}");
+        for line in carrying {
+            assert!(
+                line.contains("still the model talking"),
+                "{label}: model text spans multiple lines — it reaches column 0 and can start a heading, \
+                 a thematic break, or a fence:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attack_payload_in_why_cannot_forge_a_header_in_the_double_check_bullet() {
+        let findings = vec![finding("s/1", "src/a.ts", 2, "ev", ATTACK, None)];
+        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_folded_onto_one_line(&review.body, "double-check bullet `why`");
+        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "double-check bullet `why`");
+        assert!(review.body.contains("Approved."), "the claim is folded into the bullet, never dropped: {}", review.body);
+    }
+
+    #[test]
+    fn an_attack_payload_in_evidence_cannot_forge_a_header_in_the_search_bullet() {
+        let findings = vec![finding("s/1", "src/a.ts", 2, ATTACK, "why", Some("search"))];
+        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_folded_onto_one_line(&review.body, "search bullet `evidence`");
+        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "search bullet `evidence`");
+    }
+
+    #[test]
+    fn an_attack_payload_in_a_question_bullet_cannot_forge_a_header() {
+        let findings = vec![finding("s/1", "src/a.ts", 2, ATTACK, ATTACK, Some("question"))];
+        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_folded_onto_one_line(&review.body, "question bullet");
+        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "question bullet");
+    }
+
+    /// Reads the FIRST code span off a bullet line the way a CommonMark
+    /// reader does — opening delimiter = the leading backtick run, closing
+    /// = the next run of exactly that length — and returns what it
+    /// actually encloses. Independent of [`code_span`]'s own arithmetic,
+    /// so a test asserting on it is not tautological: given a delimiter
+    /// too short for its content, the span closes early and this returns
+    /// a truncated string.
+    fn first_code_span(line: &str) -> String {
+        let rest = line.strip_prefix("- ").unwrap_or_else(|| panic!("not a bullet: {line}"));
+        let delim_len = rest.chars().take_while(|c| *c == '`').count();
+        assert!(delim_len >= 1, "the bullet does not open with a code span: {line}");
+        let body: Vec<char> = rest.chars().skip(delim_len).collect();
+        let mut i = 0usize;
+        while i < body.len() {
+            if body[i] == '`' {
+                let run = body[i..].iter().take_while(|c| **c == '`').count();
+                if run == delim_len {
+                    return body[..i].iter().collect::<String>().trim().to_string();
+                }
+                i += run;
+            } else {
+                i += 1;
+            }
+        }
+        panic!("the code span opened and never closed: {line}");
+    }
+
+    #[test]
+    fn a_model_supplied_file_path_cannot_break_out_of_its_code_span() {
+        // The `file` field is model-authored and lands inside a backtick
+        // span via `FindingWindow::display` — both its backticks (which
+        // would close a one-backtick delimiter early) and its line breaks
+        // (which would reach column 0) must be contained.
+        const FILE: &str = "src/`a`.ts\n### darkmux review\n---";
+        let findings = vec![finding("s/1", FILE, 2, "ev", "why", None)];
+        let out = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "FindingWindow::display `file`");
+        let bullet = review
+            .body
+            .lines()
+            .find(|l| l.starts_with("- "))
+            .unwrap_or_else(|| panic!("no bullet rendered:\n{}", review.body));
+        let span = first_code_span(bullet);
+        assert!(
+            span.contains("src/`a`.ts") && span.contains("### darkmux review") && span.ends_with(":2)"),
+            "the whole window must sit INSIDE the code span — a delimiter no longer than the content's own \
+             backtick run closes it early and hands the rest of the path to markdown.\nspan: {span}\nbullet: {bullet}"
+        );
+    }
+
+    #[test]
+    fn an_attack_payload_in_an_opaque_kit_cannot_terminate_its_fence() {
+        let findings = vec![finding("s/1", "src/a.ts", 2, "ev", "why", None)];
+        let mods = vec![gated_mod("s/1", ATTACK, Some(true))];
+        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "fenced_patch_bullet kit");
+    }
+
+    #[test]
+    fn an_attack_payload_in_an_out_of_diff_hunk_cannot_terminate_its_fence() {
+        // A parseable unified-diff kit whose hunk sits outside the PR
+        // diff — its new-side lines reach `fenced_hunk_bullet`, and its
+        // `path` reaches a backtick span in the same bullet.
+        let kit = format!(
+            "diff --git a/src/`a`.ts b/src/`a`.ts\n--- a/src/`a`.ts\n+++ b/src/`a`.ts\n@@ -99,1 +99,1 @@\n-old\n{}\n",
+            ATTACK.lines().map(|l| format!("+{l}")).collect::<Vec<_>>().join("\n")
+        );
+        let findings = vec![finding("s/1", "src/a.ts", 99, "ev", "why", None)];
+        let mods = vec![gated_mod_kind("s/1", &kit, Some("unified-diff"), Some(true))];
+        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert!(review.comments.is_empty(), "{review:?}");
+        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "fenced_hunk_bullet");
+    }
+
+    #[test]
+    fn an_attack_payload_in_a_suggestion_body_cannot_terminate_its_block() {
+        // An in-diff hunk whose new-side lines carry the attack payload —
+        // the ```suggestion block is the one container that ends on a
+        // model-adjacent line, and a second one-click suggestion forged
+        // inside it would be indistinguishable from darkmux's own.
+        let kit = format!(
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n{}\n",
+            ATTACK.lines().map(|l| format!("+{l}")).collect::<Vec<_>>().join("\n")
+        );
+        let findings = vec![finding("s/1", "src/a.ts", 2, "ev", "why", None)];
+        let mods = vec![gated_mod_kind("s/1", &kit, Some("unified-diff"), Some(true))];
+        let out = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert_no_markdown_breakout(&review.comments[0].body, &[], "suggestion block");
+        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "body alongside the suggestion");
     }
 
     #[test]
