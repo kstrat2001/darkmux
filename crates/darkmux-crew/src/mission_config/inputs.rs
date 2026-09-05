@@ -590,6 +590,7 @@ mod tests {
 
     fn task(id: &str, steps: Vec<StepConfig>) -> TaskConfig {
         TaskConfig {
+            excludes: Vec::new(),
             id: id.to_string(),
             enabled: None,
             description: None,

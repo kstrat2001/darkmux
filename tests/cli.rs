@@ -7994,18 +7994,24 @@ fn clean_generic_run_leaves_no_non_terminal_step_behind() {
 /// four of four kits that applied raw.
 ///
 /// (#2310 P4e) This test used to assert the message was byte-identical in
-/// `crawl.json` and `review-v2.json`. It is now `crawl.json`'s ALONE, and
-/// deliberately: the same measurement that motivated the message is what
-/// moved review's mod creation off the local tier entirely. `review-v2`'s
-/// create-mods task no longer dispatches a coder at all — its first step is
-/// a bounded `procedural.shell` wait for a mod the operator's frontier
-/// monitor records — so there is no local seat left in that config for a
-/// message to instruct, and asserting one would pin text no model reads.
-/// `crawl.json` still dispatches its coder (crawl is separate by doctrine,
-/// and its create-mods task ships `enabled: false`), so the message and its
-/// kit-shape clauses are still load-bearing there and still pinned here.
+/// `crawl.json` and `review-v2.json`. P4e made review's create-mods task a
+/// bounded WAIT with no local seat and no message at all, so for one packet
+/// the message was `crawl.json`'s alone.
+///
+/// (#2310 P4f) It is SHARED again, by a different task: review-v2 now also
+/// ships `create-mod-dispatch`, off by default, which staffs the same seat
+/// with a `coder` on a HOSTED ENDPOINT profile for the unattended runner.
+/// That template does read a message, and it must be the same one, because
+/// it is the same job — read the finding, write the smallest applying diff,
+/// call `create_mod`. Its kit-shape clauses are what the measurement found
+/// local seats failing and a frontier-class seat passing; a divergence
+/// between the two configs would mean two different specifications of the
+/// artifact `mods.gate` has to `git apply`, drifting silently.
+///
+/// The WAIT template still carries no message and must not grow one — that
+/// would mean a local seat came back into the attended path.
 #[test]
-fn the_create_mod_message_names_the_kit_shape_and_is_crawls_alone() {
+fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
     fn create_mod_messages(doc: &str) -> Vec<String> {
         let v: serde_json::Value = serde_json::from_str(doc).expect("built-in config parses");
         let mut found = Vec::new();
@@ -8029,14 +8035,48 @@ fn the_create_mod_message_names_the_kit_shape_and_is_crawls_alone() {
     let mut crawl = create_mod_messages(include_str!("../templates/builtin/mission-configs/crawl.json"));
     assert_eq!(crawl.len(), 1, "exactly one create-mod message in crawl.json: {crawl:?}");
     let crawl = crawl.remove(0);
-    // (#2310 P4e) The review config must carry NONE — a message here would
-    // mean a local coder seat came back with it.
-    let review = create_mod_messages(include_str!("../templates/builtin/mission-configs/review-v2.json"));
-    assert!(
-        review.is_empty(),
-        "review-v2 creates mods through the frontier hook, not a local coder dispatch — it must carry no \
-         create-mod message: {review:?}"
+    // (#2310 P4f) The review config carries EXACTLY ONE, and it is the
+    // `create-mod-dispatch` template's — the endpoint seat. The WAIT
+    // template must still carry none.
+    let mut review =
+        create_mod_messages(include_str!("../templates/builtin/mission-configs/review-v2.json"));
+    assert_eq!(
+        review.len(),
+        1,
+        "exactly one create-mod message in review-v2.json — the `create-mod-dispatch` template's; the \
+         attended `create-mod` template WAITS for a frontier mod and must never grow a message of its \
+         own: {review:?}"
     );
+    let review = review.remove(0);
+    assert_eq!(
+        review, crawl,
+        "the create-mod message must be BYTE-IDENTICAL in crawl.json and review-v2.json — same job, \
+         same specification of the kit `mods.gate` has to `git apply`"
+    );
+    // And it must hang off `create-mod-dispatch`, not off the wait
+    // template: the message reaching the wrong task would pass the
+    // byte-identity assertion above while meaning the opposite thing.
+    let doc: serde_json::Value =
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
+            .expect("review-v2.json parses");
+    let tasks = doc["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == serde_json::json!("create-mods"))
+        .expect("the create-mods phase")["tasks"]
+        .as_array()
+        .unwrap();
+    let dispatch = tasks
+        .iter()
+        .find(|t| t["id"] == serde_json::json!("create-mod-dispatch"))
+        .expect("the create-mod-dispatch template");
+    assert_eq!(dispatch["grow"]["config"]["message"], serde_json::json!(review));
+    let wait = tasks
+        .iter()
+        .find(|t| t["id"] == serde_json::json!("create-mod"))
+        .expect("the create-mod wait template");
+    assert!(wait["grow"]["config"]["message"].is_null(), "the wait template carries no message");
     for needle in [
         "relative to the repository root",
         "exactly as they appear",
@@ -8045,6 +8085,289 @@ fn the_create_mod_message_names_the_kit_shape_and_is_crawls_alone() {
     ] {
         assert!(crawl.contains(needle), "the message must name the kit shape ({needle:?}):\n{crawl}");
     }
+}
+
+// ─── #2310 P4f: the unattended cloud seat, off by default ──────────────
+//
+// `create-mod-dispatch` is the SECOND way to staff the create-mods seat: a
+// `coder` on a hosted-endpoint profile, for the self-hosted runner where no
+// orchestrator session exists to receive the create_finding hook and a
+// bounded wait therefore waits for nothing. It ships `enabled: false` and
+// `excludes: ["create-mod"]`.
+
+/// The document as SHIPPED validates clean — the new input and the new
+/// template add no findings, including on the inputs path (`{{mod_seat_
+/// profile}}` is a declared, optional, whole-value placeholder, so neither
+/// the undeclared-placeholder check nor the embedded-optional warning has
+/// anything to say about it).
+#[test]
+fn review_v2_ships_both_mod_seat_templates_and_validates_clean() {
+    let cfg: darkmux_crew::mission_config::MissionConfig =
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
+            .expect("review-v2.json parses");
+    let findings = cfg.validate(&[]);
+    assert!(findings.is_empty(), "review-v2 as shipped must validate clean: {findings:?}");
+
+    // Defaults: the wait template is live, the endpoint template is not.
+    let tasks: Vec<_> = cfg
+        .phases
+        .iter()
+        .find(|p| p.id == "create-mods")
+        .expect("the create-mods phase")
+        .tasks
+        .iter()
+        .collect();
+    let wait = tasks.iter().find(|t| t.id == "create-mod").expect("the wait template");
+    let seat = tasks
+        .iter()
+        .find(|t| t.id == "create-mod-dispatch")
+        .expect("the endpoint template");
+    assert!(wait.is_enabled(), "the attended wait template stays the default");
+    assert!(!seat.is_enabled(), "the endpoint seat ships OFF");
+    assert_eq!(seat.excludes, vec!["create-mod".to_string()]);
+    assert_eq!(seat.role_id.as_deref(), Some("coder"));
+    // The seat is pinned by the step's own `profile_name` override — the
+    // key `dispatch.internal` reads (`builtins::task_or_config_str`) — fed
+    // from the `mod_seat_profile` input.
+    assert_eq!(
+        seat.grow.as_ref().expect("grow").config["profile_name"],
+        serde_json::json!("{{mod_seat_profile}}"),
+        "the endpoint seat pins its profile through the step config `dispatch.internal` reads"
+    );
+    assert!(
+        cfg.inputs.iter().any(|i| i.name == "mod_seat_profile" && i.required != Some(true)),
+        "and `mod_seat_profile` is a declared, optional input"
+    );
+    // Mutation guard for the `default: 0` the P4e packet set: the endpoint
+    // seat must not have changed the wait's own default out from under an
+    // attended operator.
+    let wait_default = cfg
+        .inputs
+        .iter()
+        .find(|i| i.name == "mod_wait_seconds")
+        .and_then(|i| i.default.clone());
+    assert_eq!(wait_default, Some(serde_json::json!("0")), "the wait's `0 = skip` default is untouched");
+}
+
+/// Both seats enabled is a validate-time `Error` naming BOTH tasks — two
+/// mod-writing tasks per finding is not a degraded run, it is a duplicated
+/// seat, and the operator's fix is one `enabled` field.
+#[test]
+fn enabling_both_mod_seat_templates_is_a_validate_error_naming_them() {
+    let mut doc: serde_json::Value =
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
+            .expect("review-v2.json parses");
+    let phase = doc["phases"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["id"] == serde_json::json!("create-mods"))
+        .expect("the create-mods phase");
+    let tasks = phase["tasks"].as_array_mut().unwrap();
+    for t in tasks.iter_mut() {
+        t["enabled"] = serde_json::json!(true);
+    }
+    let cfg: darkmux_crew::mission_config::MissionConfig =
+        serde_json::from_value(doc).expect("the edited document parses");
+    let errors: Vec<_> = cfg
+        .validate(&[])
+        .into_iter()
+        .filter(|f| f.severity == darkmux_crew::mission_config::FindingSeverity::Error)
+        .collect();
+    assert_eq!(errors.len(), 1, "exactly one finding for the one conflicting pair: {errors:?}");
+    let hit = &errors[0];
+    assert!(hit.path.ends_with("excludes"), "path names the field to fix: {}", hit.path);
+    assert!(
+        hit.message.contains("create-mod\"") && hit.message.contains("create-mod-dispatch"),
+        "the finding names BOTH templates: {}",
+        hit.message
+    );
+}
+
+/// The shared fixture for the endpoint-seat tests: a `DARKMUX_HOME` holding
+/// a user-tier `review-v2.json` with the two `enabled` fields flipped
+/// (exactly how a runner opts in), a workspace spec, an empty diff, and a
+/// profile registry defining `grok-endpoint`.
+///
+/// The registry is written to a temp file and reached through
+/// `DARKMUX_PROFILES` deliberately: `profiles::default_locations()` does
+/// NOT honor `DARKMUX_HOME` — it searches the cwd and the REAL `$HOME` —
+/// so a test that merely sets `DARKMUX_HOME` and names a profile would read
+/// whatever registry the developer happens to have, and pass or fail on
+/// their machine's contents.
+struct EndpointSeatFixture {
+    _workdir: TempDir,
+    home: TempDir,
+    spec_path: std::path::PathBuf,
+    diff_path: std::path::PathBuf,
+    profiles_path: std::path::PathBuf,
+}
+
+fn endpoint_seat_fixture() -> EndpointSeatFixture {
+    let workdir = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let workspace_root = workdir.path().join("tree");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(
+        &spec_path,
+        serde_json::json!({
+            "name": "review-v2-fixture",
+            "sources": [{"id": "app", "path": workspace_root.to_string_lossy(), "ref": "main"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let diff_path = workdir.path().join("d.diff");
+    fs::write(&diff_path, "").unwrap();
+
+    // An ENDPOINT profile, so nothing here is a local placement. Nothing is
+    // ever called at this URL — every test using this fixture stops at the
+    // dry run.
+    let profiles_path = workdir.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        serde_json::json!({
+            "schema_version": "1.5",
+            "default_profile": "local-default",
+            "profiles": {
+                "local-default": {"models": [{"id": "local-model", "n_ctx": 8000}]},
+                "grok-endpoint": {"models": [
+                    {"id": "grok-model", "n_ctx": 8000, "endpoint": {"url": "http://127.0.0.1:9"}}
+                ]}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // The built-in document, copied to the user tier with TWO fields
+    // flipped — the whole opt-in.
+    let mut doc: serde_json::Value =
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
+            .expect("review-v2.json parses");
+    {
+        let phase = doc["phases"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["id"] == serde_json::json!("create-mods"))
+            .expect("the create-mods phase");
+        for t in phase["tasks"].as_array_mut().unwrap() {
+            t["enabled"] = serde_json::json!(t["id"] == serde_json::json!("create-mod-dispatch"));
+        }
+    }
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("review-v2.json"), doc.to_string()).unwrap();
+
+    EndpointSeatFixture { _workdir: workdir, home, spec_path, diff_path, profiles_path }
+}
+
+fn endpoint_seat_dry_run(fx: &EndpointSeatFixture, seat: &str) -> std::process::Output {
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "mission",
+            "launch",
+            "review-v2",
+            "--dry-run",
+            "--param",
+            &format!("workspace={}", fx.spec_path.display()),
+            "--param",
+            &format!("diff_file={}", fx.diff_path.display()),
+            "--param",
+            &format!("mod_seat_profile={seat}"),
+        ])
+        .env("DARKMUX_HOME", fx.home.path())
+        .env("DARKMUX_FLOWS_DIR", fx.home.path().join("flows"))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .env("DARKMUX_PROFILES", &fx.profiles_path)
+        .output()
+        .expect("mission launch review-v2 --dry-run runs")
+}
+
+/// A user-tier copy with the two `enabled` fields flipped — exactly how a
+/// runner opts in — mints the coder dispatch and NOT the wait. The
+/// dry-run graph is where the operator sees which seat is live: the other
+/// template is pruned at mint, never drawn gray.
+#[test]
+fn review_v2_dry_run_shows_the_endpoint_seat_when_a_user_tier_copy_enables_it() {
+    let fx = endpoint_seat_fixture();
+    let out = endpoint_seat_dry_run(&fx, "grok-endpoint");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(stdout.contains("Create mods"), "the phase is in the graph:\n{stdout}");
+    assert!(
+        stdout.contains("dispatch.internal"),
+        "and its step is the coder dispatch:\n{stdout}"
+    );
+    // `procedural.shell` appears exactly once in this document — the wait
+    // step — so its ABSENCE is the proof the wait template was pruned.
+    assert!(
+        !stdout.contains("procedural.shell"),
+        "the wait template is pruned at mint, so no wait step is drawn:\n{stdout}"
+    );
+    assert!(!fx.home.path().join("missions").exists(), "a dry run mints nothing");
+}
+
+/// (#2310 P4f review, CONSIDER 3) A typo'd `mod_seat_profile` is REFUSED,
+/// naming the value and pointing at `darkmux profile list`.
+///
+/// Without this the launch proceeded and the seat silently became the
+/// machine's local default: `ProfileRegistry::resolve_active` falls back to
+/// `default_profile` when the requested name is undefined — deliberately,
+/// and documented as such, so a machine-agnostic caller can name a profile
+/// each machine may or may not define. That contract's own doc says the
+/// caller "can detect a fallback (resolved name != requested name) and
+/// surface it"; nothing on this path did. The operator asked for a cloud
+/// seat, got a local model, and every flow record still read
+/// `handle: coder` — a substitution with no signal anywhere (#44: never
+/// silently substitute the operator's stated intent).
+#[test]
+fn a_mod_seat_profile_naming_no_defined_profile_refuses_the_launch() {
+    let fx = endpoint_seat_fixture();
+    let out = endpoint_seat_dry_run(&fx, "grok-endpiont");
+    assert!(
+        !out.status.success(),
+        "a mod_seat_profile naming nothing must refuse, not fall back to the default profile.\n\
+         stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("grok-endpiont"), "the refusal names the typo verbatim: {stderr}");
+    assert!(
+        stderr.contains("mod_seat_profile"),
+        "and names the input it came from: {stderr}"
+    );
+    assert!(
+        stderr.contains("darkmux profile list"),
+        "and points at the command that lists the real names: {stderr}"
+    );
+    // The silent-substitution tell: the refusal must not read as if the
+    // default were an acceptable stand-in.
+    assert!(
+        !out.status.success() && !stderr.contains("falling back"),
+        "a fallback is exactly what this refuses to do: {stderr}"
+    );
+}
+
+/// The positive leg: a DEFINED name proceeds. Without it the test above
+/// would pass against a check that refused every launch.
+#[test]
+fn a_mod_seat_profile_naming_a_defined_profile_proceeds() {
+    let fx = endpoint_seat_fixture();
+    let out = endpoint_seat_dry_run(&fx, "grok-endpoint");
+    assert!(
+        out.status.success(),
+        "a defined profile must launch: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("dispatch.internal"),
+        "and still reaches the endpoint seat's dispatch step"
+    );
 }
 
 // ─── #2310 P4e: review-v2's create-mods waits for a frontier mod ────────

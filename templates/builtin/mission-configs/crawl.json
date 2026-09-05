@@ -2,7 +2,7 @@
   "id": "crawl",
   "name": "Crawl",
   "description": "Crawl a workspace with static-analysis rules and record what the crew observes as findings. (#2301) THIS DOCUMENT IS THE CRAWL — `darkmux mission launch crawl` runs it through the generic launcher; there is no literal routing and no bespoke launcher behind it any more. The `plan` phase holds one `crawl.plan` task per rule, each writing that rule's plan (units of sites at one sha) as its output; the `crawl` phase GROWS one `crawl.unit` task per planned unit from those outputs (#2300) and dispatches each to the `crawler` role against the materialized tree, mounted read-only; the `summarize` phase totals the run and its output becomes the mission's close payload. Disable a rule's task with `\"enabled\": false` (#2299), or deselect it for one launch with `--param rules=a,b` — either way it is pruned at mint (reason `disabled` / `not_selected`, recorded in `graph-report.json`) and the run's graph shows only the rules that will run. A fourth phase, `create-mods`, is declared OFF (#2302): enabling its one task grows a `coder` dispatch per finding, each carrying that finding's record in its brief and recording its change as a mod.",
-  "schema_version": "3.4",
+  "schema_version": "3.5",
   "inputs": [
     {
       "name": "workspace",
