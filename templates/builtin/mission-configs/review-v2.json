@@ -81,6 +81,12 @@
       "name": "dry_run",
       "description": "The generic `mission launch --dry-run` flag, injected by the CLI layer. Prints the task/step graph this launch would mint and mints nothing.",
       "required": false
+    },
+    {
+      "name": "mod_wait_seconds",
+      "description": "How long the `create-mods` phase waits, per finding, for a frontier-written mod to appear in the mod store. **Default `0`, which means DO NOT WAIT**: the wait step completes immediately with `{\"waited\": false, \"reason\": \"mod_wait_seconds=0, no frontier monitor expected\"}`, the gate finds no mod, and `deliver.github_review` renders that finding as a question, exactly as it does today. That is the honest behavior on the UNATTENDED path (the self-hosted runner running `darkmux-review.yml`): no orchestrator session is watching the hook there and the runner has no frontier seat, so a per-finding wait would be pure wall-clock. An ATTENDED run opts in with `--param mod_wait_seconds=<N>`, N being the window the operator's monitor + the `darkmux-mod-create` skill needs to record a mod. Poll cadence is ~5s, so the effective wait rounds up to a multiple of 5. **Keep N below `runtime.step_command_timeout_seconds`** (env `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS`, default 600): that is the bound `procedural.shell` applies to EVERY step command, it is the outer bound here, and if it is the smaller of the two it kills the poll first and the step errors naming it rather than naming this input.",
+      "required": false,
+      "default": "0"
     }
   ],
   "phases": [
@@ -163,13 +169,12 @@
     {
       "id": "create-mods",
       "display_name": "Create mods",
-      "description": "Reuses crawl's create-mods `create-mod-step` verbatim (DESIGN.md \"Review reuses the create-mods phase\") — that step's shape is byte-identical to `crawl.json`'s own. `crawl.json`'s create-mods never runs tests (findings are proposals over a read-only tree, no test target implied); a review's mod SHOULD run the changed files' own test target before it counts as confirmed (DESIGN.md \"the changed files name the test targets, which is what makes confirmation cheap enough to do per finding\") — this task's shape diverges from crawl's in exactly THREE places, all of them the gate: (1) a second step, `gate-step` (`mods.gate`, #2310 P4c-2b), where crawl's task has only `create-mod-step`; (2) `grow.config.for_key: \"{{item.key}}\"`, which is how the gate step knows WHICH finding's mods to gate; (3) `grow.config.test_command: \"{{test_command}}\"`, the command itself. Everything else — `workdir`, `brief_refs`, the coder's message — is byte-identical to `crawl.json`'s own. The gate step does NOT run `test_command` in `{{item.tree_root}}`: it takes that path as its `workdir`, resolves the single source checkout under it, copies that checkout to a scratch dir, `git apply`s the mod's kit there, and runs the command inside the PATCHED copy (mods_gate.rs L193-202, L305-306), recording `gate_passed`/`gate_skipped_reason` on every mod naming this task's finding. One more difference is a matter of default rather than shape: `crawl.json`'s own `create-mod` task carries `\"enabled\": false` and is pruned at mint, while this one carries no `enabled` field at all and therefore runs.",
+      "description": "**#2310 P4e: the coder seat here is a hook, not a dispatch.** Measured 2026-09-05, local coder seats wrote an applying unified diff 1/4, 0/3 and 1/10 times across three seats where a clean-context frontier session wrote 4/4 — so mod CREATION moved off the local tier while DETECTION (the `review` phase's units) stays local. darkmux still never calls a frontier model itself: the hooks sink already fires on `dispatch.tool` + `payload.tool_name == \\\"create_finding\\\"` + `payload.ok == true`, the operator's orchestrator session watches those matches, invokes the bundled `darkmux-mod-create` skill, and the skill's subagent records the mod with the ordinary `darkmux mod create --for <key>` verb. This task's job is therefore to WAIT for that mod, bounded, and then gate it — so its first step is a Tier-1 `procedural.shell` poll of `mod list --for` (no `role_id`, no dispatch, no model), and the create-mod MESSAGE that used to live here is gone. `crawl.json`'s own create-mods task is UNTOUCHED and still dispatches a coder (crawl is separate by doctrine), which is why the two configs no longer share one create-mod message. The gate step and the `deliver` phase are unchanged: `mods.gate` takes `{{item.tree_root}}` as its `workdir`, resolves the single source checkout under it, copies that checkout to a scratch dir, `git apply`s the mod's kit there and runs `test_command` inside the PATCHED copy (mods_gate.rs L193-202, L305-306), recording `gate_passed`/`gate_skipped_reason` on every mod naming this task's finding; `deliver.github_review` renders a gate-passed mod as an inline suggestion and everything else as a question. **`mod_wait_seconds` defaults to `0` — do not wait** — so the unattended CI path (no orchestrator session, no frontier seat on the runner) delivers detections without burning a per-finding wait; an attended run opts in with `--param mod_wait_seconds=<N>`. The outer bound on the poll is `runtime.step_command_timeout_seconds`, which `procedural.shell` applies to every step command.",
       "tasks": [
         {
           "id": "create-mod",
-          "display_name": "Create mod: propose the change one finding describes",
-          "description": "Dispatch one `coder` per finding — one task per entry in the summary's `finding_refs`.",
-          "role_id": "coder",
+          "display_name": "Await mod: the frontier proposes the change one finding describes",
+          "description": "Wait, bounded, for a mod naming this finding, then gate it — one task per entry in the summary's `finding_refs`. No model runs in this task; the mod comes from the operator's frontier monitor (see the phase description).",
           "depends_on": ["summary"],
           "grow": {
             "from": "summary",
@@ -177,14 +182,13 @@
             "id": "{{item.id}}",
             "config": {
               "workdir": "{{item.tree_root}}",
-              "brief_refs": [{"kind": "finding", "key": "{{item.key}}"}],
-              "message": "A finding recorded earlier in this run is appended below. Your job is to PROPOSE the change that finding describes, as a mod. The workspace you have been given is the tree the finding was observed in, mounted read-only: you cannot edit it, and you are not meant to.\n\n1. Read the file the finding names, around the line it names.\n2. If the finding does not hold against what you read, record nothing and say why.\n3. Otherwise write the smallest change that resolves it as a unified diff against the file as it is, and call `create_mod` with: `kit` = one sentence saying what to apply, then the exact diff; `for` = the finding's key exactly as the block below spells it.\n\nThe diff is applied by a program, so its shape matters:\n- File paths relative to the repository root, exactly as the finding's `file` field spells them (`--- a/src/x.ts` / `+++ b/src/x.ts`), never the mount path.\n- Context lines copied exactly as they appear in the file you read; one hunk per changed region.\n- The diff as plain text, not inside a code fence, and the kit must end with a newline.\n\nDo not run tests, and do not touch anything the finding does not name. The mod is your product; someone else integrates it.",
+              "command": "set -eu\nkey='{{item.key}}'\nbound='{{mod_wait_seconds}}'\ncase \"$bound\" in\n  ''|*[!0-9]*)\n    printf 'mod_wait_seconds must be a whole number of seconds, got %s\\n' \"'$bound'\" >&2\n    exit 2\n    ;;\nesac\nif [ \"$bound\" -eq 0 ]; then\n  printf '{\"waited\":false,\"for\":\"%s\",\"reason\":\"mod_wait_seconds=0, no frontier monitor expected\"}\\n' \"$key\"\n  exit 0\nfi\nelapsed=0\nwhile :; do\n  if \"${DARKMUX_BIN:-darkmux}\" mod list --for \"$key\" --json 2>/dev/null | grep -q '\"key\"'; then\n    printf '{\"waited\":true,\"for\":\"%s\",\"waited_seconds\":%s}\\n' \"$key\" \"$elapsed\"\n    exit 0\n  fi\n  if [ \"$elapsed\" -ge \"$bound\" ]; then\n    break\n  fi\n  sleep 5\n  elapsed=$((elapsed + 5))\ndone\nprintf 'no mod names %s after %ss; the frontier monitor recorded none\\n' \"$key\" \"$bound\" >&2\nexit 1\n",
               "for_key": "{{item.key}}",
               "test_command": "{{test_command}}"
             }
           },
           "steps": [
-            {"id": "create-mod-step", "kind": "dispatch.internal", "config": {}},
+            {"id": "wait-for-mod-step", "kind": "procedural.shell", "config": {}},
             {"id": "gate-step", "kind": "mods.gate", "config": {}}
           ]
         }

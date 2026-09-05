@@ -384,7 +384,40 @@ http.createServer((req, res) => {
 
 <section>
   <div class="wrap">
-    <h2>6. The knobs</h2>
+    <h2>6. Findings to suggestions: the hook is the frontier seat</h2>
+    <p>The <code>review-v2</code> mission config runs the same blocks against a pull request's diff, and it splits the work at a measured line. <strong>Detection stays local</strong> — a small seat reads one hunk against one rule and calls <code>create_finding</code>. <strong>Proposal does not.</strong> Measured on 2026-09-05, three local coder seats wrote an applying unified diff 1 of 4, 0 of 3 and 1 of 10 times; a clean-context frontier session given the same instructions wrote 4 of 4. So mod creation moved to the frontier — through the hook that already existed, because darkmux itself never calls a frontier model.</p>
+    <p>The loop, end to end:</p>
+    <pre><code>unit dispatch --create_finding--&gt; finding store
+                            \--&gt; hooks sink --&gt; your receiver / outbox
+                                                    |
+                            your orchestrator session reads the match
+                                                    |
+                            /darkmux-mod-create --&gt; subagent writes the diff
+                                                    |
+                                          darkmux mod create --for &lt;key&gt;
+                                                    |
+        create-mods waits --&gt; mods.gate applies + tests --&gt; inline suggestion</code></pre>
+
+    <h3>The rule to add</h3>
+    <p>Config is operator state — darkmux never writes this for you. Add it to <code>~/.darkmux/config.json</code>:</p>
+    <pre><code>{ "match": { "action": "dispatch.tool", "payload.tool_name": "create_finding", "payload.ok": true },
+  "http": "http://127.0.0.1:8790/events" }</code></pre>
+    <p>The finding key is not a field on the record; it is <code>session_id</code> + <code>"/"</code> + <code>payload.emit_seq</code>, which is exactly how the store names its directories. The bundled <code>darkmux-mod-create</code> skill carries the monitor recipe, including which file to watch: the day's flow file under <code>~/.darkmux/flows/</code> is the durable source, while a rule's <code>.outbox.jsonl</code> is a delivery queue whose already-delivered prefix is reclaimed once it passes 8&nbsp;MiB.</p>
+
+    <h3>The wait, and why it defaults to zero</h3>
+    <p><code>review-v2</code>'s <code>create-mods</code> phase dispatches nothing. Its first step is a bounded shell poll of <code>darkmux mod list --for &lt;key&gt;</code>, on a ~5s cadence, bounded by the <code>mod_wait_seconds</code> input.</p>
+    <ul>
+      <li><strong>Unattended (a CI runner): detections only, no suggestions.</strong> <code>mod_wait_seconds</code> defaults to <code>0</code>, which means <em>do not wait</em> — a self-hosted runner has no orchestrator session to receive the hook and no frontier seat, so a per-finding wait there would be pure wall-clock. The step completes at once, the gate finds no mod, and every finding delivers as a question.</li>
+      <li><strong>Attended: the monitor and the skill turn detections into suggestions inside the wait.</strong> Launch with <code>--param mod_wait_seconds=&lt;N&gt;</code>, watch the stream, and record each mod as its finding lands. A gate-passed unified-diff kit renders as a one-click GitHub suggestion; a finding you decline still delivers, as the question it always was.</li>
+    </ul>
+    <p>Keep <code>N</code> under <code>runtime.step_command_timeout_seconds</code> (default 600). That bound governs <em>every</em> step command and is the outer bound here — if it is the smaller of the two it kills the poll first, and the step errors naming it rather than naming your input.</p>
+    <p><code>crawl.json</code> is untouched by all of this: a crawl still dispatches its own coder for mods, and ships that task off by default. Crawl walks any corpus; review is diff-scoped and code-only, and neither config knows the other exists.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>7. The knobs</h2>
     <p>Names and defaults from <code>docs/ENVIRONMENT.md</code>:</p>
     <table>
       <tr><th>Env var</th><th>Default</th><th><code>config.json</code> field</th><th>What it does</th></tr>

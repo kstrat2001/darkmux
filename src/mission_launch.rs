@@ -485,7 +485,18 @@ pub fn launch(
         ))
     );
 
-    let collected = collect_inputs(input_file, params)?;
+    let mut collected = collect_inputs(input_file, params)?;
+    // (#2310 P4e) Document-declared defaults land BEFORE every consumer
+    // below — the required check, the typo warning, the dry-run print, the
+    // inputs fingerprint and both placeholder passes — so a defaulted
+    // input is indistinguishable from one the operator typed. That is the
+    // point: `review-v2`'s wait command interpolates `mod_wait_seconds`
+    // from inside a string, and an EMBEDDED placeholder naming an
+    // uncollected input is refused at mint (`check_embedded_inputs_
+    // collected`), so without this the config could not ship a default at
+    // all.
+    apply_input_defaults(config, &mut collected);
+    let collected = collected;
     let missing = missing_required_inputs(config, &collected);
     if !missing.is_empty() {
         bail!("{}", missing_inputs_message(config, &missing));
@@ -2152,6 +2163,32 @@ pub(crate) fn collect_inputs(
         collected.insert(k.to_string(), serde_json::Value::String(v.to_string()));
     }
     Ok(collected)
+}
+
+/// (#2310 P4e) Fill every declared-but-unsupplied input that carries a
+/// document `default` into `collected`.
+///
+/// **Supplied always wins**, including a supplied empty string: the
+/// operator typing `--param mod_wait_seconds=` is a value, not an absence,
+/// and silently replacing it with the document's default would be the
+/// launcher substituting its judgment for the operator's.
+///
+/// An `ignored: true` input is never defaulted — the ignored-input warning
+/// keys on `collected.contains_key`, so a default would make every launch
+/// warn about an input the operator never typed.
+pub(crate) fn apply_input_defaults(
+    config: &MissionConfig,
+    collected: &mut BTreeMap<String, serde_json::Value>,
+) {
+    for input in &config.inputs {
+        if input.ignored == Some(true) {
+            continue;
+        }
+        let Some(default) = input.default.as_ref() else {
+            continue;
+        };
+        collected.entry(input.name.clone()).or_insert_with(|| default.clone());
+    }
 }
 
 /// Declared inputs (per [`MissionConfig::inputs`]) still missing from
@@ -5677,6 +5714,7 @@ mod tests {
             name: name.to_string(),
             description: None,
             required,
+            default: None,
             ignored: None,
             ignored_reason: None,
             extras: BTreeMap::new(),

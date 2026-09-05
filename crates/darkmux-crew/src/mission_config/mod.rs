@@ -469,6 +469,25 @@ pub struct MissionInput {
     /// here as the intended semantic for Packet 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
+    /// (#2310 P4e) The value a launch uses when the operator supplies
+    /// none — filled into the launch's collected inputs by
+    /// `mission_launch::apply_input_defaults` BEFORE any placeholder
+    /// resolution, so a document may reference the input from an EMBEDDED
+    /// position (`"…{{mod_wait_seconds}}…"`) without the launch being
+    /// refused for an uncollected input.
+    ///
+    /// **Why a defaulted input is not the same as an absent one.** The
+    /// whole-value placeholder shape (`"draws": "{{draws}}"`) already had
+    /// a way to express "unset": the key is OMITTED from the step config
+    /// and the step kind's own Rust default applies. That mechanism cannot
+    /// reach INSIDE a string, and a shell command is one string — so an
+    /// input a command interpolates needs its default at the DOCUMENT
+    /// layer, where the operator can also read it off `mission config
+    /// show`. Only inputs that are not [`Self::ignored`] are defaulted (an
+    /// ignored input's warning keys on the operator having supplied it, so
+    /// a default there would make every launch warn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
     /// (#2310 P4c-2 item 4) `true` when this input is accepted for
     /// CLI-surface parity with another config but has NO EFFECT here —
     /// e.g. `review-v2.json`'s `bundler`, accepted so an operator carrying
@@ -2749,6 +2768,7 @@ mod tests {
             name: name.to_string(),
             description: None,
             required: None,
+            default: None,
             ignored: None,
             ignored_reason: None,
             extras: BTreeMap::new(),
