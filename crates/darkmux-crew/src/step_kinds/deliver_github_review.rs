@@ -583,7 +583,19 @@ fn render_gated_mod(
     comments: &mut Vec<GithubReviewComment>,
     mod_bullets: &mut Vec<String>,
 ) {
-    let kit = m.record.kit.as_deref().unwrap_or("");
+    // Map the kit out of container coordinates by the source the gate
+    // recorded (a no-op for a kit already in repo coordinates, and for a
+    // record with no source). Without this a gate-PASSED kit written as
+    // `a/<source>/src/x.ts` parses to a path the diff never touched and files
+    // as "outside the diff" — how the first passing coder kit rendered live.
+    let mapped_kit;
+    let kit = match (m.record.source.as_deref(), m.record.kit.as_deref()) {
+        (Some(source), Some(raw)) if !source.trim().is_empty() => {
+            mapped_kit = crate::mods::strip_kit_source_prefix(source, raw);
+            mapped_kit.as_str()
+        }
+        (_, raw) => raw.unwrap_or(""),
+    };
     if m.record.kit_kind.as_deref() != Some("unified-diff") {
         mod_bullets.push(fenced_patch_bullet(window, kit, "the kit is not a typed unified diff, so it cannot be a suggestion"));
         return;

@@ -166,6 +166,13 @@ impl StepKind for ModsGateStepKind {
         // questions and must not collapse into one summary field.
         let no_command_reason =
             if test_command.is_none() { Some("no test_command configured".to_string()) } else { None };
+        // The source id is the name of the one checkout beneath the workdir —
+        // the same resolution `gate_one_mod` applies the kit in. Recorded on
+        // every mod this step gates that arrived without one, so the deliverer
+        // can map container-coordinate kits the way the gate did.
+        let resolved_source: Option<String> = workdir
+            .and_then(|w| resolve_single_source_dir(Path::new(w)).ok())
+            .and_then(|d| d.file_name().and_then(|n| n.to_str()).map(str::to_string));
         let mut mods_gated = 0usize;
         for m in &targets {
             // A mutation self-check on this line is documented in this
@@ -181,7 +188,7 @@ impl StepKind for ModsGateStepKind {
                 None => (None, no_command_reason.clone()),
                 Some(cmd) => gate_one_mod(m, cmd, workdir),
             };
-            let res = mods::record_gate(&root, &m.key, outcome, skip_reason.as_deref())
+            let res = mods::record_gate_with_source(&root, &m.key, outcome, skip_reason.as_deref(), resolved_source.as_deref())
                 .with_context(|| format!("step `{}`: recording the gate for mod `{}`", step.id, m.key))?;
             if res == mods::Materialized::Created {
                 mods_gated += 1;
