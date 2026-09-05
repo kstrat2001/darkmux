@@ -892,11 +892,18 @@ mod tests {
         // the assertion checks for "recipe" — a word that appears ONLY in
         // the search-confirm-specific warning text, never in the rule id
         // or any other warning here.
+        //
+        // (#2310 swarm G, S1-9) Third: the fixture is renamed `thin-alpha`,
+        // so the id shares no substring with any check's own vocabulary and
+        // cannot satisfy an assertion by accident even if someone later
+        // loosens one. The doctor twin
+        // (`darkmux_doctor::rules_check_warns_on_a_search_rule_with_no_
+        // recipe`) carries the same fixture name for the same reason.
         let dir = TempDir::new().unwrap();
         fs::write(
-            dir.path().join("thin-search.json"),
+            dir.path().join("thin-alpha.json"),
             serde_json::json!({
-                "id": "thin-search", "kind": "site", "confirm": "search",
+                "id": "thin-alpha", "kind": "site", "confirm": "search",
                 "applies_to": ["**/*.rs"], "prefilter": ["x"]
             })
             .to_string(),
@@ -912,7 +919,7 @@ mod tests {
         )
         .unwrap();
         let (_, warnings) = resolve(
-            &["thin-search".to_string(), "thin-question".to_string()],
+            &["thin-alpha".to_string(), "thin-question".to_string()],
             Some(dir.path()),
         )
         .unwrap();
@@ -922,7 +929,7 @@ mod tests {
             "with applies_to/prefilter populated, only the confirm-specific checks should fire: {warnings:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("thin-search") && w.contains("recipe")),
+            warnings.iter().any(|w| w.contains("thin-alpha") && w.contains("recipe")),
             "{warnings:?}"
         );
         assert!(

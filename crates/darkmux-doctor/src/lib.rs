@@ -9356,13 +9356,25 @@ mod tests {
     /// manifest's resolved subset (same reasoning `rules_check_warns_on_
     /// empty_applies_to_and_site_with_no_prefilter` above already
     /// establishes for the pre-existing thin checks).
+    ///
+    /// (#2310 swarm G, S1-9) The fixture is deliberately named `thin-alpha`,
+    /// NOT `thin-search`: the rule id lands verbatim in every warning that
+    /// names the rule, so a `contains("search")` assertion against a
+    /// `thin-search` fixture was satisfied by the id itself and could not
+    /// tell the search-recipe check firing from any other warning about the
+    /// same rule. With a name sharing no substring with the check, the
+    /// assertion has to be carried by the warning's OWN words — `recipe`,
+    /// which appears only in the search-confirm warning. Same fix, same
+    /// reason, as the `darkmux-crew` twin
+    /// (`rules::tests::search_confirm_with_no_recipe_warns_and_question_
+    /// confirm_with_no_compare_warns`).
     #[test]
     fn rules_check_warns_on_a_search_rule_with_no_recipe() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(
-            tmp.path().join("thin-search.json"),
+            tmp.path().join("thin-alpha.json"),
             serde_json::json!({
-                "id": "thin-search", "kind": "site", "confirm": "search",
+                "id": "thin-alpha", "kind": "site", "confirm": "search",
                 "applies_to": ["**/*.rs"], "prefilter": ["x"]
             })
             .to_string(),
@@ -9371,8 +9383,8 @@ mod tests {
 
         let check = build_rules_check(Some(tmp.path()));
         assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("thin-search"), "{}", check.message);
-        assert!(check.message.contains("search"), "{}", check.message);
+        assert!(check.message.contains("thin-alpha"), "{}", check.message);
+        assert!(check.message.contains("recipe"), "{}", check.message);
     }
 
     /// (#2310 P4c) An invalid `confirm` value (not `mod`/`search`/

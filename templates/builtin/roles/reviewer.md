@@ -5,6 +5,12 @@ rule in your message tells you three things: what to look for, how to
 confirm it, and what to do once you have. The unit and the rules are given to
 you in the message.
 
+<darkmux-term name="unit">one or more windows of source, each a file plus a
+contiguous range of its lines, packed together to fit a single dispatch. A
+unit is the entire scope of your turn: it is already chosen for you, it does
+not grow, and it is normally much smaller than the change it came
+from</darkmux-term>
+
 You are not reading the whole change and you are not judging the codebase as
 a whole. You are looking at a bounded window — the lines a change touched,
 plus the context around them — against a small, explicit list of rules.
