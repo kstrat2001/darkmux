@@ -932,6 +932,27 @@ fn single_rule_id(rule_ids: &[String]) -> Option<String> {
     }
 }
 
+/// (#2360) The rule-namespaced path component for one unit's on-disk
+/// home: `units/<rule_dir>/<unit_id>/` and the mission-root
+/// `<rule_dir>.<unit_id>.findings.jsonl`. A per-rule plan numbers its own
+/// units from `u-0001`, so two different rules' plans routinely mint the
+/// SAME unit id in one mission — the rule component is what keeps their
+/// on-disk homes from colliding (live evidence: mission
+/// `review-v2-1788566897-9c149e`, 2026-09-05, 4 of 5 units errored with
+/// "caller-provided out-dir already exists"). Prefers the step's OWN
+/// `config.rule` — set on every grown unit task in both `crawl.json` and
+/// `review-v2.json` (see `UnitStepConfig::rule`), and already checked a
+/// few lines above `run`'s own call site to agree with the plan — over
+/// re-deriving it from the plan unit's rule id(s), so the two never
+/// silently disagree. Falls back to the plan unit's own rule ids only
+/// when the step config left `rule` unset (not a shape either built-in
+/// mission config produces today, but a multi-rule read unit's own
+/// `rule_ids` still yields a stable, non-colliding component rather than
+/// panicking).
+fn unit_rule_dir(declared: Option<&str>, rule_ids: &[String]) -> String {
+    declared.map(str::to_string).or_else(|| single_rule_id(rule_ids)).unwrap_or_else(|| rule_ids.join("+"))
+}
+
 /// (#2310 P4c) Same "one id or null" shape as [`single_rule`], but the
 /// resolved rule's `confirm` form (`"mod"`/`"search"`/`"question"`) rather
 /// than its id — stamped into `record_context` (host-known, never
@@ -1059,10 +1080,17 @@ impl StepKind for CrawlUnitStepKind {
         });
         let message = build_message(&rules_by_id, unit, intent_text.as_deref())?;
 
+        // (#2360) Namespace this unit's on-disk home by rule FIRST: a
+        // per-rule plan numbers its own units from `u-0001`, so two
+        // different rules routinely grow a unit named `u-0001` into the
+        // SAME mission — see `unit_rule_dir`'s own doc for the live
+        // collision this closes.
+        let rule_dir = unit_rule_dir(cfg.rule.as_deref(), &ctx.rule_ids);
+
         // Mint this unit's own out dir BEFORE dispatch (#2153): the dir is
         // then known and recorded even if the dispatch returns `Err` with
         // no `DispatchResult::out_dir` to read back.
-        let unit_dir = run_dir.join("units").join(&ctx.unit_id);
+        let unit_dir = run_dir.join("units").join(&rule_dir).join(&ctx.unit_id);
         std::fs::create_dir_all(&unit_dir).with_context(|| format!("creating {}", unit_dir.display()))?;
         let host_out = unit_dir.join("out");
 
@@ -1186,11 +1214,14 @@ impl StepKind for CrawlUnitStepKind {
 
             let exclusions = out_dir.as_deref().map(count_rejected_create_findings).unwrap_or(0);
             // (#2302) ONE read of `findings.jsonl` yields both the count and
-            // the keys.
+            // the keys. (#2360) Rule-namespaced for the SAME reason
+            // `unit_dir` above is: `<rule>.<unit>.findings.jsonl`, not
+            // `<unit>.findings.jsonl` — otherwise a second rule growing
+            // the same unit id would collide on this mission-root file too.
             let readback_into = if draw == 0 {
-                run_dir.join(format!("{}.findings.jsonl", ctx.unit_id))
+                run_dir.join(format!("{rule_dir}.{}.findings.jsonl", ctx.unit_id))
             } else {
-                run_dir.join(format!("{}.findings.jsonl.d{}", ctx.unit_id, draw + 1))
+                run_dir.join(format!("{rule_dir}.{}.findings.jsonl.d{}", ctx.unit_id, draw + 1))
             };
             let (findings, finding_refs) = match &out_dir {
                 Some(d) => readback_findings(&ctx, d, &readback_into, model.as_deref(), &draw_session_id),

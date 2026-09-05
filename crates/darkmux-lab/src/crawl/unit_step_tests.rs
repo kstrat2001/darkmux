@@ -212,14 +212,129 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     assert_eq!(ctx["sha"], serde_json::json!("a".repeat(40)));
     assert_eq!(ctx["rule"], serde_json::json!("unnamed-predicate"));
 
-    // The findings the crawl stamps land beside the run.
-    let stamped =
-        fs::read_to_string(darkmux_crew::loader::missions_dir().join(MISSION).join("u-0001.findings.jsonl")).unwrap();
+    // The findings the crawl stamps land beside the run, rule-namespaced
+    // (#2360) — `<rule>.<unit>.findings.jsonl`, not `<unit>.findings.jsonl`.
+    let stamped = fs::read_to_string(
+        darkmux_crew::loader::missions_dir().join(MISSION).join("unnamed-predicate.u-0001.findings.jsonl"),
+    )
+    .unwrap();
     let first: Value = serde_json::from_str(stamped.lines().next().unwrap()).unwrap();
     assert_eq!(first["file"], serde_json::json!("src/a.ts"), "the container prefix is stripped");
     assert_eq!(first["file_raw"], serde_json::json!("/workspace/app/src/a.ts"), "the raw value survives");
     assert_eq!(first["sha"], serde_json::json!("a".repeat(40)));
     assert_eq!(first["rule"], serde_json::json!("unnamed-predicate"));
+}
+
+/// (#2360) Two DIFFERENT rules whose plans both mint a unit named
+/// `u-0001` — exactly the shape a real crawl/review-v2 mission produces,
+/// since a per-rule plan numbers its own units starting from 1
+/// (`plan::unit_seq`). Live evidence: mission
+/// `review-v2-1788566897-9c149e` (2026-09-05), 4 of 5 units errored with
+/// "caller-provided out-dir already exists — refusing to reuse it",
+/// because both rules' units resolved to the SAME
+/// `<mission>/units/u-0001/out` with no rule component.
+///
+/// The stub dispatch below is NOT a scripted `Ok`/`Err` like the other
+/// tests in this file — it reproduces `dispatch_internal::
+/// resolve_host_out`'s OWN collision check (`fs::create_dir` on the
+/// caller-named host-out dir, refusing outright on `AlreadyExists`
+/// rather than reusing it), so this test exercises the real defect
+/// mechanically rather than asserting it from memory. Before the fix,
+/// `outcome_b` is `Err` (rule B's unit finds rule A's already-populated
+/// dir). After the fix, both rules get their own on-disk home and this
+/// also serves as the two-rules-one-mission-dir harness scenario the
+/// issue asks for, since `crawl.unit` is dispatched (stubbed) for real,
+/// not bypassed the way `review_v2_fixture_plans_every_rule_and_delivers_
+/// one_comment_per_form` (`plan.rs`) stubs findings directly.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn two_rules_growing_unit_u_0001_do_not_collide_on_disk() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+
+    let ws_a = TempDir::new().unwrap();
+    let ws_b = TempDir::new().unwrap();
+    let plan_a = write_plan(ws_a.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let plan_b = write_plan(ws_b.path(), "swallowed-error", "u-0001", &"b".repeat(40));
+
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(|opts: DispatchOpts| {
+        let dir = opts.host_out.clone().expect("crawl.unit always names its host_out");
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!(
+                    "darkmux dispatch: caller-provided out-dir already exists — refusing to \
+                     reuse it: {}",
+                    dir.display()
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let rt = dir.join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let rule = opts
+            .record_context
+            .as_ref()
+            .and_then(|c| c.get("rule"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        fs::write(
+            rt.join("findings.jsonl"),
+            format!(
+                "{{\"file\":\"/workspace/app/src/a.ts\",\"line\":1,\"pattern\":\"{rule}\",\"evidence\":\"e\",\"why\":\"w\"}}\n"
+            ),
+        )
+        .unwrap();
+        Ok(DispatchResult {
+            exit_code: 0,
+            stdout: envelope("stop", 10, 5, 100),
+            stderr: String::new(),
+            session_id: opts.session_id.unwrap_or_default(),
+            out_dir: Some(dir),
+        })
+    }));
+
+    let step_a = unit_step(serde_json::json!({
+        "plan": plan_a.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    let step_b = unit_step(serde_json::json!({
+        "plan": plan_b.to_string_lossy(), "unit": "u-0001", "rule": "swallowed-error"
+    }));
+
+    let outcome_a =
+        kind.run(&step_a, &unit_task(), &BTreeMap::new()).expect("the first rule's unit is first to the dir");
+    // Before the fix this is where #2360 reproduces: rule B's unit
+    // resolves to the SAME `units/u-0001/out` rule A's dispatch already
+    // populated, and the stub's collision check refuses it exactly the
+    // way production does.
+    let outcome_b = kind
+        .run(&step_b, &unit_task(), &BTreeMap::new())
+        .expect("a second rule naming the same unit id must get its OWN on-disk home (#2360)");
+
+    let a = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome_a.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+    let b = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome_b.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+    assert_eq!(a.result, "stop");
+    assert_eq!(b.result, "stop");
+    assert_ne!(a.out_dir, b.out_dir, "each rule's unit must own a distinct out dir");
+    assert!(a.out_dir.contains("unnamed-predicate"), "{}", a.out_dir);
+    assert!(b.out_dir.contains("swallowed-error"), "{}", b.out_dir);
+
+    // Findings recorded beside the run must be per-rule too, not one
+    // shared `u-0001.findings.jsonl` the second rule would silently fail
+    // to write (or, worse, overwrite).
+    let missions_dir = darkmux_crew::loader::missions_dir().join(MISSION);
+    let findings_a =
+        fs::read_to_string(missions_dir.join("unnamed-predicate.u-0001.findings.jsonl")).expect("rule A's findings");
+    let findings_b =
+        fs::read_to_string(missions_dir.join("swallowed-error.u-0001.findings.jsonl")).expect("rule B's findings");
+    assert!(findings_a.contains("unnamed-predicate"));
+    assert!(findings_b.contains("swallowed-error"));
 }
 
 /// (#2310 P4c-2b) `config.draws: 2` dispatches the same unit TWICE —
