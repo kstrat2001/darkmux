@@ -546,10 +546,14 @@ pub enum NodeStatus {
 
 impl NodeStatus {
     /// (#2310 swarm F / S2-2) Every variant, so a caller that must handle
-    /// all of them ITERATES rather than re-lists. Kept honest by
-    /// [`Self::as_str`]'s exhaustive `match` (a new variant breaks that at
-    /// compile time) plus this module's own round-trip test, which walks
-    /// this array and compares each entry against `serde`.
+    /// all of them ITERATES rather than re-lists. Kept honest in BOTH
+    /// directions: a new variant breaks [`Self::as_str`] and
+    /// [`Self::next_variant`] at compile time, and a variant DROPPED from
+    /// this array (which the compiler is perfectly happy with once the
+    /// length in the type is shrunk to match) is caught by the
+    /// `ALL.len() == variant_count()` assertion in this module's tests,
+    /// where the expected count is walked off `next_variant`'s exhaustive
+    /// chain rather than re-typed as a literal.
     pub const ALL: [NodeStatus; 5] = [
         NodeStatus::Planned,
         NodeStatus::Running,
@@ -557,6 +561,41 @@ impl NodeStatus {
         NodeStatus::Abandoned,
         NodeStatus::Error,
     ];
+
+    /// The variant after `self` in declaration order, `None` at the end.
+    ///
+    /// (F2, from #2374's review) This exists so [`Self::variant_count`]
+    /// can be DERIVED from an exhaustive `match` instead of hand-typed.
+    /// The previous completeness test claimed the count assertion caught
+    /// a variant dropped from [`Self::ALL`] and did not: it only iterated
+    /// `ALL` and matched exhaustively over what it found, so shrinking
+    /// `ALL` from five entries to four left every test green.
+    const fn next_variant(self) -> Option<NodeStatus> {
+        match self {
+            NodeStatus::Planned => Some(NodeStatus::Running),
+            NodeStatus::Running => Some(NodeStatus::Complete),
+            NodeStatus::Complete => Some(NodeStatus::Abandoned),
+            NodeStatus::Abandoned => Some(NodeStatus::Error),
+            NodeStatus::Error => None,
+        }
+    }
+
+    /// How many variants the enum declares, walked off
+    /// [`Self::next_variant`]'s exhaustive chain — never a literal, so it
+    /// cannot drift from the enum without failing to compile first.
+    pub const fn variant_count() -> usize {
+        let mut n = 1usize;
+        let mut cur = NodeStatus::Planned;
+        loop {
+            match cur.next_variant() {
+                Some(next) => {
+                    n += 1;
+                    cur = next;
+                }
+                None => return n,
+            }
+        }
+    }
 
     /// The STABLE wire string for this status — byte-identical to what
     /// `serde` writes for it, and the only form that may leave the
@@ -1240,24 +1279,40 @@ mod tests {
         }
     }
 
-    /// The completeness half: `ALL` must hold every variant. The `match`
-    /// is exhaustive, so a new variant breaks compilation here; the
-    /// assertion catches the other direction (a variant dropped from
-    /// `ALL` while the enum still declares it).
+    /// The completeness half: `ALL` must hold every variant, in both
+    /// directions.
+    ///
+    /// (F2, from #2374's review) The version this replaces claimed the
+    /// count assertion caught "a variant dropped from `ALL` while the
+    /// enum still declares it" and did not — it iterated `ALL` and
+    /// matched exhaustively over the entries it was handed, which says
+    /// nothing about the ones it was not. Shrinking `ALL` to four entries
+    /// (dropping `Error`) left the whole suite green. The expected count
+    /// now comes from [`NodeStatus::variant_count`], walked off an
+    /// exhaustive `match` chain, so a dropped entry fails HERE and a new
+    /// variant fails to compile in `next_variant` before it can reach
+    /// either surface unnamed.
     #[test]
     fn node_status_all_holds_every_variant() {
-        for status in NodeStatus::ALL {
-            // Exhaustive by construction — the compiler enforces it.
-            let _: () = match status {
-                NodeStatus::Planned
-                | NodeStatus::Running
-                | NodeStatus::Complete
-                | NodeStatus::Abandoned
-                | NodeStatus::Error => (),
-            };
+        assert_eq!(
+            NodeStatus::ALL.len(),
+            NodeStatus::variant_count(),
+            "`NodeStatus::ALL` must hold every variant the enum declares — the expected count \
+             is derived from `next_variant`'s exhaustive chain, so this firing means an entry \
+             was dropped from `ALL` (a caller that ITERATES it would silently skip that status)",
+        );
+        // Every entry is reachable through the chain too, so `ALL` cannot
+        // hold the right NUMBER of the wrong things (a duplicate paired
+        // with an omission).
+        let mut chained = std::collections::BTreeSet::new();
+        let mut cur = Some(NodeStatus::Planned);
+        while let Some(status) = cur {
+            chained.insert(status.as_str());
+            cur = status.next_variant();
         }
-        let distinct: std::collections::BTreeSet<&str> =
+        let listed: std::collections::BTreeSet<&str> =
             NodeStatus::ALL.iter().map(|s| s.as_str()).collect();
-        assert_eq!(distinct.len(), NodeStatus::ALL.len(), "two variants share one wire string");
+        assert_eq!(listed, chained, "`ALL` and the variant chain must name the same statuses");
+        assert_eq!(listed.len(), NodeStatus::ALL.len(), "two variants share one wire string");
     }
 }

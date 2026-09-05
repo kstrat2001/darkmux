@@ -154,6 +154,16 @@ impl StepKind for RecordsGatherStepKind {
         // for — see `pruned_rules`.
         let declared = declared_rules(&mission_id);
         not_attempted.extend(pruned_rules(&mission_id, &declared));
+        // (F2, from #2374's review) The denominator is DISTINCT RULE IDS,
+        // not rule-bearing TASKS. `declared` is keyed by task id, and a
+        // config routinely declares more than one task for one rule —
+        // `crawl.json`'s own shape is a `crawl.plan` task per rule AND a
+        // `crawl.unit` grow template per rule — so `declared.len()` made M
+        // the task count and rendered a single-rule run as "0 of 2 rules
+        // reviewed". The numerator (`rules_run`, off the `plan/<rule>.json`
+        // file set) was already per-rule, so the two halves of the same
+        // sentence were counting different things.
+        let rules_total = declared.values().collect::<std::collections::BTreeSet<_>>().len();
         not_attempted.sort();
         not_attempted.dedup();
 
@@ -165,7 +175,7 @@ impl StepKind for RecordsGatherStepKind {
             // whose task was pruned before the mint. `0` when the snapshot
             // is unreadable, which `DeliverScope::rules_declared` reads as
             // "fall back to what the lists prove".
-            rules_total: declared.len(),
+            rules_total,
             hunks_covered,
             hunks_total,
             refused: scan.findings_rejected,
@@ -662,6 +672,50 @@ mod tests {
             wrapped.body.scope
         );
         assert_eq!(wrapped.body.scope.rules_total, 1);
+    }
+
+    /// (F2, from #2374's review) M counts DISTINCT RULES, not
+    /// rule-bearing tasks. `crawl.json` declares two tasks per rule — a
+    /// `crawl.plan` and a `crawl.unit` grow template — so the
+    /// `task id -> rule` map holds two entries for one rule and
+    /// `declared.len()` rendered a single-rule run as "0 of 2 rules
+    /// reviewed", a denominator no rule count can ever reach.
+    ///
+    /// Red-proved by restoring `rules_total: declared.len()`: this asserts
+    /// 2 instead of 1.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn two_tasks_declaring_one_rule_count_as_one_rule() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        // The real shape: a plan task and a unit template, distinct task
+        // ids, the SAME rule.
+        let config: crate::mission_config::MissionConfig = serde_json::from_value(serde_json::json!({
+            "id": "crawl", "name": "Crawl",
+            "phases": [{
+                "id": "plan",
+                "tasks": [
+                    { "id": "plan-intent-vs-diff",
+                      "steps": [{"id": "s-plan", "kind": "plan.sites",
+                                 "config": {"rule": "intent-vs-diff"}}] },
+                    { "id": "unit-intent-vs-diff",
+                      "steps": [{"id": "s-unit", "kind": "crawl.unit",
+                                 "config": {"rule": "intent-vs-diff"}}] },
+                ],
+            }],
+        }))
+        .unwrap();
+        crate::lifecycle::save_config_snapshot(MISSION, &config).unwrap();
+
+        let outcome = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped =
+            crate::step_output::Output::<GatherOutput>::read(&outcome.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert_eq!(
+            wrapped.body.scope.rules_total, 1,
+            "two tasks naming one rule is ONE rule in the denominator: {:?}",
+            wrapped.body.scope
+        );
     }
 
     #[test]

@@ -214,6 +214,18 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Bounded {
                     // left behind and nothing else. Output already drained
                     // is kept: the snapshot below reads what the buffers
                     // hold, which is everything written before the kill.
+                    //
+                    // (F2) Signaling `-pid` is still safe even though
+                    // `try_wait` just REAPED that pid: a process-group id
+                    // stays reserved for as long as any process remains in
+                    // the group, so the kernel cannot recycle this pgid onto
+                    // an unrelated process while the very holder that is
+                    // keeping the pipe open sits in it. The reaped leader is
+                    // what makes the group's id available to us; the live
+                    // holder is what keeps it from meaning anything else. If
+                    // the group had in fact emptied between the two, the
+                    // signal fails with ESRCH and reaches nothing — so the
+                    // window is a no-op, not a mis-target.
                     kill_group(pid);
                 }
                 break Bounded::Finished {

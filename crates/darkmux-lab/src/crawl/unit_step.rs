@@ -1181,7 +1181,11 @@ impl StepKind for CrawlUnitStepKind {
         let mut total_completion_tokens = 0u64;
         let mut total_findings = 0u64;
         let mut total_rejected = 0u64;
-        let mut all_finding_refs: Vec<FindingRef> = Vec::new();
+        // (F2, from #2374's review) Each ref is tagged with the DRAW it
+        // came from, because "same window, same draw" and "same window,
+        // different draw" are opposite facts and the untagged union could
+        // not tell them apart. See `dedup_across_draws`.
+        let mut all_finding_refs: Vec<(usize, FindingRef)> = Vec::new();
         let mut last_result = String::new();
         let mut last_model: Option<String> = None;
         let mut last_detections = None;
@@ -1294,7 +1298,7 @@ impl StepKind for CrawlUnitStepKind {
             total_completion_tokens += completion_tokens;
             total_findings += findings as u64;
             total_rejected += exclusions as u64;
-            all_finding_refs.extend(finding_refs);
+            all_finding_refs.extend(finding_refs.into_iter().map(|r| (draw, r)));
             last_result = result.clone();
             last_model = model.clone();
             last_detections = detections;
@@ -1402,35 +1406,49 @@ impl StepKind for CrawlUnitStepKind {
 /// finding whose `file`/`line` is absent (a rare, non-windowed report)
 /// dedups on `(rule, None, None)`, which still merges two IDENTICAL
 /// windowless reports of the same rule rather than doubling them.
-/// (#2310 fix-loop E2, S1-4) Dedup, but ONLY when there was more than one
-/// draw to dedup across.
+/// (#2310 fix-loop E2, S1-4) Dedup ACROSS draws — and only across draws.
 ///
-/// The key [`dedup_finding_refs`] collapses on — `(rule, file, line)` — is
-/// what two DRAWS share when they independently re-observe one issue. It is
-/// also what two GENUINELY DIFFERENT findings share when a single draw
-/// reports two problems on the same line, which is an ordinary shape for a
-/// reviewer role (an unnamed predicate and a swallowed error can sit on one
-/// statement). Applied unconditionally, the second of those was silently
+/// The key this collapses on — `(rule, file, line)` — is what two DRAWS
+/// share when they independently re-observe one issue. It is also what two
+/// GENUINELY DIFFERENT findings share when a SINGLE draw reports two
+/// problems on the same line, which is an ordinary shape for a reviewer
+/// role (an unnamed predicate and a swallowed error can sit on one
+/// statement). Applied to the flat union, the second of those was silently
 /// discarded: `create-mods` grows one coder task per `finding_refs` entry,
 /// so the finding stayed in the store, never got a mod, and never reached
-/// the review. Gating on `draws > 1` keeps the cross-draw merge the knob
-/// exists for and stops it eating within-draw findings — a single-draw run
-/// (the default, and every run before the knob existed) now passes its refs
-/// through untouched, which is also what makes `draws: 1` byte-identical as
-/// this module's own docs claim.
-fn dedup_across_draws(draws: usize, refs: Vec<FindingRef>) -> Vec<FindingRef> {
+/// the review.
+///
+/// (F2, from #2374's review) E2 fixed that by gating the whole dedup on
+/// `draws > 1`, which left the same bug alive at every draw count the knob
+/// actually exists for: at `draws: 2` two distinct findings draw 0 reported
+/// on one line were still collapsed into one. The gate was never the real
+/// discriminator — the DRAW INDEX is. Each ref now carries the draw it came
+/// from, and a ref is dropped only when its window was already reported in
+/// an EARLIER draw:
+///
+/// * two distinct findings at one `file:line` in draw 0 → both survive
+///   (same draw, so neither is a re-observation of the other);
+/// * the same window seen again in draw 1 → dropped, which is exactly the
+///   cross-draw merge the k-draw recall technique wants;
+/// * a window first seen in draw 2, twice → both survive, for the same
+///   reason as the first case.
+///
+/// The `draws <= 1` early return is now redundant (with one draw every ref
+/// is in its own first draw) and is kept as an explicit statement that the
+/// default path is untouched — `draws: 1` stays byte-identical, as this
+/// module's own docs claim.
+fn dedup_across_draws(draws: usize, refs: Vec<(usize, FindingRef)>) -> Vec<FindingRef> {
     if draws <= 1 {
-        return refs;
+        return refs.into_iter().map(|(_, r)| r).collect();
     }
-    dedup_finding_refs(refs)
-}
-
-fn dedup_finding_refs(refs: Vec<FindingRef>) -> Vec<FindingRef> {
-    let mut seen: std::collections::BTreeSet<(String, Option<String>, Option<u64>)> = std::collections::BTreeSet::new();
+    // key -> the FIRST draw index that reported it. Every ref from that
+    // draw is kept; a later draw repeating the window is the duplicate.
+    let mut first_draw: std::collections::BTreeMap<(String, Option<String>, Option<u64>), usize> =
+        std::collections::BTreeMap::new();
     let mut out = Vec::with_capacity(refs.len());
-    for r in refs {
+    for (draw, r) in refs {
         let finding_key = (r.rule.clone(), r.file.clone(), r.line);
-        if seen.insert(finding_key) {
+        if *first_draw.entry(finding_key).or_insert(draw) == draw {
             out.push(r);
         }
     }
