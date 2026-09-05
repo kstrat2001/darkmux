@@ -12,13 +12,75 @@
 //! option (`MaterializeOptions.read_only`) rather than unconditional —
 //! `sources::resolve` always locked the tree; a generic mission input
 //! shouldn't assume every consumer wants that.
+//!
+//! **The mirror is darkmux-owned cache state, and it is checked before it
+//! is trusted (#2399).** Existence used to be the only test: `if
+//! !mirror_path.exists() { clone } else { fetch }`. On 2026-09-05 a live
+//! bake-off found a NON-bare repo sitting at a mirror path (HEAD on
+//! `main`, most likely an external `git` run inside the cache), and every
+//! `plan.sites` step died on `fatal: refusing to fetch into branch
+//! 'refs/heads/main' checked out at ...`. So a mirror that already exists
+//! is now verified — `git rev-parse --is-bare-repository` must say `true`
+//! and `remote.origin.url` must be the spec's own origin — and a mirror
+//! that fails either check is MOVED ASIDE to
+//! `<mirror>.corrupt-<unix-ts>` (moved, never deleted: it is evidence),
+//! announced on stderr in one loud line naming the path and the defect,
+//! and re-cloned from the origin the spec names. darkmux never fetches
+//! into a repository that failed the check.
+//!
+//! **One workspace materializes at a time (#2399).** Since #2397 the
+//! NoModel track runs its `plan.sites` steps 8-wide, so N `materialize`
+//! calls now hit one workspace's mirror and tree at once; before, they
+//! were only accidentally serialized. Every call takes an advisory
+//! `flock(2)` (`LOCK_EX`) on `<root>/.materialize.lock` — created if
+//! absent, never read or written. `flock` is per open-file-description,
+//! so threads in one process serialize against each other exactly as
+//! separate processes do. Non-Unix targets get a no-op lock and are
+//! documented as unsupported for concurrent materialization — the same
+//! POSIX-only posture the audit flow sink takes.
+//!
+//! **What the lock actually covers, precisely.** Not "the call": the
+//! guard is RETURNED, inside [`Materialized::lock`], and lives as long as
+//! that value does. It has to. `materialize` hands back paths, and both
+//! real callers (`crawl::plan_step`, `crawl::plan_sites_step` →
+//! `crawl::plan`) then read every file in the trees it named. Releasing
+//! at the return would leave a peer free to `remove_dir_all` those trees
+//! mid-walk, and `crawl::plan` records a failed read as
+//! `skipped: "stat error ..."` rather than failing — so the visible
+//! symptom would be a crawl that silently covered less than it claimed.
+//! The cost is stated in [`WorkspaceLock`]'s own doc: the lock is
+//! exclusive, so steps sharing ONE workspace no longer overlap, and a
+//! caller must drop the value rather than hold two of them.
+//!
+//! Work another holder already finished is not redone, in two places.
+//! The mirror existence + health checks all run AFTER the lock is
+//! acquired, and a `fetch` whose generation counter advanced while this
+//! call sat blocked on the lock is skipped (see [`fetch_is_redundant`]).
+//! The skip deliberately keys on that counter rather than on "the
+//! resolved sha already matches the tree" — without a fetch the mirror
+//! resolves the ref to the OLD sha by definition, so sha-equality would
+//! leave a mirror permanently stale and break the documented "a second
+//! materialize advances onto a new commit" contract. Separately, the
+//! WORKTREE teardown + re-add is skipped when the tree is already this
+//! mirror's worktree at the resolved sha with nothing modified or added
+//! ([`tree_is_reusable`]) — pristine by inspection rather than by
+//! rebuilding, so a peer's turn after the lock is cheap. A tree anyone
+//! has written into is still torn down and rebuilt, exactly as before.
 
 use super::{SourceSpec, WorkspaceSpec};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, OnceLock};
+
+/// The advisory lock file that serializes materialization of ONE
+/// workspace root (#2399). Created on demand, never read or written —
+/// only `flock`ed.
+const LOCK_FILE_NAME: &str = ".materialize.lock";
 
 #[derive(Debug, Clone, Copy)]
 pub struct MaterializeOptions {
@@ -51,7 +113,9 @@ pub struct SkippedFile {
     pub reason: String,
 }
 
-#[derive(Debug, Clone)]
+/// NOT `Clone`: it owns the workspace lock (`lock` below), and a lock
+/// guard that can be duplicated is not a lock.
+#[derive(Debug)]
 pub struct Materialized {
     /// (#1959) The spec's own `effective_name()`, carried here so a
     /// consumer (the crawl planner) has everything it needs from ONE
@@ -69,6 +133,23 @@ pub struct Materialized {
     /// Per source: files the spec\'s include/exclude left out — out of scope,
     /// counted, never listed (#1959).
     pub out_of_scope: std::collections::BTreeMap<String, usize>,
+    /// (#2399) The workspace lock, held for as long as this value is —
+    /// because a caller that holds a `Materialized` goes on to READ the
+    /// trees it names, and a peer `materialize` would otherwise tear those
+    /// trees down mid-read. `None` only in tests that build the struct
+    /// directly from already-resolved sources.
+    ///
+    /// Consequence worth stating: **dropping this value releases the
+    /// workspace.** Keep it alive for exactly as long as you read the
+    /// trees, and no longer.
+    ///
+    /// The field is `pub` only because `darkmux-lab`'s plan tests build a
+    /// `Materialized` from already-resolved sources (with `lock: None`).
+    /// `take()`-ing it out of a REAL one releases the workspace while the
+    /// paths in `sources`/`files` are still held and still being read —
+    /// which is precisely the failure this field exists to prevent. Drop
+    /// the whole value instead.
+    pub lock: Option<WorkspaceLock>,
 }
 
 /// Resolve every source in the spec, then walk + filter each tree.
@@ -81,10 +162,41 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
     fs::create_dir_all(&tree_root)
         .with_context(|| format!("creating tree dir {}", tree_root.display()))?;
 
+    // (#2399) Read each source's fetch generation BEFORE blocking on the
+    // lock. If it has advanced by the time we hold the lock, a peer
+    // completed a clone/fetch for that exact (mirror, ref) while we were
+    // queued behind it and ours would be redundant. Keys are built off the
+    // CANONICAL mirror root so they match the ones `resolve_one` computes
+    // from its `contained_child` path — a `?` rather than a silent
+    // fallback (#2399 review), because a key that diverged from
+    // `resolve_one`'s would cause a SPURIOUS fetch skip, not a loud error.
+    let canon_mirror_root = mirror_root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing mirror dir {}", mirror_root.display()))?;
+    let gens_before: Vec<u64> = spec
+        .sources
+        .iter()
+        .map(|s| {
+            fetch_generation(&fetch_key(
+                &canon_mirror_root.join(format!("{}.git", s.id)),
+                s.resolved_ref(),
+            ))
+        })
+        .collect();
+
+    // Held for the whole call — clone/fetch, checkout, the walk below —
+    // and then handed to the caller inside `Materialized`, which is what
+    // keeps it held while the caller READS the trees (#2399 review).
+    let canon_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
+    let lock = WorkspaceLock::acquire(&canon_root)?;
+
     let sources: Vec<MaterializedSource> = spec
         .sources
         .iter()
-        .map(|s| resolve_one(s, &mirror_root, &tree_root, opts))
+        .zip(gens_before)
+        .map(|(s, gen_before)| resolve_one(s, &mirror_root, &tree_root, opts, gen_before))
         .collect::<Result<_>>()?;
 
     let include = spec.effective_include();
@@ -107,6 +219,7 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
         files,
         skipped,
         out_of_scope,
+        lock: Some(lock),
     })
 }
 
@@ -115,6 +228,9 @@ fn resolve_one(
     mirror_root: &Path,
     tree_root: &Path,
     opts: MaterializeOptions,
+    // This call's fetch generation for this source, read BEFORE it blocked
+    // on the workspace lock (#2399).
+    gen_before: u64,
 ) -> Result<MaterializedSource> {
     let fetch = opts.fetch;
     let origin = source
@@ -128,6 +244,32 @@ fn resolve_one(
         .with_context(|| format!("resolving mirror path for source '{}'", source.id))?;
     let tree_path = contained_child(tree_root, &source.id)
         .with_context(|| format!("resolving tree path for source '{}'", source.id))?;
+
+    // (#2399) The mirror is darkmux-owned cache state, so an existing one
+    // is VERIFIED before it is trusted — bare, and pointing at the origin
+    // this spec names. A mirror that fails either check is quarantined and
+    // re-cloned; darkmux never fetches into a repository that failed.
+    if mirror_path.exists() {
+        if let Some(defect) = mirror_defect(&mirror_path, origin) {
+            // (#2399 review) Quarantine ONLY when a re-clone can follow it.
+            // A `git`-origin mirror under --no-fetch cannot be rebuilt
+            // offline, so moving it aside there would strand the operator
+            // with neither a mirror nor a way to make one. Refuse instead,
+            // and say plainly that nothing was moved.
+            if !fetch && source.git.is_some() {
+                bail!(
+                    "mirror for source '{}' at {} failed its self-check ({defect}); it was left in place \
+                     because re-cloning it needs the network — run without --no-fetch once to quarantine \
+                     and rebuild it",
+                    source.id,
+                    mirror_path.display()
+                );
+            }
+            quarantine_mirror(&mirror_path, &source.id, &defect)?;
+        }
+    }
+
+    let generation_key = fetch_key(&mirror_path, source.resolved_ref());
 
     if !mirror_path.exists() {
         // --no-fetch promises "fully offline against whatever's already
@@ -164,12 +306,14 @@ fn resolve_one(
             &["config", "--add", "remote.origin.fetch", "+refs/tags/*:refs/tags/*"],
             &format!("configuring tag fetch refspec for source '{}'", source.id),
         )?;
-    } else if fetch {
+        bump_fetch_generation(&generation_key);
+    } else if fetch && !fetch_is_redundant(gen_before, fetch_generation(&generation_key)) {
         run_git(
             Some(&mirror_path),
             &["fetch", "--prune", "--prune-tags", "origin"],
             &format!("fetching source '{}'", source.id),
         )?;
+        bump_fetch_generation(&generation_key);
     }
 
     let git_ref = source.resolved_ref();
@@ -197,6 +341,25 @@ fn resolve_one(
         // check and `contained_child` above.
         assert_direct_child(tree_root, &tree_path, &format!("tree path for source '{}'", source.id))?;
         assert_direct_child(mirror_root, &mirror_path, &format!("mirror path for source '{}'", source.id))?;
+        // (#2399 review) A tree that is already this mirror's worktree, at
+        // this exact sha, with nothing modified or added, is byte-identical
+        // to what the teardown + re-add below would produce — so skip them.
+        // That is what makes a peer's re-entry after the lock cheap, and it
+        // never costs the pristine-tree guarantee: `tree_is_reusable`
+        // refuses anything dirty (see the test that scribbles in a tree).
+        if tree_is_reusable(&tree_path, &mirror_path, &sha) {
+            if opts.read_only {
+                make_tree_read_only(&tree_path)?;
+            } else {
+                make_tree_writable(&tree_path)?;
+            }
+            return Ok(MaterializedSource {
+                id: source.id.clone(),
+                sha,
+                git_ref: git_ref.to_string(),
+                tree: tree_path,
+            });
+        }
         // The prior checkout may have been made read-only — restore write
         // access before `git worktree remove`/`remove_dir_all` need it.
         make_tree_writable(&tree_path)?;
@@ -229,6 +392,357 @@ fn resolve_one(
     }
 
     Ok(MaterializedSource { id: source.id.clone(), sha, git_ref: git_ref.to_string(), tree: tree_path })
+}
+
+/// The advisory per-workspace lock (#2399): an exclusive `flock(2)` on
+/// `<root>/.materialize.lock`, released when the LAST guard for that root
+/// drops (including on an early `?` return, and on process exit when the
+/// fd is closed).
+///
+/// `flock` locks the open file DESCRIPTION, not the process, so two
+/// threads in one process that each open the file conflict with each other
+/// exactly as two processes do — which is the case #2397's 8-wide NoModel
+/// track actually produces.
+///
+/// **Re-entrant within one thread.** Since `Materialized` carries this
+/// guard (#2399 review), a plain `flock` would turn the ordinary sequence
+/// `let a = materialize(spec); let b = materialize(spec);` into a silent,
+/// permanent hang — the same thread blocking on a lock it already holds
+/// through a second file description. So a per-root registry records the
+/// owning thread and a depth: a re-entry from the OWNING thread takes a
+/// depth ticket and no new `flock`, while any other thread (or process)
+/// still blocks. The `File` lives in the registry rather than in the
+/// guard, so the `flock` is released exactly when the depth reaches zero,
+/// whatever order the guards happen to drop in.
+///
+/// **It is `!Send`, deliberately (#2399 review).** The re-entrancy
+/// registry keys on the ACQUIRING thread, so a guard that MOVED to
+/// another thread would still be re-enterable by the thread that made it
+/// — a probe measured exactly that: thread P materialized, handed the
+/// value to thread H, materialized again in 216 ms while H was still
+/// reading, and tore the tree down under it. No caller does this today
+/// (both create and drop within one function), so rather than pay for a
+/// cross-thread ownership handoff, the type refuses to travel:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<darkmux_crew::workspace_spec::WorkspaceLock>();
+/// ```
+///
+/// `Materialized` inherits this — it owns one — so the whole value stays
+/// on the thread that materialized it.
+///
+/// **The consequence, stated plainly.** The lock is EXCLUSIVE for the
+/// whole life of the `Materialized`, so N steps materializing ONE
+/// workspace now run one after another, reads included — #2397's 8-wide
+/// `plan.sites` track no longer overlaps ON A SINGLE WORKSPACE (different
+/// workspaces are unaffected). That is the price of a read that cannot be
+/// torn down mid-walk. Holding TWO guards for one workspace on two
+/// threads at once therefore deadlocks; a caller takes what it needs and
+/// drops the value. A shared read lock (downgrade to `LOCK_SH` once the
+/// git work is done, with a fast path for "already at this sha") would
+/// restore the overlap and is the obvious follow-up — it is deliberately
+/// not in this packet, because it needs its own concurrency tests.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct WorkspaceLock {
+    /// The canonical workspace root this guard holds a ticket on.
+    key: PathBuf,
+    /// Makes the guard — and every `Materialized` that owns one — `!Send`.
+    /// See the type doc: the re-entrancy registry keys on the ACQUIRING
+    /// thread, so a guard that traveled would let its birth thread re-enter
+    /// past a holder on another thread. A raw pointer is the standard way
+    /// to spell this; nothing is ever read through it.
+    not_send: PhantomData<*const ()>,
+}
+
+#[cfg(unix)]
+struct HeldWorkspace {
+    owner: std::thread::ThreadId,
+    depth: usize,
+    /// Dropping this closes the fd, which releases the `flock`.
+    file: fs::File,
+}
+
+#[cfg(unix)]
+fn held_workspaces() -> &'static Mutex<HashMap<PathBuf, HeldWorkspace>> {
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, HeldWorkspace>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+impl WorkspaceLock {
+    /// `root` must already be canonical — the registry keys on it, and two
+    /// spellings of one directory must not look like two workspaces.
+    fn acquire(root: &Path) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let key = root.to_path_buf();
+
+        // Re-entry from the owning thread: a depth ticket, no new flock.
+        {
+            let mut held = held_workspaces().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = held.get_mut(&key) {
+                if entry.owner == std::thread::current().id() {
+                    entry.depth += 1;
+                    return Ok(Self { key, not_send: PhantomData });
+                }
+            }
+        }
+
+        // Anyone else waits. The registry mutex is NOT held across the
+        // blocking flock — holding it there would stall every other
+        // workspace in the process behind this one.
+        let path = root.join(LOCK_FILE_NAME);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening workspace lock {}", path.display()))?;
+        loop {
+            // SAFETY: `file` owns the fd for the whole call.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            // A signal can interrupt a blocking flock; that is not a
+            // failure to lock, it is a reason to ask again.
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(anyhow::Error::new(err)
+                .context(format!("locking workspace lock {}", path.display())));
+        }
+
+        let mut held = held_workspaces().lock().unwrap_or_else(|e| e.into_inner());
+        held.insert(key.clone(), HeldWorkspace { owner: std::thread::current().id(), depth: 1, file });
+        Ok(Self { key, not_send: PhantomData })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        let mut held = held_workspaces().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = held.get_mut(&self.key) else { return };
+        entry.depth -= 1;
+        if entry.depth > 0 {
+            return;
+        }
+        // Last ticket: unlock explicitly, then drop the entry (whose
+        // `File` close would release it anyway).
+        unsafe {
+            libc::flock(entry.file.as_raw_fd(), libc::LOCK_UN);
+        }
+        held.remove(&self.key);
+    }
+}
+
+/// Non-Unix targets get no lock: `flock(2)` is POSIX, and darkmux is
+/// POSIX-only elsewhere too (the audit flow sink, `bounded_command`'s
+/// process groups). Concurrent materialization of ONE workspace is
+/// therefore unsupported off Unix; a single materialize is unaffected.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct WorkspaceLock {
+    /// Same `!Send` contract as the Unix guard, so the type behaves
+    /// identically on every target even where it locks nothing.
+    not_send: PhantomData<*const ()>,
+}
+
+#[cfg(not(unix))]
+impl WorkspaceLock {
+    fn acquire(_root: &Path) -> Result<Self> {
+        Ok(Self { not_send: PhantomData })
+    }
+}
+
+/// True when `tree_path` is ALREADY this mirror's worktree, checked out at
+/// `sha`, with nothing modified, deleted or added — the only state in
+/// which skipping the teardown + re-add produces the same bytes as doing
+/// it (#2399 review). Anything it cannot prove (a git that errors, a
+/// worktree belonging to a different mirror, a dirty tree) answers `false`
+/// and falls back to the rebuild, so the safe direction is the default.
+fn tree_is_reusable(tree_path: &Path, mirror_path: &Path, sha: &str) -> bool {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git").current_dir(tree_path).args(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    if git(&["rev-parse", "HEAD"]).as_deref() != Some(sha) {
+        return false;
+    }
+    // It must be a worktree of THIS mirror, not a stale directory left by
+    // some other repository that happens to sit at the same sha.
+    let (Some(git_dir), Ok(canon_mirror)) = (git(&["rev-parse", "--absolute-git-dir"]), mirror_path.canonicalize())
+    else {
+        return false;
+    };
+    match Path::new(&git_dir).canonicalize() {
+        Ok(canon_git_dir) if canon_git_dir.starts_with(&canon_mirror) => {}
+        _ => return false,
+    }
+    // `--porcelain` prints one line per changed path and nothing at all
+    // for a pristine tree; `--untracked-files=all` makes an added file
+    // count, which is what the teardown used to remove.
+    matches!(git(&["status", "--porcelain", "--untracked-files=all"]).as_deref(), Some(""))
+}
+
+/// What a mirror self-check found wrong, phrased for the operator — or
+/// `None` when the mirror is a bare clone of the origin this spec names
+/// (#2399).
+fn mirror_defect(mirror_path: &Path, origin: &str) -> Option<String> {
+    match Command::new("git")
+        .current_dir(mirror_path)
+        .args(["rev-parse", "--is-bare-repository"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if answer != "true" {
+                return Some(format!(
+                    "it is not a bare repository (git rev-parse --is-bare-repository said '{answer}')"
+                ));
+            }
+        }
+        Ok(out) => {
+            return Some(format!(
+                "git cannot read it as a repository ({})",
+                stderr_of(&out).replace('\n', " ")
+            ))
+        }
+        Err(e) => return Some(format!("git rev-parse could not run against it ({e})")),
+    }
+
+    let configured = match Command::new("git")
+        .current_dir(mirror_path)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => String::new(),
+    };
+    if !same_origin(&configured, origin) {
+        let shown = if configured.is_empty() { "<unset>" } else { configured.as_str() };
+        return Some(format!(
+            "its remote.origin.url is '{shown}', not this spec's origin '{origin}'"
+        ));
+    }
+    None
+}
+
+/// `git clone` records a `path` origin verbatim, so the string compare
+/// answers almost every case. Two fallbacks behind it, in order:
+///
+/// 1. **Both sides are real local paths** — canonicalize and compare. This
+///    covers a symlinked temp root (`/var` vs `/private/var` on macOS) and
+///    is DECISIVE: two directories that canonicalize differently are two
+///    different origins, and `/a/repo` is not `/a/repo.git` just because
+///    one name ends in `.git`. The url normalization below never runs on
+///    that pair.
+/// 2. **Otherwise, remote-url normalization** — [`normalize_remote_url`].
+fn same_origin(configured: &str, origin: &str) -> bool {
+    if configured == origin {
+        return true;
+    }
+    if configured.is_empty() {
+        return false;
+    }
+    if let (Ok(a), Ok(b)) = (Path::new(configured).canonicalize(), Path::new(origin).canonicalize()) {
+        return a == b;
+    }
+    normalize_remote_url(configured) == normalize_remote_url(origin)
+}
+
+/// Trim the two decorations git itself treats as noise on a remote url: a
+/// trailing `/`, and a trailing `.git`. TRANSPORT IS NEVER NORMALIZED —
+/// `git@host:o/r.git` and `https://host/o/r.git` name the same upstream
+/// but are different access paths with different credentials, and a mirror
+/// configured for one is not silently the other (#2399 review).
+fn normalize_remote_url(url: &str) -> &str {
+    let trimmed = url.trim_end_matches('/');
+    match trimmed.strip_suffix(".git") {
+        Some(base) => base.trim_end_matches('/'),
+        None => trimmed,
+    }
+}
+
+/// Move a mirror that failed [`mirror_defect`] aside to
+/// `<mirror>.corrupt-<unix-ts>` and say so, loudly, in one line naming the
+/// path and what was wrong (#2399). MOVED, never deleted: a corrupted
+/// mirror is the evidence for whatever wrote into it.
+///
+/// stderr is the honest floor here — `materialize` is handed a spec and
+/// options, not a flow sink, and inventing a global one to carry a warning
+/// would be a bigger change than the warning is worth.
+fn quarantine_mirror(mirror_path: &Path, source_id: &str, defect: &str) -> Result<()> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut aside = PathBuf::from({
+        let mut s = mirror_path.as_os_str().to_os_string();
+        s.push(format!(".corrupt-{ts}"));
+        s
+    });
+    // Two quarantines within one second must not collide.
+    let mut n = 1u32;
+    while aside.exists() {
+        aside = PathBuf::from({
+            let mut s = mirror_path.as_os_str().to_os_string();
+            s.push(format!(".corrupt-{ts}-{n}"));
+            s
+        });
+        n += 1;
+    }
+    fs::rename(mirror_path, &aside).with_context(|| {
+        format!("moving corrupt mirror {} aside to {}", mirror_path.display(), aside.display())
+    })?;
+    eprintln!(
+        "[darkmux] WARNING: the mirror for source '{source_id}' at {} failed its self-check — {defect}. Moved aside to {} and re-cloning from the spec's origin. (#2399)",
+        mirror_path.display(),
+        aside.display()
+    );
+    Ok(())
+}
+
+/// Per-(mirror, ref) counter of completed clones/fetches, used only to
+/// recognize work a peer finished while this call was blocked on the
+/// workspace lock. In-process by design: #2397's concurrency is threads in
+/// one process, and a cross-process peer costs at worst one redundant
+/// fetch, never a wrong answer.
+fn fetch_generations() -> &'static Mutex<HashMap<String, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fetch_key(mirror_path: &Path, git_ref: &str) -> String {
+    format!("{}\u{0}{git_ref}", mirror_path.display())
+}
+
+fn fetch_generation(key: &str) -> u64 {
+    fetch_generations().lock().map(|m| m.get(key).copied().unwrap_or(0)).unwrap_or(0)
+}
+
+fn bump_fetch_generation(key: &str) {
+    if let Ok(mut m) = fetch_generations().lock() {
+        *m.entry(key.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Skip this call's fetch iff the generation advanced BETWEEN the read
+/// taken before we queued on the lock and the read taken while holding it
+/// — i.e. a peer clone/fetch for this exact (mirror, ref) landed while we
+/// waited. A sequential second call never sees this (nothing runs between
+/// its two reads), so "a second materialize advances onto a new commit"
+/// still holds.
+fn fetch_is_redundant(gen_before: u64, gen_now: u64) -> bool {
+    gen_now > gen_before
 }
 
 /// Compute `root/name`, refusing unless `name` is a single, non-escaping
@@ -798,4 +1312,498 @@ mod tests {
         let skip = m.skipped.iter().find(|s| s.relative_path == "link.txt").expect("symlink recorded as skipped");
         assert!(skip.reason.contains("symlink"), "{skip:?}");
     }
+
+    // ── #2399: the per-workspace lock + the mirror self-check ──
+
+    /// Every `<root>/mirror/*.corrupt-*` sibling the healing path left
+    /// behind — the observable proof a mirror was quarantined.
+    fn corrupt_siblings(root: &Path) -> Vec<String> {
+        let mirror = root.join("mirror");
+        let Ok(rd) = fs::read_dir(&mirror) else { return Vec::new() };
+        rd.filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".corrupt-"))
+            .collect()
+    }
+
+    /// (#2399) Six concurrent `materialize` calls on ONE spec — the shape
+    /// `plan.sites` takes since #2397 made the NoModel track 8-wide. Red
+    /// before the lock: every thread sees `!mirror_path.exists()` at the
+    /// same instant and six `git clone --bare` runs collide on one
+    /// destination.
+    #[test]
+    fn concurrent_materialize_of_one_spec_serializes_on_the_workspace_lock() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = std::sync::Arc::new(spec_for("t-race", workdir.path(), source.path(), "main"));
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let spec = std::sync::Arc::clone(&spec);
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    // Take the sha and DROP the value inside the thread:
+                    // `Materialized` owns the workspace lock (#2399 review),
+                    // so holding six of them for one workspace at once would
+                    // deadlock by construction — which is the contract, not
+                    // an accident. See `WorkspaceLock`'s doc.
+                    materialize(&spec, RW).map(|m| m.sources[0].sha.clone())
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let mut shas = std::collections::BTreeSet::new();
+        for r in &results {
+            let sha = r.as_ref().unwrap_or_else(|e| panic!("every concurrent materialize must succeed: {e:#}"));
+            shas.insert(sha.clone());
+        }
+        assert_eq!(shas.len(), 1, "the tree must end pinned at exactly one sha: {shas:?}");
+
+        let mirrors: Vec<_> = fs::read_dir(workdir.path().join("mirror"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(mirrors, vec!["app.git".to_string()], "exactly one mirror: {mirrors:?}");
+        assert!(
+            corrupt_siblings(workdir.path()).is_empty(),
+            "a clean concurrent run must never quarantine a mirror: {:?}",
+            corrupt_siblings(workdir.path())
+        );
+    }
+
+    /// (#2399) The live failure: a NON-bare repo sitting at the mirror
+    /// path. Red before the self-check — `git fetch` inside it dies with
+    /// "refusing to fetch into branch 'refs/heads/main' checked out at
+    /// ...", every plan step, forever.
+    #[test]
+    fn a_non_bare_repo_at_the_mirror_path_is_quarantined_and_recloned() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let mirror_dir = workdir.path().join("mirror");
+        fs::create_dir_all(&mirror_dir).unwrap();
+        let bad = mirror_dir.join("app.git");
+        fs::create_dir_all(&bad).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git").current_dir(&bad).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "test"]);
+        fs::write(bad.join("junk.txt"), "junk\n").unwrap();
+        run(&["add", "junk.txt"]);
+        run(&["commit", "-q", "-m", "not a mirror"]);
+        // Wired to the real origin with the mirror's own refspec, so with
+        // the bareness check mutated away this fixture reproduces the LIVE
+        // 2026-09-05 failure verbatim: `fatal: refusing to fetch into
+        // branch 'refs/heads/main' checked out at ...`.
+        run(&["remote", "add", "origin", &source.path().to_string_lossy()]);
+        run(&["config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"]);
+
+        let spec = spec_for("t-nonbare", workdir.path(), source.path(), "main");
+        let m = materialize(&spec, RW).unwrap_or_else(|e| panic!("materialize must heal a non-bare mirror: {e:#}"));
+        assert!(m.sources[0].tree.join("a.txt").exists(), "the re-cloned mirror must carry the real source");
+        assert!(!m.sources[0].tree.join("junk.txt").exists(), "the quarantined repo must not be the source");
+
+        let quarantined = corrupt_siblings(workdir.path());
+        assert_eq!(quarantined.len(), 1, "the bad mirror must be moved aside: {quarantined:?}");
+        assert!(quarantined[0].starts_with("app.git.corrupt-"), "{quarantined:?}");
+        assert!(
+            workdir.path().join("mirror").join(&quarantined[0]).join("junk.txt").exists(),
+            "quarantine MOVES the directory aside — it never deletes it"
+        );
+
+        let bare = Command::new("git")
+            .current_dir(workdir.path().join("mirror").join("app.git"))
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&bare.stdout).trim(), "true");
+    }
+
+    /// (#2399) A mirror whose `remote.origin.url` points somewhere else —
+    /// the same quarantine-and-reclone path. Red before the self-check:
+    /// `git fetch origin` reaches for the wrong (here unreachable) origin.
+    #[test]
+    fn a_mirror_with_a_foreign_origin_is_quarantined_and_recloned() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-foreign", workdir.path(), source.path(), "main");
+
+        let first = materialize(&spec, RW).unwrap();
+        let sha = first.sources[0].sha.clone();
+
+        let mirror = workdir.path().join("mirror").join("app.git");
+        let out = Command::new("git")
+            .current_dir(&mirror)
+            .args(["config", "remote.origin.url", "https://example.invalid/not-ours.git"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let m = materialize(&spec, RW).unwrap_or_else(|e| panic!("materialize must heal a foreign-origin mirror: {e:#}"));
+        assert_eq!(m.sources[0].sha, sha, "the re-clone resolves the same ref to the same sha");
+
+        let quarantined = corrupt_siblings(workdir.path());
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        let url = Command::new("git")
+            .current_dir(&mirror)
+            .args(["config", "--get", "remote.origin.url"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&url.stdout).trim(),
+            source.path().to_string_lossy(),
+            "the healed mirror points at the spec's own origin"
+        );
+    }
+
+    /// (#2399) The fetch-coalescing predicate, unit-tested directly — the
+    /// concurrency test above can't pin down WHICH thread skipped, but the
+    /// rule itself is a two-line decision and deserves its own red.
+    #[test]
+    fn fetch_is_skipped_only_when_a_peer_fetched_while_we_waited() {
+        assert!(!fetch_is_redundant(0, 0), "nobody fetched while we waited — fetch");
+        assert!(fetch_is_redundant(0, 1), "a peer completed a clone/fetch while we were blocked — skip");
+        assert!(fetch_is_redundant(7, 9), "two peers went ahead of us — skip");
+        assert!(!fetch_is_redundant(3, 3), "a sequential second call must still fetch (a new commit may exist)");
+    }
+
+
+
+    // ── #2399 second round: the guard's lifetime, tree reuse, and the
+    //    --no-fetch/quarantine ordering ──
+
+    /// (#2399 review MUST FIX) The lock has to outlive `materialize`'s
+    /// RETURN, because both real callers read the tree afterwards
+    /// (`crawl/plan_step.rs`, `crawl/plan_sites_step.rs` → `plan.rs`'s
+    /// per-file `fs::metadata`/`fs::read`). Red before `Materialized`
+    /// carried the guard: a peer's `materialize` tears `<root>/tree/<id>`
+    /// down under the reader, and `plan.rs` swallows the resulting errors
+    /// into `skipped: "stat error ..."` — a SILENT under-report of the
+    /// crawl's coverage, not a crash.
+    ///
+    /// The peer here materializes the SAME workspace at a DIFFERENT ref,
+    /// which is what forces a real teardown every round — a source that
+    /// moves, or two steps pinned differently, under one workspace root.
+    /// (An identical-ref peer would hit `tree_is_reusable` and never touch
+    /// the tree at all, so it could not red-prove anything about the lock.)
+    #[test]
+    fn a_reader_holding_the_materialized_value_keeps_the_workspace_locked() {
+        let source = init_source_repo();
+        let run = |args: &[&str]| {
+            let out = Command::new("git").current_dir(source.path()).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        // `v0` holds ONLY a.txt; `main` advances to carry twenty more, so a
+        // checkout swap genuinely removes the files the reader is reading.
+        run(&["tag", "v0"]);
+        for i in 0..20 {
+            fs::write(source.path().join(format!("f{i}.txt")), format!("payload {i}\n")).unwrap();
+        }
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "many"]);
+
+        let workdir = TempDir::new().unwrap();
+        let head_spec = std::sync::Arc::new(spec_for("t-reader", workdir.path(), source.path(), "main"));
+        let pinned_spec = std::sync::Arc::new(spec_for("t-reader", workdir.path(), source.path(), "v0"));
+        // Clone once up front so both threads race on an already-populated
+        // workspace — the shape a second `plan.sites` step arrives in.
+        drop(materialize(&head_spec, RW).unwrap());
+
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader = {
+            let spec = std::sync::Arc::clone(&head_spec);
+            let gate = std::sync::Arc::clone(&gate);
+            let reader_done = std::sync::Arc::clone(&reader_done);
+            std::thread::spawn(move || {
+                let m = materialize(&spec, RW).unwrap();
+                // Only release the peer once we hold the value.
+                gate.wait();
+                let tree = m.sources[0].tree.clone();
+                let files = m.files["app"].clone();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+                let mut errors: Vec<String> = Vec::new();
+                while std::time::Instant::now() < deadline {
+                    for rel in &files {
+                        if let Err(e) = fs::read(tree.join(rel)) {
+                            errors.push(format!("{rel}: {e}"));
+                        }
+                    }
+                }
+                reader_done.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(m);
+                errors
+            })
+        };
+
+        let rebuilder = {
+            let spec = std::sync::Arc::clone(&pinned_spec);
+            let gate = std::sync::Arc::clone(&gate);
+            let reader_done = std::sync::Arc::clone(&reader_done);
+            std::thread::spawn(move || {
+                gate.wait();
+                let mut rounds = 0;
+                while !reader_done.load(std::sync::atomic::Ordering::SeqCst) && rounds < 200 {
+                    materialize(&spec, RW).unwrap();
+                    rounds += 1;
+                }
+            })
+        };
+
+        let errors = reader.join().unwrap();
+        rebuilder.join().unwrap();
+        assert!(
+            errors.is_empty(),
+            "a reader holding its Materialized must never see the tree vanish under it ({} errors, first: {:?})",
+            errors.len(),
+            errors.first()
+        );
+    }
+
+    /// (#2399 review) A tree already checked out at the resolved sha, with
+    /// nothing modified, is REUSED — the inode of `<root>/tree/<id>`
+    /// survives. Red before the reuse check: `resolve_one` unconditionally
+    /// `remove_dir_all`s and re-`worktree add`s, so the directory is a new
+    /// one every call.
+    #[test]
+    fn an_unchanged_tree_at_the_resolved_sha_is_reused_not_torn_down() {
+        use std::os::unix::fs::MetadataExt;
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-reuse", workdir.path(), source.path(), "main");
+
+        let m1 = materialize(&spec, RW).unwrap();
+        let tree = m1.sources[0].tree.clone();
+        let ino1 = fs::metadata(&tree).unwrap().ino();
+        drop(m1);
+
+        let m2 = materialize(&spec, RW).unwrap();
+        let ino2 = fs::metadata(&m2.sources[0].tree).unwrap().ino();
+        assert_eq!(
+            ino1, ino2,
+            "an unchanged tree already at the resolved sha must be reused, not torn down and re-added"
+        );
+        assert!(m2.sources[0].tree.join("a.txt").exists());
+    }
+
+    /// (#2399 review) …but reuse never costs the pristine-tree guarantee:
+    /// a tree someone has written into is torn down and rebuilt, exactly
+    /// as before. This is the guard on the reuse check above.
+    #[test]
+    fn a_dirty_tree_is_still_torn_down_and_rebuilt_pristine() {
+        use std::os::unix::fs::MetadataExt;
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-dirty", workdir.path(), source.path(), "main");
+
+        let m1 = materialize(&spec, RW).unwrap();
+        let tree = m1.sources[0].tree.clone();
+        let ino1 = fs::metadata(&tree).unwrap().ino();
+        fs::write(tree.join("scribble.txt"), "someone wrote here\n").unwrap();
+        fs::write(tree.join("a.txt"), "and edited a tracked file\n").unwrap();
+        drop(m1);
+
+        let m2 = materialize(&spec, RW).unwrap();
+        let tree2 = m2.sources[0].tree.clone();
+        assert!(!tree2.join("scribble.txt").exists(), "an untracked file must not survive");
+        assert_eq!(fs::read_to_string(tree2.join("a.txt")).unwrap(), "hello\n", "a tracked edit must not survive");
+        assert_ne!(ino1, fs::metadata(&tree2).unwrap().ino(), "a dirty tree is rebuilt, not reused");
+    }
+
+    /// (#2399 review) Quarantine only when a re-clone can actually follow.
+    /// A `git`-origin mirror under `--no-fetch` cannot be re-cloned, so a
+    /// defective one is REFUSED with the mirror left exactly where it is —
+    /// moving it aside there would strand the operator with neither a
+    /// mirror nor a way to rebuild one offline.
+    #[test]
+    fn no_fetch_refuses_a_defective_git_origin_mirror_without_moving_it_aside() {
+        let workdir = TempDir::new().unwrap();
+        let mirror_dir = workdir.path().join("mirror");
+        fs::create_dir_all(&mirror_dir).unwrap();
+        let bad = mirror_dir.join("app.git");
+        fs::create_dir_all(&bad).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git").current_dir(&bad).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "test"]);
+        fs::write(bad.join("junk.txt"), "junk\n").unwrap();
+        run(&["add", "junk.txt"]);
+        run(&["commit", "-q", "-m", "not a mirror"]);
+
+        let json = serde_json::json!({
+            "name": "t-nofetch-defect",
+            "root": workdir.path().to_string_lossy(),
+            "sources": [{"id": "app", "git": "https://example.invalid/never-cloned.git", "ref": "main"}]
+        });
+        let spec: WorkspaceSpec = serde_json::from_value(json).unwrap();
+
+        let err = materialize(&spec, MaterializeOptions { fetch: false, read_only: false }).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--no-fetch"), "{msg}");
+        assert!(msg.contains("not a bare repository"), "the refusal names the defect: {msg}");
+        assert!(msg.contains("left in place"), "the refusal says the mirror was NOT moved: {msg}");
+        assert!(bad.join("junk.txt").exists(), "the mirror must be left exactly where it was");
+        assert!(
+            corrupt_siblings(workdir.path()).is_empty(),
+            "nothing may be quarantined when no re-clone can follow: {:?}",
+            corrupt_siblings(workdir.path())
+        );
+    }
+
+    /// (#2399 review) `remote.origin.url` equality is compared modulo the
+    /// two decorations git itself treats as noise on a REMOTE url — a
+    /// trailing `.git` and a trailing `/`. Transport is never normalized:
+    /// ssh and https forms of one repo stay unequal, because they are
+    /// different access paths with different credentials.
+    #[test]
+    fn same_origin_normalizes_the_git_suffix_and_trailing_slash_but_never_the_transport() {
+        assert!(same_origin("https://example.com/o/r.git", "https://example.com/o/r"));
+        assert!(same_origin("https://example.com/o/r/", "https://example.com/o/r"));
+        assert!(same_origin("https://example.com/o/r.git/", "https://example.com/o/r"));
+        assert!(!same_origin("git@example.com:o/r.git", "https://example.com/o/r.git"));
+        assert!(!same_origin("https://example.com/o/other", "https://example.com/o/r"));
+    }
+
+
+    /// (#2399 second review) The dirty-tree guard above writes BOTH an
+    /// untracked file and a tracked edit, so it stays green with
+    /// `--untracked-files=no` — it cannot pin the untracked clause. This
+    /// one dirties the tree ONLY with an untracked file, which is the case
+    /// `git status` ignores by default and the teardown used to remove.
+    #[test]
+    fn an_untracked_file_alone_forces_a_rebuild() {
+        use std::os::unix::fs::MetadataExt;
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-untracked", workdir.path(), source.path(), "main");
+
+        let m1 = materialize(&spec, RW).unwrap();
+        let tree = m1.sources[0].tree.clone();
+        let ino1 = fs::metadata(&tree).unwrap().ino();
+        fs::write(tree.join("scribble.txt"), "untracked, nothing else\n").unwrap();
+        drop(m1);
+
+        let m2 = materialize(&spec, RW).unwrap();
+        let tree2 = m2.sources[0].tree.clone();
+        assert!(!tree2.join("scribble.txt").exists(), "an untracked file alone must not survive a materialize");
+        assert_ne!(ino1, fs::metadata(&tree2).unwrap().ino(), "an untracked-only dirty tree is rebuilt, not reused");
+    }
+
+    /// (#2399 second review) A tree sitting at the right sha but belonging
+    /// to a DIFFERENT mirror must be rebuilt from ours — otherwise reuse
+    /// would adopt a worktree whose git dir, and therefore whose future
+    /// checkouts, darkmux does not own.
+    #[test]
+    fn a_tree_at_the_right_sha_from_a_foreign_mirror_is_rebuilt() {
+        use std::os::unix::fs::MetadataExt;
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-foreign-tree", workdir.path(), source.path(), "main");
+
+        let m1 = materialize(&spec, RW).unwrap();
+        let tree = m1.sources[0].tree.clone();
+        let sha = m1.sources[0].sha.clone();
+        let ours = workdir.path().join("mirror").join("app.git");
+        let ino1 = fs::metadata(&tree).unwrap().ino();
+        drop(m1);
+
+        // Hand the tree path over to a second, unrelated bare mirror of the
+        // same source, checked out at the SAME sha — so only the mirror
+        // identity distinguishes it from a reusable tree.
+        let out = Command::new("git")
+            .current_dir(&ours)
+            .args(["worktree", "remove", "--force", "--", &tree.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let elsewhere = TempDir::new().unwrap();
+        let foreign = elsewhere.path().join("other.git");
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "--no-hardlinks",
+                "--",
+                &source.path().to_string_lossy(),
+                &foreign.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .current_dir(&foreign)
+            .args(["worktree", "add", "--detach", "--force", "--", &tree.to_string_lossy(), &sha])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let planted = Command::new("git")
+            .current_dir(&tree)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&planted.stdout).trim(), sha, "the planted tree is at the same sha");
+
+        let m2 = materialize(&spec, RW).unwrap();
+        let tree2 = m2.sources[0].tree.clone();
+        assert_ne!(ino1, fs::metadata(&tree2).unwrap().ino(), "a foreign worktree is never adopted");
+        let git_dir = Command::new("git")
+            .current_dir(&tree2)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .unwrap();
+        let git_dir = String::from_utf8_lossy(&git_dir.stdout).trim().to_string();
+        assert!(
+            Path::new(&git_dir).canonicalize().unwrap().starts_with(ours.canonicalize().unwrap()),
+            "the rebuilt tree must belong to THIS mirror, not {}: {git_dir}",
+            foreign.display()
+        );
+    }
+
+    /// (#2399 second review) The re-entrancy registry, named and BOUNDED.
+    /// Materializing one workspace twice on ONE thread while the first
+    /// value is still held must not block — without the owner check the
+    /// second call waits on a `flock` its own thread holds, forever. The
+    /// `recv_timeout` is what makes a regression fail red in CI instead of
+    /// hanging the suite; the incidental coverage this replaces (the
+    /// foreign-origin test) hangs for 90 s and reports nothing useful.
+    #[test]
+    fn materializing_one_workspace_twice_on_one_thread_does_not_block() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let source = init_source_repo();
+            let workdir = TempDir::new().unwrap();
+            let spec = spec_for("t-reentrant", workdir.path(), source.path(), "main");
+            let first = materialize(&spec, RW).unwrap();
+            // Still holding `first`: the guard's owner thread re-enters.
+            let second = materialize(&spec, RW).unwrap();
+            let same = first.sources[0].sha == second.sources[0].sha;
+            let _ = tx.send(same);
+            drop(second);
+            drop(first);
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(true) => worker.join().unwrap(),
+            Ok(false) => panic!("the re-entrant materialize resolved a different sha"),
+            // Deliberately do NOT join here — the worker is wedged on a
+            // lock it will never get, and joining would hang the suite
+            // instead of reporting the regression.
+            Err(_) => panic!(
+                "materializing one workspace twice on one thread blocked for 15s — the \
+                 re-entrancy registry regressed and every caller that holds a Materialized \
+                 across a second materialize now deadlocks"
+            ),
+        }
+    }
+
 }

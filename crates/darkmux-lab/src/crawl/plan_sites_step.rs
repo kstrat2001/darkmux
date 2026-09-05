@@ -251,6 +251,11 @@ fn plan_diff(cfg: &SitesStepConfig) -> Result<Plan> {
     for w in &spec_warnings {
         eprintln!("[darkmux] warning: plan.sites: {w}");
     }
+    // (#2399) INVARIANT: `materialized` OWNS the workspace lock, and
+    // `plan_diff_rule` below reads every file in the trees it names. The
+    // binding must stay alive across that call — see the same note in
+    // `plan_step.rs`; this is the step #2397 made 8-wide, so it is the one
+    // that races.
     let materialized = materialize(&spec, MaterializeOptions { fetch: cfg.fetch, read_only: true })
         .with_context(|| format!("materializing workspace '{}'", spec.effective_name()))?;
 

@@ -193,6 +193,12 @@ pub fn plan_one_rule(cfg: &PlanStepConfig) -> Result<Plan> {
     for w in &spec_warnings {
         eprintln!("[darkmux] warning: crawl.plan: {w}");
     }
+    // (#2399) INVARIANT: `materialized` OWNS the workspace lock, and
+    // `plan_with_params` below reads every file in the trees it names. The
+    // binding must therefore stay alive across that call — dropping it
+    // early would let a peer `plan.sites` step (8-wide since #2397) tear
+    // `<root>/tree/<id>` down mid-walk, and `plan.rs` records the resulting
+    // read errors as `skipped` rather than failing: a silent under-report.
     let materialized = materialize(&spec, MaterializeOptions { fetch: cfg.fetch, read_only: true })
         .with_context(|| format!("materializing workspace '{}'", spec.effective_name()))?;
     plan::plan_with_params(&materialized, &rules_vec, cfg.params)

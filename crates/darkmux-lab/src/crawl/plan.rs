@@ -1997,7 +1997,18 @@ mod tests {
             files.insert(s.id.clone(), all);
             skipped.append(&mut sk);
         }
-        Materialized { name: "t".to_string(), root: PathBuf::new(), sources, edges, files, skipped, out_of_scope: Default::default() }
+        Materialized {
+            name: "t".to_string(),
+            root: PathBuf::new(),
+            sources,
+            edges,
+            files,
+            skipped,
+            out_of_scope: Default::default(),
+            // No workspace to lock: this fixture is built from
+            // already-resolved sources, never by `materialize` (#2399).
+            lock: None,
+        }
     }
 
     fn edge_spec(app: &str, lib: &str, package: &str) -> Vec<EdgeSpec> {
