@@ -42,7 +42,11 @@ pub mod prune;
 pub mod load;
 
 pub use grow::{grow_task, items_from_artifact, GrownFrom};
-pub use inputs::{check_embedded_inputs_collected, check_placeholders_declared, find_unsubstituted_braces, substitute_step_config, undeclared_placeholders};
+pub use inputs::{
+    check_embedded_inputs_collected, check_placeholders_declared, check_supplied_inert_inputs,
+    find_unsubstituted_braces, substitute_step_config, undeclared_placeholders,
+    unreferenced_inputs,
+};
 pub use interpret::{interpret, LaunchParams, TaskOverride};
 pub use load::{has_non_user_fallback, list_ids, load, LoadedMissionConfig, MissionConfigSource};
 

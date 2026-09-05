@@ -32,9 +32,20 @@
 //!
 //! For each `for` key that exists in the finding store, the mod copies that
 //! finding's `mission_id`, `context` and `emitted` into its own `context`, so
-//! a reader of the mod never has to go find the finding. A `for` key with no
-//! stored finding is allowed and recorded as `{key, missing: true}` — the mod
-//! is still the change someone proposed.
+//! a reader of the mod never has to go find the finding.
+//!
+//! **(#2386) A `for` key with no stored finding is not stored as a link.**
+//! It used to be recorded as `{key, missing: true}`, and a live reviewer run
+//! showed what that costs: six mods carrying real kits, each pointing at a
+//! finding key the model had copied out of a tool description's example, so
+//! `records.gather` could attach none of them and the coder phase redid the
+//! work. Each producer now handles it where its own repair lives — the
+//! runtime tool REFUSES the call (the model reads the refusal and can name
+//! the right key); [`create`] (the external `mod create` actor) REFUSES
+//! unless `--allow-missing-finding`; [`create_from_emission`] DROPS the key
+//! with the reason in the record's own `warnings` and keeps the kit, because
+//! it runs after the tool already answered and discarding the kit there
+//! would throw away the whole product of a dispatch (#2265).
 //!
 //! **That copy is a SNAPSHOT taken at create time.** It is what makes the mod
 //! self-describing, and it is also the limit: a mod created before its finding
@@ -146,8 +157,13 @@ pub struct ForFinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emitted: Option<serde_json::Value>,
     /// `true` when no finding with this key was in the store at create time.
-    /// A mod for an unstored finding is allowed — the change was still
-    /// proposed — so this is a recorded fact, not a refusal.
+    ///
+    /// **(#2386) No live producer writes this any more** — a key that names
+    /// no stored finding is refused (`create`, and the runtime tool) or
+    /// dropped into the record's `warnings` (`create_from_emission`). The
+    /// field stays because records written before that change carry it and
+    /// the store is append-only: a reader must keep telling a dangling
+    /// historical link apart from a resolved one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub missing: bool,
 }
@@ -604,6 +620,25 @@ pub fn finding_context(findings_root: &Path, for_keys: &[String]) -> Result<ModC
     Ok(ModContext { findings })
 }
 
+/// (#2386) Every `for` key with no finding in the store. The set a producer
+/// that REFUSES a dangling link needs; [`finding_context`] answers the
+/// different question of what to copy for the keys that do resolve.
+///
+/// Keys must already be canonical (see [`canonical_for_keys`]).
+pub fn missing_finding_keys(findings_root: &Path, for_keys: &[String]) -> Result<Vec<String>> {
+    let mut missing = Vec::new();
+    for key in for_keys {
+        let stored = match crate::findings::parse_key(key) {
+            None => None,
+            Some((dispatch, seq)) => crate::findings::load_at(findings_root, &dispatch, seq)?,
+        };
+        if stored.is_none() {
+            missing.push(key.clone());
+        }
+    }
+    Ok(missing)
+}
+
 /// Write a mod **once**. A minted key never collides, so an existing file
 /// means something else is already at that address — it is left exactly as it
 /// is, the same contract a finding gets.
@@ -702,6 +737,12 @@ pub fn create(
     // (see that field's own doc). `None` from every caller that predates
     // this parameter.
     kit_kind: Option<&str>,
+    // (#2386) The operator's escape hatch. `false` (the default) REFUSES a
+    // `for` key with no finding in the store; `true` records the link
+    // anyway, marked `missing`, for the case the refusal exists to make
+    // deliberate — a finding whose store copy has not been synced yet, or a
+    // mod being written against a key from another machine.
+    allow_missing_finding: bool,
 ) -> Result<ModRecord> {
     anyhow::ensure!(!by.trim().is_empty(), "a mod needs a proposer: pass --by <actor>");
     // A mod with neither instructions nor data is not a kit. Refused here
@@ -715,6 +756,23 @@ pub fn create(
     // first; everything that CANNOT is staged (below), so no failure can leave
     // a half-written mod.
     let for_keys = canonical_for_keys(for_keys)?;
+    // (#2386) A key of the right SHAPE that names no stored finding is a
+    // link nothing can follow — the outcome `canonical_for_keys`'s own doc
+    // says it exists to prevent, arrived at through the other door. The
+    // usual cause is a typo or a copied example, and the external actor
+    // running this verb is a person or an orchestrator who can fix it and
+    // run again, so it is refused rather than recorded. `--allow-missing-
+    // finding` is there for the deliberate case.
+    if !allow_missing_finding {
+        let missing = missing_finding_keys(findings_root, &for_keys)?;
+        anyhow::ensure!(
+            missing.is_empty(),
+            "no finding in the store for {} — `darkmux finding list` shows what is stored, and \
+             `darkmux finding sync` replays the flow stream into it. Pass \
+             --allow-missing-finding to record the mod with the link anyway.",
+            missing.join(", ")
+        );
+    }
     let mut names: Vec<String> = Vec::new();
     for path in attachments {
         let name = path
@@ -1036,6 +1094,49 @@ pub fn create_from_emission(
         None => kit.to_string(),
     };
     let for_keys = canonical_for_keys(for_keys)?;
+    // (#2386) A key naming no stored finding is DROPPED with its reason on
+    // the record, not stored as a link nothing can follow. The runtime
+    // refuses such a key at the tool boundary now, where the model reads the
+    // refusal and can call again with the right one; anything that still
+    // arrives here (a runtime older than #2386, a finding whose store copy
+    // never landed) loses the LINK and keeps the KIT — the #2265 contract
+    // this producer has always had: never discard a whole mod over one bad
+    // part, since a warning on a successful dispatch's stderr is kept only
+    // as a byte count.
+    //
+    // **Say plainly what "keeps the kit" is and is not worth.** The two
+    // consumers that act on a mod select it BY `for`: `mods.gate` picks its
+    // targets with `mods::mods_for` (`m.r#for.contains(key)`), and
+    // `deliver.github_review` attaches a mod to a finding with
+    // `m.record.r#for.iter().any(|k| k == &finding.key)`. So a mod whose
+    // ONLY `for` key was dropped is never gated and never rendered as a
+    // proposed change — it is a record that someone proposed something, not
+    // a proposal in flight. It is NOT invisible: it keeps its own
+    // `mission_id`, so `records.gather` (which scopes by
+    // `mods::names_mission`, not by `for`) still carries it into the
+    // mission envelope, `mod list`/`mod show` still find it, and its
+    // `warnings` name the key that was meant. The kit is kept because a kit
+    // is expensive and a person can still act on it — not because the mod
+    // still participates in the run.
+    let missing = missing_finding_keys(findings_root, &for_keys)?;
+    let mut warnings = warnings;
+    for key in &missing {
+        // (#2386 C6) The usual cause here is NOT a typo — this producer's
+        // key already passed the runtime's own tool-boundary check on the
+        // dispatch's own machine. The far more common reason a key is
+        // missing on THIS machine's store is the cross-machine case: the
+        // finding was recorded on a different machine's tailer and this
+        // one's `finding sync` never replayed it. Point at the fix that
+        // actually applies, same wording as the other two producers
+        // (`findings::brief_ref`, `mods::create`'s own missing-finding
+        // refusal above).
+        warnings.push(format!(
+            "dropped `for` key {key:?}: no finding with that key is in this machine's store, so \
+             the link would follow to nothing — `darkmux finding sync` replays the flow stream \
+             into it, which is the fix when the finding was recorded on a different machine"
+        ));
+    }
+    let for_keys: Vec<String> = for_keys.into_iter().filter(|k| !missing.contains(k)).collect();
 
     let mut names: Vec<String> = Vec::new();
     for a in attachments {
@@ -1613,7 +1714,7 @@ mod tests {
 
         // Two shapes a JSON round trip destroys, plus the exact whitespace.
         let hostile = "{\n  \"a\": 1,\n  \"a\": 2,\n  \"big\": 12345678901234567890123\n}\n";
-        let rec = create(&mods, &finds, "kain", &[], Some(hostile), &[], None).unwrap();
+        let rec = create(&mods, &finds, "kain", &[], Some(hostile), &[], None, false).unwrap();
         assert_eq!(rec.kit.as_deref(), Some(hostile), "the kit is the bytes that came in");
         assert!(rec.kit_looks_json, "a reader HINT — not a parse, and not a promise");
         let back = load_at(&mods, &rec.key).unwrap().unwrap();
@@ -1621,12 +1722,12 @@ mod tests {
 
         // Prose stays prose, with its own whitespace.
         let prose = "rename the predicate, then add a test\n";
-        let rec = create(&mods, &finds, "kain", &[], Some(prose), &[], None).unwrap();
+        let rec = create(&mods, &finds, "kain", &[], Some(prose), &[], None, false).unwrap();
         assert_eq!(rec.kit.as_deref(), Some(prose));
         assert!(!rec.kit_looks_json);
 
         // A kit that is literally the text `null` is that text — not a null.
-        let rec = create(&mods, &finds, "kain", &[], Some("null"), &[], None).unwrap();
+        let rec = create(&mods, &finds, "kain", &[], Some("null"), &[], None, false).unwrap();
         assert_eq!(rec.kit.as_deref(), Some("null"));
         let raw = std::fs::read_to_string(record_path_at(&mods, &rec.key)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1641,8 +1742,8 @@ mod tests {
         store_finding(&finds, "sess-a", 1, Some("crawl-1"));
         let for_keys = vec!["sess-a/1".to_string()];
 
-        let one = create(&mods, &finds, "sonnet", &for_keys, Some("change the code"), &[], None).unwrap();
-        let two = create(&mods, &finds, "kain", &for_keys, Some("add a comment"), &[], None).unwrap();
+        let one = create(&mods, &finds, "sonnet", &for_keys, Some("change the code"), &[], None, false).unwrap();
+        let two = create(&mods, &finds, "kain", &for_keys, Some("add a comment"), &[], None, false).unwrap();
 
         assert_ne!(one.key, two.key, "the second must NOT overwrite the first");
         assert!(record_path_at(&mods, &one.key).exists());
@@ -1651,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn create_copies_each_stored_findings_provenance_and_marks_a_missing_one() {
+    fn create_copies_each_stored_findings_provenance() {
         let tmp = TempDir::new().unwrap();
         let mods = tmp.path().join("mods");
         let finds = tmp.path().join("findings");
@@ -1661,14 +1762,15 @@ mod tests {
             &mods,
             &finds,
             "sonnet",
-            &["sess-a/1".to_string(), "sess-z/9".to_string()],
+            &["sess-a/1".to_string()],
             Some("kit"),
             &[],
             None,
+            false,
         )
         .unwrap();
 
-        assert_eq!(rec.r#for, vec!["sess-a/1", "sess-z/9"]);
+        assert_eq!(rec.r#for, vec!["sess-a/1"]);
         let stored = &rec.context.findings[0];
         assert_eq!(stored.key, "sess-a/1");
         assert!(!stored.missing);
@@ -1680,18 +1782,111 @@ mod tests {
             Some(serde_json::json!({"rule": "unnamed-predicate", "unit": "u1"}))
         );
 
-        // A `for` key with no stored finding is allowed — the change was still
-        // proposed — and is recorded as missing rather than as absent context.
-        let absent = &rec.context.findings[1];
-        assert_eq!(absent.key, "sess-z/9");
-        assert!(absent.missing, "an unstored finding is marked, not silently empty");
-        assert!(absent.emitted.is_none());
-
         // It round-trips through disk with the same shape.
         let back = load_at(&mods, &rec.key).unwrap().expect("round trips");
         assert_eq!(back.context, rec.context);
         assert_eq!(back.by, "sonnet");
         assert_eq!(back.schema_version, MOD_SCHEMA_VERSION);
+    }
+
+    /// (#2386) Was `..._and_marks_a_missing_one`, which asserted the exact
+    /// behavior the issue is about: a `for` key naming no stored finding was
+    /// recorded as `{key, missing: true}` — a link nothing can follow. Six
+    /// mods in one live reviewer run carried such links (the keys copied
+    /// from a tool description's example), so `records.gather` could attach
+    /// none of them. This producer is the EXTERNAL actor (`mod create`): a
+    /// person or an orchestrator who can read the refusal and run again.
+    #[test]
+    fn create_refuses_a_for_key_with_no_stored_finding() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, Some("crawl-1"));
+
+        let err = create(
+            &mods,
+            &finds,
+            "sonnet",
+            &["sess-a/1".to_string(), "sess-z/9".to_string()],
+            Some("kit"),
+            &[],
+            None,
+            false,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("sess-z/9"), "the refusal names the dangling key: {msg}");
+        assert!(!msg.contains("sess-a/1"), "and only that one: {msg}");
+        assert!(msg.contains("--allow-missing-finding"), "and names the escape hatch: {msg}");
+        assert!(load_all_at(&mods).unwrap().is_empty(), "nothing was written");
+    }
+
+    /// The escape hatch, for the case the refusal exists to make deliberate:
+    /// a finding whose store copy has not been synced yet.
+    #[test]
+    fn create_records_a_missing_for_key_when_the_operator_allows_it() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+
+        let rec = create(
+            &mods,
+            &finds,
+            "sonnet",
+            &["sess-z/9".to_string()],
+            Some("kit"),
+            &[],
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(rec.r#for, vec!["sess-z/9"]);
+        let absent = &rec.context.findings[0];
+        assert!(absent.missing, "recorded as missing, which is what the operator asked for");
+        assert!(absent.emitted.is_none());
+    }
+
+    /// The RUNTIME producer's own rule, and deliberately a different one:
+    /// it runs after the tool already answered the model, so refusing here
+    /// would throw away a kit nobody can re-ask for (#2265). The link is
+    /// dropped and the reason rides the record's own `warnings`.
+    #[test]
+    fn create_from_emission_drops_a_missing_for_key_and_keeps_the_kit() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, Some("crawl-1"));
+
+        let rec = create_from_emission(
+            &mods,
+            &finds,
+            "reviewer (qwen)",
+            &["sess-a/1".to_string(), "sess-abc/1".to_string()],
+            "the whole change",
+            &[],
+            crate::findings::Scope::default(),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(rec.r#for, vec!["sess-a/1"], "the dangling link is gone");
+        assert_eq!(rec.kit.as_deref(), Some("the whole change"), "the kit is NOT discarded");
+        assert_eq!(rec.context.findings.len(), 1);
+        assert!(!rec.context.findings[0].missing, "and no `missing: true` is written at all");
+        assert!(
+            rec.warnings.iter().any(|w| w.contains("sess-abc/1")),
+            "the reason rides the record: {:?}",
+            rec.warnings
+        );
+        // (#2386 C6) The usual cause is the cross-machine case (recorded on
+        // a different machine's tailer, never synced to this one's store)
+        // rather than a typo — the warning must point at the actual fix.
+        assert!(
+            rec.warnings.iter().any(|w| w.contains("darkmux finding sync")),
+            "must name the cross-machine fix: {:?}",
+            rec.warnings
+        );
     }
 
     /// (#2310 swarm F / S2-2b) The leniency the `"1"` → `"2"` bump leans
@@ -1786,6 +1981,7 @@ mod tests {
             None,
             &[src.join("a/patch.diff"), src.join("b/shot.png")],
             None,
+            false,
         )
         .unwrap();
         assert_eq!(rec.attachments, vec!["patch.diff", "shot.png"]);
@@ -1805,6 +2001,7 @@ mod tests {
             None,
             &[src.join("a/patch.diff"), src.join("b/patch.diff")],
             None,
+            false,
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("patch.diff"), "the error names it: {err:#}");
@@ -1837,6 +2034,7 @@ mod tests {
             Some("kit"),
             &[src.join("ok.diff"), unreadable.clone()],
             None,
+            false,
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("unreadable.bin"), "the error names it: {err:#}");
@@ -1863,7 +2061,7 @@ mod tests {
         let finds = tmp.path().join("findings");
         store_finding(&finds, "sess-a", 1, Some("crawl-1"));
 
-        let rec = create(&mods, &finds, "kain", &["sess-a/01".into()], Some("k"), &[], None).unwrap();
+        let rec = create(&mods, &finds, "kain", &["sess-a/01".into()], Some("k"), &[], None, false).unwrap();
         assert_eq!(rec.r#for, vec!["sess-a/1"], "stored in canonical form");
         assert_eq!(rec.context.findings[0].key, "sess-a/1");
         assert!(!rec.context.findings[0].missing, "it resolved to the real finding");
@@ -1889,7 +2087,7 @@ mod tests {
         // A key that can address no finding is refused LOUDLY at create time,
         // rather than stored as a link that nothing can ever follow.
         for bad in ["no-slash", "sess-a/notanumber", "../x/1", "/1"] {
-            let err = create(&mods, &finds, "kain", &[bad.to_string()], Some("k"), &[], None).unwrap_err();
+            let err = create(&mods, &finds, "kain", &[bad.to_string()], Some("k"), &[], None, false).unwrap_err();
             assert!(
                 format!("{err:#}").contains("finding key"),
                 "the error names the shape for {bad:?}: {err:#}"
@@ -1909,7 +2107,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join(".env.example"), b"KEY=value\n").unwrap();
 
-        let rec = create(&mods, &finds, "kain", &[], None, &[src.join(".env.example")], None).unwrap();
+        let rec = create(&mods, &finds, "kain", &[], None, &[src.join(".env.example")], None, false).unwrap();
         assert_eq!(rec.attachments, vec![".env.example"]);
         assert_eq!(
             std::fs::read(attachments_dir_at(&mods, &rec.key).join(".env.example")).unwrap(),
@@ -1930,7 +2128,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mods = tmp.path().join("mods");
         let finds = tmp.path().join("findings");
-        let good = create(&mods, &finds, "kain", &[], Some("k"), &[], None).unwrap();
+        let good = create(&mods, &finds, "kain", &[], Some("k"), &[], None, false).unwrap();
 
         std::fs::create_dir_all(mods.join("mod-liar")).unwrap();
         std::fs::write(
@@ -1957,8 +2155,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mods = tmp.path().join("mods");
         let finds = tmp.path().join("findings");
-        assert!(create(&mods, &finds, "kain", &[], None, &[], None).is_err());
-        assert!(create(&mods, &finds, "  ", &[], Some("kit"), &[], None).is_err(), "a mod names its proposer");
+        assert!(create(&mods, &finds, "kain", &[], None, &[], None, false).is_err());
+        assert!(create(&mods, &finds, "  ", &[], Some("kit"), &[], None, false).is_err(), "a mod names its proposer");
         assert!(!mods.exists(), "a refusal writes nothing at all");
     }
 
@@ -2147,10 +2345,10 @@ mod tests {
         store_finding(&finds, "sess-a", 1, Some("crawl-1"));
         store_finding(&finds, "sess-b", 2, Some("crawl-2"));
 
-        let a1 = create(&mods, &finds, "sonnet", &["sess-a/1".into()], Some("x"), &[], None).unwrap();
-        let a2 = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("y"), &[], None).unwrap();
-        let b = create(&mods, &finds, "kain", &["sess-b/2".into()], Some("z"), &[], None).unwrap();
-        let none = create(&mods, &finds, "kain", &[], Some("standalone"), &[], None).unwrap();
+        let a1 = create(&mods, &finds, "sonnet", &["sess-a/1".into()], Some("x"), &[], None, false).unwrap();
+        let a2 = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("y"), &[], None, false).unwrap();
+        let b = create(&mods, &finds, "kain", &["sess-b/2".into()], Some("z"), &[], None, false).unwrap();
+        let none = create(&mods, &finds, "kain", &[], Some("standalone"), &[], None, false).unwrap();
 
         let all = load_all_at(&mods).unwrap();
         let keys: Vec<&str> = mods_for(&all, "sess-a/1").iter().map(|m| m.key.as_str()).collect();
@@ -2224,7 +2422,7 @@ mod tests {
         let finds = tmp.path().join("findings");
         store_finding(&finds, "sess-a", 1, Some("crawl-1"));
 
-        let rec = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("p"), &[], None).unwrap();
+        let rec = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("p"), &[], None, false).unwrap();
         assert!(rec.mission_id.is_none(), "the fixture's premise: an external actor stamps no mission");
         assert!(names_mission(&rec, "crawl-1"), "the copied finding provenance still answers");
     }

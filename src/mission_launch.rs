@@ -115,6 +115,39 @@ const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", 
 /// observable behavior isn't a tiering fix, it's a feature change wearing a
 /// tiering fix's clothes").
 ///
+/// (#2384) The input names THIS launcher consumes in Rust rather than
+/// through `{{name}}` substitution into a step's config — the second of
+/// darkmux's two consumption paths, and the one no document scan can see.
+/// Passed to [`mission_config::unreferenced_inputs`] so an input the
+/// launcher genuinely reads is not mistaken for an inert knob.
+///
+/// **Each entry is a real read in this file, not a guess.** `args`
+/// (`launch`'s panel-args injection), `base`/`branch`/`workdir`
+/// (`precheck_coder_phase_inputs` + the coder-phase context builder),
+/// `dry_run` (`bool_param`), `image`/`role` (the coder-phase seat
+/// overrides), `mission_id` (INJECTED by `launch` itself once the id is
+/// minted), `mod_seat_profile`/`profiles` (the optional mod seat),
+/// `rules` (`rule_selection`). Adding a name here without a matching read
+/// re-opens exactly the hole #2384 closed, so a new entry belongs in the
+/// same commit as the code that reads it.
+///
+/// The frozen `review` config's own inputs are deliberately ABSENT: that
+/// document routes to `mission_launch_review::launch` above this check,
+/// so its inputs are that launcher's to account for.
+const LAUNCHER_CONSUMED_INPUTS: &[&str] = &[
+    "args",
+    "base",
+    "branch",
+    "dry_run",
+    "image",
+    "mission_id",
+    "mod_seat_profile",
+    "profiles",
+    "role",
+    "rules",
+    "workdir",
+];
+
 /// **Structural-routing use ONLY (#1530 — one global step-kind registry).**
 /// Mirrors [`CODER_PHASE_TIER3_KINDS`]'s doc: this list no longer feeds
 /// validation or any execution registry (both now read [`all_step_kinds`]'s
@@ -486,6 +519,14 @@ pub fn launch(
     );
 
     let mut collected = collect_inputs(input_file, params)?;
+    // (#2386 MF3) The operator's OWN action, captured before a single
+    // default lands — the inert-input checks below need to tell "the
+    // operator passed this knob" apart from "the document defaulted it".
+    // Everything else in this function wants the POST-default view (see
+    // the next comment); this set does not, and reading it off `collected`
+    // after defaults apply would make every defaulted-but-inert input look
+    // operator-supplied and refuse a launch the operator never touched.
+    let operator_supplied: std::collections::BTreeSet<String> = collected.keys().cloned().collect();
     // (#2310 P4e) Document-declared defaults land BEFORE every consumer
     // below — the required check, the typo warning, the dry-run print, the
     // inputs fingerprint and both placeholder passes — so a defaulted
@@ -683,6 +724,54 @@ pub fn launch(
     // failed and abandoned it; `--dry-run` exited 0, silent. Same
     // placement as the check above: before `--dry-run`, before any mint.
     mission_config::check_embedded_inputs_collected(config, &collected)?;
+
+    // (#2384) The OTHER direction: a DECLARED input that no step config
+    // (including a `grow.config` template) references and that this
+    // launcher does not read itself. `review-v2.json`'s `review-probe-high`
+    // is the measured case — the operator passed
+    // `--param review-probe-high=probe-4b`, the launch accepted it, and
+    // every `unit-<rule>` dispatch logged `via profile deep` with nothing
+    // saying the knob had done nothing. Refused BEFORE the `--dry-run`
+    // short-circuit and before any mint, beside the two checks above.
+    //
+    // Run against `config_as_declared` (the UNPRUNED document), never
+    // `config`: pruning drops disabled tasks and rules this launch did not
+    // select, so a `--param rules=<one>` launch would otherwise flag an
+    // input whose only reference lives in a task that was pruned away.
+    //
+    // Two strengths, for two different readers. SUPPLIED (by the OPERATOR
+    // — see `operator_supplied`, captured before defaults, above) and
+    // inert is the operator's own action being silently discarded —
+    // refused, below. Merely declared and inert is the document's bug, and
+    // refusing a launch over a knob nobody touched would block work rather
+    // than protect it — a named warning, on every launch AND every dry
+    // run, so it is visible on the free path too. See
+    // `check_supplied_inert_inputs`'s own doc for why the blanket refusal
+    // is not on yet, and what has to happen first.
+    //
+    // (#2386 MF3) A defaulted-only inert input (declared with a `default`,
+    // never named on the operator's own `--param`/stdin) is neither of
+    // those two readers: it is not the operator's action (nothing to
+    // refuse) and its `collected` value came from the document, not from
+    // silently discarding anything the operator asked for. It gets its own
+    // WARN wording naming the default explicitly, still on the WARN path
+    // — never the refusal, which is reserved for `operator_supplied`.
+    for name in mission_config::unreferenced_inputs(config_as_declared, LAUNCHER_CONSUMED_INPUTS) {
+        if operator_supplied.contains(&name) {
+            // (#2386 C7) `check_supplied_inert_inputs` below is about to
+            // bail and list this exact name — one message per input, not
+            // a WARN immediately followed by a refusal naming the same
+            // thing.
+            continue;
+        }
+        let msg = declared_inert_input_warning(config_id, &name, collected.contains_key(&name));
+        eprintln!("{}", darkmux_types::style::warn(&msg));
+    }
+    mission_config::check_supplied_inert_inputs(
+        config_as_declared,
+        LAUNCHER_CONSUMED_INPUTS,
+        &operator_supplied,
+    )?;
 
     // (#1959) `--dry-run`: everything above this point (config load,
     // command-allowlist gate, semantic validation, panel-args injection,
@@ -2288,6 +2377,30 @@ fn missing_inputs_message(config: &MissionConfig, missing: &[&mission_config::Mi
             .join(" "),
     );
     msg
+}
+
+/// (#2386 MF3) The declared-inert WARN text for one name — extracted to a
+/// pure function (mirrors `missing_inputs_message` above) so the wording is
+/// unit-testable without needing to capture the `eprintln!` this feeds at
+/// its one call site. `has_default` distinguishes a defaulted-only input
+/// (the document's `default` landed in `collected`, the operator never
+/// touched it) from one that is simply unset — the two get different
+/// wording (see `mission_launch.rs::launch`'s own call site comment for
+/// why).
+fn declared_inert_input_warning(config_id: &str, name: &str, has_default: bool) -> String {
+    if has_default {
+        format!(
+            "input `{name}` is declared with a default but referenced by no step; the default \
+             changes nothing about this run — mark it `\"ignored\": true` with an \
+             `ignored_reason`, reference it as `{{{{{name}}}}}` in a step's config, or delete it"
+        )
+    } else {
+        format!(
+            "input `{name}` is declared by \"{config_id}\" but referenced by no step and read by \
+             no launcher — supplying it would do nothing; mark it `\"ignored\": true` with an \
+             `ignored_reason`, reference it as `{{{{{name}}}}}` in a step's config, or delete it"
+        )
+    }
 }
 
 /// (#1503) Mint a fresh, UNIQUE run id for one `mission launch` call — never
@@ -5069,6 +5182,114 @@ mod tests {
         let _ = guard;
     }
 
+    // ── (#2386 MF1/MF3) declared-but-unreferenced input ("inert knob") ──
+    // on the real `launch()` path, not just `check_supplied_inert_inputs`
+    // in isolation — proving the checks actually fire from their real call
+    // site, not only that the pure function they call is correct.
+
+    const INERT_KNOB_CONFIG: &str = r#"{
+        "id": "inert-knob-test-mission",
+        "name": "Inert Knob Test Mission",
+        "schema_version": "2.3",
+        "inputs": [
+            {"name": "knob", "description": "a knob nothing consumes"}
+        ],
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop"}]}]}
+        ]
+    }"#;
+
+    const INERT_KNOB_WITH_DEFAULT_CONFIG: &str = r#"{
+        "id": "inert-knob-default-test-mission",
+        "name": "Inert Knob With Default Test Mission",
+        "schema_version": "2.3",
+        "inputs": [
+            {"name": "knob", "description": "a knob nothing consumes", "default": "unchanged"}
+        ],
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop"}]}]}
+        ]
+    }"#;
+
+    /// (#2386 MF1) `check_supplied_inert_inputs`'s call site in `launch()`
+    /// is unpinned without this — deleting the call (or passing it the
+    /// wrong set) leaves the bin suite green. An operator-supplied `--param
+    /// knob=1` naming an input NO step references must bail, pre-mint,
+    /// naming `knob` — on the real launch path, with a real on-disk
+    /// mission config (not `check_supplied_inert_inputs` called directly).
+    #[test]
+    #[serial_test::serial]
+    fn launch_refuses_an_operator_supplied_input_no_step_references() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("inert-knob-test-mission", INERT_KNOB_CONFIG);
+        let err = launch(
+            "inert-knob-test-mission",
+            None,
+            &["knob=1".to_string(), "dry_run=true".to_string()],
+            None,
+        )
+        .expect_err("an operator-supplied inert input must be refused, even under --dry-run");
+        let msg = err.to_string();
+        assert!(msg.contains("knob"), "{msg}");
+        assert!(all_mission_ids().is_empty(), "a refused launch must mint nothing");
+        let _ = guard;
+    }
+
+    /// (#2386 MF3) The mirror case: `knob` is declared with a `default`
+    /// and the operator never named it on `--param`/stdin. Before the
+    /// MF3 fix, `apply_input_defaults` ran BEFORE the supplied-set was
+    /// captured, so the defaulted value looked operator-supplied and this
+    /// exact launch was refused — unlaunchable even under `--dry-run`,
+    /// over a value the operator never touched. Must now succeed (the
+    /// WARN path, not the refusal path).
+    #[test]
+    #[serial_test::serial]
+    fn dry_run_succeeds_for_a_defaulted_only_inert_input() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("inert-knob-default-test-mission", INERT_KNOB_WITH_DEFAULT_CONFIG);
+        let exit = launch(
+            "inert-knob-default-test-mission",
+            None,
+            &["dry_run=true".to_string()],
+            None,
+        )
+        .expect("a defaulted-only inert input must not be refused, even though it lands in `collected`");
+        assert_eq!(exit, 0);
+        assert!(all_mission_ids().is_empty(), "a dry run must mint no mission");
+        let _ = guard;
+    }
+
+    /// (#2386 C7) One message per input: an operator-supplied inert input
+    /// must not ALSO print the declared-inert WARN before the refusal
+    /// names it. `declared_inert_input_warning` (the WARN body) is a
+    /// separate concern tested directly below; the guard the call site
+    /// applies (`operator_supplied.contains(&name)` skips the WARN loop
+    /// entirely) is proven by `launch_refuses_an_operator_supplied_input_
+    /// no_step_references` above bailing with the refusal's own wording
+    /// ("would change nothing about this run") rather than the WARN's
+    /// ("supplying it would do nothing").
+    #[test]
+    fn c7_refusal_wording_differs_from_the_warn_wording_so_the_two_are_distinguishable() {
+        let warn = declared_inert_input_warning("cfg", "knob", false);
+        assert!(warn.contains("supplying it would do nothing"), "{warn}");
+        assert!(!warn.contains("would change nothing about this run"), "{warn}");
+    }
+
+    /// (#2386 MF3) The two declared-inert WARN wordings are distinct and
+    /// each names the input.
+    #[test]
+    fn declared_inert_input_warning_distinguishes_defaulted_from_merely_unset() {
+        let defaulted = declared_inert_input_warning("cfg", "knob", true);
+        assert!(defaulted.contains("knob"), "{defaulted}");
+        assert!(defaulted.contains("declared with a default"), "{defaulted}");
+        assert!(defaulted.contains("the default changes nothing"), "{defaulted}");
+
+        let unset = declared_inert_input_warning("cfg", "knob", false);
+        assert!(unset.contains("knob"), "{unset}");
+        assert!(unset.contains("referenced by no step and read by no launcher"), "{unset}");
+        assert_ne!(defaulted, unset);
+    }
+
     // ── coder-phase wiring — registration only, never a live dispatch ──
     // (mocked dispatches only, never real LMStudio — the actual
     // `MissionCoderStepKind::run` dispatch is exercised, mocked, by
@@ -7378,5 +7599,85 @@ mod tests {
         assert_eq!(step_result[0]["payload"]["kind"], serde_json::json!("mission.worktree"));
 
         drop(guard);
+    }
+    // ─── (#2384) declared-but-inert inputs, over the SHIPPED configs ───
+
+    /// The conformance test #2384 asks for, run against the real documents
+    /// rather than a fixture: every input a shipped config declares must be
+    /// referenced by a step (or a `grow.config` template), marked
+    /// `ignored: true`, or read by this launcher itself
+    /// (`LAUNCHER_CONSUMED_INPUTS`).
+    ///
+    /// **The expected set is a CEILING, not an equality.** Three of
+    /// `review-v2.json`'s inputs are inert at the time of writing — its own
+    /// descriptions say so for two of them ("not yet read by any step",
+    /// "Still NOT consumed") — and that document is owned by a concurrent
+    /// packet. Asserting a subset means this test goes green the moment
+    /// those inputs are wired, ignored, or deleted, and red the moment a
+    /// NEW inert knob is added to any shipped config, which is the
+    /// regression this guards.
+    ///
+    /// The frozen `review` config is skipped: it routes to
+    /// `mission_launch_review::launch` before this check runs, so its
+    /// inputs are that launcher's to account for.
+    #[test]
+    fn no_shipped_config_declares_an_input_nothing_consumes() {
+        let expected: &[(&str, &str)] = &[
+            ("review-v2", "mode"),
+            ("review-v2", "envelope_out"),
+            ("review-v2", "review-probe-high"),
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("templates/builtin/mission-configs");
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the shipped mission-config directory exists")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        entries.sort();
+        for path in entries {
+            let raw = std::fs::read_to_string(&path).expect("readable");
+            let config: mission_config::MissionConfig =
+                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            if config_uses_review_kinds(&config) {
+                continue;
+            }
+            for name in mission_config::unreferenced_inputs(&config, LAUNCHER_CONSUMED_INPUTS) {
+                seen.push((config.id.clone(), name));
+            }
+        }
+        let unexpected: Vec<&(String, String)> = seen
+            .iter()
+            .filter(|(id, name)| !expected.contains(&(id.as_str(), name.as_str())))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "shipped mission config(s) declare an input no step references and this launcher \
+             does not read: {unexpected:?} — reference it as a `{{{{name}}}}` in a step config, \
+             mark it `\"ignored\": true` with an `ignored_reason`, or delete it"
+        );
+    }
+
+    /// The launch-path half: the check runs on the UNPRUNED document, so a
+    /// `--param rules=<one>` launch (which prunes every other rule's tasks)
+    /// cannot make a referenced input look inert.
+    #[test]
+    fn the_reference_check_reads_the_unpruned_document() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("templates/builtin/mission-configs/crawl.json"),
+        )
+        .expect("crawl.json is shipped");
+        let config: mission_config::MissionConfig = serde_json::from_str(&raw).expect("parses");
+        let (pruned, _) = mission_config::prune::prune_with_selection(&config, &|_task| false);
+        assert!(
+            mission_config::unreferenced_inputs(&config, LAUNCHER_CONSUMED_INPUTS).is_empty(),
+            "the declared document is clean"
+        );
+        assert!(
+            !mission_config::unreferenced_inputs(&pruned, LAUNCHER_CONSUMED_INPUTS).is_empty(),
+            "and a fully-pruned one is NOT — which is why the launcher passes the declared document"
+        );
     }
 }

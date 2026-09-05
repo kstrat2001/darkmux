@@ -865,9 +865,23 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
 /// one.
 fn cmd_mod(sub: cli::ModCmd) -> Result<i32> {
     match sub {
-        cli::ModCmd::Create { by, r#for, kit, kit_kind, attach, json: cli::JsonFlag { json } } => {
-            mod_cli::create(&by, &r#for, kit.as_deref(), &attach, kit_kind.as_deref(), json)
-        }
+        cli::ModCmd::Create {
+            by,
+            r#for,
+            kit,
+            kit_kind,
+            attach,
+            allow_missing_finding,
+            json: cli::JsonFlag { json },
+        } => mod_cli::create(
+            &by,
+            &r#for,
+            kit.as_deref(),
+            &attach,
+            kit_kind.as_deref(),
+            allow_missing_finding,
+            json,
+        ),
         cli::ModCmd::List { r#for, mission, json: cli::JsonFlag { json } } => {
             mod_cli::list(r#for.as_deref(), mission.as_deref(), json)
         }

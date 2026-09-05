@@ -41,6 +41,12 @@ pub fn create(
     // recognizes today). Threaded straight through to `ModRecord::
     // kit_kind`, unvalidated — see that field's own doc.
     kit_kind: Option<&str>,
+    // (#2386) `--allow-missing-finding` — record a `for` key whose finding
+    // is not in the store. Off by default: the usual cause of such a key is
+    // a typo or a copied example, and a link nothing can follow is what the
+    // store exists to prevent. On, for the deliberate case (a finding not
+    // synced yet, or one recorded on another machine).
+    allow_missing_finding: bool,
     json: bool,
 ) -> Result<i32> {
     let root = config_access::mods_dir();
@@ -68,6 +74,7 @@ pub fn create(
         kit.as_deref(),
         attachments,
         kit_kind,
+        allow_missing_finding,
     )?;
 
     let path = mods::record_path_at(&root, &rec.key);
@@ -93,9 +100,10 @@ pub fn create(
     // Everything else this command has to say goes to stderr, where it is
     // still visible to a person and invisible to a substitution.
     println!("{}", rec.key);
-    // A `for` key with no stored finding is allowed — the change was still
-    // proposed — but it is named, because the usual cause is a typo and a
-    // silent acceptance would look identical to a copied context.
+    // (#2386) Only reachable under `--allow-missing-finding` now — without
+    // it, a `for` key with no stored finding is refused before anything is
+    // written. Still named here, because the operator who asked for the
+    // link anyway should see which one is dangling.
     let missing: Vec<&str> =
         rec.context.findings.iter().filter(|f| f.missing).map(|f| f.key.as_str()).collect();
     if !missing.is_empty() {
