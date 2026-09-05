@@ -214,24 +214,29 @@ export function defaultFilterState(facets: Facets): FilterState {
   };
 }
 
-/** (#2018) How many of the operator's filters are currently HIDING something.
+/** (#2018, revised #2417 round 2) How many PRESENT values the operator's
+ * filters are currently HIDING.
  *
- * The button reads `filters` whether zero or six are set, so a pane showing
- * three rows out of four hundred looks exactly like a quiet system. That
- * invisibility — not durability — is the real hazard #1911 names when it
- * refuses to persist a selection: "a filter silently restored from last week
- * is a wrong reading that looks like a quiet system." A filter you can SEE is
- * not silent, which is why this lands before any persistence does.
+ * The button used to read `filters` whether one value or seventeen were
+ * hidden — a strict-subset-per-facet count, capped at one per facet
+ * regardless of how many values that facet was hiding. A pane showing three
+ * rows out of four hundred because sixteen activity values were unchecked
+ * read identically to one showing 399 out of 400. That invisibility — not
+ * durability — is the real hazard #1911 names when it refuses to persist a
+ * selection: "a filter silently restored from last week is a wrong reading
+ * that looks like a quiet system." A number that tracks actual hidden
+ * values, not hidden facets, is what makes the button honest at either
+ * scale.
  *
- * A facet counts as active only when it is a STRICT SUBSET of what is on
- * offer. Equal-size means every value is selected, which hides nothing — and
- * a facet whose values have not appeared yet must not read as a filter, or
- * every fresh page would open claiming filters it never applied.
+ * Each facet contributes `offered.length - selected.size` — the count of
+ * values on offer that are NOT currently checked. A facet whose values have
+ * not appeared yet contributes nothing, or every fresh page would open
+ * claiming filters it never applied.
  *
- * The free-text query counts as one, because it hides rows exactly the same
- * way a facet does.
+ * The free-text query still counts as one, because it hides rows exactly the
+ * same way a facet does and has no per-value count of its own.
  *
- * (#2416) `act`'s new curated default means this is routinely NONZERO on a
+ * (#2416) `act`'s curated default means this is routinely NONZERO on a
  * fresh, busy pane — that is correct and intended. Hiding heartbeat/
  * telemetry/lifecycle noise by default is the whole point of the fix; the
  * count exists precisely so a pane that is hiding rows never looks like one
@@ -240,9 +245,9 @@ export function defaultFilterState(facets: Facets): FilterState {
 export function activeFilterCount(state: FilterState, facets: Facets): number {
   let n = 0;
   for (const k of FACET_KEYS) {
-    const offered = facets[k];
-    const selected = state[k];
-    if (offered.length > 0 && selected.size < offered.length) n += 1;
+    const offered = facets[k].length;
+    const selected = state[k].size;
+    if (offered > 0) n += Math.max(0, offered - selected);
   }
   if (state.q.trim() !== "") n += 1;
   return n;
@@ -332,12 +337,20 @@ export function createFacetSeen(): FacetSeen {
  *
  * Returns the SAME `filters` reference when nothing changed, so a caller
  * (an effect) can call this on every `facets` change without triggering a
- * spurious re-render when nothing was actually new. */
+ * spurious re-render when nothing was actually new.
+ *
+ * (#2417 round 2) `overrides` is REQUIRED, not optional. An omitted-override
+ * caller silently fell back to "every new value follows the plain default",
+ * which is exactly the bug #2416 fixed for the real component — a caller
+ * that forgets to thread the operator's stored picks through would compile
+ * clean and regress silently. A test (or a future call site) that has no
+ * picks of its own passes `createStoredPicks()` explicitly, which is the
+ * empty/no-opinion case and behaves identically to the old default. */
 export function absorbNewFacetValues(
   filters: FilterState,
   facets: Facets,
   seen: FacetSeen,
-  overrides?: StoredPicks,
+  overrides: StoredPicks,
 ): FilterState {
   let changed = false;
   const next: FilterState = { ...filters };
@@ -345,8 +358,8 @@ export function absorbNewFacetValues(
     for (const v of facets[key]) {
       if (seen[key].has(v)) continue;
       seen[key].add(v);
-      const excluded = overrides ? overrides[key].exclude.has(v) : false;
-      const included = overrides ? overrides[key].include.has(v) : false;
+      const excluded = overrides[key].exclude.has(v);
+      const included = overrides[key].include.has(v);
       const on = excluded ? false : included || isDefaultOn(key, v);
       if (!on) continue;
       if (next[key] === filters[key]) next[key] = new Set(filters[key]);
@@ -390,24 +403,34 @@ export function matchesFilters(r: FlowRecord, filters: FilterState): boolean {
  */
 const FILTERS_STORAGE_KEY = "dmux.eventfilters";
 
-/** (#2027, revised #2416) Per-INSTANCE key. Two `EventLogColumn`s are
- * mounted at once on the `mission` route — the App-level one (always
- * mounted, CSS-hidden) and the one `MissionGraphLens` owns, fed
- * mission-scoped records. They shared this key, so a routine live-poll tick
- * on the HIDDEN pane overwrote the visible pane's picks, including its
- * search text, and a refresh restored the wrong pane's filters. Found by a
- * QA agent that mounted both as siblings.
+/** (#2027, revised #2416, revised again #2417 round 2) There is exactly ONE
+ * key, ONE global filter store — no per-scope forking.
  *
- * Scoping by the caller's own label keeps each pane's WRITES to itself: a
- * write with a `scope` always lands at the scope-specific key, never at the
- * global one, so a change inside a scoped pane never touches another pane's
- * (or the global) picks. READS go the other way — `storedFilterPicks`
- * checks the scope-specific key FIRST and falls back to the global (unscoped)
- * key when the scope has no picks of its own yet, so a pane that has never
- * had its own override still inherits the operator's baseline choices
- * instead of falling straight to the plain default. */
-function filtersKeyFor(scope?: string): string {
-  return scope ? `${FILTERS_STORAGE_KEY}.${scope}` : FILTERS_STORAGE_KEY;
+ * #2027's original fix scoped this key by the caller's own label (the
+ * mission id, a step id) because two `EventLogColumn`s could be mounted at
+ * once on the `mission` route and a routine live-poll tick on a hidden pane
+ * was overwriting the visible pane's picks. That fix worked, but it also
+ * meant `filtersKeyFor(undefined)` — the plain global key this constant
+ * names — was NEVER actually written in production: `EventLogColumn` always
+ * has a `scopeLabel` (App.tsx sets one for every route), so every real
+ * write landed at a scope-specific key and the global default sat dead. The
+ * practical effect: every view forked its own remembered picks instead of
+ * "a pick applies everywhere", which is what an operator reasonably expects
+ * from "I turned off heartbeat" — they don't expect to turn it off again on
+ * the next tab.
+ *
+ * #2417 round 2 fixes the actual #2027 hazard a different way instead:
+ * `persistFilterState` is now called ONLY from an operator gesture (a
+ * checkbox toggle, "model only", a query edit, reset) — never from mount,
+ * never from the passive `absorbNewFacetValues`/`applyStoredPicks` reconcile
+ * effects that run on every `facets` change. A hidden pane that is never
+ * touched by the operator never calls `setFilters` from a gesture, so it
+ * never writes — there is nothing left for it to clobber. With that
+ * guarantee in place, the fork is pure cost (silently dead global key, N
+ * divergent per-view defaults) for no remaining benefit, so it's removed:
+ * one key, one store, a pick sticks everywhere. */
+function filtersKeyFor(): string {
+  return FILTERS_STORAGE_KEY;
 }
 
 /** On-disk shape of `StoredPicks` — `version: 2` is the #2416 include/exclude
@@ -455,32 +478,22 @@ function readStoredPicksAt(storage: Pick<Storage, "getItem">, key: string): Stor
   return out;
 }
 
-/** (#2027, revised #2416) The stored picks, unreconciled against any
- * particular window's facets — for a caller that does not yet know what its
- * facets are (`EventLogColumn` mounts before its records query resolves),
- * and for `absorbNewFacetValues`, which needs the operator's explicit
- * include/exclude choices to decide a brand-new value rather than a
- * fully-reconciled `FilterState`.
+/** (#2027, revised #2416, revised again #2417 round 2 — one global key, no
+ * scope) The stored picks, unreconciled against any particular window's
+ * facets — for a caller that does not yet know what its facets are
+ * (`EventLogColumn` mounts before its records query resolves), and for
+ * `absorbNewFacetValues`, which needs the operator's explicit include/
+ * exclude choices to decide a brand-new value rather than a fully-
+ * reconciled `FilterState`.
  *
- * Reads scope-then-global (see `filtersKeyFor`'s doc): a scope with no picks
- * of its own inherits the global baseline rather than falling straight to
- * the plain default.
- *
- * Returns null when neither the scope nor the global key has a recognizable
- * (`version: 2`) payload, so a caller can distinguish "operator has no
- * saved picks" from "operator saved everything selected". */
+ * Returns null when the global key has no recognizable (`version: 2`)
+ * payload, so a caller can distinguish "operator has no saved picks" from
+ * "operator saved everything selected". */
 export function storedFilterPicks(
   storage: Pick<Storage, "getItem"> | null = typeof window === "undefined" ? null : window.sessionStorage,
-  scope?: string,
 ): StoredPicks | null {
   if (!storage) return null;
-  const scoped = readStoredPicksAt(storage, filtersKeyFor(scope));
-  if (scoped) return scoped;
-  if (scope) {
-    const global = readStoredPicksAt(storage, filtersKeyFor(undefined));
-    if (global) return global;
-  }
-  return null;
+  return readStoredPicksAt(storage, filtersKeyFor());
 }
 
 /** Apply stored picks to freshly-arrived facets: a value the operator
@@ -506,18 +519,16 @@ export function applyStoredPicks(picks: StoredPicks, facets: Facets): FilterStat
 
 /** Read persisted picks, reconciled against what this window offers.
  *
- * Returns the plain default when nothing is stored (scope AND global both
- * empty/unrecognizable), when storage is unavailable, or when the payload
- * is unrecognizable. Storage access can THROW outright (private mode,
- * blocked site data), not merely return null — `storedFilterPicks` (and the
- * `readStoredPicksAt` it delegates to) already wraps every access, so this
- * just defers to it. */
+ * Returns the plain default when nothing is stored, when storage is
+ * unavailable, or when the payload is unrecognizable. Storage access can
+ * THROW outright (private mode, blocked site data), not merely return null —
+ * `storedFilterPicks` (and the `readStoredPicksAt` it delegates to) already
+ * wraps every access, so this just defers to it. */
 export function restoreFilterState(
   facets: Facets,
   storage: Pick<Storage, "getItem"> | null = typeof window === "undefined" ? null : window.sessionStorage,
-  scope?: string,
 ): FilterState {
-  const picks = storedFilterPicks(storage, scope);
+  const picks = storedFilterPicks(storage);
   if (!picks) return defaultFilterState(facets);
   return applyStoredPicks(picks, facets);
 }
@@ -532,14 +543,23 @@ export function restoreFilterState(
  * exactly the `heartbeat`-comes-back-every-run bug for any value outside
  * `DEFAULT_ACTIVITIES` too.
  *
- * The fix: read whatever is already stored at this exact key (scope-specific
- * if `scope` is given, else the global key — never the OTHER one; a scoped
- * write never touches the global key and vice versa), recompute overrides
- * only for values `facets` currently offers, and carry every other
- * previously-recorded override (for a value not currently offered) forward
- * unchanged. A value matching `isDefaultOn` is removed from both lists
- * (no override needed); a value differing from it is recorded on the
- * matching side.
+ * The fix: read whatever is already stored at the (one, global) key,
+ * recompute overrides only for values `facets` currently offers, and carry
+ * every other previously-recorded override (for a value not currently
+ * offered) forward unchanged. A value matching `isDefaultOn` is removed from
+ * both lists (no override needed); a value differing from it is recorded on
+ * the matching side.
+ *
+ * (#2417 round 2) The CALLER decides when this runs, and it must be an
+ * operator gesture — a checkbox toggle, "model only", a query edit, reset —
+ * never a mount-time seed and never the passive `absorbNewFacetValues`/
+ * `applyStoredPicks` reconcile that runs on every `facets` change. Calling
+ * this from an effect keyed on `filters` (the pre-round-2 shape) persisted
+ * on EVERY state change regardless of source, which is what made the
+ * per-scope fork load-bearing in the first place — a hidden pane's own
+ * passive reconcile would write and clobber a sibling pane's picks. Gating
+ * persistence to gestures only removes the need for that fork; see
+ * `filtersKeyFor`'s doc.
  *
  * Silent on failure by design — a filter that could not be saved is a lost
  * convenience, never a reason to break the pane. */
@@ -547,11 +567,10 @@ export function persistFilterState(
   filters: FilterState,
   facets: Facets,
   storage: Pick<Storage, "getItem" | "setItem"> | null = typeof window === "undefined" ? null : window.sessionStorage,
-  scope?: string,
 ): void {
   if (!storage) return;
   try {
-    const key = filtersKeyFor(scope);
+    const key = filtersKeyFor();
     const previous = readStoredPicksAt(storage, key) ?? createStoredPicks();
     const next = createStoredPicks();
     next.q = filters.q;

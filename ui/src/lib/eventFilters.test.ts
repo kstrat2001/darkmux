@@ -113,7 +113,7 @@ describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#
     const seen = createFacetSeen();
     let filters = defaultFilterState({ act: [], cat: [], tier: [], src: [] }); // the empty-at-mount snapshot
     const facets = computeFacets([rec({ tier: "local" })]);
-    filters = absorbNewFacetValues(filters, facets, seen);
+    filters = absorbNewFacetValues(filters, facets, seen, createStoredPicks());
     expect(filters.tier.has("local")).toBe(true);
   });
 
@@ -135,12 +135,12 @@ describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#
     const seen = createFacetSeen();
     let filters = defaultFilterState(computeFacets([rec({ action: "dispatch.reasoning" })]));
     seen.act.add("reasoning"); // mark the initial batch as already-seen, matching real usage
-    filters = absorbNewFacetValues(filters, computeFacets([rec({ action: "dispatch.reasoning" })]), seen);
+    filters = absorbNewFacetValues(filters, computeFacets([rec({ action: "dispatch.reasoning" })]), seen, createStoredPicks());
 
     // A new record arrives with an activity that was never in the initial batch.
     const newRecord = rec({ action: "dispatch.tool" });
     const facetsWithNew = computeFacets([rec({ action: "dispatch.reasoning" }), newRecord]);
-    filters = absorbNewFacetValues(filters, facetsWithNew, seen);
+    filters = absorbNewFacetValues(filters, facetsWithNew, seen, createStoredPicks());
 
     expect(filters.act.has("tool call")).toBe(true);
     expect(matchesFilters(newRecord, filters)).toBe(true);
@@ -149,13 +149,13 @@ describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#
   it("does NOT re-include an already-seen value the operator explicitly unchecked", () => {
     const seen = createFacetSeen();
     let filters = defaultFilterState(computeFacets([rec({ tier: "cloud" })]));
-    filters = absorbNewFacetValues(filters, computeFacets([rec({ tier: "cloud" })]), seen);
+    filters = absorbNewFacetValues(filters, computeFacets([rec({ tier: "cloud" })]), seen, createStoredPicks());
     filters = { ...filters, tier: new Set(filters.tier) };
     filters.tier.delete("cloud"); // operator unchecks it
 
     // The SAME value shows up again in a later record set — already seen,
     // so it must stay excluded.
-    filters = absorbNewFacetValues(filters, computeFacets([rec({ tier: "cloud" })]), seen);
+    filters = absorbNewFacetValues(filters, computeFacets([rec({ tier: "cloud" })]), seen, createStoredPicks());
     expect(filters.tier.has("cloud")).toBe(false);
   });
 
@@ -163,8 +163,8 @@ describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#
     const seen = createFacetSeen();
     const facets = computeFacets([rec({ tier: "local" })]);
     let filters = defaultFilterState(facets);
-    filters = absorbNewFacetValues(filters, facets, seen);
-    const again = absorbNewFacetValues(filters, facets, seen);
+    filters = absorbNewFacetValues(filters, facets, seen, createStoredPicks());
+    const again = absorbNewFacetValues(filters, facets, seen, createStoredPicks());
     expect(again).toBe(filters);
   });
 });
@@ -206,6 +206,13 @@ describe("MODEL_ACTIVITIES — the model-doing-something vocabulary", () => {
 });
 
 describe("'model only' over the PRODUCTION filter path", () => {
+  // The other MODEL_ACTIVITIES tests assert on the Set object and reimplement
+  // the filter inline, so they exercise `Set.prototype.has` and can never fail
+  // for a production reason. Two mutations that reproduce the exact bug this
+  // fixes both left 967/967 green: gating heartbeat out inside
+  // `onlyModelFacet`, and renaming the label `activityOf` returns so the set
+  // member is dead. This test runs the real chain — activityOf -> computeFacets
+  // -> onlyModelFacet -> matchesFilters — and dies under both.
   const heartbeat: FlowRecord = {
     ts: "2026-08-08T12:00:00.000Z",
     category: "work",
@@ -255,6 +262,25 @@ describe("activeFilterCount", () => {
     const st = defaultFilterState(facets);
     st.act = new Set(["reasoning"]);
     expect(activeFilterCount(st, facets)).toBe(1);
+  });
+
+  // (#2417 round 2, MF2) The count is HIDDEN VALUES, not hidden facets — a
+  // facet hiding seventeen values must read as 17, not 1, or the button
+  // reads "filters · 1" whether one value or seventeen are hidden from a
+  // busy facet.
+  it("counts every hidden PRESENT value, not one per facet", () => {
+    const wide: Facets = { act: [], cat: Array.from({ length: 20 }, (_, i) => `c${i}`), tier: [], src: [] };
+    const st = defaultFilterState(wide);
+    st.cat = new Set(Array.from({ length: 3 }, (_, i) => `c${i}`)); // 3 of 20 selected, 17 hidden
+    expect(activeFilterCount(st, wide)).toBe(17);
+  });
+
+  it("sums hidden values across multiple facets, not just one", () => {
+    const both: Facets = { act: [], cat: ["a", "b", "c"], tier: ["x", "y"], src: [] };
+    const st = defaultFilterState(both);
+    st.cat = new Set(["a"]); // 2 hidden
+    st.tier = new Set(["x"]); // 1 hidden
+    expect(activeFilterCount(st, both)).toBe(3);
   });
 
   it("does not count a facet with nothing on offer", () => {
@@ -411,30 +437,20 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
     expect(restored.act.has("turn")).toBe(true);
   });
 
-  // (d)
-  it("a scope with no override of its own reads the global picks", () => {
+  // (d, revised #2417 round 2) There is now exactly ONE store — no scope
+  // parameter exists any more on `persistFilterState`/`restoreFilterState`/
+  // `storedFilterPicks`. A pick made anywhere is visible everywhere,
+  // because there is nowhere else for it to have landed.
+  it("a pick made through one caller is visible to every other reader — one global store, no fork", () => {
     const s = mem();
     const facets = computeFacets([rec({ action: "dispatch.reasoning" }), rec({ action: "flow.note" })]);
-    const globalState = defaultFilterState(facets);
-    globalState.act.add("note"); // operator explicitly includes "note" globally
-    persistFilterState(globalState, facets, s); // no scope => global key
+    const state = defaultFilterState(facets);
+    state.act.add("note"); // operator explicitly includes "note"
+    persistFilterState(state, facets, s);
 
-    // A scoped pane that has never had its own picks inherits the global ones.
-    expect(restoreFilterState(facets, s, "mission").act.has("note")).toBe(true);
-  });
-
-  it("a change inside a scope writes the scope key and leaves the global key untouched", () => {
-    const s = mem();
-    const facets = computeFacets([rec({ action: "dispatch.reasoning" }), rec({ action: "flow.note" })]);
-    const scopedState = defaultFilterState(facets);
-    scopedState.act.add("note");
-    persistFilterState(scopedState, facets, s, "mission");
-
-    // The global (unscoped) key was never written — restoring unscoped
-    // still gets the plain default, not the scoped operator's pick.
-    expect(restoreFilterState(facets, s).act.has("note")).toBe(false);
-    // The scope itself sees its own pick.
-    expect(restoreFilterState(facets, s, "mission").act.has("note")).toBe(true);
+    // Every reader — there is only the one key now — sees the same pick.
+    expect(restoreFilterState(facets, s).act.has("note")).toBe(true);
+    expect(storedFilterPicks(s)?.act.include.has("note")).toBe(true);
   });
 
   // (e)
@@ -492,5 +508,57 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
     expect(storedFilterPicks(s)).toBeNull();
     s.setItem("dmux.eventfilters", "not json");
     expect(storedFilterPicks(s)).toBeNull();
+  });
+
+  // (#2417 round 2, item 4) The full end-to-end sequence the fix is
+  // supposed to hold together: empty facets at mount, a dispatch introduces
+  // two brand-new activities (one absorbs on, one off), the operator
+  // corrects one of them by hand (a real gesture — persisted, just like
+  // `EventLogColumn`'s `toggleFacet` does), both activities later vanish
+  // and then reappear, and finally a simulated page refresh reads the
+  // persisted picks back. Every step uses the exact functions the component
+  // wires together (`absorbNewFacetValues`, `persistFilterState`,
+  // `restoreFilterState`) rather than re-deriving the sequence by hand.
+  it("end-to-end: absorb, operator correction, disappear/reappear, then a simulated refresh", () => {
+    const s = mem();
+    const seen = createFacetSeen();
+    let filters = defaultFilterState({ act: [], cat: [], tier: [], src: [] }); // empty at mount
+
+    // Dispatch introduces heartbeat (absorbs OFF) and tool call (absorbs ON).
+    const busy = computeFacets([rec({ action: "dispatch.turn.heartbeat" }), rec({ action: "dispatch.tool" })]);
+    filters = absorbNewFacetValues(filters, busy, seen, createStoredPicks());
+    expect(filters.act.has("heartbeat")).toBe(false);
+    expect(filters.act.has("tool call")).toBe(true);
+
+    // The operator unchecks tool call by hand — a gesture, so it persists,
+    // exactly like `EventLogColumn.toggleFacet` does.
+    filters = { ...filters, act: new Set(filters.act) };
+    filters.act.delete("tool call");
+    persistFilterState(filters, busy, s);
+    expect(filters.act.has("heartbeat")).toBe(false);
+    expect(filters.act.has("tool call")).toBe(false); // both now hidden
+
+    // The fleet goes idle: neither activity is offered for a while.
+    const idle = computeFacets([rec({ action: "dispatch.turn" })]);
+    filters = absorbNewFacetValues(filters, idle, seen, createStoredPicks());
+
+    // Both activities reappear. `seen` already has both marked, so
+    // `absorbNewFacetValues` is a no-op for them — they come back exactly
+    // as the operator left them: both OFF (heartbeat was never on; tool
+    // call is now explicitly excluded).
+    const reappeared = computeFacets([
+      rec({ action: "dispatch.turn.heartbeat" }),
+      rec({ action: "dispatch.tool" }),
+      rec({ action: "dispatch.turn" }),
+    ]);
+    filters = absorbNewFacetValues(filters, reappeared, seen, createStoredPicks());
+    expect(filters.act.has("heartbeat")).toBe(false);
+    expect(filters.act.has("tool call")).toBe(false);
+
+    // A simulated refresh: a brand-new `restoreFilterState` call against the
+    // persisted picks, with no `seen`/`filters` continuity at all.
+    const restored = restoreFilterState(reappeared, s);
+    expect(restored.act.has("heartbeat")).toBe(false);
+    expect(restored.act.has("tool call")).toBe(false);
   });
 });

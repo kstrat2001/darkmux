@@ -294,12 +294,20 @@ export function EventLogColumn({
   // exactly when new facet values arrive.
   const activeFilters = useMemo(() => activeFilterCount(filters, facets), [filters, facets]);
 
-  // Persist on change rather than on close: the operator's picks should
-  // survive a refresh taken at any moment, not only one taken after tidily
-  // dismissing the dialog.
-  useEffect(() => {
-    persistFilterState(filters, facets, undefined, scopeLabel);
-  }, [filters]);
+  // (#2417 round 2) Persistence is NOT wired to `filters` as a passive
+  // effect any more — that used to fire on every `setFilters` call
+  // regardless of source: the mount-time restore, the `absorbNewFacetValues`
+  // reconcile below, AND an operator's own gesture all funneled through the
+  // same `[filters]`-keyed effect and wrote identically. On the `mission`
+  // route with two mounted panes (#2027's own finding), the HIDDEN pane's
+  // passive reconcile fired that effect too and clobbered the visible
+  // pane's picks — the per-scope storage key was the workaround. The actual
+  // fix is upstream of storage entirely: only a real operator gesture
+  // (`setQuery`/`toggleFacet`/`onlyModel`/`clearAllFilters`, below) calls
+  // `persistFilterState` now, each right where it changes `filters`. A pane
+  // nobody has touched never calls any of those, so it never writes —
+  // there is nothing left to clobber, and the one global key
+  // (`eventFilters.ts`'s `filtersKeyFor`) is safe to have back.
 
   const seenRef = useRef<FacetSeen>(createFacetSeen());
   // The absorb runs in the EFFECT BODY, not inside the `setFilters` updater.
@@ -311,7 +319,8 @@ export function EventLogColumn({
   // returns the stale filters, silently dropping a live-streamed record whose
   // facet value is brand new. Reading `filters` here costs a dependency on it,
   // and the identity guard below keeps that from looping.
-  // (#2027, revised #2416) The operator's stored picks, read ONCE at mount and
+  // (#2027, revised #2416, revised again #2417 round 2 — one global key,
+  // read with no scope) The operator's stored picks, read ONCE at mount and
   // kept alive for the component's whole lifetime — not just until the first
   // real `facets` arrive. `absorbNewFacetValues` needs this on EVERY later
   // call too: a value like `heartbeat` that the operator excluded last
@@ -319,7 +328,16 @@ export function EventLogColumn({
   // has no heartbeat records until the first dispatch), and when it finally
   // does, it is "brand new" to `seenRef` and must still come back OFF rather
   // than falling back to `DEFAULT_ACTIVITIES`/absorb-on defaults.
-  const overridesRef = useRef<StoredPicks>(storedFilterPicks(undefined, scopeLabel) ?? createStoredPicks());
+  //
+  // Deliberately read ONCE at mount, not re-read inside the effect below on
+  // every `facets` change: `seenRef` is what gates a value ever being
+  // reconsidered (once seen, `absorbNewFacetValues` skips it), and a
+  // storage re-read mid-effect would fight that ledger — it would see
+  // whatever the operator's LATEST gesture already wrote (including this
+  // same render's own gesture, since gestures persist synchronously) and
+  // re-apply it as if it were still an unresolved "brand new value"
+  // decision, which is exactly the ledger's job to prevent.
+  const overridesRef = useRef<StoredPicks>(storedFilterPicks() ?? createStoredPicks());
   // Whether the one-time "apply the full stored snapshot" reconciliation
   // below has already run. `restoreFilterState` in the initializer above
   // cannot do this alone: the component mounts before its records query
@@ -428,22 +446,38 @@ export function EventLogColumn({
 
   const filtered = useMemo(() => records.filter((r) => matchesFilters(r, filters)), [records, filters]);
 
+  // (#2417 round 2) Each of these four is an OPERATOR GESTURE — the only
+  // call sites allowed to persist. They no longer go through a functional
+  // `setFilters(f => ...)` updater: computing `next` from the current
+  // `filters` closure and persisting it right here (rather than inside the
+  // updater) keeps `persistFilterState`'s side effect out of a function
+  // React may invoke more than once per commit (`<StrictMode>` double-
+  // invokes updaters on purpose to catch impurity — see `seenRef`'s doc
+  // above for the same concern on `absorbNewFacetValues`). These are plain
+  // synchronous event handlers, not concurrent updates racing each other
+  // within one tick, so reading `filters` from the render closure is safe.
   function setQuery(q: string) {
-    setFilters((f) => ({ ...f, q }));
+    const next = { ...filters, q };
+    setFilters(next);
+    persistFilterState(next, facets);
   }
   function toggleFacet(key: keyof Facets, value: string) {
-    setFilters((f) => {
-      const next = new Set(f[key]);
-      if (next.has(value)) next.delete(value);
-      else next.add(value);
-      return { ...f, [key]: next };
-    });
+    const values = new Set(filters[key]);
+    if (values.has(value)) values.delete(value);
+    else values.add(value);
+    const next = { ...filters, [key]: values };
+    setFilters(next);
+    persistFilterState(next, facets);
   }
   function onlyModel() {
-    setFilters((f) => ({ ...f, act: onlyModelFacet(facets) }));
+    const next = { ...filters, act: onlyModelFacet(facets) };
+    setFilters(next);
+    persistFilterState(next, facets);
   }
   function clearAllFilters() {
-    setFilters(defaultFilterState(facets));
+    const next = defaultFilterState(facets);
+    setFilters(next);
+    persistFilterState(next, facets);
   }
 
   const capped = filtered.length > LOG_CAP;
@@ -531,6 +565,13 @@ export function EventLogColumn({
     });
   }
 
+  // (#2417 round 2, MF2) How many records the facet filters themselves are
+  // hiding — as opposed to `capped`, which is the separate "only the newest
+  // LOG_CAP are rendered" disclosure. Omitted from the chip entirely when
+  // zero, so a pane with nothing filtered reads exactly as it did before.
+  const hiddenByFilters = records.length - filtered.length;
+  const hiddenSuffix = hiddenByFilters > 0 ? ` · ${hiddenByFilters} hidden` : "";
+
   const q = filters.q.length > 0;
   const qcountText = q
     ? filtered.length
@@ -558,9 +599,19 @@ export function EventLogColumn({
     // `eventsPanelEls` does — the total this component reports is itself a
     // slice of a server-capped response, so "of 734" would understate the
     // real count without it.
+    //
+    // (#2417 round 2) `${filtered.length}` here is a POST-FILTER total —
+    // "50 of 734" reads as "734 total events" when 734 is actually what's
+    // LEFT after the operator's (or the #2416 default's) facet picks hid
+    // everything else. A busy stream with 1000 records and 900 of them
+    // hidden by the curated activity default read as a quiet 100-event pane.
+    // `hiddenByFilters` names what the filters themselves are hiding —
+    // distinct from `capped`'s "the log/search window shows only the
+    // newest 50" disclosure — so the two compose rather than one silently
+    // standing in for the other.
     : capped
-      ? `${LOG_CAP} of ${filtered.length}${serverTruncated ? "+" : ""} events`
-      : `${filtered.length}${serverTruncated ? "+" : ""} events`;
+      ? `${LOG_CAP} of ${filtered.length}${serverTruncated ? "+" : ""} events${hiddenSuffix}`
+      : `${filtered.length}${serverTruncated ? "+" : ""} events${hiddenSuffix}`;
 
   return (
     <div

@@ -59,6 +59,21 @@ const SERVED_VIEWER = path.join('crates', 'darkmux-serve', 'assets', 'next.html'
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'lifecycle-flow.jsonl'), 'utf8')
   );
 
+  // (#2417 round 2) The #2416-default harness: a handful of reasoning +
+  // heartbeat records and NOTHING ELSE — small enough that a real browser,
+  // with NO seeded `sessionStorage`, must show the curated-default result
+  // (heartbeat hidden, reasoning shown, the Filters button nonzero) rather
+  // than whatever an earlier spec's seeded picks left behind.
+  const filtersDefault = viewer.replace(
+    '<head>',
+    '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./filters-default-flow.jsonl">'
+  );
+  fs.writeFileSync(path.join(SERVED, 'index-filters-default.html'), filtersDefault);
+  fs.writeFileSync(
+    path.join(SERVED, 'filters-default-flow.jsonl'),
+    fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'filters-default-flow.jsonl'), 'utf8')
+  );
+
   // (#1607) Savings-hero attribution harness. Three sessions, one per tier:
   // a positively-LOCAL one (bookends, no endpoint), a CLOUD one whose
   // completion names an endpoint and reports spend only as `remote_tokens`

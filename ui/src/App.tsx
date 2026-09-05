@@ -557,9 +557,12 @@ export function App() {
   // records are ALWAYS a cross-day, cross-restart fold, never a rolling
   // "last 24h" window — `historical: true` unconditionally, matching what
   // `MissionGraphLens`'s own retired inline mount used to pass.
-  // (#2189) Step-scoped filter-picks/persistence key — appends the step id
-  // so a step's own remembered filter picks (`EventLogColumn`'s own
-  // `storedFilterPicks`) don't collide with the whole mission's.
+  // (#2189, revised #2417 round 2) Appends the step id so `#logscope`'s
+  // hidden text (and the visible header context it feeds) names the step,
+  // not just the mission. This label no longer keys any storage —
+  // `EventLogColumn`'s filter picks are ONE global store, not scoped by
+  // this value (see `eventFilters.ts`'s `filtersKeyFor` doc for why the
+  // per-scope fork was retired) — `scopeLabel` is display-only now.
   const eventLogScopeLabel =
     route.kind === "mission" ? (route.stepId ? `${route.missionId}:${route.stepId}` : route.missionId) : logscope;
   const eventLogHistorical = route.kind === "mission" ? true : routeRecords.historical;
