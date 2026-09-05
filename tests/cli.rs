@@ -7985,3 +7985,47 @@ fn clean_generic_run_leaves_no_non_terminal_step_behind() {
         .collect();
     assert!(live.is_empty(), "a clean run must persist only Complete steps: {live:#?}");
 }
+
+/// (live proof 2026-09-05, frontier control) The create-mod message is the
+/// one lever left after the gate learned to absorb three kit shapes
+/// mechanically: local coder seats wrote kits in container coordinates, with
+/// miscounted hunk headers, in code fences, and without a terminating
+/// newline — a clean-context frontier seat given the SAME message wrote
+/// four of four kits that applied raw. The message now names the shape it
+/// wants, and it is byte-identical in `crawl.json` and `review-v2.json`
+/// (the same grow template, deliberately not two).
+#[test]
+fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
+    fn create_mod_message(doc: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(doc).expect("built-in config parses");
+        let mut found = Vec::new();
+        fn walk(x: &serde_json::Value, out: &mut Vec<String>) {
+            match x {
+                serde_json::Value::Object(m) => {
+                    if let Some(serde_json::Value::String(s)) = m.get("message") {
+                        if s.contains("PROPOSE the change") {
+                            out.push(s.clone());
+                        }
+                    }
+                    m.values().for_each(|v| walk(v, out));
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+                _ => {}
+            }
+        }
+        walk(&v, &mut found);
+        assert_eq!(found.len(), 1, "exactly one create-mod message per config: {found:?}");
+        found.remove(0)
+    }
+    let crawl = create_mod_message(include_str!("../templates/builtin/mission-configs/crawl.json"));
+    let review = create_mod_message(include_str!("../templates/builtin/mission-configs/review-v2.json"));
+    assert_eq!(crawl, review, "one grow template, two configs — the message must not fork");
+    for needle in [
+        "relative to the repository root",
+        "exactly as they appear",
+        "not inside a code fence",
+        "end with a newline",
+    ] {
+        assert!(crawl.contains(needle), "the message must name the kit shape ({needle:?}):\n{crawl}");
+    }
+}
