@@ -877,6 +877,18 @@ pub struct DockerRunConfig {
     /// flow records), so plain argv/`ps` visibility is fine, same as
     /// `--model`.
     pub role_id: String,
+    /// (#2386) This dispatch's session id — passed to the container as
+    /// `--session-id`. It is the `<dispatch>` half of every finding key
+    /// `materialize_finding` files an accepted `create_finding` call under
+    /// (`<session_id>/<emit_seq>`), so handing it to the runtime is what
+    /// lets `create_finding` return the REAL key the model must name in a
+    /// later `create_mod`'s `for` — and what lets `create_mod` refuse a key
+    /// this run never recorded and its brief never handed it. Before this,
+    /// the only key-shaped text in a reviewer's context was the tool
+    /// description's own example, which one seat copied onto six mods that
+    /// linked to nothing. Not secret (it is already in the container name
+    /// and on every flow record), so plain argv visibility is fine.
+    pub session_id: String,
     /// Resolved model name for the runtime CLI.
     pub model: String,
     /// Full system prompt (preamble + role prompt, specialist roles only).
@@ -1127,6 +1139,11 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // check. See `DockerRunConfig::role_id`'s own doc.
     args.push("--role-id".to_string());
     args.push(config.role_id.clone());
+    // (#2386) Unconditional, same as `--role-id`: the runtime needs its own
+    // finding-key namespace on every dispatch, not only on a crawl — any
+    // role with the `create_finding`/`create_mod` palette mints keys.
+    args.push("--session-id".to_string());
+    args.push(config.session_id.clone());
     args.push("--system".to_string());
     args.push(config.system_prompt.clone());
     // (#1038) Role-declared output schema → runtime `--response-schema` →
@@ -3763,6 +3780,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         },
         image: image.clone(),
         role_id: opts.role_id.clone(),
+        // (#2386) The SAME id `materialize_finding` keys stored findings by.
+        session_id: session_id.clone(),
         model: model.clone(),
         system_prompt: system_prompt.clone(),
         output_schema: role.output_schema.clone(),

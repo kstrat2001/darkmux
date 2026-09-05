@@ -6591,9 +6591,26 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
     assert!(home.path().join("mods").join(&key_a).join("mod.json").exists());
     assert!(home.path().join("mods").join(&key_a2).join("mod.json").exists());
 
-    // A `for` key with no stored finding is allowed, recorded, and NAMED.
+    // (#2386) A `for` key with no stored finding is REFUSED — it would be a
+    // link nothing can follow, and the usual cause is a typo or a copied
+    // example. The refusal names the key and the escape hatch.
     let out = dm_stdin(
         &["mod", "create", "--by", "kain", "--for", "sess-z/9", "--kit", "-"],
+        "for something not in the store",
+    );
+    assert!(!out.status.success(), "a dangling `for` key is refused");
+    let refusal = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(refusal.contains("sess-z/9"), "the refusal names it: {refusal}");
+    assert!(refusal.contains("--allow-missing-finding"), "and the hatch: {refusal}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "and nothing goes to stdout, which is the key channel"
+    );
+
+    // The hatch itself: the operator asked for the link anyway, so it is
+    // recorded — and still NAMED on stderr, so stdout stays pipeable.
+    let out = dm_stdin(
+        &["mod", "create", "--by", "kain", "--for", "sess-z/9", "--allow-missing-finding", "--kit", "-"],
         "for something not in the store",
     );
     assert!(out.status.success());
@@ -8421,6 +8438,10 @@ fn record_mod_for(home: &std::path::Path, workdir: &std::path::Path, finding_key
             finding_key,
             "--kit-kind",
             "unified-diff",
+            // (#2386) These fixtures seed a mod for a finding key they never
+            // store — exactly the case the flag exists for. Without it the
+            // seed is refused, which is the new contract working.
+            "--allow-missing-finding",
             "--kit",
             &kit.to_string_lossy(),
         ])

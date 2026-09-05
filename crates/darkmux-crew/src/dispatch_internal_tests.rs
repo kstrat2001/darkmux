@@ -1756,6 +1756,7 @@
             )),
             image: "rust:slim".to_string(),
             role_id: "test-role".to_string(),
+            session_id: "sess-test".to_string(),
             model: "llama3-8b".to_string(),
             system_prompt: "You are a coding assistant.".to_string(),
             message: "Fix the bug in main.rs".to_string(),
@@ -1895,46 +1896,50 @@
         // dispatch — see `DockerRunConfig::role_id`'s own doc.
         assert_eq!(argv[38], "--role-id");
         assert_eq!(argv[39], "test-role");
-        assert_eq!(argv[40], "--system");
-        assert_eq!(argv[41], "You are a coding assistant.");
+        // (#2386) Unconditional too — the runtime needs its finding-key
+        // namespace on every dispatch. See `DockerRunConfig::session_id`.
+        assert_eq!(argv[40], "--session-id");
+        assert_eq!(argv[41], "sess-test");
+        assert_eq!(argv[42], "--system");
+        assert_eq!(argv[43], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[42], "--prompt-file");
-        assert_eq!(argv[43], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[44], "--prompt-file");
+        assert_eq!(argv[45], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[44], "--json");
+        assert_eq!(argv[46], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[45], "--allowed-tools");
-        assert_eq!(argv[46], "exec,edit");
+        assert_eq!(argv[47], "--allowed-tools");
+        assert_eq!(argv[48], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[47], "--compact-threshold-tokens");
-        assert_eq!(argv[48], "4096");
-        assert_eq!(argv[49], "--compactor-model");
-        assert_eq!(argv[50], "util-model");
-        assert_eq!(argv[51], "--compact-threshold-ratio");
-        assert_eq!(argv[52], "0.75");
-        assert_eq!(argv[53], "--context-window");
-        assert_eq!(argv[54], "32000");
-        assert_eq!(argv[55], "--compact-strategy");
-        assert_eq!(argv[56], "structured-slot");
-        assert_eq!(argv[57], "--bail-after-compactions");
-        assert_eq!(argv[58], "10");
-        assert_eq!(argv[59], "--compactor-custom-instructions");
-        assert_eq!(argv[60], "Be terse.");
+        assert_eq!(argv[49], "--compact-threshold-tokens");
+        assert_eq!(argv[50], "4096");
+        assert_eq!(argv[51], "--compactor-model");
+        assert_eq!(argv[52], "util-model");
+        assert_eq!(argv[53], "--compact-threshold-ratio");
+        assert_eq!(argv[54], "0.75");
+        assert_eq!(argv[55], "--context-window");
+        assert_eq!(argv[56], "32000");
+        assert_eq!(argv[57], "--compact-strategy");
+        assert_eq!(argv[58], "structured-slot");
+        assert_eq!(argv[59], "--bail-after-compactions");
+        assert_eq!(argv[60], "10");
+        assert_eq!(argv[61], "--compactor-custom-instructions");
+        assert_eq!(argv[62], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[61], "--feedback-templates-json");
+        assert_eq!(argv[63], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[62].contains("error"));
-        assert!(argv[62].contains("An error occurred"));
+        assert!(argv[64].contains("error"));
+        assert!(argv[64].contains("An error occurred"));
 
         // Total arg count: 61 (0..=60) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
@@ -1942,7 +1947,8 @@
         // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` (#2094 finding 1),
         // +2 for `--role-id <id>` (security audit, #2114 resume follow-up), +2 for
         // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=<tier>` (#2165).
-        assert_eq!(argv.len(), 63);
+        // +2 for `--session-id <id>` (#2386).
+        assert_eq!(argv.len(), 65);
     }
 
     #[test]
@@ -1960,6 +1966,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
+            session_id: "sess-test".to_string(),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -2093,6 +2100,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
+            session_id: "sess-test".to_string(),
             model: "default-model".to_string(),
             system_prompt: "Tool-less reviewer.".to_string(),
             message: "Review this.".to_string(),
@@ -2147,6 +2155,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
+            session_id: "sess-test".to_string(),
             model: "m".to_string(),
             system_prompt: "role".to_string(),
             message: "msg".to_string(),
@@ -2888,6 +2897,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
+            session_id: "sess-test".to_string(),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),

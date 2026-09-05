@@ -206,10 +206,13 @@ impl Tool {
                  whatever form you choose: a diff, a sentence, a JSON value, a \
                  config line. It is stored exactly as you write it and is never \
                  parsed, so write it so that someone applying it later — with no \
-                 access to this conversation — has everything they need. When you \
-                 know which finding(s) this change addresses, name their keys in \
-                 `for` (the form `<dispatch>/<seq>`, e.g. `sess-abc/1`); a key of \
-                 any other shape is refused. `attach` copies files from the \
+                 access to this conversation — has everything they need. When this \
+                 change addresses a finding, name its key in `for`: the `key` \
+                 `create_finding` returned to you when it recorded that finding, or \
+                 the key a `<finding key=\"...\">` block in your message names. Do \
+                 not compose a key yourself — a key that names no recorded finding \
+                 is refused, and one you invent addresses nothing. Omit `for` when \
+                 this change addresses no recorded finding. `attach` copies files from the \
                  workspace into the mod, for data a kit needs but cannot inline. \
                  This tool RECORDS the change; it does not apply anything, and \
                  recording a mod is not a substitute for making an edit you were \
@@ -346,7 +349,7 @@ impl Tool {
                 "properties": {
                     "for": {
                         "type": "array",
-                        "description": "Keys of the findings this change addresses, each of the form `<dispatch>/<seq>` (e.g. `sess-abc/1`). Omit or leave empty when you do not know of a finding this addresses.",
+                        "description": "Keys of the findings this change addresses. A key is the one `create_finding` returned when it recorded the finding, or the one a `<finding key=\"...\">` block in your message names — never one you compose yourself. Omit or leave empty when you do not know of a finding this addresses.",
                         "items": { "type": "string" }
                     },
                     "kit": {
@@ -1601,6 +1604,162 @@ y = 2
         assert!(schema["properties"]["attach"].is_object());
     }
 
+    // ─── (#2386) no invented finding key anywhere the model can read ──
+
+    /// The measured defect: the description said "the form
+    /// `<dispatch>/<seq>`, e.g. `sess-abc/1`", and a reviewer seat
+    /// (qwen3.6-35b-a3b-turboquant-mlx, mission
+    /// `review-v2-1788589360-944ac8`) copied the example onto six mods,
+    /// plus the `sess-1` variations it derived from it. Every model-facing
+    /// string this tool can emit is checked, not just the description: the
+    /// schema the model is handed, the teaching shape every refusal ends
+    /// with, and the shape refusal itself.
+    #[test]
+    fn no_model_facing_create_mod_text_contains_an_example_finding_key() {
+        let schema = Tool::CreateMod.parameters_schema().to_string();
+        let shape_refusal = execute_create_mod(
+            &serde_json::json!({"for": ["not-a-key"], "kit": "k"}).to_string(),
+            fresh_workspace().path(),
+            fresh_workspace().path(),
+        )
+        .unwrap()
+        .result;
+        for (what, text) in [
+            ("description", Tool::CreateMod.description().to_string()),
+            ("schema", schema),
+            ("CREATE_MOD_SHAPE", CREATE_MOD_SHAPE.to_string()),
+            ("the shape refusal", shape_refusal),
+        ] {
+            assert!(
+                !text.contains("sess-abc") && !text.contains("sess-1"),
+                "{what} still shows an example finding key a model can copy: {text}"
+            );
+        }
+    }
+
+    /// Removing the example is only half of it — a model with no key at all
+    /// would omit `for` and the link would be lost anyway. Every one of
+    /// those strings must say WHERE a real key comes from.
+    #[test]
+    fn create_mod_text_points_the_model_at_the_key_create_finding_returned() {
+        for (what, text) in [
+            ("description", Tool::CreateMod.description().to_string()),
+            ("schema", Tool::CreateMod.parameters_schema().to_string()),
+            ("CREATE_MOD_SHAPE", CREATE_MOD_SHAPE.to_string()),
+        ] {
+            assert!(text.contains("create_finding"), "{what} must name the source of a key: {text}");
+        }
+    }
+
+    /// The other half of the repair: `create_finding` hands the key back, so
+    /// the model HAS one to name. Before #2386 it answered "Recorded." and
+    /// the only key-shaped text in its whole context was the example above.
+    #[test]
+    fn create_finding_hands_back_the_key_the_store_will_use() {
+        let m = recorded_finding_message(Some(&finding_key_for("sess-x", 3)), 3, 17);
+        assert!(m.contains("`sess-x/3`"), "the key the host will file this under: {m}");
+        assert!(m.contains("create_mod"), "and what it is FOR: {m}");
+        assert!(m.contains("3 finding(s) so far, 17 remaining"), "budget back-pressure kept: {m}");
+        // A host that passed no --session-id gets the pre-#2386 wording
+        // rather than an invented key.
+        let none = recorded_finding_message(None, 1, 19);
+        assert!(none.starts_with("Recorded. "), "{none}");
+        assert!(!none.contains('/'), "no key is better than a guessed one: {none}");
+    }
+
+    /// The key form MUST equal the host's own
+    /// `findings::build_record` -> `format!("{session_id}/{seq}")`. A key the
+    /// model is told to use that the store files elsewhere is worse than none.
+    #[test]
+    fn the_key_form_is_session_slash_seq() {
+        assert_eq!(finding_key_for("step-abc", 1), "step-abc/1");
+        assert!(finding_key_shape_ok(&finding_key_for("step-abc", 12)));
+    }
+
+    #[test]
+    fn a_for_key_this_run_recorded_is_accepted() {
+        assert_eq!(refuse_for_key("me/1", Some("me"), 1, ""), None);
+        assert_eq!(refuse_for_key("me/2", Some("me"), 3, ""), None);
+    }
+
+    #[test]
+    fn a_for_key_ahead_of_what_this_run_recorded_is_rejected() {
+        let r = refuse_for_key("me/4", Some("me"), 3, "").expect("refused");
+        assert!(r.starts_with("REJECTED:"), "failure_rate.rs keys on this prefix: {r}");
+        assert!(r.contains("`me/4`") && r.contains("recorded 3"), "{r}");
+        let none_yet = refuse_for_key("me/1", Some("me"), 0, "").expect("refused");
+        assert!(none_yet.contains("recorded none"), "{none_yet}");
+    }
+
+    /// The parroted key, exactly as it arrived in the live run.
+    #[test]
+    fn an_invented_key_from_another_dispatch_is_rejected() {
+        let r = refuse_for_key("sess-abc/1", Some("crawl-unit-0001"), 2, "your brief text")
+            .expect("refused");
+        assert!(r.starts_with("REJECTED:"), "{r}");
+        assert!(r.contains("sess-abc/1") && r.contains("does not name it"), "{r}");
+    }
+
+    /// The coder seat's ordinary case: the finding was recorded by an
+    /// EARLIER dispatch and handed over in this one's brief, which
+    /// `findings::brief_block` renders as `<finding key="...">`. Refusing
+    /// that would break the review pipeline's whole finding -> mod path.
+    #[test]
+    fn a_foreign_key_this_dispatch_was_briefed_with_is_accepted() {
+        let brief = "<finding key=\"crawl-x-0001/2\">\n context: ...\n</finding>";
+        assert_eq!(refuse_for_key("crawl-x-0001/2", Some("me"), 0, brief), None);
+    }
+
+    /// A runtime the host never told who it is cannot tell an invented key
+    /// from one of its own, so it accepts — a false refusal costs the model
+    /// its entire call, and the host still drops an unusable link.
+    #[test]
+    fn without_a_dispatch_identity_the_check_is_lenient() {
+        assert_eq!(refuse_for_key("sess-abc/1", None, 0, ""), None);
+    }
+
+    /// End to end through the tool: a `for` key this run never recorded is
+    /// NOT RECORDED, and nothing lands in `mods.jsonl`.
+    #[test]
+    fn create_mod_refuses_an_unrecorded_for_key_and_writes_nothing() {
+        let ws = fresh_workspace();
+        let out = fresh_workspace();
+        let resp = execute_create_mod_with(
+            &serde_json::json!({"for": ["sess-abc/1"], "kit": "a real kit"}).to_string(),
+            out.path(),
+            ws.path(),
+            Some("crawl-unit-0001"),
+            "no finding block here",
+        )
+        .unwrap()
+        .result;
+        assert!(resp.starts_with("REJECTED:"), "{resp}");
+        assert!(
+            !out.path().join(MODS_FILE).exists(),
+            "a refused mod records nothing — the host must never see the dangling link"
+        );
+    }
+
+    /// And the accept side still writes: the same call with a key this run
+    /// DID record goes through unchanged.
+    #[test]
+    fn create_mod_still_records_when_the_for_key_is_this_runs_own() {
+        let ws = finding_workspace(&numbered_src(40, 10, "    let _ = risky();"));
+        let out = fresh_workspace();
+        report(ws.path(), out.path(), 10, "    let _ = risky();");
+        let resp = execute_create_mod_with(
+            &serde_json::json!({"for": ["me/1"], "kit": "a real kit"}).to_string(),
+            out.path(),
+            ws.path(),
+            Some("me"),
+            "",
+        )
+        .unwrap()
+        .result;
+        assert!(!resp.starts_with("REJECTED:"), "{resp}");
+        assert_eq!(last_mod(out.path())["for"], serde_json::json!(["me/1"]));
+    }
+
     #[test]
     fn read_tool_description_covers_edit_and_write_not_just_create_finding() {
         let d = Tool::Read.description();
@@ -2379,6 +2538,129 @@ y = 2
     }
 }
 
+// ─── (#2386) this dispatch's finding-key identity ─────────────────────────
+//
+// The finding STORE is host-side: `dispatch_internal.rs::materialize_finding`
+// keys every accepted `create_finding` call as `<session-id>/<emit_seq>`.
+// Until #2386 the runtime knew neither half, so `create_finding` could only
+// answer "Recorded." — the model had no key to name in a later `create_mod`'s
+// `for`, and the only key text anywhere in its context was the tool
+// description's own invented example (`sess-abc/1`). A reviewer seat copied
+// it onto six mods in one live run; each was stored as a link to nothing, so
+// the coder phase redid work that had already been done.
+//
+// The host now passes `--session-id`, which is enough for both halves of the
+// repair: `create_finding` hands back the REAL key, and `create_mod` can tell
+// a key this run actually minted (or was handed in its brief) from one the
+// model invented.
+static DISPATCH_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static DISPATCH_BRIEF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record what this dispatch is, once, before the loop runs. `session_id` is
+/// `None` when the host passed no `--session-id` (an older host, or a
+/// non-dispatch invocation), which leaves both tools at their pre-#2386
+/// behavior rather than guessing an identity.
+pub fn set_dispatch_context(session_id: Option<String>, brief: &str) {
+    if let Some(id) = session_id {
+        let _ = DISPATCH_ID.set(id);
+    }
+    let _ = DISPATCH_BRIEF.set(brief.to_string());
+}
+
+fn dispatch_id() -> Option<&'static str> {
+    DISPATCH_ID.get().map(String::as_str)
+}
+
+fn dispatch_brief() -> &'static str {
+    DISPATCH_BRIEF.get().map(String::as_str).unwrap_or("")
+}
+
+/// The key `create_finding`'s host-side record will carry for the `seq`-th
+/// finding of this dispatch — the address the model names in `create_mod`'s
+/// `for`. `None` when this run has no identity to build one from.
+///
+/// It MUST agree with `crate::findings::build_record`'s own
+/// `format!("{session_id}/{seq}")` on the host: a key the model is told to
+/// use and the store then files under a different address is worse than no
+/// key at all.
+fn finding_key(seq: usize) -> Option<String> {
+    dispatch_id().map(|d| finding_key_for(d, seq))
+}
+
+fn finding_key_for(dispatch: &str, seq: usize) -> String {
+    format!("{dispatch}/{seq}")
+}
+
+/// The `create_finding` response text. Pure, so the key-bearing and
+/// key-less forms are both testable without touching the process-wide
+/// dispatch identity.
+fn recorded_finding_message(key: Option<&str>, recorded: usize, remaining: usize) -> String {
+    // Back-pressure through the return value: the model is TOLD where it
+    // stands so it can self-limit, and the cap enforces it regardless. Soft
+    // signal plus hard bound, the same shape as the inactivity budget.
+    let tail = format!(
+        "{recorded} finding(s) so far, {remaining} remaining in this run's budget. \
+         Continue examining the scope; report the next one when you find it."
+    );
+    match key {
+        // The key is FIRST and quoted, because it is the one part of this
+        // response the model has to carry forward into another call.
+        Some(k) => format!("Recorded finding `{k}`. Name `{k}` in `for` if you propose a change for it with `create_mod`. {tail}"),
+        None => format!("Recorded. {tail}"),
+    }
+}
+
+/// (#2386) Whether a `for` key can address a finding AT ALL from inside this
+/// dispatch, and why not when it cannot. `None` = accept.
+///
+/// Two, and only two, sources give a model a real finding key:
+///
+/// 1. a `create_finding` call THIS run made (`<my-session>/<seq>`, and the
+///    seq cannot run ahead of what has actually been recorded), or
+/// 2. a `<finding key="…">` block in this dispatch's own brief — the coder
+///    seat's ordinary case, where the finding was recorded by an EARLIER
+///    dispatch (`findings::brief_block` renders the key verbatim).
+///
+/// Anything else was invented. Refusing it here rather than host-side is
+/// deliberate and is the whole point: the host's materializer runs after the
+/// tool already answered, so its only options are to drop the link silently
+/// or throw away a good kit. At the tool boundary the model READS the
+/// refusal and can call again with the right key — `failure_rate.rs`
+/// classifies a `REJECTED:` reply from this tool as a repairable failure.
+///
+/// Lenient when this run has no identity (`dispatch_id()` is `None`): a
+/// runtime the host did not tell who it is cannot distinguish (1) from an
+/// invention, and a false refusal costs the model its whole call.
+fn refuse_for_key(key: &str, my_dispatch: Option<&str>, recorded: usize, brief: &str) -> Option<String> {
+    let me = my_dispatch?;
+    let (dispatch, seq) = key.rsplit_once('/')?;
+    if dispatch == me {
+        let n: usize = seq.parse().ok()?;
+        if n >= 1 && n <= recorded {
+            return None;
+        }
+        return Some(format!(
+            "REJECTED: `{key}` is not a finding this run recorded — {}. Use the key \
+             `create_finding` returned to you, or drop `for` entirely if this change \
+             addresses no recorded finding.",
+            match recorded {
+                0 => "this run has recorded none".to_string(),
+                1 => format!("this run has recorded 1, `{me}/1`"),
+                n => format!("this run has recorded {n}, `{me}/1` through `{me}/{n}`"),
+            }
+        ));
+    }
+    if brief.contains(key) {
+        return None;
+    }
+    Some(format!(
+        "REJECTED: `{key}` is not a finding this run recorded, and your message does not \
+         name it either. A key comes from the `create_finding` call that recorded the \
+         finding, or from a `<finding key=\"...\">` block in your message — never from an \
+         example. Drop `for` entirely if this change addresses no recorded finding."
+    ))
+}
+
 // ─── create_finding ───────────────────────────────────────────────────────
 //
 // (#1959) The crawler's output channel, and a DIFFERENT shape from escalation.
@@ -2669,14 +2951,10 @@ fn execute_create_finding(
 
     let recorded = count + 1;
     let remaining = MAX_FINDINGS_PER_DISPATCH.saturating_sub(recorded);
-    // Back-pressure through the return value: the model is TOLD where it stands
-    // so it can self-limit, and the cap above enforces it regardless. Soft
-    // signal plus hard bound, the same shape as the inactivity budget.
+    // (#2386) `recorded` IS the `emit_seq` the host keys the stored record
+    // by, so the key handed back here is the address the store will use.
     Ok(ToolRun {
-        result: format!(
-            "Recorded. {recorded} finding(s) so far, {remaining} remaining in this run's budget. \
-             Continue examining the scope; report the next one when you find it."
-        ),
+        result: recorded_finding_message(finding_key(recorded).as_deref(), recorded, remaining),
         emitted: verbatim,
         emit_seq: Some(recorded),
     })
@@ -2724,7 +3002,13 @@ pub const MAX_EMISSION_BYTES: usize = 64 * 1024;
 /// The teaching response every refusal ends with — a model that cannot read a
 /// rejection cannot correct it, and a `create_mod` that reads as broken gets
 /// abandoned the way `create_finding` was on the first live crawl.
-const CREATE_MOD_SHAPE: &str = "\n\n  {\"for\": [\"sess-abc/1\"], \
+///
+/// (#2386) The `for` slot is a PLACEHOLDER, never a literal key. The first
+/// version showed `["sess-abc/1"]` here and in the description, and a
+/// reviewer seat copied that example onto six mods in one live run —
+/// every one of them a link to a finding that does not exist. A model with
+/// no key of its own reads an example key as an answer.
+const CREATE_MOD_SHAPE: &str = "\n\n  {\"for\": [\"<the key create_finding returned>\"], \
      \"kit\": \"<the change, as instructions and/or data>\", \
      \"attach\": [\"path/inside/the/workspace\"]}\n\n\
      Only `kit` is required. Nothing was recorded.";
@@ -2821,7 +3105,23 @@ fn b64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Production entry: this dispatch's own identity and brief, read from the
+/// process-wide context the host set before the loop started.
 fn execute_create_mod(raw_args: &str, out_dir: &Path, workspace_root: &Path) -> Result<ToolRun> {
+    execute_create_mod_with(raw_args, out_dir, workspace_root, dispatch_id(), dispatch_brief())
+}
+
+/// (#2386) The same tool with its dispatch context passed IN — the form the
+/// tests drive, so a test that needs an identity does not have to set a
+/// process-wide `OnceLock` that every later test in the binary would then
+/// inherit.
+fn execute_create_mod_with(
+    raw_args: &str,
+    out_dir: &Path,
+    workspace_root: &Path,
+    my_dispatch: Option<&str>,
+    brief: &str,
+) -> Result<ToolRun> {
     // NEVER return Err from a model-facing tool — see
     // `execute_create_finding`'s own doc for the measured reason.
     // (#2265) The emission, verbatim, from the ONE parse the runtime already
@@ -2849,11 +3149,30 @@ fn execute_create_mod(raw_args: &str, out_dir: &Path, workspace_root: &Path) -> 
     // as a link nothing could follow. Refused with the form, not repaired.
     if let Some(bad) = args.r#for.iter().find(|k| !finding_key_shape_ok(k)) {
         return Ok(ToolRun::text(format!(
-            "NOT RECORDED — {bad:?} in `for` is not a finding key. A key is \
-             `<dispatch>/<seq>`, e.g. `sess-abc/1` — the address the finding \
-             was given when it was recorded. Drop `for` entirely if you do not \
-             know which finding this addresses.{CREATE_MOD_SHAPE}"
+            "NOT RECORDED — {bad:?} in `for` is not a finding key. A key is the \
+             `<dispatch>/<seq>` address `create_finding` returned when it recorded \
+             the finding, or the one a `<finding key=\"...\">` block in your message \
+             names. Drop `for` entirely if you do not know which finding this \
+             addresses.{CREATE_MOD_SHAPE}"
         )));
+    }
+    // (#2386) The shape is right; now — can this key address a finding at
+    // all? A key naming this run's own dispatch must name a finding this run
+    // actually recorded, and a key naming any other dispatch must be one
+    // this dispatch's message handed it. Anything else was invented, and a
+    // stored link nothing can follow is exactly what `canonical_for_keys`'s
+    // own doc says it exists to prevent.
+    {
+        let recorded = std::fs::read_to_string(out_dir.join(FINDINGS_FILE))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        for key in &args.r#for {
+            if let Some(refusal) = refuse_for_key(key, my_dispatch, recorded, brief) {
+                return Ok(ToolRun::text(format!("{refusal}{CREATE_MOD_SHAPE}")));
+            }
+        }
     }
 
     // Attachments are read BEFORE anything is written, so a mod is never

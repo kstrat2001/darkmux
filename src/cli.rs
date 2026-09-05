@@ -445,6 +445,14 @@ pub(crate) enum ModCmd {
         /// A file to copy into the mod's own `attachments/`. Repeatable.
         #[arg(long)]
         attach: Vec<std::path::PathBuf>,
+        /// (#2386) Record a `--for` key even when no finding with that key is
+        /// in the store. Off by default: such a key is a link nothing can
+        /// follow, and the usual cause is a typo or a copied example. Pass
+        /// this for the deliberate case — a finding not synced into the store
+        /// yet (`darkmux finding sync` replays the flow stream), or one
+        /// recorded on another machine.
+        #[arg(long = "allow-missing-finding")]
+        allow_missing_finding: bool,
         #[command(flatten)]
         json: JsonFlag,
     },

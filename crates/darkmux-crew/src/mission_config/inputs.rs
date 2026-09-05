@@ -437,6 +437,120 @@ pub fn check_embedded_inputs_collected(
     );
 }
 
+/// (#2384) Every placeholder name the document's static graph REFERENCES —
+/// every step's `config`, every task's `grow.config`, and a `grow.id`
+/// template. The mirror image of [`undeclared_placeholders`], which asks
+/// "does every reference name a declared input"; this asks "does every
+/// declared input have a reference".
+pub fn referenced_placeholder_names(config: &MissionConfig) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for phase in &config.phases {
+        for task in &phase.tasks {
+            for step in &task.steps {
+                collect_names(&step.config, &mut out);
+            }
+            if let Some(grow) = &task.grow {
+                collect_names(&grow.config, &mut out);
+                out.extend(placeholder_names(&grow.id));
+            }
+        }
+    }
+    out
+}
+
+fn collect_names(value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::String(s) => out.extend(placeholder_names(s)),
+        Value::Array(items) => items.iter().for_each(|v| collect_names(v, out)),
+        Value::Object(map) => map.values().for_each(|v| collect_names(v, out)),
+        _ => {}
+    }
+}
+
+/// (#2384) Every DECLARED input that nothing in the document references and
+/// that the launcher does not consume itself — an inert knob. The operator
+/// passes `--param <name>=<value>`, the launch accepts it, and the run does
+/// something else with no hint that the knob was ignored (`review-v2.json`'s
+/// `review-probe-high`: every unit dispatched on profile `deep` regardless).
+///
+/// **Why `consumed_by_launcher` is a parameter and not derivable here.**
+/// darkmux has TWO consumption paths for a declared input: placeholder
+/// substitution into a step's config (structural, and what this function
+/// scans) and a LAUNCHER reading the collected value by name in Rust
+/// (`dry_run`, `rules`, `workdir`/`branch`/`base`, `mission_id`, …). The
+/// second is invisible to any document scan — measured at HEAD, all four
+/// shipped configs declare at least one such input, so a scan-only rule
+/// would refuse every one of them. The knowledge of which names a launcher
+/// reads belongs to that launcher, so it is passed IN rather than guessed
+/// here. That is also why this is not a [`MissionConfig::validate`]
+/// finding: `validate` has no launcher, and a finding it cannot qualify
+/// would fire on correct documents in `mission config show` and `doctor`.
+///
+/// An `ignored: true` input is exempt by construction — that flag IS the
+/// document saying "declared for CLI-surface parity, consumed by nothing",
+/// and the launcher already warns when the operator supplies one.
+pub fn unreferenced_inputs(config: &MissionConfig, consumed_by_launcher: &[&str]) -> Vec<String> {
+    let referenced = referenced_placeholder_names(config);
+    config
+        .inputs
+        .iter()
+        .filter(|i| i.ignored != Some(true))
+        .filter(|i| !referenced.contains(&i.name))
+        .filter(|i| !consumed_by_launcher.contains(&i.name.as_str()))
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+/// (#2384) Refuses, pre-mint, when this launch SUPPLIED a value for an
+/// input nothing consumes — the operator passed a knob, and the run would
+/// otherwise do something else with no hint the knob was ignored.
+/// `--param review-probe-high=probe-4b` was accepted and every
+/// `unit-<rule>` dispatch logged `via profile deep`.
+///
+/// **Supplied-only, deliberately, and this is a narrowing of #2384's first
+/// option.** A blanket refusal on any inert declaration would be the
+/// stronger authoring gate, and it is what the issue asks for first — but
+/// measured at HEAD it refuses `mission launch review-v2` outright, because
+/// that document declares three inputs nothing consumes (`mode` and
+/// `envelope_out`, whose own descriptions say "not yet read by any step" /
+/// "Still NOT consumed", plus `review-probe-high`). Refusing a launch over a
+/// knob the operator never touched trades one silent-wrong-run for a
+/// hard-blocked-run, so the refusal keys on the operator's own action — the
+/// issue's own "or at minimum warns loudly, pre-mint" covers the rest, which
+/// the launcher prints for every inert input on every launch AND dry run
+/// (see [`unreferenced_inputs`]'s call site in `mission_launch.rs`). Tighten
+/// this to the blanket form once no shipped config trips it.
+pub fn check_supplied_inert_inputs(
+    config: &MissionConfig,
+    consumed_by_launcher: &[&str],
+    collected: &BTreeMap<String, Value>,
+) -> Result<()> {
+    let supplied: Vec<String> = unreferenced_inputs(config, consumed_by_launcher)
+        .into_iter()
+        .filter(|name| collected.contains_key(name))
+        .collect();
+    if supplied.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = supplied
+        .iter()
+        .map(|name| {
+            format!(
+                "  input `{name}` is declared but referenced by no step, so the value you \
+                 supplied would change nothing about this run; mark it ignored \
+                 (`\"ignored\": true` with an `ignored_reason`) if that is intended, or \
+                 reference it as `{{{{{name}}}}}` in a step's config"
+            )
+        })
+        .collect();
+    bail!(
+        "mission config \"{}\" was given {} input(s) nothing consumes, refused before minting:\n{}",
+        config.id,
+        supplied.len(),
+        lines.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,5 +892,124 @@ mod tests {
         let err = check_embedded_inputs_collected(&cfg, &collected).unwrap_err().to_string();
         assert!(err.contains("grow.config"), "{err}");
         assert!(err.contains("tag"), "{err}");
+    }
+    // ─── (#2384) a declared input nothing references ──────────────────
+
+    /// The `review-v2.json` shape the issue measured: the document declares
+    /// `review-probe-high`, the description documents the override recipe,
+    /// and no step config carries `{{review-probe-high}}` — so the operator's
+    /// `--param review-probe-high=probe-4b` was accepted and every unit
+    /// dispatched on a different seat, silently.
+    #[test]
+    fn a_declared_input_no_step_references_is_refused_by_name() {
+        let mut cfg = minimal_config(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![task("t", vec![step("t-step", "k", json!({"workspace": "{{workspace}}"}))])],
+            extras: BTreeMap::new(),
+        }]);
+        cfg.inputs.push(crate::mission_config::MissionInput {
+            name: "review-probe-high".to_string(),
+            description: None,
+            required: None,
+            default: None,
+            ignored: None,
+            ignored_reason: None,
+            extras: BTreeMap::new(),
+        });
+        assert_eq!(
+            unreferenced_inputs(&cfg, &[]),
+            vec!["review-probe-high".to_string()],
+            "the inert knob is named"
+        );
+        // Not supplied: the launch proceeds (and warns).
+        assert!(check_supplied_inert_inputs(&cfg, &[], &BTreeMap::new()).is_ok());
+        // Supplied: refused before anything mints, naming it.
+        let collected: BTreeMap<String, Value> =
+            [("review-probe-high".to_string(), json!("probe-4b"))].into_iter().collect();
+        let err = check_supplied_inert_inputs(&cfg, &[], &collected).unwrap_err().to_string();
+        assert!(err.contains("review-probe-high"), "{err}");
+        assert!(err.contains("would change nothing about this run"), "{err}");
+        assert!(err.contains("ignored"), "the remedy names the escape hatch: {err}");
+    }
+
+    /// `ignored: true` IS the document saying "consumed by nothing, declared
+    /// for CLI-surface parity" — `review-v2.json`'s `bundler`. The launcher's
+    /// existing supplied-an-ignored-input warning is what covers it.
+    #[test]
+    fn an_ignored_input_no_step_references_is_clean() {
+        let mut cfg = minimal_config(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![task("t", vec![step("t-step", "k", json!({"workspace": "{{workspace}}"}))])],
+            extras: BTreeMap::new(),
+        }]);
+        cfg.inputs.push(crate::mission_config::MissionInput {
+            name: "bundler".to_string(),
+            description: None,
+            required: None,
+            default: None,
+            ignored: Some(true),
+            ignored_reason: Some("review-v2 has no external bundler".to_string()),
+            extras: BTreeMap::new(),
+        });
+        assert!(unreferenced_inputs(&cfg, &[]).is_empty());
+    }
+
+    /// An input the LAUNCHER reads by name in Rust (`dry_run`, `rules`,
+    /// `workdir`) is consumed, just not through a placeholder. Measured at
+    /// HEAD: every shipped config declares at least one, so without this
+    /// parameter the check would refuse all four.
+    #[test]
+    fn an_input_the_launcher_consumes_itself_is_clean() {
+        let mut cfg = minimal_config(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![task("t", vec![step("t-step", "k", json!({"workspace": "{{workspace}}"}))])],
+            extras: BTreeMap::new(),
+        }]);
+        cfg.inputs.push(crate::mission_config::MissionInput {
+            name: "dry_run".to_string(),
+            description: None,
+            required: None,
+            default: None,
+            ignored: None,
+            ignored_reason: None,
+            extras: BTreeMap::new(),
+        });
+        let collected: BTreeMap<String, Value> =
+            [("dry_run".to_string(), json!(true))].into_iter().collect();
+        assert!(check_supplied_inert_inputs(&cfg, &["dry_run"], &collected).is_ok());
+        assert_eq!(unreferenced_inputs(&cfg, &[]), vec!["dry_run".to_string()], "and it IS caught without the allowance");
+    }
+
+    /// A reference from inside a `grow.config` template counts — the grown
+    /// steps are real steps, and `review-v2.json`'s `unit-<rule>` tasks are
+    /// exactly this shape.
+    #[test]
+    fn a_reference_from_a_grow_template_counts_as_a_reference() {
+        let mut t = task("t", vec![step("t-step", "k", json!({}))]);
+        t.grow = Some(GrowSpec {
+            from: "other".to_string(),
+            items: "units".to_string(),
+            id: "{{item.id}}".to_string(),
+            config: json!({"workspace": "{{workspace}}"}),
+            extras: BTreeMap::new(),
+        });
+        let cfg = minimal_config(vec![PhaseConfig {
+            id: "p".to_string(),
+            display_name: None,
+            description: None,
+            enabled: None,
+            tasks: vec![t],
+            extras: BTreeMap::new(),
+        }]);
+        assert!(unreferenced_inputs(&cfg, &[]).is_empty());
     }
 }

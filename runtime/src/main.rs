@@ -154,6 +154,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // means a future resume attempt's role comparison will (correctly)
     // never match anything but another equally-unlabeled checkpoint.
     let mut role_id: String = String::new();
+    // (#2386) The host's session id for this dispatch, when it passed one —
+    // see the `--session-id` arm below.
+    let mut session_id: Option<String> = None;
     // (#1038) Raw JSON-schema string for the role's output, wrapped into an
     // LMStudio json_schema response_format before the loop. None ⇒ free-form.
     let mut response_schema: Option<String> = None;
@@ -377,6 +380,22 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     i += 2;
                 } else {
                     eprintln!("--role-id requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            // (#2386) The host's session id — the `<dispatch>` half of every
+            // finding key this dispatch's `create_finding` calls will be
+            // stored under (`dispatch_internal.rs::materialize_finding`
+            // builds `<session_id>/<emit_seq>`). Optional: a host that does
+            // not pass it leaves the runtime unable to name a key, and both
+            // tools fall back to their pre-#2386 behavior rather than
+            // guessing one.
+            "--session-id" => {
+                if let Some(v) = args.get(i + 1) {
+                    session_id = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--session-id requires a value");
                     return ExitCode::from(2);
                 }
             }
@@ -725,6 +744,16 @@ fn run_dispatch(args: &[String]) -> ExitCode {
          is done."
             .into()
     });
+
+    // (#2386) The finding-key identity this dispatch mints under, plus the
+    // brief it was given. `create_finding` returns the real key
+    // (`<session-id>/<seq>`) so the model has the address to name in a
+    // `create_mod`'s `for`, and `create_mod` can refuse a key that names
+    // neither a finding this run recorded nor one this brief handed it —
+    // the shape check alone accepted the tool description's own example,
+    // which a reviewer seat then copied onto six mods that linked to
+    // nothing. Set BEFORE the loop starts, from the values the host passed.
+    crate::tools::set_dispatch_context(session_id.clone(), &prompt);
 
     let initial_messages = vec![
         Message::system(system_prompt),
