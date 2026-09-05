@@ -1362,14 +1362,7 @@ pub fn cascade_dead_dependents(
             if !matches!(status, NodeStatus::Error | NodeStatus::Abandoned) {
                 return None;
             }
-            let src = terminal_source_step(task, status, steps)?;
-            let reason = match status {
-                // An already-abandoned task's own output IS the origin
-                // text (`cascade_abandon` wrote it) — forward it verbatim.
-                NodeStatus::Abandoned => src.output.clone()?,
-                _ => format!("{}: {}", src.id, src.output.clone().unwrap_or_default()),
-            };
-            Some((task.id.clone(), reason))
+            Some((task.id.clone(), terminal_forward_reason(task, status, steps)?))
         })
         .collect();
     for (task_id, reason) in dead {
@@ -1377,26 +1370,111 @@ pub fn cascade_dead_dependents(
     }
 }
 
-/// (#2310 fix-loop C2 / S4-1) Roll every still-`Planned` step of the named
-/// tasks to `Abandoned` — the in-memory twin of
+/// (#2310 fix-loop C1/C3 / S4-2/S4-3) The reason text a TERMINAL task
+/// forwards to anything downstream of it — one composition site shared by
+/// [`cascade_dead_dependents`] and [`abandon_stranded_steps`], so a
+/// dependent reads the SAME sentence whichever of them reaches it first.
+///
+/// - `Abandoned` → the task's own `output` verbatim (`cascade_abandon`
+///   already wrote the ORIGIN's `"<step-id>: <reason>"` there, so
+///   forwarding it unchanged is what stops a second `"<id>: <id>: …"`
+///   wrapper accruing per hop).
+/// - anything else terminal → `"<step-id>: <reason>"` composed from the
+///   step that MADE the status (see [`terminal_source_step`]).
+/// - non-terminal, or no recoverable text → `None`.
+fn terminal_forward_reason(
+    task: &Task,
+    status: NodeStatus,
+    steps: &BTreeMap<String, Step>,
+) -> Option<String> {
+    let src = terminal_source_step(task, status, steps)?;
+    Some(match status {
+        NodeStatus::Abandoned => src.output.clone()?,
+        _ => format!("{}: {}", src.id, src.output.clone().unwrap_or_default()),
+    })
+}
+
+/// (#2310 fix-loop C2 / C2-1) Is a `Planned` step of `task` genuinely
+/// STRANDED — i.e. can it never become ready — and if so, WHY?
+///
+/// `None` means "still reachable, leave it `Planned`". The rule is
+/// reachability, deliberately NOT "the phase's pass ended":
+///
+/// - the task has an ERRORED step → stranded (`step_is_ready`'s intra-task
+///   rule holds its later steps `Planned` forever); the reason is that
+///   step's own id and output.
+/// - every declared `depends_on`/`reads` is TERMINAL and at least one is
+///   REFUSED by this task's `run_on` → stranded; the reason is that
+///   DEPENDENCY's own origin text (#2310 C2-7 — downstream provenance
+///   names the cause, not the mechanism).
+/// - ANY dependency still `Planned`/`Running`, or not in `tasks` AT ALL →
+///   NOT stranded, `None`.
+///   This is the case the first cut of the phase-exit sweep got wrong: a
+///   task in phase 1 depending on a task in phase 2 (legal — `depends_on`
+///   ids are DOCUMENT-WIDE, see `TaskConfig::depends_on`) was abandoned
+///   "not started" at phase 1's exit, even though phase 2's own pass runs
+///   over the CUMULATIVE maps and would have run it. Declared work was
+///   dropped silently: the phase closed `Abandoned`, the run exited 0 and
+///   the summary said "0 errored".
+/// - everything terminal and ACCEPTED, yet the step never ran → stranded
+///   with the plain "never started" line `reconcile_phase_steps_terminal`
+///   uses for the same situation (a pass that ended early — nothing else
+///   in the graph explains it).
+///
+/// A dependency MISSING from `tasks` is read as "not minted yet", not as
+/// "dangling": the launcher sweeps with the CUMULATIVE map (the phases
+/// entered so far), so a forward edge's target is legitimately absent at
+/// the declaring phase's exit. A genuinely dangling id never reaches the
+/// scheduler — `MissionConfig::validate` refuses one as an Error at load
+/// time — and a step left `Planned` by this branch is terminalized by the
+/// whole-mission reconcile (`lifecycle::reconcile_terminal_steps`) rather
+/// than by a guess made here.
+fn stranded_reason(
+    task: &Task,
+    tasks: &BTreeMap<String, Task>,
+    steps: &BTreeMap<String, Step>,
+) -> Option<String> {
+    if let Some(src) = terminal_source_step(task, NodeStatus::Error, steps) {
+        return Some(format!("{}: {}", src.id, src.output.clone().unwrap_or_default()));
+    }
+    let mut refused: Option<String> = None;
+    for dep_id in task.depends_on.iter().chain(task.reads.iter()) {
+        // A dependency not in the map is NOT MINTED YET (a forward edge at
+        // the declaring phase's exit) — reachable, see this function's doc.
+        let dep = tasks.get(dep_id)?;
+        let status = task_status(dep, steps);
+        if matches!(status, NodeStatus::Planned | NodeStatus::Running) {
+            return None;
+        }
+        if !dependency_satisfies_run_on(status, &task.run_on) {
+            let text = terminal_forward_reason(dep, status, steps).unwrap_or_else(|| {
+                format!(
+                    "dependency `{dep_id}` ended {status:?}, which this task's `run_on` does \
+                     not accept"
+                )
+            });
+            refused.get_or_insert(text);
+        }
+    }
+    Some(refused.unwrap_or_else(|| {
+        "not started: the phase's scheduler pass ended before this step ran".to_string()
+    }))
+}
+
+/// (#2310 fix-loop C2 / S4-1) Roll every UNREACHABLE still-`Planned` step
+/// of the named tasks to `Abandoned` — the in-memory twin of
 /// `lifecycle::reconcile_phase_steps_terminal`, run by the launcher the
 /// moment a phase's `run_step_graph` returns.
 ///
-/// A step of a phase whose scheduler pass has ENDED and is still `Planned`
-/// can never run: its owning task either errored (its own later steps are
-/// stranded by `step_is_ready`'s intra-task rule — deliberately NOT the
-/// cascade's domain, see `cascade_abandon`'s doc) or its dependency chain
-/// holds a status its `run_on` refuses. Leaving it `Planned` is what let a
-/// Finalized mission persist non-terminal steps: the launcher's end-of-run
-/// bulk save wrote the stale `Planned` back over a phase record that had
-/// already closed around them.
+/// Which steps those are, and the reason each carries, is
+/// [`stranded_reason`]'s call — see its doc for the reachability rule and
+/// for the regression that made "the pass ended" the wrong test. Leaving a
+/// genuinely unreachable step `Planned` is what let a Finalized mission
+/// persist non-terminal steps: the launcher's end-of-run bulk save wrote
+/// the stale `Planned` back over a phase record that had already closed
+/// around them.
 ///
-/// Reason text follows the SAME vocabulary the cascade uses: when the
-/// owning task has an errored step, the stranded step names it
-/// (`"<step-id>: <reason>"`) so the operator reads the real cause off the
-/// step itself; otherwise it gets the plain "never started" line
-/// `reconcile_phase_steps_terminal` uses for the same situation. Returns
-/// the ids it abandoned.
+/// Returns the ids it abandoned.
 pub fn abandon_stranded_steps(
     task_ids: impl IntoIterator<Item = String>,
     tasks: &BTreeMap<String, Task>,
@@ -1407,13 +1485,7 @@ pub fn abandon_stranded_steps(
     let mut abandoned = Vec::new();
     for task_id in task_ids {
         let Some(task) = tasks.get(&task_id) else { continue };
-        let reason = match terminal_source_step(task, NodeStatus::Error, steps) {
-            Some(src) => {
-                format!("{}: {}", src.id, src.output.clone().unwrap_or_default())
-            }
-            None => "not started: the phase's scheduler pass ended before this step ran"
-                .to_string(),
-        };
+        let Some(reason) = stranded_reason(task, tasks, steps) else { continue };
         for step_id in task.step_ids.clone() {
             if let Some(s) = steps.get_mut(&step_id) {
                 if s.status == NodeStatus::Planned {
@@ -1907,6 +1979,94 @@ mod tests {
         // A completed step is untouched, and nothing else is persisted.
         assert_eq!(steps["t-ok-step"].status, NodeStatus::Complete);
         assert_eq!(persisted, vec!["t-fail-step-2".to_string()]);
+    }
+
+    /// (#2310 fix-loop C2 / C2-1) A `Planned` step whose dependency lives
+    /// in a LATER phase is NOT stranded — the phase-exit sweep must leave
+    /// it alone so the later phase's own scheduler pass (which runs over
+    /// the CUMULATIVE task/step maps) can still run it. Abandoning it here
+    /// is how declared work was silently dropped: the owning phase closed
+    /// `Abandoned`, the run exited 0, and the summary said "0 errored".
+    #[test]
+    fn abandon_stranded_steps_leaves_a_step_blocked_on_a_still_planned_dependency() {
+        let (early, mut early_step) = task_and_step("t-early", &[]);
+        early_step.status = NodeStatus::Complete;
+        let (forward, forward_step) = task_and_step("t-forward", &["t-late"]);
+        let (late, late_step) = task_and_step("t-late", &[]);
+        let (tasks, mut steps) = graph_with(vec![
+            (early, vec![early_step]),
+            (forward, vec![forward_step]),
+            (late, vec![late_step]),
+        ]);
+
+        let mut persisted: Vec<String> = Vec::new();
+        // Only the FIRST phase's tasks are swept — `t-late` belongs to the
+        // phase that has not run yet.
+        let abandoned = abandon_stranded_steps(
+            ["t-early".to_string(), "t-forward".to_string()],
+            &tasks,
+            &mut steps,
+            &mut |s| persisted.push(s.id.clone()),
+        );
+
+        assert!(abandoned.is_empty(), "nothing is stranded here, got {abandoned:?}");
+        assert_eq!(steps["t-forward-step"].status, NodeStatus::Planned);
+        assert!(persisted.is_empty(), "a reachable step must not be persisted as terminal");
+    }
+
+    /// The same rule with the dependency RUNNING rather than `Planned` —
+    /// still reachable, still left alone.
+    #[test]
+    fn abandon_stranded_steps_leaves_a_step_blocked_on_a_running_dependency() {
+        let (forward, forward_step) = task_and_step("t-forward", &["t-slow"]);
+        let (slow, slow_step) = step_with_status("t-slow", &[], NodeStatus::Running);
+        let (tasks, mut steps) =
+            graph_with(vec![(forward, vec![forward_step]), (slow, vec![slow_step])]);
+
+        let abandoned =
+            abandon_stranded_steps(["t-forward".to_string()], &tasks, &mut steps, &mut |_| {});
+
+        assert!(abandoned.is_empty(), "got {abandoned:?}");
+        assert_eq!(steps["t-forward-step"].status, NodeStatus::Planned);
+    }
+
+    /// (#2310 fix-loop C2 / C2-7) When the sweep abandons because every
+    /// dependency is TERMINAL and refused by the task's `run_on`, the
+    /// reason carried is the DEPENDENCY's origin text — the cause — not
+    /// the generic "the phase's scheduler pass ended" mechanism line.
+    #[test]
+    fn abandon_stranded_steps_forwards_the_refused_dependencys_reason() {
+        let (dead, dead_steps) = errored_two_step_task("t-fail", &[]);
+        let (dep, dep_step) = task_and_step("t-dep", &["t-fail"]);
+        let (tasks, mut steps) =
+            graph_with(vec![(dead, dead_steps), (dep, vec![dep_step])]);
+
+        let abandoned =
+            abandon_stranded_steps(["t-dep".to_string()], &tasks, &mut steps, &mut |_| {});
+
+        assert_eq!(abandoned, vec!["t-dep-step".to_string()]);
+        assert_eq!(
+            steps["t-dep-step"].output.as_deref(),
+            Some("t-fail-step: command exited with Some(3)"),
+            "the sweep must forward the CAUSE, not the mechanism"
+        );
+    }
+
+    /// A dependency the map does not hold is "not minted yet", not
+    /// "dangling": the launcher sweeps with the CUMULATIVE map, so a
+    /// forward edge's target is legitimately absent at the declaring
+    /// phase's exit. (A genuinely dangling id is refused by
+    /// `MissionConfig::validate` before the scheduler ever sees it.)
+    #[test]
+    fn abandon_stranded_steps_leaves_a_step_whose_dependency_is_not_minted_yet() {
+        let (dep, dep_step) = task_and_step("t-dep", &["t-not-yet"]);
+        let (tasks, mut steps) = graph_with(vec![(dep, vec![dep_step])]);
+
+        let abandoned =
+            abandon_stranded_steps(["t-dep".to_string()], &tasks, &mut steps, &mut |_| {});
+
+        assert!(abandoned.is_empty(), "got {abandoned:?}");
+        assert_eq!(steps["t-dep-step"].status, NodeStatus::Planned);
     }
 
     /// (#2310 fix-loop C3 / S4-3 / #2352 item 2) The reason reaches a

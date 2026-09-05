@@ -805,6 +805,76 @@ fn reconcile_phase_steps_terminal(mission_id: &str, phase_id: &str) -> Vec<Strin
     warned
 }
 
+/// (#2310 fix-loop C2 / C2-2) Roll every non-terminal (`Planned`/`Running`)
+/// Step that sits under an ALREADY-TERMINAL phase — or under any phase of
+/// an already-terminal mission — to `Abandoned`. Returns the ids it rolled.
+///
+/// **Why this exists.** The two step-level drift rules (`mission status`'s
+/// `phase-terminal-live-step` / `mission-terminal-live-step`) suggest
+/// `darkmux mission finalize <id>`. But every mission those rules can fire
+/// on is already terminal, and [`mission_terminal_with_reasoning_and_payload`]
+/// bails `"already Finalized"` BEFORE calling
+/// [`reconcile_mission_phases_terminal`] — and that reconcile only routes
+/// through `phase_abandon`, which refuses an already-Complete phase, so
+/// even a first close never reaches a live step under one. The remedy the
+/// board printed therefore changed nothing and the row was permanent.
+///
+/// This closes both gaps from one place, and is what makes the suggestion
+/// honest. Idempotent (a terminal step is skipped) and best-effort
+/// throughout, matching every other reconcile in this module: a load/save
+/// hiccup degrades the board VIEW, never the terminal transition that
+/// already succeeded.
+///
+/// Distinct from [`reconcile_phase_steps_terminal`] on purpose: that one is
+/// the phase state machine's own guard, fired BY a transition and scoped to
+/// the phase making it. This one is the whole-mission reconcile an operator
+/// runs AFTER the fact, over phases whose transitions are long past.
+pub fn reconcile_terminal_steps(mission_id: &str) -> Vec<String> {
+    let Ok(mission) = load_mission(mission_id) else {
+        return Vec::new();
+    };
+    let mission_terminal =
+        matches!(mission.status, MissionStatus::Finalized | MissionStatus::Aborted);
+    let Ok(phases) = load_phases() else {
+        return Vec::new();
+    };
+    let mut rolled = Vec::new();
+    for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
+        let phase_terminal =
+            matches!(phase.status, PhaseStatus::Complete | PhaseStatus::Abandoned);
+        if !(mission_terminal || phase_terminal) {
+            continue;
+        }
+        let Ok(steps) = load_steps_for_phase(mission_id, &phase.id) else {
+            continue;
+        };
+        for mut step in steps {
+            if !matches!(step.status, NodeStatus::Planned | NodeStatus::Running) {
+                continue;
+            }
+            step.status = NodeStatus::Abandoned;
+            if step.completed_ts.is_none() {
+                step.completed_ts = Some(now_unix());
+            }
+            // Names WHICH invariant was violated — a phase that closed
+            // around this step, or a mission that did — so the operator
+            // reads the cause off the step rather than re-deriving it from
+            // the board row that sent them here.
+            let scope = if phase_terminal {
+                format!("phase `{}` already terminal", phase.id)
+            } else {
+                format!("mission `{mission_id}` already terminal")
+            };
+            step.output
+                .get_or_insert_with(|| format!("reconciled by mission finalize: {scope}"));
+            if save_step(mission_id, &phase.id, &step).is_ok() {
+                rolled.push(step.id.clone());
+            }
+        }
+    }
+    rolled
+}
+
 /// Roll every non-terminal (`Planned`/`Running`) Phase belonging to
 /// `mission_id` to `Abandoned` — called from [`mission_close_with_reasoning`]
 /// so a Mission can never persist `Finalized` while a Phase it contains is
@@ -1674,6 +1744,51 @@ mod tests {
             "{:?}",
             running.output
         );
+    }
+
+    /// (#2310 fix-loop C2 / C2-2) The whole-mission reconcile reaches a
+    /// live step under an ALREADY-Complete phase — the one place
+    /// `phase_abandon`'s own guard structurally cannot, because it refuses
+    /// a Complete phase outright.
+    #[serial_test::serial]
+    #[test]
+    fn reconcile_terminal_steps_rolls_a_planned_step_under_a_complete_phase() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Finalized);
+        seed_phase("p-closed", PhaseStatus::Complete);
+        seed_step("test-mission", "p-closed", "orphan-step", crate::types::NodeStatus::Planned);
+        seed_step("test-mission", "p-closed", "done-step", crate::types::NodeStatus::Complete);
+
+        let rolled = reconcile_terminal_steps("test-mission");
+
+        assert_eq!(rolled, vec!["orphan-step".to_string()]);
+        let orphan = load_step("test-mission", "p-closed", "orphan-step").unwrap();
+        assert_eq!(orphan.status, crate::types::NodeStatus::Abandoned);
+        assert!(orphan.completed_ts.is_some());
+        assert!(
+            orphan.output.as_deref().unwrap_or("").contains("phase `p-closed` already terminal"),
+            "{:?}",
+            orphan.output
+        );
+        // Terminal steps are untouched, and a second run is a no-op.
+        let done = load_step("test-mission", "p-closed", "done-step").unwrap();
+        assert_eq!(done.status, crate::types::NodeStatus::Complete);
+        assert!(reconcile_terminal_steps("test-mission").is_empty(), "must be idempotent");
+    }
+
+    /// An ACTIVE mission's still-running phase is live work, not drift —
+    /// the reconcile leaves it entirely alone.
+    #[serial_test::serial]
+    #[test]
+    fn reconcile_terminal_steps_leaves_a_live_phase_of_an_active_mission_alone() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Active);
+        seed_phase("p-live", PhaseStatus::Running);
+        seed_step("test-mission", "p-live", "in-flight-step", crate::types::NodeStatus::Running);
+
+        assert!(reconcile_terminal_steps("test-mission").is_empty());
+        let step = load_step("test-mission", "p-live", "in-flight-step").unwrap();
+        assert_eq!(step.status, crate::types::NodeStatus::Running);
     }
 
     /// `phase_abandon` gets the same treatment as `phase_complete` — an

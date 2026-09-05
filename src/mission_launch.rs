@@ -2558,6 +2558,15 @@ fn outcome_task<'a>(
 /// Best-effort: an unresolvable `outcome_from` is already a loud `Err` at
 /// `run_summary_payload`, so this returns `false` rather than raising the
 /// same failure twice.
+///
+/// (#2310 fix-loop C2 / C2-4) **Who subscribes.** `review-v2.json` declares
+/// `outcome_from: "deliver"` — a review that never shipped is a failed run,
+/// and the CI job that launches it keys on the exit code. `crawl.json`
+/// deliberately does NOT: its `summary` task TOTALS a run rather than
+/// delivering one, so an errored summary is a lost tally, not a missing
+/// deliverable, and exiting 1 for it would misreport the crawl. The
+/// distinction is the config author's to make, which is exactly why this
+/// rule reads an explicit declaration instead of the positional guess.
 fn delivery_failed(
     config: &MissionConfig,
     real_phase_ids: &BTreeMap<String, String>,
@@ -3509,11 +3518,28 @@ pub(crate) fn lazy_start_phase_for_step(
 /// principle overlap bands, and an early wrong `Abandoned` is far worse than a
 /// late-but-correct one — finalize still reconciles whatever this skips.
 ///
-/// (#2310 fix-loop C2 / S4-1) A still-`PLANNED` step is NOT that case and is
-/// no longer deferred on: it means the phase did not finish, so the phase
-/// cannot be `Complete` — and deferring instead is precisely how a
-/// `Complete` phase came to hold `Planned` steps that `phase_abandon` could
-/// then never reconcile. See the check itself for the full argument.
+/// (#2310 fix-loop C2 / C2-1) A still-`PLANNED` step is deferred on for the
+/// same reason: since `depends_on` ids are DOCUMENT-WIDE, a task in THIS
+/// phase may legally name one in a LATER phase, and every pass runs over
+/// the cumulative maps — so a `Planned` step that survived the phase-exit
+/// reachability sweep is genuinely pending work a later pass will run, not
+/// evidence the phase failed. Closing it early is how a forward
+/// `depends_on` came to close its own phase `Abandoned` while the step it
+/// declared went on to complete.
+///
+/// Deferring is safe against the S4-1 defect this rule briefly tried to
+/// fix by closing early, because the CAUSE of that defect is fixed
+/// elsewhere: every minted step is persisted `Planned` at mint (see
+/// `launch`), so this function judges a phase's FULL step set rather than
+/// whichever subset had transitioned; and a deferred phase is still closed
+/// by the end-of-run finalize from its own final step statuses
+/// ([`derive_phase_outcomes`]), whose `phase_abandon` carries the #1504
+/// reconcile for anything left non-terminal.
+///
+/// **Scope.** The GENERIC launcher (this module) is the only caller today.
+/// The review launcher persists at transition only and closes its phases
+/// in `mission_launch_review.rs`'s own finalize; it retires onto this path
+/// in #2310 P4d, at which point this doc covers it too.
 pub(crate) fn lazy_close_prior_phases(
     mission_id: &str,
     phase_order: &[String],
@@ -3548,20 +3574,24 @@ pub(crate) fn lazy_close_prior_phases(
         // that is genuinely live work, and an early wrong verdict on it is
         // far worse than a late-but-correct one; finalize reconciles it.
         //
-        // (#2310 fix-loop C2 / S4-1) A still-`PLANNED` step is a different
-        // thing and is no longer a reason to defer: since every minted step
-        // is persisted at mint (see `launch`) this slice is the phase's FULL
-        // step set, and the phase-exit sweep
-        // (`crew::scheduler::abandon_stranded_steps`) has already rolled the
-        // unreachable ones to `Abandoned` by the time a LATER phase's first
-        // step triggers this close. A `Planned` step surviving both is
-        // therefore a phase that did not finish — and `phase_finalization`
-        // below already refuses `Complete` for exactly that, so the phase
-        // closes `Abandoned` and `phase_abandon`'s own #1504 reconcile
-        // terminalizes the leftovers on disk. Deferring instead is what left
-        // a Finalized mission holding `Planned` steps under a `Complete`
-        // phase that `phase_abandon` could no longer touch.
-        if steps.is_empty() || steps.iter().any(|s| s.status == NodeStatus::Running) {
+        // (#2310 fix-loop C2 / C2-1) A still-`PLANNED` step is deferred on
+        // too. The phase-exit sweep
+        // (`crew::scheduler::abandon_stranded_steps`) has already rolled
+        // every UNREACHABLE step of this phase to `Abandoned` by the time a
+        // later phase's first step triggers this close — so one still
+        // `Planned` here is, by that sweep's own reachability rule, work a
+        // LATER pass can still run: a forward `depends_on` (document-wide
+        // ids, cumulative maps). Closing the phase `Abandoned` for holding
+        // it declared the phase failed while its step went on to complete,
+        // and left the envelope's `Complete` unable to drive the record
+        // (`phase_complete` refuses an Abandoned phase). The end-of-run
+        // finalize closes a deferred phase from its FINAL step statuses
+        // instead, which is the honest verdict either way.
+        if steps.is_empty()
+            || steps
+                .iter()
+                .any(|s| matches!(s.status, NodeStatus::Running | NodeStatus::Planned))
+        {
             closed.remove(prior);
             continue;
         }

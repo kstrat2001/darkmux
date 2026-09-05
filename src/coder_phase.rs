@@ -1518,6 +1518,26 @@ fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<
         ),
     }
 
+    // (#2310 fix-loop C2 / C2-2) Whatever the close above did or refused to
+    // do, reconcile the STEPS. Two paths reach here holding live steps the
+    // phase/mission machinery structurally cannot touch: an ALREADY-terminal
+    // mission (the close bails before its own #1504 reconcile ever runs),
+    // and an already-Complete phase (`phase_abandon` refuses one, so the
+    // reconcile it carries never reaches the steps under it). Both are what
+    // `mission status`'s two step-level drift rules fire on — and both rules
+    // suggest THIS command, so it has to actually be the remedy.
+    let rolled = crew::lifecycle::reconcile_terminal_steps(mission_id);
+    if !rolled.is_empty() {
+        println!(
+            "{}",
+            style::dim(&format!(
+                "reconciled {} step(s) left non-terminal under a terminal phase/mission: {}",
+                rolled.len(),
+                rolled.join(", ")
+            ))
+        );
+    }
+
     // (#1000) A finalized mission is DONE — cue the debrief ceremony so its
     // transient signal (cautions + corrections) becomes durable lessons for
     // the next crew. An abort is a kill, not a success — no debrief cue.

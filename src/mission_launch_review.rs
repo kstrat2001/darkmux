@@ -2871,20 +2871,28 @@ mod tests {
         assert_eq!(phase_status(&mission_id, &order[2]), "planned");
     }
 
-    /// (#2310 fix-loop C2 / S4-1) A prior phase whose FULL step set (every
-    /// minted step is persisted at mint now) holds a still-`Planned` step
-    /// did not finish — so it closes `Abandoned`, and `phase_abandon`'s own
-    /// #1504 reconcile terminalizes the leftover.
+    /// (#2310 fix-loop C2 / C2-1, correcting the first cut of S4-1) A prior
+    /// phase holding a still-`Planned` step is DEFERRED on, not closed.
     ///
-    /// The old rule deferred on ANY non-terminal step, which judged the
-    /// phase from whichever subset happened to have transitioned: a phase
-    /// whose steps were all still `Planned` on disk looked "every step on
-    /// disk is terminal" and closed `Complete`, after which `phase_abandon`
-    /// refused it forever and finalize could not reconcile. `Running` is
-    /// still deferred on — that is genuinely live work.
+    /// By the time this runs, the phase-exit sweep
+    /// (`crew::scheduler::abandon_stranded_steps`) has already rolled every
+    /// UNREACHABLE step of that phase to `Abandoned` — so one still
+    /// `Planned` is, by that sweep's reachability rule, work a LATER pass
+    /// can still run: a forward `depends_on` (ids are document-wide, and
+    /// every pass runs over the cumulative maps). The first cut closed the
+    /// phase `Abandoned` for holding it, which declared the phase failed
+    /// while its step went on to COMPLETE — and then `phase_complete` could
+    /// no longer drive the record the envelope had earned.
+    ///
+    /// Deferring is safe against the S4-1 defect it was reaching for,
+    /// because that defect's cause is fixed elsewhere: every minted step is
+    /// persisted `Planned` at mint, so this function judges the FULL step
+    /// set rather than whichever subset had transitioned, and the
+    /// end-of-run finalize closes a deferred phase from its FINAL step
+    /// statuses (with `phase_abandon`'s #1504 reconcile behind it).
     #[test]
     #[serial_test::serial]
-    fn a_prior_phase_holding_a_planned_step_closes_abandoned_not_complete() {
+    fn a_prior_phase_holding_a_planned_step_is_deferred_on_not_closed() {
         let _guard = CrewDirGuard::new();
         let config = crew::mission_config::load("review").expect("review is embedded").config;
         let mission_id = mission_launch::mint_run_id("review").unwrap();
@@ -2934,16 +2942,18 @@ mod tests {
 
         assert_eq!(
             phase_status(&mission_id, &order[0]),
-            "abandoned",
-            "a phase with a step that never ran did not finish — it must not read Complete,              and it must not be left Running for finalize to trip over either"
+            "running",
+            "a reachable `Planned` step is pending work, not evidence the phase failed — \
+             the end-of-run finalize closes this phase from its FINAL statuses"
         );
-        let reconciled = crew::lifecycle::load_steps_for_phase(&mission_id, &order[0]).unwrap();
-        let leftover = reconciled.iter().find(|s| s.id == never_ran.id).unwrap();
-        assert_eq!(
-            leftover.status,
-            crew::types::NodeStatus::Abandoned,
-            "phase_abandon's #1504 reconcile must terminalize the leftover step"
+        assert!(
+            !closed.contains(&order[0]),
+            "a deferred phase must stay eligible for a later close attempt"
         );
+        // …and the step itself is untouched, so the later pass can run it.
+        let steps = crew::lifecycle::load_steps_for_phase(&mission_id, &order[0]).unwrap();
+        let leftover = steps.iter().find(|s| s.id == never_ran.id).unwrap();
+        assert_eq!(leftover.status, crew::types::NodeStatus::Planned);
     }
 
     /// A prior phase with a step still RUNNING is still deferred on — the
