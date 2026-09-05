@@ -226,6 +226,52 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("a stored height outside the drag range is clamped on load instead of trusted", () => {
+    // (operator finding on a real phone, 2026-09-05) A persisted value
+    // the drag logic could never have produced (a stale build's per-tab
+    // key, a save taken against a keyboard-shrunk viewport, a hand
+    // edit) opened the sheet at a height the layout wasn't designed
+    // for — the Machine tab's content sat ~180px below the tab row and
+    // the sheet read as "won't open". `openPct` is clamped through the
+    // same `clampPct` the drag uses, so a stored 300 opens at
+    // MAX_OPEN_PCT (90): `openHeightPx(90, 768, 64)` = min(691.2, 696)
+    // = 691.2, and a stored 3 opens at MIN_OPEN_PCT (14): 0.14*768 =
+    // 107.52.
+    window.localStorage.setItem("dmux.phone-drawer.height", "300");
+    const { unmount } = render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    let sheet = document.querySelector(
+      '[data-act="phone-drawer"]',
+    ) as HTMLElement;
+    expect(parseFloat(sheet.style.height)).toBeCloseTo(691.2, 5);
+    unmount();
+    window.localStorage.setItem("dmux.phone-drawer.height", "3");
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    sheet = document.querySelector(
+      '[data-act="phone-drawer"]',
+    ) as HTMLElement;
+    expect(parseFloat(sheet.style.height)).toBeCloseTo(107.52, 5);
+  });
+
   it("re-opening EITHER tab restores the ONE shared persisted height", () => {
     window.localStorage.setItem("dmux.phone-drawer.height", "30");
     render(

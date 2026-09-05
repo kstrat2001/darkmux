@@ -27,7 +27,7 @@
  *
  * **Height, not transform, drives open/close.** Closed, `.phone-drawer`
  * has NO inline `height` — it falls back to `styles.css`'s own rule
- * (`calc(58px + env(safe-area-inset-bottom, 0px))`, just enough for the
+ * (`calc(68px + env(safe-area-inset-bottom, 0px))`, just enough for the
  * handle+tabs, which is all that's visible). Open, an inline
  * `style={{ height: `${openPct}vh` }}` overrides that, and CSS `height`
  * genuinely transitions between the two (both are concrete lengths — no
@@ -46,7 +46,7 @@
  * wrapper is always mounted — this is what keeps `EventLogColumn` (and the
  * machine stats panel's own daemon polling, gated separately via
  * `onMachineOpenChange` below) from rendering/fetching while the sheet is
- * closed (58px tall — there is no room to show it anyway).
+ * closed (68px tall — there is no room to show it anyway).
  *
  * **Modal while open, at ANY height (operator finding, phone install
  * review):** the page behind is unusable while the drawer is open — body
@@ -212,7 +212,7 @@ export function PhoneDrawer({
   // glitch. `lib/drawerStorage.ts`'s own doc has the full story; this
   // state is never re-derived from `activeTab` again after mount.
   const [openPct, setOpenPct] = useState<number>(
-    () => loadDrawerHeightPct() ?? DEFAULT_OPEN_PCT,
+    () => clampPct(loadDrawerHeightPct() ?? DEFAULT_OPEN_PCT),
   );
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef<{
@@ -459,7 +459,7 @@ export function PhoneDrawer({
         className={`phone-drawer${open ? " phone-drawer--open" : ""}${dragging ? " phone-drawer--dragging" : ""}`}
         data-act="phone-drawer"
         // (#2108, "one card" packet) Closed: NO inline height — falls
-        // back to `styles.css`'s own `calc(58px + env(safe-area-inset-
+        // back to `styles.css`'s own `calc(68px + env(safe-area-inset-
         // bottom, 0px))` rule, just enough for the handle+tabs below.
         // Open: a REAL PIXEL height (`openHeightPx`'s own doc) — the
         // browser still transitions smoothly to/from the closed CSS
@@ -545,7 +545,7 @@ export function PhoneDrawer({
             section (`flex: 1`) inside the ONE sliding sheet rather than a
             second independently-animated element. The CONTENT inside
             stays gated on `open` so nothing renders/polls/fetches while
-            the sheet is closed (58px tall — there is no room for it
+            the sheet is closed (68px tall — there is no room for it
             anyway). */}
         <div
           className="phone-drawer__body"
