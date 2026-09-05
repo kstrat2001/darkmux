@@ -3300,8 +3300,17 @@ async fn aggregate_flow_records_for_date(
 /// Keyed to match the viewer's own `recKey` convention (`ui/src/lib/flow.ts`)
 /// so both layers agree on what "the same record" means; the payload is part
 /// of the identity because two records can otherwise share every scalar field.
-/// Redis order is preserved and local-only records append — callers sort by
-/// `ts` downstream, and the viewer dedups again on its own key regardless.
+/// The union is sorted by `ts` (stable, so same-instant records keep their
+/// write order) — previously Redis order was preserved and local-only
+/// records appended, on the theory that callers sort downstream. Measured
+/// live 2026-09-06 with #2410's pinned bookends: the 236 local-only
+/// bookends Redis's newest-10k window had evicted landed at index 10000+,
+/// a 00:08 `dispatch start` behind 16:21 telemetry, breaking the
+/// chronological promise `GET /flow/<date>` documents. The viewer's window
+/// builders do sort, but the route is a contract of its own (`flow tail`,
+/// scripts, the ACP panel read it too), so the order is fixed HERE. RFC 3339
+/// `Z` timestamps compare correctly as strings; a record with no `ts` sorts
+/// first rather than being dropped.
 fn union_flow_records(
     redis_records: Vec<serde_json::Value>,
     local_records: Vec<serde_json::Value>,
@@ -3310,6 +3319,10 @@ fn union_flow_records(
         redis_records.iter().map(flow_record_identity).collect();
     let mut out = redis_records;
     out.extend(local_records.into_iter().filter(|r| !seen.contains(&flow_record_identity(r))));
+    out.sort_by(|a, b| {
+        let ts = |r: &serde_json::Value| r.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+        ts(a).cmp(&ts(b))
+    });
     out
 }
 
