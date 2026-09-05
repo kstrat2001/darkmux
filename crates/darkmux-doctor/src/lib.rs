@@ -1762,6 +1762,22 @@ fn check_step_command_timeout() -> Check {
         "default"
     };
     let seconds = darkmux_types::config_access::step_command_timeout_seconds();
+    // (#2310 fix-loop E2, from the loop-D review) `0` is UNBOUNDED, the same
+    // reading every other darkmux zero-knob has — see
+    // `darkmux_crew::bounded_command::configured_timeout`. Said out loud
+    // here because the previous behavior was the opposite ("kill instantly"),
+    // and an operator who set `0` deserves to see which one they got.
+    if seconds == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!(
+                "0s ({provenance}) — unbounded; a step's shell command (mods.gate's \
+                 test_command, procedural.shell) runs until it exits or darkmux is interrupted"
+            ),
+            hint: None,
+        };
+    }
     Check {
         name: name.into(),
         status: Status::Pass,
@@ -6364,6 +6380,96 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
             }
         }
+    }
+
+    // ─── (#2361, #2310 fix-loop E2) check_step_command_timeout — resolved state + provenance ─
+
+    /// Scopes `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS` for one check and
+    /// restores the prior value — the same shape the
+    /// `check_host_sampler_interval` siblings above use.
+    fn step_command_timeout_check_with(env: Option<&str>) -> Check {
+        let k = "DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            match env {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let check = check_step_command_timeout();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        check
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_step_command_timeout_default_is_pass_and_names_600s() {
+        let check = step_command_timeout_check_with(None);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("600s"), "{}", check.message);
+        assert!(check.message.contains("default"), "provenance named: {}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_step_command_timeout_env_override_names_the_value_and_its_provenance() {
+        let check = step_command_timeout_check_with(Some("30"));
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("30s"), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+    }
+
+    /// (#2310 fix-loop E2, from the loop-D review) `0` is UNBOUNDED, and
+    /// doctor says so — the knob's meaning INVERTED in this fix (it used to
+    /// kill instantly), so the one surface that reports resolved values has
+    /// to report the new reading, not the number alone.
+    #[serial_test::serial]
+    #[test]
+    fn check_step_command_timeout_zero_is_pass_and_says_unbounded() {
+        let check = step_command_timeout_check_with(Some("0"));
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("unbounded"), "{}", check.message);
+        assert!(!check.message.contains("killed at this bound"), "the old reading must be gone: {}", check.message);
+    }
+
+    /// The middle tier the siblings above have no test for: the check sees
+    /// `config.json` and SAYS so, with the env tier absent.
+    ///
+    /// Only the PROVENANCE is asserted, not the resolved value, and that is
+    /// a structural limit rather than an omission: `config_access::config()`
+    /// is EMPTY by construction in every test build (#811 — a process-wide
+    /// `OnceLock` a test could never reliably control, and a populated real
+    /// config silently flaked default assertions), so a test build's
+    /// resolved value is always the built-in default no matter what file
+    /// exists. The value half of this tier is covered where it CAN be —
+    /// `config_access`'s own `pick_parsed` tier tests, which take the config
+    /// value as an explicit argument.
+    #[serial_test::serial]
+    #[test]
+    fn check_step_command_timeout_reads_config_json_when_env_is_unset() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"schema_version":"1.2","runtime":{"step_command_timeout_seconds":45}}"#,
+        )
+        .unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = step_command_timeout_check_with(None);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("from config.json"), "provenance named: {}", check.message);
+        assert!(!check.message.contains("env"), "the env tier is absent here: {}", check.message);
     }
 
     // ─── (#2111) check_telemetry_record_every_samples — resolved state + provenance ─

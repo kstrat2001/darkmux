@@ -403,9 +403,14 @@ pub fn model_load_timeout_seconds() -> u64 {
 /// a STEP runs — `mods.gate`'s `test_command`, `procedural.shell`'s
 /// `command`. Both used to run unbounded and unregistered, so a hung suite
 /// pinned the mission open and neither SIGTERM nor SIGINT could reach it.
-/// Consumed by `darkmux_crew::bounded_command::run_shell_bounded`. Mirrors
-/// [`model_load_timeout_seconds`]' wiring exactly — the sibling bound on a
-/// host model load.
+/// Consumed by `darkmux_crew::bounded_command::configured_timeout`, which
+/// turns this into the `Duration` `bounded_command::run_bounded` enforces.
+/// (An earlier revision of this comment named `run_shell_bounded`, which has
+/// never existed.) Mirrors [`model_load_timeout_seconds`]' wiring exactly —
+/// the sibling bound on a host model load — with ONE deliberate difference:
+/// `0` here means UNBOUNDED (#2310 fix-loop E2), the same reading every
+/// other darkmux zero-knob has. This accessor returns the raw seconds;
+/// `configured_timeout` is where `0` becomes "never fires".
 pub fn step_command_timeout_seconds() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.step_command_timeout_seconds);
     pick_parsed("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS", cfg, Some(600)).unwrap()

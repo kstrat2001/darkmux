@@ -5659,26 +5659,38 @@ fn review_v2_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
         .into_iter()
         .find(|r| r["action"] == serde_json::json!("mission close"))
         .expect("a mission close record");
-    // The close payload is promoted from the OUTCOME task's last step —
-    // `deliver`'s. That step's output is its emit DESTINATION (a path, by
-    // `DeliverGithubReviewStepKind::run`'s own contract, pinned by
-    // `the_step_kind_run_reads_config_and_emits_to_the_named_path`), not
-    // the DeliverOutcome JSON — so there is no JSON object to promote and
-    // the payload is honestly absent. Pinned so that if the kind's output
-    // contract ever changes, this seam is where it surfaces.
+    // (#2310 fix-loop E2) The close payload IS the delivery's verdict. The
+    // deliver step's output is a `{mode, summary, emit}` object — declaring
+    // `outcome_from: "deliver"` and then emitting a bare PATH promoted
+    // nothing, so a run whose whole purpose is to deliver a review closed
+    // with a null payload and the verdict was reachable only by opening the
+    // emit file. Pinned here because this is the seam where the kind's
+    // output contract meets `outcome_from`.
+    assert_eq!(
+        close["payload"]["mode"],
+        serde_json::json!("degraded"),
+        "the run's verdict is promoted into the close payload: {close}"
+    );
+    assert_eq!(
+        close["payload"]["emit"],
+        serde_json::json!(emit_path.to_string_lossy()),
+        "and the emit destination is still carried, as a field: {close}"
+    );
     assert!(
-        close["payload"].is_null(),
-        "a path-valued step output promotes nothing: {close}"
+        close["payload"]["summary"].as_str().unwrap_or_default().contains("rules reviewed"),
+        "the scope line rides it too: {close}"
     );
     let deliver_output = probe_steps(&mission_dir)
         .into_iter()
         .find(|(id, _)| id.contains("deliver") && !id.contains("gather"))
         .map(|(_, (_, output))| output)
         .expect("a deliver step");
+    let deliver_output: serde_json::Value =
+        serde_json::from_str(&deliver_output).expect("the deliver step's output is a promotable JSON object");
     assert_eq!(
-        deliver_output,
-        emit_path.to_string_lossy(),
-        "the deliver step's output is its emit destination"
+        deliver_output["emit"],
+        serde_json::json!(emit_path.to_string_lossy()),
+        "the deliver step's output names its emit destination"
     );
 }
 
