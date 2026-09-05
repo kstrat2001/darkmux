@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import { EventLogColumn } from "./EventLogColumn";
 import type { FlowRecord } from "../types/handwritten";
 import { closeOpenModal } from "../lib/dialogManager";
@@ -95,7 +95,9 @@ describe("EventLogColumn", () => {
     const records = [rec({ session_id: "s-alpha" }), rec({ session_id: "s-beta" })];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
-    expect(document.getElementById("qcount")?.textContent).toBe("1 match");
+    // (#2417 round 3) The one non-matching record is also "hidden" by the
+    // active search — same `hiddenSuffix` the no-search chip carries.
+    expect(document.getElementById("qcount")?.textContent).toBe("1 match · 1 hidden");
   });
 
   it("shows a plural match count for more than one match", () => {
@@ -106,7 +108,9 @@ describe("EventLogColumn", () => {
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
-    expect(document.getElementById("qcount")?.textContent).toBe("2 matches");
+    // (#2417 round 3) The one non-matching record is also "hidden" by the
+    // active search — same `hiddenSuffix` the no-search chip carries.
+    expect(document.getElementById("qcount")?.textContent).toBe("2 matches · 1 hidden");
   });
 
   it("appends the LOG_CAP disclosure once the match count exceeds what's shown", () => {
@@ -116,6 +120,23 @@ describe("EventLogColumn", () => {
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
     expect(document.getElementById("qcount")?.textContent).toBe("60 matches · 50 shown");
+  });
+
+  // (#2417 round 3, CONSIDER-1) A live search used to drop the
+  // hidden-by-facets context entirely — "12 matches" gave no sense of how
+  // much a busy stream's curated default was ALSO hiding underneath the
+  // search. Distinct from the LOG_CAP disclosure (`· 50 shown`): this
+  // fixture has a query match count under LOG_CAP, so that segment is
+  // absent and only the hidden-count segment appears.
+  it("appends the hidden-by-filters count to a search match too, not just the no-search chip", () => {
+    const records = [
+      rec({ action: "dispatch.reasoning", session_id: "s-alpha-1" }),
+      rec({ action: "dispatch.reasoning", session_id: "s-alpha-2" }),
+      rec({ action: "dispatch.turn.heartbeat", session_id: "s-alpha-heartbeat" }), // hidden by the #2416 default, even though its id would match the query
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
+    expect(document.getElementById("qcount")?.textContent).toBe("2 matches · 1 hidden");
   });
 
   it("carries the server-truncation marker into a filtered match count too", () => {
@@ -250,6 +271,108 @@ describe("EventLogColumn", () => {
     expect(document.querySelectorAll('[data-act="rec"]').length).toBe(0);
     fireEvent.click(screen.getByText("clear all"));
     expect(document.querySelectorAll('[data-act="rec"]').length).toBe(1);
+  });
+
+  // (#2417 round 2, MF2) The button used to read "filters · 1" whether one
+  // value or seventeen were hidden — a strict-subset-per-facet count capped
+  // at one per facet. Seventeen distinct unmapped activities (none of them
+  // in `DEFAULT_ACTIVITIES`, so all seventeen default OFF) beside three
+  // that ARE in the curated default proves the count is real hidden values.
+  it("the Filters button counts every hidden PRESENT value, not one per facet", () => {
+    const records = [
+      rec({ action: "dispatch.reasoning" }),
+      rec({ action: "dispatch.checkpoint" }),
+      rec({ action: "dispatch.turn" }),
+      ...Array.from({ length: 17 }, (_, i) => rec({ action: `custom.action.${i}` })),
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    expect(screen.getByRole("button", { name: /filters, 17 active/i })).toBeInTheDocument();
+  });
+
+  // (#2417 round 2, MF2) The pane chip used to print "50 of <filtered.length>"
+  // — a POST-filter total that reads as the whole record count. A stream
+  // that is mostly telemetry, with the curated activity default hiding it,
+  // must say so.
+  it("the pane chip names how many records the filters are hiding, not just the post-filter total", () => {
+    const telemetry = Array.from({ length: 900 }, (_, i) =>
+      rec({
+        ts: `2026-08-08T${String(10 + Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}:00.000Z`,
+        category: "telemetry",
+        source: "process",
+        action: undefined,
+      }),
+    );
+    const reasoning = Array.from({ length: 100 }, (_, i) =>
+      rec({ ts: `2026-08-08T20:${String(i % 60).padStart(2, "0")}:00.000Z`, action: "dispatch.reasoning" }),
+    );
+    render(<EventLogColumn scopeLabel="fleet" records={[...telemetry, ...reasoning]} visible />);
+    expect(document.getElementById("qcount")?.textContent).toContain("900 hidden");
+  });
+
+  // (#2027, revised #2417 round 2 — one global store, written on gestures
+  // only) Two `EventLogColumn`s ARE mounted at once on the `mission` route
+  // historically (the App-level mainstay plus a lens's own pane — since
+  // retired, but the invariant must hold regardless of which route reaches
+  // it). The old fix scoped storage per-pane because a routine reconcile
+  // tick on the hidden one clobbered the visible one's picks. The round-2
+  // fix removes the need for scoping a different way: only an operator
+  // gesture persists, so a pane nobody has touched never writes at all.
+  //
+  // The gesture here is the search box, not a facet checkbox — the
+  // checkbox modal (`FiltersDialog`, via `Dialog`'s `createPortal`) is a
+  // SINGLETON DOM id (`#modalbg`) shared by every mounted `EventLogColumn`
+  // instance (see `App.tsx`'s own doc: "two live mounts... would fight over
+  // dialogManager's modalbg id"), which is a separate, pre-existing
+  // collision this test is not about. The search input has no such
+  // singleton and exercises the identical `persistFilterState` gesture
+  // path (`setQuery`).
+  it("(#2027 dual-mount) an idle sibling pane's own reconcile never writes, so it cannot clobber a gesture made in the other", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "local" }),
+      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "cloud" }),
+    ];
+    const { container: paneA } = render(<EventLogColumn scopeLabel="fleet" paneId="a" records={records} visible />);
+    const { rerender: rerenderB } = render(
+      <EventLogColumn scopeLabel="mission m1" paneId="b" records={records} visible={false} />,
+    );
+
+    // Neither pane has been touched by the operator yet.
+    expect(window.sessionStorage.getItem("dmux.eventfilters")).toBeNull();
+
+    // The operator interacts with pane A only.
+    fireEvent.change(within(paneA).getByPlaceholderText("filter events…"), { target: { value: "s-cloud" } });
+    expect(paneA.querySelectorAll('[data-act="rec"]').length).toBe(1);
+
+    const storedAfterA = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    expect(storedAfterA.q).toBe("s-cloud");
+
+    // Pane B receives a fresh `records` array (a routine live-poll tick),
+    // re-running its own facets/absorb reconcile effect — the exact path
+    // that used to fire a mount/every-change persist under the old
+    // per-scope keying. It must not write anything: pane B never had an
+    // operator gesture of its own.
+    //
+    // (#2417 round 3, MF-B) The tick record carries a BRAND-NEW facet value
+    // (`tier: "edge"` — neither "local" nor "cloud" was ever offered
+    // before) rather than reusing an already-seen one. `absorbNewFacetValues`
+    // returns the SAME `filters` reference when nothing is new (its own
+    // "no spurious re-render" guarantee — see `eventFilters.ts`'s doc), so
+    // a tick that introduces no new value never even reaches the
+    // `setFilters` call inside the reconcile effect: the branch this test
+    // exists to prove doesn't write is never actually exercised. A new
+    // tier forces `absorbNewFacetValues` to return a NEW reference, which
+    // takes the `next !== filters` branch and calls `setFilters` for real.
+    rerenderB(
+      <EventLogColumn
+        scopeLabel="mission m1"
+        paneId="b"
+        records={[...records, rec({ ts: "2026-08-08T12:10:00.000Z", action: "dispatch.reasoning", session_id: "s-edge", tier: "edge" })]}
+        visible={false}
+      />,
+    );
+
+    const storedAfterB = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    expect(storedAfterB.q).toBe("s-cloud");
   });
 
   // RED-PROVED (real regression, caught by

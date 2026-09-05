@@ -1,9 +1,40 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
 import { clkhm } from "./lib/format";
 import { fmtElapsed } from "./lib/format";
+import { ACT_ORDER } from "./lib/eventFilters";
+
+/**
+ * (#2416) This file's fixtures use real dispatch-lifecycle actions
+ * (`dispatch.start`/`dispatch.complete`, etc.) because they're testing
+ * mission/session/playback logic that genuinely needs those semantics —
+ * unlike a filter-agnostic fixture, these can't just be swapped for
+ * "dispatch.reasoning". None of these tests are about the event-filter
+ * FEATURE itself (that's `eventFilters.test.ts` and `EventLogColumn.test.tsx`'s
+ * own filter-specific tests), so this seeds the global stored picks with
+ * every known activity explicitly included — restoring the pre-#2416
+ * "everything visible" view for this file only, the same way these tests
+ * already relied on before the default became a curated allowlist.
+ */
+beforeEach(() => {
+  try {
+    window.sessionStorage.setItem(
+      "dmux.eventfilters",
+      JSON.stringify({
+        version: 2,
+        act: { include: ACT_ORDER, exclude: [] },
+        cat: { include: [], exclude: [] },
+        tier: { include: [], exclude: [] },
+        src: { include: [], exclude: [] },
+        q: "",
+      }),
+    );
+  } catch {
+    // storage unavailable — nothing to seed
+  }
+});
 
 /**
  * Regression test for the `useSyncExternalStore` snapshot-stability bug

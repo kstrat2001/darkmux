@@ -29,6 +29,35 @@ const MISSION_RE = /\/flow-mission\/[^/?]+(\?.*)?$/;
 const DAY_RE = /\/flow\/\d{4}-\d{2}-\d{2}(?!\/stream)(\?.*)?$/;
 const STREAM_RE = /\/flow\/\d{4}-\d{2}-\d{2}\/stream(\?.*)?$/;
 
+// (#2416) This spec's fixtures use raw `action` strings ("step start",
+// "phase start", "mission start", "step complete") that don't map to a
+// known `activityOf()` branch and fall through to the label itself — none
+// of them are in the event log's new default allowlist (reasoning/
+// checkpoint/tool call/turn/dispatch error). This spec is about backfill/
+// live-stream/cap-disclosure behavior, not the filter feature, so seed the
+// global stored picks to show every activity these fixtures use — the same
+// "everything visible" view the default used to be before #2416 curated it.
+const SHOW_ALL_ACTIVITIES = [
+  'reasoning', 'checkpoint', 'tool call', 'turn', 'heartbeat',
+  'dispatch start', 'dispatch end', 'dispatch error', 'feedback', 'routing',
+  'compaction', 'note', 'machine online', 'machine offline', 'session end',
+  'detector', 'runtime', 'tokens', 'lms', 'host telemetry', 'telemetry',
+  'other', 'step start', 'phase start', 'mission start', 'step complete',
+];
+
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript((acts) => {
+    window.sessionStorage.setItem('dmux.eventfilters', JSON.stringify({
+      version: 2,
+      act: { include: acts, exclude: [] },
+      cat: { include: [], exclude: [] },
+      tier: { include: [], exclude: [] },
+      src: { include: [], exclude: [] },
+      q: '',
+    }));
+  }, SHOW_ALL_ACTIVITIES);
+});
+
 const mockEmpty = (page, re) => page.route(re, (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify([]) }));
 
 const GRAPH = {

@@ -23,6 +23,32 @@ const BACKFILL_RE = /\/flow\/\d{4}-\d{2}-\d{2}(?!\/stream)(\?.*)?$/;
 const STREAM_RE = /\/flow\/\d{4}-\d{2}-\d{2}\/stream(\?.*)?$/;
 const MISSION_RE = /\/flow-mission\/[^/?]+(\?.*)?$/;
 
+// (#2416) This spec's fixtures use `dispatch start`/`dispatch complete`/
+// `step complete`/`telemetry.tokens` — none in the event log's new default
+// allowlist (reasoning/checkpoint/tool call/turn/dispatch error). This spec
+// is about mission-isolation scoping, not the filter feature, so seed the
+// global stored picks to show every activity these fixtures use.
+const SHOW_ALL_ACTIVITIES = [
+  'reasoning', 'checkpoint', 'tool call', 'turn', 'heartbeat',
+  'dispatch start', 'dispatch end', 'dispatch error', 'feedback', 'routing',
+  'compaction', 'note', 'machine online', 'machine offline', 'session end',
+  'detector', 'runtime', 'tokens', 'lms', 'host telemetry', 'telemetry',
+  'other', 'step complete',
+];
+
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript((acts) => {
+    window.sessionStorage.setItem('dmux.eventfilters', JSON.stringify({
+      version: 2,
+      act: { include: acts, exclude: [] },
+      cat: { include: [], exclude: [] },
+      tier: { include: [], exclude: [] },
+      src: { include: [], exclude: [] },
+      q: '',
+    }));
+  }, SHOW_ALL_ACTIVITIES);
+});
+
 const GRAPH = {
   mission_id: MISSION_ID,
   mission_status: 'active',

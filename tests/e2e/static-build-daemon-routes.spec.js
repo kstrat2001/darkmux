@@ -39,11 +39,14 @@ test.beforeEach(async ({ page }) => {
   page.on('pageerror', (e) => { throw new Error(`uncaught page error: ${e}`); });
 });
 
-/** The events column's own count chip ("50 of 6092 events" / "0 events"). */
+/** The events column's own count chip ("50 of 6092 events" / "0 events" /
+ *  "50 of 6092 events · 4952 hidden" — #2417 round 2 appends the hidden-by-
+ *  filters count whenever the facet defaults hide something, which is the
+ *  common case on the demo's busy fixture). */
 async function eventCountText(page) {
   return page.evaluate(() => {
     const el = [...document.querySelectorAll('*')].find(
-      (e) => e.children.length === 0 && /^\d+\+? (of \d+\+? )?events?$/.test((e.textContent || '').trim()),
+      (e) => e.children.length === 0 && /^\d+\+? (of \d+\+? )?events?( · \d+ hidden)?$/.test((e.textContent || '').trim()),
     );
     return el ? el.textContent.trim() : null;
   });
@@ -86,4 +89,12 @@ test('(U4-1) every lens shows the same committed day in the events column, at re
   // lens is showing does not change how much of it happened.
   const distinct = new Set(Object.values(counts));
   expect([...distinct], `per-lens counts disagreed: ${JSON.stringify(counts)}`).toHaveLength(1);
+
+  // (#2417 round 3, CONSIDER-2) The finder above stays permissive (the
+  // hidden-count segment is optional in its own regex), but on THIS busy
+  // demo fixture the #2416 curated default hides real records, so the
+  // fleet lens's chip is one place that segment must actually be present —
+  // pinning it here catches a future change that silently stops computing
+  // or rendering it, which the permissive finder alone would not.
+  expect(counts.fleet, `fleet lens chip did not name a hidden count: ${counts.fleet}`).toMatch(/ · \d+ hidden$/);
 });

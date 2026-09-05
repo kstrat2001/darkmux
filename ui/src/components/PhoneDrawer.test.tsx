@@ -29,12 +29,16 @@ const NOOP_MACHINE_TAB = {
   body: <div data-act="stub-machine-body">stats</div>,
 };
 
+// (#2416) `dispatch.reasoning` — the default event-filter view now curates
+// by activity (reasoning/checkpoint/tool call/turn/dispatch error); the
+// previous `note` fixture no longer shows by default, and none of these
+// tests are about filtering, just generic row/drawer mechanics.
 function record(i: number): FlowRecord {
   return {
     ts: `2026-01-01T00:0${i}:00Z`,
-    category: "note",
+    category: "work",
     source: "operator",
-    action: "note",
+    action: "dispatch.reasoning",
     handle: `rec-${i}`,
   };
 }
@@ -511,7 +515,7 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     // role/label; its painted height is a stylesheet-body concern,
     // covered by this file's own stylesheet-check tests below.
     const strip = document.querySelector('[data-act="rec-strip"]')!;
-    expect(strip.textContent).toContain("note");
+    expect(strip.textContent).toContain("reasoning"); // (#2416) fixture activity renamed from "note"
     expect(strip.getAttribute("role")).toBe("button");
     expect(strip.getAttribute("aria-label")).toBe("Back to list");
     expect(document.querySelector('[data-act="eventlog-back"]')).toBeNull();

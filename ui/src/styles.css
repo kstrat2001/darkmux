@@ -6566,6 +6566,25 @@ body {
   .phone-drawer__body .eventlog__qcount {
     justify-content: center;
   }
+  /* (#2417 round 3, MF-A) The events chip overflowed the drawer at 390px
+     once the "· N hidden" suffix (#2417 round 2) landed on a busy stream —
+     `.eventlog__headbtns` was `inline-flex` with no wrap and `.eventlog__
+     qcount` was `white-space: nowrap`, so a chip like "50 of 1140 events ·
+     4952 hidden" pushed the row's right edge past the drawer's own bounds
+     instead of wrapping. Scoped to `.phone-drawer__body` — the standalone
+     desktop layout (real vertical room, no fixed-width sheet) is untouched.
+     `flex-wrap: wrap` on the button row lets the chip drop to its own line
+     under follow/filters once `flex: 1 1 100%` forces it to claim the
+     whole row's width the moment it doesn't fit beside its siblings. */
+  .phone-drawer__body .eventlog__headbtns {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+  .phone-drawer__body .eventlog__qcount {
+    flex: 1 1 100%;
+    white-space: normal;
+  }
   /* 16px stays — dropping it re-triggers iOS Safari's zoom-on-focus for
      any input under 16px (`.eventlog__searchbox input`'s own base-rule
      doc has the full reasoning); this only trims the PADDING toward the

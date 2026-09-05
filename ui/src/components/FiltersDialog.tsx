@@ -1,5 +1,5 @@
 import type { Facets, FilterState } from "../lib/eventFilters";
-import { MODEL_ACTIVITIES } from "../lib/eventFilters";
+import { DEFAULT_ACTIVITIES } from "../lib/eventFilters";
 import { Dialog } from "./Dialog";
 
 const GROUPS: { title: string; key: keyof Facets }[] = [
@@ -129,8 +129,14 @@ export function FiltersBody({
 }
 
 /** `onlyModelActivity()` — viewer.html:2869-2873. Narrows the activity facet
- * to exactly `MODEL_ACTIVITIES` (intersected with what's actually present in
- * `facets.act`, matching legacy's `FACTS.filter(a=>keep.has(a))`). */
+ * to exactly `DEFAULT_ACTIVITIES` (intersected with what's actually present
+ * in `facets.act`, matching legacy's `FACTS.filter(a=>keep.has(a))`).
+ *
+ * (#2416) This used to narrow to `MODEL_ACTIVITIES`, which included
+ * `heartbeat`. It now matches the same allowlist the default filter state
+ * itself uses, so "model only" and "the default view" are the same set —
+ * the operator no longer has to hit this button AND uncheck heartbeat by
+ * hand to get the view they actually want every time. */
 export function onlyModelFacet(facets: Facets): Set<string> {
-  return new Set(facets.act.filter((a) => MODEL_ACTIVITIES.has(a)));
+  return new Set(facets.act.filter((a) => DEFAULT_ACTIVITIES.has(a)));
 }
