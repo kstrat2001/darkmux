@@ -999,7 +999,10 @@ impl<'a> DiffSource<'a> {
     }
 
     /// (#2310 fix-loop round 2, item 1) See the field's own doc — the
-    /// deleted-file case neither counter above can represent.
+    /// deleted-file case neither counter above can represent. It IS the
+    /// deleted case and nothing else: `plan_diff_rule` admits exactly one
+    /// workspace source, so "belongs to a different source" is not a
+    /// reachable explanation here (#2310 fix-loop round 3, R3).
     fn diff_entries_absent_from_tree(&self) -> usize {
         self.diff_entries_absent_from_tree
     }
@@ -1021,21 +1024,29 @@ fn diff_git_header_paths(diff_text: &str) -> std::collections::BTreeSet<String> 
         // rename/binary entry in such a diff out of
         // `diff_entries_without_hunks` and into `out_of_scope`, which
         // says the opposite thing (the diff never mentioned it).
-        // The `+++` side gets the same optional-prefix treatment in
-        // `darkmux_crew::diff::header_path`.
-        let new_side = match rest.strip_prefix("a/").and_then(|r| r.find(" b/").map(|i| &r[i + 3..])) {
+        // (#2310 fix-loop round 3, R1) The value is then normalized by
+        // the SHARED `header_path` — the same function `parse_diff` binds
+        // its own paths with — so a git-quoted path (`"b/caf\303\251.ts"`,
+        // which `core.quotepath` emits by default for anything non-ASCII)
+        // decodes to the identical string on both sides. Hand-rolling the
+        // strip here meant the raw quoted form landed in `mentioned`
+        // while `by_file` held the decoded one; they never matched, so a
+        // file that planned perfectly was ALSO reported as deleted. Note
+        // the new side is handed over WITH its `b/` still attached:
+        // stripping the dialect prefix is `header_path`'s job, and doing
+        // it here would eat a real top-level directory named `b`.
+        let new_side = match rest.strip_prefix("a/").and_then(|r| r.find(" b/").map(|i| &r[i + 1..])) {
             Some(p) => p,
             // Prefixless: `<old> <new>`. Paths with spaces are ambiguous
-            // in this dialect (git itself quotes them; not handled here,
-            // same as before) — take the last space-separated field,
-            // which is the new side for every unquoted path.
+            // in this dialect unless the two halves are equal — see
+            // `no_prefix_new_side`.
             None => match no_prefix_new_side(rest) {
                 Some(new_side) => new_side,
                 None => continue,
             },
         };
-        if !new_side.is_empty() {
-            out.insert(new_side.to_string());
+        if let Some(p) = crate::lab::bundle::diff::header_path(new_side) {
+            out.insert(p);
         }
     }
     out
@@ -1301,8 +1312,7 @@ pub fn plan_diff_rule(materialized: &Materialized, rule: &Rule, diff_text: &str,
         skipped.push(SkippedEntry {
             reason: format!(
                 "the diff names {entries_absent_from_tree} file(s) that are not in the workspace \
-                 tree (deleted by this diff, or belonging to another source) — nothing to plan a \
-                 site from"
+                 tree (deleted by this diff) — nothing to plan a site from"
             ),
             file: String::new(),
             source: Some(source.id.clone()),
@@ -2539,6 +2549,54 @@ line two
         // records its REAL byte count, not a rounded-to-zero one.
         let ws = plan_diff_rule(&materialized, &site_rule(), "  \n\n", PlanParams::default()).unwrap();
         assert!(ws.totals.skipped.iter().any(|s| s.reason.contains("diff_bytes: 4")), "{:?}", ws.totals.skipped);
+    }
+
+    /// (#2310 fix-loop round 3, R1 — PROVEN) `diff_git_header_paths` did
+    /// not unquote or prefix-strip the way `header_path` does, so a diff
+    /// touching a git-quoted path (non-ASCII, or a space) put the RAW
+    /// `"b/caf\303\251.ts"` into `mentioned` while `by_file` held the
+    /// decoded `café.ts`. The two never matched, so the file planned
+    /// fine AND the round-2 absent-from-tree ledger fired a false
+    /// "deleted by this diff" entry against it.
+    #[test]
+    fn a_git_quoted_path_plans_its_unit_and_is_never_reported_as_absent_from_the_tree() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("café.ts"), "function f() {\n  try {\n    risky();\n  } catch (e) {\n  }\n}\n").unwrap();
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"b".repeat(40))], Vec::new());
+        let diff_text = [
+            "diff --git \"a/caf\\303\\251.ts\" \"b/caf\\303\\251.ts\"",
+            "--- \"a/caf\\303\\251.ts\"",
+            "+++ \"b/caf\\303\\251.ts\"",
+            "@@ -1,6 +1,6 @@",
+            " function f() {",
+            "   try {",
+            "     risky();",
+            "   } catch (e) {",
+            "   }",
+            " }",
+            "",
+        ]
+        .join("\n");
+        let plan = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap();
+        assert_eq!(plan.units.len(), 1, "the quoted path plans like any other: {:?}", plan.units);
+        assert!(
+            !plan.totals.skipped.iter().any(|s| s.reason.contains("not in the workspace tree")),
+            "no false deleted-file entry: {:?}",
+            plan.totals.skipped
+        );
+    }
+
+    /// (#2310 fix-loop round 3, R1) The same decode on the `diff --git`
+    /// sides directly — both dialects, and with the `b/` prefix intact on
+    /// the new side so the shared helper is what strips it.
+    #[test]
+    fn diff_git_header_paths_decodes_a_quoted_path_like_the_plus_header_does() {
+        let quoted = diff_git_header_paths("diff --git \"a/caf\\303\\251.ts\" \"b/caf\\303\\251.ts\"\n");
+        assert_eq!(quoted.iter().cloned().collect::<Vec<_>>(), vec!["café.ts".to_string()]);
+        // A real top-level directory named `b` under the prefixed dialect:
+        // `a/b/foo.ts b/b/foo.ts` must yield `b/foo.ts`, not `foo.ts`.
+        let b_dir = diff_git_header_paths("diff --git a/b/foo.ts b/b/foo.ts\n");
+        assert_eq!(b_dir.iter().cloned().collect::<Vec<_>>(), vec!["b/foo.ts".to_string()], "only the DIALECT prefix comes off");
     }
 
     /// (#2310 fix-loop B1) `diff_git_header_paths` read ONLY the

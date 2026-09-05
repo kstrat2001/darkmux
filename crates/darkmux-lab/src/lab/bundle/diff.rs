@@ -13,7 +13,7 @@
 //! resolves to working behavior. `darkmux_crew::diff`'s own module carries
 //! its own copy of this coverage beside the real implementation.
 
-pub use darkmux_crew::diff::{parse_diff, Hunk};
+pub use darkmux_crew::diff::{header_path, parse_diff, Hunk};
 
 #[cfg(test)]
 mod tests {

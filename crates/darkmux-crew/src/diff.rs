@@ -135,9 +135,21 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
         //      file's real second hunk bound to a phantom path `x`, so
         //      every finding from hunk 2 onward silently dropped out of
         //      the in-diff check. `@@` closing the open HUNK was never
-        //      the risk; rebinding the PATH was. A half-headered
-        //      concatenation always has a finished hunk at that point; a
-        //      mid-hunk content line does not.
+        //      the risk; rebinding the PATH was.
+        //
+        //      The completeness test has its own cost, stated rather than
+        //      hidden (#2310 fix-loop round 3, R4): it trusts the `@@`
+        //      counts. A half-headered kit whose header OVER-declares
+        //      (says `+1,9` and then supplies four lines, which a model
+        //      writing a patch by hand does) leaves its hunk permanently
+        //      unfinished, so the NEXT file's `+++ ` is read as content
+        //      and that file MERGES into the current one — its hunks and
+        //      path are lost. Nothing with `--- ` halves is affected
+        //      (signal 1 has no completeness test), and a correctly
+        //      counted concatenation is not either. The trade is
+        //      deliberate: a miscounted kit loses a file that was already
+        //      malformed, while the alternative lost hunk 2 onward of
+        //      every WELL-FORMED two-hunk diff — the common case.
         //
         // Anything else starting `+++ `/`--- ` is hunk CONTENT, which is
         // also why the old `!ln.starts_with("+++")` / `!ln.starts_with(
@@ -251,8 +263,21 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
     files
 }
 
-/// The path a `+++ <rest>` (or `--- <rest>`) header names, or `None` when
-/// it names `/dev/null` (a deleted file) or nothing at all.
+/// The path a `+++ <rest>` header names, or `None` when it names
+/// `/dev/null` (a deleted file), decodes to nothing, or is a quoted value
+/// that does not decode.
+///
+/// **Public because it is the ONE place a diff's path-shaped value is
+/// normalized** (#2310 fix-loop round 3, R1). `darkmux-lab`'s
+/// `diff_git_header_paths` reads the `diff --git <old> <new>` header for
+/// its own accounting and needs byte-identical normalization: when it
+/// hand-rolled its own, a git-quoted path landed there raw while
+/// `parse_diff` bound the decoded form, the two never matched, and a file
+/// that planned perfectly was ALSO reported as deleted. Two normalizers
+/// is the same mistake this module's own doc records for two parsers.
+/// Callers pass the value AFTER the `+++ `/`diff --git ` marker, with any
+/// `b/` dialect prefix still attached — stripping it is this function's
+/// job, not the caller's.
 ///
 /// (#2310 fix-loop B1, S3-1 — PROVEN live) This used to be a literal
 /// `strip_prefix("+++ b/")`, which recognized ONLY `git diff`'s default
@@ -285,7 +310,7 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
 /// directory repo is the sacrificed corner. Preferring the strict
 /// dialect — the previous behavior — sacrifices EVERY prefixless patch
 /// instead, silently, which is the bug being fixed.
-fn header_path(rest: &str) -> Option<String> {
+pub fn header_path(rest: &str) -> Option<String> {
     let p = rest.split('\t').next().unwrap_or(rest);
     let p = p.strip_suffix('\r').unwrap_or(p);
     // (#2310 fix-loop R4) `core.quotepath` is git's DEFAULT, so a path
