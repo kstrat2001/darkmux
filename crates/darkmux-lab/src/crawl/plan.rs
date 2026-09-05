@@ -1002,16 +1002,16 @@ fn diff_git_header_paths(diff_text: &str) -> std::collections::BTreeSet<String> 
         // rename/binary entry in such a diff out of
         // `diff_entries_without_hunks` and into `out_of_scope`, which
         // says the opposite thing (the diff never mentioned it).
-        // Same optional-prefix rule `darkmux_crew::diff::header_path`
-        // applies to `+++`/`---`.
+        // The `+++` side gets the same optional-prefix treatment in
+        // `darkmux_crew::diff::header_path`.
         let new_side = match rest.strip_prefix("a/").and_then(|r| r.find(" b/").map(|i| &r[i + 3..])) {
             Some(p) => p,
             // Prefixless: `<old> <new>`. Paths with spaces are ambiguous
             // in this dialect (git itself quotes them; not handled here,
             // same as before) — take the last space-separated field,
             // which is the new side for every unquoted path.
-            None => match rest.rsplit_once(' ') {
-                Some((_, new_side)) => new_side,
+            None => match no_prefix_new_side(rest) {
+                Some(new_side) => new_side,
                 None => continue,
             },
         };
@@ -1020,6 +1020,22 @@ fn diff_git_header_paths(diff_text: &str) -> std::collections::BTreeSet<String> 
         }
     }
     out
+}
+
+/// The NEW side of a prefixless `diff --git <old> <new>` header.
+///
+/// (#2310 fix-loop, review) `<old> <new>` is genuinely ambiguous when a
+/// path contains a space — but the dominant case, a non-rename entry
+/// where old and new are the SAME path, is not: the header is then two
+/// equal halves around one space, whatever those halves contain. Try that
+/// first and fall back to the last space (correct for every unquoted path
+/// without spaces, which is what git emits unquoted).
+fn no_prefix_new_side(rest: &str) -> Option<&str> {
+    let mid = rest.len() / 2;
+    if rest.len() % 2 == 1 && rest.is_char_boundary(mid) && rest.as_bytes()[mid] == b' ' && rest[..mid] == rest[mid + 1..] {
+        return Some(&rest[mid + 1..]);
+    }
+    rest.rsplit_once(' ').map(|(_, new_side)| new_side)
 }
 
 impl plan_sites::SiteSource for DiffSource<'_> {
@@ -1175,28 +1191,44 @@ pub fn plan_diff_rule(materialized: &Materialized, rule: &Rule, diff_text: &str,
     // candidates, same as a tree walk.
     let is_hit = |line: &str| regexes.is_empty() || regexes.iter().any(|re| re.is_match(line));
 
-    let mut diff_source = DiffSource::new(&mut files, &mut skipped, &source.id, diff_text);
-    // (#2310 fix-loop B1, S3-1 — PROVEN live) A diff file with content in
-    // it that yields NO files is never a legitimate "nothing to review":
-    // it is a diff this parser could not read, or one whose paths belong
-    // to a different tree than the workspace names. Planning zero units
-    // from it produced a green run with a noop payload, which the
-    // operator reads as "the PR is clean" — indistinguishable from the
-    // rule genuinely finding nothing, the same failure the rule-kind and
-    // rule-scope guards above already refuse. Refuse by name and say what
-    // to check. An EMPTY diff file is left alone: "nothing changed" is a
-    // real, unambiguous input.
-    if !diff_text.trim().is_empty() && diff_source.by_file.is_empty() {
+    // (#2310 fix-loop B1, S3-1 — PROVEN live) A diff with content that
+    // this parser cannot read at all planned zero units and exited green,
+    // which the operator reads as "the PR is clean" — indistinguishable
+    // from the rule genuinely finding nothing, the same failure the
+    // rule-kind and rule-scope guards above already refuse.
+    //
+    // (#2310 fix-loop R1 — review regression) The test is HEADER
+    // PRESENCE, not the parse OUTCOME. Keying on "zero files parsed"
+    // hard-failed three diffs that are perfectly readable and honestly
+    // have nothing to plan — delete-only (every NEW side is `/dev/null`),
+    // rename-only and binary-only (no `+++` line at all) — and blamed the
+    // operator's diff dialect for it. Those plan zero units honestly;
+    // they are already counted as entries without hunks below. Only text
+    // that names no file in ANY shape darkmux reads is refused.
+    let names_a_file = diff_text.lines().any(|l| l.starts_with("+++ ") || l.starts_with("diff --git "));
+    if !diff_text.trim().is_empty() && !names_a_file {
         anyhow::bail!(
-            "the diff has content but parses to no files — check the diff's dialect and paths. \
-             darkmux reads `+++ <path>` headers with the `a/`/`b/` prefix optional and an \
-             optional trailing tab+timestamp (`git diff`, `git diff --no-prefix`, `diff -u`, \
-             `diff -Naur` all work); a diff of only renames or binary files has no `+++` header \
-             at all and nothing to plan a site from. Planning it would have produced zero units, \
-             which is indistinguishable from rule '{}' finding nothing.",
+            "the diff has content but names no file — check the diff's dialect. darkmux reads \
+             unified diffs: a `+++ <path>` header (the `b/` prefix and a trailing tab+timestamp \
+             are both optional, so `git diff`, `git diff --no-prefix`, `diff -u` and `diff -Naur` \
+             all work) or a `diff --git` header. Neither appears here — a `diff -c` context diff \
+             or an `ed` script looks like this. Planning it would have produced zero units, which \
+             is indistinguishable from rule '{}' finding nothing.",
             rule.id
         );
     }
+    // (#2310 fix-loop, review) An EMPTY diff is a legitimate input, but a
+    // plan with zero units and an empty ledger reads in the envelope
+    // exactly like a clean review of a real diff. Record which one it
+    // was, as a stated fact with its byte count.
+    if diff_text.trim().is_empty() {
+        skipped.push(SkippedEntry {
+            reason: format!("the diff was empty (diff_bytes: {}) — no file was reviewed", diff_text.len()),
+            file: String::new(),
+            source: Some(source.id.clone()),
+        });
+    }
+    let mut diff_source = DiffSource::new(&mut files, &mut skipped, &source.id, diff_text);
     // Read both counters BEFORE `plan_site_units` runs its own mutable
     // borrow through `&mut diff_source` for the rest of this function —
     // `DiffSource` holds `&mut skipped` as a field for its whole
@@ -2390,32 +2422,75 @@ line two
     /// above already refuses on the rule side. Refused by name instead,
     /// with the likely cause stated.
     ///
-    /// After B1's parser fix a `--no-prefix` diff PARSES, so the fixture
-    /// here is the other door to the same zero-files end state: a real
-    /// rename-only diff, non-empty and legitimately hunk-less.
+    /// (#2310 fix-loop R1 — review regression) The guard used to key on
+    /// the parse OUTCOME (`by_file.is_empty()`), which hard-failed the
+    /// plan step for three diffs that are perfectly readable and honestly
+    /// have nothing to plan: delete-only, rename-only, binary-only. It
+    /// keys on HEADER PRESENCE now — no `+++ ` and no `diff --git ` line
+    /// anywhere means the text is not a dialect this parser reads. The
+    /// fixture is a real `diff -c` context diff (`*** `/`--- `/`***...`),
+    /// which is exactly that.
     #[test]
-    fn plan_diff_rule_refuses_a_non_empty_diff_that_parses_to_zero_files() {
+    fn plan_diff_rule_refuses_a_diff_whose_dialect_names_no_file_at_all() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f.ts"), "export const x = 1;\n").unwrap();
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"f".repeat(40))], Vec::new());
+        let diff_text = ["*** old/f.ts\t2026-09-05 08:45:23", "--- new/f.ts\t2026-09-05 08:45:23", "***************", "*** 1,3 ****", "! export const x = 1;", ""].join("\n");
+        let err = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("names no file"), "names the outcome: {msg}");
+        assert!(msg.contains("dialect"), "names the likely cause the operator can act on: {msg}");
+    }
+
+    /// (#2310 fix-loop R1 — review regression, PROVEN) A delete-only PR
+    /// is a real, readable, correctly-parsed diff whose NEW sides are all
+    /// `/dev/null`. Refusing it hard-failed the plan step with a message
+    /// blaming the operator's diff dialect. It plans zero units instead;
+    /// the deletion is already counted as an entry without hunks.
+    #[test]
+    fn plan_diff_rule_plans_a_delete_only_diff_as_zero_units_not_an_error() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f.ts"), "export const x = 1;\n").unwrap();
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"f".repeat(40))], Vec::new());
+        let diff_text = ["diff --git a/gone.ts b/gone.ts", "deleted file mode 100644", "index 1234567..0000000", "--- a/gone.ts", "+++ /dev/null", "@@ -1,2 +0,0 @@", "-one", "-two", ""].join("\n");
+        let plan = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap();
+        assert!(plan.units.is_empty(), "nothing to review in a deletion: {:?}", plan.units);
+    }
+
+    /// (#2310 fix-loop R1) The rename-only case this test used to assert
+    /// a REFUSAL for — same reasoning as the delete-only twin above.
+    #[test]
+    fn plan_diff_rule_plans_a_rename_only_diff_as_zero_units_not_an_error() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("f.ts"), "export const x = 1;\n").unwrap();
         let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"f".repeat(40))], Vec::new());
         let diff_text =
             ["diff --git a/old.ts b/new.ts", "similarity index 100%", "rename from old.ts", "rename to new.ts", ""].join("\n");
-        let err = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("no files"), "names the zero-file outcome: {msg}");
-        assert!(msg.contains("dialect"), "names the likely cause the operator can act on: {msg}");
+        let plan = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap();
+        assert!(plan.units.is_empty(), "{:?}", plan.units);
     }
 
     /// (#2310 fix-loop B1) The guard must NOT fire on an empty diff file —
     /// "nothing changed" is a legitimate, unambiguous input, and the
     /// message about diff dialects would be actively misleading there.
+    /// The emptiness is RECORDED, not merely tolerated (#2310 fix-loop,
+    /// review): a plan with zero units and nothing in `skipped` reads in
+    /// the envelope exactly like a clean review of a real diff. The
+    /// skipped entry names the byte count so the artifact says which one
+    /// it was.
     #[test]
-    fn plan_diff_rule_allows_a_genuinely_empty_diff() {
+    fn plan_diff_rule_allows_a_genuinely_empty_diff_and_records_it_as_a_fact() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("f.ts"), "export const x = 1;\n").unwrap();
         let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"a".repeat(40))], Vec::new());
-        let plan = plan_diff_rule(&materialized, &site_rule(), "  \n\n", PlanParams::default()).unwrap();
+        let plan = plan_diff_rule(&materialized, &site_rule(), "", PlanParams::default()).unwrap();
         assert!(plan.units.is_empty(), "{:?}", plan.units);
+        let note = plan.totals.skipped.iter().find(|s| s.reason.contains("diff_bytes")).expect("the empty diff is recorded");
+        assert!(note.reason.contains("diff_bytes: 0"), "the byte count is a stated fact: {}", note.reason);
+        // Whitespace-only is the same "nothing to review" case and
+        // records its REAL byte count, not a rounded-to-zero one.
+        let ws = plan_diff_rule(&materialized, &site_rule(), "  \n\n", PlanParams::default()).unwrap();
+        assert!(ws.totals.skipped.iter().any(|s| s.reason.contains("diff_bytes: 4")), "{:?}", ws.totals.skipped);
     }
 
     /// (#2310 fix-loop B1) `diff_git_header_paths` read ONLY the
@@ -2428,6 +2503,11 @@ line two
     fn diff_git_header_paths_reads_the_no_prefix_form_too() {
         let prefixed = diff_git_header_paths("diff --git a/src/old.ts b/src/new.ts\n");
         let bare = diff_git_header_paths("diff --git src/old.ts src/new.ts\n");
+        // (#2310 fix-loop, review) `<old> <new>` is ambiguous for paths
+        // with spaces; the equal-halves case (no rename, the common one)
+        // is not, so it is split exactly rather than at the last space.
+        let spaced = diff_git_header_paths("diff --git src/a b.ts src/a b.ts\n");
+        assert_eq!(spaced.iter().cloned().collect::<Vec<_>>(), vec!["src/a b.ts".to_string()], "equal halves split exactly");
         assert_eq!(prefixed.iter().cloned().collect::<Vec<_>>(), vec!["src/new.ts".to_string()]);
         assert_eq!(
             bare.iter().cloned().collect::<Vec<_>>(),

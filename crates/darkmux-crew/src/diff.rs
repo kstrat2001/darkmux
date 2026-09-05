@@ -8,7 +8,9 @@
 //! simple enough for hand-rolled prefix/token parsing. Every unified-diff
 //! dialect a real tool emits is accepted (#2310 fix-loop B1) — see
 //! [`header_path`] for the three verified header shapes and why the
-//! optional `a/`/`b/` prefix is accepted rather than required.
+//! optional `b/` prefix is accepted rather than required, and why a
+//! header is recognized by POSITION (an adjacent `--- `/`+++ ` pair, or
+//! a `+++ ` with no hunk body around it) rather than by prefix alone.
 //!
 //! **Canonical home, moved from `darkmux-lab`'s `bundle::diff` (#2310 P4b).**
 //! `deliver_github_review`'s "is this line inside the diff" check needs the
@@ -90,13 +92,71 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
         }
     }
 
-    for ln in diff_text.lines() {
-        if let Some(rest) = ln.strip_prefix("+++ ") {
-            flush(&mut files, &path, &mut cur);
-            path = header_path(rest);
-            cur = None;
-            continue;
+    // (#2310 fix-loop R2) Indexed, not a plain `for` over `lines()` — a
+    // file header is the ADJACENT `--- <old>` / `+++ <new>` PAIR, so
+    // recognizing one needs a one-line lookahead. See the loop's own
+    // header-detection comment for why position, not prefix alone,
+    // decides.
+    let lines: Vec<&str> = diff_text.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let ln = lines[i];
+        // (#2310 fix-loop R2, R3 — review regressions) HEADER DETECTION IS
+        // POSITIONAL. Widening the old literal `+++ b/` to a bare `+++ `
+        // prefix made `+++ ` a header ANYWHERE — including inside a hunk
+        // body, where a raw `+++ foo` line is an ADDED line whose content
+        // is `++ foo`. That truncated the hunk, dropped every later line,
+        // and rebound the path to a phantom file. A unified diff defines
+        // the file header as the adjacent `--- <old>` / `+++ <new>` pair,
+        // so that is what is matched here:
+        //
+        //   1. `--- <old>` immediately followed by `+++ <new>` — a file
+        //      header pair, wherever it appears. The NEW side names the
+        //      path (the OLD side is `/dev/null` for an added file and is
+        //      never the path we bind).
+        //   2. a lone `+++ <new>` with NO hunk open — a model-authored kit
+        //      commonly omits the `--- ` half (see `mods::
+        //      looks_like_unified_diff`), and at that point there is no
+        //      hunk body for it to be content OF.
+        //   3. a lone `+++ <new>` whose NEXT line is a hunk header — the
+        //      other half-headered shape, a concatenation of per-file
+        //      `+++`/`@@` blocks with the `--- ` halves omitted. This adds
+        //      no exposure over (1)/(2): a `@@ -a,b +c,d @@` line already
+        //      closes the current hunk wherever it appears, so a content
+        //      line followed by one was never going to keep its hunk
+        //      anyway.
+        //
+        // Anything else starting `+++ `/`--- ` is hunk CONTENT, which is
+        // also why the old `!ln.starts_with("+++")` / `!ln.starts_with(
+        // "---")` content guards are gone (R3): they silently DROPPED an
+        // added line whose content begins `++` and a removed line whose
+        // content begins `--`, and a dropped added line fails to advance
+        // `new_ln`, shifting every later line — the same class of bug B2
+        // fixed for blank lines.
+        //
+        // Known, accepted corner: a removed line whose content is `-- x`
+        // (raw `--- x`) immediately followed by an added line whose
+        // content is `++ y` (raw `+++ y`) reads as a header pair. Two
+        // adjacent adversarially-shaped content lines; strictly rarer
+        // than the cases above and no worse than the status quo ante.
+        if ln.starts_with("--- ") {
+            if let Some(next) = lines.get(i + 1).and_then(|n| n.strip_prefix("+++ ")) {
+                flush(&mut files, &path, &mut cur);
+                path = header_path(next);
+                cur = None;
+                i += 2;
+                continue;
+            }
         }
+        if let Some(rest) = ln.strip_prefix("+++ ") {
+            if cur.is_none() || lines.get(i + 1).is_some_and(|n| parse_hunk_header(n).is_some()) {
+                flush(&mut files, &path, &mut cur);
+                path = header_path(rest);
+                i += 1;
+                continue;
+            }
+        }
+        i += 1;
         if let Some((old_start, start)) = parse_hunk_header(ln) {
             flush(&mut files, &path, &mut cur);
             cur = Some(Hunk {
@@ -110,16 +170,14 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
         if cur.is_none() || path.is_none() {
             continue;
         }
-        if ln.starts_with('+') && !ln.starts_with("+++") {
-            let content = &ln[1..];
+        if let Some(content) = ln.strip_prefix('+') {
             let h = cur.as_mut().unwrap();
             h.added.push(content.to_string());
             h.new_block.push(content.to_string());
             h.new_lines.insert(new_ln);
             h.added_line_numbers.insert(new_ln);
             new_ln += 1;
-        } else if ln.starts_with('-') && !ln.starts_with("---") {
-            let content = &ln[1..];
+        } else if let Some(content) = ln.strip_prefix('-') {
             let h = cur.as_mut().unwrap();
             h.removed.push(content.to_string());
             h.old_block.push(content.to_string());
@@ -146,9 +204,10 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
             h.new_lines.insert(new_ln);
             new_ln += 1;
         }
-        // Other lines (e.g. `\ No newline at end of file`, the `---
-        // a/<path>` line, `diff --git` headers) carry no line-content
-        // signal — ignored, matching the reference.
+        // Other lines (e.g. `\ No newline at end of file`, a `diff --git`
+        // header, `index`/mode/similarity lines, and a `--- ` line whose
+        // `+++ ` partner is missing) carry no line-content signal —
+        // ignored, matching the reference.
     }
     flush(&mut files, &path, &mut cur);
     files
@@ -175,7 +234,9 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
 ///
 /// So: cut at the first tab (the timestamp field), drop a trailing `\r`
 /// (a lone CR — `str::lines` already eats the one in a CRLF pair), then
-/// strip an OPTIONAL `b/`/`a/` prefix.
+/// strip an OPTIONAL `b/` prefix — `b/` only, never `a/`: no dialect
+/// puts `a/` on the NEW side, and stripping it there mangled a
+/// `--no-prefix` path under a top-level directory named `a`.
 ///
 /// **The optional prefix is genuinely ambiguous and cannot be resolved
 /// from one line.** A `--no-prefix` diff of a repo whose top-level
@@ -189,12 +250,81 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
 fn header_path(rest: &str) -> Option<String> {
     let p = rest.split('\t').next().unwrap_or(rest);
     let p = p.strip_suffix('\r').unwrap_or(p);
-    let p = p.strip_prefix("b/").or_else(|| p.strip_prefix("a/")).unwrap_or(p);
+    // (#2310 fix-loop R4) `core.quotepath` is git's DEFAULT, so a path
+    // with a non-ASCII byte, a control character, a `"` or a `\` arrives
+    // C-quoted with octal byte escapes: `+++ "b/src/caf\303\251.ts"`.
+    // Binding THAT as the path meant no finding ever matched the file —
+    // and because the file did "parse", the zero-files guard never fired
+    // either, so the run read as a clean review. Unquoted BEFORE the
+    // prefix strip: the quotes wrap the `b/` too.
+    let owned;
+    let p = match unquote_c_path(p) {
+        Some(decoded) => {
+            owned = decoded;
+            owned.as_str()
+        }
+        None => p,
+    };
+    // Only `b/` — the NEW side never carries `a/` in any dialect, and
+    // stripping it there mangled a `--no-prefix` path under a top-level
+    // directory literally named `a` (#2310 fix-loop, review).
+    let p = p.strip_prefix("b/").unwrap_or(p);
     if p.is_empty() || p == "/dev/null" {
         None
     } else {
         Some(p.to_string())
     }
+}
+
+/// Decode one C-quoted path (`"a\303\251b"`), or `None` when `s` is not a
+/// complete `"`-wrapped value — an unterminated quote is left ALONE
+/// rather than half-decoded (#2310 fix-loop R4). Handles the escapes git
+/// emits: three-digit octal bytes (assembled and validated as UTF-8),
+/// `\\`, `\"`, and the `\a \b \f \n \r \t \v` set.
+fn unquote_c_path(s: &str) -> Option<String> {
+    let inner = s.strip_prefix('"')?.strip_suffix('"')?;
+    let b = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'\\' || i + 1 >= b.len() {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        let c = b[i + 1];
+        if c.is_ascii_digit() && c < b'8' {
+            let mut v: u32 = 0;
+            let mut n = 0usize;
+            while n < 3 {
+                match b.get(i + 1 + n) {
+                    Some(d) if d.is_ascii_digit() && *d < b'8' => {
+                        v = v * 8 + u32::from(d - b'0');
+                        n += 1;
+                    }
+                    _ => break,
+                }
+            }
+            // A three-digit octal escape can name 0o400..=0o777, which is
+            // not a byte — git never emits one, so refuse the whole path
+            // rather than truncate it into a different file's name.
+            out.push(u8::try_from(v).ok()?);
+            i += 1 + n;
+            continue;
+        }
+        out.push(match c {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 0x0b,
+            other => other,
+        });
+        i += 2;
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Parse `@@ -a[,b] +c[,d] @@...` and return `(a, c)` — the OLD-file and
@@ -284,17 +414,21 @@ mod tests {
         assert!(files.is_empty());
     }
 
+    /// (#2310 fix-loop R2) The fixture carries its `--- ` half now. It
+    /// used to be `+++ b/a.ts` twice with no `--- ` line — a shape no
+    /// tool emits, and one that only passed by accident once header
+    /// detection became positional: the second `+++` landed INSIDE the
+    /// open hunk as content, and the following `@@` opened hunk two
+    /// anyway, so the count assertion held while testing nothing. Pinned
+    /// per-hunk content now so it cannot pass that way again.
     #[test]
     fn multiple_hunks_same_file_collect_under_one_entry() {
-        let diff = "+++ b/a.ts\n\
-@@ -1,1 +1,1 @@\n\
-+x\n\
-+++ b/a.ts\n\
-@@ -10,1 +10,1 @@\n\
-+y\n";
-        let files = parse_diff(diff);
+        let diff = ["--- a/a.ts", "+++ b/a.ts", "@@ -1,1 +1,1 @@", "+x", "--- a/a.ts", "+++ b/a.ts", "@@ -10,1 +10,1 @@", "+y", ""].join("\n");
+        let files = parse_diff(&diff);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1.len(), 2);
+        assert_eq!(files[0].1[0].added, vec!["x"]);
+        assert_eq!(files[0].1[1].added, vec!["y"]);
     }
 
     /// (#2310 fix-loop B1, S3-1 — PROVEN live) The parser used to bind a
@@ -362,6 +496,120 @@ mod tests {
             let diff = format!("{header}\n@@ -1,2 +0,0 @@\n-gone\n-gone2\n");
             assert!(parse_diff(&diff).is_empty(), "{header}");
         }
+    }
+
+    /// (#2310 fix-loop R2 — review regression) Widening `+++ b/` to
+    /// `+++ ` made `+++ ` a header ANYWHERE, including inside a hunk
+    /// body. A raw `+++ foo` line there is an ADDED line whose content is
+    /// `++ foo` — treating it as a header truncated the hunk at that
+    /// point, dropped every later line, and rebound the path to a phantom
+    /// file. For a model-authored kit that means the suggestion anchors
+    /// and replaces a SHORTER span than the operator's code.
+    #[test]
+    fn a_plus_plus_plus_line_inside_a_hunk_is_content_not_a_header() {
+        let diff = ["+++ b/x.ts", "@@ -1,3 +1,4 @@", " a", "+++ foo", " b", "+z", ""].join("\n");
+        let files = parse_diff(&diff);
+        assert_eq!(files.len(), 1, "no phantom second file: {files:?}");
+        assert_eq!(files[0].0, "x.ts");
+        assert_eq!(files[0].1.len(), 1, "the hunk is not truncated: {:?}", files[0].1);
+        let h = &files[0].1[0];
+        assert_eq!(h.new_lines, [1, 2, 3, 4].into_iter().collect::<BTreeSet<u32>>());
+        assert_eq!(h.added_line_numbers, [2, 4].into_iter().collect::<BTreeSet<u32>>());
+        assert_eq!(h.added, vec!["++ foo", "z"]);
+    }
+
+    /// (#2310 fix-loop R2) The half-headered concatenation shape — one
+    /// `+++ <path>` / `@@` block per file, `--- ` halves omitted — is what
+    /// this repo's own bundler fixtures use and what a tool emitting only
+    /// the new side produces. Every file must bind, not just the first:
+    /// under a `--- `-pair-only rule the second `+++` landed inside the
+    /// first file's open hunk as content and the diff collapsed to ONE
+    /// file. Recognized by the third positional signal (the next line is
+    /// a hunk header), which is already a hunk boundary either way.
+    #[test]
+    fn a_half_headered_concatenation_binds_every_file_not_just_the_first() {
+        let diff = ["+++ b/a.ts", "@@ -1,1 +1,1 @@", "+x", "+++ b/b.ts", "@@ -1,1 +1,1 @@", "+y", ""].join("\n");
+        let files = parse_diff(&diff);
+        assert_eq!(files.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["a.ts", "b.ts"]);
+        assert_eq!(files[0].1[0].added, vec!["x"]);
+        assert_eq!(files[1].1[0].added, vec!["y"]);
+    }
+
+    /// (#2310 fix-loop R3 — review regression) The in-hunk guards
+    /// `!ln.starts_with("+++")` / `!ln.starts_with("---")` DROPPED an
+    /// added line whose content begins with `++` and a removed line whose
+    /// content begins with `--`. A dropped added line fails to advance
+    /// `new_ln`, which shifts every later line in the hunk — the exact
+    /// class B2 fixed for blank lines. Header detection is positional
+    /// now (a `--- `/`+++ ` pair, or `+++ ` with no hunk open), so the
+    /// content guards are gone.
+    #[test]
+    fn added_and_removed_lines_whose_content_starts_with_a_marker_are_kept() {
+        let diff = ["--- a/x.ts", "+++ b/x.ts", "@@ -1,3 +1,3 @@", " a", "++++ b/evil.ts", "---foo", " b", "+z", ""].join("\n");
+        let files = parse_diff(&diff);
+        assert_eq!(files.len(), 1, "{files:?}");
+        let h = &files[0].1[0];
+        assert_eq!(h.added, vec!["+++ b/evil.ts", "z"], "the `++++` line is an ADDED line with content `+++ b/evil.ts`");
+        assert_eq!(h.removed, vec!["--foo"], "the `---foo` line is a REMOVED line with content `--foo`");
+        // a(1), +++ b/evil.ts(2), b(3), z(4) — the removed line consumes
+        // no new-side number.
+        assert_eq!(h.new_lines, [1, 2, 3, 4].into_iter().collect::<BTreeSet<u32>>());
+        assert_eq!(h.added_line_numbers, [2, 4].into_iter().collect::<BTreeSet<u32>>());
+    }
+
+    /// (#2310 fix-loop R4 — review regression) With `core.quotepath` (git's
+    /// DEFAULT), a path with a non-ASCII byte, a control character, a `"`
+    /// or a `\` is emitted C-quoted with octal byte escapes. Binding the
+    /// path WITH its quotes and escapes means no finding ever matches it,
+    /// and — since the file DID parse — the zero-files guard never fires
+    /// either: a silently empty review.
+    #[test]
+    fn a_c_quoted_path_is_unquoted_and_octal_decoded() {
+        let diff = ["--- \"a/src/caf\\303\\251.ts\"", "+++ \"b/src/caf\\303\\251.ts\"", "@@ -1,1 +1,1 @@", "-x", "+y", ""].join("\n");
+        let files = parse_diff(&diff);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].0, "src/caf\u{e9}.ts", "quotes stripped, \\303\\251 decoded to one UTF-8 char");
+    }
+
+    /// (#2310 fix-loop R4) The other C escapes git emits, and the `"`
+    /// wrapper that is NOT a quoted path (a real file whose name starts
+    /// with a quote is itself quoted, so a bare unterminated `"` is left
+    /// alone rather than half-decoded).
+    #[test]
+    fn c_quoting_decodes_backslash_quote_and_tab_and_leaves_unquoted_paths_alone() {
+        let cases = [
+            ("+++ \"b/a\\\\b.ts\"", "a\\b.ts"),
+            ("+++ \"b/a\\\"b.ts\"", "a\"b.ts"),
+            ("+++ \"b/a\\tb.ts\"", "a\tb.ts"),
+            ("+++ b/plain.ts", "plain.ts"),
+            ("+++ \"b/unterminated.ts", "\"b/unterminated.ts"),
+        ];
+        for (header, want) in cases {
+            let diff = format!("{header}\n@@ -1,1 +1,1 @@\n+y\n");
+            let files = parse_diff(&diff);
+            assert_eq!(files.len(), 1, "{header}: {files:?}");
+            assert_eq!(files[0].0, want, "{header}");
+        }
+    }
+
+    /// (#2310 fix-loop, review) No dialect emits `a/` on the `+++` side —
+    /// stripping it there mangled a `--no-prefix` path under a top-level
+    /// directory literally named `a`.
+    #[test]
+    fn an_a_slash_prefix_on_the_plus_side_is_a_real_directory_not_a_dialect() {
+        let diff = ["--- a/mod.ts", "+++ a/mod.ts", "@@ -1,1 +1,1 @@", "+y", ""].join("\n");
+        assert_eq!(parse_diff(&diff)[0].0, "a/mod.ts", "`a/` on the NEW side is a directory named `a`");
+    }
+
+    /// (#2310 fix-loop R1 — review regression) A delete-only patch binds
+    /// `/dev/null` on the NEW side and therefore yields no files. That is
+    /// CORRECT and must stay cheap to distinguish from an unreadable
+    /// diff: the caller decides what to do about it (see `plan.rs`'s
+    /// header-presence guard), the parser just reports the truth.
+    #[test]
+    fn a_delete_only_patch_yields_no_files_but_keeps_its_diff_git_header() {
+        let diff = ["diff --git a/gone.ts b/gone.ts", "deleted file mode 100644", "index 1234567..0000000", "--- a/gone.ts", "+++ /dev/null", "@@ -1,2 +0,0 @@", "-one", "-two", ""].join("\n");
+        assert!(parse_diff(&diff).is_empty(), "the NEW side is /dev/null");
     }
 
     /// (#2310 fix-loop B2, S3-3) A truly empty line inside a hunk body is
