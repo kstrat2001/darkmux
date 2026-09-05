@@ -8345,7 +8345,7 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 32 static checks via run() (#1405 removed the 4 openclaw-gated
+        // 55 static checks via run() (#1405 removed the 4 openclaw-gated
         // checks; #1426 removed recommendation-drift +
         // recommended-profile-not-shadowed with the retired recommendations
         // family; #1758 removed orchestrator-declared, a write-only field's

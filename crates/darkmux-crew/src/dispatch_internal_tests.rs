@@ -40,9 +40,7 @@
                 emitted.push((at_ms, rec.payload.expect("machine.telemetry always carries a payload")));
             }
         }
-        // Ticks 0, 5000(->10000 rounds to the 3rd tick=6000? let's just
-        // assert against `telemetry_emission_due`'s own contract directly):
-        // due at at_ms=0 (first, always), then next due once
+        // Due at at_ms=0 (first, always), then next due once
         // at_ms - last_emit_at_ms >= 5000 -> at_ms=6000 (gap=6000),
         // then next due at_ms - 6000 >= 5000 -> at_ms=12000 (gap=6000),
         // then at_ms=18000 (gap=6000). Ticks: 0, 6000, 12000, 18000 = 4.

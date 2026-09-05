@@ -863,15 +863,20 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.42.0";
 //           `mission_id`, and `phase_id` are ALWAYS absent on a
 //           `machine.telemetry` record written at this version — a reader
 //           joins it to a run by `machine_uid` + a time window instead of
-//           by session. The payload gains `interval_ms`: the MEASURED gap
-//           since the PREVIOUS emission (round 3 MF2 — not the configured
+//           by session. The payload gains `interval_ms`, and there is
+//           exactly ONE rule for it, followed identically by BOTH
+//           producers (the daemon's `host_sampler.rs` and a dispatch-
+//           owned sampler in `dispatch_internal.rs`, round 3 MF2 / round
+//           4 MF1): the MEASURED gap since that producer's OWN previous
+//           emission (`at_ms - last_emit_at_ms`) — not the configured
 //           knob stamped verbatim, which drifted from reality whenever a
-//           tick ran late), except the very first emission on a fresh
-//           sampler, which has no prior gap to measure and stamps the
-//           configured `runtime.host_sampler_interval_ms` (10x that while
-//           idle — the daemon sampler only; a dispatch-owned sampler is
-//           definitionally live and always targets the base cadence).
-//           Every other payload key
+//           tick ran late. The exception, identical on both producers: the
+//           very FIRST emission of a fresh sampler has no prior gap to
+//           measure, so it stamps the configured
+//           `runtime.host_sampler_interval_ms` for whatever multiplier is
+//           in effect at that tick (10x while idle — the daemon sampler
+//           only; a dispatch-owned sampler is definitionally live and
+//           always targets the base cadence at 1x). Every other payload key
 //           (`sampled_at_ms`, `sampler_cost_ms`, `cpu_pct`, `mem_pct`,
 //           `gpu_pct`, `thermal`, `power_mw`, etc.) is UNCHANGED —
 //           `host_probe::sample_full_json`'s shape. A reader keyed to the

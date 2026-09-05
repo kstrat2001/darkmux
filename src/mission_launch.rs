@@ -1126,8 +1126,8 @@ pub fn launch(
     // construction left.
     //
     // (#2413 round 2 M3) This function used to ALSO construct a per-run
-    // `HostTelemetrySampler` right here, draining it into `telemetry.
-    // process` records at every emission point below. That construction
+    // `HostTelemetrySampler` right here, draining it into `telemetry.process`
+    // records at every emission point below. That construction
     // is deleted: host cpu/ram/gpu samples now come from the ONE
     // machine-scoped sampler (`darkmux_crew::host_sampler_lock`,
     // `dispatch_internal.rs`'s always-on sampler thread, or `darkmux
@@ -1151,9 +1151,9 @@ pub fn launch(
     // calls `bookend.close(...)` explicitly with the real outcome; this is
     // strictly the backstop for the unexpected case.
     //
-    // (#2413 round 2 M3, correcting round 3 MF3) The paragraph that used
-    // to sit here named a gap in a per-run telemetry drain this function
-    // no longer has: `on_abort` builds exactly one record and had no way
+    // (#2413 M3) The paragraph that used to sit here named a gap in a
+    // per-run telemetry drain this function no longer has: `on_abort`
+    // builds exactly one record and had no way
     // to also flush a `HostTelemetrySampler`'s buffered samples on the
     // panic/early-return backstop path. That sampler construction is
     // deleted (#2413 M3) — host samples come from the machine-scoped

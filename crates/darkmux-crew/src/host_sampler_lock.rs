@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn mf1_a_dispatch_first_attempt_against_a_daemon_held_fresh_lock_writes_no_contention_marker() {
+    fn mf1_a_dispatch_first_attempt_against_a_daemon_held_fresh_lock_is_declined() {
         // (#2413 round 3 MF1) A decline by the DESIGNED holder (a daemon
         // steadily emitting) is the correct, healthy steady state — not
         // contention. Before this fix, the dispatch's very FIRST acquire
@@ -421,29 +421,24 @@ mod tests {
         // `try_acquire`, so every dispatch start under a running daemon
         // wrote a contention marker and `darkmux doctor` warned "two live
         // pids" for the next 3x interval, reading a healthy install as
-        // faulty. `try_acquire` no longer records contention at all — the
-        // channel is retired, per this issue's own "or retire the
-        // channel" option — so the marker file must never appear.
+        // faulty. `try_acquire` no longer records contention AT ALL — the
+        // whole channel is deleted (round 4 cosmetic: this test used to
+        // also assert the marker file never appears, but nothing in this
+        // module can write that file any more, so that assertion tested
+        // a mechanism that no longer exists) — this just pins the decline.
+        // `check_host_sampler_a_declined_dispatch_first_attempt_against_a_
+        // daemon_held_lock_is_pass` (`darkmux-doctor`) pins the Pass side.
         with_isolated_home(|| {
             let daemon_guard = try_acquire("daemon", 5000).expect("daemon acquires first");
             let dispatch_pid = std::process::id().wrapping_add(1);
             let declined = try_acquire_as_for_test(dispatch_pid, "dispatch", 5000);
             assert!(declined.is_none(), "a fresh daemon-held lock is not stealable by a live dispatch");
-            let contention_marker = lock_path().with_file_name("host-sampler.contention.json");
-            assert!(
-                !contention_marker.exists(),
-                "the contention channel is retired — a routine decline must never write it"
-            );
             drop(daemon_guard);
         });
     }
 
     #[test]
-    fn a_second_acquire_against_a_fresh_lock_is_declined_and_writes_no_contention_marker() {
-        // (#2413 round 3 MF1) The contention channel is retired — see
-        // `mf1_a_dispatch_first_attempt_against_a_daemon_held_fresh_lock_
-        // writes_no_contention_marker` for the full rationale. This test
-        // now just pins that a decline stays a plain `None`, nothing more.
+    fn a_second_acquire_against_a_fresh_lock_is_declined() {
         with_isolated_home(|| {
             let guard = try_acquire("daemon", 5000).expect("first acquire succeeds");
             // Simulate a SECOND process (distinct pid) attempting to
@@ -452,8 +447,6 @@ mod tests {
             let other_pid = std::process::id().wrapping_add(1);
             let second = try_acquire_as_for_test(other_pid, "dispatch", 5000);
             assert!(second.is_none(), "a fresh lock held by a different (alive) pid is not stealable");
-            let contention_marker = lock_path().with_file_name("host-sampler.contention.json");
-            assert!(!contention_marker.exists(), "the retired channel must never write this file");
             drop(guard);
         });
     }

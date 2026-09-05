@@ -369,6 +369,29 @@ fn thermal_edge(
 /// therefore carries no `cpu_pct` and no `power` — it is the one that seeds
 /// the deltas, and the drawer renders those two as "not measured" for that
 /// one tick.
+/// (#2413 round 4 MF1) The `interval_ms` value to stamp on THIS
+/// `machine.telemetry` emission — one rule, shared with `dispatch_
+/// internal.rs`'s `maybe_build_machine_telemetry_record`: the MEASURED
+/// gap since the previous emission (`at_ms - last_emit_at_ms`), or, on
+/// the very first emission (no prior gap to measure), the configured
+/// cadence for whatever live/idle multiplier is in effect at that tick
+/// (`interval_ms * emit_every_n_ticks`). Pure and extracted specifically
+/// so this can be unit-tested with fake timestamps — a real-thread test
+/// driving the actual sampler can't reliably distinguish "measured" from
+/// "configured" in the common case, since a healthy real clock makes the
+/// two numbers land in the same neighborhood anyway.
+fn machine_telemetry_effective_interval_ms(
+    last_emit_at_ms: Option<u64>,
+    at_ms: u64,
+    interval_ms: u64,
+    emit_every_n_ticks: u64,
+) -> u64 {
+    match last_emit_at_ms {
+        Some(last) => at_ms.saturating_sub(last),
+        None => interval_ms.saturating_mul(emit_every_n_ticks),
+    }
+}
+
 pub(crate) fn spawn(
     interval_ms: u64,
     ring: HostSamplerRing,
@@ -411,6 +434,15 @@ pub(crate) fn spawn(
         // it gates, same as the steady-state case.
         let mut cached_live =
             crate::runs::any_dispatch_live_locally(darkmux_crew::host_probe::epoch_ms_now(), crate::runs::stale_after_ms());
+        // (#2413 round 4 MF1) One rule for `interval_ms` on both host-sample
+        // producers (this daemon sampler and the dispatch-owned one in
+        // `dispatch_internal.rs`): the MEASURED gap since the previous
+        // emission, not the configured cadence stamped verbatim. `None`
+        // before the first emission — that one has no prior gap to
+        // measure, so it stamps the configured cadence for the tick it
+        // lands on instead (`interval_ms * emit_every_n_ticks`, matching
+        // whatever live/idle multiplier was in effect at that moment).
+        let mut last_emit_at_ms: Option<u64> = None;
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 break;
@@ -467,7 +499,15 @@ pub(crate) fn spawn(
                         let probe_start = Instant::now();
                         cached_live = crate::runs::any_dispatch_live_locally(at_ms, crate::runs::stale_after_ms());
                         let liveness_probe_ms = probe_start.elapsed().as_millis() as u64;
-                        let effective_interval_ms = interval_ms.saturating_mul(emit_every_n_ticks);
+                        // (#2413 round 4 MF1) Measured gap since the LAST
+                        // emission, not the knob times the multiplier — a
+                        // tick that ran late (a slow probe, a paused
+                        // thread) reports what actually happened, same
+                        // rule `dispatch_internal.rs`'s dispatch-owned
+                        // sampler already follows.
+                        let effective_interval_ms =
+                            machine_telemetry_effective_interval_ms(last_emit_at_ms, at_ms, interval_ms, emit_every_n_ticks);
+                        last_emit_at_ms = Some(at_ms);
                         let mut rec = darkmux_crew::host_probe::build_machine_scoped_telemetry_record(
                             &sample,
                             at_ms,
@@ -728,6 +768,23 @@ mod tests {
     /// Poll `flows_dir/<today>.jsonl` until a `machine.telemetry` record
     /// appears (bounded), returning it as raw JSON. Panics past the
     /// deadline — every caller expects one to land.
+    // ─── (#2413 round 4 MF1) machine_telemetry_effective_interval_ms — the real pin ─
+
+    #[test]
+    fn machine_telemetry_effective_interval_ms_first_emission_stamps_the_configured_cadence() {
+        assert_eq!(machine_telemetry_effective_interval_ms(None, 12345, 5000, 1), 5000);
+        assert_eq!(machine_telemetry_effective_interval_ms(None, 12345, 5000, 10), 50_000, "idle multiplier applies");
+    }
+
+    #[test]
+    fn machine_telemetry_effective_interval_ms_later_emissions_stamp_the_measured_gap() {
+        // A tick that ran LATE (an 8s gap against a 500ms knob) must
+        // report the real 8s, not the configured 500ms it would report if
+        // this had regressed back to stamping the knob verbatim.
+        assert_eq!(machine_telemetry_effective_interval_ms(Some(1_000), 9_000, 500, 1), 8_000);
+        assert_eq!(machine_telemetry_effective_interval_ms(Some(1_000), 9_000, 500, 10), 8_000, "knob ignored once a prior emission exists");
+    }
+
     fn wait_for_machine_telemetry_record(flows_dir: &std::path::Path, deadline: Duration) -> serde_json::Value {
         let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
         let start = Instant::now();
@@ -743,6 +800,42 @@ mod tests {
             }
             if start.elapsed() > deadline {
                 panic!("no machine.telemetry record landed in {} within {deadline:?}", day_path.display());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// (#2413 round 4 MF1) Same idea as [`wait_for_machine_telemetry_record`]
+    /// but collects at least `n` of them — needed to assert the FIRST
+    /// emission stamps the configured cadence while the SECOND+ stamps the
+    /// measured gap since the previous one.
+    fn wait_for_n_machine_telemetry_records(
+        flows_dir: &std::path::Path,
+        n: usize,
+        deadline: Duration,
+    ) -> Vec<serde_json::Value> {
+        let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
+        let start = Instant::now();
+        loop {
+            let mut found = Vec::new();
+            if let Ok(text) = std::fs::read_to_string(&day_path) {
+                for line in text.lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        if v.get("action").and_then(|a| a.as_str()) == Some("machine.telemetry") {
+                            found.push(v);
+                        }
+                    }
+                }
+            }
+            if found.len() >= n {
+                return found;
+            }
+            if start.elapsed() > deadline {
+                panic!(
+                    "only {} of {n} machine.telemetry records landed in {} within {deadline:?}",
+                    found.len(),
+                    day_path.display()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -783,15 +876,27 @@ mod tests {
     fn spawn_emits_at_10x_the_base_interval_while_idle() {
         with_isolated_env(|flows_dir| {
             // Nothing live on this machine — `any_dispatch_live_locally`
-            // must read false, so the FIRST emitted record's `interval_ms`
-            // is 10x the base 50ms cadence passed to `spawn`.
+            // must read false, so emissions land at 10x the base 50ms
+            // cadence (every ~500ms). (#2413 round 4 MF1) The FIRST
+            // emission has no prior emission to measure a gap against, so
+            // it stamps the CONFIGURED cadence (500 = 50 * 10x); the
+            // SECOND stamps the MEASURED gap since the first — which,
+            // running for real on a real clock, lands close to but not
+            // necessarily bit-identical to 500, so this asserts it's in a
+            // generous neighborhood rather than exact-equal (a flaky
+            // scheduler pause must not fail this test).
             let ring = HostSamplerRing::new();
             let stop = Arc::new(AtomicBool::new(false));
             let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
-            let rec = wait_for_machine_telemetry_record(flows_dir, Duration::from_secs(10));
+            let recs = wait_for_n_machine_telemetry_records(flows_dir, 2, Duration::from_secs(10));
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
-            assert_eq!(rec["payload"]["interval_ms"], 500, "idle: 10x the 50ms base interval");
+            assert_eq!(recs[0]["payload"]["interval_ms"], 500, "first emission stamps the configured 10x cadence");
+            let second = recs[1]["payload"]["interval_ms"].as_u64().expect("interval_ms is a number");
+            assert!(
+                (400..=2000).contains(&second),
+                "second emission must stamp the MEASURED gap, in the neighborhood of 500ms: got {second}"
+            );
         });
     }
 
@@ -819,10 +924,19 @@ mod tests {
             let ring = HostSamplerRing::new();
             let stop = Arc::new(AtomicBool::new(false));
             let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
-            let rec = wait_for_machine_telemetry_record(flows_dir, Duration::from_secs(10));
+            // (#2413 round 4 MF1) First emission stamps the CONFIGURED 1x
+            // cadence (no prior gap to measure); the second stamps the
+            // MEASURED gap, which on a real clock lands close to but not
+            // necessarily bit-identical to 50ms.
+            let recs = wait_for_n_machine_telemetry_records(flows_dir, 2, Duration::from_secs(10));
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
-            assert_eq!(rec["payload"]["interval_ms"], 50, "live: 1x the base interval, no idle backoff");
+            assert_eq!(recs[0]["payload"]["interval_ms"], 50, "first emission stamps the configured 1x cadence");
+            let second = recs[1]["payload"]["interval_ms"].as_u64().expect("interval_ms is a number");
+            assert!(
+                (20..=500).contains(&second),
+                "second emission must stamp the MEASURED gap, in the neighborhood of 50ms: got {second}"
+            );
         });
     }
 
