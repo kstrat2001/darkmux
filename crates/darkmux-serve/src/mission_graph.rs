@@ -167,12 +167,15 @@ pub struct StepRow {
     pub local_ok: Option<bool>,
     /// (#1481) The resolved model this step's dispatch ran against, read from
     /// the persisted `Step.config` (`model`, else `model_key`). A
-    /// `dispatch.map` seat stamps its launch-resolved model here — the
-    /// `review-probe-*`/`review-judge`/`review-verify` seats via
-    /// `build_review_graph`'s per-role role→profile→model rollup (#1475) — so
-    /// the page can render WHICH model staffed a seat directly on its card
+    /// `dispatch.map` seat stamps its launch-resolved model here, so the
+    /// page can render WHICH model staffed a seat directly on its card
     /// (the graph payload otherwise carried no model at all, forcing a full
-    /// re-navigate to the run view). `None` when the step config declares no
+    /// re-navigate to the run view). Historical records from the retired
+    /// review funnel (`review-probe-*`/`review-judge`/`review-verify`,
+    /// minted by the since-deleted `build_review_graph`'s per-role
+    /// role→profile→model rollup, #1475) still carry this field, so the
+    /// viewer renders those old runs the same way. `None` when the step
+    /// config declares no
     /// model: a procedural step (bundle/dedup), a not-yet-materialized
     /// synthesized step (unresolved template config), or a Tier 3 kind
     /// (`mission.coder`) whose model resolves at dispatch time and isn't

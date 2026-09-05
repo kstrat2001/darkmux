@@ -585,10 +585,16 @@ pub struct FleetConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteConfig {
     /// Max remote `total_tokens` one pipeline stage may spend (default
-    /// 500000). When a stage exhausts it, that stage's remaining remote
-    /// calls stop with the reason named in the run's envelope: a
-    /// load-bearing stage (judge/verify) exhausting is an honest degraded
-    /// run; probe exhaustion is a reduced-coverage warning.
+    /// 500000) — e.g. an endpoint-staffed `crawl.unit` seat, or `review`'s
+    /// own `create-mod-dispatch` seat. When a stage exhausts it, that
+    /// stage's remaining remote calls stop with the reason named in the
+    /// run's envelope. A group of `dispatch.map` steps that name the same
+    /// `bucket_group` share ONE allowance between them (#1442) — the
+    /// scheduler hands every sibling in the group the same shared bucket,
+    /// so a fan-out never multiplies the stage ceiling by the step count;
+    /// a `dispatch.map` step naming no group gets its own step-scoped
+    /// allowance. See `docs/ENVIRONMENT.md`'s entry for this field's env
+    /// override for the full per-stage degradation semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens_per_execution: Option<u64>,
     /// (#1230 Packet 1) Max CONCURRENT remote (hosted-endpoint) dispatches
     /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once — remote

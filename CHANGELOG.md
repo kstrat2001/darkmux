@@ -12,6 +12,37 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [Unreleased]
+
+### Changed
+
+- **`review` is now the former `review-v2` pipeline** ([#2310](https://github.com/kstrat2001/darkmux/issues/2310) P4d) —
+  the generic launch path (plan → review → summarize → create-mods →
+  deliver), built on the shared mission building blocks. The `review-v2`
+  config id is gone; `review` is the only `review` now.
+- Fork-PR heads resolve via a one-shot miss-recovery fetch (an explicit
+  `git fetch` argument, not a standing refspec); the mirror's own fetch
+  refspec stays heads+tags only, so an ordinary fetch never re-downloads
+  the whole pull-heads namespace.
+- `CONFIG_SCHEMA_VERSION` 1.21 → 1.22: the `review{}` config block
+  (`judge_concurrency`, `judge_fail_on_any_skip`) is removed. Old keys are
+  read leniently; `darkmux doctor` warns on them.
+- `mode`/`envelope_out` are accepted on `review` for CLI-surface parity
+  with the retired funnel launcher but IGNORED, with a warning when
+  supplied.
+
+### Removed
+
+- The old review funnel (bundle → probe → dedup → judge → verify →
+  synthesis) and its ten Tier-3 `review.*` step kinds are deleted.
+  Historical run records that used them still render in the viewer.
+- `review`'s `bundler` and `pr` inputs.
+- The `docs/guide/bundlers.html` guide page. `--bundler` survives only on
+  `lab eval` / `lab review-bench`.
+- `darkmux-review.yml` no longer builds `darkmux-bundler-rust`.
+
+[Unreleased]: https://github.com/kstrat2001/darkmux/compare/v3.6.0...HEAD
+
 ## [3.6.0] - 2026-09-04
 
 The crawl is a mission, and its output is records you can pick up.

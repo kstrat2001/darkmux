@@ -10,10 +10,6 @@
 //! and decides — per the operator-ratified design — how an invoked command
 //! should run:
 //!
-//! - A config whose graph structurally uses a review-pipeline step kind
-//!   `src/mission_launch.rs::launch` uses, never an `id == "review"`
-//!   string literal) keeps `acp.rs`'s EXISTING bespoke path (`run_review`)
-//!   unchanged — this module never touches it beyond routing to it.
 //! - A config whose graph contains ZERO model-dispatching steps (every
 //!   step kind is `procedural.*`) runs EPHEMERAL: [`run_ephemeral`]
 //!   interprets the config's graph and drives it through
@@ -25,8 +21,14 @@
 //!   correlation id (see `run_ephemeral`'s doc) so concurrent runs of the
 //!   same config don't collide in the viewer.
 //! - Anything else (at least one model-seated step) launches as a normal
-//!   `darkmux mission launch <id>` subprocess — a full instance, same
-//!   pattern `acp.rs` already uses for `review`'s own subprocess spawn.
+//!   `darkmux mission launch <id>` subprocess through `acp.rs`'s generic
+//!   `run_launch_command`. A panel invocation types no params, so a
+//!   config that declares a required `diff_file` input (`review` is the
+//!   only shipped one) needs its diff/workspace/`head_sha` params filled
+//!   from somewhere else: [`synthesize_diff_launch_inputs`] derives them
+//!   from the session's `cwd`. `run_launch_command` calls it directly;
+//!   `radio_cli.rs`'s headless launch path calls the same function for
+//!   the same reason.
 //!
 //! **Advertised id vs. document id.** A [`PanelCommand`]'s `id` is always
 //! the REGISTRY-RESOLVABLE key (what `list_ids()`/`load()` key on — an

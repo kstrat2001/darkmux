@@ -123,12 +123,13 @@
 //!   collision-proof across very different diffs that happen to hash the
 //!   same 8 hex chars (astronomically unlikely; not worth guarding for a
 //!   spike).
-//! - Bundler routing is extension-sniffing on the diff ([`choose_bundler`]):
-//!   TypeScript present → the built-in bundler; else `.edge` present → the
-//!   operator's `darkmux-bundler-edge` plugin (absolute-path resolved from
-//!   `~/.local/bin` because Zed's GUI env may not carry it on PATH). A
-//!   mixed ts+edge diff takes the TS path and skips the templates; real
-//!   bundler composition/config is follow-up work, not spike work.
+//! - (historical — the spike's bundler step is gone) Bundler routing used
+//!   to be extension-sniffing on the diff (`choose_bundler`): TypeScript
+//!   present → the built-in bundler; else `.edge` present → the
+//!   operator's `darkmux-bundler-edge` plugin. The shipped `review`
+//!   pipeline (plan → review → summarize → create-mods → deliver) takes
+//!   no bundler input at all; `--bundler` survives only on `lab eval` /
+//!   `lab review-bench`.
 //! - (#1684 remainder — RESOLVED) The review subprocess path's stderr-draining loop (since folded into `run_launch_command`) used
 //!   to forward every non-JSON, non-blank line straight into the chat as an
 //!   agent chunk — including darkmux-flow's own sink-init diagnostics

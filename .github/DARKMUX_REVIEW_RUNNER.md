@@ -23,9 +23,10 @@ gh workflow run darkmux-review.yml -f pr=<PR_NUMBER>
 (or the **Run workflow** button under Actions → *darkmux self-review*). The job
 reads the PR **diff** plus its **title and description** via the GitHub API —
 all data, never checked out or executed — and dispatches them to `darkmux
-mission launch review`, which drives the named crew's seats (a `review-probe` seat
-that argues the diff, then a `review-judge` seat that weighs the probes'
-findings) in the sandboxed, network-isolated internal runtime. The pipeline's
+mission launch review`, which plans each enabled rule against the diff
+(`plan.sites`) and dispatches one `crawl.unit` reviewer task per planned site,
+then gates and delivers any findings (`create-mods`/`deliver`) in the
+sandboxed, network-isolated internal runtime. The pipeline's
 own GitHub file source (used when a probe or the judge wants to see more of a
 changed file than the diff shows) also reads file contents via the API as
 data, never executed — same trust class as the diff. (The title + description
@@ -161,11 +162,13 @@ job or, in a future release, a remote-staffed seat.
 
 ```bash
 darkmux mission launch review \
-  --param worktree=<any local repo> \
-  --param diff_file=<small.diff> \
-  --param crew=review-deep \
-  --param mode=sequential
+  --param workspace=<workspace-spec.json naming any local repo> \
+  --param diff_file=<small.diff>
 ```
+
+`review.json` has no `crew`/`worktree`/dispatch-`mode` inputs — role staffing
+comes from `~/.darkmux/profiles.json`'s `role_profiles.reviewer` binding on
+this machine, not a launch param.
 
 No `--timeout` needed: when it is omitted, the review launcher defaults each
 single-shot call to 3600 seconds — the same per-call ceiling the retired

@@ -4129,17 +4129,26 @@ fn parse_major_minor(v: &str) -> Option<(u32, u32)> {
 ///   actionable problems — either one flips this check to `Warn` and names
 ///   the offending document(s).
 /// - **Unrecognized step-kind references** are checked ONLY against
-///   `StepKindRegistry::with_builtins()`'s four Tier 1 ids and are
-///   deliberately treated as INFORMATIONAL, never blocking: Tier 3 kinds
-///   (`review.*`, `mission.*`, #1352) register into their OWN per-mission
-///   registry at COMPOSITION time (`build_review_graph`,
-///   `default_phase_graph`), which this document-level check has no way
-///   to see. Both built-in configs shipped in this packet reference ONLY
-///   Tier 3 kinds, so an "unknown kind" hit is the EXPECTED steady state,
-///   not a sign anything is broken — surfaced in the message for
-///   visibility, but never flips the check's status on its own (a
-///   permanent Warn for an expected, unfixable-by-design condition would
-///   just teach operators to ignore this check).
+///   `StepKindRegistry::with_builtins()`'s five Tier 1 ids
+///   (`dispatch.internal`, `dispatch.map`, `dispatch.single_shot`,
+///   `procedural.noop`, `procedural.shell`) and are deliberately treated
+///   as INFORMATIONAL, never blocking: everything else registers into its
+///   OWN per-mission registry at COMPOSITION time
+///   (`src/mission_launch.rs::all_step_kinds`, which layers the coder-phase
+///   `mission.*` kinds, the crawl kinds, and `review.json`'s
+///   `records.gather`/`deliver.github_review`/`mods.gate` on top of the
+///   Tier 1 set), which this document-level check has no way to see. The
+///   three shipped configs mint a mix: `coder-phase.json` is pure `mission.*`;
+///   `crawl.json` mints `crawl.plan`/`crawl.summary`/`crawl.unit` alongside
+///   Tier 1 `dispatch.internal`; `review.json` mints `plan.sites`,
+///   `crawl.unit`, `crawl.summary`, `mods.gate`, `records.gather`, and
+///   `deliver.github_review` alongside Tier 1 `procedural.shell` and
+///   `dispatch.internal`. So an "unknown kind" hit on the non-Tier-1 ones
+///   is the EXPECTED steady state, not a sign anything is broken —
+///   surfaced in the message for visibility, but never flips the check's
+///   status on its own (a permanent Warn for an expected,
+///   unfixable-by-design condition would just teach operators to ignore
+///   this check).
 fn check_mission_config_registry() -> Check {
     use darkmux_crew::mission_config::{self, FindingSeverity};
     use darkmux_crew::step_kinds::StepKindRegistry;

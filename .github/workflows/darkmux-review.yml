@@ -199,13 +199,21 @@ jobs:
           # table. `--timeout` is the ONE exception: it stayed the generic
           # `mission launch` CLI flag every config-launched dispatch shares,
           # rather than becoming its own `--param`.
+          # `mode`/`envelope_out` are declared `ignored: true` by review.json
+          # (CLI-surface parity with the retired funnel launcher only) and
+          # passing either one just prints a warning every run — dropped
+          # here rather than carried forward for no effect. Nothing
+          # downstream reads `envelope_out`'s VALUE: the "Upload review
+          # envelope" step below names a fixed temp path, never populated
+          # either way since review.json's `deliver.github_review` writes
+          # only the rendered `{mode, review}` payload (`emit`), never a
+          # separate envelope file — that upload step no-ops on
+          # `if-no-files-found: ignore` regardless of this param.
           "$DARKMUX_BIN" mission launch review \
             --param "github=$REPO" \
             --param "head_sha=$HEAD_SHA" \
             --param "diff_file=$RUNNER_TEMP/qa/pr.diff" \
             --param "intent_file=$RUNNER_TEMP/qa/intent.txt" \
-            --param "mode=$MODE" \
-            --param "envelope_out=$RUNNER_TEMP/qa/envelope.json" \
             --param "emit=$RUNNER_TEMP/qa/rendered.json" \
             --timeout 3600 || true
 

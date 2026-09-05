@@ -470,8 +470,10 @@ fn collect_names(value: &Value, out: &mut BTreeSet<String>) {
 /// (#2384) Every DECLARED input that nothing in the document references and
 /// that the launcher does not consume itself — an inert knob. The operator
 /// passes `--param <name>=<value>`, the launch accepts it, and the run does
-/// something else with no hint that the knob was ignored (`review-v2.json`'s
-/// `review-probe-high`: every unit dispatched on profile `deep` regardless).
+/// something else with no hint that the knob was ignored (measured on
+/// `review.json` — then named `review-v2.json` — before the #2310 P4d
+/// funnel retirement: its since-deleted `review-probe-high` input, every
+/// unit dispatched on profile `deep` regardless).
 ///
 /// **Why `consumed_by_launcher` is a parameter and not derivable here.**
 /// darkmux has TWO consumption paths for a declared input: placeholder
@@ -510,10 +512,16 @@ pub fn unreferenced_inputs(config: &MissionConfig, consumed_by_launcher: &[&str]
 /// **Supplied-only, deliberately, and this is a narrowing of #2384's first
 /// option.** A blanket refusal on any inert declaration would be the
 /// stronger authoring gate, and it is what the issue asks for first — but
-/// measured at HEAD it refuses `mission launch review-v2` outright, because
-/// that document declares three inputs nothing consumes (`mode` and
-/// `envelope_out`, whose own descriptions say "not yet read by any step" /
-/// "Still NOT consumed", plus `review-probe-high`). Refusing a launch over a
+/// when this was measured (on `review-v2.json`, before `mode`/
+/// `envelope_out` picked up their own `ignored: true` and before the
+/// #2310 P4d retirement deleted the then-unreferenced `review-probe-high`
+/// input entirely) it refused `mission launch review-v2` outright over
+/// knobs the operator never touched. `review.json` today declares no such
+/// case — `mode`/`envelope_out` are `ignored: true` and so exempt by
+/// construction (see this function's own filter, above) — but the
+/// supplied-only design this measurement motivated stays the general
+/// rule for the next config that adds an inert input without marking it
+/// `ignored`. Refusing a launch over a
 /// knob the operator never touched trades one silent-wrong-run for a
 /// hard-blocked-run, so the refusal keys on the operator's own action — the
 /// issue's own "or at minimum warns loudly, pre-mint" covers the rest, which
@@ -906,11 +914,13 @@ mod tests {
     }
     // ─── (#2384) a declared input nothing references ──────────────────
 
-    /// The `review-v2.json` shape the issue measured: the document declares
-    /// `review-probe-high`, the description documents the override recipe,
-    /// and no step config carries `{{review-probe-high}}` — so the operator's
-    /// `--param review-probe-high=probe-4b` was accepted and every unit
-    /// dispatched on a different seat, silently.
+    /// The `review.json` shape the issue measured (back when the file was
+    /// named `review-v2.json` and still declared `review-probe-high`,
+    /// since deleted with the #2310 P4d funnel retirement): the document
+    /// declares an input, the description documents the override recipe,
+    /// and no step config carries the placeholder — so the operator's
+    /// `--param <name>=<value>` was accepted and every unit dispatched on
+    /// a different seat, silently.
     #[test]
     fn a_declared_input_no_step_references_is_refused_by_name() {
         let mut cfg = minimal_config(vec![PhaseConfig {
@@ -946,7 +956,9 @@ mod tests {
     }
 
     /// `ignored: true` IS the document saying "consumed by nothing, declared
-    /// for CLI-surface parity" — `review-v2.json`'s `bundler`. The launcher's
+    /// for CLI-surface parity" — `review.json`'s `mode`/`envelope_out`
+    /// today (`bundler` was the historical example before the #2310 P4d
+    /// funnel retirement removed that input entirely). The launcher's
     /// existing supplied-an-ignored-input warning is what covers it.
     #[test]
     fn an_ignored_input_no_step_references_is_clean() {
@@ -999,7 +1011,7 @@ mod tests {
     }
 
     /// A reference from inside a `grow.config` template counts — the grown
-    /// steps are real steps, and `review-v2.json`'s `unit-<rule>` tasks are
+    /// steps are real steps, and `review.json`'s `unit-<rule>` tasks are
     /// exactly this shape.
     #[test]
     fn a_reference_from_a_grow_template_counts_as_a_reference() {

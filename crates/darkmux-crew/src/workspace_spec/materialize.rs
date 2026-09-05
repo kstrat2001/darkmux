@@ -316,6 +316,13 @@ fn add_fetch_refspecs(mirror_path: &Path, source_id: &str, specs: &[&str]) -> Re
 /// PR it belongs to, so production always falls to the full pull-heads
 /// wildcard below — still a one-shot argument, so still leaves the config
 /// alone.
+///
+/// One consequence of that one-shot design: a PR head this function pulls
+/// in stays as a LIVE ref in the mirror afterward — the ordinary
+/// heads+tags fetch (whose standing refspec never grew) doesn't prune it,
+/// and doesn't re-fetch it either, since it was never that fetch's own
+/// refspec to begin with. It sits there until the next wildcard recovery
+/// runs and its `--prune` sweeps the whole pull-heads namespace again.
 fn fetch_pull_heads_once(mirror_path: &Path, source_id: &str, git_ref: &str) -> Result<()> {
     let refspec =
         if git_ref.starts_with("refs/") { format!("+{git_ref}:{git_ref}") } else { PULL_HEADS_REFSPEC.to_string() };

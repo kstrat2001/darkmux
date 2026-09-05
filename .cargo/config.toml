@@ -34,7 +34,7 @@
 # Flow records, sinks, the audit hash chain, schema, config access.
 t-flow = "nextest run -p darkmux-flow -p darkmux-types"
 
-# Review funnel, bundler, lab harness, crew scheduler + step kinds.
+# Review + crawl pipelines, lab harness, crew scheduler + step kinds.
 t-review = "nextest run -p darkmux-lab -p darkmux-crew"
 
 # The HTTP daemon and the bundled viewer.

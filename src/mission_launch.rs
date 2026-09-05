@@ -602,14 +602,14 @@ pub fn launch(
     }
 
     // (#2310 P4c-2 item 4) An input the document declares `"ignored":
-    // true` on (`review.json`'s `bundler`, accepted for CLI-surface
-    // parity with the frozen `review` config's launch line but never
-    // consumed by review's own planner) gets a named warning when the
-    // operator supplies it — STRUCTURAL, any config on any input, never
-    // keyed on a config id (replaces the old `config.id == "review"`
-    // special case). BEFORE the `--dry-run` short-circuit below so the
-    // signal is visible on the free path too, not only on a real (costly)
-    // launch.
+    // true` on (`review.json`'s `mode`/`envelope_out`, accepted for
+    // CLI-surface parity with the retired funnel launcher's own params
+    // but never consumed by review's own pipeline) gets a named warning
+    // when the operator supplies it — STRUCTURAL, any config on any
+    // input, never keyed on a config id (replaces the old
+    // `config.id == "review"` special case). BEFORE the `--dry-run`
+    // short-circuit below so the signal is visible on the free path too,
+    // not only on a real (costly) launch.
     for input in &config.inputs {
         if input.ignored == Some(true) && collected.contains_key(&input.name) {
             let reason = input.ignored_reason.as_deref().unwrap_or("it has no effect on this config");
@@ -659,12 +659,17 @@ pub fn launch(
 
     // (#2384) The OTHER direction: a DECLARED input that no step config
     // (including a `grow.config` template) references and that this
-    // launcher does not read itself. `review-v2.json`'s `review-probe-high`
-    // is the measured case — the operator passed
+    // launcher does not read itself. `review.json`'s `review-probe-high`
+    // was the originally measured case (back when the file was named
+    // `review-v2.json` and still ran the probe stage the #2310 P4d
+    // retirement later deleted) — the operator passed
     // `--param review-probe-high=probe-4b`, the launch accepted it, and
     // every `unit-<rule>` dispatch logged `via profile deep` with nothing
-    // saying the knob had done nothing. Refused BEFORE the `--dry-run`
-    // short-circuit and before any mint, beside the two checks above.
+    // saying the knob had done nothing. That specific input is gone along
+    // with the probe stage; the check itself is general-purpose and still
+    // guards any config against the same class of silently-ignored
+    // param. Refused BEFORE the `--dry-run` short-circuit and before any
+    // mint, beside the two checks above.
     //
     // Run against `config_as_declared` (the UNPRUNED document), never
     // `config`: pruning drops disabled tasks and rules this launch did not
