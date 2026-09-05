@@ -139,3 +139,59 @@ test('(U1-4) every playback transport control meets the 44px floor', async ({ pa
     expect(r.ok, `${sel}: resolved to ${r.hit}`).toBe(true);
   }
 });
+
+// (U1-3) The fleet activity lane's session bars were 2-18px wide `role=button`
+// targets on a phone. `.sbar` is absolutely positioned by percent inside its
+// lane's `.tltrack`, so a short session on a 24-hour window paints a sliver —
+// `min-width: 2px` was the only floor, and 2px is not a tap target.
+//
+// A SYNTHETIC lane rather than a sampled one: the assertion is about the
+// stylesheet's floor for a known set of widths, and whether the demo day
+// happens to contain a sub-minute session is not something this test should
+// depend on. The classes are the ones `FleetLens.tsx` renders
+// (`.lane` > `.tltrack` > `.sbar[data-arg=<sid>]`).
+//
+// The residual, named rather than hidden: bars in ONE lane are drawn in time
+// order and a later sibling paints over an earlier one, so two back-to-back
+// sub-minute sessions still overlap once both are widened. What the floor
+// guarantees is that every bar owns its own START — the point a finger aims
+// at — which is what the last assertion below measures.
+test.describe('(U1-3) fleet activity session bars', () => {
+  const SLIVER_MIN = 24;
+
+  async function mountLane(page, widthsPct) {
+    return page.evaluate(
+      ({ widths }) => {
+        document.querySelectorAll('#lanepobe').forEach((n) => n.remove());
+        const host = document.createElement('div');
+        host.id = 'lanepobe';
+        host.style.cssText = 'position:fixed;left:0;top:0;width:340px;z-index:99999;background:#000';
+        host.innerHTML =
+          '<div class="lane"><div class="lname">probe</div><div class="tltrack">' +
+          widths
+            .map((w, i) => `<div class="sbar done" data-act="session" data-arg="s${i}" role="button" style="left:${i * 22}%;width:${w}%"></div>`)
+            .join('') +
+          '</div></div>';
+        document.body.appendChild(host);
+        return [...host.querySelectorAll('.sbar')].map((b) => {
+          const r = b.getBoundingClientRect();
+          const own = document.elementFromPoint(r.left + 2, r.top + r.height / 2);
+          return { sid: b.dataset.arg, width: Math.round(r.width), ownsItsStart: own === b };
+        });
+      },
+      { widths: widthsPct },
+    );
+  }
+
+  test('a sub-minute session is still at least 24px of tappable bar, and owns its own start', async ({ page }) => {
+    await page.goto('/index.html#lens=fleet');
+    await page.waitForSelector('.app-shell');
+    // 0.5% of a 340px track is 1.7px — the shape of the finding.
+    const bars = await mountLane(page, [0.5, 1.5, 4, 0.5]);
+    expect(bars).toHaveLength(4);
+    for (const b of bars) {
+      expect(b.width, `bar ${b.sid} is ${b.width}px — untappable`).toBeGreaterThanOrEqual(SLIVER_MIN);
+      expect(b.ownsItsStart, `a tap at bar ${b.sid}'s own start must resolve to ${b.sid}`).toBe(true);
+    }
+  });
+});

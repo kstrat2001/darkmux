@@ -132,7 +132,12 @@ export interface SessionRunView {
    * summary line alone would pass against the very bug it is meant to
    * catch. */
   disclosures: Disclosure[];
-  metrics: Array<{ value: string; label: string }>;
+  /** (U3-6) `hint` is a SHORT label rendered by one CSS rule off
+   * `data-hint` (so it never enters `textContent` and
+   * `goldens/session-task-list.txt` stays byte-identical); `hintTitle` is the
+   * long form on hover. Present only where a tile's number is ambiguous
+   * against a number the operator can see on another surface. */
+  metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string }>;
   /** (#1973) Which metrics describe the MODEL's work and which describe the
    * HARNESS around it. `metrics` stays the flat, ordered list every existing
    * consumer reads; this is the grouping laid over it, by index.
@@ -591,18 +596,32 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // conditional (host tiles only exist when host telemetry does), and an
   // audit already flagged the hardcoded form as a positional contract nothing
   // enforced — this makes the two unable to drift because there is only one.
-  const metrics: Array<{ value: string; label: string }> = [];
+  const metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string }> = [];
   const modelIdx: number[] = [];
   const systemIdx: number[] = [];
-  const push = (into: number[], value: string, label: string) => {
+  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string) => {
     into.push(metrics.length);
-    metrics.push({ value, label });
+    metrics.push({ value, label, hint, hintTitle });
   };
   push(modelIdx, turnsValue != null ? String(turnsValue) : "—", "TURNS");
   push(modelIdx, tokIn != null ? fmtC(tokIn) : "—", "TOKENS IN");
   push(modelIdx, tokOut != null ? fmtC(tokOut) : "—", "TOKENS OUT");
   push(modelIdx, nctx ? `${(ctxHeadline / 1000).toFixed(0)}K` : "—", ctxLabel);
-  push(systemIdx, wall, "WALL CLOCK");
+  // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
+  // the model's work, and the gate — while this tile is the dispatch's own
+  // `wall_ms`, the runtime's measure of the execution alone. On a real
+  // mission the same step read 10:36 there and 10:07 here with nothing on
+  // either screen saying why. The flow record carries no step span (see
+  // `DispatchCompletePayload`: no step start/end field exists), so this side
+  // cannot show BOTH numbers — it can only stop being anonymous, which is
+  // what the label does. `StepRow.tsx` carries the matching half.
+  push(
+    systemIdx,
+    wall,
+    "WALL CLOCK",
+    "model time",
+    "model time — the runtime's own measure of this execution. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.",
+  );
   // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
   // and it is the reading contract 8 supports: the harness DECIDES to compact
   // and performs it through a UTILITY role's sub-execution. The specialist

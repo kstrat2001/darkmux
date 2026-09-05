@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { clkrange, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
+import { MISSING, clkrange, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
 
 // `memStateCls` was ported (format.ts) ahead of its first consumer; #1806
 // Stage 1, then Stage 2/3's `MachineHealthRegion.tsx`, is that consumer —
@@ -194,8 +194,30 @@ describe("fmtElapsed — the one duration formatter", () => {
     expect(fmtElapsed(3_600_000)).not.toBe(retired(3_600_000));
   });
 
-  it("never renders a negative or unparseable duration", () => {
+  it("never renders a negative duration", () => {
     expect(fmtElapsed(-5_000)).toBe("0:00");
-    expect(fmtElapsed(NaN)).toBe("0:00");
+  });
+
+  it("(C4) renders the missing-value dash for a duration it cannot compute, not a confident 0:00", () => {
+    // `NaN` is reachable in production: `sessionRun.ts`'s `runWallMs` falls
+    // back to `T(close.ts) - startTs`, and an unparsable `ts` subtracts to
+    // NaN. Rendering that as "0:00" asserts "this run took no time", which
+    // is a lie shaped like data — the same failure the rest of this lens
+    // uses "—" to avoid (TURNS, TOKENS IN and CTX all already do).
+    expect(fmtElapsed(NaN)).toBe(MISSING);
+    expect(fmtElapsed(Infinity)).toBe(MISSING);
+    expect(fmtElapsed(-Infinity)).toBe(MISSING);
+    // `0` is a real, computable duration and keeps reading as one.
+    expect(fmtElapsed(0)).toBe("0:00");
+  });
+
+  it("(C5) matches the retired fmtDuration across the WHOLE sub-hour range, not nine samples", () => {
+    // The nine-sample version could not have caught a rollover boundary it
+    // did not happen to name. This sweeps every 17ms — coprime with 1000
+    // and 60000, so it lands inside every second and every minute.
+    const retired = (ms: number) => Math.floor(ms / 60000) + ":" + String(Math.floor(ms / 1000) % 60).padStart(2, "0");
+    for (let ms = 0; ms < 3_600_000; ms += 17) {
+      if (fmtElapsed(ms) !== retired(ms)) throw new Error(`fmtElapsed(${ms}) = ${fmtElapsed(ms)}, retired = ${retired(ms)}`);
+    }
   });
 });

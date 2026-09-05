@@ -250,7 +250,7 @@ describe("MissionGraphLens", () => {
     await waitFor(() => expect(lastEventsCall(onEvents)?.[0]).toHaveLength(2));
   });
 
-  it("a daemon-less static build with NO published graph fixture shows an honest 'needs a daemon' notice, never attempts a fetch", () => {
+  it("a daemon-less static build with NO published graph fixture shows an honest 'needs a daemon' notice, and asks a DAEMON for nothing", () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-flow-src";
     meta.content = "./demo-flow.jsonl";
@@ -259,7 +259,15 @@ describe("MissionGraphLens", () => {
     vi.stubGlobal("fetch", fetchMock);
     renderLens();
     expect(screen.getByText(/needs a running daemon/i)).toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalled();
+    // (C2) Was `not.toHaveBeenCalled()`. The lens now reads the COMMITTED
+    // FLOW FILE on a static build (the shared `queryKeys.staticFlowSrc`
+    // slot `App.tsx` already fills, so no extra request in the composed
+    // app), which is a request — just never a daemon's. The invariant this
+    // test exists for is the second clause, and it is asserted directly
+    // rather than through a count that conflated the two.
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.every((u) => u.endsWith("demo-flow.jsonl")), `unexpected fetch: ${JSON.stringify(urls)}`).toBe(true);
+    expect(urls.some((u) => u.includes("/mission/") || u.includes("/flow-mission/") || u.includes("/flow/"))).toBe(false);
   });
 
   describe("static graphs fixture (#2032 packet 2)", () => {
@@ -294,18 +302,20 @@ describe("MissionGraphLens", () => {
 
     it("renders a mission's real task graph from the committed fixture map, with no fetch to the daemon's /mission/:id/graph.json route", async () => {
       injectStaticMetas();
-      const { fetchMock, calls } = mockStaticFetch({ m1: GRAPH });
+      const { calls } = mockStaticFetch({ m1: GRAPH });
       renderLens("m1");
       await waitFor(() => expect(document.querySelector(".midname")?.textContent).toBe("m1"));
       expect(screen.getByText("finalized")).toBeInTheDocument();
       expect(document.querySelector(".phasegroup")).not.toBeNull();
       expect(document.querySelector(".mnode.k-task.s-complete")).not.toBeNull();
       expect(document.querySelector(".steprow.s-complete")).not.toBeNull();
-      // Exactly one network call — the fixture map itself — and NONE of
-      // them named the daemon-only per-mission route.
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // (C2) Two committed-fixture calls now — the graphs map and the flow
+      // file the events column folds — and NONE of them named the
+      // daemon-only per-mission route. Both ride cache slots the shell
+      // already fills, so the composed app downloads neither twice.
       expect(calls.some((u) => u.includes("/mission/"))).toBe(false);
-      expect(calls[0]).toContain("demo-graphs.json");
+      expect(calls.some((u) => u.endsWith("demo-graphs.json"))).toBe(true);
+      expect(calls.every((u) => u.endsWith("demo-graphs.json") || u.endsWith("demo-flow.jsonl")), `unexpected fetch: ${JSON.stringify(calls)}`).toBe(true);
     });
 
     it("renders the lens's existing empty/absent state — not an error, not a permanent spinner — when the routed mission isn't in the fixture map", async () => {
@@ -324,6 +334,54 @@ describe("MissionGraphLens", () => {
       vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
       renderLens("m1");
       expect(screen.getByRole("status", { name: /loading mission m1/i })).toBeInTheDocument();
+    });
+
+    it("(C2) folds the COMMITTED FLOW FILE on a static build, so #mission=<id> is not stuck at 0 EVENTS", async () => {
+      // The static-demo sibling of U4-1. All three of this lens's record
+      // sources (`/flow-mission/<id>`, `/flow/<today>`, the live tail) are
+      // `enabled: daemonBacked`, so on a daemon-less build `allRecords` was
+      // empty by construction: the graph rendered from the committed fixture
+      // map while the shared events column beside it read "0 EVENTS" — for a
+      // day the page had already downloaded whole.
+      //
+      // Same rule U4-1 settled on: a static build has ONE committed file and
+      // it is the answer on EVERY route. Read through `useDay`, which shares
+      // the cache slot `App.tsx` already fills, so this costs no request.
+      injectStaticMetas();
+      const rec = {
+        ts: "2026-08-26T07:36:48Z",
+        action: "dispatch.start",
+        session_id: "s-1",
+        mission_id: "m1",
+        machine_id: "mac",
+        category: "work",
+        source: "crew",
+      };
+      const other = { ...rec, ts: "2026-08-26T07:36:49Z", session_id: "s-2", mission_id: "m-other" };
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string) => {
+          calls.push(url);
+          if (url.endsWith("demo-graphs.json")) return Promise.resolve(new Response(JSON.stringify({ m1: GRAPH }), { status: 200 }));
+          if (url.endsWith("demo-flow.jsonl"))
+            return Promise.resolve(new Response([JSON.stringify(rec), JSON.stringify(other)].join("\n"), { status: 200 }));
+          return Promise.resolve(new Response("not found", { status: 404 }));
+        }),
+      );
+      const onEvents = vi.fn();
+      renderLens("m1", onEvents);
+      await waitFor(() => expect(document.querySelector(".midname")?.textContent).toBe("m1"));
+      await waitFor(() => expect(lastEventsCall(onEvents)?.[0].length).toBeGreaterThan(0));
+
+      const [events] = lastEventsCall(onEvents)!;
+      // Scoped to THIS mission — the committed file is the whole day, and
+      // handing the column another mission's records would be a worse bug
+      // than the empty column it replaces.
+      expect(events.every((r) => r.mission_id === "m1")).toBe(true);
+      expect(events.some((r) => r.session_id === "s-1")).toBe(true);
+      // And still no daemon route asked for.
+      expect(calls.some((u) => u.includes("/flow-mission/") || u.includes("/flow/"))).toBe(false);
     });
 
     it("(inverted case) with no darkmux-graphs-src meta, the daemon fetch path is used — the static branch never engages", async () => {

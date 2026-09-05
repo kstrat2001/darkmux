@@ -299,9 +299,9 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
       {view.metricScope.model.length > 0 && (
       <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
         {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
-          <div className="met" key={i}>
+          <div className="met" key={i} title={m.hintTitle}>
             <div className="mv">{m.value}</div>
-            <div className="ml">{m.label}</div>
+            <div className="ml" data-hint={m.hint}>{m.label}</div>
           </div>
         ))}
       </div>
@@ -319,9 +319,9 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
       {view.metricScope.system.length > 0 && (
         <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
           {view.metricScope.system.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
-            <div className="met" key={i}>
+            <div className="met" key={i} title={m.hintTitle}>
               <div className="mv">{m.value}</div>
-              <div className="ml">{m.label}</div>
+              <div className="ml" data-hint={m.hint}>{m.label}</div>
             </div>
           ))}
         </div>
