@@ -373,6 +373,7 @@ mod tests {
 
     fn template() -> TaskConfig {
         TaskConfig {
+            excludes: Vec::new(),
             id: "unit".into(),
             enabled: None,
             description: None,

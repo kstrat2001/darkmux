@@ -200,10 +200,24 @@ use std::collections::{BTreeMap, BTreeSet};
 /// "Mission configs: a task's `run_on` decides which of its dependencies'
 /// failures it survives" for the full cascade design.
 ///
+/// Bumped to **"3.5"** (#2310 P4f) — additive: [`TaskConfig`] gained the
+/// optional `excludes` field — document-wide task ids that must not be
+/// `enabled` alongside this one, so a phase can ship TWO templates for one
+/// slot with exactly one live. `review-v2.json`'s `create-mods` phase is
+/// the first user: the attended `create-mod` (wait for a frontier-written
+/// mod) and the unattended `create-mod-dispatch` (a coder on a
+/// hosted-endpoint profile, for the self-hosted runner where no
+/// orchestrator session exists). Enforced only in
+/// [`MissionConfig::validate`], never at run time. A pre-3.5 reader
+/// overflows the field into `extras` and mints whatever `enabled` says —
+/// and since every SHIPPED document keeps one of each excluded pair
+/// disabled, an older binary's behavior on one is unchanged, the additive
+/// contract.
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "3.4";
+pub const MISSION_CONFIG_SCHEMA: &str = "3.5";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -415,6 +429,7 @@ pub fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &s
         return;
     }
     let args_task = TaskConfig {
+        excludes: Vec::new(),
         enabled: None,
         id: PANEL_ARGS_TASK_ID.to_string(),
         description: Some("synthetic: the raw text typed after the panel command name (ACP) or the \
@@ -583,6 +598,30 @@ pub struct TaskConfig {
     /// config snapshot the run keeps, which carries the flag verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// (#2310 P4f, schema 3.5) Task ids, document-wide, that must not be
+    /// ENABLED alongside this one — two ways to staff the SAME slot, of
+    /// which exactly one may be live. `review-v2.json`'s `create-mods`
+    /// phase is the first user: `create-mod` waits for a frontier-written
+    /// mod (the attended path) and `create-mod-dispatch` sends a coder to
+    /// a hosted-endpoint profile (the unattended runner path); both
+    /// enabled would mint two mod-writing tasks per finding, which is not
+    /// a degraded run but a duplicated seat.
+    ///
+    /// Enforced in [`MissionConfig::validate`] as an `Error`, never at run
+    /// time: the operator flips one `enabled` field in their own copy, and
+    /// the mistake is worth catching before a mint rather than after a
+    /// phase's worth of dispatches. The relation is symmetric in EFFECT —
+    /// declaring it on one side is enough, and declaring it on both
+    /// reports once, not twice. An id naming no task in the document is
+    /// its own `Error`, because an exclusion that resolves to nothing
+    /// fails OPEN.
+    ///
+    /// A pre-3.5 reader overflows the field into `extras` and mints
+    /// whatever `enabled` says, which is the additive contract: every
+    /// SHIPPED document keeps one of each excluded pair disabled, so an
+    /// older binary reading one behaves exactly as it does today.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excludes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// (#1398) Operator-facing short label — same overload split as
@@ -1339,6 +1378,78 @@ impl MissionConfig {
             }
         }
 
+        // (#2310 P4f, schema 3.5) `excludes` — two templates for ONE seat,
+        // of which exactly one may be live (see `TaskConfig::excludes`).
+        // Every branch here is an Error, and each for the same reason the
+        // `grow` checks above are: the failure is not a degraded run, it is
+        // a document that mints work nobody asked for. Both seats enabled
+        // means two mod-writing tasks per finding — one waiting on a
+        // frontier that may never answer, one spending endpoint tokens —
+        // and the run only reveals that after a phase's worth of dispatches.
+        // An exclusion that names NOTHING (a typo, a renamed task) is
+        // called out separately because it fails OPEN: it protects nothing
+        // and looks, in the document, exactly like protection.
+        {
+            let mut reported: BTreeSet<(&str, &str)> = BTreeSet::new();
+            for (pi, phase) in self.phases.iter().enumerate() {
+                for (ti, task) in phase.tasks.iter().enumerate() {
+                    if task.excludes.is_empty() {
+                        continue;
+                    }
+                    let path = format!("phases[{pi}].tasks[{ti}].excludes");
+                    for peer in &task.excludes {
+                        if peer == &task.id {
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: path.clone(),
+                                message: format!(
+                                    "task \"{}\" excludes ITSELF — `excludes` names the OTHER way \
+                                     of staffing this slot, never this task; use `enabled: false` \
+                                     to turn a task off",
+                                    task.id
+                                ),
+                            });
+                        } else if !all_task_ids.contains(peer.as_str()) {
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: path.clone(),
+                                message: format!(
+                                    "task \"{}\" excludes unknown task id \"{peer}\" — an exclusion \
+                                     that resolves to nothing fails OPEN (both seats would run), so \
+                                     a typo here is silent protection. Name a real task declared \
+                                     somewhere in `phases`",
+                                    task.id
+                                ),
+                            });
+                        } else if !disabled_tasks.contains(task.id.as_str())
+                            && !disabled_tasks.contains(peer.as_str())
+                        {
+                            // One PAIR is one finding, whichever side (or
+                            // both) declared the relation — a duplicated
+                            // error reads as two separate defects.
+                            let pair = if task.id.as_str() < peer.as_str() {
+                                (task.id.as_str(), peer.as_str())
+                            } else {
+                                (peer.as_str(), task.id.as_str())
+                            };
+                            if reported.insert(pair) {
+                                findings.push(ValidationFinding {
+                                    severity: FindingSeverity::Error,
+                                    path: path.clone(),
+                                    message: format!(
+ "tasks \"{}\" and \"{peer}\" are both ENABLED, but they exclude each other — they are two ways to \
+  staff the SAME slot, so enabling both mints two tasks per item where one was meant. Set \
+  `\"enabled\": false` on whichever one this run should not use",
+                                        task.id
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // (#2310 P4c-2 review MUST FIX) Every undeclared placeholder in the
         // static graph — the SAME check `mission_launch.rs::launch` runs
         // before minting, surfaced here too so `mission config show` and
@@ -1556,6 +1667,128 @@ mod tests {
         assert!(cfg.validate(&[]).is_empty());
     }
 
+    // ─── (#2310 P4f, schema 3.5) `excludes`: two ways to staff one seat ───
+    //
+    // A phase can ship TWO templates for the same slot — review-v2's
+    // create-mods phase carries the attended `create-mod` (wait for a
+    // frontier-written mod) and the unattended `create-mod-dispatch` (a
+    // coder on a hosted endpoint). Exactly one is meant to be live. Both
+    // enabled is not a degraded run, it is two seats writing a mod for the
+    // same finding, so it is refused at validate time, before a mint.
+
+    /// Two enabled tasks naming each other's slot is an Error naming BOTH.
+    #[test]
+    fn two_enabled_tasks_that_exclude_each_other_are_a_validate_error() {
+        let json = r#"{
+          "id":"x","name":"X",
+          "phases":[{"id":"p","tasks":[
+            {"id":"seat-a","steps":[{"id":"a-step","kind":"procedural.noop","config":{}}]},
+            {"id":"seat-b","excludes":["seat-a"],"steps":[{"id":"b-step","kind":"procedural.noop","config":{}}]}
+          ]}]
+        }"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        let findings = cfg.validate(&[]);
+        let hit = findings
+            .iter()
+            .find(|f| f.severity == FindingSeverity::Error && f.path.ends_with("excludes"))
+            .unwrap_or_else(|| panic!("expected an excludes error, got {findings:?}"));
+        assert!(
+            hit.message.contains("seat-a") && hit.message.contains("seat-b"),
+            "the finding must name BOTH tasks so the operator knows which field to flip: {}",
+            hit.message
+        );
+    }
+
+    /// The shipped shape: one of the pair is `enabled: false`, which is the
+    /// whole point of declaring the exclusion — no finding at all.
+    #[test]
+    fn an_exclusion_is_silent_when_only_one_of_the_pair_is_enabled() {
+        let json = r#"{
+          "id":"x","name":"X",
+          "phases":[{"id":"p","tasks":[
+            {"id":"seat-a","steps":[{"id":"a-step","kind":"procedural.noop","config":{}}]},
+            {"id":"seat-b","enabled":false,"excludes":["seat-a"],"steps":[{"id":"b-step","kind":"procedural.noop","config":{}}]}
+          ]}]
+        }"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate(&[]).is_empty(), "{:?}", cfg.validate(&[]));
+    }
+
+    /// One pair, one finding — even when both sides declare the exclusion.
+    /// A duplicated error would read as two separate defects.
+    #[test]
+    fn a_mutual_exclusion_declared_from_both_sides_reports_once() {
+        let json = r#"{
+          "id":"x","name":"X",
+          "phases":[{"id":"p","tasks":[
+            {"id":"seat-a","excludes":["seat-b"],"steps":[{"id":"a-step","kind":"procedural.noop","config":{}}]},
+            {"id":"seat-b","excludes":["seat-a"],"steps":[{"id":"b-step","kind":"procedural.noop","config":{}}]}
+          ]}]
+        }"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        let errors: Vec<_> = cfg
+            .validate(&[])
+            .into_iter()
+            .filter(|f| f.path.ends_with("excludes"))
+            .collect();
+        assert_eq!(errors.len(), 1, "one pair is one finding: {errors:?}");
+    }
+
+    /// A typo'd peer id is its own Error — an exclusion that names nothing
+    /// protects nothing, and fails OPEN (both seats run) if left silent.
+    #[test]
+    fn excluding_an_unknown_task_id_is_an_error() {
+        let json = r#"{
+          "id":"x","name":"X",
+          "phases":[{"id":"p","tasks":[
+            {"id":"seat-a","excludes":["seat-typo"],"steps":[{"id":"a-step","kind":"procedural.noop","config":{}}]}
+          ]}]
+        }"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        let findings = cfg.validate(&[]);
+        assert!(
+            findings.iter().any(|f| f.severity == FindingSeverity::Error
+                && f.path.ends_with("excludes")
+                && f.message.contains("seat-typo")),
+            "{findings:?}"
+        );
+    }
+
+    /// Self-exclusion is a nonsense document, not a task that disables
+    /// itself.
+    #[test]
+    fn excluding_yourself_is_an_error() {
+        let json = r#"{
+          "id":"x","name":"X",
+          "phases":[{"id":"p","tasks":[
+            {"id":"seat-a","excludes":["seat-a"],"steps":[{"id":"a-step","kind":"procedural.noop","config":{}}]}
+          ]}]
+        }"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        let findings = cfg.validate(&[]);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == FindingSeverity::Error && f.path.ends_with("excludes")),
+            "{findings:?}"
+        );
+    }
+
+    /// A DISABLED PHASE prunes both seats, so there is no conflict to
+    /// report — the check keys on what will actually be minted.
+    #[test]
+    fn an_exclusion_inside_a_disabled_phase_is_silent() {
+        let json = r#"{
+          "id":"x","name":"X",
+          "phases":[{"id":"p","enabled":false,"tasks":[
+            {"id":"seat-a","steps":[{"id":"a-step","kind":"procedural.noop","config":{}}]},
+            {"id":"seat-b","excludes":["seat-a"],"steps":[{"id":"b-step","kind":"procedural.noop","config":{}}]}
+          ]}]
+        }"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate(&[]).is_empty(), "{:?}", cfg.validate(&[]));
+    }
+
     fn step(id: &str, kind: &str) -> StepConfig {
         StepConfig {
             enabled: None,
@@ -1573,6 +1806,7 @@ mod tests {
 
     fn task(id: &str, depends_on: &[&str], steps: Vec<StepConfig>) -> TaskConfig {
         TaskConfig {
+            excludes: Vec::new(),
             enabled: None,
             id: id.to_string(),
             description: None,
@@ -2751,7 +2985,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_3_4() {
+    fn schema_version_constant_is_3_5() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
@@ -2786,7 +3020,15 @@ mod tests {
         // `crate::types::default_run_on()` (`["complete"]`), the exact
         // behavior every pre-3.4 document already had — so nothing already
         // shipped changes meaning under this bump.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "3.4");
+        //
+        // (#2310 P4f) Bumped to "3.5" — additive: `TaskConfig::excludes`,
+        // the "two ways to staff one seat, exactly one live" relation the
+        // `create-mods` phase's attended and unattended templates need. A
+        // pre-3.5 reader overflows the field into `extras` and mints
+        // whatever `enabled` says — and every shipped document keeps one
+        // of each excluded pair disabled, so nothing already shipped
+        // changes meaning under this bump either.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "3.5");
     }
 
     // ── (#2300) `grow` — the run-time fan-out ────────────────────────────

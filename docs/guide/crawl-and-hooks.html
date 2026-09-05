@@ -412,6 +412,38 @@ http.createServer((req, res) => {
       <li><strong>Declining is clean, not a failure.</strong> A wait that ends with no mod exits 0 with <code>{"waited": true, "found": false, …}</code>; the gate records its ordinary no-mod skip and the run stays Clean. Reading a finding and writing nothing is the correct answer for a search-form finding or one that does not hold, so it must not be the thing that marks a run Degraded. Only a non-numeric <code>mod_wait_seconds</code> and a genuine infra failure error the step.</li>
     </ul>
     <p>Keep <code>N</code> under <code>runtime.step_command_timeout_seconds</code> (default 600). That bound governs <em>every</em> step command and is the outer bound here — if it is the smaller of the two it kills the poll first, and the step errors naming it rather than naming your input.</p>
+    <h3>Unattended: a cloud seat</h3>
+    <p>The hook needs a session watching it. A self-hosted runner has none, so the wait above is the wrong instrument there — and the finding that moved this work off the local tier was about the <em>tier</em> of the seat, not about who typed the command. A frontier-class hosted endpoint is a seat a runner <em>can</em> staff. So <code>review-v2</code>'s <code>create-mods</code> phase ships a second template, <code>create-mod-dispatch</code>, off by default: a <code>coder</code> dispatch carrying the same create-mod message <code>crawl.json</code> carries, byte for byte, aimed at an endpoint profile.</p>
+    <p>The opt-in is two fields in your own copy at <code>~/.darkmux/mission-configs/review-v2.json</code> — <code>"enabled": true</code> on <code>create-mod-dispatch</code>, <code>"enabled": false</code> on <code>create-mod</code>. The two <code>excludes</code> each other: enabling both is a validation error naming both, because they staff one slot. The dry-run graph shows whichever is live; the other is pruned at mint, never drawn gray.</p>
+    <pre><code>darkmux mission launch review-v2 --dry-run \
+  --param workspace=ws.json --param diff_file=pr.diff \
+  --param mod_seat_profile=grok-mod-seat</code></pre>
+    <p><code>mod_seat_profile</code> names a profile in <code>~/.darkmux/profiles.json</code>; leave it unset and the dispatch resolves <code>coder</code> through the machine's own <code>role_profiles.coder</code> binding instead, which is the other way to point a runner at a seat. Three endpoint profiles, all OpenAI-compatible — there is no dialect field, because there is only one dialect. <code>endpoint.url</code> is the base up to <code>/chat/completions</code>, and <code>auth.keychain</code> names a macOS Keychain item, never a key:</p>
+    <pre><code>{ "profiles": {
+    "grok-mod-seat":   { "models": [ { "id": "&lt;grok-model-id&gt;",   "n_ctx": 128000,
+        "endpoint": { "url": "https://api.x.ai/v1",
+                      "auth": { "type": "bearer", "keychain": "darkmux-grok" } } } ] },
+    "gemini-mod-seat": { "models": [ { "id": "&lt;gemini-model-id&gt;", "n_ctx": 128000,
+        "endpoint": { "url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                      "auth": { "type": "bearer", "keychain": "darkmux-gemini" } } } ] },
+    "openai-mod-seat": { "models": [ { "id": "&lt;openai-model-id&gt;", "n_ctx": 128000,
+        "endpoint": { "url": "https://api.openai.com/v1",
+                      "auth": { "type": "bearer", "keychain": "darkmux-openai" } } } ] } } }</code></pre>
+    <p>On a runner with no login keychain to unlock, declare <code>"key_env": "&lt;VAR NAME&gt;"</code> instead — only the variable's name lives in the profile, and a present env var wins over the Keychain item.</p>
+    <p><strong>Data boundary.</strong> This seat sends the finding and the source lines it names to a third party. Use it on public repositories only. Work under a client or employer boundary stays on a local seat or on that organization's own endpoint — the attended hook path exists for exactly that case.</p>
+
+    <h3>What the seat costs, in tokens</h3>
+    <p>Every dispatch writes a <code>dispatch complete</code> flow record carrying <code>prompt_tokens</code>, <code>completion_tokens</code> and, for a remote seat, <code>endpoint</code>. Sum the <code>coder</code> handle for one mission and put it beside the diff you fed in:</p>
+    <pre><code>jq -r 'select(.action == "dispatch complete" and .handle == "coder"
+              and .mission_id == "&lt;mission-id&gt;")
+       | [.payload.prompt_tokens, .payload.completion_tokens] | @tsv' \
+  ~/.darkmux/flows/*.jsonl \
+| awk '{p+=$1; c+=$2} END {printf "prompt %d  completion %d  total %d\n", p, c, p+c}'
+
+wc -l pr.diff        # the size the run was asked to review</code></pre>
+    <p>Run that on a handful of PRs and you have a tokens-per-diff-line curve for your repository, which is the number to budget against. Tokens only — darkmux never prints a currency figure, because the rate is your contract with the provider and not something a run can know.</p>
+    <p><strong>The ceiling today is time, not tokens.</strong> <code>remote.max_tokens_per_execution</code> meters the review funnel's remote seats and the tool-less single-shot remote dispatch. It does <em>not</em> yet meter the agentic-remote container loop (<a href="https://github.com/kstrat2001/darkmux/issues/1187">#1187</a>), which is the path a tool-granting role like <code>coder</code> takes. Until that lands, the only bounds on this seat are the inactivity budget (<code>DARKMUX_INACTIVITY_TIMEOUT_SECONDS</code>, default 600) and the turn cap (<code>runtime.max_turns</code>, unset means uncapped). Set a turn cap before pointing a runner at a metered endpoint unattended.</p>
+
     <p><code>crawl.json</code> is untouched by all of this: a crawl still dispatches its own coder for mods, and ships that task off by default. Crawl walks any corpus; review is diff-scoped and code-only, and neither config knows the other exists.</p>
   </div>
 </section>

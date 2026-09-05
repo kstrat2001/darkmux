@@ -540,6 +540,7 @@ mod tests {
 
     fn task(id: &str, depends_on: &[&str], role_id: Option<&str>, steps: Vec<StepConfig>) -> TaskConfig {
         TaskConfig {
+            excludes: Vec::new(),
             enabled: None,
             id: id.to_string(),
             description: Some(format!("do {id}")),

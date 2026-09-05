@@ -836,6 +836,7 @@ mod tests {
     fn task(id: &str, depends_on: &[&str], reads: &[&str], steps: Vec<StepConfig>) -> TaskConfig {
         TaskConfig {
             enabled: None,
+            excludes: Vec::new(),
             id: id.to_string(),
             description: None,
             display_name: None,
