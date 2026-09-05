@@ -611,8 +611,18 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const cpuPeak = hostAgg.cpu.high;
   const ramPeak = hostAgg.mem.high;
   const gpuPeak = hostAgg.gpu.high;
-  const avgHighValue = (m: { avg: number | null; high: number | null }): string =>
-    `${roundPct(m.avg)}% avg · ${roundPct(m.high)}% high`;
+  // (operator, 2026-09-05, second pass) Used to be ONE string —
+  // `41% avg · 94% high` — crammed into the value slot. The value slot
+  // holds exactly one figure on one line, always (same rule as every other
+  // tile now): the AVERAGE is the primary figure an operator reads at a
+  // glance, so it becomes `value`; the peak qualifies it, so it becomes
+  // `sub` — the same value/label/sub split CTX got, applied here because
+  // this was the OTHER place a tile's value was a multi-stat phrase rather
+  // than a figure.
+  const avgHighSplit = (m: { avg: number | null; high: number | null }): { value: string; sub: string } => ({
+    value: `${roundPct(m.avg)}%`,
+    sub: `avg · ${roundPct(m.high)}% high`,
+  });
 
   // Built as a list with its scope recorded AS EACH TILE IS ADDED, rather
   // than as a fixed array plus hardcoded indices. The indices are now
@@ -658,9 +668,18 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // would assert "the harness compacted nothing" where the truth is "there
   // was nothing here that could be compacted".
   if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
-  if (cpuPeak != null) push(systemIdx, avgHighValue(hostAgg.cpu), "CPU");
-  if (ramPeak != null) push(systemIdx, avgHighValue(hostAgg.mem), "RAM");
-  if (gpuPeak != null) push(systemIdx, avgHighValue(hostAgg.gpu), "GPU");
+  if (cpuPeak != null) {
+    const s = avgHighSplit(hostAgg.cpu);
+    push(systemIdx, s.value, "CPU", undefined, undefined, s.sub);
+  }
+  if (ramPeak != null) {
+    const s = avgHighSplit(hostAgg.mem);
+    push(systemIdx, s.value, "RAM", undefined, undefined, s.sub);
+  }
+  if (gpuPeak != null) {
+    const s = avgHighSplit(hostAgg.gpu);
+    push(systemIdx, s.value, "GPU", undefined, undefined, s.sub);
+  }
 
   // (#1973) Indices into `metrics`, not a second copy — one ordered list, one
   // grouping over it, so the two cannot drift apart. TURNS/TOKENS/CTX/

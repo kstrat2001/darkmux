@@ -264,12 +264,27 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const byLabel = (l: string) => view.metrics[view.metricScope.system.find((i) => view.metrics[i].label === l) ?? -1]?.value;
+    const tileFor = (l: string) => view.metrics[view.metricScope.system.find((i) => view.metrics[i].label === l) ?? -1];
     // cpu [30,39,12]: avg 27, high 39. mem [60,68,61]: avg 63, high 68.
     // gpu [20,97,12]: avg 43, high 97.
-    expect(byLabel("CPU")).toBe("27% avg · 39% high");
-    expect(byLabel("RAM")).toBe("63% avg · 68% high");
-    expect(byLabel("GPU")).toBe("43% avg · 97% high");
+    //
+    // (operator, 2026-09-05, second pass) The value slot holds ONE figure on
+    // ONE line, always — the primary (average) reading — with the peak
+    // qualifying it in `sub`, same split CTX got. The single combined
+    // string this used to be (`27% avg · 39% high` as the VALUE) is exactly
+    // the shape that forced `white-space: nowrap` to either split mid-word
+    // or overflow the tile; a value can never again contain a second,
+    // space-separated figure.
+    expect(tileFor("CPU")?.value).toBe("27%");
+    expect(tileFor("CPU")?.sub).toBe("avg · 39% high");
+    expect(tileFor("RAM")?.value).toBe("63%");
+    expect(tileFor("RAM")?.sub).toBe("avg · 68% high");
+    expect(tileFor("GPU")?.value).toBe("43%");
+    expect(tileFor("GPU")?.sub).toBe("avg · 97% high");
+    // No metric's value smuggles a second figure back in via a space.
+    for (const l of ["CPU", "RAM", "GPU"]) {
+      expect(tileFor(l)?.value, `${l}'s value must be one figure`).not.toContain(" ");
+    }
     // ...and they are HARNESS facts, not the model's own work.
     expect(view.metricScope.model.map((i) => view.metrics[i].label)).not.toContain("GPU");
   });
