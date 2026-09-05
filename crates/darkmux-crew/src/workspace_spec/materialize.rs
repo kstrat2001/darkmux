@@ -72,6 +72,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
@@ -141,6 +142,13 @@ pub struct Materialized {
     /// Consequence worth stating: **dropping this value releases the
     /// workspace.** Keep it alive for exactly as long as you read the
     /// trees, and no longer.
+    ///
+    /// The field is `pub` only because `darkmux-lab`'s plan tests build a
+    /// `Materialized` from already-resolved sources (with `lock: None`).
+    /// `take()`-ing it out of a REAL one releases the workspace while the
+    /// paths in `sources`/`files` are still held and still being read —
+    /// which is precisely the failure this field exists to prevent. Drop
+    /// the whole value instead.
     pub lock: Option<WorkspaceLock>,
 }
 
@@ -407,6 +415,23 @@ fn resolve_one(
 /// guard, so the `flock` is released exactly when the depth reaches zero,
 /// whatever order the guards happen to drop in.
 ///
+/// **It is `!Send`, deliberately (#2399 review).** The re-entrancy
+/// registry keys on the ACQUIRING thread, so a guard that MOVED to
+/// another thread would still be re-enterable by the thread that made it
+/// — a probe measured exactly that: thread P materialized, handed the
+/// value to thread H, materialized again in 216 ms while H was still
+/// reading, and tore the tree down under it. No caller does this today
+/// (both create and drop within one function), so rather than pay for a
+/// cross-thread ownership handoff, the type refuses to travel:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<darkmux_crew::workspace_spec::WorkspaceLock>();
+/// ```
+///
+/// `Materialized` inherits this — it owns one — so the whole value stays
+/// on the thread that materialized it.
+///
 /// **The consequence, stated plainly.** The lock is EXCLUSIVE for the
 /// whole life of the `Materialized`, so N steps materializing ONE
 /// workspace now run one after another, reads included — #2397's 8-wide
@@ -423,6 +448,12 @@ fn resolve_one(
 pub struct WorkspaceLock {
     /// The canonical workspace root this guard holds a ticket on.
     key: PathBuf,
+    /// Makes the guard — and every `Materialized` that owns one — `!Send`.
+    /// See the type doc: the re-entrancy registry keys on the ACQUIRING
+    /// thread, so a guard that traveled would let its birth thread re-enter
+    /// past a holder on another thread. A raw pointer is the standard way
+    /// to spell this; nothing is ever read through it.
+    not_send: PhantomData<*const ()>,
 }
 
 #[cfg(unix)]
@@ -453,7 +484,7 @@ impl WorkspaceLock {
             if let Some(entry) = held.get_mut(&key) {
                 if entry.owner == std::thread::current().id() {
                     entry.depth += 1;
-                    return Ok(Self { key });
+                    return Ok(Self { key, not_send: PhantomData });
                 }
             }
         }
@@ -487,7 +518,7 @@ impl WorkspaceLock {
 
         let mut held = held_workspaces().lock().unwrap_or_else(|e| e.into_inner());
         held.insert(key.clone(), HeldWorkspace { owner: std::thread::current().id(), depth: 1, file });
-        Ok(Self { key })
+        Ok(Self { key, not_send: PhantomData })
     }
 }
 
@@ -516,12 +547,16 @@ impl Drop for WorkspaceLock {
 /// therefore unsupported off Unix; a single materialize is unaffected.
 #[cfg(not(unix))]
 #[derive(Debug)]
-pub struct WorkspaceLock;
+pub struct WorkspaceLock {
+    /// Same `!Send` contract as the Unix guard, so the type behaves
+    /// identically on every target even where it locks nothing.
+    not_send: PhantomData<*const ()>,
+}
 
 #[cfg(not(unix))]
 impl WorkspaceLock {
     fn acquire(_root: &Path) -> Result<Self> {
-        Ok(Self)
+        Ok(Self { not_send: PhantomData })
     }
 }
 
@@ -1637,6 +1672,138 @@ mod tests {
         assert!(same_origin("https://example.com/o/r.git/", "https://example.com/o/r"));
         assert!(!same_origin("git@example.com:o/r.git", "https://example.com/o/r.git"));
         assert!(!same_origin("https://example.com/o/other", "https://example.com/o/r"));
+    }
+
+
+    /// (#2399 second review) The dirty-tree guard above writes BOTH an
+    /// untracked file and a tracked edit, so it stays green with
+    /// `--untracked-files=no` — it cannot pin the untracked clause. This
+    /// one dirties the tree ONLY with an untracked file, which is the case
+    /// `git status` ignores by default and the teardown used to remove.
+    #[test]
+    fn an_untracked_file_alone_forces_a_rebuild() {
+        use std::os::unix::fs::MetadataExt;
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-untracked", workdir.path(), source.path(), "main");
+
+        let m1 = materialize(&spec, RW).unwrap();
+        let tree = m1.sources[0].tree.clone();
+        let ino1 = fs::metadata(&tree).unwrap().ino();
+        fs::write(tree.join("scribble.txt"), "untracked, nothing else\n").unwrap();
+        drop(m1);
+
+        let m2 = materialize(&spec, RW).unwrap();
+        let tree2 = m2.sources[0].tree.clone();
+        assert!(!tree2.join("scribble.txt").exists(), "an untracked file alone must not survive a materialize");
+        assert_ne!(ino1, fs::metadata(&tree2).unwrap().ino(), "an untracked-only dirty tree is rebuilt, not reused");
+    }
+
+    /// (#2399 second review) A tree sitting at the right sha but belonging
+    /// to a DIFFERENT mirror must be rebuilt from ours — otherwise reuse
+    /// would adopt a worktree whose git dir, and therefore whose future
+    /// checkouts, darkmux does not own.
+    #[test]
+    fn a_tree_at_the_right_sha_from_a_foreign_mirror_is_rebuilt() {
+        use std::os::unix::fs::MetadataExt;
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-foreign-tree", workdir.path(), source.path(), "main");
+
+        let m1 = materialize(&spec, RW).unwrap();
+        let tree = m1.sources[0].tree.clone();
+        let sha = m1.sources[0].sha.clone();
+        let ours = workdir.path().join("mirror").join("app.git");
+        let ino1 = fs::metadata(&tree).unwrap().ino();
+        drop(m1);
+
+        // Hand the tree path over to a second, unrelated bare mirror of the
+        // same source, checked out at the SAME sha — so only the mirror
+        // identity distinguishes it from a reusable tree.
+        let out = Command::new("git")
+            .current_dir(&ours)
+            .args(["worktree", "remove", "--force", "--", &tree.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let elsewhere = TempDir::new().unwrap();
+        let foreign = elsewhere.path().join("other.git");
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "--no-hardlinks",
+                "--",
+                &source.path().to_string_lossy(),
+                &foreign.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .current_dir(&foreign)
+            .args(["worktree", "add", "--detach", "--force", "--", &tree.to_string_lossy(), &sha])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let planted = Command::new("git")
+            .current_dir(&tree)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&planted.stdout).trim(), sha, "the planted tree is at the same sha");
+
+        let m2 = materialize(&spec, RW).unwrap();
+        let tree2 = m2.sources[0].tree.clone();
+        assert_ne!(ino1, fs::metadata(&tree2).unwrap().ino(), "a foreign worktree is never adopted");
+        let git_dir = Command::new("git")
+            .current_dir(&tree2)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .unwrap();
+        let git_dir = String::from_utf8_lossy(&git_dir.stdout).trim().to_string();
+        assert!(
+            Path::new(&git_dir).canonicalize().unwrap().starts_with(ours.canonicalize().unwrap()),
+            "the rebuilt tree must belong to THIS mirror, not {}: {git_dir}",
+            foreign.display()
+        );
+    }
+
+    /// (#2399 second review) The re-entrancy registry, named and BOUNDED.
+    /// Materializing one workspace twice on ONE thread while the first
+    /// value is still held must not block — without the owner check the
+    /// second call waits on a `flock` its own thread holds, forever. The
+    /// `recv_timeout` is what makes a regression fail red in CI instead of
+    /// hanging the suite; the incidental coverage this replaces (the
+    /// foreign-origin test) hangs for 90 s and reports nothing useful.
+    #[test]
+    fn materializing_one_workspace_twice_on_one_thread_does_not_block() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let source = init_source_repo();
+            let workdir = TempDir::new().unwrap();
+            let spec = spec_for("t-reentrant", workdir.path(), source.path(), "main");
+            let first = materialize(&spec, RW).unwrap();
+            // Still holding `first`: the guard's owner thread re-enters.
+            let second = materialize(&spec, RW).unwrap();
+            let same = first.sources[0].sha == second.sources[0].sha;
+            let _ = tx.send(same);
+            drop(second);
+            drop(first);
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(true) => worker.join().unwrap(),
+            Ok(false) => panic!("the re-entrant materialize resolved a different sha"),
+            // Deliberately do NOT join here — the worker is wedged on a
+            // lock it will never get, and joining would hang the suite
+            // instead of reporting the regression.
+            Err(_) => panic!(
+                "materializing one workspace twice on one thread blocked for 15s — the \
+                 re-entrancy registry regressed and every caller that holds a Materialized \
+                 across a second materialize now deadlocks"
+            ),
+        }
     }
 
 }
