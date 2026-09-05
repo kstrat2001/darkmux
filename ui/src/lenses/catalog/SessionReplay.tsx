@@ -302,6 +302,12 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
           <div className="met" key={i} title={m.hintTitle}>
             <div className="mv">{m.value}</div>
             <div className="ml" data-hint={m.hint}>{m.label}</div>
+            {/* (operator, 2026-09-05, second pass) Rendered ONLY when
+                non-empty — grid row `align-items: stretch` (the default,
+                see `.session-run .metrics`) equalizes tile heights WITHIN a
+                row now, so a tile with nothing to add here doesn't need a
+                dead empty slot to avoid sitting shorter than a neighbor. */}
+            {m.sub && <div className="msub">{m.sub}</div>}
           </div>
         ))}
       </div>
@@ -322,6 +328,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
             <div className="met" key={i} title={m.hintTitle}>
               <div className="mv">{m.value}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
+              {m.sub && <div className="msub">{m.sub}</div>}
             </div>
           ))}
         </div>

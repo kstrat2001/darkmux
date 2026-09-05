@@ -136,8 +136,18 @@ export interface SessionRunView {
    * `data-hint` (so it never enters `textContent` and
    * `goldens/session-task-list.txt` stays byte-identical); `hintTitle` is the
    * long form on hover. Present only where a tile's number is ambiguous
-   * against a number the operator can see on another surface. */
-  metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string }>;
+   * against a number the operator can see on another surface.
+   *
+   * `sub` (#2xxx — the "CTX PEAK 19K / 262.144K" quirk) is a QUIET third
+   * line for a fact that qualifies the value without restating it — CTX's
+   * window ceiling, today. A label may never repeat the value it sits next
+   * to (that was the defect: `CTX PEAK 19K / 262.144K WINDOW` printed the
+   * headline number a second time, inside its own label); a fact that
+   * belongs beside the value but isn't the value itself goes in `sub`
+   * instead. Every tile renders its `sub` slot, empty or not, so the grid
+   * doesn't go ragged the moment one tile has more to say than its
+   * neighbors — see `.session-run .msub` in `styles.css`. */
+  metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string }>;
   /** (#1973) Which metrics describe the MODEL's work and which describe the
    * HARNESS around it. `metrics` stays the flat, ordered list every existing
    * consumer reads; this is the grouping laid over it, by index.
@@ -537,12 +547,25 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     briefRows.length || promptLines.length ? [...briefRows, ...promptLines] : [];
 
   // ── metrics ────────────────────────────────────────────────────────
+  // (operator, 2026-09-05) This used to be ONE string that did the whole
+  // tile's talking — `CTX PEAK 19K / 262.144K WINDOW` — printed as the
+  // tile's LABEL while the tile's VALUE printed the same "19K" a second
+  // time right above it. Two defects rode together: the label restated the
+  // value, and `nctx / 1000` (a bare division, no formatter) produced
+  // `262.144K` for a 262144-token window instead of a compact `262k`.
+  //
+  // The fix splits the one string into the three slots every metric tile
+  // now has: `label` names WHAT the number is (never repeats it), `value`
+  // IS the number, and `sub` carries the qualifying fact — the window
+  // ceiling, and, while live, the peak-so-far — that used to be crammed
+  // into the label. `fmtC` (the same compact formatter TOKENS IN/OUT
+  // already use) replaces the hand-rolled `/1000 + toFixed + "K"` division,
+  // which both fixes the format and gets the casing that formatter uses
+  // (`262k`, not `262.144K`) — matching TOKENS IN/OUT rather than the
+  // uppercase `K` this tile used to invent on its own.
   const ctxHeadline = done ? ctxPeak : ctxNow;
-  const ctxLabel = !nctx
-    ? "CONTEXT"
-    : done
-      ? `CTX PEAK ${(ctxPeak / 1000).toFixed(0)}K / ${nctx / 1000}K WINDOW`
-      : `CTX NOW · PEAK ${(ctxPeak / 1000).toFixed(0)}K / ${nctx / 1000}K WINDOW`;
+  const ctxLabel = !nctx ? "CONTEXT" : done ? "CTX PEAK" : "CTX NOW";
+  const ctxSub = !nctx ? undefined : done ? `of ${fmtC(nctx)}` : `peak ${fmtC(ctxPeak)} · of ${fmtC(nctx)}`;
 
   // (#1973) Did this unit do MODEL work at all?
   //
@@ -588,25 +611,35 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const cpuPeak = hostAgg.cpu.high;
   const ramPeak = hostAgg.mem.high;
   const gpuPeak = hostAgg.gpu.high;
-  const avgHighValue = (m: { avg: number | null; high: number | null }): string =>
-    `${roundPct(m.avg)}% avg · ${roundPct(m.high)}% high`;
+  // (operator, 2026-09-05, second pass) Used to be ONE string —
+  // `41% avg · 94% high` — crammed into the value slot. The value slot
+  // holds exactly one figure on one line, always (same rule as every other
+  // tile now): the AVERAGE is the primary figure an operator reads at a
+  // glance, so it becomes `value`; the peak qualifies it, so it becomes
+  // `sub` — the same value/label/sub split CTX got, applied here because
+  // this was the OTHER place a tile's value was a multi-stat phrase rather
+  // than a figure.
+  const avgHighSplit = (m: { avg: number | null; high: number | null }): { value: string; sub: string } => ({
+    value: `${roundPct(m.avg)}%`,
+    sub: `avg · ${roundPct(m.high)}% high`,
+  });
 
   // Built as a list with its scope recorded AS EACH TILE IS ADDED, rather
   // than as a fixed array plus hardcoded indices. The indices are now
   // conditional (host tiles only exist when host telemetry does), and an
   // audit already flagged the hardcoded form as a positional contract nothing
   // enforced — this makes the two unable to drift because there is only one.
-  const metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string }> = [];
+  const metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string }> = [];
   const modelIdx: number[] = [];
   const systemIdx: number[] = [];
-  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string) => {
+  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string) => {
     into.push(metrics.length);
-    metrics.push({ value, label, hint, hintTitle });
+    metrics.push({ value, label, hint, hintTitle, sub });
   };
   push(modelIdx, turnsValue != null ? String(turnsValue) : "—", "TURNS");
   push(modelIdx, tokIn != null ? fmtC(tokIn) : "—", "TOKENS IN");
   push(modelIdx, tokOut != null ? fmtC(tokOut) : "—", "TOKENS OUT");
-  push(modelIdx, nctx ? `${(ctxHeadline / 1000).toFixed(0)}K` : "—", ctxLabel);
+  push(modelIdx, nctx ? fmtC(ctxHeadline) : "—", ctxLabel, undefined, undefined, ctxSub);
   // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
   // the model's work, and the gate — while this tile is the dispatch's own
   // `wall_ms`, the runtime's measure of the execution alone. On a real
@@ -635,9 +668,18 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // would assert "the harness compacted nothing" where the truth is "there
   // was nothing here that could be compacted".
   if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
-  if (cpuPeak != null) push(systemIdx, avgHighValue(hostAgg.cpu), "CPU");
-  if (ramPeak != null) push(systemIdx, avgHighValue(hostAgg.mem), "RAM");
-  if (gpuPeak != null) push(systemIdx, avgHighValue(hostAgg.gpu), "GPU");
+  if (cpuPeak != null) {
+    const s = avgHighSplit(hostAgg.cpu);
+    push(systemIdx, s.value, "CPU", undefined, undefined, s.sub);
+  }
+  if (ramPeak != null) {
+    const s = avgHighSplit(hostAgg.mem);
+    push(systemIdx, s.value, "RAM", undefined, undefined, s.sub);
+  }
+  if (gpuPeak != null) {
+    const s = avgHighSplit(hostAgg.gpu);
+    push(systemIdx, s.value, "GPU", undefined, undefined, s.sub);
+  }
 
   // (#1973) Indices into `metrics`, not a second copy — one ordered list, one
   // grouping over it, so the two cannot drift apart. TURNS/TOKENS/CTX/
