@@ -2416,6 +2416,27 @@
         /// only locally — including the `machine.online` record emitted DURING
         /// the outage. The store was intact; only the read path lost it.
         #[test]
+        fn union_output_is_chronological_when_local_only_records_predate_redis() {
+            // (#2410 follow-up, measured live 2026-09-06) With Redis on, the
+            // route returned Redis's newest-10k FIRST and appended the 236
+            // local-only bookends the ring had pinned — so a 00:08 `dispatch
+            // start` sat at index 10000 behind 16:21 telemetry. The set was
+            // right; the order broke the "chronological" promise the route
+            // documents. The union sorts by `ts` (stable, so same-instant
+            // records keep write order).
+            let rec = |ts: &str, action: &str| serde_json::json!({ "ts": ts, "action": action, "handle": "h" });
+            let redis = vec![rec("2026-09-05T13:49:59Z", "telemetry.process"), rec("2026-09-05T16:21:49Z", "telemetry.process")];
+            let local = vec![rec("2026-09-05T00:08:17Z", "dispatch start"), rec("2026-09-05T13:01:32Z", "dispatch start")];
+            let out = super::union_flow_records(redis, local);
+            let ts: Vec<&str> = out.iter().filter_map(|r| r.get("ts").and_then(|v| v.as_str())).collect();
+            assert_eq!(
+                ts,
+                vec!["2026-09-05T00:08:17Z", "2026-09-05T13:01:32Z", "2026-09-05T13:49:59Z", "2026-09-05T16:21:49Z"],
+                "the union must be chronological, not redis-then-local"
+            );
+        }
+
+        #[test]
         fn redis_records_union_with_local_rather_than_replacing_them() {
             let rec = |ts: &str, action: &str| {
                 serde_json::json!({ "ts": ts, "action": action, "handle": "h" })
