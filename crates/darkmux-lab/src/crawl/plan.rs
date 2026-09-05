@@ -937,6 +937,14 @@ struct DiffSource<'a> {
     /// shape has either). Counted separately from `out_of_scope`: the diff
     /// DID touch these, there is simply nothing to plan a site from.
     diff_entries_without_hunks: usize,
+    /// (#2310 fix-loop round 2, item 1 — PROVEN) Paths the diff names
+    /// that are NOT in this source's tree at all. `out_of_scope` and
+    /// `diff_entries_without_hunks` are both computed over `files.all`,
+    /// so neither can ever see a DELETED file — a delete-only diff
+    /// produced zero units and an entirely empty ledger, which reads in
+    /// the envelope exactly like a clean review. Counted here so the
+    /// artifact says a deletion is what happened.
+    diff_entries_absent_from_tree: usize,
 }
 
 impl<'a> DiffSource<'a> {
@@ -965,7 +973,12 @@ impl<'a> DiffSource<'a> {
             files.all.iter().filter(|f| !by_file.contains_key(f.as_str()) && !mentioned.contains(f.as_str())).count();
         let diff_entries_without_hunks =
             files.all.iter().filter(|f| !by_file.contains_key(f.as_str()) && mentioned.contains(f.as_str())).count();
-        Self { files, skipped, source_id, by_file, out_of_scope, diff_entries_without_hunks }
+        // Counted from the DIFF's side, not the tree's — that is the
+        // whole point: these paths are absent from `files.all`.
+        let in_tree: std::collections::BTreeSet<&str> = files.all.iter().map(String::as_str).collect();
+        let diff_entries_absent_from_tree =
+            mentioned.iter().filter(|m| !in_tree.contains(m.as_str()) && !by_file.contains_key(m.as_str())).count();
+        Self { files, skipped, source_id, by_file, out_of_scope, diff_entries_without_hunks, diff_entries_absent_from_tree }
     }
 
     /// Files this source's tree has that the diff never MENTIONS at all —
@@ -983,6 +996,12 @@ impl<'a> DiffSource<'a> {
     /// these are not `out_of_scope`.
     fn diff_entries_without_hunks(&self) -> usize {
         self.diff_entries_without_hunks
+    }
+
+    /// (#2310 fix-loop round 2, item 1) See the field's own doc — the
+    /// deleted-file case neither counter above can represent.
+    fn diff_entries_absent_from_tree(&self) -> usize {
+        self.diff_entries_absent_from_tree
     }
 }
 
@@ -1202,9 +1221,13 @@ pub fn plan_diff_rule(materialized: &Materialized, rule: &Rule, diff_text: &str,
     // hard-failed three diffs that are perfectly readable and honestly
     // have nothing to plan — delete-only (every NEW side is `/dev/null`),
     // rename-only and binary-only (no `+++` line at all) — and blamed the
-    // operator's diff dialect for it. Those plan zero units honestly;
-    // they are already counted as entries without hunks below. Only text
-    // that names no file in ANY shape darkmux reads is refused.
+    // operator's diff dialect for it. Those plan zero units honestly and
+    // each lands a ledger entry below — a rename or a binary file as an
+    // entry WITHOUT HUNKS, a deletion as an entry ABSENT FROM THE TREE
+    // (`files.all` cannot contain a deleted path, so the without-hunks
+    // counter structurally never sees one — #2310 fix-loop round 2, item
+    // 1). Only text that names no file in ANY shape darkmux reads is
+    // refused.
     let names_a_file = diff_text.lines().any(|l| l.starts_with("+++ ") || l.starts_with("diff --git "));
     if !diff_text.trim().is_empty() && !names_a_file {
         anyhow::bail!(
@@ -1236,6 +1259,7 @@ pub fn plan_diff_rule(materialized: &Materialized, rule: &Rule, diff_text: &str,
     // scope would be a second, conflicting mutable borrow (E0499); the
     // informational push below runs only after `diff_source`'s last use.
     let entries_without_hunks = diff_source.diff_entries_without_hunks();
+    let entries_absent_from_tree = diff_source.diff_entries_absent_from_tree();
     // (#2310 P4c) `DiffSource::files()` itself has no opinion on a rule's
     // OWN `applies_to`/`exclude` — it returns every path the diff touches,
     // the same way `TreeSource` would if `SourceFiles::matching` weren't
@@ -1268,6 +1292,17 @@ pub fn plan_diff_rule(materialized: &Materialized, rule: &Rule, diff_text: &str,
             reason: format!(
                 "the diff mentions {entries_without_hunks} file(s) with no hunks (a pure rename \
                  or a binary file) — nothing to plan a site from"
+            ),
+            file: String::new(),
+            source: Some(source.id.clone()),
+        });
+    }
+    if entries_absent_from_tree > 0 {
+        skipped.push(SkippedEntry {
+            reason: format!(
+                "the diff names {entries_absent_from_tree} file(s) that are not in the workspace \
+                 tree (deleted by this diff, or belonging to another source) — nothing to plan a \
+                 site from"
             ),
             file: String::new(),
             source: Some(source.id.clone()),
@@ -2455,6 +2490,19 @@ line two
         let diff_text = ["diff --git a/gone.ts b/gone.ts", "deleted file mode 100644", "index 1234567..0000000", "--- a/gone.ts", "+++ /dev/null", "@@ -1,2 +0,0 @@", "-one", "-two", ""].join("\n");
         let plan = plan_diff_rule(&materialized, &site_rule(), &diff_text, PlanParams::default()).unwrap();
         assert!(plan.units.is_empty(), "nothing to review in a deletion: {:?}", plan.units);
+        // (#2310 fix-loop round 2, item 1 — PROVEN) The refusal's own
+        // comment claimed a deletion "is counted as an entry without
+        // hunks", but that counter is `files.all n mentioned` — TREE
+        // files — and a deleted file is by definition not in the tree.
+        // So a delete-only diff produced units=[] AND skipped=[], the
+        // empty-ledger shape the R1 refusal exists to avoid.
+        let note = plan
+            .totals
+            .skipped
+            .iter()
+            .find(|s| s.reason.contains("not in the workspace tree"))
+            .unwrap_or_else(|| panic!("the deleted entry is recorded: {:?}", plan.totals.skipped));
+        assert!(note.reason.contains('1'), "names how many: {}", note.reason);
     }
 
     /// (#2310 fix-loop R1) The rename-only case this test used to assert

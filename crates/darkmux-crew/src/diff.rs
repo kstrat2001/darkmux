@@ -82,6 +82,9 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
     let mut path: Option<String> = None;
     let mut cur: Option<Hunk> = None;
     let mut new_ln: u32 = 0;
+    // The open hunk's own declared extents, used only to decide whether
+    // it is FINISHED (#2310 fix-loop round 2, blocker) — see signal 3.
+    let mut declared = HunkHeader { old_start: 0, old_count: 0, new_start: 0, new_count: 0 };
 
     fn flush(files: &mut Vec<(String, Vec<Hunk>)>, path: &Option<String>, cur: &mut Option<Hunk>) {
         if let (Some(h), Some(p)) = (cur.take(), path) {
@@ -118,13 +121,23 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
         //      commonly omits the `--- ` half (see `mods::
         //      looks_like_unified_diff`), and at that point there is no
         //      hunk body for it to be content OF.
-        //   3. a lone `+++ <new>` whose NEXT line is a hunk header — the
-        //      other half-headered shape, a concatenation of per-file
-        //      `+++`/`@@` blocks with the `--- ` halves omitted. This adds
-        //      no exposure over (1)/(2): a `@@ -a,b +c,d @@` line already
-        //      closes the current hunk wherever it appears, so a content
-        //      line followed by one was never going to keep its hunk
-        //      anyway.
+        //   3. a lone `+++ <new>` whose NEXT line is a hunk header AND
+        //      whose currently-open hunk has already consumed the line
+        //      count its own `@@` declared — the other half-headered
+        //      shape, a concatenation of per-file `+++`/`@@` blocks with
+        //      the `--- ` halves omitted.
+        //
+        //      The completeness test is the whole load-bearing part
+        //      (#2310 fix-loop round 2, blocker — PROVEN). Without it,
+        //      signal 3 fired on an ordinary two-hunk file whenever an
+        //      added line whose content is `++ x` happened to sit right
+        //      before the second `@@`: that line was swallowed AND the
+        //      file's real second hunk bound to a phantom path `x`, so
+        //      every finding from hunk 2 onward silently dropped out of
+        //      the in-diff check. `@@` closing the open HUNK was never
+        //      the risk; rebinding the PATH was. A half-headered
+        //      concatenation always has a finished hunk at that point; a
+        //      mid-hunk content line does not.
         //
         // Anything else starting `+++ `/`--- ` is hunk CONTENT, which is
         // also why the old `!ln.starts_with("+++")` / `!ln.starts_with(
@@ -134,11 +147,19 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
         // `new_ln`, shifting every later line — the same class of bug B2
         // fixed for blank lines.
         //
-        // Known, accepted corner: a removed line whose content is `-- x`
-        // (raw `--- x`) immediately followed by an added line whose
-        // content is `++ y` (raw `+++ y`) reads as a header pair. Two
-        // adjacent adversarially-shaped content lines; strictly rarer
-        // than the cases above and no worse than the status quo ante.
+        // Known, accepted corner, stated at full cost (#2310 fix-loop
+        // round 2, item 3): a removed line whose content is `-- x` (raw
+        // `--- x`) immediately followed by an added line whose content is
+        // `++ y` (raw `+++ y`) reads as a header pair, and the damage is
+        // not cosmetic — the open hunk is TRUNCATED there, every line
+        // after the pair (trailing context included) is LOST from it, and
+        // the path rebinds to `y`, a file that never materializes in the
+        // tree. Findings in the lost tail then fail the in-diff check
+        // silently. Accepted only because it needs two adjacent
+        // adversarially-shaped content lines in that exact order, which
+        // no diff-producing tool emits; signal 1 has no completeness
+        // escape hatch the way signal 3 does, because a `--- `/`+++ `
+        // pair mid-hunk is not a shape any real concatenation produces.
         if ln.starts_with("--- ") {
             if let Some(next) = lines.get(i + 1).and_then(|n| n.strip_prefix("+++ ")) {
                 flush(&mut files, &path, &mut cur);
@@ -149,7 +170,23 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
             }
         }
         if let Some(rest) = ln.strip_prefix("+++ ") {
-            if cur.is_none() || lines.get(i + 1).is_some_and(|n| parse_hunk_header(n).is_some()) {
+            let hunk_finished = match cur.as_ref() {
+                None => true,
+                Some(h) => {
+                    // Lines consumed so far, read off the hunk itself:
+                    // the new-side cursor has advanced once per added and
+                    // per context line, and `old_block` holds exactly the
+                    // removed + context lines.
+                    let consumed_new = new_ln.saturating_sub(h.new_start);
+                    let consumed_old = h.old_block.len() as u32;
+                    // A pure-deletion hunk declares `+c,0`, so the
+                    // new-side test passes from the first line — fall back
+                    // to the old side for those rather than declaring the
+                    // hunk finished before it starts.
+                    consumed_new >= declared.new_count && (declared.new_count > 0 || consumed_old >= declared.old_count)
+                }
+            };
+            if hunk_finished && lines.get(i + 1).is_some_and(|n| parse_hunk_header(n).is_some()) {
                 flush(&mut files, &path, &mut cur);
                 path = header_path(rest);
                 i += 1;
@@ -157,14 +194,15 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
             }
         }
         i += 1;
-        if let Some((old_start, start)) = parse_hunk_header(ln) {
+        if let Some(h) = parse_hunk_header(ln) {
             flush(&mut files, &path, &mut cur);
             cur = Some(Hunk {
-                new_start: start,
-                old_start,
+                new_start: h.new_start,
+                old_start: h.old_start,
                 ..Default::default()
             });
-            new_ln = start;
+            new_ln = h.new_start;
+            declared = h;
             continue;
         }
         if cur.is_none() || path.is_none() {
@@ -257,13 +295,20 @@ fn header_path(rest: &str) -> Option<String> {
     // and because the file did "parse", the zero-files guard never fired
     // either, so the run read as a clean review. Unquoted BEFORE the
     // prefix strip: the quotes wrap the `b/` too.
+    //
+    // (#2310 fix-loop round 2, item 2) A value that LOOKS quoted but does
+    // not decode is REFUSED, not passed through raw. Falling back to the
+    // raw string bound a path containing quotes and backslash escapes —
+    // one that can never match any file on disk — so the file was absent
+    // from every in-diff check while the run still looked healthy. `None`
+    // here means the hunk binds no file, exactly like `/dev/null`; the
+    // caller's ledger (`plan.rs`) is where its absence is recorded.
     let owned;
-    let p = match unquote_c_path(p) {
-        Some(decoded) => {
-            owned = decoded;
-            owned.as_str()
-        }
-        None => p,
+    let p = if p.starts_with('"') {
+        owned = unquote_c_path(p)?;
+        owned.as_str()
+    } else {
+        p
     };
     // Only `b/` — the NEW side never carries `a/` in any dialect, and
     // stripping it there mangled a `--no-prefix` path under a top-level
@@ -277,10 +322,15 @@ fn header_path(rest: &str) -> Option<String> {
 }
 
 /// Decode one C-quoted path (`"a\303\251b"`), or `None` when `s` is not a
-/// complete `"`-wrapped value — an unterminated quote is left ALONE
-/// rather than half-decoded (#2310 fix-loop R4). Handles the escapes git
-/// emits: three-digit octal bytes (assembled and validated as UTF-8),
-/// `\\`, `\"`, and the `\a \b \f \n \r \t \v` set.
+/// complete `"`-wrapped value or its escapes do not assemble into valid
+/// UTF-8. Handles the escapes git emits: three-digit octal bytes
+/// (assembled and validated as UTF-8), `\\`, `\"`, and the
+/// `\a \b \f \n \r \t \v` set.
+///
+/// `None` is a REFUSAL, and [`header_path`] treats it as one for any
+/// value that starts with `"` (#2310 fix-loop round 2, item 2) — the
+/// earlier behavior of falling back to the raw quoted string bound an
+/// unmatchable path instead of declining to bind one.
 fn unquote_c_path(s: &str) -> Option<String> {
     let inner = s.strip_prefix('"')?.strip_suffix('"')?;
     let b = inner.as_bytes();
@@ -327,19 +377,37 @@ fn unquote_c_path(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Parse `@@ -a[,b] +c[,d] @@...` and return `(a, c)` — the OLD-file and
-/// NEW-file start lines — or `None` if `ln` isn't a hunk header.
+/// The four numbers a `@@ -a[,b] +c[,d] @@` header declares. The COUNTS
+/// are load-bearing, not decoration (#2310 fix-loop round 2): they are
+/// how `parse_diff` knows whether an open hunk has finished, which is
+/// what stops a `+++ ` CONTENT line sitting right before the next `@@`
+/// from being mistaken for a file header. An omitted count means 1.
+#[derive(Debug, Clone, Copy)]
+struct HunkHeader {
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+}
+
+/// Parse `@@ -a[,b] +c[,d] @@...` into a [`HunkHeader`], or `None` if
+/// `ln` isn't a hunk header.
 /// Hand-rolled equivalent of `re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", ln)`.
 ///
 /// (#2310 P4b review, M-B) Returns BOTH sides now (used to return only
 /// `c`) — `Hunk::old_start` needs `a` too. Every existing call site reads
 /// `.1` for what used to be the whole return value, so nothing downstream
 /// of the new-side number changed.
-fn parse_hunk_header(ln: &str) -> Option<(u32, u32)> {
+fn parse_hunk_header(ln: &str) -> Option<HunkHeader> {
     let rest = ln.strip_prefix("@@ -")?;
     let space = rest.find(' ')?;
-    let minus_digits = rest[..space].split(',').next()?;
-    let old_start: u32 = minus_digits.parse().ok()?;
+    let mut minus = rest[..space].split(',');
+    let old_start: u32 = minus.next()?.parse().ok()?;
+    // An omitted count means 1 (`@@ -a +c @@`), the unified-diff default.
+    let old_count: u32 = match minus.next() {
+        Some(d) => d.parse().ok()?,
+        None => 1,
+    };
     let after_minus = &rest[space + 1..];
     let plus_digits = after_minus.strip_prefix('+')?;
     let end = plus_digits
@@ -357,7 +425,14 @@ fn parse_hunk_header(ln: &str) -> Option<(u32, u32)> {
         return None;
     }
     let new_start: u32 = plus_digits[..end].parse().ok()?;
-    Some((old_start, new_start))
+    let new_count: u32 = match tail.strip_prefix(',') {
+        Some(after_comma) => {
+            let n = after_comma.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_comma.len());
+            after_comma[..n].parse().ok()?
+        }
+        None => 1,
+    };
+    Some(HunkHeader { old_start, old_count, new_start, new_count })
 }
 
 #[cfg(test)]
@@ -582,7 +657,6 @@ mod tests {
             ("+++ \"b/a\\\"b.ts\"", "a\"b.ts"),
             ("+++ \"b/a\\tb.ts\"", "a\tb.ts"),
             ("+++ b/plain.ts", "plain.ts"),
-            ("+++ \"b/unterminated.ts", "\"b/unterminated.ts"),
         ];
         for (header, want) in cases {
             let diff = format!("{header}\n@@ -1,1 +1,1 @@\n+y\n");
@@ -590,6 +664,56 @@ mod tests {
             assert_eq!(files.len(), 1, "{header}: {files:?}");
             assert_eq!(files[0].0, want, "{header}");
         }
+    }
+
+    /// (#2310 fix-loop round 2, item 2) A `"`-wrapped value that does NOT
+    /// decode is REFUSED, not bound raw. Binding the undecoded string
+    /// gives a path that can never match any file — the file is silently
+    /// absent from every in-diff check while the run still looks healthy.
+    /// `\377` is a lone 0xFF byte, which is not valid UTF-8; an
+    /// unterminated quote is malformed the same way.
+    #[test]
+    fn a_quoted_path_that_does_not_decode_binds_nothing() {
+        for header in ["+++ \"b/bad\\377name.ts\"", "+++ \"b/unterminated.ts"] {
+            let diff = format!("{header}\n@@ -1,1 +1,1 @@\n+y\n");
+            let files = parse_diff(&diff);
+            assert!(files.is_empty(), "{header} must bind no file, got {files:?}");
+        }
+    }
+
+    /// (#2310 fix-loop round 2, BLOCKER — proven) Header signal 3 (a lone
+    /// `+++ ` whose next line is a hunk header) fired regardless of
+    /// whether the OPEN hunk had finished. In a normal two-hunk file, an
+    /// added line whose content is `++ x` sitting right before the second
+    /// `@@` was read as a file header: the added line was swallowed AND
+    /// the file's real second hunk bound to a phantom path `x`, so every
+    /// finding in hunk 2 onward dropped out of the in-diff check
+    /// silently. Signal 3 now fires only when the open hunk has consumed
+    /// the line count its own `@@` header declared.
+    #[test]
+    fn signal_three_never_fires_while_the_open_hunk_is_still_short_of_its_declared_lines() {
+        let diff = [
+            "--- a/real.ts",
+            "+++ b/real.ts",
+            "@@ -1,3 +1,4 @@",
+            " a",
+            " b",
+            "+++ x",
+            "@@ -10,3 +10,3 @@",
+            " p",
+            "+q",
+            " r",
+            "",
+        ]
+        .join("\n");
+        let files = parse_diff(&diff);
+        assert_eq!(files.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["real.ts"], "no phantom file");
+        assert_eq!(files[0].1.len(), 2, "both hunks belong to real.ts: {:?}", files[0].1);
+        assert_eq!(files[0].1[0].added, vec!["++ x"], "the added line is content, not a header");
+        assert_eq!(files[0].1[0].new_lines, [1, 2, 3].into_iter().collect::<BTreeSet<u32>>());
+        assert_eq!(files[0].1[1].new_start, 10, "the second hunk keeps its own start");
+        assert_eq!(files[0].1[1].added, vec!["q"]);
+        assert_eq!(files[0].1[1].new_lines, [10, 11, 12].into_iter().collect::<BTreeSet<u32>>());
     }
 
     /// (#2310 fix-loop, review) No dialect emits `a/` on the `+++` side —
