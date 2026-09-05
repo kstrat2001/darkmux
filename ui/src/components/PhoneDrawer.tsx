@@ -27,7 +27,7 @@
  *
  * **Height, not transform, drives open/close.** Closed, `.phone-drawer`
  * has NO inline `height` — it falls back to `styles.css`'s own rule
- * (`calc(58px + env(safe-area-inset-bottom, 0px))`, just enough for the
+ * (`calc(var(--phone-drawer-closed-h) + env(safe-area-inset-bottom, 0px))`, just enough for the
  * handle+tabs, which is all that's visible). Open, an inline
  * `style={{ height: `${openPct}vh` }}` overrides that, and CSS `height`
  * genuinely transitions between the two (both are concrete lengths — no
@@ -46,7 +46,7 @@
  * wrapper is always mounted — this is what keeps `EventLogColumn` (and the
  * machine stats panel's own daemon polling, gated separately via
  * `onMachineOpenChange` below) from rendering/fetching while the sheet is
- * closed (58px tall — there is no room to show it anyway).
+ * closed (68px tall — there is no room to show it anyway).
  *
  * **Modal while open, at ANY height (operator finding, phone install
  * review):** the page behind is unusable while the drawer is open — body
@@ -121,6 +121,18 @@ const CLOSE_SNAP_PCT = 20;
  * threshold in spirit but tuned tighter since this now gates tap-vs-drag
  * on the SAME handle rather than distinguishing a swipe on a separate bar. */
 const TAP_SLOP_PX = 6;
+/** (operator finding on a real iPhone, 2026-09-05: "fast swipe doesn't
+ * send to max" / "it loses control") A release whose smoothed finger
+ * velocity is at least this many px/ms is a FLICK, not a drag-and-place:
+ * upward snaps the sheet to `MAX_OPEN_PCT`, downward closes it — the
+ * iOS sheet convention. Below it, the sheet stays where the finger
+ * stopped (the existing behavior). 0.6 px/ms is ~600 px/s; a deliberate
+ * slow drag on a phone is well under 0.3, a flick well over 1. */
+const FLING_PX_PER_MS = 0.6;
+/** Exponential-moving-average weight for the newest velocity sample —
+ * a single jittery pointer sample must not decide the flick on its own,
+ * and a finger that flicks then pauses must not read as a flick. */
+const VELOCITY_EMA_NEW = 0.4;
 
 function clampPct(pct: number): number {
   return Math.max(MIN_OPEN_PCT, Math.min(MAX_OPEN_PCT, pct));
@@ -212,7 +224,7 @@ export function PhoneDrawer({
   // glitch. `lib/drawerStorage.ts`'s own doc has the full story; this
   // state is never re-derived from `activeTab` again after mount.
   const [openPct, setOpenPct] = useState<number>(
-    () => loadDrawerHeightPct() ?? DEFAULT_OPEN_PCT,
+    () => clampPct(loadDrawerHeightPct() ?? DEFAULT_OPEN_PCT),
   );
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef<{
@@ -220,6 +232,11 @@ export function PhoneDrawer({
     startPct: number;
     startOpen: boolean;
     moved: boolean;
+    /** Last pointer sample, for the velocity estimate below. */
+    lastY: number;
+    lastT: number;
+    /** Smoothed finger velocity in px/ms, positive == upward. */
+    velocity: number;
   } | null>(null);
   // (iOS scroll-lock fix) The backdrop's own non-passive `touchmove`
   // listener needs a real DOM node to attach to — see that effect's own
@@ -394,12 +411,21 @@ export function PhoneDrawer({
       startPct: open ? openPct : 0,
       startOpen: open,
       moved: false,
+      lastY: e.clientY,
+      lastT: performance.now(),
+      velocity: 0,
     };
     setDragging(true);
   }
   function onHandlePointerMove(e: React.PointerEvent) {
     const drag = dragRef.current;
     if (!drag) return;
+    const now = performance.now();
+    const dt = Math.max(1, now - drag.lastT);
+    const sample = (drag.lastY - e.clientY) / dt; // positive == upward
+    drag.velocity = drag.velocity * (1 - VELOCITY_EMA_NEW) + sample * VELOCITY_EMA_NEW;
+    drag.lastY = e.clientY;
+    drag.lastT = now;
     const dy = drag.startY - e.clientY; // positive == dragged UP == taller
     if (Math.abs(dy) > TAP_SLOP_PX) drag.moved = true;
     if (!drag.moved) return;
@@ -409,16 +435,42 @@ export function PhoneDrawer({
     if (!open) setOpen(true);
     setOpenPct(nextPct);
   }
+  /** (operator finding, real iPhone: "it loses control") iOS Safari
+   * fires `pointercancel` — never `pointerup` — when it decides a fast
+   * touch is a pan gesture it wants for itself. Without this handler the
+   * drag ref stayed set, `dragging` stayed true (so the height
+   * transition stayed off), and the sheet froze wherever the last sample
+   * landed. A cancel finishes the drag exactly like a release, except
+   * that an un-moved cancel is NOT a tap. */
+  function onHandlePointerCancel(e: React.PointerEvent) {
+    finishDrag(e, /* isTap */ false);
+  }
   function onHandlePointerUp(e: React.PointerEvent) {
+    finishDrag(e, /* isTap */ true);
+  }
+  function finishDrag(e: React.PointerEvent, tapAllowed: boolean) {
     const drag = dragRef.current;
     dragRef.current = null;
     setDragging(false);
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
     if (!drag) return;
     if (!drag.moved) {
+      if (!tapAllowed) return;
       // A tap, not a drag (spec: "tapping ... the handle ... closes it").
       if (drag.startOpen) close();
       else openTab(activeTab);
+      return;
+    }
+    // A flick decides by velocity, not by where the finger stopped.
+    if (drag.velocity >= FLING_PX_PER_MS) {
+      setOpen(true);
+      setOpenPct(MAX_OPEN_PCT);
+      saveDrawerHeightPct(MAX_OPEN_PCT);
+      return;
+    }
+    if (drag.velocity <= -FLING_PX_PER_MS) {
+      setOpen(false);
+      setOpenPct(drag.startPct > 0 ? drag.startPct : DEFAULT_OPEN_PCT);
       return;
     }
     setOpenPct((pct) => {
@@ -459,7 +511,7 @@ export function PhoneDrawer({
         className={`phone-drawer${open ? " phone-drawer--open" : ""}${dragging ? " phone-drawer--dragging" : ""}`}
         data-act="phone-drawer"
         // (#2108, "one card" packet) Closed: NO inline height — falls
-        // back to `styles.css`'s own `calc(58px + env(safe-area-inset-
+        // back to `styles.css`'s own `calc(var(--phone-drawer-closed-h) + env(safe-area-inset-
         // bottom, 0px))` rule, just enough for the handle+tabs below.
         // Open: a REAL PIXEL height (`openHeightPx`'s own doc) — the
         // browser still transitions smoothly to/from the closed CSS
@@ -499,6 +551,7 @@ export function PhoneDrawer({
             onPointerDown={onHandlePointerDown}
             onPointerMove={onHandlePointerMove}
             onPointerUp={onHandlePointerUp}
+            onPointerCancel={onHandlePointerCancel}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
@@ -545,7 +598,7 @@ export function PhoneDrawer({
             section (`flex: 1`) inside the ONE sliding sheet rather than a
             second independently-animated element. The CONTENT inside
             stays gated on `open` so nothing renders/polls/fetches while
-            the sheet is closed (58px tall — there is no room for it
+            the sheet is closed (68px tall — there is no room for it
             anyway). */}
         <div
           className="phone-drawer__body"

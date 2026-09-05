@@ -1,4 +1,10 @@
 :root {
+  /* The phone drawer's COLLAPSED height (handle 24px + tab row 44px). The
+     drawer's own closed-height rule and `.app-shell`'s bottom reservation
+     both read this ONE value; `MissionCanvas.tsx` reads the shell's
+     resolved padding. A change here moves all three together (PR #2407's
+     round 2 shipped a 10px mismatch by editing one of two literals). */
+  --phone-drawer-closed-h: 68px;
   color-scheme: dark;
   /* ONE mono stack, because there were three and they disagreed (#2001).
      Measured with CDP on macOS Chrome, what each of the old ones actually
@@ -6295,7 +6301,7 @@ body {
    ONE card, `.phone-drawer` itself: the sole element carrying a
    background/border/border-radius, `position:fixed`+bottom-anchored, and
    the ONE thing whose `height` animates (closed → this rule's own
-   `calc(58px + env(safe-area-inset-bottom, 0px))`, open → an inline
+   `calc(var(--phone-drawer-closed-h) + env(safe-area-inset-bottom, 0px))`, open → an inline
    `openPct vh` `PhoneDrawer.tsx` sets). `.phone-drawer__bar` (handle,
    then the two tabs) is its FIRST child, pinned at the card's own top
    edge; `.phone-drawer__body` (the active tab's content, `flex: 1`) is
@@ -6313,7 +6319,7 @@ body {
    — the sheet would mount unstyled. Both halves must always agree. */
 @media (max-width: 768px), (pointer: coarse) and (max-width: 1024px) and (orientation: landscape) {
   .app-shell {
-    padding-bottom: calc(58px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(var(--phone-drawer-closed-h) + env(safe-area-inset-bottom, 0px));
   }
   /* (operator finding, real-device review) A DIMMED tap-catcher, sitting
      just BEHIND `.phone-drawer` (lower z-index) — while the drawer is
@@ -6389,7 +6395,7 @@ body {
        more (there is no content mounted to show anyway). `PhoneDrawer.tsx`
        overrides this with an inline `openPct vh` while open; the browser
        transitions between the two since both are concrete lengths. */
-    height: calc(58px + env(safe-area-inset-bottom, 0px));
+    height: calc(var(--phone-drawer-closed-h) + env(safe-area-inset-bottom, 0px));
     transition: height 220ms ease-out;
   }
   .phone-drawer--dragging {
@@ -6397,6 +6403,14 @@ body {
        (the base rule's `transition` above) the instant the pointer
        releases. */
     transition: none;
+    /* (operator finding, real iPhone: "it loses control") While a drag
+       is live the WHOLE sheet refuses browser pan/zoom gestures, so a
+       fast finger that leaves the 24px handle over the tab row or the
+       panel cannot hand the touch to iOS as a scroll mid-drag. The
+       handle's own `touch-action: none` only covers the handle. */
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
   }
   .phone-drawer__bar {
     flex: 0 0 auto;
@@ -6442,6 +6456,27 @@ body {
        fixed`) body — this is the ONE scrollable region inside the sheet
        that's allowed to scroll at all. */
     overscroll-behavior: contain;
+  }
+  /* (operator finding — real device, Machine tab) `.hx-section` (below)
+     carries its own separator spacing (`margin-top: 16px` + `border-top:
+     1px` + `padding-top: 14px` — 31px total) so one titled block reads as
+     visually distinct from the PREVIOUS block above it. The Machine tab's
+     "General" section is always the FIRST thing `machineStatsContent.tsx`
+     renders into this panel (`aboutSection` leads `body`'s own fragment),
+     so there is no previous section for that spacing to separate FROM —
+     it just stacked on top of this panel's own 12px `padding-top`, putting
+     43px of dead space between the tab row and the first legible text
+     (measured; roughly 3-4x this sheet's own 8-12px gutter, and the
+     Events tab's own `.eventlog__head` padding sits at the low end of
+     that range by comparison). Same `:first-child` convention this file
+     already uses for `.power-block .dialog__kv:first-child` above —
+     scoped to THIS panel so the desktop `<Dialog>` rendering of the exact
+     same `body` (`MachineDrawer.tsx`, `className="dialog--machine"`)
+     keeps its own separator above "General" untouched. */
+  .phone-drawer__panel > .hx-section:first-child {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
   }
   /* The Events tab's OWN `EventLogColumn` instance fills the panel
      exactly, overriding the general phone-width `.eventlog` rule
@@ -6541,9 +6576,19 @@ body {
   .phone-drawer__handle {
     display: flex;
     justify-content: center;
-    padding: 6px 0 4px;
+    /* (#2107 follow-up, operator finding on a real phone: "hard to drag")
+       The visible bar is 4px; the HIT target was 6+4+4 = 14px, well under
+       a fingertip. 12px above / 8px below makes the target 24px without
+       moving the bar visually much. The closed-height rule on
+       `--phone-drawer-closed-h` on `:root` sums this (24 + 44 tab row = 68px). */
+    padding: 12px 0 8px;
     cursor: pointer;
     touch-action: none;
+    /* A held finger on the handle must not raise iOS's selection/callout
+       UI over the drag. */
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
   .phone-drawer__handle-bar {
     width: 36px;

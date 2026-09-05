@@ -193,3 +193,66 @@ test.describe('every lens ends above the collapsed phone drawer', () => {
     }
   });
 });
+
+// (operator finding, real device — the OPEN drawer's own top inset) The
+// tests above are about the COLLAPSED drawer's bar; this one is about the
+// OPEN drawer's own body. On a real phone the Machine tab left ~43px of
+// dead space between the tab row and the first legible text ("General") —
+// `.hx-section`'s own separator spacing (16px margin + 1px border + 14px
+// padding, meant to divide one titled block from the PREVIOUS one) stacked
+// on top of `.phone-drawer__panel`'s own 12px `padding-top`, even though
+// "General" is always the FIRST thing the panel renders and has no
+// previous section to separate from. The Events tab's own head padding
+// already sits at this sheet's intended 8-12px gutter — the fix must not
+// widen that one while narrowing the other.
+test.describe('phone drawer open: content starts right under the tab row, not ~40px under it', () => {
+  const GUTTER_MAX_PX = 16;
+
+  /** Opens the sheet to `tab` from `url`, waiting for `ready` (a hook proving
+   * the underlying lens actually mounted — see this file's own doc on why
+   * every route here waits for one before measuring) and for the sheet's
+   * own open state, so a measurement never race against the open transition. */
+  async function openDrawerTab(page, url, ready, tab) {
+    await page.goto(url);
+    await expect(page.locator(ready).first(), `${url} never rendered`).toBeVisible();
+    await page.locator(`[data-act="phone-drawer-tab-${tab}"]`).click();
+    await expect(page.locator('.phone-drawer')).toHaveClass(/phone-drawer--open/);
+  }
+
+  /** The tab row's own bottom edge, and the top of `sel` (this tab's own
+   * "first real content row" hook) — both real painted boxes, not inferred
+   * from any CSS value, so the assertion holds regardless of which rule
+   * ends up producing the gutter. */
+  async function gapAbove(page, sel) {
+    return page.evaluate((sel) => {
+      const bar = document.querySelector('.phone-drawer__bar');
+      const first = document.querySelector(sel);
+      if (!bar || !first) return { barBottom: null, top: null, gap: null };
+      const barBottom = bar.getBoundingClientRect().bottom;
+      const top = first.getBoundingClientRect().top;
+      return { barBottom, top, gap: top - barBottom };
+    }, sel);
+  }
+
+  test('Machine info tab: the General section starts within the gutter', async ({ page }) => {
+    await openDrawerTab(page, '/index.html#lens=fleet', '.savrow', 'machine');
+    // The panel's own first child — whichever section
+    // `machineStatsContent.tsx` renders first (always "General" today, per
+    // that file's own doc), independent of which row inside it happens to
+    // carry the first legible label.
+    const { gap } = await gapAbove(page, '.phone-drawer__panel > *:first-child');
+    expect(gap, 'the Machine tab panel never mounted a first section').not.toBeNull();
+    expect(gap, `first section starts ${gap}px below the tab row (want <= ${GUTTER_MAX_PX}px)`).toBeLessThanOrEqual(
+      GUTTER_MAX_PX,
+    );
+  });
+
+  test('Events tab: the search row starts within the gutter', async ({ page }) => {
+    await openDrawerTab(page, '/index.html#lens=fleet', '.savrow', 'events');
+    const { gap } = await gapAbove(page, '.phone-drawer__body .eventlog__searchbox input');
+    expect(gap, 'the Events tab never mounted its search row').not.toBeNull();
+    expect(gap, `search row starts ${gap}px below the tab row (want <= ${GUTTER_MAX_PX}px)`).toBeLessThanOrEqual(
+      GUTTER_MAX_PX,
+    );
+  });
+});
