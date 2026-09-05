@@ -25,7 +25,8 @@
 //! module's `BookendGuard`) still emitted competing vocabulary from
 //! INSIDE `run_review_graph`, nested inside `with_dispatch_bookends`'s
 //! own already-correct outer wrap — retired in favor of that outer wrap
-//! alone (see `run_review_graph`'s doc in `darkmux-lab::lab::review`).
+//! alone (`run_review_graph` and the review funnel that owned it were
+//! themselves later deleted outright in #2310 P4d).
 //!
 //! This module intentionally knows nothing about `FlowRecord`'s domain
 //! meaning beyond its existence — callers build every `started`/`finished`/

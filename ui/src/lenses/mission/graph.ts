@@ -290,6 +290,12 @@ export function isAiKind(kind: string | undefined): boolean {
   if (kind.endsWith("-render") || kind.endsWith("-collect")) return false;
   if (kind.indexOf("dispatch.") === 0) return true;
   if (kind === "mission.coder" || kind === "mission.verify") return true;
+  // (#2310 P4d; #2404 P4d round 3) The `review.probe`/`review.judge`/
+  // `review.verify` funnel step kinds this special-case matches were
+  // deleted along with the review funnel itself — `review` today runs
+  // through the generic `dispatch.*`/`mission.*` kinds matched above. This
+  // branch stays only to keep rendering HISTORICAL records emitted by a
+  // run from before that deletion; no live config can mint these kinds.
   if (kind.indexOf("review.probe") === 0 || kind.indexOf("review.judge") === 0 || kind.indexOf("review.verify") === 0)
     return true;
   return false;

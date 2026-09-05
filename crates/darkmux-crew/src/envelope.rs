@@ -13,9 +13,10 @@
 //! every future mission-type driver can reuse, while the mission-specific
 //! payload rides untouched in [`MissionEnvelope::payload`].
 //!
-//! **Producers and consumers.** A mission driver (today: `run_review_graph`
-//! via `src/pr_review.rs`'s conversion; future: any config-launched mission,
-//! #1284 Packet 3+) builds a `MissionEnvelope` at the end of its run and
+//! **Producers and consumers.** A mission driver (originally: the retired
+//! review funnel's `run_review_graph` via the long-retired `src/pr_review.rs`'s
+//! conversion; today: any config-launched mission, #1284 Packet 3+) builds a
+//! `MissionEnvelope` at the end of its run and
 //! hands it to [`finalize_mission`], which drives the phase/mission
 //! terminal transitions in [`crate::lifecycle`]. The SAME envelope is the
 //! natural artifact for the mission board (`darkmux mission status`) and

@@ -1704,55 +1704,40 @@ fn build_hooks_check(
     out
 }
 
-/// (#1876/#1877; #2310 P4d) The `review{}` config block's judge knobs —
-/// `judge_fail_on_any_skip` and `judge_concurrency` — are INERT. They
-/// governed the retired review funnel's judge stage; that pipeline, its ten
-/// step kinds and its launcher were deleted in #2310 P4d, and today's
-/// `review` mission has no judge stage for either knob to reach. The keys
-/// still LOAD (config is lenient on read, so an existing `config.json` is
-/// never bricked by them) — which is exactly why an operator needs to be
-/// told here rather than left believing a setting is doing something.
+/// (#1876/#1877; #2310 P4d; #2404 P4d round 3) The `review{}` config block
+/// (`judge_fail_on_any_skip` / `judge_concurrency`) was REMOVED from
+/// `DarkmuxConfig` in CONFIG_SCHEMA_VERSION 1.22 — the review funnel those
+/// knobs tuned was deleted in #2310 P4d, and darkmux is pre-1.0 (no
+/// deprecate-in-place; remove outright). Because the field is gone, a
+/// `config.json` still carrying a `review` key lands it in the top-level
+/// `extras` overflow (lenient-on-read) instead of a typed field — this
+/// check looks THERE, not at a typed accessor that no longer exists.
 ///
-/// `Warn` only when one is actually SET; a machine that never set them has
-/// nothing to act on and gets a `Pass` saying so.
+/// `Pass` when `extras` has no `review` key at all (the common case, and
+/// the case `DarkmuxConfig::with_defaults()` must produce — a regression
+/// here is exactly what let the round-2 field survive one review pass).
+/// `Warn`, naming the key, when an old config still has it.
 fn check_review_judge_exhaustion_policy() -> Check {
-    let name = "review.judge_* (inert)";
-    let env_set = std::env::var("DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP")
-        .ok()
-        .is_some_and(|s| !s.trim().is_empty());
-    let review = darkmux_types::config::DarkmuxConfig::load_resolved().review;
-    let skip_set = review.as_ref().and_then(|r| r.judge_fail_on_any_skip).is_some();
-    let concurrency_set = review.as_ref().and_then(|r| r.judge_concurrency).is_some();
-    if !env_set && !skip_set && !concurrency_set {
+    let name = "review.judge_* (removed)";
+    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
+    if !cfg.extras.contains_key("review") {
         return Check {
             name: name.into(),
             status: Status::Pass,
-            message: "not set — nothing reads these keys since the review funnel retired (#2310 P4d)"
-                .into(),
+            message: "not present".into(),
             hint: None,
         };
-    }
-    let mut set: Vec<&str> = Vec::new();
-    if env_set {
-        set.push("DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP (env)");
-    }
-    if skip_set {
-        set.push("review.judge_fail_on_any_skip");
-    }
-    if concurrency_set {
-        set.push("review.judge_concurrency");
     }
     Check {
         name: name.into(),
         status: Status::Warn,
         message: format!(
-            "{} is set but has NO effect — the review funnel's judge stage retired in #2310 P4d, \
-             and today's `review` mission has no judge stage to configure",
-            set.join(", ")
+            "config.json has a `review` key — removed in CONFIG {}; delete it from config.json",
+            darkmux_types::config::CONFIG_SCHEMA_VERSION
         ),
         hint: Some(
-            "remove the key(s) from ~/.darkmux/config.json (and unset the env var) — they are read \
-             leniently and ignored, never applied"
+            "the review funnel this block configured was deleted in #2310 P4d; remove the \
+             `review` block from ~/.darkmux/config.json — it is read leniently but has no effect"
                 .into(),
         ),
     }
@@ -6794,6 +6779,82 @@ mod tests {
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("from config.json"), "provenance named: {}", check.message);
         assert!(!check.message.contains("env"), "the env tier is absent here: {}", check.message);
+    }
+
+    // ─── (#2404 P4d round 3) check_review_judge_exhaustion_policy — removed field ─
+
+    #[serial_test::serial]
+    #[test]
+    fn check_review_judge_removed_passes_when_review_key_absent() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("config.json"), r#"{"schema_version":"1.22"}"#).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_review_judge_exhaustion_policy();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    /// The test that would have caught round 2's regression: a config
+    /// produced by `DarkmuxConfig::with_defaults()` itself — the exact
+    /// shape `darkmux init` writes — must Pass this check. Round 2 shipped
+    /// `with_defaults()` still populating a `review` block, which this
+    /// check (had it existed then) would have flagged as Warn on a
+    /// brand-new, never-hand-edited config.
+    #[serial_test::serial]
+    #[test]
+    fn check_review_judge_removed_passes_against_with_defaults() {
+        use darkmux_types::config::DarkmuxConfig;
+        let home = tempfile::TempDir::new().unwrap();
+        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
+        std::fs::write(home.path().join("config.json"), contents).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_review_judge_exhaustion_policy();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "with_defaults() must never itself trip the removed-key warning: {}",
+            check.message
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_review_judge_removed_warns_and_names_the_key_when_present() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"schema_version":"1.21","review":{"judge_concurrency":1}}"#,
+        )
+        .unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_review_judge_exhaustion_policy();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("review"), "names the key: {}", check.message);
+        assert!(
+            check.message.contains(darkmux_types::config::CONFIG_SCHEMA_VERSION),
+            "names the schema version it was removed in: {}",
+            check.message
+        );
     }
 
     // ─── (#2111) check_telemetry_record_every_samples — resolved state + provenance ─

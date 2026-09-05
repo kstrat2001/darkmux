@@ -574,13 +574,16 @@ fn mission_config_show_review_names_every_phase_and_flags_unconstructible_kinds(
     }
 }
 
-/// (#2310 P4c-2 review item 3 — proven) `mission config show review`
-/// must render its `bundler` input's `ignored`/`ignored_reason` — both in
-/// `--json` (typed fields, always present) and in the text form (`(optional,
-/// ignored: <reason>)`), so an operator sees the same signal launch-time
-/// gives without having to launch first.
+/// (#2310 P4c-2 review item 3 — proven; #2404 P4d round 3: `bundler` this
+/// test originally used was removed outright — see review.json's own
+/// `inputs` doc — so it now proves the same rendering against `mode`,
+/// review's other still-ignored CLI-parity input.) `mission config show
+/// review` must render an ignored input's `ignored`/`ignored_reason` —
+/// both in `--json` (typed fields, always present) and in the text form
+/// (`(optional, ignored: <reason>)`), so an operator sees the same signal
+/// launch-time gives without having to launch first.
 #[test]
-fn mission_config_show_review_renders_the_ignored_bundler_input() {
+fn mission_config_show_review_renders_the_ignored_mode_input() {
     let tmp = TempDir::new().unwrap();
     let json_out = Command::cargo_bin("darkmux")
         .unwrap()
@@ -590,15 +593,15 @@ fn mission_config_show_review_renders_the_ignored_bundler_input() {
         .expect("mission config show review --json runs");
     assert!(json_out.status.success(), "stderr: {}", String::from_utf8_lossy(&json_out.stderr));
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&json_out.stdout)).expect("valid JSON");
-    let bundler = v["inputs"]
+    let mode = v["inputs"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["name"] == serde_json::json!("bundler"))
-        .expect("the bundler input is listed");
-    assert_eq!(bundler["ignored"], serde_json::json!(true), "{bundler}");
-    let reason = bundler["ignored_reason"].as_str().expect("a reason string");
-    assert!(!reason.is_empty(), "{bundler}");
+        .find(|i| i["name"] == serde_json::json!("mode"))
+        .expect("the mode input is listed");
+    assert_eq!(mode["ignored"], serde_json::json!(true), "{mode}");
+    let reason = mode["ignored_reason"].as_str().expect("a reason string");
+    assert!(!reason.is_empty(), "{mode}");
 
     let text_out = Command::cargo_bin("darkmux")
         .unwrap()
@@ -609,7 +612,7 @@ fn mission_config_show_review_renders_the_ignored_bundler_input() {
     assert!(text_out.status.success(), "stderr: {}", String::from_utf8_lossy(&text_out.stderr));
     let text = String::from_utf8_lossy(&text_out.stdout);
     assert!(
-        text.contains(&format!("bundler (optional, ignored: {reason})")),
+        text.contains(&format!("mode (optional, ignored: {reason})")),
         "text output must render the ignored form:\n{text}"
     );
 
@@ -3284,81 +3287,6 @@ fn crawl_dry_run_prunes_the_rules_the_launch_did_not_select() {
     );
     // Mutation guard: if the selection stopped pruning, these would match.
     assert_ne!(all_out, one_out, "`--param rules=` must change the minted graph");
-}
-
-/// (#2310 P4c review round 2, item (f) — proven) `review.json`'s
-/// `bundler` input was documented as "accepted and ignored" with no actual
-/// warning — a silent no-op that would leave an operator carrying the
-/// funnel's `bundler=` param over from the frozen `review` config with no
-/// signal that it does nothing here. `--param bundler=<anything>` must now
-/// print a named warning naming what it's ignored for, on the SAME
-/// `--dry-run` path (before any real dispatch), so the signal is visible
-/// with zero cost.
-#[test]
-fn review_dry_run_warns_when_bundler_is_passed() {
-    let workdir = TempDir::new().unwrap();
-    let home = TempDir::new().unwrap();
-    let workspace_root = workdir.path().join("tree");
-    fs::create_dir_all(&workspace_root).unwrap();
-    let spec_path = workdir.path().join("workspace.json");
-    fs::write(
-        &spec_path,
-        serde_json::json!({
-            "name": "review-fixture",
-            "sources": [{"id": "app", "path": workspace_root.to_string_lossy(), "ref": "main"}]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let diff_path = workdir.path().join("d.diff");
-    fs::write(&diff_path, "").unwrap();
-
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--dry-run",
-            "--param",
-            &format!("workspace={}", spec_path.display()),
-            "--param",
-            &format!("diff_file={}", diff_path.display()),
-            "--param",
-            "bundler=/usr/bin/true",
-        ])
-        .env("DARKMUX_HOME", home.path())
-        .output()
-        .expect("mission launch review --dry-run runs");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("bundler") && stderr.contains("ignored"),
-        "a `bundler` param on review must warn that it is ignored: {stderr}"
-    );
-
-    // Negative leg: no `bundler` param, no warning.
-    let quiet = Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "mission",
-            "launch",
-            "review",
-            "--dry-run",
-            "--param",
-            &format!("workspace={}", spec_path.display()),
-            "--param",
-            &format!("diff_file={}", diff_path.display()),
-        ])
-        .env("DARKMUX_HOME", home.path())
-        .output()
-        .expect("mission launch review --dry-run runs");
-    assert!(quiet.status.success(), "stderr: {}", String::from_utf8_lossy(&quiet.stderr));
-    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
-    assert!(
-        !quiet_stderr.contains("bundler"),
-        "no `bundler` param means no warning: {quiet_stderr}"
-    );
 }
 
 /// (#2310 P4c-2 item 4 — proven structurally) A SYNTHETIC config (not

@@ -223,29 +223,33 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
     })
 }
 
-/// The refspecs a darkmux mirror fetches, applied idempotently (an
-/// `--add` of a spec already present would duplicate it, and git then
-/// fetches it twice).
+/// The pull-request head namespace's own refspec — see
+/// [`fetch_pull_heads_once`] for why this is NOT in [`ensure_fetch_refspecs`]'s
+/// unconditional set.
+const PULL_HEADS_REFSPEC: &str = "+refs/pull/*/head:refs/pull/*/head";
+
+/// The refspecs a darkmux mirror fetches on EVERY clone/fetch, applied
+/// idempotently (an `--add` of a spec already present would duplicate it,
+/// and git then fetches it twice).
 ///
 /// - `+refs/heads/*` — branches, force-updated so a rewritten branch
 ///   advances. `git clone --bare` does NOT configure this the way a normal
 ///   clone does, which is why it is set explicitly.
 /// - `+refs/tags/*` — `+` force-update, same reason: git's default
 ///   auto-follow-tags won't move an EXISTING local tag ref that diverged.
-/// - `+refs/pull/*/head` (#2310 P4d) — **the fork-PR fix.** A pull request
-///   from a FORK has no branch in this repository, so its head commit is
-///   reachable only from `refs/pull/<n>/head`. Without this refspec the
-///   mirror never fetches it and the checkout fails with git's opaque
-///   "Needed a single revision" — the reviewer reproduced exactly that
-///   against a fork PR. GitHub serves the namespace read-only; a host that
-///   does not have it simply matches nothing, so this costs nothing
-///   elsewhere.
+///
+/// `+refs/pull/*/head` (the fork-PR fix, #2310 P4d) is deliberately NOT
+/// here any more — see [`fetch_pull_heads_once`]'s own doc for why #2404
+/// P4d round 3 moved it off the unconditional path.
 fn ensure_fetch_refspecs(mirror_path: &Path, source_id: &str) -> Result<()> {
-    const REFSPECS: [&str; 3] = [
-        "+refs/heads/*:refs/heads/*",
-        "+refs/tags/*:refs/tags/*",
-        "+refs/pull/*/head:refs/pull/*/head",
-    ];
+    add_fetch_refspecs(mirror_path, source_id, &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"])
+}
+
+/// Idempotently `config --add remote.origin.fetch <spec>` for every spec
+/// not already present. Shared by [`ensure_fetch_refspecs`] (the
+/// unconditional heads+tags set) and [`fetch_pull_heads_once`] (the
+/// miss-recovery-only pull-heads set) so both add refspecs the same way.
+fn add_fetch_refspecs(mirror_path: &Path, source_id: &str, specs: &[&str]) -> Result<()> {
     let existing = Command::new("git")
         .current_dir(mirror_path)
         .args(["config", "--get-all", "remote.origin.fetch"])
@@ -258,7 +262,7 @@ fn ensure_fetch_refspecs(mirror_path: &Path, source_id: &str) -> Result<()> {
     } else {
         Vec::new()
     };
-    for spec in REFSPECS {
+    for spec in specs {
         if have.iter().any(|h| h == spec) {
             continue;
         }
@@ -269,6 +273,46 @@ fn ensure_fetch_refspecs(mirror_path: &Path, source_id: &str) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// **Miss-recovery only — the fork-PR fix, re-scoped (#2404 P4d round 3).**
+/// `+refs/pull/*/head` used to be part of every mirror's UNCONDITIONAL
+/// fetch, on the doc-comment claim that "GitHub serves the namespace
+/// read-only... this costs nothing elsewhere". Measured against a real
+/// clone of kstrat2001/darkmux (2026-09): a warm (second, no-op) `git
+/// fetch --prune` was ~0.3s slower with the pull refspec configured than
+/// without it — inside the ~3s budget — but the pull namespace itself
+/// (1331 refs vs. 374 heads+tags on this repo) pulled the mirror's ON-DISK
+/// size from 39MB to 778MB, roughly 739MB over the ~50MB budget. That is
+/// not "costs nothing" for an operator's disk on every single source this
+/// crawl/review pipeline ever touches, the overwhelming majority of which
+/// are same-repo branches that never need the pull namespace at all.
+///
+/// So the pull refspec is now fetched exactly once, ONLY when the ordinary
+/// heads+tags fetch already ran and the requested ref still doesn't
+/// resolve — i.e. only for the fork-PR case this refspec exists to fix.
+/// Idempotent like its sibling: adds the refspec to `remote.origin.fetch`
+/// if not already present (so a SECOND miss on the same mirror is a
+/// no-op add, not a duplicate), then runs one `git fetch` scoped to just
+/// that refspec.
+fn fetch_pull_heads_once(mirror_path: &Path, source_id: &str) -> Result<()> {
+    add_fetch_refspecs(mirror_path, source_id, &[PULL_HEADS_REFSPEC])?;
+    run_git(
+        Some(mirror_path),
+        &["fetch", "--prune", "origin", PULL_HEADS_REFSPEC],
+        &format!("fetching the pull-heads namespace for source '{source_id}' (ref not found in heads/tags)"),
+    )?;
+    Ok(())
+}
+
+/// Whether a mirror clone should pass `--no-hardlinks` — see the call
+/// site's own comment for the measured cost. `&[]` (no flag, hardlinking
+/// allowed) for a LOCAL `path` origin; `&["--no-hardlinks"]` (forced copy)
+/// for a `git` (remote) origin, where the flag is a no-op anyway (git
+/// never hardlinks across a network clone) but costs nothing to keep as
+/// the explicit, doc-carrying default.
+fn no_hardlinks_flag(source: &SourceSpec) -> &'static [&'static str] {
+    if source.path.is_some() { &[] } else { &["--no-hardlinks"] }
 }
 
 fn resolve_one(
@@ -331,9 +375,27 @@ fn resolve_one(
                 source.id
             );
         }
+        // (#2404 P4d round 3) `--no-hardlinks` forces a real byte-for-byte
+        // object COPY even when the origin is a local directory git could
+        // otherwise hardlink into instead. Measured against a 769MB local
+        // mirror: with `--no-hardlinks` the clone duplicated the full
+        // ~766MB of objects (0.76s); with hardlinking allowed, the clone's
+        // OWN genuinely-new disk footprint was ~108KB (0.05s) — objects
+        // shared with the source via hardlink rather than copied. That
+        // cost is only worth paying for a REMOTE (`git`) origin, where
+        // git's own clone protocol never hardlinks in the first place (the
+        // flag is a no-op there) and where a mid-clone crash leaving a
+        // hardlinked-into-nowhere mirror isn't a risk at all — the origin
+        // isn't even on this filesystem. For a LOCAL `path` origin, the
+        // flag turns every crawl/review source into a full duplicate of
+        // its own already-on-disk repository for no benefit.
+        let mirror_path_str = mirror_path.to_string_lossy();
+        let mut clone_args: Vec<&str> = vec!["clone", "--bare"];
+        clone_args.extend_from_slice(no_hardlinks_flag(source));
+        clone_args.extend_from_slice(&["--", origin, &mirror_path_str]);
         run_git(
             None,
-            &["clone", "--bare", "--no-hardlinks", "--", origin, &mirror_path.to_string_lossy()],
+            &clone_args,
             &format!("cloning source '{}' ({origin})", source.id),
         )?;
         // See `ensure_fetch_refspecs` for what is configured and why.
@@ -355,15 +417,32 @@ fn resolve_one(
     }
 
     let git_ref = source.resolved_ref();
-    let rev_out = Command::new("git")
-        .current_dir(&mirror_path)
-        // `--end-of-options` is rev-parse's "stop parsing options" marker
-        // that still treats what follows as a revision — plain `--` before
-        // a rev-parse positional means "everything after is a path" and
-        // breaks every valid ref.
-        .args(["rev-parse", "--verify", "--end-of-options", &format!("{git_ref}^{{commit}}")])
-        .output()
-        .with_context(|| format!("running git rev-parse for source '{}'", source.id))?;
+    let rev_parse_ref = |mirror_path: &Path| -> Result<std::process::Output> {
+        Command::new("git")
+            .current_dir(mirror_path)
+            // `--end-of-options` is rev-parse's "stop parsing options" marker
+            // that still treats what follows as a revision — plain `--` before
+            // a rev-parse positional means "everything after is a path" and
+            // breaks every valid ref.
+            .args(["rev-parse", "--verify", "--end-of-options", &format!("{git_ref}^{{commit}}")])
+            .output()
+            .with_context(|| format!("running git rev-parse for source '{}'", source.id))
+    };
+    let mut rev_out = rev_parse_ref(&mirror_path)?;
+    // (#2404 P4d round 3) The pull-heads namespace is no longer fetched
+    // unconditionally — see `fetch_pull_heads_once`'s own doc for the
+    // measured cost that moved it here. A miss against the ordinary
+    // heads+tags mirror is retried EXACTLY ONCE against that namespace —
+    // gated on `fetch` (mirrors both `git` and `path` origins: a `--no-
+    // fetch` run promised fully-offline behavior against whatever's
+    // already mirrored, so it must not reach out for a recovery fetch
+    // either) — which is what makes a fork PR's head resolve without
+    // paying the pull namespace's cost for every same-repo source that
+    // never needed it.
+    if !rev_out.status.success() && fetch {
+        fetch_pull_heads_once(&mirror_path, &source.id)?;
+        rev_out = rev_parse_ref(&mirror_path)?;
+    }
     if !rev_out.status.success() {
         bail!(
             "ref '{git_ref}' not found for source '{}' (git rev-parse failed): {}",
@@ -1059,6 +1138,41 @@ mod tests {
 
     const RW: MaterializeOptions = MaterializeOptions { fetch: true, read_only: false };
     const RO: MaterializeOptions = MaterializeOptions { fetch: true, read_only: true };
+
+    /// (#2404 P4d round 3) `--no-hardlinks` is the right default for a
+    /// REMOTE `git` origin (git never hardlinks across a network clone
+    /// anyway) but forces a full byte-for-byte object copy for a LOCAL
+    /// `path` origin that could otherwise share objects with the source
+    /// via hardlink — measured against a 769MB local mirror: ~766MB
+    /// duplicated with the flag vs. ~108KB of genuinely new disk without
+    /// it. See `no_hardlinks_flag`'s own doc.
+    #[test]
+    fn no_hardlinks_flag_is_absent_for_a_local_path_origin_and_present_for_a_git_origin() {
+        let path_source = SourceSpec {
+            id: "app".to_string(),
+            git: None,
+            path: Some("/tmp/some/local/repo".to_string()),
+            git_ref: None,
+            extras: Default::default(),
+        };
+        assert!(
+            no_hardlinks_flag(&path_source).is_empty(),
+            "a local path origin must allow hardlinking, not force a copy"
+        );
+
+        let git_source = SourceSpec {
+            id: "app".to_string(),
+            git: Some("https://github.com/kstrat2001/darkmux".to_string()),
+            path: None,
+            git_ref: None,
+            extras: Default::default(),
+        };
+        assert_eq!(
+            no_hardlinks_flag(&git_source),
+            &["--no-hardlinks"],
+            "a remote git origin keeps the explicit --no-hardlinks default"
+        );
+    }
 
 
     /// (#2310 P4d — RED before `ensure_fetch_refspecs` added the pull

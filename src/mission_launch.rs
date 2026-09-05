@@ -47,28 +47,20 @@
 //! graphs with NO gate semantics (a Tier-1-only graph); a freeform config
 //! mints + starts and finalizes nothing.
 //!
-//! `review` (the 3-phase PR-review config, #1284 Packet 4b, the clean verb
-//! break that retired `darkmux pr-review run`) is executable through this
-//! verb too, but via a DEDICATED launcher (the retired review funnel launcher)
-//! rather than steps 2-4 above: `launch` branches to it as early as
-//! possible (right after config load + validation, before this module's own
-//! `--input`/`--param` collection or its generic header banner — review's
-//! rendered payload is a stdout CONTRACT the CI workflow parses, so nothing
-//! decorative may precede it). `review.*` Tier 3 kinds need crew-staffing
-//! resolution (`staffing`, `judge_concurrency` — see `templates/
-//! builtin/mission-configs/review.json`'s own `inputs` doc) that
-//! `crates/darkmux-lab/src/lab/review.rs::build_review_graph` already knows
-//! how to do — the retired review funnel launcher is a NEW CALLER of that
-//! SAME driver (the former `pr_review.rs::run_dispatch`), not a second
-//! graph builder; see that module's doc for why review does not collapse
-//! into steps 2-4's generic `mission_config::interpret` + `crew::
-//! scheduler::run_step_graph` path (an audited non-collapse per
-//! `CLAUDE.md`'s StepKind tiering section). A config whose graph
-//! references a step kind THIS generic path can't construct at all (step
-//! 4's `executable` check below, still reachable by any non-`review`
-//! config) gets a GUARDED punt: the instance is still minted (so its
-//! Task/Step records show the intended graph shape for inspection), but
-//! nothing is dispatched and `launch` returns exit code `4`.
+//! **`review` today (#2310 P4d — the funnel deletion).** The old 10-kind
+//! PR-review funnel (bundle → probe → dedup → judge → verify → synthesis,
+//! each a bespoke `StepKind`) and its dedicated launcher are GONE. `review`
+//! is now an ordinary on-disk mission config (`templates/builtin/
+//! mission-configs/review.json`) that runs through the SAME generic path
+//! as any other config — steps 2-4 above: `mission_config::interpret` +
+//! `crew::scheduler::run_step_graph`. There is no early branch, no
+//! dedicated builder, and no special-cased stdout contract for it in this
+//! module; `review` gets no more (and no less) special treatment than any
+//! other named config. A config whose graph references a step kind the
+//! generic path can't construct at all (step 4's `executable` check below)
+//! gets a GUARDED punt: the instance is still minted (so its Task/Step
+//! records show the intended graph shape for inspection), but nothing is
+//! dispatched and `launch` returns exit code `4`.
 
 use crate::crew;
 use crate::fleet;
@@ -2988,8 +2980,8 @@ fn register_coder_phase_step_kinds(registry: &crew::step_kinds::StepKindRegistry
 /// run) is mutated in place to stamp the coder step's own
 /// `timeout_seconds`/`image`/`injected_budget_chars` onto its `Step.config`
 /// — the same "compute once, stamp, read back in `run_streaming`" pattern
-/// `darkmux-lab`'s `build_review_graph_from_config` uses for the review
-/// judge seat's staffing (#1530 Packet 3a).
+/// the retired review funnel's own launcher used for its judge seat's
+/// staffing (#1530 Packet 3a) before that pipeline was deleted (#2310 P4d).
 ///
 /// (#1546) `message` is no longer among the stamped fields — composing the
 /// brief text itself (the mission/phase disk load, the corrections/
@@ -3639,10 +3631,11 @@ pub(crate) fn lazy_start_phase_for_step(
 /// ([`derive_phase_outcomes`]), whose `phase_abandon` carries the #1504
 /// reconcile for anything left non-terminal.
 ///
-/// **Scope.** The GENERIC launcher (this module) is the only caller today.
-/// The review launcher persists at transition only and closes its phases
-/// in the retired review funnel launcher's own finalize; it retires onto this path
-/// in #2310 P4d, at which point this doc covers it too.
+/// **Scope.** The GENERIC launcher (this module) is the ONLY caller now —
+/// `review`'s own dedicated launcher (which used to persist phases at
+/// transition only and close them in its own finalize) retired onto this
+/// path in #2310 P4d, so this doc covers `review` too, same as every other
+/// generic-path config.
 pub(crate) fn lazy_close_prior_phases(
     mission_id: &str,
     phase_order: &[String],
@@ -3935,9 +3928,10 @@ fn build_envelope(
 /// forever: the same stranded-Active drift class an operator hit at scale
 /// (10 Active missions whose phases were stranded `running` with no process
 /// behind them, mobile report 2026-07-16). This brings the failed run to an
-/// honest terminal state, exactly as the review launcher already does by
-/// always finalizing off its captured `Result` (never `?`-propagating past
-/// the finalize): flip every still-`Running` step to `Error` (persisting it),
+/// honest terminal state, the same discipline the retired review funnel
+/// launcher followed by always finalizing off its captured `Result` (never
+/// `?`-propagating past the finalize): flip every still-`Running` step to
+/// `Error` (persisting it),
 /// then finalize the mission with an Error-status envelope whose PER-PHASE
 /// outcomes come from each phase's own steps ([`derive_phase_outcomes`]), so a
 /// phase that fully completed before the failure still reads `Complete`;

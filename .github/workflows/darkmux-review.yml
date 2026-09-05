@@ -90,9 +90,9 @@ jobs:
           # and long-fixed template bugs reappearing in the posted
           # comment — all burning real diagnosis time before the stale
           # binary was identified. Building here, from the SAME
-          # trusted-main checkout the bundler plugin below already builds
-          # from, guarantees the dispatch always runs the code this
-          # workflow actually checked out.
+          # trusted-main checkout this workflow already ran the review
+          # tooling from, guarantees the dispatch always runs the code
+          # this workflow actually checked out.
           #
           # Built to a workflow-local path ($GITHUB_WORKSPACE/target/release)
           # rather than `cargo install --path .` into the runner's global
@@ -110,26 +110,6 @@ jobs:
           cargo build --release --locked
           echo "DARKMUX_BIN=$PWD/target/release/darkmux" >> "$GITHUB_ENV"
           "$PWD/target/release/darkmux" --version
-
-      - name: Build the Rust bundler plugin (#1319 reference --bundler implementation)
-        run: |
-          set -euo pipefail
-          # Built from THIS checkout of trusted main — the same tree the
-          # review tooling itself came from, not the reviewed PR. The
-          # built-in bundler only understands TypeScript; without this,
-          # darkmux reviewing its own (Rust) PRs produces 0 bundles ->
-          # degenerate on every single one (darkmux#1319, #1318 dogfood).
-          #
-          # plugins/darkmux-bundler-rust is a genuinely STANDALONE Cargo
-          # project (its own [workspace] table, its own Cargo.lock, ZERO
-          # darkmux-* dependencies) — excluded from the root workspace on
-          # purpose. Building the reference plugin from privileged access
-          # to darkmux-lab's own internals wouldn't actually prove the
-          # public --bundler contract is sufficient on its own for a real
-          # third-party author; a fully standalone build does.
-          cd plugins/darkmux-bundler-rust
-          cargo build --release --locked
-          echo "BUNDLER_RUST_BIN=$PWD/target/release/darkmux-bundler-rust" >> "$GITHUB_ENV"
 
       - name: Fetch PR diff + head SHA (API only — no PR checkout, no code execution)
         id: diff
@@ -201,22 +181,11 @@ jobs:
           # Resilient: a hiccup leaves no/empty envelope; the review dispatch's own
           # degraded-mode handling (below) turns that into a loud comment plus
           # a failed run rather than a silent green check.
-          # `bundler`: darkmux-public's own source is Rust, not the
-          # built-in bundler's TypeScript — without this every self-review
-          # produced 0 bundles -> degenerate (darkmux#1319). Points at the
-          # reference plugin built above, run through the SAME public
-          # `bundler` input seam a third-party plugin author would use.
-          #
-          # (darkmux#2119) Pinning this plugin does NOT mean every self-
-          # review needs a `.rs` hunk: a docs/config/UI-only PR (the
-          # #2118 3.4.0 release PR — Cargo manifests, CHANGELOG, guide
-          # HTML) makes the reference plugin exit 1 with its own "nothing
-          # to bundle" line, since it only handles `.rs` files. That decline
-          # is read as `bundle_skip` for THIS plugin, not a review failure —
-          # `review-bundle-step` falls back to the built-in bundler over the
-          # same diff and records `bundler_fallback` on the envelope, so a
-          # non-Rust PR still gets reviewed instead of failing this check by
-          # construction.
+          # (#2310 P4d) `review` reads `diff_file` directly — there is no
+          # bundler stage in this pipeline any more (the funnel that had
+          # one was deleted), so darkmux reviewing its own Rust PRs no
+          # longer depends on a reference plugin to avoid a degenerate
+          # 0-bundle run.
           #
           # Invoked via the explicit $DARKMUX_BIN path built above (#1359),
           # NOT a bare `darkmux` PATH lookup — guarantees this dispatch runs
@@ -233,11 +202,9 @@ jobs:
           "$DARKMUX_BIN" mission launch review \
             --param "github=$REPO" \
             --param "head_sha=$HEAD_SHA" \
-            --param "pr=$PR" \
             --param "diff_file=$RUNNER_TEMP/qa/pr.diff" \
             --param "intent_file=$RUNNER_TEMP/qa/intent.txt" \
             --param "mode=$MODE" \
-            --param "bundler=$BUNDLER_RUST_BIN" \
             --param "envelope_out=$RUNNER_TEMP/qa/envelope.json" \
             --param "emit=$RUNNER_TEMP/qa/rendered.json" \
             --timeout 3600 || true

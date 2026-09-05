@@ -240,8 +240,11 @@ pub fn route_command(advertised: &[PanelCommand], cmd: &str) -> Option<RoutePlan
 /// a renamed variant working, the same discipline `route_command` follows.
 ///
 /// **What it reviews, stated plainly.** The diff is the branch's COMMITTED
-/// work (`git diff <base>..HEAD`, base = the merge-base with the upstream
-/// default branch, else `HEAD~1`), NOT the uncommitted working tree the
+/// work (`git diff <base>..HEAD`, base = the merge-base with the first of
+/// `origin/HEAD`/`origin/main`/`origin/master`/local `main`/local
+/// `master`/`init.defaultBranch` that resolves, else `HEAD~1` as a last
+/// resort — see [`synthesize_diff_launch_inputs`]'s own comment for the
+/// full order), NOT the uncommitted working tree the
 /// retired launcher used to pass. That is forced by the planner's own
 /// contract: `plan.sites`'s diff source reads the post-diff content through
 /// a MATERIALIZED tree ("the tree is the confirmation surface"), and a
@@ -312,15 +315,38 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
             cwd.display()
         )
     })?;
-    // The base to diff against: the merge-base with the remote's default
-    // branch when there is one, else the previous commit. Tried in order,
-    // first hit wins — a fresh clone with no upstream still reviews its
-    // last commit rather than refusing.
-    let base = ["origin/HEAD", "origin/main", "origin/master"]
+    // The base to diff against, tried in order, first hit wins: the
+    // merge-base with the remote's default branch (`origin/HEAD` covers a
+    // clone whose remote HEAD symref is set; `origin/main`/`origin/master`
+    // cover the common case where it isn't); then a LOCAL `main`/`master`
+    // branch (a repo with no remote at all — the common shape for a
+    // freshly-initialized or fully-local project — still finds its own
+    // base branch instead of falling straight to "review only the last
+    // commit"); then whatever `git config init.defaultBranch` names, if
+    // that branch actually exists; and only then the previous commit, so
+    // a repo with genuinely no base branch anywhere still reviews
+    // something rather than refusing. `fallback_to_last_commit` records
+    // whether that last resort fired, so the caller can say so.
+    let mut fallback_to_last_commit = false;
+    let default_branch_candidate = git_out(cwd, &["config", "init.defaultBranch"]);
+    let mut candidates: Vec<String> =
+        vec!["origin/HEAD".into(), "origin/main".into(), "origin/master".into(), "main".into(), "master".into()];
+    if let Some(b) = &default_branch_candidate {
+        if !b.trim().is_empty() {
+            candidates.push(b.trim().to_string());
+        }
+    }
+    let base = candidates
         .iter()
         .find_map(|r| git_out(cwd, &["merge-base", "HEAD", r]))
         .filter(|b| b != &head)
-        .or_else(|| git_out(cwd, &["rev-parse", "HEAD~1"]))
+        .or_else(|| {
+            let h1 = git_out(cwd, &["rev-parse", "HEAD~1"]);
+            if h1.is_some() {
+                fallback_to_last_commit = true;
+            }
+            h1
+        })
         .unwrap_or_else(|| head.clone());
     let diff = if base == head {
         String::new()
@@ -370,15 +396,22 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
         format!("workspace={}", spec_path.display()),
         format!("head_sha={head}"),
     ];
+    let mut notes: Vec<String> = Vec::new();
+    if fallback_to_last_commit {
+        notes.push("no base branch found; reviewing only the last commit.".to_string());
+    }
     if let Some(dirty) = git_out(cwd, &["status", "--porcelain"]).filter(|s| !s.trim().is_empty()) {
         let n = dirty.lines().count();
-        synthesized.excluded_note = Some(format!(
+        notes.push(format!(
             "{n} uncommitted change{} in this tree {} NOT part of this review — it reads the \
              committed tree at {}.",
             if n == 1 { "" } else { "s" },
             if n == 1 { "is" } else { "are" },
             &head[..head.len().min(12)]
         ));
+    }
+    if !notes.is_empty() {
+        synthesized.excluded_note = Some(notes.join(" "));
     }
     Ok(DiffLaunchInputs::Ready(synthesized))
 }
@@ -2002,6 +2035,80 @@ mod tests {
 
     fn embedded_review() -> MissionConfig {
         mission_config::load("review").expect("the embedded review config loads").config
+    }
+
+    /// (#2404 P4d round 3) A no-remote repo whose base branch is only
+    /// reachable LOCALLY (no `origin/*` refs at all) used to fall straight
+    /// to the `HEAD~1` last resort, which reviews only the single most
+    /// recent commit — silently under-reviewing every commit before it.
+    /// `main` gets 3 commits, then `feat` branches off and gets 3 more;
+    /// the merge-base chain's local `main` candidate must resolve the
+    /// base to where `feat` diverged, so the diff covers all 3 of
+    /// `feat`'s commits, not just its last one.
+    #[test]
+    #[serial_test::serial]
+    fn no_remote_repo_finds_the_local_main_branch_and_reviews_every_commit() {
+        // Isolate from the operator's real ~/.gitconfig: if it happens to
+        // set `init.defaultBranch = main` globally, that candidate alone
+        // would mask a broken local-branch fallback and this test would
+        // stay green for the wrong reason. `GIT_CONFIG_GLOBAL`/`_SYSTEM`
+        // pointed at `/dev/null` makes `git config init.defaultBranch`
+        // resolve to nothing here, so only the LOCAL `main`/`master`
+        // candidates this test means to prove can make it pass.
+        let prev_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        let prev_nosystem = std::env::var("GIT_CONFIG_NOSYSTEM").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+            // Xcode's bundled git ships its OWN system gitconfig
+            // (`init.defaultbranch=main`) that `GIT_CONFIG_SYSTEM=/dev/null`
+            // does not suppress on this platform — `GIT_CONFIG_NOSYSTEM`
+            // is the flag that actually disables it.
+            std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        }
+        let repo = temp_repo(3);
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["checkout", "-q", "-b", "feat"]);
+        for k in 3..6 {
+            std::fs::write(repo.path().join(format!("src/f{k}.rs")), format!("fn f{k}() {{}}
+")).unwrap();
+            run(&["add", "-A"]);
+            run(&["commit", "-q", "-m", &format!("feat c{k}")]);
+        }
+        let synth = match synthesize_diff_launch_inputs(&embedded_review(), repo.path()).unwrap() {
+            DiffLaunchInputs::Ready(s) => s,
+            other => panic!("expected Ready, got {}", match other {
+                DiffLaunchInputs::NotNeeded => "NotNeeded",
+                DiffLaunchInputs::Nothing(_) => "Nothing",
+                DiffLaunchInputs::Ready(_) => unreachable!(),
+            }),
+        };
+        let diff_path = synth
+            .params()
+            .iter()
+            .find_map(|p| p.strip_prefix("diff_file=").map(String::from))
+            .expect("diff_file param present");
+        let diff = std::fs::read_to_string(diff_path).unwrap();
+        for k in 3..6 {
+            assert!(diff.contains(&format!("f{k}.rs")), "commit for f{k}.rs missing from the diff — reviewed less than 3 of 3:\n{diff}");
+        }
+        assert!(synth.excluded_note.is_none(), "a local main WAS found, so no last-resort note should print: {:?}", synth.excluded_note);
+        unsafe {
+            match prev_global {
+                Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+            match prev_nosystem {
+                Some(v) => std::env::set_var("GIT_CONFIG_NOSYSTEM", v),
+                None => std::env::remove_var("GIT_CONFIG_NOSYSTEM"),
+            }
+        }
     }
 
     /// RED before this packet's synthesis existed: the panel typed no

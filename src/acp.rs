@@ -17,16 +17,19 @@
 //!   `panel` block — see `src/acp_panel.rs`, which owns the registry
 //!   enumeration, the ephemeral-vs-mission-launch routing decision, and the
 //!   in-process ephemeral graph runner. `review` itself now reaches this
-//!   file's bespoke [`run_review`] through that SAME routing path (rather
-//!   than a hand-rolled string match), unchanged otherwise.
-//! - Review-stage progress ("bundle", "probe", ...) is recognized by
-//!   pattern-matching known substrings out of the review subprocess's
-//!   stderr (see [`REVIEW_STAGES`] and [`recognize_stage`]). This is
-//!   fragile — a wording change in the review pipeline's liveness markers
-//!   silently stops advancing the on-screen plan — but it is genuinely the
-//!   only signal available without teaching the review pipeline a
-//!   structured progress channel, which is out of scope for a spike whose
-//!   job is "does ACP+Zed work at all".
+//!   file's generic [`run_launch_command`] through that SAME routing path
+//!   (rather than a hand-rolled string match or a bespoke `run_review`
+//!   function — #2310 P4d deleted the dedicated review launcher, and
+//!   `run_launch_command` synthesizes the diff/workspace inputs review
+//!   needs via `acp_panel::synthesize_diff_launch_inputs` before spawning
+//!   the same `mission launch <config_id>` subprocess every other panel
+//!   command uses).
+//! - (#2310 P4d — RESOLVED) Review-stage progress used to be recognized by
+//!   pattern-matching known substrings out of the review subprocess's own
+//!   stderr (`REVIEW_STAGES`/`recognize_stage`, since deleted along with
+//!   the bespoke review launcher). `run_launch_command` has no stage
+//!   concept at all now — it reports "launching…" then the final
+//!   stdout/stderr, same as any other mission-launch panel command.
 //! - (#1684 remainder — RESOLVED) Session state (the cwd per ACP session)
 //!   used to live in an in-memory map that was never pruned. `session/close`
 //!   is now advertised (`SessionCapabilities.close`) and handled: it aborts
@@ -47,7 +50,7 @@
 //!   `cx.spawn`'d closure from Packet 2) rather than directly inline in that
 //!   closure — `cx.spawn` alone never hands back an abort handle, so
 //!   cancellation needed a genuinely abortable task underneath it. Because
-//!   [`run_review`]'s and [`run_launch_command`]'s subprocess `Command`s set
+//!   [`run_launch_command`]'s subprocess `Command`s set
 //!   `kill_on_drop(true)`, aborting the task — which drops the `Child`
 //!   mid-`.wait()`/`.output()` — sends the OS process a real kill rather
 //!   than orphaning it (the exact defect this packet's own audit named: an
@@ -105,10 +108,10 @@
 //!   `InFlight` now stores a `Cancelled` tombstone (`InFlightSlot`) in that
 //!   window, so the command aborts itself the instant it registers instead
 //!   of racing ahead uncancelled. (2) A `kill_on_drop`'d SIGKILL has no
-//!   finalize step — a cancelled `run_review`/`run_launch_command` mission
+//!   finalize step — a cancelled `run_launch_command` mission
 //!   is left permanently `Active` (`darkmux mission status` will flag it;
 //!   a manual `mission abort` reconciles it), and the temp diff file
-//!   `run_review` writes is never cleaned up (`tokio::fs::remove_file`
+//!   `run_launch_command` writes is never cleaned up (`tokio::fs::remove_file`
 //!   sits AFTER `child.wait().await`, a line a cancel never reaches).
 //!   Neither is fixable by anything short of a completion-independent
 //!   cleanup path; named here so a stop-button user isn't surprised by
@@ -126,7 +129,7 @@
 //!   `~/.local/bin` because Zed's GUI env may not carry it on PATH). A
 //!   mixed ts+edge diff takes the TS path and skips the templates; real
 //!   bundler composition/config is follow-up work, not spike work.
-//! - (#1684 remainder — RESOLVED) `run_review`'s stderr-draining loop used
+//! - (#1684 remainder — RESOLVED) The review subprocess path's stderr-draining loop (since folded into `run_launch_command`) used
 //!   to forward every non-JSON, non-blank line straight into the chat as an
 //!   agent chunk — including darkmux-flow's own sink-init diagnostics
 //!   (`crates/darkmux-flow/src/lib.rs::build_default_sink`), which print
@@ -1149,10 +1152,10 @@ fn session_shelf_push(sessions: &Sessions, session_id: &SessionId, entry: crate:
 }
 
 /// Turn a resolved [`crate::acp_panel::RoutePlan`] into an actual execution
-/// — the SAME three-way match `serve()`'s `PromptRequest` handler ran
+/// — the SAME two-way match `serve()`'s `PromptRequest` handler ran
 /// inline before #1698 Packet B, extracted so BOTH the slash-command path
 /// AND the new no-slash channel (`run_no_slash_route` below) drive
-/// identical behavior once a plan is resolved: same `run_review`/
+/// identical behavior once a plan is resolved: same
 /// `run_ephemeral_command`/`run_launch_command` execution primitives, same
 /// gates, no divergence between "the operator typed `/review`" and "the
 /// operator typed `review this` and the router picked `/review`".
@@ -1338,9 +1341,11 @@ async fn answer_no_slash_refusal(
 /// lifecycle records. `run_ephemeral` is fully synchronous (it shells out
 /// to `std::process::Command::output()` for `procedural.shell` steps), so
 /// it runs on a `spawn_blocking` thread rather than the connection's own
-/// async task — the same "never stall the ACP event loop" concern
-/// `run_review`'s own module-doc note names for its (accepted, spike-grade)
-/// blocking-in-place subprocess await.
+/// async task — a "never stall the ACP event loop" concern; the retired
+/// review launcher's own module doc named the equivalent tradeoff for its
+/// (accepted, spike-grade) subprocess await before #2310 P4d folded it
+/// into [`run_launch_command`], which awaits its `tokio::process::Command`
+/// directly and needs no `spawn_blocking` of its own.
 ///
 /// `acp_panel::run_ephemeral` prints NOTHING to this process's own
 /// stdout — the ACP wire — by construction (it never touches
@@ -1391,7 +1396,7 @@ async fn run_ephemeral_command(
     // whichever text comes back, byte-identical to before `run_ephemeral`
     // gained a typed `success` field (#1698 Packet B carry-list item 5).
     // (#1698 Packet B2, scope C) Shelved BEFORE the notification — see
-    // `run_review`'s own comment on the same ordering.
+    // `run_launch_command`'s own comment on the same ordering, below.
     session_shelf_push(sessions, session_id, crate::radio_answer::shelf_entry(&config_id, &args_for_shelf, &outcome.text));
     cx.send_notification(agent_chunk(session_id, outcome.text))?;
     Ok(())
@@ -1505,8 +1510,9 @@ async fn request_operator_sign_off(
     const REJECT: &str = "reject";
 
     // (#1684 QA CONSIDER) This `ToolCallId` is never announced via a prior
-    // `SessionUpdate::ToolCall` before this request — unlike `run_review`'s
-    // stage tool calls (`stage_tool_call_id`), which always send a
+    // `SessionUpdate::ToolCall` before this request — unlike the retired
+    // review launcher's own stage tool calls (`stage_tool_call_id`,
+    // deleted with that launcher in #2310 P4d), which always sent a
     // `ToolCall` notification before referencing that id again. Per the
     // schema, `RequestPermissionRequest.tool_call` is a `ToolCallUpdate`
     // (an upsert, not an update-only reference), so this SHOULD be fine on
@@ -1684,18 +1690,18 @@ fn loaded_config(config_id: &str) -> Result<crate::crew::mission_config::Mission
 
 /// (#1684 rule D) Launch a panel command whose graph has at least one
 /// model-dispatching step as a normal `darkmux mission launch <id>`
-/// subprocess — a full instance, same pattern [`run_review`] uses for its
-/// own subprocess (this process's own executable, re-invoked, cwd = the
-/// session's cwd, stdout/stderr captured as pipes — never inherited, so
-/// nothing but this file's own `agent_chunk` notifications reaches the ACP
-/// wire). Unlike `run_review`, there is no bespoke stage/liveness parsing
-/// here — that machinery is `review`'s own; a generic panel command
-/// renders its subprocess's stdout (trimmed) as the final message on
+/// subprocess — a full instance (this process's own executable,
+/// re-invoked, cwd = the session's cwd, stdout/stderr captured as pipes —
+/// never inherited, so nothing but this file's own `agent_chunk`
+/// notifications reaches the ACP wire). There is no bespoke stage/
+/// liveness parsing here — the retired review launcher had its own
+/// (`REVIEW_STAGES`/`recognize_stage`, deleted in #2310 P4d); this generic
+/// path renders its subprocess's stdout (trimmed) as the final message on
 /// success, or its stderr on failure. Sends an up-front "launched…" chunk
-/// before awaiting the subprocess (#1684 QA finding — CONSIDER 12): unlike
-/// `run_review`, which streams a `Plan` immediately, this route would
-/// otherwise leave Zed showing nothing but a spinner for however long the
-/// launched mission's own model dispatches take.
+/// before awaiting the subprocess (#1684 QA finding — CONSIDER 12), so
+/// Zed shows something other than a bare spinner for however long the
+/// launched mission's own model dispatches take (the retired review
+/// launcher streamed a `Plan` immediately for the same reason).
 ///
 /// **`args` honesty note (#1684 QA finding — MUST-FIX 5).** The raw text
 /// forwards as `--param args=<raw>` (omitted when empty) — the standard
@@ -1781,8 +1787,9 @@ async fn run_launch_command(
         .stdin(ProcStdio::null())
         .stdout(ProcStdio::piped())
         .stderr(ProcStdio::piped())
-        // (#1684 remainder — cancellation) See `run_review`'s own comment on
-        // this same flag — same subprocess-kill-on-abort mechanism.
+        // (#1684 remainder — cancellation) A `session/cancel`-driven abort
+        // drops this `Child` mid-`.output()`; `kill_on_drop(true)` sends the
+        // OS process a real kill rather than orphaning it.
         .kill_on_drop(true)
         .output()
         .await
@@ -1800,8 +1807,8 @@ async fn run_launch_command(
         let detail = if stderr.is_empty() { &stdout } else { &stderr };
         format!("darkmux: `{config_id}` failed ({}).\n\n{detail}", output.status)
     };
-    // (#1698 Packet B2, scope C) Shelved BEFORE the notification — see
-    // `run_review`'s own comment on the same ordering.
+    // (#1698 Packet B2, scope C) Shelved BEFORE the notification — so a
+    // shelf read that races the notification still sees this exchange.
     session_shelf_push(sessions, session_id, crate::radio_answer::shelf_entry(config_id, args, &text));
     cx.send_notification(agent_chunk(session_id, text))?;
     Ok(())
@@ -2762,15 +2769,15 @@ mod tests {
     /// `StopReason::Cancelled` comes back promptly — over the no-slash
     /// ROUTER path, which is precisely the path where nothing is
     /// killable (a plain synchronous call, no `Child` anywhere). The
-    /// actual promise `kill_on_drop(true)` makes for `run_review`'s and
-    /// `run_launch_command`'s real subprocess `Command`s — that the OS
-    /// PROCESS itself dies, not just that the Rust future resolves — has
-    /// rested on drop-topology reasoning alone until now.
+    /// actual promise `kill_on_drop(true)` makes for `run_launch_command`'s
+    /// real subprocess `Command`s — that the OS PROCESS itself dies, not
+    /// just that the Rust future resolves — has rested on drop-topology
+    /// reasoning alone until now.
     ///
     /// This proves that half directly: `tokio::spawn` a task that spawns
     /// a real, observably long-lived child (`sleep 30`, with
-    /// `.kill_on_drop(true)` — the IDENTICAL flag `run_review`/
-    /// `run_launch_command` set on their own `Command`s) and holds it
+    /// `.kill_on_drop(true)` — the IDENTICAL flag `run_launch_command`
+    /// sets on its own `Command`) and holds it
     /// across an in-place `.await` on `child.wait()` — the SAME "own the
     /// `Child` across an await point, get a real abort handle from
     /// `tokio::spawn`" shape those two functions use, and the exact shape

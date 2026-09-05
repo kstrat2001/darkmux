@@ -87,12 +87,11 @@ pub struct LaunchParams {
     /// `TaskConfig.id` → override — see [`TaskOverride`].
     pub task_overrides: BTreeMap<String, TaskOverride>,
     /// `StepConfig.id` → replacement `config` value. REPLACES, never
-    /// merges, the document's own `config` — e.g. the review launcher
-    /// overriding `review-judge-step`'s `concurrency` with the operator's
-    /// resolved `config_access::review_judge_concurrency()`, never the
-    /// document's own static default (see `CLAUDE.md`'s judge_concurrency
-    /// decision for why the static JSON value is a documented default
-    /// only, never load-bearing at launch).
+    /// merges, the document's own `config` — a launcher's way of handing a
+    /// step an operator-resolved value in place of the document's own
+    /// static default at launch time (the retired review funnel's judge
+    /// step once used this for its bounded-concurrency cap; the mechanism
+    /// itself is generic and outlives that one caller).
     pub step_config_overrides: BTreeMap<String, serde_json::Value>,
     /// (#2310 P4c-2 item 0) Every input the launch actually collected
     /// (`--input`/`--param`), keyed by name — the values [`super::
@@ -580,7 +579,7 @@ mod tests {
         // though the launcher supplies a DIFFERENT real phase id.
         let cfg = doc(vec![phase(
             "investigate",
-            vec![task("review-bundle-task", &[], None, vec![step("review-bundle-step", "review.bundle", serde_json::Value::Null)])],
+            vec![task("review-bundle-task", &[], None, vec![step("review-bundle-step", "example.bundle", serde_json::Value::Null)])],
         )]);
         let mut phase_ids = Map::new();
         phase_ids.insert("investigate".to_string(), "pr-review-123-investigate".to_string());
@@ -590,7 +589,7 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "review-bundle-task", "fixed ids stay verbatim");
         assert_eq!(tasks[0].phase_id, "pr-review-123-investigate", "Task.phase_id is still the REAL phase id");
-        assert_eq!(steps["review-bundle-step"].kind, "review.bundle");
+        assert_eq!(steps["review-bundle-step"].kind, "example.bundle");
     }
 
     #[test]
@@ -756,17 +755,17 @@ mod tests {
         let cfg = doc(vec![
             phase(
                 "investigate",
-                vec![task("review-dedup-task", &[], None, vec![step("review-dedup-step", "review.dedup", serde_json::Value::Null)])],
+                vec![task("review-dedup-task", &[], None, vec![step("review-dedup-step", "example.dedup", serde_json::Value::Null)])],
             ),
             phase(
                 "report",
                 vec![
-                    task("review-verify-task", &["review-dedup-task"], None, vec![step("review-verify-step", "review.verify", serde_json::Value::Null)]),
+                    task("review-verify-task", &["review-dedup-task"], None, vec![step("review-verify-step", "example.verify", serde_json::Value::Null)]),
                     task(
                         "review-synthesis-task",
                         &["review-dedup-task", "review-verify-task"],
                         None,
-                        vec![step("review-synthesis-step", "review.synthesis", serde_json::Value::Null)],
+                        vec![step("review-synthesis-step", "example.synthesis", serde_json::Value::Null)],
                     ),
                 ],
             ),

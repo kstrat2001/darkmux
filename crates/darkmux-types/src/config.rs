@@ -154,7 +154,18 @@ use std::path::Path;
 //           this one always has a value (absence is not a distinct
 //           behavior). `Option<u32>`, lenient-on-read: an older binary
 //           ignores the field and keeps its old serialized behavior.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.21";
+// 1.22 (#2404 P4d round 3): REMOVED the `review{}` block
+//           (`judge_concurrency` / `judge_fail_on_any_skip`) added in 1.4.
+//           The funnel driver those knobs tuned was deleted in #2310 — the
+//           `review` mission config is now an ordinary on-disk mission
+//           config run through the generic launch path, with no judge
+//           step left to bound. Pre-1.0, no-compat-baggage posture: the
+//           field is removed outright rather than deprecated in place. An
+//           older config's `review` key still loads fine — it lands in
+//           top-level `extras` overflow, same lenient-read guarantee as
+//           every other removal (see 1.8's `orchestrator` precedent);
+//           `darkmux doctor` names it and tells the operator to delete it.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.22";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -191,8 +202,6 @@ pub struct DarkmuxConfig {
     // MissionConfig -> MissionBoardConfig (#1284; see that struct's doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<MissionBoardConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review: Option<ReviewConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radio: Option<RadioConfig>,
     /// (#1685) The `gh`-verb allowlist — see [`CmdConfig`]'s own doc.
@@ -610,38 +619,6 @@ pub struct MissionBoardConfig {
     /// no drift surfaced at all, because the pre-#1230-Packet-5 detector
     /// only checked Closed+non-terminal and Active+all-terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub stale_active_days: Option<u64>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
-}
-
-/// (#1349) The PR-review pipeline's own tuning knobs — separate from
-/// `RuntimeBehaviorConfig`/`RemoteConfig` because they're specific to
-/// `darkmux mission launch review`'s driver (`darkmux_lab::lab::review`), not
-/// general dispatch behavior.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ReviewConfig {
-    /// The judge step's internal bounded-concurrency for-each cap —
-    /// dispatch pass-1 (then pass-2 if confirmed) for up to this many
-    /// deduped flags AT ONCE (default 1, fully sequential). Was a bare
-    /// `std::env::var("DARKMUX_FUNNEL_JUDGE_CONCURRENCY")` read prior to
-    /// #1349 (deliberately, per its own doc — a placeholder pending real
-    /// concurrency-ceiling data); wired through the standard precedence
-    /// chain now that it's being renamed anyway, per `config_access`'s
-    /// "every setting resolves in ONE place" contract.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub judge_concurrency: Option<u32>,
-    /// (#1876/#1877) The judge stage's remote-token-budget exhaustion
-    /// policy. `false` (DEFAULT, "partial"): a skipped judge call is a
-    /// COVERAGE fact, not a verdict — the flags that DID get judged still
-    /// render, alongside a loud banner naming the shortfall (never a clean
-    /// pass). `true` ("strict"): restores the pre-#1876 behavior — ANY
-    /// skipped judge call, regardless of how many flags were successfully
-    /// judged, degrades the whole run and discards its findings. An
-    /// operator who genuinely wants "any skip is fatal" sets this; nobody
-    /// else needs to touch it. Named after the incident it fixes: a judge
-    /// that had ruled 123 of 134 flags (7 confirmed, 67 needs-check, both
-    /// complete with evidence) discarded all of it and posted "the review
-    /// produced no signal" because the last 11 calls were skipped when the
-    /// per-execution token bucket ran out.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub judge_fail_on_any_skip: Option<bool>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1096,11 +1073,6 @@ impl DarkmuxConfig {
             }),
             mission: Some(MissionBoardConfig {
                 stale_active_days: Some(14),
-                extras: Default::default(),
-            }),
-            review: Some(ReviewConfig {
-                judge_concurrency: Some(1),
-                judge_fail_on_any_skip: Some(false),
                 extras: Default::default(),
             }),
             // (#1698 Packet B2) Written visible with empty (unset) profile

@@ -179,10 +179,6 @@ struct SitesStepConfig {
     /// `owner/repo` (or a full GitHub URL). With `head_sha` and no
     /// `workspace`, this is the origin of the derived source.
     github: Option<String>,
-    /// (#2310 P4d) The pull-request NUMBER, when the launch knows one. It
-    /// decides the derived source's REF — see [`derive_workspace_spec`] for
-    /// why a fork PR's head is unreachable without it.
-    pr: Option<String>,
 }
 
 impl SitesStepConfig {
@@ -206,7 +202,6 @@ impl SitesStepConfig {
         let workspace = opt_str("workspace").map(PathBuf::from);
         let head_sha = opt_str("head_sha");
         let github = opt_str("github");
-        let pr = opt_str("pr");
         if workspace.is_none() && !(head_sha.is_some() && github.is_some()) {
             anyhow::bail!(
                 "step `{}`: `{PLAN_SITES_KIND}` requires config.workspace, or both \
@@ -244,7 +239,7 @@ impl SitesStepConfig {
                 step.id
             );
         }
-        Ok(Self { rule, workspace, params, fetch, plan_out, source, diff_file, head_sha, github, pr })
+        Ok(Self { rule, workspace, params, fetch, plan_out, source, diff_file, head_sha, github })
     }
 
     /// The workspace spec this step plans against — loaded from
@@ -260,7 +255,7 @@ impl SitesStepConfig {
                 let github = self.github.as_deref().expect("from_step refuses no workspace with no github");
                 let head_sha =
                     self.head_sha.as_deref().expect("from_step refuses no workspace with no head_sha");
-                Ok((derive_workspace_spec(github, head_sha, self.pr.as_deref())?, Vec::new()))
+                Ok((derive_workspace_spec(github, head_sha)?, Vec::new()))
             }
         }
     }
@@ -286,24 +281,30 @@ impl SitesStepConfig {
     }
 }
 
-/// (#2310 P4d) Build the one-source [`WorkspaceSpec`] a `github` +
-/// `head_sha` launch implies: a single `git` source at the repository's
-/// GitHub URL. `github` is accepted as `owner/repo` or as a full URL (with
-/// or without a trailing `.git`); anything else is refused by name. Pure —
-/// it builds the spec and nothing else; the caller materializes it through
-/// the same path an on-disk spec takes.
+/// (#2310 P4d; #2404 P4d round 3) Build the one-source [`WorkspaceSpec`] a
+/// `github` + `head_sha` launch implies: a single `git` source at the
+/// repository's GitHub URL, pinned to the bare `head_sha`. `github` is
+/// accepted as `owner/repo` or as a full URL (with or without a trailing
+/// `.git`); anything else is refused by name. Pure — it builds the spec
+/// and nothing else; the caller materializes it through the same path an
+/// on-disk spec takes.
 ///
-/// **The ref is `refs/pull/<pr>/head` when a PR number is known, and the
-/// bare `head_sha` otherwise.** A pull request FROM A FORK has no branch in
-/// the reviewed repository, so its head commit is reachable only from the
-/// pull namespace; asking a mirror for the bare sha fails with git's opaque
-/// "Needed a single revision" (reproduced against a real fork PR). The
-/// mirror fetches `+refs/pull/*/head` (see `workspace_spec::materialize`),
-/// so naming the pull ref resolves for fork and same-repo PRs alike.
-/// `head_sha` stays the provenance the launch recorded; when no `pr` is
-/// supplied the sha is used directly, which is correct for a same-repo
-/// branch already fetched through `+refs/heads/*`.
-pub(crate) fn derive_workspace_spec(github: &str, head_sha: &str, pr: Option<&str>) -> Result<WorkspaceSpec> {
+/// **The ref is always the bare `head_sha`, never a `refs/pull/<pr>/head`
+/// literal.** A pull request FROM A FORK has no branch in the reviewed
+/// repository, so a naive `git rev-parse <sha>` against a mirror that only
+/// fetched `+refs/heads/*` fails with git's opaque "Needed a single
+/// revision". That is solved one layer down instead: the mirror
+/// `workspace_spec::materialize` maintains ALWAYS fetches
+/// `+refs/pull/*/head` alongside the ordinary heads/tags refspecs, so a
+/// fork sha is reachable by the time anything tries to resolve it —
+/// verified live against a real fork PR (`git rev-parse
+/// <fork-sha>^{commit}` resolves after that fetch). Naming a `refs/pull/
+/// <pr>/head` literal here would pin this spec to a MOVING ref (the PR's
+/// head can force-push after this spec is minted, changing what materializes
+/// on a later re-run at the "same" spec); the bare sha stays a fixed point
+/// regardless of what the PR does afterward, and the fetch above is what
+/// makes that fixed point reachable.
+pub(crate) fn derive_workspace_spec(github: &str, head_sha: &str) -> Result<WorkspaceSpec> {
     let trimmed = github.trim().trim_end_matches('/');
     let slug = trimmed
         .strip_prefix("https://github.com/")
@@ -324,15 +325,6 @@ pub(crate) fn derive_workspace_spec(github: &str, head_sha: &str, pr: Option<&st
     if head_sha.is_empty() {
         anyhow::bail!("`{PLAN_SITES_KIND}`: config.head_sha must not be empty");
     }
-    let git_ref = match pr.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(pr) => {
-            if !pr.chars().all(|c| c.is_ascii_digit()) {
-                anyhow::bail!("`{PLAN_SITES_KIND}`: config.pr must be a pull-request number, got {pr:?}");
-            }
-            format!("refs/pull/{pr}/head")
-        }
-        None => head_sha.to_string(),
-    };
     Ok(WorkspaceSpec {
         schema_version: None,
         name: Some(repo.to_string()),
@@ -341,7 +333,7 @@ pub(crate) fn derive_workspace_spec(github: &str, head_sha: &str, pr: Option<&st
             id: repo.to_string(),
             git: Some(format!("https://github.com/{owner}/{repo}")),
             path: None,
-            git_ref: Some(git_ref),
+            git_ref: Some(head_sha.to_string()),
             extras: BTreeMap::new(),
         }],
         include: None,
@@ -488,7 +480,7 @@ mod tests {
     /// no network.
     #[test]
     fn a_github_slug_and_head_sha_derive_one_source_at_that_sha() {
-        let spec = derive_workspace_spec("kstrat2001/darkmux", "abc123def", None).unwrap();
+        let spec = derive_workspace_spec("kstrat2001/darkmux", "abc123def").unwrap();
         assert_eq!(spec.sources.len(), 1, "exactly one source: {:?}", spec.sources);
         let src = &spec.sources[0];
         assert_eq!(src.git.as_deref(), Some("https://github.com/kstrat2001/darkmux"));
@@ -500,14 +492,14 @@ mod tests {
     /// operator pasting a browser URL must resolve to the SAME origin.
     #[test]
     fn a_full_github_url_derives_the_same_origin_as_the_slug() {
-        let from_url = derive_workspace_spec("https://github.com/kstrat2001/darkmux.git", "sha1", None).unwrap();
-        let from_slug = derive_workspace_spec("kstrat2001/darkmux", "sha1", None).unwrap();
+        let from_url = derive_workspace_spec("https://github.com/kstrat2001/darkmux.git", "sha1").unwrap();
+        let from_slug = derive_workspace_spec("kstrat2001/darkmux", "sha1").unwrap();
         assert_eq!(from_url.sources[0].git, from_slug.sources[0].git);
     }
 
     #[test]
     fn a_github_value_that_is_not_owner_slash_repo_is_refused_by_name() {
-        let err = derive_workspace_spec("darkmux", "sha1", None).unwrap_err();
+        let err = derive_workspace_spec("darkmux", "sha1").unwrap_err();
         assert!(err.to_string().contains("owner/repo"), "{err}");
     }
 
@@ -559,44 +551,6 @@ mod tests {
         assert!(err.to_string().contains("config.workspace"), "{err}");
     }
 
-
-    /// (#2310 P4d — the fork-PR fix.) With a PR number the derived source's
-    /// ref is the PULL ref, not the bare sha: a fork PR's head is in no
-    /// branch of the reviewed repository, and asking a mirror for the sha
-    /// fails with git's "Needed a single revision" (see
-    /// `workspace_spec::materialize`'s own pull-ref test).
-    #[test]
-    fn a_pr_number_makes_the_derived_ref_the_pull_ref_not_the_bare_sha() {
-        let spec = derive_workspace_spec("kstrat2001/darkmux", "abc123def", Some("2404")).unwrap();
-        assert_eq!(spec.sources[0].resolved_ref(), "refs/pull/2404/head");
-    }
-
-    /// No `pr` (a local or non-PR launch) keeps the bare sha — correct for
-    /// a same-repo commit already reachable through `+refs/heads/*`.
-    #[test]
-    fn no_pr_number_keeps_the_bare_sha_as_the_ref() {
-        let spec = derive_workspace_spec("kstrat2001/darkmux", "abc123def", None).unwrap();
-        assert_eq!(spec.sources[0].resolved_ref(), "abc123def");
-    }
-
-    #[test]
-    fn a_non_numeric_pr_is_refused_by_name() {
-        let err = derive_workspace_spec("kstrat2001/darkmux", "abc", Some("feature/x")).unwrap_err();
-        assert!(err.to_string().contains("pull-request number"), "{err}");
-    }
-
-    /// The step config carries `pr` end to end: parsed off the step, then
-    /// used by the derivation `resolve_spec` performs.
-    #[test]
-    fn the_pr_config_field_reaches_the_derived_spec() {
-        let cfg = SitesStepConfig::from_step(&step(serde_json::json!({
-            "rule": "swallowed-error", "source": "diff", "diff_file": "/tmp/d.diff",
-            "github": "kstrat2001/darkmux", "head_sha": "abc123def", "pr": "2404"
-        })))
-        .unwrap();
-        let (spec, _) = cfg.resolve_spec().unwrap();
-        assert_eq!(spec.sources[0].resolved_ref(), "refs/pull/2404/head");
-    }
 
     #[test]
     fn the_kind_registers_beside_the_builtins() {

@@ -2548,14 +2548,13 @@ mod tests {
     }
 
     /// (#2310 P4b review, CONSIDER — renamed to what it actually asserts)
-    /// `emit: "-"` resolves to the SAME `Path::new("-")` convention
-    /// `review_render::emit_rendered` uses (reimplemented independently —
-    /// see this module's doc for why it cannot depend on that one) and the
-    /// step reports `"-"` as its own output marker rather than a file
-    /// path. This does NOT capture actual stdout bytes (`println!` isn't
-    /// trivially interceptable from a plain `#[test]`) — it proves the
-    /// DESTINATION decision, not the byte-for-byte "one JSON line and
-    /// nothing else" purity claim the old name implied.
+    /// `emit: "-"` is this step's own stdout convention: `Path::new("-")`
+    /// is treated as "print to stdout, not a file", and the step reports
+    /// `"-"` as its own output marker rather than a file path. This does
+    /// NOT capture actual stdout bytes (`println!` isn't trivially
+    /// interceptable from a plain `#[test]`) — it proves the DESTINATION
+    /// decision, not the byte-for-byte "one JSON line and nothing else"
+    /// purity claim the old name implied.
     #[test]
     fn emit_dash_step_output_names_stdout_not_a_path() {
         let step = Step {

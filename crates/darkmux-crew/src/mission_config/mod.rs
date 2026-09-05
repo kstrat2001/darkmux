@@ -2211,14 +2211,17 @@ mod tests {
     fn unknown_step_kind_is_a_warning_not_an_error() {
         let cfg = doc(vec![phase(
             "p1",
-            vec![task("t1", &[], vec![step("s1", "review.bundle")])],
+            vec![task("t1", &[], vec![step("s1", "example.made-up-kind")])],
         )]);
-        // Only Tier 1 kinds known to this call site — "review.bundle" is a
-        // real Tier 3 kind, but this check can't see it.
+        // Only Tier 1 kinds known to this call site — "example.made-up-kind"
+        // is an ARBITRARY kind literal this check can't see, standing in
+        // for any real Tier 2/3 kind a given call site doesn't know about
+        // (#2404 P4d round 3: the review funnel's own Tier-3 `review.*`
+        // kinds, once used here for the same purpose, were deleted).
         let findings = cfg.validate(&["dispatch.internal", "procedural.shell"]);
         assert!(findings
             .iter()
-            .any(|f| f.severity == FindingSeverity::Warning && f.message.contains("review.bundle")));
+            .any(|f| f.severity == FindingSeverity::Warning && f.message.contains("example.made-up-kind")));
         assert!(!findings.iter().any(|f| f.severity == FindingSeverity::Error));
         assert!(cfg.is_valid(&["dispatch.internal", "procedural.shell"]));
     }
@@ -2510,7 +2513,7 @@ mod tests {
         assert!(!cfg.inputs.is_empty(), "review declares its runtime inputs");
         // The workflow's frozen param names all stay declared, so
         // `.github/workflows/darkmux-review.yml` runs unchanged.
-        for frozen in ["github", "head_sha", "diff_file", "intent_file", "mode", "bundler", "envelope_out", "emit"] {
+        for frozen in ["github", "head_sha", "diff_file", "intent_file", "mode", "envelope_out", "emit"] {
             assert!(
                 cfg.inputs.iter().any(|i| i.name == frozen),
                 "the workflow's frozen `--param {frozen}=` must stay declared"
