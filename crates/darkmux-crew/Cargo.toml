@@ -62,7 +62,11 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # every macOS install and are linked directly from inside the probe's own
 # `cfg(all(target_os = "macos", target_arch = "aarch64"))` modules, so no
 # other target sees either the crate or the frameworks.
-[target.'cfg(target_os = "macos")'.dependencies]
+# (#2310 swarm D) `bounded_command` runs every step command in its own process
+# group (`setpgid`) and kills the group on deadline/interrupt (`kill(-pgid)`),
+# on every Unix darkmux supports — so libc is a `cfg(unix)` dependency now, not
+# macOS-only. Windows is unsupported (the flow audit sink is POSIX-only too).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]
