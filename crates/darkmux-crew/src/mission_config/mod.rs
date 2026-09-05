@@ -612,9 +612,19 @@ pub struct TaskConfig {
     /// the mistake is worth catching before a mint rather than after a
     /// phase's worth of dispatches. The relation is symmetric in EFFECT —
     /// declaring it on one side is enough, and declaring it on both
-    /// reports once, not twice. An id naming no task in the document is
-    /// its own `Error`, because an exclusion that resolves to nothing
-    /// fails OPEN.
+    /// reports once, not twice.
+    ///
+    /// **What the disabled state does and does not silence.** The CONFLICT
+    /// is only reported when both sides would actually be minted — a pair
+    /// with one side `enabled: false`, or living under a disabled phase,
+    /// is the intended shipping shape and says nothing. A MALFORMED
+    /// exclusion is not covered by that: an id naming no task in the
+    /// document, or a task naming itself, is an `Error` regardless of
+    /// enabled state. That asymmetry is deliberate. An exclusion that
+    /// resolves to nothing fails OPEN — it protects nothing while looking
+    /// exactly like protection — and the copy most likely to carry that
+    /// typo is a template shipping DISABLED, where it costs nothing right
+    /// up until the operator enables it and both seats run.
     ///
     /// A pre-3.5 reader overflows the field into `extras` and mints
     /// whatever `enabled` says, which is the additive contract: every
@@ -1746,11 +1756,22 @@ mod tests {
         }"#;
         let cfg: MissionConfig = serde_json::from_str(json).unwrap();
         let findings = cfg.validate(&[]);
+        let hit = findings
+            .iter()
+            .find(|f| f.severity == FindingSeverity::Error && f.path.ends_with("excludes"))
+            .unwrap_or_else(|| panic!("expected an unknown-id error, got {findings:?}"));
+        assert!(hit.message.contains("seat-typo"), "names the id that resolves to nothing: {}", hit.message);
+        // (#2310 P4f review, CONSIDER 2) Pin the MESSAGE, not just the
+        // severity and path. Deleting this branch outright left this test
+        // green: the both-enabled branch below emits an Error on the same
+        // path whose text also happens to contain the typo'd id, so the
+        // operator would be told "these two tasks are both enabled" about
+        // a task that does not exist. The fail-open explanation is the
+        // whole reason this is a separate finding.
         assert!(
-            findings.iter().any(|f| f.severity == FindingSeverity::Error
-                && f.path.ends_with("excludes")
-                && f.message.contains("seat-typo")),
-            "{findings:?}"
+            hit.message.contains("unknown task id") && hit.message.contains("fails OPEN"),
+            "the finding must explain that an exclusion resolving to nothing protects nothing: {}",
+            hit.message
         );
     }
 
@@ -1766,11 +1787,19 @@ mod tests {
         }"#;
         let cfg: MissionConfig = serde_json::from_str(json).unwrap();
         let findings = cfg.validate(&[]);
+        let hit = findings
+            .iter()
+            .find(|f| f.severity == FindingSeverity::Error && f.path.ends_with("excludes"))
+            .unwrap_or_else(|| panic!("expected a self-exclusion error, got {findings:?}"));
+        // (#2310 P4f review, CONSIDER 2) Same gap as the unknown-id test
+        // above: severity + path alone were satisfied by the both-enabled
+        // branch, so this branch was deletable while the test stayed
+        // green. A self-exclusion must be named as one, and must point at
+        // `enabled: false` as the way to actually turn a task off.
         assert!(
-            findings
-                .iter()
-                .any(|f| f.severity == FindingSeverity::Error && f.path.ends_with("excludes")),
-            "{findings:?}"
+            hit.message.contains("excludes ITSELF") && hit.message.contains("enabled"),
+            "the finding must name self-exclusion and point at the field that turns a task off: {}",
+            hit.message
         );
     }
 
@@ -1787,6 +1816,35 @@ mod tests {
         }"#;
         let cfg: MissionConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.validate(&[]).is_empty(), "{:?}", cfg.validate(&[]));
+    }
+
+    /// (#2310 P4f review, CONSIDER 4) The disabled guard covers the
+    /// CONFLICT only. A malformed exclusion — one naming no task at all —
+    /// is an Error whether or not the declaring task is enabled, and that
+    /// is deliberate rather than an oversight in the branch ordering: a
+    /// typo inside a template that ships DISABLED is precisely the one
+    /// nobody notices, because it costs nothing until the day an operator
+    /// flips `enabled` and the exclusion silently protects nothing. Catch
+    /// it while the document is being written, not on the launch that
+    /// depends on it.
+    #[test]
+    fn a_disabled_task_excluding_an_unknown_id_is_still_an_error() {
+        let json = r#"{
+          "id":"x","name":"X",
+          "phases":[{"id":"p","tasks":[
+            {"id":"seat-a","steps":[{"id":"a-step","kind":"procedural.noop","config":{}}]},
+            {"id":"seat-b","enabled":false,"excludes":["seat-typo"],"steps":[{"id":"b-step","kind":"procedural.noop","config":{}}]}
+          ]}]
+        }"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        let findings = cfg.validate(&[]);
+        let hit = findings
+            .iter()
+            .find(|f| f.severity == FindingSeverity::Error && f.path.ends_with("excludes"))
+            .unwrap_or_else(|| {
+                panic!("a disabled task's typo'd exclusion is still a document defect: {findings:?}")
+            });
+        assert!(hit.message.contains("fails OPEN"), "{}", hit.message);
     }
 
     fn step(id: &str, kind: &str) -> StepConfig {
@@ -2442,7 +2500,6 @@ mod tests {
     fn review_builtin_has_the_expected_graph_shape() {
         let cfg = &embedded_config("review");
         assert_eq!(cfg.id, "review");
-        assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
         assert!(!cfg.inputs.is_empty(), "review declares its runtime-only inputs");
         assert!(
             cfg.inputs.iter().any(|i| i.name == "staffing"),
@@ -2625,7 +2682,6 @@ mod tests {
     fn coder_phase_builtin_has_the_expected_graph_shape() {
         let cfg = &embedded_config("coder-phase");
         assert_eq!(cfg.id, "coder-phase");
-        assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
         assert!(
             cfg.inputs.iter().any(|i| i.name == "workdir"),
             "workdir must be declared as a runtime-only input, not a TaskConfig field"
@@ -2750,6 +2806,39 @@ mod tests {
         }
     }
 
+    /// (#2310 P4f review, MUST FIX) EVERY embedded built-in declares the
+    /// CURRENT `MISSION_CONFIG_SCHEMA`, enumerated from the embedded set
+    /// itself rather than from a list written by hand.
+    ///
+    /// This replaces three per-config assertions that lived inside three
+    /// separate graph-shape tests. That arrangement covered `review`,
+    /// `coder-phase` and `crawl` and silently did NOT cover `review-v2` —
+    /// which is the config this packet edited: mutating `review-v2.json`'s
+    /// declared version to a stale `"3.4"` left the whole suite green,
+    /// while the identical mutation on `crawl.json` went red. A per-config
+    /// pin only ever covers the configs somebody remembered to write one
+    /// for, and the one nobody remembered is exactly the one drifting. A
+    /// FIFTH config now inherits this check by existing.
+    ///
+    /// A declared version is not cosmetic: `validate` warns on a
+    /// major-version mismatch, and the version is the only signal an older
+    /// binary reading a newer document has.
+    #[test]
+    fn every_embedded_builtin_declares_the_current_schema_version() {
+        let embedded = load::embedded_all();
+        assert!(embedded.len() >= 4, "the embedded set should not have shrunk: {embedded:?}");
+        for (id, _) in embedded {
+            let cfg = embedded_config(id);
+            assert_eq!(
+                cfg.schema_version.as_deref(),
+                Some(MISSION_CONFIG_SCHEMA),
+                "embedded `{id}` declares `{:?}`, but the current schema is `{MISSION_CONFIG_SCHEMA}` \
+                 — every built-in ships on the current version",
+                cfg.schema_version
+            );
+        }
+    }
+
     #[test]
     fn both_builtins_round_trip_through_json() {
         for id in ["review", "coder-phase"] {
@@ -2771,7 +2860,6 @@ mod tests {
         let known_refs = known_kinds_refs(&known);
         let cfg = embedded_config("crawl");
         assert_eq!(cfg.id, "crawl");
-        assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
         // (#2298 + #2301) Three phases: a `crawl.plan` task per built-in
         // rule, a `crawl.unit` GROW template per rule growing from that
         // rule's own plan task, and one `crawl.summary`.

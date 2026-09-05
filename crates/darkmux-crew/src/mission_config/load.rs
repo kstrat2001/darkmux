@@ -73,6 +73,19 @@ const EMBEDDED_MISSION_CONFIGS: &[(&str, &str)] = &[
 /// machine). The chain's embedded-tier resolution keeps its own
 /// `#[serial]`-guarded test below
 /// (`embedded_resolves_with_no_user_or_on_disk_copy`).
+/// Every embedded built-in as `(id, raw JSON)` — test-only, for the same
+/// reason [`find_embedded`] is `pub(crate)`: `mission_config`'s golden
+/// tests assert document-wide invariants over the WHOLE embedded set, and
+/// a test that enumerates the set itself is the only kind a newly-added
+/// fifth config cannot silently escape. Production code always resolves
+/// one config by id through the user → on-disk → embedded chain, never the
+/// whole table, so this is `#[cfg(test)]` rather than dead weight in the
+/// shipped binary.
+#[cfg(test)]
+pub(crate) fn embedded_all() -> &'static [(&'static str, &'static str)] {
+    EMBEDDED_MISSION_CONFIGS
+}
+
 pub(crate) fn find_embedded(id: &str) -> Option<&'static str> {
     EMBEDDED_MISSION_CONFIGS
         .iter()

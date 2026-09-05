@@ -502,6 +502,57 @@ pub fn launch(
         bail!("{}", missing_inputs_message(config, &missing));
     }
 
+    // (#2310 P4f review, CONSIDER 3) `mod_seat_profile` names the profile
+    // `review-v2`'s optional endpoint create-mod seat dispatches to. A name
+    // that matches NO defined profile does not fail — it silently becomes
+    // the machine's `default_profile`, because
+    // `ProfileRegistry::resolve_active` falls back by design (so a
+    // machine-agnostic caller can name a profile each machine may or may
+    // not define, and that function's own doc tells the caller to "detect a
+    // fallback and surface it"). Nothing here surfaced it: the operator
+    // asked for a hosted cloud seat, got their local default, and every
+    // flow record still said `handle: coder`. That is a silent substitution
+    // of the operator's stated intent (#44), and it is worth more here than
+    // elsewhere because the whole POINT of this input is that the seat is a
+    // different TIER — the failure is invisible in the graph, in the
+    // records, and in the delivered review.
+    //
+    // Checked BEFORE the dry-run print below, so `--dry-run` is where a
+    // runner's typo surfaces rather than mid-run. Keyed on the input NAME:
+    // any config declaring `mod_seat_profile` gets the same check, which is
+    // honest — there is exactly one such config today, and a generic
+    // "this input names a profile" declaration is a schema change to make
+    // when a second one exists, not before.
+    if let Some(seat) = collected.get("mod_seat_profile").and_then(|v| v.as_str()) {
+        if !seat.trim().is_empty() {
+            let loaded = darkmux_profiles::profiles::load_registry(
+                collected.get("profiles").and_then(|v| v.as_str()),
+            )
+            .context(
+                "mission launch: `mod_seat_profile` was supplied, but the profile registry could \
+                 not be read, so the name cannot be verified",
+            )?;
+            if !loaded.registry.profiles.contains_key(seat) {
+                let mut defined: Vec<&str> =
+                    loaded.registry.profiles.keys().map(String::as_str).collect();
+                defined.sort_unstable();
+                let listed = if defined.is_empty() {
+                    "  (the registry defines no profiles)".to_string()
+                } else {
+                    defined.iter().map(|d| format!("  {d}")).collect::<Vec<_>>().join("\n")
+                };
+                bail!(
+                    "mission launch: `mod_seat_profile={seat}` names no profile in the registry.\n\
+                     Defined profiles:\n{listed}\n\
+                     Run `darkmux profile list` to see them. This is refused rather than resolved \
+                     to the default profile: the endpoint create-mod seat exists to put this task \
+                     on a DIFFERENT tier, and quietly running it on the default would look \
+                     identical in the graph and in every flow record."
+                );
+            }
+        }
+    }
+
     // (#1284 review round 1, consider 2) A supplied input the config never
     // declared still shapes the derived instance id below — so a TYPO'D key
     // wouldn't just be ignored, it would silently derive a DIFFERENT

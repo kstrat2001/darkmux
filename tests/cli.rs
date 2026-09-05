@@ -8184,12 +8184,26 @@ fn enabling_both_mod_seat_templates_is_a_validate_error_naming_them() {
     );
 }
 
-/// A user-tier copy with the two `enabled` fields flipped — exactly how a
-/// runner opts in — mints the coder dispatch and NOT the wait. The
-/// dry-run graph is where the operator sees which seat is live: the other
-/// template is pruned at mint, never drawn gray.
-#[test]
-fn review_v2_dry_run_shows_the_endpoint_seat_when_a_user_tier_copy_enables_it() {
+/// The shared fixture for the endpoint-seat tests: a `DARKMUX_HOME` holding
+/// a user-tier `review-v2.json` with the two `enabled` fields flipped
+/// (exactly how a runner opts in), a workspace spec, an empty diff, and a
+/// profile registry defining `grok-endpoint`.
+///
+/// The registry is written to a temp file and reached through
+/// `DARKMUX_PROFILES` deliberately: `profiles::default_locations()` does
+/// NOT honor `DARKMUX_HOME` — it searches the cwd and the REAL `$HOME` —
+/// so a test that merely sets `DARKMUX_HOME` and names a profile would read
+/// whatever registry the developer happens to have, and pass or fail on
+/// their machine's contents.
+struct EndpointSeatFixture {
+    _workdir: TempDir,
+    home: TempDir,
+    spec_path: std::path::PathBuf,
+    diff_path: std::path::PathBuf,
+    profiles_path: std::path::PathBuf,
+}
+
+fn endpoint_seat_fixture() -> EndpointSeatFixture {
     let workdir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let workspace_root = workdir.path().join("tree");
@@ -8206,6 +8220,26 @@ fn review_v2_dry_run_shows_the_endpoint_seat_when_a_user_tier_copy_enables_it() 
     .unwrap();
     let diff_path = workdir.path().join("d.diff");
     fs::write(&diff_path, "").unwrap();
+
+    // An ENDPOINT profile, so nothing here is a local placement. Nothing is
+    // ever called at this URL — every test using this fixture stops at the
+    // dry run.
+    let profiles_path = workdir.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        serde_json::json!({
+            "schema_version": "1.5",
+            "default_profile": "local-default",
+            "profiles": {
+                "local-default": {"models": [{"id": "local-model", "n_ctx": 8000}]},
+                "grok-endpoint": {"models": [
+                    {"id": "grok-model", "n_ctx": 8000, "endpoint": {"url": "http://127.0.0.1:9"}}
+                ]}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
 
     // The built-in document, copied to the user tier with TWO fields
     // flipped — the whole opt-in.
@@ -8227,7 +8261,11 @@ fn review_v2_dry_run_shows_the_endpoint_seat_when_a_user_tier_copy_enables_it() 
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(config_dir.join("review-v2.json"), doc.to_string()).unwrap();
 
-    let out = Command::cargo_bin("darkmux")
+    EndpointSeatFixture { _workdir: workdir, home, spec_path, diff_path, profiles_path }
+}
+
+fn endpoint_seat_dry_run(fx: &EndpointSeatFixture, seat: &str) -> std::process::Output {
+    Command::cargo_bin("darkmux")
         .unwrap()
         .args([
             "mission",
@@ -8235,17 +8273,28 @@ fn review_v2_dry_run_shows_the_endpoint_seat_when_a_user_tier_copy_enables_it() 
             "review-v2",
             "--dry-run",
             "--param",
-            &format!("workspace={}", spec_path.display()),
+            &format!("workspace={}", fx.spec_path.display()),
             "--param",
-            &format!("diff_file={}", diff_path.display()),
+            &format!("diff_file={}", fx.diff_path.display()),
             "--param",
-            "mod_seat_profile=grok-endpoint",
+            &format!("mod_seat_profile={seat}"),
         ])
-        .env("DARKMUX_HOME", home.path())
-        .env("DARKMUX_FLOWS_DIR", home.path().join("flows"))
+        .env("DARKMUX_HOME", fx.home.path())
+        .env("DARKMUX_FLOWS_DIR", fx.home.path().join("flows"))
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .env("DARKMUX_PROFILES", &fx.profiles_path)
         .output()
-        .expect("mission launch review-v2 --dry-run runs");
+        .expect("mission launch review-v2 --dry-run runs")
+}
+
+/// A user-tier copy with the two `enabled` fields flipped — exactly how a
+/// runner opts in — mints the coder dispatch and NOT the wait. The
+/// dry-run graph is where the operator sees which seat is live: the other
+/// template is pruned at mint, never drawn gray.
+#[test]
+fn review_v2_dry_run_shows_the_endpoint_seat_when_a_user_tier_copy_enables_it() {
+    let fx = endpoint_seat_fixture();
+    let out = endpoint_seat_dry_run(&fx, "grok-endpoint");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
 
@@ -8260,7 +8309,65 @@ fn review_v2_dry_run_shows_the_endpoint_seat_when_a_user_tier_copy_enables_it() 
         !stdout.contains("procedural.shell"),
         "the wait template is pruned at mint, so no wait step is drawn:\n{stdout}"
     );
-    assert!(!workdir.path().join("missions").exists(), "a dry run mints nothing");
+    assert!(!fx.home.path().join("missions").exists(), "a dry run mints nothing");
+}
+
+/// (#2310 P4f review, CONSIDER 3) A typo'd `mod_seat_profile` is REFUSED,
+/// naming the value and pointing at `darkmux profile list`.
+///
+/// Without this the launch proceeded and the seat silently became the
+/// machine's local default: `ProfileRegistry::resolve_active` falls back to
+/// `default_profile` when the requested name is undefined — deliberately,
+/// and documented as such, so a machine-agnostic caller can name a profile
+/// each machine may or may not define. That contract's own doc says the
+/// caller "can detect a fallback (resolved name != requested name) and
+/// surface it"; nothing on this path did. The operator asked for a cloud
+/// seat, got a local model, and every flow record still read
+/// `handle: coder` — a substitution with no signal anywhere (#44: never
+/// silently substitute the operator's stated intent).
+#[test]
+fn a_mod_seat_profile_naming_no_defined_profile_refuses_the_launch() {
+    let fx = endpoint_seat_fixture();
+    let out = endpoint_seat_dry_run(&fx, "grok-endpiont");
+    assert!(
+        !out.status.success(),
+        "a mod_seat_profile naming nothing must refuse, not fall back to the default profile.\n\
+         stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("grok-endpiont"), "the refusal names the typo verbatim: {stderr}");
+    assert!(
+        stderr.contains("mod_seat_profile"),
+        "and names the input it came from: {stderr}"
+    );
+    assert!(
+        stderr.contains("darkmux profile list"),
+        "and points at the command that lists the real names: {stderr}"
+    );
+    // The silent-substitution tell: the refusal must not read as if the
+    // default were an acceptable stand-in.
+    assert!(
+        !out.status.success() && !stderr.contains("falling back"),
+        "a fallback is exactly what this refuses to do: {stderr}"
+    );
+}
+
+/// The positive leg: a DEFINED name proceeds. Without it the test above
+/// would pass against a check that refused every launch.
+#[test]
+fn a_mod_seat_profile_naming_a_defined_profile_proceeds() {
+    let fx = endpoint_seat_fixture();
+    let out = endpoint_seat_dry_run(&fx, "grok-endpoint");
+    assert!(
+        out.status.success(),
+        "a defined profile must launch: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("dispatch.internal"),
+        "and still reaches the endpoint seat's dispatch step"
+    );
 }
 
 // ─── #2310 P4e: review-v2's create-mods waits for a frontier mod ────────
