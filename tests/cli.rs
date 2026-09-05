@@ -8082,6 +8082,8 @@ fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
         "exactly as they appear",
         "not inside a code fence",
         "end with a newline",
+        "mounted at `/workspace/<source>`",
+        "A diff written into your reply is not a mod",
     ] {
         assert!(crawl.contains(needle), "the message must name the kit shape ({needle:?}):\n{crawl}");
     }
