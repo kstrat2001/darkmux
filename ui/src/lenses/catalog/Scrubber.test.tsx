@@ -3,7 +3,7 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { Scrubber } from "./Scrubber";
 import { clkhm, clkrange } from "../../lib/format";
-import { fmtElapsed } from "../mission/graph";
+import { fmtElapsed } from "../../lib/format";
 
 const TMIN = Date.parse("2026-08-07T00:00:00.000Z");
 const TMAX = Date.parse("2026-08-07T02:00:00.000Z");

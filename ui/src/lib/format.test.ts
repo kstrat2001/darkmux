@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { clkrange, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
+import { clkrange, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
 
 // `memStateCls` was ported (format.ts) ahead of its first consumer; #1806
 // Stage 1, then Stage 2/3's `MachineHealthRegion.tsx`, is that consumer —
@@ -163,5 +163,39 @@ describe("clkrange — day-boundary branch", () => {
     const anchor = noon.getTime();
     const range = clkrange(anchor - 60 * 60000, anchor);
     expect(range.split("–")[0]).not.toMatch(/[A-Za-z]/);
+  });
+});
+
+/** (U3-7/U5-2) Moved here from `lenses/mission/graph.test.ts` with the
+ * function itself: there is ONE duration formatter now, and it does not
+ * belong to the mission graph. The hour case is the whole reason the other
+ * one (`fmtDuration`, no rollover) is gone — `lenses/session/sessionRun.ts`
+ * formatted a dispatch's wall clock with it, and a dispatch over an hour is
+ * ordinary. The sub-hour cases are the parity contract: every golden
+ * recorded against `fmtDuration` must still read identically. */
+describe("fmtElapsed — the one duration formatter", () => {
+  it("renders m:ss, and rolls over to h:mm:ss past an hour", () => {
+    expect(fmtElapsed(0)).toBe("0:00");
+    expect(fmtElapsed(65_000)).toBe("1:05");
+    expect(fmtElapsed(3_661_000)).toBe("1:01:01");
+    // The measured shape of the bug: 75 minutes read as "75:23".
+    expect(fmtElapsed(4_523_000)).toBe("1:15:23");
+  });
+
+  it("matches the retired fmtDuration below an hour, so no parity golden moves", () => {
+    const retired = (ms: number) => {
+      const c = Math.max(0, ms);
+      return Math.floor(c / 60000) + ":" + String(Math.floor(c / 1000) % 60).padStart(2, "0");
+    };
+    for (const ms of [0, 1, 999, 1000, 59_999, 60_000, 61_500, 599_000, 3_599_999]) {
+      expect(fmtElapsed(ms)).toBe(retired(ms));
+    }
+    // …and diverges only where the old one was wrong.
+    expect(fmtElapsed(3_600_000)).not.toBe(retired(3_600_000));
+  });
+
+  it("never renders a negative or unparseable duration", () => {
+    expect(fmtElapsed(-5_000)).toBe("0:00");
+    expect(fmtElapsed(NaN)).toBe("0:00");
   });
 });

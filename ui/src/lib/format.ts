@@ -13,10 +13,29 @@
  * uppercase the STRING directly so the text is correct independent of CSS.
  */
 
-/** `fmt()` — viewer.html:962. Duration as `M:SS`, floored, never negative. */
-export function fmtDuration(ms: number): string {
-  const clamped = Math.max(0, ms);
-  return Math.floor(clamped / 60000) + ":" + String(Math.floor(clamped / 1000) % 60).padStart(2, "0");
+/** THE duration formatter — `M:SS`, rolling over to `H:MM:SS` past an hour.
+ * Floored, never negative.
+ *
+ * (U3-7/U5-2) There were TWO: this one (`fmtElapsed`, from
+ * `lenses/mission/graph.ts`, itself `mission-graph.html`'s own) and a
+ * `fmtDuration` (`fmt()` — viewer.html:962) with NO hour rollover, which
+ * rendered a 75-minute run as "75:23". `lenses/session/sessionRun.ts`
+ * formatted a dispatch's WALL CLOCK with the latter, and a dispatch running
+ * over an hour is ordinary (the operator's own #2346 run: 1h54m). One
+ * formatter now, the one that stays correct past 60 minutes; identical
+ * output below an hour, so every parity golden is unchanged.
+ *
+ * Kept HERE rather than in `graph.ts` because it is not mission-graph
+ * vocabulary — the run detail, the scrubber clock and the step rows all
+ * format the same concept. */
+export function fmtElapsed(ms: number): string {
+  const clamped = !ms || ms < 0 ? 0 : ms;
+  const s = Math.floor(clamped / 1000);
+  const m = Math.floor(s / 60);
+  const hr = Math.floor(m / 60);
+  const ss = String(s % 60).padStart(2, "0");
+  if (hr > 0) return hr + ":" + String(m % 60).padStart(2, "0") + ":" + ss;
+  return m + ":" + ss;
 }
 
 /** `clk()` — viewer.html:968. Time-of-day in the browser's local timezone

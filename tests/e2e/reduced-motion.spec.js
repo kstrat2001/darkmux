@@ -33,3 +33,29 @@ test('prefers-reduced-motion neutralizes the live-badge pulse animation', async 
   expect(secs, `animation-duration was ${result.duration}`).toBeLessThan(0.01);
   expect(result.iterations).not.toBe('infinite');
 });
+
+// (U5-3) The fleet strip's loading shimmer was the ONE animation in the sheet
+// with no guard — every other one (`--beat`, `.masthead__refresh.spin`,
+// `.labrunrow`'s nudge, `.dialog`'s entrance) has had one for releases. An
+// endless loading shimmer is exactly the motion this preference exists to
+// stop. Same construct-and-measure shape as the pulse test above, because the
+// pending state needs a daemon that is slow to answer and no fixture reaches
+// it — the CSS is what is under test either way.
+test('prefers-reduced-motion neutralizes the fleet strip shimmer', async ({ page }) => {
+  await page.goto('/index.html');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+
+  const result = await page.evaluate(() => {
+    const strip = document.createElement('div');
+    strip.className = 'fleet-strip fleet-strip--pending';
+    const skel = document.createElement('div');
+    skel.className = 'fleet-skeleton';
+    strip.appendChild(skel);
+    document.body.appendChild(strip);
+    const cs = getComputedStyle(skel);
+    return { name: cs.animationName, iterations: cs.animationIterationCount };
+  });
+
+  expect(result.name, `animation-name was ${result.name}`).toBe('none');
+  expect(result.iterations).not.toBe('infinite');
+});

@@ -252,7 +252,7 @@ describe("SessionReplay", () => {
 
   it("(#1972) a run silent longer than the watchdog's kill timeout does NOT tick — abandonment is not liveness", async () => {
     // A dispatch that died months ago also has no terminal record. Ticking it
-    // would render `1071:54 so far` and climbing. The host watchdog hard-kills
+    // would render `17:51:54 so far` and climbing. The host watchdog hard-kills
     // after `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (600s), so anything quieter
     // than that cannot still be running — and the recorded parity corpus is
     // exactly this shape, which is how the rule was found.
@@ -453,7 +453,11 @@ describe("SessionReplay", () => {
     expect(screen.getByText(/task-list on/)).toBeInTheDocument();
     expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument();
     expect(screen.getByText(/07:36:48 · running/)).toBeInTheDocument();
-    expect(screen.getByText("1071:54 so far")).toBeInTheDocument();
+    // (U3-7/U5-2) Rebaselined with the golden: legacy's `fmt()` had no hour
+    // rollover, so this 17h51m run read "1071:54". One formatter now
+    // (`fmtElapsed`), and it says hours. See `tests/parity/README.md` on
+    // hand-editing a golden, and `lib/format.ts` for the divergence.
+    expect(screen.getByText("17:51:54 so far")).toBeInTheDocument();
     // Same reason as the track below: this corpus did no model work, so the
     // MODEL pane is absent and TURNS with it. The SYSTEM pane still renders.
     expect(screen.queryByText("TURNS")).not.toBeInTheDocument();

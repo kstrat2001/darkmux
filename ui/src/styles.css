@@ -173,7 +173,26 @@ body {
   flex: none;
   border: 1px solid var(--border);
   border-radius: 6px;
-  overflow: hidden;
+  /* (U1-2) NOT `overflow: hidden`. The clip did one job — keep the active
+     tab's accent fill inside the rounded frame — and paid for it by
+     amputating the phone-only `.nav-tab::after` 44px tap extension, which
+     reaches ABOVE and BELOW the 35px strip by design. Measured on an
+     iPhone 14 profile: a point 4px above the strip resolved to
+     `.app-shell__sticky`, not the tab, so the top ~5px of every tab's
+     advertised target was dead. The end tabs carry their own corner radii
+     instead (5px = the container's 6px minus its 1px border), which clips
+     the PAINT without clipping the hit region. */
+  overflow: visible;
+}
+
+.nav-tab:first-child {
+  border-top-left-radius: 5px;
+  border-bottom-left-radius: 5px;
+}
+
+.nav-tab:last-child {
+  border-top-right-radius: 5px;
+  border-bottom-right-radius: 5px;
 }
 
 .nav-tab {
@@ -915,6 +934,17 @@ body {
     height: 44px;
     transform: translate(-50%, -50%);
   }
+  /* (U1-4) The scrub track is the transport's one control that can't carry
+     the `::after` pattern — a replaced element has no usable pseudo-element
+     — so its BOX grows to the same 44px floor instead. The native track
+     paints centered in that box, so nothing looks taller; measured red
+     first: a point 8px above the 16px track resolved to `.scrub`.
+     (The buttons beside it were a false positive in the same measurement
+     pass: 40x34 painted, but the rule above already gives them 44px of hit
+     region, so they are left alone.) */
+  .scrub input[type="range"] {
+    height: 44px;
+  }
   .eventlog {
     width: 100%;
     /* (#2071) `position: sticky; height: calc(100vh - chrome)` is the
@@ -1505,6 +1535,17 @@ body {
   }
   100% {
     background-position: -100% 0;
+  }
+}
+
+/* (U5-3) The one animation on this page that was missing the guard every
+   other one carries (`--beat`, `.masthead__refresh.spin`, `.labrunrow`'s
+   nudge, `.dialog`'s entrance). A loading skeleton is exactly the kind of
+   endless motion the preference exists to stop; the state still reads as
+   "pending" from its own placeholder shape. */
+@media (prefers-reduced-motion: reduce) {
+  .fleet-strip--pending .fleet-skeleton {
+    animation: none;
   }
 }
 
@@ -2973,9 +3014,18 @@ body {
 .rv__grouphd { font-size: calc(10px * var(--fs-scale)); letter-spacing: .12em; text-transform: uppercase;
                color: var(--dim); margin-bottom: 6px; }
 
-.rv__row { display: flex; gap: 10px; align-items: baseline; padding: 1px 0; }
-.rv__key { flex: none; width: 116px; color: var(--dim); font-size: calc(11px * var(--fs-scale));
-           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv__row { display: flex; gap: 10px; align-items: baseline; padding: 1px 0; flex-wrap: wrap; }
+/* (U2-2) A MINIMUM column, not a fixed one. The 116px width was set before
+   `--fs-scale: 1.18` (#2002) grew every glyph in this panel, and a fixed
+   column plus `text-overflow: ellipsis` clipped real payload field names at
+   1456 — measured: `cpu speed limit pct` rendered as "cpu speed lim…", a
+   truncation that hides WHICH field a number belongs to. Long keys now WRAP
+   (the same thing the phone rule below already does, one step earlier),
+   capped at 45% so a pathological key can never squeeze `.rv__val` out of
+   the row. Short keys are unaffected: they still occupy exactly 116px, so
+   the column stays aligned for every ordinary record. */
+.rv__key { flex: 0 0 auto; min-width: 116px; max-width: 45%; color: var(--dim); font-size: calc(11px * var(--fs-scale));
+           white-space: normal; overflow-wrap: anywhere; }
 .rv__val { flex: 1; min-width: 0; word-break: break-word; }
 
 .rv__num  { color: #e6c07b; }
@@ -3603,9 +3653,14 @@ body {
 }
 /* The `(i)` affordance. A real <button> rather than a `title` tooltip: this
    page is read over the tailnet on a phone, where hover does not exist and a
-   `title` never appears at all. Sized to a comfortable tap target while
-   drawing as a small glyph — the padding does the touch work, the border
-   does the seeing. */
+   `title` never appears at all. Drawn as a small glyph; the TAP region is
+   extended separately in the phone block below.
+
+   (U1-1) The line that used to end this comment — "the padding does the
+   touch work" — was false: `padding: 0` on a 14x14 box is a 14x14 target,
+   a third of Apple's 44pt floor, and measured on an iPhone 14 profile a
+   point 12px outside the glyph resolved to whatever sat behind it. The
+   padding never did any touch work; the `::after` below does. */
 .mm-odo-i {
   display: inline-flex;
   align-items: center;
@@ -3621,6 +3676,26 @@ body {
   border-radius: 50%;
   cursor: pointer;
   vertical-align: middle;
+}
+/* (U1-1) The shared 44px hit-area pattern — the both-axes form `.scrub
+   button::after` already uses (a 14px glyph needs the WIDTH extended too,
+   unlike `.nav-tab`/`.catalog-toggle`, which are wide enough already and
+   extend only the height). Phone-scoped like every other use of it: the
+   painted control keeps its 14px size, only the invisible tap region grows,
+   because hit area and visual weight are different things. */
+@media (max-width: 768px) {
+  .mm-odo-i {
+    position: relative;
+  }
+  .mm-odo-i::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: max(100%, 44px);
+    height: 44px;
+    transform: translate(-50%, -50%);
+  }
 }
 .mm-odo-i:hover,
 .mm-odo-i:focus-visible {
