@@ -620,7 +620,11 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.header.pillLabel).toBe("RUNNING");
   });
 
-  it("the context metric names peak/window once a context-telemetry stream exists", () => {
+  it("(operator, 2026-09-05) the CTX tile splits label/value/sub — the label never restates the value", () => {
+    // The quirk: `CTX PEAK 19K / 262.144K WINDOW` was the LABEL, sitting
+    // directly under a VALUE tile that already printed `19K` once. The
+    // fixed anatomy: `label` names the number, `value` IS the number, `sub`
+    // carries the window ceiling — and none of the three repeats another.
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 100000, used: 20000 } },
@@ -629,8 +633,59 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     const ctx = view.metrics.find((m) => m.label.startsWith("CTX"));
-    expect(ctx?.label).toBe("CTX PEAK 45K / 100K WINDOW");
-    expect(ctx?.value).toBe("45K"); // done -> headline is peak, not the last sample
+    expect(ctx?.label).toBe("CTX PEAK");
+    expect(ctx?.value).toBe("45k"); // done -> headline is peak, not the last sample
+    expect(ctx?.sub).toBe("of 100k");
+    // The defect, stated as an assertion: the label must never contain the
+    // value it sits beside.
+    expect(ctx?.label).not.toContain(ctx?.value ?? "\0");
+  });
+
+  it("(operator, 2026-09-05) a LIVE ctx tile names the current value, with the peak-so-far and the window in sub", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 262144, used: 20000 } },
+      { ts: "2026-01-01T00:02:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 262144, used: 19000 } },
+      // No dispatch.complete — still running.
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const ctx = view.metrics.find((m) => m.label.startsWith("CTX"));
+    expect(ctx?.label).toBe("CTX NOW");
+    expect(ctx?.value).toBe("19k"); // live -> headline is the LAST sample, not the peak
+    expect(ctx?.sub).toBe("peak 20k · of 262k"); // 262144 -> "262k", the bug's exact number
+    expect(ctx?.label).not.toContain(ctx?.value ?? "\0");
+  });
+
+  it("no metric tile's label contains its own value (the shape of the CTX quirk, checked for every tile)", () => {
+    // Reuses the recorded, real-corpus completed run from the byte-parity
+    // fixture above plus a live context stream, so TURNS/TOKENS IN/TOKENS
+    // OUT/WALL CLOCK/CTX are all populated with real values — not just CTX,
+    // which is the one this quirk was found on but not the only one that
+    // could grow the same defect.
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "darkmux/coder",
+        model: "darkmux:qwen3-coder",
+        payload: { runtime: "internal", image: "darkmux-runtime:latest", workspace: "/tmp/wt", prompt_chars: 500 },
+      },
+      { ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 262144, used: 19000 } },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 3 } },
+      { ts: "2026-01-01T00:05:30Z", session_id: "s1", category: "telemetry", source: "tokens", payload: { prompt_tokens: 50000, completion_tokens: 3000 } },
+      { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { prompt_tokens: 50000, completion_tokens: 3000 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    // A real assertion, not a vacuous loop: fail loudly if the fixture
+    // didn't actually populate the tiles this test exists to check.
+    expect(view.metrics.map((m) => m.label)).toEqual(
+      expect.arrayContaining(["TURNS", "TOKENS IN", "TOKENS OUT", "CTX PEAK", "WALL CLOCK"]),
+    );
+    for (const m of view.metrics) {
+      if (m.value === "—" || m.value === "") continue; // a placeholder can't "restate" anything
+      expect(m.label, `label "${m.label}" must not restate value "${m.value}"`).not.toContain(m.value);
+    }
   });
 
   // (#1945 review) The mission drill-out was entirely unpinned: deleting the

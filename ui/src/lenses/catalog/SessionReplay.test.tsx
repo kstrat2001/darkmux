@@ -148,6 +148,74 @@ describe("SessionReplay", () => {
     expect(wall?.textContent).not.toContain("model time");
   });
 
+  it("(operator, 2026-09-05) no rendered tile's label restates its own value — the CTX quirk, at the DOM layer", async () => {
+    // `sessionRun.test.ts` pins this at the DERIVATION layer, but that mirror
+    // is unenforced against this component (#1978 — see the module doc
+    // above); the actual defect shipped as MARKUP (`CTX PEAK 19K /
+    // 262.144K WINDOW` as the `.ml` text, sitting under a `.mv` that already
+    // read `19K`), so the real regression test has to render it.
+    const records = [
+      {
+        ts: "2026-08-26T07:36:48Z",
+        action: "dispatch.start",
+        session_id: "s-disc",
+        machine_id: "MacBook-Pro",
+        payload: { role: "coder", runtime: "internal" },
+      },
+      {
+        ts: "2026-08-26T07:37:00Z",
+        session_id: "s-disc",
+        category: "telemetry",
+        source: "context",
+        machine_id: "MacBook-Pro",
+        payload: { max: 262144, used: 19000 },
+      },
+      {
+        ts: "2026-08-26T07:40:00Z",
+        session_id: "s-disc",
+        category: "telemetry",
+        source: "context",
+        machine_id: "MacBook-Pro",
+        payload: { max: 262144, used: 35000 },
+      },
+      { ts: "2026-08-26T07:42:00Z", session_id: "s-disc", action: "dispatch.turn", machine_id: "MacBook-Pro", payload: { turn_seq: 19 } },
+      {
+        ts: "2026-08-26T07:42:30Z",
+        session_id: "s-disc",
+        category: "telemetry",
+        source: "tokens",
+        machine_id: "MacBook-Pro",
+        payload: { prompt_tokens: 50000, completion_tokens: 3000 },
+      },
+      {
+        ts: "2026-08-26T07:46:00Z",
+        session_id: "s-disc",
+        action: "dispatch.complete",
+        machine_id: "MacBook-Pro",
+        payload: { prompt_tokens: 50000, completion_tokens: 3000 },
+      },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-disc");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    const tiles = [...document.querySelectorAll(".met")];
+    expect(tiles.length).toBeGreaterThan(0);
+    const ctx = tiles.find((t) => t.querySelector(".ml")?.textContent === "CTX PEAK");
+    expect(ctx, "the CTX PEAK tile").toBeTruthy();
+    expect(ctx?.querySelector(".mv")?.textContent).toBe("35k");
+    // The defect, verbatim: the label used to BE `CTX PEAK 35K / 262.144K
+    // WINDOW` — the value, restated, in a bad number format.
+    expect(ctx?.querySelector(".msub")?.textContent).toBe("of 262k");
+
+    for (const t of tiles) {
+      const label = t.querySelector(".ml")?.textContent ?? "";
+      const value = t.querySelector(".mv")?.textContent ?? "";
+      if (value === "—" || value === "") continue;
+      expect(label, `tile label "${label}" must not contain its own value "${value}"`).not.toContain(value);
+    }
+  });
+
   it("(#1973) separates MODEL metrics from SYSTEM metrics into distinct panes", async () => {
     // The operator question that produced this: reading `model (lms)` beside
     // TURNS/TOKENS/WALL CLOCK, it was not knowable which numbers described the

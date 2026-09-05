@@ -2871,26 +2871,21 @@ body {
    touch-target sweep along with TODAY's 58x21. Mobile-only. `.twin`'s own
    `overflow:hidden` + shared border still frame the group the same way at
    the larger size. */
-@media (max-width: 768px) {
-  /* (operator, 2026-09-01) On a phone `28% avg · 98% high` wrapped to two
-     lines and the label took a third. If the tile is spending a second line
-     anyway, spend it on the LABEL rather than on a widow: value and label
-     share the first line and wrap together.
-     `row-reverse` puts the label first VISUALLY while leaving DOM order
-     (value, then label) untouched — the session goldens compare innerText
-     byte-for-byte, so the reading order must not move. */
-  .met {
-    display: flex;
-    flex-direction: row-reverse;
-    justify-content: flex-end;
-    align-items: baseline;
-    flex-wrap: wrap;
-    gap: 4px 8px;
-  }
-  .met .ml {
-    flex: 0 0 auto;
-  }
-}
+/* (operator, 2026-09-05) The mobile-only row-reverse hack that used to live
+   here (2026-09-01: "value and label share the first line and wrap
+   together") is RETIRED — it was the direct cause of the CTX tile's
+   overflow. `row-reverse` + `flex: 0 0 auto` on `.ml` fit short labels
+   (TURNS, TOKENS IN) onto one line with the value just fine, but sized a
+   LONG label (`CTX PEAK 19K / 262.144K WINDOW`) to its own unshrinkable
+   max-content width — which is wider than a phone-width tile — and let it
+   bleed straight past the tile's border rather than wrap. It also only
+   applied under 768px, so the same four tiles had two different anatomies
+   depending on viewport width, which is the "wrap on all these boxes is a
+   bit random" the operator flagged.
+   `.session-run .met` below now uses `order` to put the label first and
+   the value second UNCONDITIONALLY, at every width, with a `min-height`
+   sized off the tallest tile — see that block, and `.session-run .mv`'s own
+   comment, for why this can't overflow the way the hack did. */
 
 @media (max-width: 768px) {
   /* (operator, 2026-09-01) Tab-like on a phone: the group spans the content
@@ -4669,24 +4664,71 @@ body {
   gap: 10px;
   margin-bottom: 12px;
 }
+/* (operator, 2026-09-05) One tile anatomy — label, value, sub — at EVERY
+   width, via `order` rather than DOM position. The DOM keeps `.mv` before
+   `.ml` (the golden byte-parity test, `sessionRun.test.ts`'s
+   `flattenView()`, walks `metrics` in that order and a real legacy golden
+   pins it — see `goldens/session-task-list.txt`); `order` moves the label
+   above the value on screen without touching that text order. `min-height`
+   is sized off the tallest a tile ever gets (a two-line CPU/RAM/GPU value
+   plus its label and an empty sub slot) so every tile in the grid reports
+   the SAME height regardless of what it's showing — the "wrap is a bit
+   random" the operator flagged was every tile sizing itself off its own
+   content instead of one shared box. */
 .session-run .met {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.02);
+  /* Measured (Playwright, 390px viewport, real demo corpus): the tallest
+     tile — CPU/RAM/GPU's two-line "NN% avg · NN% high" value plus its label
+     and the empty sub slot — renders at ~116px. 100px * the type scale
+     clears that with a little room; every shorter tile (a one-line value,
+     no hint-wrap on the label) gets padded up to the same box instead of
+     reporting its own, smaller height. */
+  min-height: calc(100px * var(--fs-scale));
 }
 .session-run .mv {
+  order: 2;
   font-size: calc(15px * var(--fs-scale));
   font-weight: 600;
   color: var(--fg);
+  margin-top: 3px;
+  /* (operator, 2026-09-05) Deliberately NOT `white-space: nowrap` — tried it,
+     measured it, reverted it. Most values here (`19k`, `3`, `9:07`) have no
+     space to break at, so default wrapping already can't split them
+     mid-token; the CPU/RAM/GPU value (`41% avg · 94% high`) DOES have
+     spaces, and forcing nowrap on it doesn't stop it wrapping — it stops it
+     SHRINKING, so it renders at its full one-line width and bleeds straight
+     into the next grid column at narrow widths, the exact overflow this
+     redesign exists to remove. Default word-boundary wrapping is the actual
+     fix: it never breaks inside a token (no `overflow-wrap` override here),
+     and it lets the one value that legitimately needs two lines take them. */
 }
 .session-run .ml {
+  order: 1;
   font-size: calc(10px * var(--fs-scale));
   letter-spacing: 0.06em;
   color: var(--dim);
-  margin-top: 3px;
   /* Labels are already uppercased directly in `sessionRun.ts` — no
      text-transform here, same reasoning as `.session-run__header` above. */
+}
+/* (operator, 2026-09-05) The third slot — see `SessionRunView.metrics.sub`
+   in `sessionRun.ts`. A qualifying fact (CTX's window ceiling; the peak
+   while a dispatch is still live) that must never be folded into `label`,
+   because a label that carries a number reads as if it WERE the value.
+   Rendered on every tile, empty or not (`min-height` reserves its line even
+   with no text), so a tile with nothing to add here doesn't sit shorter
+   than its neighbor that does. */
+.session-run .msub {
+  order: 3;
+  font-size: calc(10px * var(--fs-scale));
+  color: var(--dim);
+  margin-top: 3px;
+  min-height: calc(1.2em * var(--fs-scale));
 }
 
 /* ── Modal dialogs (#1640) — Filters/Notes/About ─────────────────────────

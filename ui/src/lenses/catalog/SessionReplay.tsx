@@ -302,6 +302,11 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
           <div className="met" key={i} title={m.hintTitle}>
             <div className="mv">{m.value}</div>
             <div className="ml" data-hint={m.hint}>{m.label}</div>
+            {/* (operator, 2026-09-05) Rendered every tile, empty or not — a
+                slot a sibling tile fills and this one doesn't must still
+                claim the same line, or the grid goes ragged the moment
+                content differs between tiles. See `.session-run .msub`. */}
+            <div className="msub">{m.sub ?? ""}</div>
           </div>
         ))}
       </div>
@@ -322,6 +327,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
             <div className="met" key={i} title={m.hintTitle}>
               <div className="mv">{m.value}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
+              <div className="msub">{m.sub ?? ""}</div>
             </div>
           ))}
         </div>
