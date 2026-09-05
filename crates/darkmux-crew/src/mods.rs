@@ -1103,6 +1103,21 @@ pub fn create_from_emission(
     // this producer has always had: never discard a whole mod over one bad
     // part, since a warning on a successful dispatch's stderr is kept only
     // as a byte count.
+    //
+    // **Say plainly what "keeps the kit" is and is not worth.** The two
+    // consumers that act on a mod select it BY `for`: `mods.gate` picks its
+    // targets with `mods::mods_for` (`m.r#for.contains(key)`), and
+    // `deliver.github_review` attaches a mod to a finding with
+    // `m.record.r#for.iter().any(|k| k == &finding.key)`. So a mod whose
+    // ONLY `for` key was dropped is never gated and never rendered as a
+    // proposed change — it is a record that someone proposed something, not
+    // a proposal in flight. It is NOT invisible: it keeps its own
+    // `mission_id`, so `records.gather` (which scopes by
+    // `mods::names_mission`, not by `for`) still carries it into the
+    // mission envelope, `mod list`/`mod show` still find it, and its
+    // `warnings` name the key that was meant. The kit is kept because a kit
+    // is expensive and a person can still act on it — not because the mod
+    // still participates in the run.
     let missing = missing_finding_keys(findings_root, &for_keys)?;
     let mut warnings = warnings;
     for key in &missing {

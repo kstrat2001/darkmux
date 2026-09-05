@@ -572,8 +572,10 @@ fn apply_cache_mount(args: &mut Vec<String>, cache: &Path) {
 /// musl-static, so it runs in any Linux image (verified against alpine +
 /// debian). Returns the cached path.
 ///
-/// Staleness: the cache is NOT auto-invalidated — after rebuilding/pulling a
-/// new runtime image, `rm ~/.darkmux/runtime/darkmux-runtime` to refresh.
+/// Staleness: (#2386 review) the cache IS auto-invalidated now — it carries a
+/// sibling stamp naming the darkmux build it was extracted for, and a binary
+/// stamped for a different build (or carrying no stamp at all) is re-extracted
+/// on the next dispatch. `darkmux doctor` surfaces a stale one too.
 /// (#907, P2 defense-in-depth) Reject image refs that could be smuggled as a
 /// docker flag or carry shell/control characters. An image ref is a positional
 /// arg to `docker create`/`docker run`; a leading `-`, embedded whitespace, or
@@ -593,13 +595,76 @@ fn validate_image_ref(image: &str) -> Result<()> {
     Ok(())
 }
 
+/// The cached binary's file name inside [`runtime_cache_dir`].
+pub const RUNTIME_BINARY_NAME: &str = "darkmux-runtime";
+
+/// (#2386 review, MUST FIX) The sibling stamp naming the darkmux build the
+/// cached binary was extracted for — the SAME string `darkmux --version`
+/// prints (`darkmux_types::build_version`).
+///
+/// **Why a stamp exists at all.** The cache was `if dest.exists() { return }`
+/// with no version key and no invalidation, so a binary extracted once was
+/// reused forever. That was survivable while the runtime's flag surface never
+/// grew; it stopped being survivable the moment the host started passing a
+/// flag the old runtime does not know — the runtime exits 2 on an unknown
+/// flag, so EVERY `dispatch --image <own image>` after an upgrade would die,
+/// and rebuilding or re-pulling the image would not fix it because nothing
+/// re-reads the image once the cache is warm. The stamp makes the cache
+/// self-invalidating on exactly the event that matters.
+pub const RUNTIME_BINARY_STAMP: &str = "darkmux-runtime.version";
+
+/// Paths of the cached runtime binary and its version stamp inside `dir`.
+pub fn runtime_binary_cache_paths_at(dir: &Path) -> (PathBuf, PathBuf) {
+    (dir.join(RUNTIME_BINARY_NAME), dir.join(RUNTIME_BINARY_STAMP))
+}
+
+/// The build the cached binary was extracted for, or `None` when there is no
+/// cached binary — or when it predates the stamp, which is indistinguishable
+/// from a stale one and is treated as stale for that reason.
+pub fn cached_runtime_binary_version_at(dir: &Path) -> Option<String> {
+    let (binary, stamp) = runtime_binary_cache_paths_at(dir);
+    if !binary.exists() {
+        return None;
+    }
+    let v = fs::read_to_string(stamp).ok()?.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Whether the cache can be used as-is for `want_version`.
+fn cached_binary_is_current_at(dir: &Path, want_version: &str) -> bool {
+    cached_runtime_binary_version_at(dir).is_some_and(|v| v == want_version)
+}
+
 fn ensure_runtime_binary_cached(source_image: &str) -> Result<PathBuf> {
-    let dir = darkmux_types::config_access::runtime_cache_dir();
-    let dest = dir.join("darkmux-runtime");
-    if dest.exists() {
+    ensure_runtime_binary_cached_at(
+        &darkmux_types::config_access::runtime_cache_dir(),
+        source_image,
+        &darkmux_types::build_version(),
+    )
+}
+
+/// The version-keyed cache, with its directory and wanted build passed in so
+/// the cache DECISION is testable without docker.
+fn ensure_runtime_binary_cached_at(
+    dir: &Path,
+    source_image: &str,
+    want_version: &str,
+) -> Result<PathBuf> {
+    let (dest, stamp) = runtime_binary_cache_paths_at(dir);
+    if cached_binary_is_current_at(dir, want_version) {
         return Ok(dest);
     }
-    fs::create_dir_all(&dir)
+    // Not a cache miss but a cache INVALIDATION — say which, once, because
+    // the alternative (silence) is a dispatch that dies inside a container
+    // with `unknown flag` and no host-side breadcrumb.
+    if dest.exists() {
+        eprintln!(
+            "darkmux dispatch: cached runtime binary was built for {}, this darkmux is \
+             {want_version} — re-extracting from {source_image}",
+            cached_runtime_binary_version_at(dir).unwrap_or_else(|| "an unknown build".into())
+        );
+    }
+    fs::create_dir_all(dir)
         .with_context(|| format!("creating runtime-binary cache dir {}", dir.display()))?;
 
     // A throwaway container is the standard `docker cp` source; clean it up
@@ -675,12 +740,21 @@ fn ensure_runtime_binary_cached(source_image: &str) -> Result<PathBuf> {
         }
     }
 
+    // (#2386 review) The stamp is removed BEFORE the binary is published and
+    // written AFTER, so a crash between the two leaves an unstamped binary —
+    // which reads as stale and re-extracts, never as current-but-wrong.
+    let _ = fs::remove_file(&stamp);
+
     // Atomic publish — only a complete, executable binary ever appears at dest.
     fs::rename(&tmp, &dest)
         .with_context(|| format!("publishing runtime binary to {}", dest.display()))?;
 
+    fs::write(&stamp, want_version)
+        .with_context(|| format!("writing runtime-binary version stamp {}", stamp.display()))?;
+
     eprintln!(
-        "darkmux dispatch: cached runtime binary → {} (from {source_image}, for --image injection)",
+        "darkmux dispatch: cached runtime binary → {} (from {source_image}, darkmux \
+         {want_version}, for --image injection)",
         dest.display()
     );
     Ok(dest)

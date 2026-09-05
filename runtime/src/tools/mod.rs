@@ -1710,6 +1710,66 @@ y = 2
         assert_eq!(refuse_for_key("crawl-x-0001/2", Some("me"), 0, brief), None);
     }
 
+    /// (#2386 review, item 3) The brief check was `brief.contains(key)`.
+    /// Probe 1 — PREFIX: a brief handing over `crawl-x/11` must not also
+    /// hand over `crawl-x/1`, which is a different finding and a substring
+    /// of the first.
+    #[test]
+    fn a_key_that_is_only_a_prefix_of_a_briefed_key_is_rejected() {
+        let brief = "<finding key=\"crawl-x/11\">\n context: ...\n</finding>";
+        assert_eq!(refuse_for_key("crawl-x/11", Some("me"), 0, brief), None, "the real one passes");
+        let r = refuse_for_key("crawl-x/1", Some("me"), 0, brief).expect("the prefix is refused");
+        assert!(r.starts_with("REJECTED:"), "{r}");
+    }
+
+    /// Probe 2 — PROSE: a key spelled in a sentence, a kit, or an earlier
+    /// mod's text is a MENTION, not a handover. Only the `key="…"` attribute
+    /// of a `<finding …>` tag hands a key over.
+    #[test]
+    fn a_key_merely_mentioned_in_prose_is_not_a_handover() {
+        let brief = "Earlier someone proposed a change for sess-old/4; do not repeat it.";
+        let r = refuse_for_key("sess-old/4", Some("me"), 0, brief).expect("refused");
+        assert!(r.contains("does not name it"), "{r}");
+        // And a `key="…"` outside a `<finding>` opening tag is not one either.
+        let sneaky = "<mod key=\"mod-1-aaa\">kit mentions key=\"sess-old/4\"</mod>";
+        assert!(refuse_for_key("sess-old/4", Some("me"), 0, sneaky).is_some());
+    }
+
+    /// Probe 3 — CANONICAL SEQ: `sess-a/02` and `sess-a/2` are ONE address
+    /// (`mods::canonical_finding_key` renumbers on the host). Both branches
+    /// of the check must agree with that and with each other.
+    #[test]
+    fn a_briefed_key_matches_across_seq_zero_padding() {
+        let brief = "<finding key=\"sess-a/02\">x</finding>";
+        assert_eq!(refuse_for_key("sess-a/2", Some("me"), 0, brief), None, "padded brief, bare for");
+        let brief2 = "<finding key=\"sess-a/2\">x</finding>";
+        assert_eq!(refuse_for_key("sess-a/02", Some("me"), 0, brief2), None, "bare brief, padded for");
+        // The same-dispatch branch canonicalizes too, so the two halves of
+        // this check never disagree about one address.
+        assert_eq!(refuse_for_key("me/02", Some("me"), 2, ""), None);
+        assert!(refuse_for_key("me/03", Some("me"), 2, "").is_some());
+    }
+
+    #[test]
+    fn brief_finding_keys_reads_only_the_finding_tags_own_attribute() {
+        let brief = "<finding key=\"a/1\">body</finding>\n<finding key=\"b/02\">body</finding>";
+        let keys = brief_finding_keys(brief);
+        assert!(keys.contains("a/1") && keys.contains("b/2"), "{keys:?}");
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert!(brief_finding_keys("no tags here key=\"c/1\"").is_empty());
+    }
+
+    /// (#2386 review, item 4) The degraded mode must ANNOUNCE itself — a
+    /// silent fallback is what makes a host/image version mismatch present
+    /// as "mods link to nothing" with no way back to the cause.
+    #[test]
+    fn a_dispatch_with_no_session_id_says_so_and_one_with_an_id_stays_quiet() {
+        let notice = leniency_notice(None).expect("the degraded mode announces itself");
+        assert!(notice.starts_with("[darkmux-runtime]"), "{notice}");
+        assert!(notice.contains("--session-id") && notice.contains("Upgrade"), "{notice}");
+        assert_eq!(leniency_notice(Some("step-x")), None, "a grounded dispatch says nothing");
+    }
+
     /// A runtime the host never told who it is cannot tell an invented key
     /// from one of its own, so it accepts — a false refusal costs the model
     /// its entire call, and the host still drops an unusable link.
@@ -2560,7 +2620,30 @@ static DISPATCH_BRIEF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// `None` when the host passed no `--session-id` (an older host, or a
 /// non-dispatch invocation), which leaves both tools at their pre-#2386
 /// behavior rather than guessing an identity.
+/// (#2386 review, item 4) What a dispatch with no `--session-id` says on
+/// stderr — `None` when there is nothing to say.
+///
+/// Without an id this runtime silently drops to pre-#2386 behavior:
+/// `create_finding` returns no key, and `create_mod` accepts any shape-valid
+/// `for`. The usual cause is a version mismatch (an OLD darkmux binary
+/// driving a NEW image), and the symptom — mods that link to nothing — shows
+/// up far from the cause. One line here is the difference between a
+/// diagnosable mismatch and a mystery.
+///
+/// A `[darkmux-runtime]` prefix, per the self-identifying-provenance
+/// convention for text the runtime speaks in its own voice.
+fn leniency_notice(session_id: Option<&str>) -> Option<&'static str> {
+    session_id.is_none().then_some(
+        "[darkmux-runtime] no --session-id was passed: finding keys cannot be grounded on this \
+         dispatch, so create_finding cannot return one and create_mod cannot refuse an invented \
+         `for` key. Upgrade the darkmux binary driving this container.",
+    )
+}
+
 pub fn set_dispatch_context(session_id: Option<String>, brief: &str) {
+    if let Some(notice) = leniency_notice(session_id.as_deref()) {
+        eprintln!("{notice}");
+    }
     if let Some(id) = session_id {
         let _ = DISPATCH_ID.set(id);
     }
@@ -2610,6 +2693,59 @@ fn recorded_finding_message(key: Option<&str>, recorded: usize, remaining: usize
     }
 }
 
+/// Split a key into `(dispatch, seq)` with the seq PARSED — the one place
+/// this crate decides what a key means.
+///
+/// **Must agree with the host's `mods::canonical_finding_key`**, which
+/// renumbers the seq so `sess-a/01` and `sess-a/1` are one address. Comparing
+/// raw text instead lets the two halves of this check disagree with each
+/// other and with the store: `/02` in a brief would not match `/2` in a
+/// `for`, while the same-dispatch branch (which parses) would accept it.
+fn canonical_parts(key: &str) -> Option<(&str, u64)> {
+    let (dispatch, seq) = key.rsplit_once('/')?;
+    Some((dispatch, seq.parse().ok()?))
+}
+
+fn canonical_key(key: &str) -> Option<String> {
+    let (dispatch, seq) = canonical_parts(key)?;
+    Some(format!("{dispatch}/{seq}"))
+}
+
+/// Every finding key this dispatch's brief DECLARES, canonical — read only
+/// from the `key="…"` attribute of a `<finding …>` opening tag, which is the
+/// shape `findings::brief_block` renders.
+///
+/// **Not a substring search.** The first version asked `brief.contains(key)`,
+/// which accepts three things it should not: `crawl-x/1` whenever the brief
+/// mentions `crawl-x/11` (a prefix of a longer key), any key a kit or a prose
+/// sentence happens to spell (a mention is not a handover), and — because it
+/// compares raw text — it disagrees with the same-dispatch branch about
+/// `/02` versus `/2`. A key is handed over by the brief's own structure or it
+/// is not handed over.
+fn brief_finding_keys(brief: &str) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    let mut rest = brief;
+    while let Some(at) = rest.find("<finding") {
+        let after = &rest[at + "<finding".len()..];
+        // Bound the search to THIS opening tag, so a `key="…"` in some later
+        // element's body can never be read as this one's attribute.
+        let tag = match after.find('>') {
+            Some(end) => &after[..end],
+            None => after,
+        };
+        if let Some(k) = tag.find("key=\"") {
+            let v = &tag[k + 5..];
+            if let Some(end) = v.find('"') {
+                if let Some(canonical) = canonical_key(&v[..end]) {
+                    keys.insert(canonical);
+                }
+            }
+        }
+        rest = after;
+    }
+    keys
+}
+
 /// (#2386) Whether a `for` key can address a finding AT ALL from inside this
 /// dispatch, and why not when it cannot. `None` = accept.
 ///
@@ -2633,9 +2769,9 @@ fn recorded_finding_message(key: Option<&str>, recorded: usize, remaining: usize
 /// invention, and a false refusal costs the model its whole call.
 fn refuse_for_key(key: &str, my_dispatch: Option<&str>, recorded: usize, brief: &str) -> Option<String> {
     let me = my_dispatch?;
-    let (dispatch, seq) = key.rsplit_once('/')?;
+    let (dispatch, n) = canonical_parts(key)?;
     if dispatch == me {
-        let n: usize = seq.parse().ok()?;
+        let n = n as usize;
         if n >= 1 && n <= recorded {
             return None;
         }
@@ -2650,7 +2786,7 @@ fn refuse_for_key(key: &str, my_dispatch: Option<&str>, recorded: usize, brief: 
             }
         ));
     }
-    if brief.contains(key) {
+    if brief_finding_keys(brief).contains(&canonical_key(key)?) {
         return None;
     }
     Some(format!(

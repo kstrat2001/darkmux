@@ -135,6 +135,15 @@ path or `-`. **stdout is the new mod key, alone** — everything else goes to
 stderr — so `MOD=$(darkmux mod create …)` is safe. Every call mints a NEW key;
 recording twice makes two mods, not one.
 
+**`--for <key>` needs that finding present in THIS machine's store.** A key
+naming no stored finding is refused before anything is written, because the
+mod would carry a link nothing can follow — the usual cause is a typo or a key
+copied from an example. If the finding was recorded elsewhere (another
+machine, or a run whose records have not landed yet), `darkmux finding sync`
+replays the flow stream into the store first; `darkmux finding list` shows
+what is there. `--allow-missing-finding` records the link anyway, for the case
+you mean it. (#2386)
+
 Then confirm and hand the key back:
 
 ```bash

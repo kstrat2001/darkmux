@@ -148,6 +148,7 @@ pub fn run() -> DoctorReport {
         check_daemon_freshness(),
         check_binary_vs_source(),
         check_runtime_image_freshness(),
+        check_runtime_binary_cache(),
         check_ram_headroom(),
         check_ram_headroom_load_projection(),
         check_power_state(),
@@ -3899,6 +3900,62 @@ fn classify_runtime_image_freshness(probe: RuntimeImageProbe, installed: &str) -
     }
 }
 
+const RUNTIME_BINARY_CACHE_CHECK_NAME: &str = "runtime binary cache";
+
+/// (#2386 review, MUST FIX) The OTHER direction of the runtime/binary
+/// staleness pair.
+///
+/// `check_runtime_image_freshness` above covers "the IMAGE is older than this
+/// binary". This one covers the cache that `dispatch --image <your image>`
+/// injects: darkmux extracts its static runtime binary out of the darkmux
+/// image once and keeps it at `~/.darkmux/runtime/darkmux-runtime`. That copy
+/// had no version key and no invalidation, so it was reused forever — and the
+/// moment the host starts passing a flag the cached (old) runtime does not
+/// know, the container exits 2 with `unknown flag` on every such dispatch,
+/// with nothing on the host saying why. The cache is version-stamped now and
+/// self-invalidates; this check is the surface that lets an operator SEE a
+/// stale one instead of discovering it as a failed dispatch.
+fn check_runtime_binary_cache() -> Check {
+    classify_runtime_binary_cache(
+        darkmux_crew::dispatch_internal::cached_runtime_binary_version_at(
+            &darkmux_types::config_access::runtime_cache_dir(),
+        ),
+        &darkmux_types::build_version(),
+    )
+}
+
+/// Pure classifier — `None` means no cached binary (or one written before the
+/// stamp existed, which is treated the same way and for the same reason).
+fn classify_runtime_binary_cache(cached: Option<String>, installed: &str) -> Check {
+    match cached {
+        None => Check {
+            name: RUNTIME_BINARY_CACHE_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: "no cached runtime binary — the next `dispatch --image` extracts one".into(),
+            hint: None,
+        },
+        Some(v) if v == installed => Check {
+            name: RUNTIME_BINARY_CACHE_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: format!("cached runtime binary matches this binary ({installed})"),
+            hint: None,
+        },
+        Some(v) => Check {
+            name: RUNTIME_BINARY_CACHE_CHECK_NAME.into(),
+            status: Status::Warn,
+            message: format!(
+                "cached runtime binary was extracted for darkmux {v}, but this binary is \
+                 {installed} — it is injected into every `dispatch --image <your image>`"
+            ),
+            hint: Some(
+                "the next such dispatch re-extracts it automatically; to force it now, \
+                 `rm ~/.darkmux/runtime/darkmux-runtime*`"
+                    .into(),
+            ),
+        },
+    }
+}
+
 fn check_profile_registry() -> Check {
     match profiles::load_registry(None) {
         Ok(loaded) => {
@@ -7496,6 +7553,24 @@ mod tests {
         assert!(c.message.contains("no version label"), "{}", c.message);
     }
 
+    // ─── (#2386 review) the injected runtime binary's own cache ─────────
+
+    #[test]
+    fn a_runtime_binary_cache_stamped_for_another_build_warns_and_names_both() {
+        let c = classify_runtime_binary_cache(Some("3.5.0".into()), "3.6.0");
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("3.5.0") && c.message.contains("3.6.0"), "{}", c.message);
+        assert!(c.hint.is_some(), "and says what to do about it");
+    }
+
+    #[test]
+    fn a_matching_or_absent_runtime_binary_cache_passes() {
+        assert_eq!(classify_runtime_binary_cache(Some("3.6.0".into()), "3.6.0").status, Status::Pass);
+        let none = classify_runtime_binary_cache(None, "3.6.0");
+        assert_eq!(none.status, Status::Pass, "{}", none.message);
+        assert!(none.message.contains("no cached runtime binary"), "{}", none.message);
+    }
+
     #[test]
     fn staleness_checks_never_fail_only_warn() {
         // Sovereignty (#44): a deliberately-old daemon/image is a legitimate
@@ -7507,6 +7582,7 @@ mod tests {
             classify_daemon_freshness(Some(DaemonBuild::Legacy("1.18.5".into())), "new", Some(1000)),
             classify_binary_vs_source(Some("0ldc0de"), Some("a1b2c3d")),
             classify_runtime_image_freshness(RuntimeImageProbe::Labeled("1.0.0".into()), "2.0.0"),
+            classify_runtime_binary_cache(Some("1.0.0".into()), "2.0.0"),
         ];
         for c in all {
             assert_ne!(c.status, Status::Fail, "{} must never fail", c.name);
@@ -7949,7 +8025,10 @@ mod tests {
         // max-stall-recoveries [#2190] +
         // step-command-timeout [#2361] +
         // dispatch-free-concurrency [#2394] +
-        // quarantined-mirrors [#2399]) + one per active eureka rule.
+        // quarantined-mirrors [#2399] +
+        // runtime-binary-cache [#2386 — the injected runtime binary's own
+        // version-keyed cache, the mirror of runtime-image-freshness])
+        // + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
         let expected = 53 + darkmux_eureka::all_rules().len();

@@ -4645,6 +4645,30 @@
         prev
     }
 
+    /// (#2386) Put a finding in the store so a mod's `for` key resolves.
+    /// `create_from_emission` DROPS a key naming no stored finding (the
+    /// dangling link that shipped six unusable mods in one live run), so a
+    /// fixture that wants a key to SURVIVE has to store the finding it names
+    /// — the same thing a real dispatch does, in order, before any
+    /// `create_mod` call can reference it.
+    fn seed_finding(findings_root: &std::path::Path, dispatch: &str, seq: u64) {
+        let rec = crate::findings::build_record(
+            dispatch,
+            seq,
+            "2026-09-05T01:00:00Z".to_string(),
+            "create_finding",
+            crate::findings::Proposer {
+                handle: "crawler".into(),
+                model: "darkmux:qwen3.6".into(),
+                machine_id: None,
+            },
+            crate::findings::Scope::default(),
+            None,
+            serde_json::json!({"file": "a.ts", "line": 4}),
+        );
+        crate::findings::materialize(findings_root, &rec).expect("seeding a finding");
+    }
+
     fn restore_env(prev: Vec<(&'static str, Option<String>)>) {
         unsafe {
             for (k, v) in prev {
@@ -4668,7 +4692,12 @@
     fn the_host_records_the_wire_shape_the_runtime_actually_emits() {
         let tmp = TempDir::new().unwrap();
         let mods_store = tmp.path().join("mods");
-        let prev = mod_test_env(tmp.path(), &mods_store, &tmp.path().join("findings"));
+        let findings_store = tmp.path().join("findings");
+        let prev = mod_test_env(tmp.path(), &mods_store, &findings_store);
+        // (#2386) The fixture's `for` names `sess-crawl/03`; store the finding
+        // it addresses, so this stays a test of the WIRE SHAPE and not an
+        // accidental test of the dangling-key drop.
+        seed_finding(&findings_store, "sess-crawl", 3);
 
         let fx: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
@@ -4724,7 +4753,12 @@
     fn a_malformed_part_is_dropped_with_a_warning_and_the_kit_is_still_recorded() {
         let tmp = TempDir::new().unwrap();
         let mods_store = tmp.path().join("mods");
-        let prev = mod_test_env(tmp.path(), &mods_store, &tmp.path().join("findings"));
+        let findings_store = tmp.path().join("findings");
+        let prev = mod_test_env(tmp.path(), &mods_store, &findings_store);
+        // (#2386) `sess-ok/1` is the part this test asserts SURVIVES the cull,
+        // so it has to be a real stored finding — a shape-valid key that
+        // addresses nothing is itself a dropped part now.
+        seed_finding(&findings_store, "sess-ok", 1);
 
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
@@ -4762,6 +4796,119 @@
         for expected in ["sess/extra/1", "not a string", "no-bytes.txt", "bad.txt", "dir/good.txt"] {
             assert!(joined.contains(expected), "{expected} must be named: {joined}");
         }
+        restore_env(prev);
+    }
+
+    // ─── (#2386 review, MUST FIX) the version-keyed runtime-binary cache ──
+
+    fn seed_cached_binary(dir: &std::path::Path, stamp: Option<&str>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let (binary, stamp_path) = crate::dispatch_internal::runtime_binary_cache_paths_at(dir);
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        match stamp {
+            Some(v) => std::fs::write(&stamp_path, v).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&stamp_path);
+            }
+        }
+    }
+
+    /// A cache extracted for THIS build is used as-is — proven without docker
+    /// by passing an image ref that `validate_image_ref` would refuse: the
+    /// call returns `Ok`, so it never reached the extraction path.
+    #[test]
+    fn a_cached_runtime_binary_stamped_for_this_build_is_reused() {
+        let tmp = TempDir::new().unwrap();
+        seed_cached_binary(tmp.path(), Some("3.6.0"));
+        let got = ensure_runtime_binary_cached_at(tmp.path(), "-not-a-real-image", "3.6.0")
+            .expect("a current cache is a hit, and a hit never touches docker");
+        assert_eq!(got, tmp.path().join("darkmux-runtime"));
+    }
+
+    /// The defect this closes: the cache had NO version key and NO
+    /// invalidation (`if dest.exists() { return }`), so a binary extracted
+    /// before an upgrade was reused forever. Once the host began passing
+    /// `--session-id` (#2386), that stale binary exits 2 (`unknown flag`) on
+    /// EVERY `dispatch --image` — and rebuilding or re-pulling the image did
+    /// not help, because nothing re-read the image once the cache was warm.
+    ///
+    /// Docker-free proof of RE-EXTRACTION: with a stale stamp the call must
+    /// get far enough to reject the bogus image ref, which only the
+    /// extraction path does.
+    #[test]
+    fn a_cached_runtime_binary_stamped_for_another_build_is_re_extracted() {
+        let tmp = TempDir::new().unwrap();
+        seed_cached_binary(tmp.path(), Some("3.5.0"));
+        let err = ensure_runtime_binary_cached_at(tmp.path(), "-not-a-real-image", "3.6.0")
+            .expect_err("a stale stamp must NOT short-circuit");
+        assert!(
+            format!("{err:#}").contains("-not-a-real-image"),
+            "it proceeded to re-extract: {err:#}"
+        );
+    }
+
+    /// A cache written before the stamp existed is indistinguishable from a
+    /// stale one, so it is treated as stale rather than trusted — the
+    /// upgrade path every existing install takes exactly once.
+    #[test]
+    fn an_unstamped_cache_from_before_this_change_is_treated_as_stale() {
+        let tmp = TempDir::new().unwrap();
+        seed_cached_binary(tmp.path(), None);
+        assert_eq!(crate::dispatch_internal::cached_runtime_binary_version_at(tmp.path()), None);
+        let err = ensure_runtime_binary_cached_at(tmp.path(), "-not-a-real-image", "3.6.0")
+            .expect_err("an unstamped cache must not short-circuit");
+        assert!(format!("{err:#}").contains("-not-a-real-image"), "{err:#}");
+    }
+
+    /// An empty cache dir reports no version (not an empty-string one).
+    #[test]
+    fn an_absent_cache_reports_no_version() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(crate::dispatch_internal::cached_runtime_binary_version_at(tmp.path()), None);
+    }
+
+    /// (#2386 review, item 6) The argv's `--session-id` value and the id the
+    /// finding tailer stamps into a stored key must be ONE string. Pinning
+    /// only the literal `"sess-test"` would stay green if the two drifted to
+    /// different fields, and the model would then be handed a key the store
+    /// files elsewhere — worse than handing it no key at all.
+    #[test]
+    #[serial]
+    fn the_argv_session_id_is_the_id_the_finding_tailer_stamps() {
+        let tmp = TempDir::new().unwrap();
+        let findings_store = tmp.path().join("findings");
+        let prev = mod_test_env(tmp.path(), &tmp.path().join("mods"), &findings_store);
+
+        let session_id = "step-review-unit-0007";
+
+        // 1. What the container is TOLD, off the real argv builder.
+        let mut config = base_argv_config();
+        config.session_id = session_id.to_string();
+        let argv = build_docker_run_argv(&config);
+        let at = argv.iter().position(|a| a == "--session-id").expect("--session-id is passed");
+        let told = argv[at + 1].clone();
+
+        // 2. What the tailer STAMPS, off a real create_finding event.
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            session_id.into(),
+            "crawler".into(),
+            "m".into(),
+        );
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0,
+                "tool_name": "create_finding", "args": "{}", "result": "Recorded.",
+                "ok": true, "emit_seq": 1,
+                "emitted": {"file": "a.ts", "line": 4, "pattern": "p", "evidence": "e", "why": "w"},
+            })
+            .to_string(),
+        );
+        let stored = crate::findings::load_at(&findings_store, &told, 1)
+            .expect("readable")
+            .expect("the tailer stamped its key under the SAME id the argv carries");
+        assert_eq!(stored.key, format!("{told}/1"));
+        assert_eq!(told, session_id);
         restore_env(prev);
     }
 
