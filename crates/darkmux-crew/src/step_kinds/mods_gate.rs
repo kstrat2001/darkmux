@@ -242,6 +242,21 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
     if let Err(e) = strip_git_dir(&scratch_checkout) {
         return (None, Some(format!("could not detach the scratch copy from git: {e}")));
     }
+    // (live proof 2026-09-05) A create-mod dispatch carries no `context.source`,
+    // so its kit reaches the store in container coordinates — `a/<source
+    // id>/src/x.ts` — with nothing having mapped it (`create_from_emission`
+    // maps only when the emission names a source). The gate has just resolved
+    // the one source checkout beneath the workdir, and that directory's name
+    // IS the source id, so map here; a kit already in repo coordinates is a
+    // no-op for the `a/`/`b/`-marked headers (see `strip_kit_source_prefix`).
+    let mapped_kit;
+    let kit = match source_dir.file_name().and_then(|n| n.to_str()) {
+        Some(source_id) if !source_id.trim().is_empty() => {
+            mapped_kit = mods::strip_kit_source_prefix(source_id, kit);
+            mapped_kit.as_str()
+        }
+        _ => kit,
+    };
     let patch_path = scratch.path().join("mod.patch");
     // (#2387) Terminate the patch. A kit arrives as a JSON string, which
     // needs no trailing newline and rarely has one; `git apply` reads an
@@ -286,7 +301,13 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
     let check = std::process::Command::new("git")
         .current_dir(&scratch_checkout)
         .env("GIT_CEILING_DIRECTORIES", &ceiling)
-        .args(["apply", "--check", &patch_path.to_string_lossy()])
+        // `--recount` (both calls): a model-written hunk header's line counts
+        // are wrong often enough (`@@ -1,7 +1,5 @@` over an 8/9-line body —
+        // 1 of 3 failed kits in the third live run) that git's "corrupt
+        // patch" was sinking correct bodies. Recounting trusts the body,
+        // which is the part the model actually looked at; wrong CONTEXT still
+        // fails as "patch does not apply", honestly.
+        .args(["apply", "--check", "--recount", &patch_path.to_string_lossy()])
         .output();
     let applied_cleanly = match check {
         Ok(out) => out.status.success(),
@@ -311,7 +332,7 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
     let apply = std::process::Command::new("git")
         .current_dir(&scratch_checkout)
         .env("GIT_CEILING_DIRECTORIES", &ceiling)
-        .args(["apply", &patch_path.to_string_lossy()])
+        .args(["apply", "--recount", &patch_path.to_string_lossy()])
         .output();
     match apply {
         Ok(out) if out.status.success() => {}
@@ -833,6 +854,80 @@ mod tests {
         let gate = rec.gate.as_ref().unwrap_or_else(|| panic!("expected a real gate outcome: {rec:?}"));
         assert_eq!(gate.applied, Some(true), "an unterminated kit must still apply: {gate:?}");
         assert!(gate.passed, "{gate:?}");
+    }
+
+    /// Runs one kit through the gate against the standard fixture and returns
+    /// the recorded gate outcome. Shared by the kit-shape tests below (live
+    /// proof 2026-09-05): each one is a shape a real coder seat wrote for a
+    /// correct change that `git apply` refused verbatim.
+    fn gate_kit(key: &str, kit: &str) -> GateOutcome {
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        mods::materialize(mods_dir.path(), &a_mod_kit(key, "sess-a/1", kit, Some("unified-diff"))).unwrap();
+        ModsGateStepKind
+            .run(
+                &step(json!({
+                    "for_key": "sess-a/1",
+                    "test_command": "grep -q right answer.txt",
+                    "workdir": tree_root.to_string_lossy(),
+                })),
+                &task(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let rec = mods::load_at(mods_dir.path(), key).unwrap().unwrap();
+        rec.gate.clone().unwrap_or_else(|| panic!("expected a real gate outcome: {rec:?}"))
+    }
+
+    /// The coder explains the change in prose and puts the diff in a
+    /// ```diff fence — the shape 3 of 3 pass-3 kits had. The kit is stored
+    /// verbatim (the record is the artifact); the gate applies the DIFF.
+    #[test]
+    #[serial_test::serial]
+    fn a_kit_wrapped_in_prose_and_a_diff_fence_applies() {
+        let kit = format!(
+            "Replace the wrong answer with the right one.\n\nFile: answer.txt\n\n```diff\n{}```\n\nThat is the whole change.\n",
+            one_line_kit("wrong", "right")
+        );
+        let gate = gate_kit("mod-fenced", &kit);
+        assert_eq!(gate.applied, Some(true), "the diff inside the fence must apply: {gate:?}");
+        assert!(gate.passed, "{gate:?}");
+    }
+
+    /// A create-mod dispatch carries no `context.source`, so the kit reaches
+    /// the store in container coordinates (`a/app/answer.txt`, the source id
+    /// as a path prefix) with nothing having mapped it. The gate knows the
+    /// source checkout it resolved, so it maps at apply time.
+    #[test]
+    #[serial_test::serial]
+    fn a_kit_in_container_coordinates_is_mapped_at_the_gate() {
+        let kit = one_line_kit("wrong", "right").replace("a/answer.txt", "a/app/answer.txt").replace("b/answer.txt", "b/app/answer.txt");
+        assert!(kit.contains("--- a/app/answer.txt"), "{kit}");
+        let gate = gate_kit("mod-container", &kit);
+        assert_eq!(gate.applied, Some(true), "the source-prefixed kit must apply: {gate:?}");
+        assert!(gate.passed, "{gate:?}");
+    }
+
+    /// Models miscount hunk headers (`@@ -1,7 +1,5 @@` over an 8/9-line body);
+    /// git calls that "corrupt patch". The body is right and `--recount`
+    /// applies it; a kit whose CONTEXT is wrong still fails honestly.
+    #[test]
+    #[serial_test::serial]
+    fn a_kit_with_miscounted_hunk_headers_still_applies() {
+        let kit = one_line_kit("wrong", "right").replace("@@ -1 +1 @@", "@@ -1,3 +1,4 @@");
+        let gate = gate_kit("mod-recount", &kit);
+        assert_eq!(gate.applied, Some(true), "a miscounted header must not sink a correct body: {gate:?}");
+        assert!(gate.passed, "{gate:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_kit_whose_context_does_not_match_still_fails_honestly() {
+        let kit = one_line_kit("something-else", "right");
+        let gate = gate_kit("mod-badctx", &kit);
+        assert_eq!(gate.applied, Some(false), "{gate:?}");
+        assert_eq!(gate.reason.as_deref(), Some("kit did not apply"));
     }
 
     #[test]
