@@ -135,6 +135,21 @@ jobs:
         if: always()
         run: python3 scripts/ci-coverage-summary.py cov.json --badge coverage-badge.json >> "$GITHUB_STEP_SUMMARY"
 
+      # The coverage run builds with every feature, so the `ts-export` tests
+      # regenerate `ui/src/types/generated/*.ts` from the Rust types. A field
+      # added to an exported struct without regenerating leaves the committed
+      # binding stale — and nothing caught that until the badge step below
+      # tripped over the modified file on main (2026-09-05: `CrawlSummary.ts`,
+      # stale since #2357, failed every main push for a day while every PR
+      # run stayed green). Fail HERE, on the PR, with the remedy.
+      - name: Generated TS bindings are in sync with the Rust types
+        run: |
+          if ! git diff --exit-code -- ui/src/types/generated; then
+            echo "::error::ui/src/types/generated is stale. Run 'cargo test -p darkmux-lab --features ts-export export_bindings' (and the same for any other crate with ts(export) types) and commit the regenerated bindings."
+            exit 1
+          fi
+          echo "generated bindings match the Rust types"
+
       # (#1792) Publish the badge to an orphan `badges` branch that shields.io
       # reads. Deliberately NOT a third-party service: no account, no data
       # leaving the repo, no token beyond GITHUB_TOKEN. main-only, so a PR
@@ -148,8 +163,19 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           tmp=$(mktemp -d); cp coverage-badge.json "$tmp/coverage.json"
-          git fetch origin badges --depth=1 2>/dev/null && git checkout badges \
-            || git checkout --orphan badges
+          # The measure step may leave tracked files modified (regenerated
+          # bindings, build side effects); a dirty tree makes `git checkout`
+          # refuse, and the old `|| --orphan` fallback then silently created
+          # a NEW orphan branch whose push was rejected as non-fast-forward.
+          # Revert the tree first, and only take the orphan path when the
+          # remote branch genuinely does not exist.
+          git checkout -q -- .
+          if git fetch origin badges --depth=1 2>/dev/null; then
+            git checkout -q badges
+          else
+            echo "no remote badges branch yet — creating it"
+            git checkout -q --orphan badges
+          fi
           git rm -rqf . 2>/dev/null || true
           cp "$tmp/coverage.json" coverage.json
           git add coverage.json
