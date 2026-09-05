@@ -3623,7 +3623,11 @@ fn mission_launch_outcome_from_unknown_task_refused_before_minting() {
 /// `dirs::home_dir()` directly (`config_access::flows_dir_default`, fixed
 /// alongside this test to derive from `paths::resolve(Auto)` instead —
 /// see `crates/darkmux-types/src/config_access.rs`'s
-/// `flows_dir_honors_darkmux_home` for the unit-level red→green proof of
+/// NOTE (#2363 review): `flows_dir_honors_darkmux_home` pins the cfg(test) twin body,
+/// not the production `flows_dir_default`; the production fix has NO automated pin here.
+/// Its evidence is the manual run of a non-test-support binary recorded in PR #2363;
+/// the available real pin is an `#[ignore]`d test (or a CI step) that builds and runs
+/// the release-cfg binary with DARKMUX_HOME set and a fake HOME.
 /// that fix). `HOME` is pointed at a SEPARATE tempdir here (never the
 /// operator's real home) so this test can prove the negative without ever
 /// touching a real machine's state.
