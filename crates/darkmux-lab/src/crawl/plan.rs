@@ -3647,10 +3647,11 @@ line two
             "export function retryWithBackoff",
             "did you check for an existing retry helper",
         );
-        // union-vs-enum (confirm=search) — a search bullet. The search
-        // form's rendered bullet reads `evidence` (the candidates found),
-        // never `why` — see `render_github_review`'s `DeliveryForm::Search`
-        // arm.
+        // union-vs-enum (confirm=search), with nobody proposing a change —
+        // a lead under the tail section, headed by its own rule. Its
+        // rendered entry carries the claim (`why`) AND the instances
+        // (`evidence`); see `render_github_review`'s own doc for why a
+        // searched rule with no change is never a headline.
         let uve_key = mk_finding(
             "sess-fix",
             4,
@@ -3788,12 +3789,45 @@ line two
         // falls back to what the lists prove: 5 run, none not-attempted.
         assert!(review.body.contains("review ran: 5 of 5 rules reviewed"), "{}", review.body);
         assert!(review.body.contains("rule-shaped review"), "the standing narrowness: {}", review.body);
-        assert!(review.body.contains(&up_key), "gate-failed unnamed-predicate mod renders as a double-check: {}", review.body);
-        assert!(review.body.contains(&es_key), "existing-solution renders as a question: {}", review.body);
+        // (#2310 delivery rewrite) Every entry is headed by its RULE — the
+        // title from `templates/builtin/rules/<id>.json`, tagged with the
+        // id the author re-runs the check by — and located by `path:line`.
+        // The finding KEY (darkmux's own record id) never renders.
+        for key in [&se_key, &up_key, &es_key, &uve_key, &ssc_key] {
+            assert!(!review.body.contains(key.as_str()), "the record key {key} must not render: {}", review.body);
+        }
+        assert!(
+            review.body.contains("**A new routine looks re-implemented rather than reused** `existing-solution`"),
+            "existing-solution heads its own group: {}",
+            review.body
+        );
+        assert!(review.body.contains("`src/retry.ts:3`"), "located by path:line: {}", review.body);
         assert!(review.body.contains("did you check for an existing retry helper"));
-        assert!(review.body.contains(&uve_key), "union-vs-enum renders as a search bullet: {}", review.body);
-        assert!(review.body.contains(&ssc_key), "shared-symbol-callers renders as a search bullet: {}", review.body);
+        // The two searched rules and the gate-failed mod are leads, under
+        // the one cross-rule tail section, each still headed by its rule.
+        let tail = review.body.find("Worth a double check").unwrap_or_else(|| panic!("{}", review.body));
+        for (heading, location) in [
+            ("_A compound condition encodes a domain rule that has no name and cannot be tested on its own_", "`src/auth.ts:3`"),
+            ("_A new string-literal union or enum-like set may duplicate an existing one_", "`src/status.ts:3`"),
+            ("_A shared function or type's signature or behavior changed_", "`src/shared.ts:4`"),
+        ] {
+            assert!(review.body[tail..].contains(heading), "{heading} heads a group in the tail: {}", review.body);
+            assert!(review.body[tail..].contains(location), "{location} sits in the tail: {}", review.body);
+        }
         assert!(review.body.contains("3 callers found"));
+        // (#2310 delivery rewrite, rule 4) The delivered review speaks the
+        // AUTHOR's language: darkmux's own procedure words never appear in
+        // the body or the inline comments. Rule IDS do — a rule id names
+        // what was violated and is the handle for re-running the check.
+        let mut spoken = review.body.clone();
+        for c in &review.comments {
+            spoken.push('\n');
+            spoken.push_str(&c.body);
+        }
+        let spoken = spoken.to_lowercase();
+        for word in ["search-confirmed", "confirm", "kit", "mod-form", "question-form", "dispatch", "unit"] {
+            assert!(!spoken.contains(word), "the review speaks darkmux's own procedure word {word:?}: {spoken}");
+        }
 
         let actual = serde_json::to_string_pretty(&payload).unwrap();
         let golden_path = review_v2_fixture_dir().join("golden-payload.json");
