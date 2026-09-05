@@ -49,6 +49,9 @@ pub mod gate;
 // make. `telemetry_sampler::sample_host` still exists with the same
 // signature; it now reads THROUGH this probe.
 pub mod host_probe;
+// (#2413) Singleton coordination lock for the ONE machine-scoped host
+// sampler — see the module doc.
+pub mod host_sampler_lock;
 // (#1284 Packet 2) The standard output contract every mission emits +
 // generalized finalization. `ReviewEnvelope` (darkmux-lab) maps INTO
 // `MissionEnvelope::payload` — this crate has no reverse dependency on

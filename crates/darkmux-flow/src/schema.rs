@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.41.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.42.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -839,6 +839,44 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.41.0";
 //               otherwise the output itself. Renamed rather than aliased:
 //               1.38.0 is days old, unreleased, and had no consumers
 //               outside this repo.
+//
+//   1.42.0 (#2413): `telemetry.process` RETIRED from the container-loop
+//           dispatch path — `dispatch_internal::run_telemetry_sampler`
+//           (the per-dispatch, 2s-cadence CPU/mem/gpu-only emitter this
+//           issue measured at 37,455 records/day) no longer writes it.
+//           **Known remaining producer, explicitly OUT OF this bump's
+//           scope:** `darkmux_crew::run_obs::HostTelemetrySampler` — an
+//           older, separate mechanism (shells to `top`/`vm_stat`/`ioreg`)
+//           used by `mission_launch.rs` (mission-level runs), `acp_panel.rs`
+//           (ACP sessions), and (until its own deletion, tracked
+//           separately) `darkmux-lab::lab::review`'s pipeline — still
+//           writes `telemetry.process` at this version. A reader still
+//           sees it, from both this producer and historical (pre-1.42.0)
+//           day files — lenient-on-read either way, no migration.
+//
+//           `machine.telemetry` becomes MACHINE-scoped: it is now emitted
+//           by exactly ONE process per machine (the daemon's host sampler,
+//           or a dispatch process's sampler when no daemon runs on that
+//           machine — coordinated by a singleton lock,
+//           `darkmux_crew::host_sampler_lock`), not by every dispatch.
+//           `session_id`, `handle`'s dispatch identity, `model`,
+//           `mission_id`, and `phase_id` are ALWAYS absent on a
+//           `machine.telemetry` record written at this version — a reader
+//           joins it to a run by `machine_uid` + a time window instead of
+//           by session. The payload gains `interval_ms`: the EFFECTIVE
+//           emission cadence for that record (the configured
+//           `runtime.host_sampler_interval_ms` while a dispatch is live
+//           anywhere on the machine, 10x that while idle — the daemon
+//           sampler only; a dispatch-owned sampler is definitionally live
+//           and always uses the base cadence). Every other payload key
+//           (`sampled_at_ms`, `sampler_cost_ms`, `cpu_pct`, `mem_pct`,
+//           `gpu_pct`, `thermal`, `power_mw`, etc.) is UNCHANGED —
+//           `host_probe::sample_full_json`'s shape. A reader keyed to the
+//           pre-1.42.0 per-dispatch shape (session-scoped) sees a record
+//           with those fields simply absent, which its own leniency rule
+//           already covers; a reader wanting the retired per-dispatch
+//           curve's SPECIFIC session attribution has no substitute at this
+//           version — join by machine + time instead.
 //
 //   1.41.0 (#2394): every scheduler-emitted `step start` record gains
 //           `payload.seat_class` — what that step CONSUMES, as declared by

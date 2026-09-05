@@ -168,7 +168,7 @@ pub fn run() -> DoctorReport {
         check_reasoning_checkpoint_interval(),
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
-        check_telemetry_record_every_samples(),
+        check_host_sampler(),
         check_generation_checkpoint_interval(),
         check_thermal_governor(),
         check_host_probe(),
@@ -2074,43 +2074,83 @@ fn check_host_sampler_interval() -> Check {
     }
 }
 
-/// (#2111) Surface the resolved `runtime.telemetry_record_every_samples`
-/// with provenance — how many dispatch-sampler ticks (2s cadence) between
-/// `machine.telemetry` periodic SAMPLE flow records, alongside
-/// `machine.thermal`'s TRANSITION events. Always Pass: `0` is an honest
-/// opt-out (the periodic curve simply isn't written; the sampler itself,
-/// the thermal governor, and `dispatch complete`'s `host_window` summary
-/// are all unaffected), not a defect — same shape as
-/// `check_host_sampler_interval`'s `0` case.
-fn check_telemetry_record_every_samples() -> Check {
-    let name = "runtime.telemetry_record_every_samples";
-    let (value, source) =
-        darkmux_types::config_access::telemetry_record_every_samples_with_source();
-    let provenance = source.as_str();
-    if value == 0 {
+/// (#2413) Surface the singleton host-sampler lock's state —
+/// `<darkmux-home>/liveness/host-sampler.lock` — the coordination file that
+/// keeps exactly one machine.telemetry emitter alive per machine (the
+/// daemon, or a dispatch process when no daemon runs).
+///
+/// Three outcomes, checked in this order:
+/// 1. No lock file at all → Pass: nothing has sampled yet on this machine
+///    (fresh install, or no daemon/dispatch has started one).
+/// 2. A RECENT contention marker (see `host_sampler_lock::read_contention`)
+///    → Warn "two live pids": a second process attempted to acquire the
+///    lock while another held a fresh one. **Honesty limit, stated
+///    plainly:** this file-based lock can only ever record ONE current
+///    holder — a genuine second emitter is observable ONLY at the instant
+///    a loser's acquisition attempt writes the contention marker. A race
+///    that resolved with the loser correctly backing off leaves exactly
+///    this trace; a race that somehow left two active emitters (a bug in
+///    the acquire path) would NOT be distinguishable from a clean loss by
+///    this check alone — it can name "a second pid tried," never "a second
+///    pid is currently also emitting."
+/// 3. Otherwise: stale (heartbeat older than 3x its own declared interval,
+///    or its pid is dead) → Warn; else → Pass, naming the live holder.
+fn check_host_sampler() -> Check {
+    let name = "host sampler";
+    let now_ms = darkmux_crew::host_sampler_lock::epoch_ms_now();
+    let Some(state) = darkmux_crew::host_sampler_lock::read_lock() else {
         return Check {
             name: name.into(),
             status: Status::Pass,
-            message: format!(
-                "0 ({provenance}) — the periodic machine.telemetry curve is disabled; \
-                 machine.thermal transitions and dispatch complete's host_window are unaffected"
-            ),
+            message: "no sampler active yet (no dispatch or daemon has started one on this machine)".into(),
             hint: None,
         };
+    };
+    if let Some(c) = darkmux_crew::host_sampler_lock::read_contention() {
+        let recent_window_ms = state.interval_ms.max(1).saturating_mul(3);
+        if now_ms.saturating_sub(c.ts_ms) <= recent_window_ms {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!(
+                    "two live pids recently claimed the host-sampler lock: pid {} ({}) holds it; \
+                     pid {} ({}) was declined at a recent acquisition attempt. This can only be seen \
+                     AT the moment a second process attempts to acquire while another holds a fresh \
+                     lock — it names that a second pid tried, not whether it is still emitting.",
+                    state.pid, state.owner, c.declined_pid, c.declined_owner
+                ),
+                hint: Some(
+                    "If this recurs, check whether both a `darkmux serve` daemon and a dispatch \
+                     process are starting a sampler on this machine at the same time."
+                        .into(),
+                ),
+            };
+        }
     }
-    // (#2111 review finding) Derived from the sampler's own constant
-    // rather than a hardcoded literal, so this message can't silently
-    // drift from the real tick if that constant ever changes.
-    let cadence_ms = value.saturating_mul(darkmux_crew::dispatch_internal::TELEMETRY_SAMPLE_INTERVAL_MS);
-    Check {
-        name: name.into(),
-        status: Status::Pass,
-        message: format!(
-            "every {value} sample(s) ({provenance}) — the machine.telemetry periodic \
-             host-pressure curve's cadence (≈{}s at the dispatch sampler's own tick)",
-            cadence_ms / 1000
-        ),
-        hint: None,
+    let dead = !darkmux_crew::host_sampler_lock::pid_alive(state.pid);
+    let stale = dead || darkmux_crew::host_sampler_lock::is_stale(&state, now_ms);
+    if stale {
+        Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "stale lock: pid {} ({}), last heartbeat {}ms ago (every {}ms), pid {} — will be \
+                 reclaimed by the next sampler to start",
+                state.pid,
+                state.owner,
+                now_ms.saturating_sub(state.heartbeat_ts_ms),
+                state.interval_ms,
+                if dead { "dead" } else { "alive" },
+            ),
+            hint: None,
+        }
+    } else {
+        Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("one sampler (pid {}, {}, every {}ms)", state.pid, state.owner, state.interval_ms),
+            hint: None,
+        }
     }
 }
 
@@ -6779,55 +6819,115 @@ mod tests {
         assert!(!check.message.contains("env"), "the env tier is absent here: {}", check.message);
     }
 
-    // ─── (#2111) check_telemetry_record_every_samples — resolved state + provenance ─
+    // ─── (#2413) check_host_sampler — singleton lock Pass/Warn/Warn ───
 
-    #[serial_test::serial]
-    #[test]
-    fn check_telemetry_record_every_samples_default_is_pass_and_names_5() {
-        let prev = std::env::var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES").ok();
-        unsafe { std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES") };
-        let check = check_telemetry_record_every_samples();
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains("every 5 sample"), "{}", check.message);
+    /// Isolate `host_sampler_lock_path()` to a fresh tempdir for the
+    /// duration of `f`, restoring `DARKMUX_HOME` afterward. Serialized
+    /// (env mutation) like every other doctor env test in this file.
+    fn with_isolated_liveness_dir(f: impl FnOnce()) {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        f();
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", v),
-                None => std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
 
     #[serial_test::serial]
     #[test]
-    fn check_telemetry_record_every_samples_zero_is_pass_and_says_disabled() {
-        let prev = std::env::var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES").ok();
-        unsafe { std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", "0") };
-        let check = check_telemetry_record_every_samples();
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains("disabled"), "{}", check.message);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", v),
-                None => std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES"),
-            }
-        }
+    fn check_host_sampler_no_lock_file_is_pass() {
+        with_isolated_liveness_dir(|| {
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Pass, "{}", check.message);
+            assert!(check.message.contains("no sampler active"), "{}", check.message);
+        });
     }
 
     #[serial_test::serial]
     #[test]
-    fn check_telemetry_record_every_samples_env_override_names_provenance() {
-        let prev = std::env::var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES").ok();
-        unsafe { std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", "10") };
-        let check = check_telemetry_record_every_samples();
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains("every 10 sample"), "{}", check.message);
-        assert!(check.message.contains("env"), "provenance named: {}", check.message);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", v),
-                None => std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES"),
-            }
-        }
+    fn check_host_sampler_fresh_lock_is_pass_and_names_pid_owner_interval() {
+        with_isolated_liveness_dir(|| {
+            let guard = darkmux_crew::host_sampler_lock::try_acquire("daemon", 5000)
+                .expect("nothing else holds the lock");
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Pass, "{}", check.message);
+            assert!(check.message.contains(&std::process::id().to_string()), "{}", check.message);
+            assert!(check.message.contains("daemon"), "{}", check.message);
+            assert!(check.message.contains("5000ms"), "{}", check.message);
+            drop(guard);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_stale_heartbeat_is_warn() {
+        with_isolated_liveness_dir(|| {
+            // A lock whose heartbeat is far older than 3x its own interval,
+            // owned by OUR OWN (alive) pid — so this specifically exercises
+            // the heartbeat-staleness branch, not the dead-pid branch.
+            darkmux_crew::host_sampler_lock::write_lock_state_for_test(
+                &darkmux_crew::host_sampler_lock::LockState {
+                    pid: std::process::id(),
+                    machine_uid: None,
+                    started_ts_ms: 0,
+                    heartbeat_ts_ms: 0,
+                    interval_ms: 1000,
+                    owner: "daemon".to_string(),
+                },
+            );
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Warn, "{}", check.message);
+            assert!(check.message.contains("stale"), "{}", check.message);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_dead_pid_is_warn() {
+        with_isolated_liveness_dir(|| {
+            // A pid that (almost certainly) does not exist, with a FRESH
+            // heartbeat — isolates the dead-pid branch from the staleness
+            // branch above.
+            let now = darkmux_crew::host_sampler_lock::epoch_ms_now();
+            darkmux_crew::host_sampler_lock::write_lock_state_for_test(
+                &darkmux_crew::host_sampler_lock::LockState {
+                    pid: 999_999,
+                    machine_uid: None,
+                    started_ts_ms: now,
+                    heartbeat_ts_ms: now,
+                    interval_ms: 5000,
+                    owner: "dispatch".to_string(),
+                },
+            );
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Warn, "{}", check.message);
+            assert!(check.message.contains("dead"), "{}", check.message);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_recent_contention_is_warn_two_live_pids() {
+        with_isolated_liveness_dir(|| {
+            let guard = darkmux_crew::host_sampler_lock::try_acquire("daemon", 5000)
+                .expect("nothing else holds the lock");
+            // A second acquisition attempt against the same fresh lock
+            // records contention and declines. A distinct (simulated) pid
+            // is required — one test binary is one real OS process, so two
+            // `try_acquire` calls here would otherwise share a pid and
+            // never exercise the "a DIFFERENT process holds it" branch.
+            let other_pid = std::process::id().wrapping_add(1);
+            let second = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 5000);
+            assert!(second.is_none(), "a fresh lock is not stealable");
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Warn, "{}", check.message);
+            assert!(check.message.contains("two live pids"), "{}", check.message);
+            drop(guard);
+        });
     }
 
     // ─── (#2171 test e) check_generation_checkpoint_interval — resolved state ─

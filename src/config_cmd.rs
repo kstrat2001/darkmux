@@ -141,8 +141,6 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2107, #1833) Cadence of `darkmux serve`'s daemon-side continuous
     // host sampler feeding the machine stats drawer. `0` disables it.
     ("runtime.host_sampler_interval_ms", Ty::Uint),
-    // (#2111) Every Nth dispatch-sampler tick emits a `machine.telemetry` record; 0 = off.
-    ("runtime.telemetry_record_every_samples", Ty::Uint),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc.
     ("runtime.thermal.enabled", Ty::Bool),

@@ -5563,52 +5563,13 @@ fn run_tailer(
     state.summary
 }
 
-/// (#2111) Pure: whether tick number `sample_idx` (1-indexed — the first
-/// tick a sampler takes is `1`, not `0`) should emit a periodic
-/// `machine.telemetry` SAMPLE record, given the configured cadence
-/// `every` (`config_access::telemetry_record_every_samples()`). `every ==
-/// 0` means "disabled" — never emits, regardless of `sample_idx`. A
-/// 1-indexed counter means the very first tick is never itself a record
-/// (the periodic curve starts roughly `every` ticks in, not immediately),
-/// matching `machine.thermal`'s own "the first reading seeds silently"
-/// convention for the other new action this issue adds.
-fn should_record_machine_telemetry(sample_idx: u64, every: u64) -> bool {
-    every > 0 && sample_idx % every == 0
-}
-
-/// (#2111) Build one `machine.telemetry` SAMPLE flow record — the full
-/// host reading (`host_probe::sample_full_json`, shared with the daemon
-/// ring's `/machine/resources` `load.now` block) through
-/// `merge_record_context` so it keys to this dispatch's mission/step the
-/// same way every other tailer-emitted telemetry record does. Pure: no
-/// probe, no clock, no sampler thread — the cadence gate
-/// (`should_record_machine_telemetry`) and this payload/record shape are
-/// each independently testable without spinning the real sampler.
-#[allow(clippy::too_many_arguments)]
-fn build_machine_telemetry_record(
-    sample: &crate::host_probe::HostSampleFull,
-    sampled_at_ms: u64,
-    role_id: &str,
-    session_id: &str,
-    model: &str,
-    mission_id: Option<&str>,
-    phase_id: Option<&str>,
-    record_context: &Option<serde_json::Value>,
-) -> darkmux_flow::FlowRecord {
-    let mut payload = crate::host_probe::sample_full_json(sample, sampled_at_ms);
-    merge_record_context(&mut payload, record_context);
-    crate::dispatch::build_telemetry_record(
-        darkmux_flow::Level::Info,
-        "machine.telemetry",
-        "host",
-        role_id,
-        session_id,
-        Some(model),
-        mission_id,
-        phase_id,
-        payload,
-    )
-}
+// (#2413) `should_record_machine_telemetry` and the dispatch-scoped
+// `build_machine_telemetry_record` (the #2111 per-dispatch periodic
+// `machine.telemetry` curve) are retired along with the per-dispatch
+// emitter itself. The machine-scoped replacement lives in
+// `host_probe::build_machine_scoped_telemetry_record`, shared by this
+// sampler (when it holds the singleton lock — see the loop below) and
+// `darkmux-serve`'s daemon sampler.
 
 /// (#2111) A compact host-pressure summary for `dispatch complete`/
 /// `dispatch error`'s FLOW RECORD payload (and the `--json` envelope,
@@ -5901,13 +5862,25 @@ fn run_telemetry_sampler(
         ));
     };
 
-    // (#2111) The periodic `machine.telemetry` curve's cadence, resolved
-    // ONCE up front — `env > config.json > 5` (≈10s at this sampler's 2s
-    // tick). `0` disables the periodic curve without touching anything
-    // else this sampler does (thermal governor, `host_window` reduction).
-    let telemetry_record_every_samples = darkmux_types::config_access::telemetry_record_every_samples();
-    let mut sample_idx: u64 = 0;
-    // (#2111 review finding) The MEASURED write duration of the PREVIOUS
+    // (#2413) This dispatch is, by definition, LIVE for as long as this
+    // sampler thread runs — so if it becomes the machine's singleton host
+    // sampler, it always emits at the base `host_sampler_interval_ms()`
+    // cadence (never the daemon's idle 10x backoff, which exists only
+    // because the DAEMON runs when nothing may be live). `try_acquire`
+    // returns `None` when a daemon (or another dispatch) already holds a
+    // fresh lock — in that case this dispatch emits NO `machine.telemetry`
+    // records at all, matching the rule "at most one emitter per machine."
+    // The guard is a local: RAII releases it on every exit from this
+    // function (normal return, the early `return` mid-loop below, or a
+    // panic-unwind through this scope), same lifecycle contract as every
+    // other bookend guard in this codebase.
+    let machine_sampler_interval_ms = darkmux_types::config_access::host_sampler_interval_ms();
+    let mut sampler_lock = if machine_sampler_interval_ms > 0 {
+        crate::host_sampler_lock::try_acquire("dispatch", machine_sampler_interval_ms)
+    } else {
+        None
+    };
+    // (#2413 review finding) The MEASURED write duration of the PREVIOUS
     // `machine.telemetry` emission — `None` until the first one has
     // happened. A record cannot honestly report its OWN write cost (the
     // write hasn't happened yet when the payload is built), so this stamps
@@ -6044,21 +6017,6 @@ fn run_telemetry_sampler(
                 mem: sample.mem_pct,
                 gpu: sample.gpu_pct,
             });
-            let mut payload = serde_json::Map::new();
-            if let Some(c) = sample.cpu_pct {
-                payload.insert("cpu".into(), c.into());
-            }
-            if let Some(m) = sample.mem_pct {
-                payload.insert("mem".into(), m.into());
-            }
-            if let Some(g) = sample.gpu_pct {
-                payload.insert("gpu".into(), g.into());
-            }
-            emit(
-                "process",
-                "telemetry.process",
-                serde_json::Value::Object(payload),
-            );
         }
         // (#2108) Recorded on EVERY tick, including one where cpu/mem/gpu
         // all failed: a tick that read power but not utilization is still a
@@ -6075,46 +6033,51 @@ fn run_telemetry_sampler(
             });
         }
 
-        // (#2111) The periodic `machine.telemetry` curve — every Nth tick,
-        // never every tick (the observer-cost rule: the sample is ALREADY
-        // taken above for the governor + the `host`/`host_window`
-        // reduction; only the record WRITE is the added cost, and only on
-        // the ticks that actually emit).
-        sample_idx += 1;
-        if should_record_machine_telemetry(sample_idx, telemetry_record_every_samples) {
-            // (#2111 review finding) `at_ms` above is RELATIVE to this
-            // sampler's own start (`started.elapsed()`) — correct for the
-            // reduction math and the thermal governor's gap timing, but
-            // wrong for a flow record's `sampled_at_ms`: `machine.thermal`
-            // (the daemon sampler) and `/machine/resources` both stamp
-            // real UNIX epoch ms, so a relative offset here would read as
-            // 1970 next to either of them on a chart. `epoch_ms_now()` is
-            // the one shared wall-clock read every `sampled_at_ms`
-            // producer uses.
-            let sampled_at_epoch_ms = crate::host_probe::epoch_ms_now();
-            let mut rec = build_machine_telemetry_record(
-                &sample,
-                sampled_at_epoch_ms,
-                &role_id,
-                &session_id,
-                &model,
-                mission_id.as_deref(),
-                phase_id.as_deref(),
-                &record_context,
-            );
-            // (#2111 review finding, CLAUDE.md "samplers stamp their own
-            // cost") This record's OWN write hasn't happened yet — it
-            // can't honestly report its own cost — so it carries the
-            // PREVIOUS emission's measured write duration instead. `None`
-            // on the first emission (no previous write to report).
-            if let (Some(ms), Some(obj)) =
-                (prev_record_write_ms, rec.payload.as_mut().and_then(|p| p.as_object_mut()))
-            {
-                obj.insert("prev_record_write_ms".into(), serde_json::json!(ms));
+        // (#2413) The machine-scoped `machine.telemetry` curve — emitted
+        // ONLY when this dispatch is the machine's singleton host sampler
+        // (no daemon, and no other dispatch, currently holds the lock).
+        // Every tick, never every Nth: unlike the retired per-dispatch
+        // curve, a dispatch-owned sampler exists only because a dispatch
+        // (itself) is live, so there is no idle backoff to apply here —
+        // that only makes sense for the DAEMON's sampler (see
+        // `darkmux-serve::host_sampler`), which keeps running when nothing
+        // is live. `heartbeat` returning `false` means another process won
+        // a steal race; drop the guard so this loop stops trying (and lets
+        // whoever won be the sole emitter, per the "at most one" rule).
+        if let Some(guard) = sampler_lock.as_ref() {
+            if guard.heartbeat(machine_sampler_interval_ms) {
+                // (#2111 review finding, kept) `at_ms` above is RELATIVE to
+                // this sampler's own start (`started.elapsed()`) — correct
+                // for the reduction math and the thermal governor's gap
+                // timing, but wrong for a flow record's `sampled_at_ms`:
+                // `machine.thermal` (the daemon sampler) and
+                // `/machine/resources` both stamp real UNIX epoch ms, so a
+                // relative offset here would read as 1970 next to either
+                // of them on a chart. `epoch_ms_now()` is the one shared
+                // wall-clock read every `sampled_at_ms` producer uses.
+                let sampled_at_epoch_ms = crate::host_probe::epoch_ms_now();
+                let mut rec = crate::host_probe::build_machine_scoped_telemetry_record(
+                    &sample,
+                    sampled_at_epoch_ms,
+                    machine_sampler_interval_ms,
+                );
+                // (CLAUDE.md "samplers stamp their own cost") This
+                // record's OWN write hasn't happened yet — it can't
+                // honestly report its own cost — so it carries the
+                // PREVIOUS emission's measured write duration instead.
+                // `None` on the first emission (no previous write to
+                // report).
+                if let (Some(ms), Some(obj)) =
+                    (prev_record_write_ms, rec.payload.as_mut().and_then(|p| p.as_object_mut()))
+                {
+                    obj.insert("prev_record_write_ms".into(), serde_json::json!(ms));
+                }
+                let write_start = Instant::now();
+                let _ = darkmux_flow::record(rec);
+                prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
+            } else {
+                sampler_lock = None;
             }
-            let write_start = Instant::now();
-            let _ = darkmux_flow::record(rec);
-            prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
         }
 
         // Wait out the sample interval, but poll the stop flag every

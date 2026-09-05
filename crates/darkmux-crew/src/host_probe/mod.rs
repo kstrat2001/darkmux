@@ -194,6 +194,55 @@ pub fn sample_full_json(s: &HostSampleFull, sampled_at_ms: u64) -> serde_json::V
     })
 }
 
+/// (#2413) Build one machine-SCOPED `machine.telemetry` flow record — the
+/// full host reading (`sample_full_json`, above) plus `interval_ms` (the
+/// EFFECTIVE emission cadence for this tick), and explicitly NO
+/// session/handle/model/mission/phase fields. Shared by the two possible
+/// singleton-sampler owners: a dispatch process holding
+/// `host_sampler_lock` (`dispatch_internal::run_telemetry_sampler`) and
+/// `darkmux-serve`'s daemon sampler — replacing the retired per-dispatch
+/// `build_machine_telemetry_record`, which stamped role/session/model onto
+/// every record and made every dispatch its own emitter (#2413's whole
+/// point is that there is only ever ONE).
+///
+/// `machine_id`/`machine_uid` are left `None` — `darkmux_flow::record`'s
+/// write-time auto-stamp fills them from THIS machine's own provenance,
+/// same convention `darkmux-serve::host_sampler::build_thermal_transition_record`
+/// already uses for `machine.thermal`.
+pub fn build_machine_scoped_telemetry_record(
+    sample: &HostSampleFull,
+    sampled_at_ms: u64,
+    interval_ms: u64,
+) -> darkmux_flow::FlowRecord {
+    let mut payload = sample_full_json(sample, sampled_at_ms);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("interval_ms".into(), serde_json::json!(interval_ms));
+    }
+    let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level: darkmux_flow::Level::Info,
+        category: darkmux_flow::Category::Machinery,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
+        action: "machine.telemetry".to_string(),
+        handle: display_name,
+        phase_id: None,
+        session_id: None,
+        source: Some("host".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+        work_id: None,
+        attempt: None,
+    }
+}
+
 // ── Window reduction ───────────────────────────────────────────────────────
 
 /// One metric's window reduction in milliwatts. Mirrors

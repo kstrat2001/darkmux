@@ -105,3 +105,41 @@ describe("lastKnown (#2107 phone feedback)", () => {
     expect(s.lastKnown).toBeNull();
   });
 });
+
+// ─── (#2413) machine.telemetry — the machine-scoped replacement ──────────
+
+const machineTelemetry = (ts: string, cpu: number, machine_uid?: string): FlowRecord => ({
+  ts,
+  category: "machinery",
+  source: "host",
+  action: "machine.telemetry",
+  machine_uid,
+  payload: { cpu_pct: cpu, mem_pct: cpu, gpu_pct: cpu, sampled_at_ms: Date.parse(ts), interval_ms: 5000 },
+});
+
+describe("machine.telemetry recognition (#2413)", () => {
+  it("the rolling window recognizes machine.telemetry and reads its cpu_pct/mem_pct/gpu_pct shape", () => {
+    const now = Date.parse("2026-01-01T00:00:02Z");
+    const rolling = [machineTelemetry("2026-01-01T00:00:00Z", 33), machineTelemetry("2026-01-01T00:00:02Z", 66)];
+    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, null, now);
+    expect(s.samples.map((p) => p.cpu)).toEqual([33, 66]);
+    expect(s.samples.map((p) => p.mem)).toEqual([33, 66]);
+    expect(s.samples.map((p) => p.gpu)).toEqual([33, 66]);
+  });
+
+  it("findLastKnownSample recognizes machine.telemetry, still respecting the machine uid filter", () => {
+    const now = Date.parse("2026-01-01T01:00:00Z");
+    const rolling = [
+      machineTelemetry("2026-01-01T00:00:00Z", 99, "peer-machine"),
+      machineTelemetry("2026-01-01T00:00:00Z", 40, "this-machine"),
+    ];
+    const found = findLastKnownSample(rolling, "this-machine", now);
+    expect(found?.point.cpu).toBe(40);
+  });
+
+  it("a mixed window of old telemetry.process and new machine.telemetry records both fold in, oldest first", () => {
+    const routeRecords = [machineTelemetry("2026-01-01T00:00:02Z", 20), proc("2026-01-01T00:00:00Z", 10)];
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, routeRecords, [], null, Date.parse("2026-01-01T00:00:02Z"));
+    expect(s.samples.map((p) => p.cpu)).toEqual([10, 20]);
+  });
+});

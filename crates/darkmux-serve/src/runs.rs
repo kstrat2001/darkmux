@@ -1216,8 +1216,73 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64) -> RunStatus {
 /// (#1621) How long a lab run's newest artifact may age before the run stops
 /// counting as live. Twice the runtime's inactivity budget — see
 /// [`lab_run_status`] for why that is the right anchor.
-fn stale_after_ms() -> u64 {
+pub(crate) fn stale_after_ms() -> u64 {
     darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(2_000)
+}
+
+/// (#2413) Best-effort, LOCAL-ONLY: is at least one dispatch bookend-open
+/// (a `dispatch start` with no matching `dispatch complete`/`error` yet,
+/// within [`stale_after_ms`] of `now_ms`) on THIS machine? Feeds the
+/// daemon host sampler's live-vs-idle emission cadence
+/// (`host_sampler::spawn`) — reusing the SAME dispatch-bookend vocabulary
+/// (`darkmux_flow::is_dispatch_start`/`is_dispatch_terminal`) and the SAME
+/// staleness budget [`session_is_live`] already judges run liveness by,
+/// rather than inventing a second liveness definition.
+///
+/// **What this can see:** any dispatch whose start bookend landed in
+/// TODAY's local JSONL file (`darkmux_types::config_access::flows_dir()`)
+/// without a terminal yet, judged against the timestamp of its own most
+/// recent record (any action) — so a genuinely long-running dispatch that
+/// keeps emitting stays "live" past `stale_after_ms` from its START, the
+/// same way `session_is_live` judges last ACTIVITY rather than start age.
+///
+/// **What this cannot see:** a dispatch that crossed the UTC midnight
+/// boundary mid-run (its start bookend is in YESTERDAY's file — reading
+/// only today's file is a deliberate cost bound, not an oversight: this
+/// runs on every sampler tick, so it stays a single small file read rather
+/// than a multi-day scan); dispatches on OTHER machines (correct on
+/// purpose — sampler cadence is a PER-MACHINE decision, so a busy fleet
+/// peer must not speed up an idle machine's own sampler); a dispatch whose
+/// records land ONLY in a non-local sink (theoretical: `LocalFileSink` is
+/// always-on regardless of what else is configured).
+pub(crate) fn any_dispatch_live_locally(now_ms: u64, max_age_ms: u64) -> bool {
+    any_dispatch_live_in(&darkmux_types::config_access::flows_dir(), &darkmux_flow::day_utc_now(), now_ms, max_age_ms)
+}
+
+fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_ms: u64) -> bool {
+    let path = dir.join(format!("{day}.jsonl"));
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    let mut last_activity_ms: HashMap<String, u64> = HashMap::new();
+    // (self-QA catch, #2413) A session is "open" ONLY from its OWN
+    // `dispatch start` bookend through its OWN `dispatch complete`/`error`
+    // — never inferred from mere PRESENCE in the file. The first cut of
+    // this function tracked `last_activity_ms` for every record carrying a
+    // `session_id`, live-checking "not yet seen a terminal" — which
+    // wrongly read a `mission close` record's `mission-<id>` session (a
+    // mission session is never `dispatch`-terminated at all) as an
+    // eternally-open dispatch, always live. Red-proved against a fixture
+    // with only `mission start`/`mission close` records: the buggy
+    // version returned `true`; this one correctly returns `false`.
+    let mut open: HashSet<String> = HashSet::new();
+    for line in text.lines() {
+        let Ok(rec) = serde_json::from_str::<darkmux_flow::FlowRecord>(line) else { continue };
+        let Some(sid) = rec.session_id.clone() else { continue };
+        let Some(ts_secs) = parse_flow_ts(&rec.ts) else { continue };
+        let ts_ms = ts_secs.saturating_mul(1000);
+        if darkmux_flow::is_dispatch_start(&rec.action) {
+            open.insert(sid.clone());
+            last_activity_ms.insert(sid, ts_ms);
+        } else if darkmux_flow::is_dispatch_terminal(&rec.action) {
+            open.remove(&sid);
+        } else if open.contains(&sid) {
+            // Any OTHER record for an ALREADY-open dispatch session is
+            // proof of work — bumps its last-activity, same convention
+            // `session_is_live`'s `last_activity_ts` uses.
+            last_activity_ms.insert(sid, ts_ms);
+        }
+    }
+    open.into_iter()
+        .any(|sid| last_activity_ms.get(&sid).is_some_and(|ts| now_ms.saturating_sub(*ts) <= max_age_ms))
 }
 
 /// (#1642, #1633) The ONE liveness decision every `/runs` source — lab,
@@ -1757,7 +1822,7 @@ fn cutoff_date_string(window_days: i64) -> String {
 /// Returns `None` on anything that doesn't match the exact fixed-width
 /// shape — a malformed/absent `ts` degrades to "no flow-derived timestamp",
 /// never a panic.
-fn parse_flow_ts(ts: &str) -> Option<u64> {
+pub(crate) fn parse_flow_ts(ts: &str) -> Option<u64> {
     let b = ts.as_bytes();
     if b.len() != 20
         || b[4] != b'-'
@@ -1927,6 +1992,105 @@ mod tests {
         for line in lines {
             writeln!(f, "{}", serde_json::to_string(line).unwrap()).unwrap();
         }
+    }
+
+    // ─── (#2413) any_dispatch_live_in — the daemon sampler's cadence signal ─
+
+    #[test]
+    fn any_dispatch_live_is_false_with_no_flows_dir_at_all() {
+        let tmp = TempDir::new().unwrap();
+        // No day file written at all.
+        assert!(!any_dispatch_live_in(tmp.path(), &today(), 10_000, 60_000));
+    }
+
+    #[test]
+    fn any_dispatch_live_is_true_for_an_open_bookend_within_the_window() {
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"})],
+        );
+        let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
+        assert!(any_dispatch_live_in(tmp.path(), &today(), start_ms + 5_000, 60_000));
+    }
+
+    #[test]
+    fn any_dispatch_live_is_false_once_terminated() {
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:05Z", "action": "dispatch complete", "session_id": "s1"}),
+            ],
+        );
+        let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
+        assert!(
+            !any_dispatch_live_in(tmp.path(), &today(), start_ms + 5_000, 60_000),
+            "a terminated dispatch is not live even within the age window"
+        );
+    }
+
+    #[test]
+    fn any_dispatch_live_is_false_once_last_activity_ages_out() {
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"})],
+        );
+        let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
+        assert!(
+            !any_dispatch_live_in(tmp.path(), &today(), start_ms + 61_000, 60_000),
+            "an open bookend whose last activity is past max_age_ms no longer counts as live"
+        );
+    }
+
+    #[test]
+    fn any_dispatch_live_ignores_a_different_session_that_terminated() {
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "dispatch complete", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:02Z", "action": "dispatch start", "session_id": "s2"}),
+            ],
+        );
+        let start_ms = parse_flow_ts("2026-01-01T00:00:02Z").unwrap() * 1000;
+        assert!(
+            any_dispatch_live_in(tmp.path(), &today(), start_ms + 1_000, 60_000),
+            "s2 is still open even though s1 (a different session) terminated"
+        );
+    }
+
+    /// (self-QA catch, #2413) Regression for the bug the daemon-suite
+    /// integration tests caught live: a `mission start`/`mission close`
+    /// pair (a MISSION session, never `dispatch`-terminated by
+    /// definition) must NOT read as an open dispatch just because its
+    /// session_id was recently active. The first cut of
+    /// `any_dispatch_live_in` tracked last-activity for EVERY
+    /// session-carrying record and checked "no terminal seen yet" — which
+    /// made a mission's own session look permanently live.
+    #[test]
+    fn any_dispatch_live_is_false_for_a_mission_session_with_no_dispatch_bookend_at_all() {
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[
+                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "mission start", "session_id": "mission-m1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "mission close", "session_id": "mission-m1"}),
+            ],
+        );
+        let ts_ms = parse_flow_ts("2026-01-01T00:00:01Z").unwrap() * 1000;
+        assert!(
+            !any_dispatch_live_in(tmp.path(), &today(), ts_ms + 500, 60_000),
+            "a mission session with no dispatch start/terminal bookend at all is never 'live' by this signal"
+        );
     }
 
     fn minimal_mission(id: &str, phase_ids: Vec<String>, spec: Option<MissionSpec>) -> Mission {

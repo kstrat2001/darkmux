@@ -816,25 +816,48 @@ pub fn host_sampler_interval_ms() -> u64 {
     pick_parsed("DARKMUX_HOST_SAMPLER_INTERVAL_MS", cfg, Some(5000)).unwrap()
 }
 
-/// (#2111) How many `dispatch_internal::run_telemetry_sampler` ticks (its
-/// 2s cadence) between `machine.telemetry` SAMPLE flow records — the
-/// periodic host-pressure curve (thermal/power/cpu/gpu/mem) a run-detail
-/// view can chart alongside `machine.thermal`'s TRANSITION events. Resolves
-/// `env(DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES) >
-/// config.runtime.telemetry_record_every_samples > 5` (≈10s at the
-/// sampler's 2s cadence) — mirrors `turn_delay_ms`'s wiring. `0` disables
-/// the periodic curve without touching the sampler thread itself: the
-/// thermal governor still reads every tick, and `dispatch complete`'s
-/// `host_window` summary is built from every sample regardless.
-pub fn telemetry_record_every_samples() -> u64 {
-    telemetry_record_every_samples_with_source().0
+// ── Host sampler singleton lock (#2413) ──
+// The one machine-scoped host sampler (the daemon, or a dispatch process
+// when no daemon runs) coordinates via a single lock file. No env/config
+// override tier — this is internal coordination state, not an operator-
+// facing knob (unlike `dirs.*`, which is relocatable).
+
+/// `<darkmux-home>/liveness/` — shared with
+/// `darkmux_types::dispatch_liveness`'s per-pid heartbeat floor (same
+/// directory, different file shape): that module writes `<pid>.log` text
+/// heartbeats; the host-sampler singleton lock (below) writes one
+/// `host-sampler.lock` JSON file. Kept in the SAME directory rather than a
+/// new one because both are "who is alive/active on this machine right
+/// now" coordination state, not operator-facing config.
+pub fn liveness_dir() -> std::path::PathBuf {
+    liveness_dir_default()
 }
-/// `telemetry_record_every_samples` plus WHICH tier resolved it.
-pub fn telemetry_record_every_samples_with_source() -> (u64, Source) {
-    let cfg = config().runtime.as_ref().and_then(|r| r.telemetry_record_every_samples);
-    let (v, s) =
-        pick_parsed_with_source("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", cfg, Some(5));
-    (v.unwrap(), s)
+
+/// (#994/#2359-style isolation) In test / `test-support` builds, never
+/// resolve to the operator's real `~/.darkmux/liveness` unless the test
+/// explicitly isolated itself (`DARKMUX_HOME` or a project-local
+/// `./.darkmux`) — mirrors `flows_dir_default`'s own test-build variant
+/// exactly, for the same reason: a test that forgets to isolate must not
+/// touch real operator state.
+#[cfg(not(any(test, feature = "test-support")))]
+fn liveness_dir_default() -> std::path::PathBuf {
+    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("liveness")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn liveness_dir_default() -> std::path::PathBuf {
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/liveness");
+    }
+    resolved.root.join("liveness")
+}
+
+/// `<darkmux-home>/liveness/host-sampler.lock` — the singleton-sampler
+/// coordination file (#2413). See `darkmux_crew::host_sampler_lock`.
+pub fn host_sampler_lock_path() -> std::path::PathBuf {
+    liveness_dir().join("host-sampler.lock")
 }
 
 // ── Thermal governor + breaker (#2110/#2109) ──
@@ -1667,30 +1690,20 @@ mod tests {
         }
     }
 
-    // ── telemetry_record_every_samples (#2111): env > config > 5 default,
-    //    mirroring host_sampler_interval_ms's resolution exactly ──
-    #[serial_test::serial]
+    // (#2413) `telemetry_record_every_samples` — the #2111 per-dispatch
+    // `machine.telemetry` curve's cadence knob — retired along with the
+    // per-dispatch emitter it configured. See `host_sampler_lock` tests
+    // (darkmux-crew) and `host_sampler` tests (darkmux-serve) for the
+    // machine-scoped replacement's cadence coverage.
+
     #[test]
-    fn telemetry_record_every_samples_env_overrides_then_default() {
-        let k = "DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES";
-        let prev = std::env::var(k).ok();
-        unsafe { std::env::remove_var(k) };
-        // No env + the empty test config (#811) → the built-in 5-sample default.
-        assert_eq!(telemetry_record_every_samples(), 5);
-        unsafe { std::env::set_var(k, "10") };
-        assert_eq!(telemetry_record_every_samples(), 10, "env wins live");
-        // `0` is a real, honored value — the explicit disable.
-        unsafe { std::env::set_var(k, "0") };
-        assert_eq!(telemetry_record_every_samples(), 0, "0 disables the periodic curve");
-        // An unparseable env value falls through (here, to the default).
-        unsafe { std::env::set_var(k, "not-a-number") };
-        assert_eq!(telemetry_record_every_samples(), 5);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
+    fn liveness_dir_and_host_sampler_lock_path_are_test_isolated() {
+        // Mirrors `flows_dir`'s own isolation test: in a test build with no
+        // `DARKMUX_HOME` override, the path must NOT resolve to the
+        // operator's real `~/.darkmux/liveness`.
+        let real = dirs::home_dir().map(|h| h.join(".darkmux").join("liveness"));
+        assert_ne!(Some(liveness_dir()), real, "must not resolve to the real ~/.darkmux/liveness");
+        assert_eq!(host_sampler_lock_path(), liveness_dir().join("host-sampler.lock"));
     }
 
     /// Ships objective: the RADIO persona's humor is low out of the box and

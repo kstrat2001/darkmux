@@ -35,6 +35,14 @@ export function activityOf(r: FlowRecord): string {
   if (a === "machine.online" || a === "machine online") return "machine online";
   if (a === "machine.offline" || a === "machine offline") return "machine offline";
   if (a === "session.end") return "session end";
+  // (#2413) `machine.telemetry` is the machine-scoped replacement for the
+  // retired per-dispatch `telemetry.process` — same friendly facet label
+  // as the `category: "telemetry", source: "process"` branch below, so a
+  // saved "host telemetry" filter keeps working across the schema change
+  // (and across the retired mechanism's continuing partial use — see
+  // `FLOW_SCHEMA_VERSION` 1.42.0's changelog) instead of fragmenting into
+  // a second, differently-named facet.
+  if (a === "machine.telemetry") return "host telemetry";
   if (r.category === "telemetry") {
     if (r.source === "detector") return "detector";
     if (r.source === "tokens") return "tokens";

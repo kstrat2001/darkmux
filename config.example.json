@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.21",
+  "schema_version": "1.22",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -36,8 +36,7 @@
       "max_pause_ms": 900000,
       "min_cpu_speed_limit_pct": 50,
       "speed_limit_hold_samples": 3
-    },
-    "telemetry_record_every_samples": 5
+    }
   },
   "fleet": {
     "mode": "standalone"

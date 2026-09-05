@@ -732,6 +732,7 @@ dependencies = [
  "blake3",
  "darkmux-flow",
  "darkmux-gestalt",
+ "darkmux-hardware",
  "darkmux-profiles",
  "darkmux-types",
  "dirs",

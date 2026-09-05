@@ -53,5 +53,5 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # (#2301) The typed step-output structs export their TypeScript from the
 # SAME `export_bindings` test run the view-model types already use. Dev-dep
 # only, so the release binary never pulls `ts-rs` through these crates.
-darkmux-crew = { path = "../darkmux-crew", features = ["ts-export"] }
+darkmux-crew = { path = "../darkmux-crew", features = ["ts-export", "test-support"] }
 darkmux-lab = { path = "../darkmux-lab", features = ["ts-export"] }

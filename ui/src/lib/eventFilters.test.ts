@@ -27,6 +27,15 @@ describe("activityOf", () => {
     expect(activityOf(rec({ action: "note" }))).toBe("note");
     expect(activityOf(rec({ action: undefined, source: "orchestrator" }))).toBe("note");
   });
+
+  it("(#2413) machine.telemetry maps to the same 'host telemetry' facet as the retired telemetry.process", () => {
+    expect(activityOf(rec({ action: "machine.telemetry", category: "machinery", source: "host" }))).toBe(
+      "host telemetry",
+    );
+    expect(activityOf(rec({ action: "telemetry.process", category: "telemetry", source: "process" }))).toBe(
+      "host telemetry",
+    );
+  });
 });
 
 describe("computeFacets / defaultFilterState", () => {
