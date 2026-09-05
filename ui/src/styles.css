@@ -352,26 +352,6 @@ body {
   white-space: pre;
 }
 
-/* `#modebadge` (Packet 5) — viewer.html:406 (`#modebadge.stale{opacity:.65}`)
-   + the `.live` accent legacy's `setBadges()` toggles. Global chrome, a
-   sibling of `#meta`, not a lens region — see `LiveStatusBadge.tsx`'s own
-   doc. */
-#modebadge.pb {
-  flex: none;
-  font-size: calc(11px * var(--fs-scale));
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  color: var(--dim);
-  /* (Chrome packet) Matches legacy's `.pb{text-transform:uppercase}`
-     (viewer.html:747) — a real visual rule, not just a parity trick: the
-     underlying text nodes STAY lowercase ("● live"/"◌ reconnecting", see
-     `LiveStatusBadge.tsx`), so `next-parity-live.spec.ts`'s case-sensitive
-     `toContainText("live")`/`toContainText("reconnecting")` (which read
-     `textContent`, unaffected by CSS) keep passing — verified with a
-     throwaway Playwright probe before relying on it. */
-  text-transform: uppercase;
-}
-
 /* (operator: "should live be pulsing like it did before?") — it should, and
    it was MISSING: legacy has `@keyframes lpulse` + `.pb.live{animation:…}`
    and this port had neither. Another purely visual element the text goldens
@@ -411,13 +391,27 @@ body {
   }
 }
 
-#modebadge.pb.live {
-  color: var(--accent);
+/* (#2412) The masthead's ONE transport control — the playback-catalog pill
+   — now carries the dot the retired `#modebadge` used to own. Reuses the
+   SAME `--beat` keyframe above and the SAME `--accent`/`--error` tokens
+   `#modebadge.pb.live`/`.stale` used to (this project's own "no snowflakes"
+   rule: a new indicator for an existing concept is the anti-pattern, not a
+   feature). `.chip` already colors the pill `--accent` by default, so the
+   dot only needs its OWN override for the dropped-stream state; the beat
+   itself is scoped to `.live` alone so a `.stale`/`--replay` dot never
+   pulses. */
+.masthead__pilldot {
+  margin-right: 0.35em;
 }
-
-#modebadge.pb.stale {
+.masthead__pilldot.live {
+  animation: var(--beat);
+}
+.masthead__pilldot.stale {
   color: var(--error);
   opacity: 0.85;
+}
+.masthead__pilldot--replay {
+  color: var(--dim);
 }
 
 /* (#2108, operator finding — desktop tab-row fold, rounds 1 + 2) `#crumb`
@@ -3217,11 +3211,6 @@ body {
 .mco { white-space: nowrap; }
 .mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim); }
 
-/* (#238, ported) Reduced-motion drops the pulse. Live stays distinguishable
-   WITHOUT motion — the badge keeps its color, the ● glyph and the word. */
-#modebadge.pb.live .pbdot {
-  animation: var(--beat);
-}
 
 
 /* ── Machine lens (Tuesday-list item 1) ─────────────────────────────────────

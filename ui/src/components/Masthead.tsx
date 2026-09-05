@@ -1,6 +1,5 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { LiveStatusBadge } from "./LiveStatusBadge";
 import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
 import { openModalEl } from "../lib/dialogManager";
 import { isLiveRoute, type Route } from "../lib/route";
@@ -58,7 +57,7 @@ import type { LiveTailStatus } from "../hooks/useLiveTail";
  * care which component renders that id.
  * to hold it.
  *
- * **The catalog trigger (legacy's `#srcbadge`, "today"/a specific date,
+ * **The catalog trigger (legacy's `#srcbadge`, "live"/a specific date,
  * doubling as the playback-catalog toggle) is represented by the EXISTING,
  * already-tested `<CatalogPanel>` component moved in here from `App.tsx`,
  * not reproduced as a second, separate element.** `CatalogPanel`'s own
@@ -66,16 +65,11 @@ import type { LiveTailStatus } from "../hooks/useLiveTail";
  * outside-click + Escape dismissal, live/mission/day rows) with a full test
  * suite (`CatalogPanel.test.tsx`) pinned to that button's ACCESSIBLE NAME
  * ("browse history", via `aria-label` — see `CatalogPanel.tsx`'s own doc).
- * This component passes `label={srcbadgeText(route, replayDate)}` to override the
- * button's VISIBLE text to legacy's actual `#srcbadge` content ("TODAY" in
- * live mode, matching `setBadges()`'s `dl` — viewer.html:3432/3439) —
- * literally pre-uppercased, the SAME "uppercase the STRING directly, don't
- * lean on a CSS rule this port doesn't reproduce" discipline `App.tsx`'s
- * `routeChrome` already uses for the fleet `#logscope` value (see that
- * function's own comment) — so the accessible name and the on-page text are
- * deliberately decoupled: a screen reader always hears "browse history", a
- * sighted operator reading the masthead sees "TODAY" (or a date), matching
- * BOTH `next-parity.spec.ts`'s strict byte comparison against
+ * This component passes `label={pillLabel(route, replayDate, liveStatus)}`
+ * to override the button's VISIBLE content — a screen reader always hears
+ * "browse history" (the button's fixed `aria-label`), a sighted operator
+ * reading the masthead sees the pill content below, matching BOTH
+ * `next-parity.spec.ts`'s strict byte comparison against
  * `goldens/fleet.txt`/`goldens/machine.txt` (which now includes the
  * masthead — see `extract-lens.js`'s `extractTopbarText`) AND
  * `CatalogPanel.test.tsx`'s own accessible-name-based queries, which never
@@ -92,20 +86,22 @@ import type { LiveTailStatus } from "../hooks/useLiveTail";
  * render a working-looking button that 404s on click. The plain `<span>`
  * below carries the same VISIBLE text (`srcbadgeText`) with no click
  * handler and no fetch — the honest equivalent of legacy's un-upgraded
- * `#srcbadge`.
+ * `#srcbadge`. `isLiveRoute()` always returns false for a static build (see
+ * that function's own doc), so this branch never needs the pill's dot —
+ * plain text is the whole story there.
  *
- * `#modebadge` (`<LiveStatusBadge>`) needs no equivalent split: its
- * lowercase JS-rendered text ("● live"/"◌ reconnecting") is matched to
- * legacy's CSS-uppercased visual (`.pb{text-transform:uppercase}`,
- * viewer.html:400ish) by a real `text-transform: uppercase` rule on
- * `#modebadge.pb` in `styles.css` instead — CSS, not a literal string, is
- * the right tool THERE because `next-parity-live.spec.ts`'s own assertions
- * (`toContainText("live")`/`toContainText("reconnecting")`) read
- * `textContent`, not the rendered/`innerText` value, so they're
- * unaffected by a CSS transform (verified with a throwaway Playwright probe
- * — `text-transform:uppercase` on an element does NOT change what
- * `toContainText` matches against) — unlike `#srcbadge`, which has no
- * shared component with its own case-sensitive test suite to protect.
+ * **`#modebadge` (`<LiveStatusBadge>`) is RETIRED (#2412).** The operator's
+ * own reading of the transport-state table: the badge and the pill agreed in
+ * every state but one (a live route with a dropped stream — the badge alone
+ * carried that bit), so the merge folds the badge's dot INTO the pill rather
+ * than keeping two elements derived from nearly the same state. `pillLabel`
+ * below is the whole of what used to be split across `<LiveStatusBadge>` and
+ * `srcbadgeText`: a beating/held dot beside `LIVE` on a live route, or the
+ * SAME `▣` glyph the catalog's own mission rows already use beside the
+ * mission id / date once a route names a specific recording. The dot reuses
+ * `styles.css`'s shared `--beat` keyframe (`@keyframes beat`) and the same
+ * `--accent`/`--error` tokens `#modebadge.pb.live`/`.stale` used to — no new
+ * color, no new motion, per this project's own "no snowflakes" rule.
  *
  * Moving `<CatalogPanel>`'s MOUNT POINT here is a pure relocation beyond
  * the `label` prop: its internal markup/tests are otherwise untouched, and
@@ -198,17 +194,7 @@ export function Masthead({
       ) : (
         <span className="masthead__ver" id="verbadge" />
       )}
-            {/* (#1801) A static build shows the PLAYBACK badge on every lens, not
-          just the playback route. `isLiveRoute()` now returns false for the
-          whole build (see its own doc), so keying the fallback on
-          `route.kind === "playback"` alone would leave `#lens=runs` on the
-          demo with NO mode badge at all — a page that is neither live nor
-          visibly playback. Legacy's `setBadges(mode, date)` shows the play
-          badge on every lens, mode being global there. */}
-      {live ? (
-        <LiveStatusBadge status={liveStatus} />
-      ) : null}
-      {/* (operator: "a reload button next to 'live' is absurd") — and it is:
+            {/* (operator: "a reload button next to 'live' is absurd") — and it is:
           a refresh control beside a badge reading `● LIVE` contradicts
           itself. If the view is live there is nothing to refresh; if you
           need to refresh, it is not live. The one state where a manual retry
@@ -243,7 +229,7 @@ export function Masthead({
           {srcbadgeText(route, replayDate)}
         </span>
       ) : (
-        <CatalogPanel label={srcbadgeText(route, replayDate)} />
+        <CatalogPanel label={pillLabel(route, replayDate, liveStatus)} />
       )}
       <nav className="masthead__nav">
         <a href="https://darkmux.com/" target="_blank" rel="noopener">
@@ -275,8 +261,10 @@ function srcbadgeText(route: Route, replayDate: string | null = null): string {
   // phrase" for a route with no real playback pipeline behind it. That reason
   // has EXPIRED — the pipeline exists now, `goldens/playback-date.txt` reads
   // `FLOW · 2026-08-07`, and the prefix is the honest label rather than a
-  // borrowed one. A same-day `#<date>` hash still reads "TODAY", matching
-  // legacy's `dl` (its own boot treats today's date as live, not playback).
+  // borrowed one. A same-day `#<date>` hash still reads "LIVE" (#2412 — the
+  // word this chip uses for a live page dropped "TODAY", see `LIVE_CHIP`'s
+  // own doc for why), matching legacy's `dl` (its own boot treats today's
+  // date as live, not playback).
   // `?? todayUTC()` is not defensive noise: `route.date` became `string | null`
   // (#1801, a static build knows its date only after the flow file resolves)
   // and a template literal accepts null SILENTLY — `FLOW · null` would render
@@ -285,10 +273,10 @@ function srcbadgeText(route: Route, replayDate: string | null = null): string {
   // rather than in that one caller's habits.
   // (#2072) A static build replays one recorded file on every route; naming
   // its day only on the playback route left the runs/machine/console tabs
-  // saying `TODAY` and mission/dispatch saying `REPLAY` for the same data.
+  // saying `LIVE` and mission/dispatch saying `REPLAY` for the same data.
   // Checked BEFORE the playback branch on purpose: that branch's date comes
   // from the fetched records and is unresolved on first paint, so the
-  // landing route flashed `TODAY` (and stayed there if the file was slow)
+  // landing route flashed `LIVE` (and stayed there if the file was slow)
   // while every other tab had the date from the meta at once.
   // (operator, 2026-08-28) The chip is the bare date on every width: the
   // `FLOW · ` prefix read as noise on desktop and was already hidden on
@@ -298,21 +286,96 @@ function srcbadgeText(route: Route, replayDate: string | null = null): string {
   if (route.kind === "playback") {
     const date = route.date ?? todayUTC();
     // (operator, 2026-08-28) A playback names its day even when that day
-    // is today: `TODAY` beside `▶ PLAYBACK` read as a different chip from
-    // the demo's dated one. `TODAY` is the LIVE view's word.
+    // is today: `LIVE` beside `▶ PLAYBACK` read as a different chip from
+    // the demo's dated one. `LIVE` is the LIVE view's word.
     return date;
   }
   // A dispatch or mission page names its day once the shell has derived it
   // from the records (a finished subject is a recording). Until then it is
-  // LIVE, and the live page's word is the same on every route: TODAY. The
+  // LIVE, and the live page's word is the same on every route: LIVE. The
   // word RESULT (operator, 2026-08-28: "instead of replay doesn't result seem
   // better?") predates the header owning liveness — back then a running
   // dispatch page showed no badge, so the chip had to say what the page was.
-  // Now the badge says live and the chip says which day, on every route
-  // (operator, 2026-09-04: "shouldn't it be consistent with live TODAY?").
+  // Now the pill's dot says live and the chip says which day, on every route
+  // (operator, 2026-09-04: "shouldn't it be consistent with live TODAY?" —
+  // #2412 dropped the word TODAY itself, but the consistency it asked for
+  // stands: one word for every live route).
   if (route.kind === "dispatch" || route.kind === "mission") return replayDate ?? LIVE_CHIP;
   return LIVE_CHIP;
 }
 
-/** The chip's one word for a live page, whatever the route. */
-export const LIVE_CHIP = "TODAY";
+/** The chip's one word for a live page, whatever the route. (#2412, operator
+ * 2026-09-06: "the word 'today' should disappear from the header entirely"
+ * — the 24H fleet window can run into yesterday, so "today" was sometimes
+ * wrong on top of being redundant with the pill's own dot. "LIVE" is never
+ * wrong: it names the TRANSPORT state, not a calendar day. */
+export const LIVE_CHIP = "LIVE";
+
+/** The catalog toggle's own glyph for a route that names a specific
+ * recording — the mission id once a mission has closed, or a past date.
+ * The SAME glyph `CatalogPanel.tsx`'s own mission rows already draw beside
+ * `m.mission_id` (`▣`); reused here rather than invented, matching this
+ * project's "one pulse, one palette" rule for the live dot below. */
+const REPLAY_GLYPH = "▣";
+
+/**
+ * (#2412) The pill's full content for the real, daemon-backed
+ * `<CatalogPanel>` toggle — the ONE transport indicator left in the header
+ * once `<LiveStatusBadge>` (`#modebadge`) retires. Two shapes:
+ *
+ * - **Live** (`isLiveRoute(route) && replayDate == null`): a dot beside the
+ *   word `LIVE`. The dot beats (`--beat`, the SAME keyframe the RUNNING pill
+ *   and every other liveness indicator use) and sits at `--accent` while the
+ *   stream is connected; while it's dropped the dot holds still, turns
+ *   `--error` (the color `#modebadge.pb.stale` used to carry), and gets a
+ *   `title="reconnecting"` — the SAME two facts `<LiveStatusBadge>` used to
+ *   split across two elements, now on the one dot. The visible "● LIVE" is
+ *   `aria-hidden` (the button's own `aria-label` already fixes its
+ *   accessible name to "browse history", so this text was never announced
+ *   as the button's NAME either way — see `CatalogPanel.tsx`'s own doc); a
+ *   separate `aria-live="polite"` sr-only span carries "live"/"reconnecting"
+ *   as its own announced text, so a screen reader hears the transition the
+ *   removed badge never explicitly announced either, without also being
+ *   read the visible "LIVE" text twice in browse mode.
+ * - **Replay** (everything else this component reaches — a closed mission,
+ *   a dispatch/playback route with a resolved day): `REPLAY_GLYPH` in place
+ *   of the dot, then the mission id for a closed mission or `srcbadgeText`'s
+ *   date for everything else. No `aria-live` here — this is a static label,
+ *   not a state that transitions while the page is open.
+ */
+function pillLabel(route: Route, replayDate: string | null, liveStatus: LiveTailStatus): ReactNode {
+  if (isLiveRoute(route) && replayDate == null) {
+    const connected = liveStatus === "live";
+    return (
+      <>
+        <span aria-hidden="true">
+          <span
+            className={`masthead__pilldot${connected ? " live" : " stale"}`}
+            data-state={liveStatus}
+            title={connected ? undefined : "reconnecting"}
+          >
+            {connected ? "●" : "◌"}
+          </span>
+          {` ${LIVE_CHIP}`}
+        </span>
+        <span className="mm-sr-only" aria-live="polite">
+          {connected ? "live" : "reconnecting"}
+        </span>
+      </>
+    );
+  }
+  // A closed mission names itself, not the day it happened to close on —
+  // the ONE behavior change this packet makes beyond the badge merge
+  // (operator, in #2412: "pill shows the mission id"). Every other replay
+  // shape (a playback date, a finished dispatch) keeps naming its day, via
+  // the same `srcbadgeText` the static branch above already calls.
+  const name = route.kind === "mission" && replayDate != null ? route.missionId : srcbadgeText(route, replayDate);
+  return (
+    <>
+      <span className="masthead__pilldot masthead__pilldot--replay" aria-hidden="true">
+        {REPLAY_GLYPH}
+      </span>
+      {` ${name}`}
+    </>
+  );
+}

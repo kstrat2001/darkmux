@@ -59,6 +59,14 @@ test('catalog picker renders days + missions inertly and wires navigation', asyn
   // button is interactive from first paint.
   await page.waitForSelector('.catalog-toggle', { timeout: 15_000 });
 
+  // (#2412) The pill is now the ONE transport indicator, on every route —
+  // this harness boots straight onto `#2026-01-01` (a replay), so the pill
+  // already names that day with the replay glyph, and there is no separate
+  // `#modebadge` beside it in any state.
+  await expect(page.locator('.catalog-toggle')).toContainText('2026-01-01');
+  await expect(page.locator('.catalog-toggle')).toContainText('▣');
+  expect(await page.locator('#modebadge').count()).toBe(0);
+
   await page.click('.catalog-toggle');
   await page.waitForSelector('#catpanel .catrow');
 
@@ -90,6 +98,12 @@ test('catalog picker renders days + missions inertly and wires navigation', asyn
   await dayRow.click();
   await expect.poll(() => page.evaluate(() => location.hash)).toBe('#2026-01-02');
   await expect(page.locator('.fleet-lens')).toBeVisible();
+
+  // (#2412) A past-date replay: the pill names the day with the replay
+  // glyph in place of the dot, still with no separate badge.
+  await expect(page.locator('.catalog-toggle')).toContainText('2026-01-02');
+  await expect(page.locator('.catalog-toggle')).toContainText('▣');
+  expect(await page.locator('#modebadge').count()).toBe(0);
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
