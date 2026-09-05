@@ -7991,12 +7991,22 @@ fn clean_generic_run_leaves_no_non_terminal_step_behind() {
 /// mechanically: local coder seats wrote kits in container coordinates, with
 /// miscounted hunk headers, in code fences, and without a terminating
 /// newline — a clean-context frontier seat given the SAME message wrote
-/// four of four kits that applied raw. The message now names the shape it
-/// wants, and it is byte-identical in `crawl.json` and `review-v2.json`
-/// (the same grow template, deliberately not two).
+/// four of four kits that applied raw.
+///
+/// (#2310 P4e) This test used to assert the message was byte-identical in
+/// `crawl.json` and `review-v2.json`. It is now `crawl.json`'s ALONE, and
+/// deliberately: the same measurement that motivated the message is what
+/// moved review's mod creation off the local tier entirely. `review-v2`'s
+/// create-mods task no longer dispatches a coder at all — its first step is
+/// a bounded `procedural.shell` wait for a mod the operator's frontier
+/// monitor records — so there is no local seat left in that config for a
+/// message to instruct, and asserting one would pin text no model reads.
+/// `crawl.json` still dispatches its coder (crawl is separate by doctrine,
+/// and its create-mods task ships `enabled: false`), so the message and its
+/// kit-shape clauses are still load-bearing there and still pinned here.
 #[test]
-fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
-    fn create_mod_message(doc: &str) -> String {
+fn the_create_mod_message_names_the_kit_shape_and_is_crawls_alone() {
+    fn create_mod_messages(doc: &str) -> Vec<String> {
         let v: serde_json::Value = serde_json::from_str(doc).expect("built-in config parses");
         let mut found = Vec::new();
         fn walk(x: &serde_json::Value, out: &mut Vec<String>) {
@@ -8014,12 +8024,19 @@ fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
             }
         }
         walk(&v, &mut found);
-        assert_eq!(found.len(), 1, "exactly one create-mod message per config: {found:?}");
-        found.remove(0)
+        found
     }
-    let crawl = create_mod_message(include_str!("../templates/builtin/mission-configs/crawl.json"));
-    let review = create_mod_message(include_str!("../templates/builtin/mission-configs/review-v2.json"));
-    assert_eq!(crawl, review, "one grow template, two configs — the message must not fork");
+    let mut crawl = create_mod_messages(include_str!("../templates/builtin/mission-configs/crawl.json"));
+    assert_eq!(crawl.len(), 1, "exactly one create-mod message in crawl.json: {crawl:?}");
+    let crawl = crawl.remove(0);
+    // (#2310 P4e) The review config must carry NONE — a message here would
+    // mean a local coder seat came back with it.
+    let review = create_mod_messages(include_str!("../templates/builtin/mission-configs/review-v2.json"));
+    assert!(
+        review.is_empty(),
+        "review-v2 creates mods through the frontier hook, not a local coder dispatch — it must carry no \
+         create-mod message: {review:?}"
+    );
     for needle in [
         "relative to the repository root",
         "exactly as they appear",
@@ -8028,4 +8045,351 @@ fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
     ] {
         assert!(crawl.contains(needle), "the message must name the kit shape ({needle:?}):\n{crawl}");
     }
+}
+
+// ─── #2310 P4e: review-v2's create-mods waits for a frontier mod ────────
+//
+// The seat that writes a mod moved off the local tier (see the config's own
+// `create-mods` phase description). What ships in `review-v2.json` is
+// therefore not a coder dispatch but a shell command, and a shell command in
+// a JSON document is exactly the kind of artifact that rots silently. These
+// tests execute the SHIPPED BYTES: `create_mod_wait_command` pulls the
+// command out of the embedded config and substitutes only the two
+// placeholders the launcher/grow passes would have substituted, so a change
+// to the command text is a change these tests see.
+
+/// The `create-mod` task's wait command, as shipped, with `{{item.key}}`
+/// (grow's namespace) and `{{mod_wait_seconds}}` (the launch-input
+/// namespace) resolved the way the two real substitution passes resolve
+/// them.
+fn create_mod_wait_command(finding_key: &str, bound: &str) -> String {
+    let doc: serde_json::Value =
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
+            .expect("review-v2.json parses");
+    let phase = doc["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == serde_json::json!("create-mods"))
+        .expect("a create-mods phase");
+    let raw = phase["tasks"][0]["grow"]["config"]["command"]
+        .as_str()
+        .expect("the create-mod task's grow config carries a shell command");
+    raw.replace("{{item.key}}", finding_key).replace("{{mod_wait_seconds}}", bound)
+}
+
+/// Record a mod naming `finding_key` through the real `mod create` verb, in
+/// the store `home` roots — the same call the `darkmux-mod-create` skill's
+/// subagent makes.
+fn record_mod_for(home: &std::path::Path, workdir: &std::path::Path, finding_key: &str) {
+    let kit = workdir.join(format!("kit-{}.diff", finding_key.replace('/', "-")));
+    fs::write(&kit, "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n").unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home)
+        .args([
+            "mod",
+            "create",
+            "--by",
+            "frontier",
+            "--for",
+            finding_key,
+            "--kit-kind",
+            "unified-diff",
+            "--kit",
+            &kit.to_string_lossy(),
+        ])
+        .output()
+        .expect("mod create runs");
+    assert!(
+        out.status.success(),
+        "seeding a mod failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Run the shipped wait command with a real store behind it.
+fn run_wait_command(home: &std::path::Path, command: &str) -> std::process::Output {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("DARKMUX_HOME", home)
+        .env("DARKMUX_BIN", assert_cmd::cargo::cargo_bin("darkmux"))
+        .output()
+        .expect("the wait command runs")
+}
+
+/// (#2310 P4e) The SHAPE of the change: no local seat is staffed for mod
+/// creation any more. Red-proved by restoring `dispatch.internal` as the
+/// first step — every assertion below fails.
+#[test]
+fn review_v2_create_mods_waits_for_a_mod_instead_of_dispatching_a_coder() {
+    let doc: serde_json::Value =
+        serde_json::from_str(include_str!("../templates/builtin/mission-configs/review-v2.json"))
+            .expect("review-v2.json parses");
+
+    let input = doc["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == serde_json::json!("mod_wait_seconds"))
+        .expect("review-v2 declares mod_wait_seconds");
+    assert_eq!(input["required"], serde_json::json!(false));
+    // The unattended path (the self-hosted runner) has no orchestrator
+    // session to receive the hook and no frontier seat, so the DEFAULT must
+    // be "do not wait".
+    assert_eq!(
+        input["default"],
+        serde_json::json!("0"),
+        "the default must be 0 — a CI runner waiting per finding is pure wall-clock"
+    );
+
+    let phase = doc["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == serde_json::json!("create-mods"))
+        .expect("a create-mods phase");
+    let task = &phase["tasks"][0];
+    assert!(
+        task.get("role_id").is_none(),
+        "the create-mod task staffs no seat: {task}"
+    );
+    assert!(
+        task["grow"]["config"].get("message").is_none()
+            && task["grow"]["config"].get("brief_refs").is_none(),
+        "a dispatch brief here would mean a local coder is still being asked to write the kit: {task}"
+    );
+    let kinds: Vec<&str> =
+        task["steps"].as_array().unwrap().iter().map(|s| s["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec!["procedural.shell", "mods.gate"],
+        "wait then gate — no dispatch step: {task}"
+    );
+    let command = task["grow"]["config"]["command"].as_str().unwrap();
+    for needle in ["{{item.key}}", "{{mod_wait_seconds}}", "mod list --for", "DARKMUX_BIN"] {
+        assert!(command.contains(needle), "the wait command must name {needle:?}:\n{command}");
+    }
+}
+
+/// (#2310 P4e) A mod already in the store when the step starts: the wait
+/// returns at once. Red-proved by inverting `grep -q` to `grep -qv` — the
+/// command then runs the full bound and exits 1.
+#[test]
+fn the_wait_command_returns_at_once_when_a_mod_already_names_the_finding() {
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    record_mod_for(home.path(), workdir.path(), "sess-already/1");
+
+    let started = std::time::Instant::now();
+    let out = run_wait_command(home.path(), &create_mod_wait_command("sess-already/1", "60"));
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("\"waited\":true"), "{stdout}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "an already-recorded mod must not cost a poll cycle, took {elapsed:?}"
+    );
+}
+
+/// (#2310 P4e) The real shape of the loop: the mod does not exist when the
+/// step starts and the frontier records it while the step is waiting.
+/// Red-proved by deleting the `while` loop's `sleep`/re-check (a single
+/// probe then exit) — the mod lands after the probe and the step errors.
+#[test]
+fn the_wait_command_completes_when_the_mod_appears_mid_wait() {
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    let home_path = home.path().to_path_buf();
+    let workdir_path = workdir.path().to_path_buf();
+
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        record_mod_for(&home_path, &workdir_path, "sess-midwait/3");
+    });
+
+    let out = run_wait_command(home.path(), &create_mod_wait_command("sess-midwait/3", "60"));
+    writer.join().unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "the wait must see a mod recorded after it started: stdout {stdout}\nstderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("\"waited\":true"), "{stdout}");
+    assert!(stdout.contains("sess-midwait/3"), "the output names the finding it waited for: {stdout}");
+}
+
+/// (#2310 P4e review, item 8) No mod inside the bound is a CLEAN outcome,
+/// not an error. A frontier that read the finding and declined to write a
+/// mod — because it is a search-form finding, or because the finding does
+/// not hold — is the correct behavior, and the skill instructs it
+/// explicitly. Exiting non-zero there made every decline an Error step and
+/// finalized the run Degraded, which reads as "darkmux broke" for the one
+/// path the design calls right. So the bound-exhausted branch exits 0 with
+/// `found: false`; the gate then records its ordinary no-mod skip and the
+/// deliverer renders the finding as a question. A non-numeric bound is
+/// still exit 2 (a real config defect), and an infra failure still errors.
+///
+/// The store is deliberately NOT empty: it holds a mod for a DIFFERENT
+/// finding, because the probe's whole job is `mod list --for <this key>`
+/// and an empty store would pass just as well with the filter dropped.
+/// Red-proved three ways: change the terminal `exit 1`/`exit 0` back to
+/// `exit 1` (the status assertion fails); delete `--for "$key"` from the
+/// command (the unrelated mod satisfies this finding's wait and `found`
+/// comes back true); flip the terminal `"found":false` to `"found":true`.
+#[test]
+fn the_wait_command_completes_with_found_false_when_no_mod_appears_within_the_bound() {
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    record_mod_for(home.path(), workdir.path(), "sess-someone-else/2");
+    let out = run_wait_command(home.path(), &create_mod_wait_command("sess-never/9", "3"));
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "a decline is a clean outcome, never a step error: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        stdout.contains("\"found\":false"),
+        "and it says so in its output, so the gate and the deliverer can tell: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"waited\":true"),
+        "the wait DID run — `waited` reports that, `found` reports the outcome: {stdout}"
+    );
+    assert!(stdout.contains("sess-never/9"), "naming the finding it waited for: {stdout}");
+    assert!(stderr.contains("sess-never/9"), "the note names the finding: {stderr}");
+    assert!(stderr.contains("3s"), "and the bound it waited: {stderr}");
+}
+
+/// (#2310 P4e, operator refinement) `mod_wait_seconds=0` — the DEFAULT, and
+/// the unattended path's behavior — is "do not wait", not "wait zero
+/// seconds and then check". It completes immediately with an honest output
+/// saying no frontier monitor was expected, so the gate finds no mod and
+/// the deliverer renders the finding as a question exactly as today.
+///
+/// Red-proved by deleting the `if [ "$bound" -eq 0 ]` early return: the loop
+/// then probes the store once, finds nothing, and exits 1, so a CI run's
+/// every finding would surface a step error instead of a detection.
+#[test]
+fn the_wait_command_does_not_wait_at_all_when_the_bound_is_zero() {
+    let home = TempDir::new().unwrap();
+    let started = std::time::Instant::now();
+    let out = run_wait_command(home.path(), &create_mod_wait_command("sess-unattended/1", "0"));
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "0 must complete the step, never error it: stdout {stdout}\nstderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("\"waited\":false"), "{stdout}");
+    assert!(stdout.contains("no frontier monitor expected"), "the reason is in the output: {stdout}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "0 must not consult the store or sleep, took {elapsed:?}"
+    );
+}
+
+/// (#2310 P4e) The document default reaches a real launch. `--dry-run`
+/// prints the resolved inputs, which is the surface an operator reads to
+/// see what a launch will use — so this proves both the new
+/// `MissionInput::default` plumbing and that `review-v2` ships `0`.
+/// Red-proved by removing `apply_input_defaults`'s call site: the line
+/// disappears from the dry-run output and a real launch is refused for an
+/// uncollected embedded placeholder.
+#[test]
+fn review_v2_dry_run_resolves_mod_wait_seconds_to_the_documents_default() {
+    let workdir = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    write_app_repo(&app, "^1.0.0");
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(
+        &spec_path,
+        serde_json::json!({
+            "name": "review-v2-default-inputs",
+            "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let diff_path = workdir.path().join("d.diff");
+    fs::write(&diff_path, "").unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "mission",
+            "launch",
+            "review-v2",
+            "--param",
+            &format!("workspace={}", spec_path.display()),
+            "--param",
+            &format!("diff_file={}", diff_path.display()),
+            "--dry-run",
+        ])
+        .output()
+        .expect("mission launch review-v2 --dry-run runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("mod_wait_seconds = 0"),
+        "the document's default must resolve into the launch's own inputs:\n{stdout}"
+    );
+}
+
+/// (#2310 P4e) An operator-supplied value beats the document default —
+/// the launcher must never substitute its own judgment for a typed one.
+#[test]
+fn a_supplied_mod_wait_seconds_beats_the_documents_default() {
+    let workdir = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    write_app_repo(&app, "^1.0.0");
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(
+        &spec_path,
+        serde_json::json!({
+            "name": "review-v2-supplied-input",
+            "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let diff_path = workdir.path().join("d.diff");
+    fs::write(&diff_path, "").unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "mission",
+            "launch",
+            "review-v2",
+            "--param",
+            &format!("workspace={}", spec_path.display()),
+            "--param",
+            &format!("diff_file={}", diff_path.display()),
+            "--param",
+            "mod_wait_seconds=45",
+            "--dry-run",
+        ])
+        .output()
+        .expect("mission launch review-v2 --dry-run runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.contains("mod_wait_seconds = 45"), "{stdout}");
 }

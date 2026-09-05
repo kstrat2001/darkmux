@@ -485,7 +485,18 @@ pub fn launch(
         ))
     );
 
-    let collected = collect_inputs(input_file, params)?;
+    let mut collected = collect_inputs(input_file, params)?;
+    // (#2310 P4e) Document-declared defaults land BEFORE every consumer
+    // below — the required check, the typo warning, the dry-run print, the
+    // inputs fingerprint and both placeholder passes — so a defaulted
+    // input is indistinguishable from one the operator typed. That is the
+    // point: `review-v2`'s wait command interpolates `mod_wait_seconds`
+    // from inside a string, and an EMBEDDED placeholder naming an
+    // uncollected input is refused at mint (`check_embedded_inputs_
+    // collected`), so without this the config could not ship a default at
+    // all.
+    apply_input_defaults(config, &mut collected);
+    let collected = collected;
     let missing = missing_required_inputs(config, &collected);
     if !missing.is_empty() {
         bail!("{}", missing_inputs_message(config, &missing));
@@ -2152,6 +2163,32 @@ pub(crate) fn collect_inputs(
         collected.insert(k.to_string(), serde_json::Value::String(v.to_string()));
     }
     Ok(collected)
+}
+
+/// (#2310 P4e) Fill every declared-but-unsupplied input that carries a
+/// document `default` into `collected`.
+///
+/// **Supplied always wins**, including a supplied empty string: the
+/// operator typing `--param mod_wait_seconds=` is a value, not an absence,
+/// and silently replacing it with the document's default would be the
+/// launcher substituting its judgment for the operator's.
+///
+/// An `ignored: true` input is never defaulted — the ignored-input warning
+/// keys on `collected.contains_key`, so a default would make every launch
+/// warn about an input the operator never typed.
+pub(crate) fn apply_input_defaults(
+    config: &MissionConfig,
+    collected: &mut BTreeMap<String, serde_json::Value>,
+) {
+    for input in &config.inputs {
+        if input.ignored == Some(true) {
+            continue;
+        }
+        let Some(default) = input.default.as_ref() else {
+            continue;
+        };
+        collected.entry(input.name.clone()).or_insert_with(|| default.clone());
+    }
 }
 
 /// Declared inputs (per [`MissionConfig::inputs`]) still missing from
@@ -5671,12 +5708,85 @@ mod tests {
         assert_ne!(a, c, "different inputs must fingerprint differently (distinct groups)");
     }
 
+    /// (#2310 P4e review, item 4) The three rules `apply_input_defaults`
+    /// owns, each with a mutation that kills exactly one of them:
+    ///
+    /// - a declared default is injected — delete the `or_insert_with` and
+    ///   `defaulted` is absent;
+    /// - a SUPPLIED value wins, including a supplied empty string — swap
+    ///   `or_insert_with` for `insert` and `supplied` becomes `"9"`;
+    /// - an `ignored: true` input is NEVER defaulted — delete the
+    ///   `continue` and `ignored_with_default` appears, which then makes
+    ///   the launcher warn "input `x` is ignored" on every launch about an
+    ///   input the operator never typed.
+    ///
+    /// That last one is why it is tested here rather than left to the
+    /// integration tests: its failure is a spurious WARNING, not a wrong
+    /// value, so nothing downstream goes red.
+    #[test]
+    fn apply_input_defaults_fills_only_unsupplied_live_inputs() {
+        let mk = |name: &str, default: Option<serde_json::Value>, ignored: Option<bool>| {
+            mission_config::MissionInput {
+                name: name.to_string(),
+                description: None,
+                required: Some(false),
+                default,
+                ignored,
+                ignored_reason: None,
+                extras: BTreeMap::new(),
+            }
+        };
+        let cfg = MissionConfig {
+            id: "x".to_string(),
+            name: "X".to_string(),
+            description: None,
+            schema_version: None,
+            inputs: vec![
+                mk("defaulted", Some(serde_json::json!("0")), None),
+                mk("supplied", Some(serde_json::json!("9")), None),
+                mk("supplied_empty", Some(serde_json::json!("5")), None),
+                mk("no_default", None, None),
+                mk("ignored_with_default", Some(serde_json::json!("7")), Some(true)),
+            ],
+            phases: vec![],
+            outcome_from: None,
+            panel: None,
+            cmd: None,
+            extras: BTreeMap::new(),
+        };
+
+        let mut collected: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        collected.insert("supplied".to_string(), serde_json::json!("2"));
+        collected.insert("supplied_empty".to_string(), serde_json::json!(""));
+        apply_input_defaults(&cfg, &mut collected);
+
+        assert_eq!(collected.get("defaulted"), Some(&serde_json::json!("0")));
+        assert_eq!(
+            collected.get("supplied"),
+            Some(&serde_json::json!("2")),
+            "a supplied value must win over the document default"
+        );
+        assert_eq!(
+            collected.get("supplied_empty"),
+            Some(&serde_json::json!("")),
+            "an EMPTY supplied value is still a value the operator typed, not an absence"
+        );
+        assert_eq!(collected.get("no_default"), None, "an input with no default stays absent");
+        assert_eq!(
+            collected.get("ignored_with_default"),
+            None,
+            "an ignored input must never be defaulted — the ignored-input warning keys on the \
+             operator having supplied it, so injecting one warns on every launch"
+        );
+    }
+
     #[test]
     fn missing_required_inputs_excludes_mission_id_and_optional_fields() {
         let input = |name: &str, required: Option<bool>| mission_config::MissionInput {
             name: name.to_string(),
             description: None,
             required,
+            default: None,
             ignored: None,
             ignored_reason: None,
             extras: BTreeMap::new(),

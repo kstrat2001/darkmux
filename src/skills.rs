@@ -83,6 +83,15 @@ const EMBEDDED_SKILLS: &[(&str, &str)] = &[
         "darkmux-escalation-handler",
         include_str!("../skills/darkmux-escalation-handler/SKILL.md"),
     ),
+    // (#2310 P4e) SHIPPED, not maintainer-only: it operates on the
+    // operator's own finding/mod stores, never on the darkmux source tree.
+    // It is also the half of `review-v2`'s create-mods phase darkmux cannot
+    // perform itself — that phase waits for a mod a frontier session
+    // records, and this is the procedure that records it.
+    (
+        "darkmux-mod-create",
+        include_str!("../skills/darkmux-mod-create/SKILL.md"),
+    ),
 ];
 
 /// On-disk `skills/darkmux-*` directories deliberately NOT embedded, and so

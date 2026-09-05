@@ -2192,7 +2192,9 @@ impl StepKind for DispatchMapStepKind {
 /// `DARKMUX_STEP_INPUT_<SANITIZED-DEP-ID>` (non-alphanumeric bytes in
 /// the dependency id become `_`) so a shell step can consume prior
 /// output without darkmux having to parse the command's own
-/// substitution syntax. A non-zero exit is a loud `Err` carrying stdout
+/// substitution syntax. `DARKMUX_BIN` is exported too — the absolute path
+/// of the darkmux running the mission, for a command that has to call
+/// darkmux back. A non-zero exit is a loud `Err` carrying stdout
 /// + stderr, never a silently-`Ok` failed command.
 pub struct ProceduralShellStepKind;
 
@@ -2228,6 +2230,39 @@ impl StepKind for ProceduralShellStepKind {
         for (dep_id, output) in input {
             let env_key = sanitize_env_key(dep_id);
             cmd.env(format!("DARKMUX_STEP_INPUT_{env_key}"), output);
+        }
+        // (#2310 P4e) `DARKMUX_BIN` — THIS darkmux, by absolute path, so a
+        // step command that has to ask darkmux something (`review-v2`'s
+        // wait step polls `mod list --for`) calls the binary running the
+        // mission rather than whatever `darkmux` on `PATH` resolves to. A
+        // step spawned from `cargo run`, from a worktree's `target/`, or
+        // from a launcher whose `PATH` carries no darkmux at all would
+        // otherwise fail on a name lookup that has nothing to do with the
+        // step's own work. Set only when `current_exe` resolves; a command
+        // written as `"${DARKMUX_BIN:-darkmux}"` still works when it does
+        // not.
+        //
+        // (#2310 P4e review, item 8) Two cases where this is set but not
+        // the darkmux an operator means, both of which the fallback CANNOT
+        // rescue because the variable is present, just wrong:
+        //
+        //  - **Under `cargo test`** it is the TEST HARNESS binary, not
+        //    darkmux. A step command that shells out to it gets a test
+        //    runner. Harmless for the in-process kind tests (which only
+        //    read the variable), and the integration tests that exercise a
+        //    real command set `DARKMUX_BIN` themselves to
+        //    `assert_cmd::cargo::cargo_bin("darkmux")` — but a future test
+        //    that lets this default through would be testing the harness.
+        //  - **After an in-place reinstall** (`cargo install` renames, but
+        //    a `cp` over a running binary does not) `current_exe` can name
+        //    a path that no longer exists. The command then fails on a
+        //    missing file rather than falling back to `PATH`.
+        //
+        // Both are narrower than the failure this closes (a `PATH` with no
+        // darkmux on it at all, which is the ordinary case for a worktree
+        // build), so it stays — named here rather than silently inherited.
+        if let Ok(exe) = std::env::current_exe() {
+            cmd.env("DARKMUX_BIN", exe);
         }
 
         // (#2361, swarm S4-4) BOUNDED, in its own process group, and
@@ -2524,6 +2559,27 @@ mod tests {
         );
         let out = ProceduralShellStepKind.run(&s, &empty_task(), &input).unwrap();
         assert!(out.output.contains("value-from-upstream"), "got: {}", out.output);
+    }
+
+    /// (#2310 P4e) A step command that has to call darkmux back gets the
+    /// RUNNING binary's absolute path, not a `PATH` lookup. Red-proved by
+    /// deleting the `cmd.env("DARKMUX_BIN", …)` line: the command then
+    /// prints the empty string and the `is_absolute` assertion fails.
+    #[test]
+    fn procedural_shell_exports_the_running_darkmux_binarys_path() {
+        let s = step("s1", "procedural.shell", json!({"command": "printf %s \"${DARKMUX_BIN:-}\""}));
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let seen = std::path::PathBuf::from(out.output.trim());
+        assert!(
+            seen.is_absolute() && seen.exists(),
+            "DARKMUX_BIN must name the running binary by absolute path, got {:?}",
+            out.output
+        );
+        assert_eq!(
+            seen,
+            std::env::current_exe().unwrap(),
+            "and it must be THIS process's binary, never a PATH lookup"
+        );
     }
 
     #[test]

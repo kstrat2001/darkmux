@@ -469,6 +469,25 @@ pub struct MissionInput {
     /// here as the intended semantic for Packet 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
+    /// (#2310 P4e) The value a launch uses when the operator supplies
+    /// none — filled into the launch's collected inputs by
+    /// `mission_launch::apply_input_defaults` BEFORE any placeholder
+    /// resolution, so a document may reference the input from an EMBEDDED
+    /// position (`"…{{mod_wait_seconds}}…"`) without the launch being
+    /// refused for an uncollected input.
+    ///
+    /// **Why a defaulted input is not the same as an absent one.** The
+    /// whole-value placeholder shape (`"draws": "{{draws}}"`) already had
+    /// a way to express "unset": the key is OMITTED from the step config
+    /// and the step kind's own Rust default applies. That mechanism cannot
+    /// reach INSIDE a string, and a shell command is one string — so an
+    /// input a command interpolates needs its default at the DOCUMENT
+    /// layer, where the operator can also read it off `mission config
+    /// show`. Only inputs that are not [`Self::ignored`] are defaulted (an
+    /// ignored input's warning keys on the operator having supplied it, so
+    /// a default there would make every launch warn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
     /// (#2310 P4c-2 item 4) `true` when this input is accepted for
     /// CLI-surface parity with another config but has NO EFFECT here —
     /// e.g. `review-v2.json`'s `bundler`, accepted so an operator carrying
@@ -1347,9 +1366,21 @@ impl MissionConfig {
         // still USABLE (the launcher enforces the real constraint at
         // launch time), this just flags that the document's own
         // `required: false` is misleading.
+        //
+        // (#2310 P4e review, MUST FIX) A DEFAULTED input is exempt,
+        // because the premise above is false for it: `mission_launch::
+        // apply_input_defaults` collects a declared `default` on EVERY
+        // launch before either placeholder pass runs, so the input is
+        // never unset and `check_embedded_inputs_collected` never has
+        // anything to refuse. A document default is in fact the RIGHT
+        // way to embed an optional input — it is the only mechanism that
+        // reaches inside a string — so warning on it told the operator to
+        // make a genuinely-optional input required, on every `mission
+        // config show review-v2` and every doctor pass, about a document
+        // that is correct.
         for (where_, name) in inputs::embedded_placeholders(self) {
             if let Some(input) = self.inputs.iter().find(|i| i.name == name) {
-                if input.required != Some(true) {
+                if input.required != Some(true) && input.default.is_none() {
                     findings.push(ValidationFinding {
                         severity: FindingSeverity::Warning,
                         path: "inputs".to_string(),
@@ -1359,6 +1390,31 @@ impl MissionConfig {
                         ),
                     });
                 }
+            }
+        }
+
+        // (#2310 P4e review, item 5) `required: true` combined with a
+        // `default` is the same shape of contradiction as `ignored` +
+        // `required` below, and it fails SILENTLY rather than loudly:
+        // `apply_input_defaults` runs BEFORE `missing_required_inputs`, so
+        // the default always satisfies the requirement and the launch that
+        // `required: true` exists to block can never happen. The operator
+        // reading the document believes they must supply the input; the
+        // launcher never asks. Error, not Warning — unlike the embedded
+        // smell above, there is no reading of this document under which the
+        // `required` flag does anything at all.
+        for input in &self.inputs {
+            if input.required == Some(true) && input.default.is_some() {
+                findings.push(ValidationFinding {
+                    severity: FindingSeverity::Error,
+                    path: format!("inputs[{}]", input.name),
+                    message: format!(
+                        "input \"{}\" declares BOTH `required: true` and a `default` — the default \
+                         is collected before the required check runs, so `required` can never \
+                         block a launch; drop one of the two",
+                        input.name
+                    ),
+                });
             }
         }
 
@@ -2403,6 +2459,39 @@ mod tests {
         }
     }
 
+    /// (#2310 P4e review, MUST FIX) The embedded-optional warning's own
+    /// premise is "whenever the operator leaves that input unset,
+    /// `check_embedded_inputs_collected` refuses the launch outright". A
+    /// DEFAULTED input is never unset: `mission_launch::
+    /// apply_input_defaults` collects it on every launch before either
+    /// placeholder pass runs, so the placeholder always resolves. Warning
+    /// on it told the operator to make a genuinely-optional input
+    /// required, on every `mission config show review-v2` and every doctor
+    /// pass, about a document that is correct.
+    ///
+    /// Red-proved by restoring the `input.required != Some(true)`
+    /// condition without the `default.is_none()` half.
+    #[test]
+    fn a_defaulted_embedded_input_does_not_warn() {
+        let known = known_kinds();
+        let known_refs = known_kinds_refs(&known);
+        for id in ["review-v2", "crawl"] {
+            let cfg = embedded_config(id);
+            let findings = cfg.validate(&known_refs);
+            let input_findings: Vec<&ValidationFinding> =
+                findings.iter().filter(|f| f.path == "inputs").collect();
+            assert!(
+                input_findings.is_empty(),
+                "`{id}` must validate with zero findings on the inputs path, got: {input_findings:?}"
+            );
+            let errors: Vec<&ValidationFinding> = findings
+                .iter()
+                .filter(|f| f.severity == FindingSeverity::Error)
+                .collect();
+            assert!(errors.is_empty(), "`{id}` must validate with zero Error findings, got: {errors:?}");
+        }
+    }
+
     #[test]
     fn both_builtins_reference_only_tier_3_kinds_unknown_to_tier_1() {
         // Every real step kind in both built-ins is Tier 3 (`review.*` /
@@ -2749,6 +2838,7 @@ mod tests {
             name: name.to_string(),
             description: None,
             required: None,
+            default: None,
             ignored: None,
             ignored_reason: None,
             extras: BTreeMap::new(),
@@ -2848,6 +2938,48 @@ mod tests {
         };
         let errs = grow_errors(&cfg);
         assert!(errs.iter().any(|e| e.contains('x') && e.contains("ignored") && e.contains("required")), "{errs:?}");
+    }
+
+    /// (#2310 P4e review, item 5) The silent half of the same
+    /// contradiction: `apply_input_defaults` runs before
+    /// `missing_required_inputs`, so a defaulted input always satisfies
+    /// `required` and the flag never blocks anything. Red-proved by
+    /// deleting the `required == Some(true) && default.is_some()` loop.
+    #[test]
+    fn required_true_with_a_default_is_a_validate_error() {
+        let cfg = MissionConfig {
+            inputs: vec![MissionInput {
+                required: Some(true),
+                default: Some(serde_json::json!("0")),
+                ..input_named("x")
+            }],
+            ..doc(vec![])
+        };
+        let errs = grow_errors(&cfg);
+        assert!(
+            errs.iter().any(|e| e.contains('x') && e.contains("required") && e.contains("default")),
+            "{errs:?}"
+        );
+    }
+
+    /// The other side: an OPTIONAL input with a default is the ordinary,
+    /// correct shape (`review-v2`'s `mod_wait_seconds`) and must be silent.
+    #[test]
+    fn an_optional_input_with_a_default_is_clean() {
+        let cfg = MissionConfig {
+            inputs: vec![MissionInput {
+                required: Some(false),
+                default: Some(serde_json::json!("0")),
+                ..input_named("x")
+            }],
+            ..doc(vec![])
+        };
+        assert!(grow_errors(&cfg).is_empty(), "{:?}", grow_errors(&cfg));
+        assert!(
+            grow_warnings(&cfg).iter().all(|w| !w.contains("default")),
+            "{:?}",
+            grow_warnings(&cfg)
+        );
     }
 
     #[test]
