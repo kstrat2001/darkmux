@@ -162,13 +162,14 @@ pub fn run() -> DoctorReport {
         check_redis_config(),
         check_gh_allowlist(),
         check_removed_review_config_block(),
+        check_removed_telemetry_record_every_samples(),
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
         check_reasoning_checkpoint_interval(),
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
-        check_telemetry_record_every_samples(),
+        check_host_sampler(),
         check_generation_checkpoint_interval(),
         check_thermal_governor(),
         check_host_probe(),
@@ -1745,6 +1746,37 @@ fn check_removed_review_config_block() -> Check {
     }
 }
 
+/// (#2413 M5) `runtime.telemetry_record_every_samples` is retired — the
+/// per-dispatch `machine.telemetry` curve it configured a downsample rate
+/// for is gone (one machine-scoped sampler now owns that emission). Same
+/// shape as `check_removed_review_config_block` just above: `Pass` when
+/// absent (including a fresh `with_defaults()` config), `Warn` naming the
+/// key and telling the operator to delete it when present.
+fn check_removed_telemetry_record_every_samples() -> Check {
+    let name = "runtime.telemetry_record_every_samples (removed)";
+    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
+    let present = cfg
+        .runtime
+        .as_ref()
+        .is_some_and(|r| r.extras.contains_key("telemetry_record_every_samples"));
+    if !present {
+        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: "config.json has `runtime.telemetry_record_every_samples` — retired in CONFIG 1.22; \
+                  delete it from config.json"
+            .into(),
+        hint: Some(
+            "the per-dispatch machine.telemetry curve it downsampled is gone (#2413) — remove \
+             `telemetry_record_every_samples` from the `runtime` block in ~/.darkmux/config.json; \
+             it is read leniently but has no effect"
+                .into(),
+        ),
+    }
+}
+
 /// (#2361, swarm S4-4) Informational: the bound on ONE operator-supplied
 /// shell command a step runs — `mods.gate`'s `test_command` and
 /// `procedural.shell`'s `command`. Always `Pass` (a preference, not a
@@ -2077,43 +2109,62 @@ fn check_host_sampler_interval() -> Check {
     }
 }
 
-/// (#2111) Surface the resolved `runtime.telemetry_record_every_samples`
-/// with provenance — how many dispatch-sampler ticks (2s cadence) between
-/// `machine.telemetry` periodic SAMPLE flow records, alongside
-/// `machine.thermal`'s TRANSITION events. Always Pass: `0` is an honest
-/// opt-out (the periodic curve simply isn't written; the sampler itself,
-/// the thermal governor, and `dispatch complete`'s `host_window` summary
-/// are all unaffected), not a defect — same shape as
-/// `check_host_sampler_interval`'s `0` case.
-fn check_telemetry_record_every_samples() -> Check {
-    let name = "runtime.telemetry_record_every_samples";
-    let (value, source) =
-        darkmux_types::config_access::telemetry_record_every_samples_with_source();
-    let provenance = source.as_str();
-    if value == 0 {
+/// (#2413) Surface the singleton host-sampler lock's state —
+/// `<darkmux-home>/liveness/host-sampler.lock` — the coordination file that
+/// keeps exactly one machine.telemetry emitter alive per machine (the
+/// daemon, or a dispatch process when no daemon runs).
+///
+/// Two outcomes, checked in this order:
+/// 1. No lock file at all → Pass: nothing has sampled yet on this machine
+///    (fresh install, or no daemon/dispatch has started one).
+/// 2. Otherwise: stale (heartbeat older than 3x its own declared interval,
+///    or its pid is dead) → Warn; else → Pass, naming the live holder.
+///
+/// (#2413 round 3 MF1) A THIRD outcome — Warn "two live pids", fed by a
+/// contention marker every declined `try_acquire` used to write — is
+/// RETIRED. It measured the wrong thing: a decline against a fresh lock
+/// held by the DESIGNED sole emitter is the correct, healthy steady state,
+/// not contention, and every acquisition attempt (including a caller's
+/// very first one) is exactly that whenever a daemon already runs — so
+/// the Warn fired on every dispatch start under a running daemon, reading
+/// a healthy install as faulty. The file-based lock could only ever show
+/// ONE current holder either way, so the marker never actually proved a
+/// second emitter was active; deleting the channel loses no real signal.
+fn check_host_sampler() -> Check {
+    let name = "host sampler";
+    let now_ms = darkmux_crew::host_sampler_lock::epoch_ms_now();
+    let Some(state) = darkmux_crew::host_sampler_lock::read_lock() else {
         return Check {
             name: name.into(),
             status: Status::Pass,
-            message: format!(
-                "0 ({provenance}) — the periodic machine.telemetry curve is disabled; \
-                 machine.thermal transitions and dispatch complete's host_window are unaffected"
-            ),
+            message: "no sampler active yet (no dispatch or daemon has started one on this machine)".into(),
             hint: None,
         };
-    }
-    // (#2111 review finding) Derived from the sampler's own constant
-    // rather than a hardcoded literal, so this message can't silently
-    // drift from the real tick if that constant ever changes.
-    let cadence_ms = value.saturating_mul(darkmux_crew::dispatch_internal::TELEMETRY_SAMPLE_INTERVAL_MS);
-    Check {
-        name: name.into(),
-        status: Status::Pass,
-        message: format!(
-            "every {value} sample(s) ({provenance}) — the machine.telemetry periodic \
-             host-pressure curve's cadence (≈{}s at the dispatch sampler's own tick)",
-            cadence_ms / 1000
-        ),
-        hint: None,
+    };
+    let dead = !darkmux_crew::host_sampler_lock::pid_alive(state.pid);
+    let stale = dead || darkmux_crew::host_sampler_lock::is_stale(&state, now_ms);
+    if stale {
+        Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "stale lock: pid {} ({}), last heartbeat {}ms ago (every {}ms), pid {} — will be \
+                 reclaimed by the next sampler to start",
+                state.pid,
+                state.owner,
+                now_ms.saturating_sub(state.heartbeat_ts_ms),
+                state.interval_ms,
+                if dead { "dead" } else { "alive" },
+            ),
+            hint: None,
+        }
+    } else {
+        Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("one sampler (pid {}, {}, every {}ms)", state.pid, state.owner, state.interval_ms),
+            hint: None,
+        }
     }
 }
 
@@ -6873,55 +6924,191 @@ mod tests {
         );
     }
 
-    // ─── (#2111) check_telemetry_record_every_samples — resolved state + provenance ─
+    // ─── (#2413 M5) check_removed_telemetry_record_every_samples ──────────
 
     #[serial_test::serial]
     #[test]
-    fn check_telemetry_record_every_samples_default_is_pass_and_names_5() {
-        let prev = std::env::var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES").ok();
-        unsafe { std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES") };
-        let check = check_telemetry_record_every_samples();
+    fn check_telemetry_record_every_samples_removed_passes_when_absent() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("config.json"), r#"{"schema_version":"1.22"}"#).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_removed_telemetry_record_every_samples();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
         assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains("every 5 sample"), "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_telemetry_record_every_samples_removed_passes_against_with_defaults() {
+        use darkmux_types::config::DarkmuxConfig;
+        let home = tempfile::TempDir::new().unwrap();
+        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
+        std::fs::write(home.path().join("config.json"), contents).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_removed_telemetry_record_every_samples();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "with_defaults() must never itself trip the removed-key warning: {}",
+            check.message
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_telemetry_record_every_samples_warns_and_names_the_key_when_present() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"schema_version":"1.21","runtime":{"telemetry_record_every_samples":30}}"#,
+        )
+        .unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_removed_telemetry_record_every_samples();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("telemetry_record_every_samples"), "names the key: {}", check.message);
+        assert!(
+            check.message.contains("1.22"),
+            "names the schema version it was retired in: {}",
+            check.message
+        );
+    }
+
+    // ─── (#2413) check_host_sampler — singleton lock Pass/Warn/Warn ───
+
+    /// Isolate `host_sampler_lock_path()` to a fresh tempdir for the
+    /// duration of `f`, restoring `DARKMUX_HOME` afterward. Serialized
+    /// (env mutation) like every other doctor env test in this file.
+    fn with_isolated_liveness_dir(f: impl FnOnce()) {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        f();
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", v),
-                None => std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
 
     #[serial_test::serial]
     #[test]
-    fn check_telemetry_record_every_samples_zero_is_pass_and_says_disabled() {
-        let prev = std::env::var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES").ok();
-        unsafe { std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", "0") };
-        let check = check_telemetry_record_every_samples();
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains("disabled"), "{}", check.message);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", v),
-                None => std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES"),
-            }
-        }
+    fn check_host_sampler_no_lock_file_is_pass() {
+        with_isolated_liveness_dir(|| {
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Pass, "{}", check.message);
+            assert!(check.message.contains("no sampler active"), "{}", check.message);
+        });
     }
 
     #[serial_test::serial]
     #[test]
-    fn check_telemetry_record_every_samples_env_override_names_provenance() {
-        let prev = std::env::var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES").ok();
-        unsafe { std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", "10") };
-        let check = check_telemetry_record_every_samples();
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains("every 10 sample"), "{}", check.message);
-        assert!(check.message.contains("env"), "provenance named: {}", check.message);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", v),
-                None => std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES"),
-            }
-        }
+    fn check_host_sampler_fresh_lock_is_pass_and_names_pid_owner_interval() {
+        with_isolated_liveness_dir(|| {
+            let guard = darkmux_crew::host_sampler_lock::try_acquire("daemon", 5000)
+                .expect("nothing else holds the lock");
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Pass, "{}", check.message);
+            assert!(check.message.contains(&std::process::id().to_string()), "{}", check.message);
+            assert!(check.message.contains("daemon"), "{}", check.message);
+            assert!(check.message.contains("5000ms"), "{}", check.message);
+            drop(guard);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_stale_heartbeat_is_warn() {
+        with_isolated_liveness_dir(|| {
+            // A lock whose heartbeat is far older than 3x its own interval,
+            // owned by OUR OWN (alive) pid — so this specifically exercises
+            // the heartbeat-staleness branch, not the dead-pid branch.
+            darkmux_crew::host_sampler_lock::write_lock_state_for_test(
+                &darkmux_crew::host_sampler_lock::LockState {
+                    pid: std::process::id(),
+                    machine_uid: None,
+                    started_ts_ms: 0,
+                    heartbeat_ts_ms: 0,
+                    interval_ms: 1000,
+                    owner: "daemon".to_string(),
+                },
+            );
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Warn, "{}", check.message);
+            assert!(check.message.contains("stale"), "{}", check.message);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_dead_pid_is_warn() {
+        with_isolated_liveness_dir(|| {
+            // A pid that (almost certainly) does not exist, with a FRESH
+            // heartbeat — isolates the dead-pid branch from the staleness
+            // branch above.
+            let now = darkmux_crew::host_sampler_lock::epoch_ms_now();
+            darkmux_crew::host_sampler_lock::write_lock_state_for_test(
+                &darkmux_crew::host_sampler_lock::LockState {
+                    pid: 999_999,
+                    machine_uid: None,
+                    started_ts_ms: now,
+                    heartbeat_ts_ms: now,
+                    interval_ms: 5000,
+                    owner: "dispatch".to_string(),
+                },
+            );
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Warn, "{}", check.message);
+            assert!(check.message.contains("dead"), "{}", check.message);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_a_declined_dispatch_first_attempt_against_a_daemon_held_lock_is_pass() {
+        // (#2413 round 3 MF1) A daemon-owned fresh lock, then a dispatch's
+        // FIRST acquisition attempt against it — the exact scenario that
+        // used to warn "two live pids" for the healthy steady state (every
+        // dispatch start under a running daemon). The contention channel
+        // is retired; this must read Pass, naming the daemon as the live
+        // holder, not Warn.
+        with_isolated_liveness_dir(|| {
+            let guard = darkmux_crew::host_sampler_lock::try_acquire("daemon", 5000)
+                .expect("nothing else holds the lock");
+            // A distinct (simulated) pid is required — one test binary is
+            // one real OS process, so two `try_acquire` calls here would
+            // otherwise share a pid and never exercise the "a DIFFERENT
+            // process holds it" branch.
+            let other_pid = std::process::id().wrapping_add(1);
+            let declined = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 5000);
+            assert!(declined.is_none(), "a fresh daemon-held lock is not stealable by a live dispatch");
+            let check = check_host_sampler();
+            assert_eq!(check.status, Status::Pass, "{}", check.message);
+            assert!(check.message.contains("daemon"), "names the live holder: {}", check.message);
+            assert!(!check.message.to_lowercase().contains("two live pids"), "{}", check.message);
+            drop(guard);
+        });
     }
 
     // ─── (#2171 test e) check_generation_checkpoint_interval — resolved state ─
@@ -8158,7 +8345,7 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 32 static checks via run() (#1405 removed the 4 openclaw-gated
+        // 55 static checks via run() (#1405 removed the 4 openclaw-gated
         // checks; #1426 removed recommendation-drift +
         // recommended-profile-not-shadowed with the retired recommendations
         // family; #1758 removed orchestrator-declared, a write-only field's
@@ -8196,22 +8383,22 @@ mod tests {
         // hooks checks are a different, disabled-by-default surface] + one
         // per active eureka rule.
         //
-        // (round-3 merge fix) The constant here is 54, not 53: the static
-        // array above literally has 53 entries (recount it before touching
-        // this number — `grep -c` inside the `let checks = vec![...]`
-        // block), `check_hooks()` always contributes exactly 1 more
-        // (disabled by default → the single overview check), and only
-        // THEN does `eureka_checks()` add one per active rule. A prior
-        // rebase kept an origin/main-side "53" that predated this branch's
-        // own `check_runtime_binary_cache` addition to the static array,
-        // silently undercounting by exactly the one check the OTHER side
-        // of that same merge conflict had just added — proof that a
-        // colliding-file rebase needs its literal counts re-derived, not
-        // just its prose reconciled.
+        // (round-3 merge fix) The constant here is 55, not 54: #2413 M5
+        // added `check_removed_telemetry_record_every_samples` to the
+        // static array (recount it before touching this number — `grep -c`
+        // inside the `let checks = vec![...]` block), `check_hooks()`
+        // always contributes exactly 1 more (disabled by default → the
+        // single overview check), and only THEN does `eureka_checks()` add
+        // one per active rule. A prior rebase kept an origin/main-side
+        // "53" that predated this branch's own `check_runtime_binary_cache`
+        // addition to the static array, silently undercounting by exactly
+        // the one check the OTHER side of that same merge conflict had
+        // just added — proof that a colliding-file rebase needs its
+        // literal counts re-derived, not just its prose reconciled.
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 54 + darkmux_eureka::all_rules().len();
+        let expected = 55 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

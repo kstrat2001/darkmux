@@ -289,9 +289,12 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.metricScope.model.map((i) => view.metrics[i].label)).not.toContain("GPU");
   });
 
-  it("(#1973) a run with no host telemetry shows no host tiles rather than zeros", () => {
+  it("(#1973, #2413 M4) a run with no host telemetry shows an explicit HOST tile rather than zeros or silence", () => {
     // Older runs predate the sampler. A `0%` would assert the machine was
-    // idle, which is a different claim from "not measured".
+    // idle, which is a different claim from "not measured". #2413 M4
+    // upgraded this further: silently omitting the tile read the same as
+    // "this pane doesn't cover host stats" — an explicit "no host samples"
+    // tile (matching the machine drawer's own wording) says so instead.
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
@@ -300,7 +303,60 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const labels = view.metricScope.system.map((i) => view.metrics[i].label);
     // COMPACTIONS is present because this fixture DID dispatch (it just had
     // no host sampler); the no-model case is covered separately below.
-    expect(labels).toEqual(["WALL CLOCK", "COMPACTIONS"]);
+    expect(labels).toEqual(["WALL CLOCK", "COMPACTIONS", "HOST"]);
+    const hostIdx = view.metricScope.system[labels.indexOf("HOST")];
+    expect(view.metrics[hostIdx].sub).toBe("no host samples for this run");
+  });
+
+  it("(#2413 M4) a run WITH a machine-scoped host sample joined into its record set renders CPU/RAM/GPU tiles", () => {
+    // The server joins `machine.telemetry` (category "machinery", source
+    // "host", no session_id) into a session's own record set by
+    // machine_uid + time window (darkmux-serve's `join_host_samples_
+    // into_session_records`) — this fixture simulates that already-joined
+    // shape, since this module's own tests exercise the CLIENT-side read
+    // of it, not the server join itself (covered in darkmux-serve's Rust
+    // tests).
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:00:30Z",
+        action: "machine.telemetry",
+        machine_uid: "m-1",
+        category: "machinery",
+        source: "host",
+        payload: { cpu_pct: 40, mem_pct: 60, gpu_pct: 10 },
+      } as unknown as FlowRecord,
+      { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const labels = view.metricScope.system.map((i) => view.metrics[i].label);
+    expect(labels).toContain("CPU");
+    expect(labels).toContain("RAM");
+    expect(labels).toContain("GPU");
+    expect(labels).not.toContain("HOST");
+  });
+
+  it("(#2413 round 3 CONSIDER 3) a machine-scoped sample from a DIFFERENT machine is never rendered", () => {
+    // A multi-machine playback fixture (records from more than one
+    // machine's day file) must not let this run's SYSTEM pane render
+    // another machine's samples just because they land in the same time
+    // window — only `machine_uid === this run's own machine_uid` counts.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", machine_uid: "m-1" } as FlowRecord,
+      {
+        ts: "2026-01-01T00:00:30Z",
+        action: "machine.telemetry",
+        machine_uid: "m-2",
+        category: "machinery",
+        source: "host",
+        payload: { cpu_pct: 40, mem_pct: 60, gpu_pct: 10 },
+      } as unknown as FlowRecord,
+      { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const labels = view.metricScope.system.map((i) => view.metrics[i].label);
+    expect(labels).not.toContain("CPU");
+    expect(labels).toContain("HOST");
   });
 
   it("(#1973) a unit that did NO model work has no model pane and no loaded-models track", () => {

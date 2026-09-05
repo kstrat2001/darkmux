@@ -28,3 +28,6 @@ serial_test = "3.1"
 # tests never read the operator's real ~/.darkmux/config.json (e.g. doctor's
 # redis-enabled / check-updates gates). Dev-dep only; off in the release binary.
 darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
+# (#2413) `check_host_sampler`'s tests build stale/dead-pid lock fixtures
+# via `host_sampler_lock::write_lock_state_for_test`.
+darkmux-crew = { path = "../darkmux-crew", features = ["test-support"] }

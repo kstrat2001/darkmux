@@ -561,34 +561,28 @@ pub fn run_ephemeral(
     // `<mission_id>/` is ever written).
     let correlation_id = mint_ephemeral_correlation_id(&config.id);
 
-    // (#1877 QA must-fix 1) Telemetry + a whole-run dispatch bookend,
-    // PRESCRIBED here too — not just for `darkmux mission launch`. Before
-    // this, `run_ephemeral` was a second door into `run_step_graph` with
-    // neither: the SAME cmd configs `launch()` now covers (`pr-merge`,
-    // `pr-approve`) run through here whenever the ACP panel in Zed invokes
-    // them, so a panel-launched `pr-merge` that hung had none of the
-    // observability its terminal-launched twin gets, and the Runs lens
-    // showed nothing for it. This path is Tier-1-only by construction
-    // (`is_procedural_only` gates routing here at all — see `route_command`),
-    // so no per-step model dispatch ever happens on it; telemetry is the
-    // whole value (host cpu/ram/gpu + lms load/unload deltas alongside a
-    // `procedural.shell` step that shells out to `gh` and might hang), and
-    // the bookend pair is what makes an ephemeral run's liveness visible at
-    // all, the same way `mission_bookend_record`'s own doc explains for
-    // `launch`. Reuses `mission_launch`'s builders (`mission_bookend_record`,
-    // `drained_telemetry`) rather than a second hand-rolled copy of the
-    // record shape — same discipline #1685 QA MUST-FIX 2 already applied to
-    // `emit_cmd_audit`. No mission instance is minted either way (rule
-    // D still holds): `mission_id`/`session_id` on every record here is the
-    // per-invocation `correlation_id`, never a real mission id.
-    let telemetry = crate::crew::run_obs::HostTelemetrySampler::start(
-        correlation_id.clone(),
-        config.id.clone(),
-        crate::crew::run_obs::DEFAULT_TELEMETRY_INTERVAL,
-        crate::crew::run_obs::DEFAULT_TELEMETRY_POLL,
-        crate::crew::telemetry_sampler::sample_host,
-        darkmux_profiles::lms::list_loaded,
-    );
+    // (#1877 QA must-fix 1) A whole-run dispatch bookend, PRESCRIBED here
+    // too — not just for `darkmux mission launch`. Before this, `run_
+    // ephemeral` was a second door into `run_step_graph` with none: the
+    // SAME cmd configs `launch()` now covers (`pr-merge`, `pr-approve`) run
+    // through here whenever the ACP panel in Zed invokes them, so a
+    // panel-launched `pr-merge` that hung had no liveness signal at all,
+    // and the Runs lens showed nothing for it. The bookend pair is what
+    // makes an ephemeral run's liveness visible, the same way `mission_
+    // bookend_record`'s own doc explains for `launch`. Reuses `mission_
+    // launch`'s own builder (`mission_bookend_record`) rather than a
+    // second hand-rolled copy of the record shape — same discipline #1685
+    // QA MUST-FIX 2 already applied to `emit_cmd_audit`. No mission
+    // instance is minted either way (rule D still holds): `mission_id`/
+    // `session_id` on every record here is the per-invocation
+    // `correlation_id`, never a real mission id.
+    //
+    // (#2413 M3) This path used to ALSO run its own per-invocation host
+    // sampler (`HostTelemetrySampler`, drained into `telemetry.process`
+    // records) — retired along with the generic launch path's identical
+    // construction. One machine-scoped sampler now covers every live
+    // dispatch on the machine, this ephemeral path included; there is
+    // nothing left for this function to start or drain.
     let mut dispatch_sink = |record: crate::flow::FlowRecord| {
         let _ = crate::flow::record(record);
     };
@@ -661,9 +655,6 @@ pub fn run_ephemeral(
             // `launch`'s own emit closure uses, so telemetry streams
             // alongside this run's other records rather than batching at
             // the end (CLAUDE.md's "no blind runs" mandate).
-            for sample in crate::mission_launch::drained_telemetry(&telemetry, &correlation_id) {
-                let _ = crate::flow::record(sample);
-            }
             let _ = crate::flow::record(record);
         },
         &mut |_step: &Step| {
@@ -684,9 +675,6 @@ pub fn run_ephemeral(
     let report = match scheduler_result {
         Ok(report) => report,
         Err(e) => {
-            for sample in crate::mission_launch::drained_telemetry(&telemetry, &correlation_id) {
-                bookend.emit_now(sample);
-            }
             bookend.close(
                 "dispatch",
                 crate::mission_launch::mission_bookend_record(
@@ -708,9 +696,6 @@ pub fn run_ephemeral(
     let outcome = match render_ephemeral_result(&ordered_tasks, &steps, &report, &interpret_warnings) {
         Ok(outcome) => outcome,
         Err(e) => {
-            for sample in crate::mission_launch::drained_telemetry(&telemetry, &correlation_id) {
-                bookend.emit_now(sample);
-            }
             bookend.close(
                 "dispatch",
                 crate::mission_launch::mission_bookend_record(
@@ -729,9 +714,6 @@ pub fn run_ephemeral(
         }
     };
 
-    for sample in crate::mission_launch::drained_telemetry(&telemetry, &correlation_id) {
-        bookend.emit_now(sample);
-    }
     bookend.close(
         "dispatch",
         crate::mission_launch::mission_bookend_record(

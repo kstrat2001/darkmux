@@ -386,7 +386,37 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const visible = data.filter((r) => T(r.ts) <= nowMs);
   const tel = visible.filter((r) => inAttempt(r) && r.category === "telemetry");
   const lms = tel.filter((r) => r.source === "lms");
-  const procs = tel.filter((r) => r.source === "process");
+  // (#2413 M4) Host cpu/ram/gpu samples used to ride the per-dispatch
+  // `telemetry.process` record — `category: "telemetry"`, `source:
+  // "process"`, this session's own `session_id` — so `tel`'s filters
+  // above caught it for free. M3 retired that producer; the replacement,
+  // `machine.telemetry`, is machine-scoped: `category: "machinery"`
+  // (NOT "telemetry"), `source: "host"`, and no `session_id` at all — so
+  // `inAttempt` (which requires a session_id match) silently excludes it
+  // and this pane's CPU/RAM/GPU tiles would vanish. The server already
+  // joins the machine-scoped samples covering this run's window into the
+  // SAME record set this session's own records arrive in (darkmux-serve's
+  // `join_host_samples_into_session_records`, keyed on machine_uid + the
+  // dispatch.start..terminal window) — so here it's a plain time-window
+  // filter instead of `inAttempt`'s session match. Historical (pre-#2413)
+  // `telemetry.process` records with this session's own `session_id`
+  // still match via the `tel`/`source==="process"` half below —
+  // lenient-on-read, both curves render.
+  // (#2413 round 3 CONSIDER 3) `d`'s own `machine_uid` (the dispatch.start
+  // record — falls back to the session's first record for the same reason
+  // `startTs` does above) gates the join client-side too: without it, a
+  // multi-machine playback fixture (records from more than one machine's
+  // day file, e.g. a fleet view) would render every machine's samples
+  // on every run's SYSTEM pane, not just the run's own machine's.
+  const runMachineUid = d?.machine_uid ?? firstSessRec?.machine_uid ?? null;
+  const hostSamples = visible.filter(
+    (r) =>
+      r.action === "machine.telemetry" &&
+      (runMachineUid == null || r.machine_uid === runMachineUid) &&
+      T(r.ts) >= startTs &&
+      (closeTs == null || T(r.ts) <= closeTs),
+  );
+  const procs = [...tel.filter((r) => r.source === "process"), ...hostSamples];
   const rt = tel.filter((r) => r.source === "runtime").slice(-1)[0] ?? null;
   const dets = tel.filter((r) => r.source === "detector");
   const loads = lms.filter((r) => (r.fields as Record<string, unknown> | undefined)?.event === "load");
@@ -605,7 +635,16 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const hostAgg = aggregateHostSamples(
     procs.map((r) => {
       const f = r.fields as Record<string, unknown> | undefined;
-      return { cpu: toNum(f?.cpu), mem: toNum(f?.mem), gpu: toNum(f?.gpu) };
+      // (#2413 M4) The retired `telemetry.process` payload used bare
+      // `cpu`/`mem`/`gpu`; the machine-scoped `machine.telemetry`
+      // replacement uses `cpu_pct`/`mem_pct`/`gpu_pct` (see
+      // `host_probe::sample_full_json`) — read either so both curves
+      // aggregate through the same code.
+      return {
+        cpu: toNum(f?.cpu ?? f?.cpu_pct),
+        mem: toNum(f?.mem ?? f?.mem_pct),
+        gpu: toNum(f?.gpu ?? f?.gpu_pct),
+      };
     }),
   );
   const cpuPeak = hostAgg.cpu.high;
@@ -679,6 +718,20 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   if (gpuPeak != null) {
     const s = avgHighSplit(hostAgg.gpu);
     push(systemIdx, s.value, "GPU", undefined, undefined, s.sub);
+  }
+  // (#2413 M4) CPU/RAM/GPU used to silently vanish here whenever the
+  // machine-scoped join below found nothing for this run's window — no
+  // tile, no explanation, indistinguishable from "the pane doesn't cover
+  // host stats". `hasModelWork` gates it the same as COMPACTIONS above: a
+  // Tier-1-only run genuinely has nothing to sample, so no explicit tile
+  // there either — this is specifically for a model-work run whose join
+  // came up empty (historical pre-#2413 data with no machine_uid, or a
+  // machine-scoped sampler that simply never ran during this window).
+  // Wording matches the machine drawer's own "no host samples" tile
+  // (`machineStatsContent.tsx`) rather than inventing a second phrase for
+  // the same fact.
+  if (hasModelWork && cpuPeak == null && ramPeak == null && gpuPeak == null) {
+    push(systemIdx, "—", "HOST", undefined, undefined, "no host samples for this run");
   }
 
   // (#1973) Indices into `metrics`, not a second copy — one ordered list, one
