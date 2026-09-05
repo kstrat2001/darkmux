@@ -18,19 +18,77 @@
 //     already guarantees the document ends above the bar. That is not the
 //     same problem, and this file asserts the two separately rather than
 //     conflating them into one number.
+//
+// Every route below names a READY selector and waits for it before
+// measuring. Without that this whole file is vacuous by construction: a
+// route that rendered nothing has no pinned controls, and "no control is
+// under the bar" passes loudest exactly when the lens failed to mount. An
+// earlier draft pointed at demo-only mission and dispatch ids that do not
+// exist in this harness, and those two cases went green against an empty
+// stage.
 const { test, expect } = require('@playwright/test');
 
-const BASE = process.env.SHOT_BASE || 'http://127.0.0.1:47955/index.html';
-const MISSION = 'demo-review-nameof-recency';
-const DISPATCH = 'darkmux-compactor-compact-trajectories-2619114180';
+const MISSION_ID = 'drawer-inset';
 
+/** The smallest graph that still renders a canvas with phases, tasks and a
+ * step row — this file is about where the canvas ENDS, not what it draws, so
+ * the sibling geometry spec's fuller snapshot would be noise here. */
+function graphSnapshot() {
+  return {
+    mission_id: MISSION_ID,
+    mission_status: 'finalized',
+    nodes: [
+      { id: 'phase-investigate', kind: 'phase', label: 'Investigate', status: 'complete', depth: 0, steps: [] },
+      {
+        id: 'bundle', kind: 'task', label: 'Bundle', parentId: 'phase-investigate', status: 'complete', depth: 0,
+        steps: [{ id: 'bundle-1', kind: 'review.bundle', label: 'Bundle', status: 'complete' }],
+      },
+      {
+        id: 'probe', kind: 'task', label: 'Probe', parentId: 'phase-investigate', status: 'complete', depth: 1,
+        steps: [{ id: 'probe-1', kind: 'dispatch.map', label: 'Dispatch (map)', status: 'complete', model: 'darkmux:qwen3.6-35b-a3b' }],
+      },
+      { id: 'phase-report', kind: 'phase', label: 'Report', status: 'complete', depth: 1, steps: [] },
+      {
+        id: 'synthesis', kind: 'task', label: 'Synthesis', parentId: 'phase-report', status: 'complete', depth: 0,
+        steps: [{ id: 'synth-1', kind: 'review.synthesis', label: 'Synthesis', status: 'complete' }],
+      },
+    ],
+    edges: [
+      { id: 'e1', source: 'bundle', target: 'probe', kind: 'depends' },
+      { id: 'p1', source: 'phase-investigate', target: 'phase-report', kind: 'phase' },
+    ],
+    generated_at_ms: 0,
+  };
+}
+
+/** The daemon stubs `index-live.html` needs — the same set, and the same
+ * reasons, as `mission-lens-layout-geometry.spec.js`'s own `routeAll`. */
+async function routeMission(page) {
+  await page.route(`**/mission/${MISSION_ID}/graph.json`, (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify(graphSnapshot()) }),
+  );
+  const emptyBody = JSON.stringify({ records: [], count: 0, truncated: false, generated_at_ms: 0 });
+  await page.route(/\/flow-mission\/.*/, (r) => r.fulfill({ contentType: 'application/json', body: emptyBody }));
+  await page.route(/\/flow\/[^/]+\/mission\/.*/, (r) => r.fulfill({ contentType: 'application/json', body: emptyBody }));
+  await page.route(/\/flow\/[^/]+\/backfill.*/, (r) => r.fulfill({ contentType: 'application/json', body: '[]' }));
+  await page.route(/\/flow\/[^/]+\/stream.*/, (r) => r.fulfill({ status: 204, body: '' }));
+  await page.route(/\/(missions|phases|runs|lab\/runs|machine\/.*|presence.*|fleet\/.*)(\?.*)?$/, (r) =>
+    r.fulfill({ contentType: 'application/json', body: '[]' }),
+  );
+}
+
+// `index.html` is the static XSS-fixture harness — a real committed flow
+// file, so the plain lenses render real content. `index-lifecycle.html` is
+// the same shape pointed at a fixture with clean session ids, which is where
+// a dispatch drill-in is reachable without a daemon.
 const ROUTES = [
-  ['fleet', '#lens=fleet'],
-  ['console', '#lens=console'],
-  ['runs', '#lens=runs'],
-  ['machine', '#lens=machine'],
-  ['mission', `#mission=${MISSION}`],
-  ['dispatch', `#dispatch=${DISPATCH}`],
+  ['fleet', '/index.html#lens=fleet', '.savrow'],
+  ['console', '/index.html#lens=console', '.panelwrap'],
+  // `.stagehdr` is this suite's documented "a lens rendered" hook (see
+  // `styles.css`'s own note on it); the machine lens has its own root.
+  ['runs', '/index.html#lens=runs', '.stagehdr'],
+  ['machine', '/index.html#lens=machine', '.machine-lens'],
+  ['dispatch', '/index-lifecycle.html#dispatch=sess-clean-complete', '.session-run'],
 ];
 
 test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
@@ -62,35 +120,60 @@ async function pinnedControls(page) {
   });
 }
 
+/** Offenders = pinned controls ON SCREEN and cut by the bar.
+ *
+ * INTERSECTING the bar at rest, not merely "below y=drawerTop": most pinned
+ * boxes in these lenses (`.sbar` activity segments, `.mm-row-*` meter fills)
+ * are absolutely positioned inside a NORMAL-FLOW container far down the
+ * document, so they sit at y=1200+ on an 844px viewport and scroll into view
+ * above the bar like any other content. */
+async function offenders(page, top) {
+  const vh = await page.evaluate(() => window.innerHeight);
+  return (await pinnedControls(page)).filter((c) => c.top < vh && c.bottom > top);
+}
+
 test.describe('every lens ends above the collapsed phone drawer', () => {
-  for (const [name, hash] of ROUTES) {
+  for (const [name, url, ready] of ROUTES) {
     test(`${name}: no pinned control crosses the drawer bar`, async ({ page }) => {
-      await page.goto(BASE + hash);
-      await page.waitForSelector('.app-shell');
-      await page.waitForTimeout(2000);
+      await page.goto(url);
+      await expect(
+        page.locator(ready).first(),
+        `${name} never rendered — the measurement below would be vacuous`,
+      ).toBeVisible();
       const top = await drawerTop(page);
       expect(top, 'the phone drawer must be mounted at this viewport').not.toBeNull();
-      // INTERSECTING the bar at rest, not merely "below y=drawerTop": most
-      // pinned boxes here (`.sbar` activity segments, `.mm-row-*` meter
-      // fills) are absolutely positioned inside a NORMAL-FLOW container far
-      // down the document, so they sit at y=1200+ on a 844px viewport and
-      // scroll into view above the bar like any other content. The defect is
-      // a control that is ON SCREEN and cut in half by the bar.
-      const vh = await page.evaluate(() => window.innerHeight);
-      const offenders = (await pinnedControls(page)).filter((c) => c.top < vh && c.bottom > top);
-      expect(offenders, `pinned controls under the drawer bar (top=${top}): ${JSON.stringify(offenders)}`).toEqual([]);
+      const bad = await offenders(page, top);
+      expect(bad, `pinned controls under the drawer bar (top=${top}): ${JSON.stringify(bad)}`).toEqual([]);
     });
   }
 
+  test('mission TIMELINE (the phone default): no pinned control crosses the drawer bar', async ({ page }) => {
+    await routeMission(page);
+    await page.goto(`/index-live.html#mission=${MISSION_ID}`);
+    await expect(page.locator('.missionlens')).toBeVisible();
+    await page.waitForFunction(() => !!document.querySelector('.missionlens .canvas, .missionlens .tlt-hd'));
+    const top = await drawerTop(page);
+    const bad = await offenders(page, top);
+    expect(bad, `pinned controls under the drawer bar (top=${top}): ${JSON.stringify(bad)}`).toEqual([]);
+  });
+
   test('mission GRAPH view: the canvas and its React Flow overlays stop at the drawer', async ({ page }) => {
-    await page.goto(`${BASE}#mission=${MISSION}`);
-    await page.waitForSelector('.evbtn');
-    await page.waitForTimeout(1500);
-    // The phone renders the TIMELINE first; the canvas is one tap away, and
-    // it is the canvas whose overlays are bottom-pinned.
-    await page.locator('.evbtn').click();
-    await page.waitForSelector('.react-flow__controls', { timeout: 15000 });
-    await page.waitForTimeout(2000);
+    await routeMission(page);
+    await page.goto(`/index-live.html#mission=${MISSION_ID}`);
+
+    // A phone defaults to the TIMELINE renderer; the canvas — and with it the
+    // bottom-pinned controls this test is about — is one tap away. Waiting
+    // for the lens to have PICKED a renderer before asking which one it
+    // picked is the race guard `mission-lens-layout-geometry.spec.js`
+    // documents: `.canvas` is also absent while the lens is still mounting,
+    // so an unguarded click can toggle the wrong way.
+    await expect(page.locator('.missionlens')).toBeVisible();
+    await page.waitForFunction(() => !!document.querySelector('.missionlens .canvas, .missionlens .tlt-hd'));
+    if ((await page.locator('.missionlens .canvas').count()) === 0) {
+      await page.locator('button[title="switch renderer"]').click();
+    }
+    await expect(page.locator('.missionlens .mnode').first()).toBeVisible();
+    await page.waitForSelector('.react-flow__controls');
 
     const top = await drawerTop(page);
     const boxes = await page.evaluate(() => {

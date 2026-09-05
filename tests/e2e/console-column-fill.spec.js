@@ -11,7 +11,8 @@
 // auto` with the default `min-height: auto` never shrinks below content).
 const { test, expect } = require('@playwright/test');
 
-const BASE = process.env.SHOT_BASE || 'http://127.0.0.1:47955/index.html';
+// Relative to the harness's baseURL (tests/e2e/playwright.config.js), like every sibling spec.
+const BASE = '/index.html';
 
 test.describe('(U2-4) console lens column fill', () => {
   test.use({ viewport: { width: 1456, height: 900 } });
