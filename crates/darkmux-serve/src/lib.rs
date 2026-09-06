@@ -3248,12 +3248,18 @@ fn join_host_samples_into_session_records(
     else {
         return;
     };
-    let is_start = |r: &serde_json::Value| r.get("action").and_then(|a| a.as_str()) == Some("dispatch.start");
+    // Both spellings: the crew and the CLI emit `dispatch start`/`dispatch
+    // complete` (spaced); darkmux-lab and the runtime emit the dotted form.
+    // Matching only the dotted one here meant no real run ever got a host
+    // sample (found live, 2026-09-06). Same shared helpers `/flow/<date>`'s
+    // bookend keep-list uses (#2410), so the two cannot drift again.
+    fn action_of(r: &serde_json::Value) -> &str {
+        r.get("action").and_then(|a| a.as_str()).unwrap_or("")
+    }
+    let is_start = |r: &serde_json::Value| darkmux_flow::is_dispatch_start(action_of(r));
     let is_terminal = |r: &serde_json::Value| {
-        matches!(
-            r.get("action").and_then(|a| a.as_str()),
-            Some("dispatch.complete") | Some("dispatch.error") | Some("session.end")
-        )
+        let a = action_of(r);
+        darkmux_flow::is_dispatch_complete(a) || darkmux_flow::is_dispatch_error(a) || a == "session.end"
     };
     let ts_ms = |r: &serde_json::Value| -> Option<u64> {
         r.get("ts").and_then(|t| t.as_str()).and_then(runs::parse_flow_ts).map(|secs| secs.saturating_mul(1000))

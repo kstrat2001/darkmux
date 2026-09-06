@@ -5772,6 +5772,56 @@ fn join_host_samples_pulls_in_window_machine_telemetry_and_drops_out_of_window()
     assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(42));
 }
 
+// (#2413 follow-up, found live 2026-09-06) The crew and the CLI emit the SPACED
+// `dispatch start`/`dispatch complete`; the join used to match only the dotted
+// spelling, so `start_ms` was never found and no real run ever got a sample.
+#[test]
+fn join_host_samples_joins_when_the_bookends_use_the_spaced_spelling_production_emits() {
+    let tmp = TempDir::new().unwrap();
+    let day = "2026-01-01";
+    let in_window = serde_json::json!({
+        "ts": "2026-01-01T00:00:05Z",
+        "action": "machine.telemetry",
+        "machine_uid": "m-1",
+        "payload": {"cpu": 42},
+    });
+    let out_of_window = serde_json::json!({
+        "ts": "2026-01-01T00:05:00Z",
+        "action": "machine.telemetry",
+        "machine_uid": "m-1",
+        "payload": {"cpu": 99},
+    });
+    let other_machine = serde_json::json!({
+        "ts": "2026-01-01T00:00:06Z",
+        "action": "machine.telemetry",
+        "machine_uid": "m-2",
+        "payload": {"cpu": 7},
+    });
+    let contents = format!("{in_window}\n{out_of_window}\n{other_machine}\n");
+    fs::write(tmp.path().join(format!("{day}.jsonl")), contents).unwrap();
+
+    let mut records = vec![
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:00Z",
+            "action": "dispatch start",
+            "session_id": "s-1",
+            "machine_uid": "m-1",
+        }),
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:10Z",
+            "action": "dispatch complete",
+            "session_id": "s-1",
+            "machine_uid": "m-1",
+        }),
+    ];
+    join_host_samples_into_session_records(tmp.path(), &[], &mut records);
+
+    let telemetry: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
+    assert_eq!(telemetry.len(), 1, "exactly the in-window, same-machine sample joins: {records:#?}");
+    assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(42));
+}
+
 #[test]
 fn join_host_samples_is_a_noop_when_the_session_carries_no_machine_uid() {
     let tmp = TempDir::new().unwrap();
