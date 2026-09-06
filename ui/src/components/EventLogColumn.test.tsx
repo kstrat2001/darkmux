@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
-import { EventLogColumn } from "./EventLogColumn";
+import { EventLogColumn, compactCountLabel } from "./EventLogColumn";
 import type { FlowRecord } from "../types/handwritten";
 import { closeOpenModal } from "../lib/dialogManager";
 
@@ -287,6 +287,27 @@ describe("EventLogColumn", () => {
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     expect(screen.getByRole("button", { name: /filters, 17 active/i })).toBeInTheDocument();
+  });
+
+  // (operator, 2026-09-06) The filters button's visible label moved from
+  // "filters" text (+ an inline " · N" suffix when active) to an icon glyph
+  // with the count as a separate badge — matching `.eventlog__follow`'s own
+  // icon-only convention. `aria-label`/`title` (asserted above) already
+  // carry the full semantics, so the glyph and badge are `aria-hidden` and
+  // the button's own accessible name is unaffected by this markup change —
+  // this test pins the DOM shape itself so a future edit can't silently
+  // reintroduce the text label.
+  it("the filters button renders an icon + a bare-digit badge, not a text label", () => {
+    const records = [rec({ action: "dispatch.reasoning" }), rec({ action: "dispatch.turn.heartbeat" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    const fbtn = document.getElementById("fbtn")!;
+    expect(fbtn.textContent).not.toContain("filters");
+    expect(fbtn.querySelector(".eventlog__ficon")).not.toBeNull();
+    const badge = fbtn.querySelector(".eventlog__fcount");
+    expect(badge).not.toBeNull();
+    // Bare digit — no " · " prefix carried over from the old inline suffix.
+    expect(badge!.textContent).toBe("1");
+    expect(badge!.getAttribute("aria-hidden")).toBe("true");
   });
 
   // (#2417 round 2, MF2) The pane chip used to print "50 of <filtered.length>"
@@ -682,5 +703,29 @@ describe("EventLogColumn — phone divider + one-tap expand (#2108)", () => {
     // arbitrary dragged value — proving no stray drag state leaked in.
     expect(detail.style.flexBasis).toBe("");
     expect(before).not.toBe("");
+  });
+});
+
+// (operator, 2026-09-06) The phone drawer's Events toolbar row (follow +
+// filters icon + the matches count) has no room for the full "50 of 684
+// events · 12889 hidden" chip text beside two icon buttons at 320-390px —
+// `compactCountLabel()` is the pure transform the mobile row applies to
+// the exact same `qcountText` every other consumer reads (desktop, ARIA),
+// so there is one source of truth for the wording and no parallel branch
+// that could drift from it.
+describe("compactCountLabel", () => {
+  it("drops \"events\", swaps \"of\" for \"/\", and abbreviates 4+-digit runs to one-decimal k", () => {
+    expect(compactCountLabel("50 of 684 events · 12889 hidden")).toBe("50/684 · 12.9k hidden");
+  });
+
+  it("leaves short text with no \"events\"/\"of\"/4-digit run untouched", () => {
+    expect(compactCountLabel("2 matches · 1 hidden")).toBe("2 matches · 1 hidden");
+    expect(compactCountLabel("60 matches · 50 shown")).toBe("60 matches · 50 shown");
+    expect(compactCountLabel("no match")).toBe("no match");
+  });
+
+  it("abbreviates a hidden-count run even in the search-match branch", () => {
+    expect(compactCountLabel("12 matches · 900 hidden")).toBe("12 matches · 900 hidden");
+    expect(compactCountLabel("12 matches · 4952 hidden")).toBe("12 matches · 5.0k hidden");
   });
 });

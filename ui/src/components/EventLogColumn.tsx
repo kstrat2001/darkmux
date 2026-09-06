@@ -26,6 +26,33 @@ import { openModalEl } from "../lib/dialogManager";
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
  * newest 50, newest-first. */
 const LOG_CAP = 50;
+
+/** (operator, 2026-09-06) The phone drawer's Events toolbar moved the
+ * matches count (`qcountText` below) onto the SAME line as the follow and
+ * filter icon buttons — real width is scarce there, and "50 of 684 events ·
+ * 12889 hidden" is long enough to force a wrap or an overflow beside two
+ * buttons at 320-390px. This is a pure STRING TRANSFORM over the exact same
+ * `qcountText` every other consumer (desktop, ARIA) reads — a single
+ * source of truth for the wording, not a parallel branch that could drift
+ * from it — dropping the word "events" (redundant beside the tab's own
+ * "Events · N"), swapping " of " for "/", and abbreviating any run of 4+
+ * digits to one-decimal "k" form. "50 of 684 events · 12889 hidden" becomes
+ * "50/684 · 12.9k hidden"; short numbers and the no-search "N matches · M
+ * hidden"/"no match" forms have no 4-digit run or " of "/" events" to
+ * touch and pass through unchanged. Applied unconditionally in the phone
+ * drawer/narrow-width row rather than only-when-it-would-overflow: the
+ * row's available width is fixed and known (icons are a constant size), so
+ * the compact form is deterministic rather than a runtime measurement —
+ * simpler to reason about and to test than a resize-observed toggle. */
+export function compactCountLabel(text: string): string {
+  return text
+    .replace(/ events\b/g, "")
+    .replace(/ of /g, "/")
+    .replace(/\d{4,}/g, (digits) => {
+      const n = Number(digits);
+      return `${(n / 1000).toFixed(1)}k`;
+    });
+}
 /** (#2068) How long the followed record holds in the detail card before the
  * next one may replace it. Two updates a second is still "live"; faster is
  * unreadable on a phone and reads as flicker. */
@@ -808,8 +835,30 @@ export function EventLogColumn({
                 onClick={() => (isMobile ? setFiltersInline((v) => !v) : openModalEl("modalbg"))}
                 aria-expanded={isMobile ? filtersInline : undefined}
               >
-                filters
-                {activeFilters > 0 ? <span className="eventlog__fcount"> · {activeFilters}</span> : null}
+                {/* (operator, 2026-09-06, round 2) An icon glyph — matching
+                    the follow button's own long-standing icon-only
+                    convention (`⏱`, no label) — replaces the "filters" text
+                    label so the phone drawer's two-row header (search; then
+                    follow + filters + the matches count on one line) has
+                    room for the count text to actually fit beside the icons
+                    instead of wrapping to a THIRD row. `▾` is this
+                    codebase's EXISTING disclosure glyph (`styles.css`'s
+                    `content: "▾"` rules), used here rather than introducing
+                    a new codepoint (round 1 shipped `⏷`, U+23F7, which had
+                    no other use in the tree — round 2 caught it). `aria-
+                    hidden` on both the glyph and the badge: `aria-label`/
+                    `title` above already carry the full semantics
+                    ("filters, 2 active"), so a screen reader is not asked
+                    to read the glyph AND the bare digit as if they were
+                    separate content. */}
+                <span className="eventlog__ficon" aria-hidden="true">
+                  ▾
+                </span>
+                {activeFilters > 0 ? (
+                  <span className="eventlog__fcount" aria-hidden="true">
+                    {activeFilters}
+                  </span>
+                ) : null}
               </button>
               {/* (#2108, operator finding — real device, oversized Events
                   header) Moved here from `.eventlog__search` below — on a
@@ -822,8 +871,13 @@ export function EventLogColumn({
                   did, this is purely which FLEX GROUP the pill's DOM node
                   sits in — `id="qcount"` and its content are unchanged, so
                   nothing that reads it by id cares that it moved. */}
-              <span className={`eventlog__qcount${qcountText ? " show" : ""}${q && filtered.length === 0 ? " zero" : ""}`} id="qcount" aria-live="polite">
-                {qcountText}
+              <span
+                className={`eventlog__qcount${qcountText ? " show" : ""}${q && filtered.length === 0 ? " zero" : ""}`}
+                id="qcount"
+                aria-live="polite"
+                title={isMobile && qcountText ? qcountText : undefined}
+              >
+                {isMobile ? compactCountLabel(qcountText) : qcountText}
               </span>
             </span>
           </h3>
