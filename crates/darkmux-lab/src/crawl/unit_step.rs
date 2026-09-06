@@ -275,7 +275,10 @@ fn pattern_block(rule: &Rule) -> String {
                 out.push_str(&format!(
                     "\nBefore you call create_finding for this pattern: answer this question in one line, then \
                      put your answer AND its reasoning at the start of `why` — this pattern's finding is a \
-                     QUESTION for the author, not a claim, so be honest that it is unconfirmed: {compare}\n",
+                     QUESTION for the author, not a claim, so be honest that it is unconfirmed: {compare} If your \
+                     answer is no, or you cannot tell, do NOT call create_finding for this pattern at all — a \
+                     negative or unconfirmable answer is not a finding, and every conversation you raise costs the \
+                     author a click.\n",
                 ));
             }
         }

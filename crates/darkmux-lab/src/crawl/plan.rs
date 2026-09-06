@@ -3793,8 +3793,13 @@ line two
         assert_eq!(payload.mode, "review");
         let review = payload.review.clone().unwrap();
 
-        // one comment per delivery form, plus the scope line naming every rule run
-        assert_eq!(review.comments.len(), 1, "exactly one in-diff suggestion (swallowed-error's gated mod): {review:?}");
+        // (#2429) Every ANCHORED finding is an inline comment now: the
+        // gated mod still rides as a one-click suggestion, and the other
+        // four (a gate-failed mod, and three plain findings across
+        // question/search-confirmed rules) each become a plain comment —
+        // none of them reach the body any more. The body is a coverage/
+        // scope summary only.
+        assert_eq!(review.comments.len(), 5, "1 suggestion (swallowed-error's gated mod) + 4 plain comments: {review:?}");
         // (#2310 fix-loop E2) "N of M rules reviewed". This fixture saves
         // no config snapshot, so `rules_total` is 0 and the denominator
         // falls back to what the lists prove: 5 run, none not-attempted.
@@ -3804,32 +3809,48 @@ line two
             "the standing narrowness, in the author's frame: {}",
             review.body
         );
-        // (#2310 delivery rewrite) Every entry is headed by its RULE — the
-        // title from `templates/builtin/rules/<id>.json`, tagged with the
-        // id the author re-runs the check by — and located by `path:line`.
-        // The finding KEY (darkmux's own record id) never renders.
+        // (#2310 delivery rewrite) Every entry is tagged with its RULE —
+        // the id the author re-runs the check by (never its title, which
+        // only ever headed a BODY group — a plain comment has none to lean
+        // on). The finding KEY (darkmux's own record id) never renders.
         for key in [&se_key, &up_key, &es_key, &uve_key, &ssc_key] {
             assert!(!review.body.contains(key.as_str()), "the record key {key} must not render: {}", review.body);
+            assert!(
+                review.comments.iter().all(|c| !c.body.contains(key.as_str())),
+                "the record key {key} must not render in a comment either: {review:?}"
+            );
         }
         assert!(
-            review.body.contains("**A new routine looks re-implemented rather than reused** `existing-solution`"),
-            "existing-solution heads its own group: {}",
-            review.body
+            review.comments.iter().any(|c| c.path == "src/retry.ts" && c.line == 3 && c.body.contains("`existing-solution`")),
+            "existing-solution's finding is a plain comment tagged with its rule id: {review:?}"
         );
-        assert!(review.body.contains("`src/retry.ts:3`"), "located by path:line: {}", review.body);
-        assert!(review.body.contains("did you check for an existing retry helper"));
-        // The two searched rules and the gate-failed mod are leads, under
-        // the one cross-rule tail section, each still headed by its rule.
-        let tail = review.body.find("Worth a double check").unwrap_or_else(|| panic!("{}", review.body));
-        for (heading, location) in [
-            ("_A compound condition encodes a domain rule that has no name and cannot be tested on its own_", "`src/auth.ts:3`"),
-            ("_A new string-literal union or enum-like set may duplicate an existing one_", "`src/status.ts:3`"),
-            ("_A shared function or type's signature or behavior changed_", "`src/shared.ts:4`"),
+        assert!(
+            review.comments.iter().any(|c| c.body.contains("did you check for an existing retry helper")),
+            "{review:?}"
+        );
+        // The two searched rules and the gate-failed mod are plain inline
+        // comments too now — the "Worth a double check" tail is gone
+        // entirely.
+        assert!(!review.body.contains("Worth a double check"), "{}", review.body);
+        for (claim, location, rule) in [
+            ("the condition is hard to read at a glance", ("src/auth.ts", 3), "unnamed-predicate"),
+            ("a new string-literal union may duplicate an existing enum", ("src/status.ts", 3), "union-vs-enum"),
+            ("a shared function's signature changed", ("src/shared.ts", 4), "shared-symbol-callers"),
         ] {
-            assert!(review.body[tail..].contains(heading), "{heading} heads a group in the tail: {}", review.body);
-            assert!(review.body[tail..].contains(location), "{location} sits in the tail: {}", review.body);
+            assert!(
+                review.comments.iter().any(|c| {
+                    c.path == location.0 && c.line == location.1 && c.body.contains(claim) && c.body.contains(&format!("`{rule}`"))
+                }),
+                "{claim:?} at {location:?} tagged `{rule}` must be a plain comment: {review:?}"
+            );
         }
-        assert!(review.body.contains("3 callers found"));
+        // (#2429 part 3) `evidence` ("3 callers found: ...") is no longer
+        // read by any renderer — the "Candidates" suffix that used to
+        // interpolate it is gone, and nothing replaced it.
+        assert!(
+            !review.body.contains("3 callers found") && review.comments.iter().all(|c| !c.body.contains("3 callers found")),
+            "`evidence` must not render anywhere: {review:?}"
+        );
         // (#2310 delivery rewrite, rule 4) The delivered review speaks the
         // AUTHOR's language: darkmux's own procedure words never appear in
         // the body or the inline comments. Rule IDS do — a rule id names

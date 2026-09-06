@@ -138,24 +138,18 @@ pub struct DeliverScope {
 /// unparseable patch. Anything model-authored is still checked through the
 /// rendered output; this array is for the words darkmux itself chooses.
 #[cfg(test)]
-const AUTHORED_PROSE: [&str; 8] = [
+const AUTHORED_PROSE: [&str; 5] = [
     STANDING_NARROWNESS,
     REASON_NOT_A_PATCH,
     REASON_DID_NOT_PARSE,
     REASON_INSERTION,
     REASON_OUTSIDE_DIFF,
-    SUGGESTION_ATTACHED_ONE,
-    SUGGESTION_ATTACHED_MANY,
-    DOUBLE_CHECK_HEADING,
 ];
 
 const REASON_NOT_A_PATCH: &str = "The change is written out rather than as a patch, so it is quoted here";
 const REASON_DID_NOT_PARSE: &str = "The change did not read as a patch, so it is quoted here";
 const REASON_INSERTION: &str = "The change adds lines rather than replacing them, so it cannot be attached to a line";
 const REASON_OUTSIDE_DIFF: &str = "The change touches lines outside this diff";
-const SUGGESTION_ATTACHED_ONE: &str = "A suggested change is attached to that line.";
-const SUGGESTION_ATTACHED_MANY: &str = "Suggested changes are attached to those lines.";
-const DOUBLE_CHECK_HEADING: &str = "**Worth a double check** (not merge-blocking):";
 
 const STANDING_NARROWNESS: &str =
     "This review checks a fixed set of rules; it is not a full design review.";
@@ -224,6 +218,19 @@ pub struct GithubReviewPayload {
 pub struct DeliverOutcome {
     pub mode: String,
     pub review: Option<GithubReviewPayload>,
+    /// (#2429 part 4) The `head_sha` this run's plan/units read the diff
+    /// at, echoed at the TOP LEVEL of the emitted payload (never inside
+    /// `review` — the posted body/comments are author-facing text, this is
+    /// provenance for the poster). `None` when the caller supplied no
+    /// `head_sha` (every non-CI caller today — see `DeliverConfig`'s own
+    /// doc). The workflow's post step reads this back and compares it
+    /// against a fresh `gh pr view --json headRefOid` at POST time: a
+    /// review can run for tens of minutes, and a branch that moved during
+    /// that window means the anchored comments may point at lines that no
+    /// longer exist — this field is what makes that check possible without
+    /// threading a second out-of-band value through the workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at_sha: Option<String>,
     /// (PR #2398 review, item 5) What was delivered, one row per rendered
     /// entry — the operator's index back from a posted review to the
     /// records behind it, now that the finding KEY no longer renders in
@@ -237,13 +244,27 @@ pub struct DeliverOutcome {
     /// posted, and nothing else.
     #[serde(skip)]
     pub entries: Vec<DeliveredEntry>,
+    /// (#2429 part 5) How many findings this render DROPPED because their
+    /// own claim answered a yes/no/can't-tell rule negatively ("No, ..." /
+    /// "Can't tell ..." — see [`render_github_review`]'s own doc). Belt and
+    /// braces on top of the unit brief's own instruction not to call
+    /// `create_finding` for such an answer; counted here, never posted,
+    /// same `#[serde(skip)]` provenance-for-the-operator treatment as
+    /// [`Self::entries`].
+    #[serde(skip)]
+    pub dropped_non_findings: usize,
 }
 
 /// One rendered entry's provenance — the row `DeliverOutcome::entries`
-/// carries. `rendered_as` is the SHAPE the entry took (`"suggestion"`,
-/// `"patch"`, `"question"`, `"double_check"`), one row per rendered
-/// artifact: a change whose patch spanned two hunks, one inside the diff
-/// and one outside, is two rows, because that is two things a reader sees.
+/// carries. `rendered_as` is the SHAPE the entry took — `"suggestion"` (a
+/// gate-passed mod's hunk, anchored inside the diff), `"comment"` (any
+/// other anchored finding, a plain inline comment), or `"body"` (a
+/// gate-passed mod's hunk that could not become a suggestion, OR a finding
+/// with no anchor at all — #2429 folded both into the one body-rendered
+/// shape) — one row per rendered artifact: a change whose patch spanned
+/// two hunks, one inside the diff and one outside, is two rows, because
+/// that is two things a reader sees. A finding [`is_dropped_non_finding`]
+/// drops gets NO row at all — see [`DeliverOutcome::dropped_non_findings`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeliveredEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -427,41 +448,41 @@ fn code_span(content: &str) -> String {
 /// to its author-facing title (`Rule::title`); [`rule_titles`] is how the
 /// step kind builds one, and a caller with none may pass an empty map.
 ///
-/// (#2310 delivery rewrite) **Every entry is headed by the RULE it came
-/// from, never by how it was found.** The author of a pull request does
-/// not care which internal procedure surfaced a problem — but the rule
-/// itself is useful to them the way a lint rule name is: it names what was
-/// violated and is the handle for re-running the same check after a fix.
-/// So the body groups entries under the rule's own title, tagged with the
-/// rule id, and an entry reads: the location (`path:line`), the finding's
-/// own claim (`why`), then whichever applies —
+/// (#2429 "every finding is an inline conversation") **Every finding
+/// anchored to a `path`+`line` becomes an inline review comment — never a
+/// body bullet.** A gate-passed mod anchored inside the diff still rides
+/// as a one-click `suggestion` block, exactly as before this packet
+/// (`render_gated_mod`, unchanged); every OTHER anchored finding —
+/// whatever its rule's confirm form (`mod`/`search`/`question`) — becomes
+/// a plain inline comment carrying the claim ([`plain_finding_comment_body`]),
+/// so the author resolves it as a conversation on the line it names rather
+/// than hunting a body bullet for the context a line number already gives
+/// for free. Kain's own framing (#2429): "I can set rules to make sure
+/// merges are gated by unresolved conversations so that an author has to
+/// address each one, even if it is a false positive" — a claim sitting in
+/// the body is invisible to that gate; a claim on a `comments[]` entry is
+/// not.
 ///
-/// - **a gate-passed mod whose hunk sits inside the diff** — the change
-///   rides as an inline `comments[]` suggestion on that line, and the body
-///   entry says so. This is true WHATEVER the rule's confirmation form:
-///   a passed change is a passed change, and dropping one because the rule
-///   happened to be confirmed by searching is what shipped a review with a
-///   ready patch nobody saw.
-/// - **a gate-passed mod outside the diff (or one that is not an
-///   applicable patch)** — the change quoted as a fenced block, with a
-///   plain-words reason.
-/// - **a question the finding answers** — the claim as a question, with
-///   any candidates the finding recorded.
+/// Only a finding with NO anchor at all (its own emission carries no
+/// `file`/`line`) falls back to the body — and even then it renders as a
+/// COUNT under its rule's heading, never its claim. The body is a summary
+/// surface now: the coverage line, a per-rule heading for whatever a rule
+/// still has to say once its findings are all accounted for elsewhere (a
+/// gate-passed mod's fenced fallback when it can't become a suggestion, or
+/// an unanchored count), the errored-unit note, and the fixed-rule
+/// disclaimer — never a second copy of a claim the reader already saw
+/// inline.
 ///
-/// Everything else is a lead, not a headline: a finding with no passed
-/// change lands in the single cross-rule tail section, **Worth a double
-/// check**, still headed by its rule inside it. That deliberately includes
-/// a search-shaped finding with no change proposed. The reason is
-/// evidential: a finding whose search came back "nothing to change here"
-/// (`shared-symbol-callers`' "all callers already match") is
-/// indistinguishable, MECHANICALLY, from one that found a real problem —
-/// `create_finding`'s tool arguments are fixed at `{file, line, pattern,
-/// evidence, why}` (`runtime/src/tools/mod.rs`) with no severity/holds/
-/// action field to read, and prose-matching a model's `why` for
-/// all-clear-ness is exactly the kind of guess this module refuses to
-/// make. Widening the FINDING contract is a separate change; until then
-/// the honest placement for "somebody looked, nothing was patched" is the
-/// thread-to-pull section, never a headline that reads as a defect.
+/// (#2429 part 5, belt and braces) A finding whose own claim opens with
+/// "No"/"Can't tell" answered a yes/no/can't-tell rule NEGATIVELY and
+/// should never have called `create_finding` at all — the unit brief says
+/// so now (`crawl::unit_step::pattern_block`'s `ConfirmForm::Question`
+/// arm) — but a model that already didn't comply cannot be trusted to
+/// comply this run either, so [`is_dropped_non_finding`] drops it
+/// unconditionally, before it ever reaches a mod lookup or a comment: a
+/// "No, nothing exists that does this" is not a false positive worth a
+/// click, it is the reviewer's own answer that there is nothing here.
+/// Counted in [`DeliverOutcome::dropped_non_findings`], never posted.
 ///
 /// Refused/rejected findings never reach this function at all (see
 /// [`DeliverScope::refused`]'s doc) — only their count feeds the summary
@@ -477,12 +498,21 @@ pub fn render_github_review(
     let touched = diff_touched_lines(diff);
 
     let mut comments: Vec<GithubReviewComment> = Vec::new();
-    let mut headline: Vec<RuleGroup> = Vec::new();
-    let mut double_check: Vec<RuleGroup> = Vec::new();
+    let mut rule_groups: Vec<RuleGroup> = Vec::new();
     let mut entries: Vec<DeliveredEntry> = Vec::new();
+    let mut dropped_non_findings = 0usize;
 
     for finding in findings {
         let window = FindingWindow::from(finding);
+        // (#2429 part 5) Dropped before anything else runs: a finding
+        // whose own claim is a "No"/"can't tell" answer gets no mod
+        // lookup, no comment, no body bullet, and no `DeliveredEntry` row
+        // — it is treated as though the unit never called `create_finding`
+        // for it at all.
+        if is_dropped_non_finding(window.why.as_deref().unwrap_or("")) {
+            dropped_non_findings += 1;
+            continue;
+        }
         let rule = rule_id_of(finding);
         // (#2310 P4b review, CONSIDER) Prefer a GATE-PASSED mod over an
         // earlier gate-failed one naming the same finding: without this, a
@@ -493,43 +523,54 @@ pub fn render_github_review(
             .filter(|m| m.record.r#for.iter().any(|k| k == &finding.key))
             .find(|m| m.gate_passed == Some(true));
         if let Some(m) = gated {
-            // (#2310 delivery rewrite, rule 2) The FORM does not gate this
-            // branch — a passed change renders as a change no matter which
-            // way its rule is confirmed. The form decides only what to
-            // render when there is no passed change at all.
-            let bullets = group_for(&mut headline, rule.as_deref(), rule_titles);
-            let rendered = render_gated_mod(m, &window, &touched, &mut comments, bullets);
+            // (#2429 part 1) The FORM does not gate this branch — a passed
+            // change renders as a change no matter which way its rule is
+            // confirmed, and no matter whether it lands as a suggestion or
+            // (outside the diff / not a patch at all) a fenced body block
+            // — both unchanged from before this packet.
+            let group = group_for(&mut rule_groups, rule.as_deref(), rule_titles);
+            let rendered = render_gated_mod(m, &window, &touched, &mut comments, group);
             for _ in 0..rendered.suggestions {
                 entries.push(DeliveredEntry::of(&window, rule.as_deref(), "suggestion"));
             }
             for _ in 0..rendered.patches {
-                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "patch"));
+                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "body"));
             }
             continue;
         }
-        match delivery_form(finding) {
-            DeliveryForm::Question => {
-                let bullets = group_for(&mut headline, rule.as_deref(), rule_titles);
-                bullets.push(question_bullet(&window));
-                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "question"));
-            }
-            // (#2310 delivery rewrite, rule 3) A search-shaped finding with
-            // no passed change is a lead, not a headline — see this
-            // function's own doc for why the all-clear case cannot be
-            // detected mechanically today.
-            DeliveryForm::Search | DeliveryForm::Mod => {
-                let bullets = group_for(&mut double_check, rule.as_deref(), rule_titles);
-                bullets.push(double_check_bullet(&window));
-                entries.push(DeliveredEntry::of(&window, rule.as_deref(), "double_check"));
-            }
+        let has_anchor = window.file.is_some() && window.line.is_some();
+        if has_anchor {
+            // (#2429 part 1) No gated mod, but the finding names a real
+            // line: an inline comment, never a body bullet — the shape
+            // every finding takes now, regardless of its rule's confirm
+            // form.
+            comments.push(GithubReviewComment {
+                path: window.file.clone().expect("has_anchor checked file.is_some()"),
+                line: window.line.expect("has_anchor checked line.is_some()"),
+                start_line: None,
+                side: Some("RIGHT".to_string()),
+                body: plain_finding_comment_body(&window, rule.as_deref()),
+            });
+            entries.push(DeliveredEntry::of(&window, rule.as_deref(), "comment"));
+        } else {
+            // (#2429 part 1) No anchor at all — the one case that still
+            // reaches the body, and even then as a COUNT under its rule's
+            // heading, never the claim.
+            let group = group_for(&mut rule_groups, rule.as_deref(), rule_titles);
+            group.unanchored += 1;
+            entries.push(DeliveredEntry::of(&window, rule.as_deref(), "body"));
         }
     }
 
     let unresolved = unresolved_rule_titles(findings, rule_titles);
 
     // Captured before `body` takes ownership below — whether there was
-    // anything to say at all decides `mode`.
-    let nothing_to_say = comments.is_empty() && headline.is_empty() && double_check.is_empty();
+    // anything to say at all decides `mode`. A gate-passed mod whose every
+    // hunk became a suggestion still populates `comments`, even though it
+    // left its own `RuleGroup` empty (nothing further to say in the body)
+    // — so this check reads `comments` first, the same as before this
+    // packet.
+    let nothing_to_say = comments.is_empty() && rule_groups.is_empty();
     if nothing_to_say {
         // (#2310 fix loop A, S3-2 — PROVEN) "Nothing was found" only means
         // a clean run when the run actually LOOKED. A scope of
@@ -544,7 +585,13 @@ pub fn render_github_review(
             // A genuinely CLEAN run — nothing to say because nothing went
             // wrong, nothing was found, and the whole diff was looked at.
             // The only `mode` this applies to.
-            return DeliverOutcome { mode: "noop".to_string(), review: None, entries };
+            return DeliverOutcome {
+                mode: "noop".to_string(),
+                review: None,
+                reviewed_at_sha: None,
+                entries,
+                dropped_non_findings,
+            };
         }
         // (#2310 P4c-2b PR #2357 review MUST FIX D, proven live) Before
         // this fix, an errored run with zero findings ALSO rendered
@@ -563,24 +610,29 @@ pub fn render_github_review(
         return DeliverOutcome {
             mode: "degraded".to_string(),
             review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments: Vec::new() }),
+            reviewed_at_sha: None,
             entries,
+            dropped_non_findings,
         };
     }
 
     let mut body = vec!["### darkmux review".to_string(), String::new()];
     body.push(scope_line(scope, findings.len(), &unresolved));
-    for group in &headline {
+    // (#2429 part 2) The body is a summary surface now: only a group that
+    // still has something to say (a gated mod's fenced fallback, or an
+    // unanchored count) gets a heading at all — a rule whose every finding
+    // rendered cleanly as a suggestion or a plain inline comment leaves no
+    // trace here, because the reader already saw it at the line.
+    for group in &rule_groups {
+        if group.bullets.is_empty() && group.unanchored == 0 {
+            continue;
+        }
         body.push(String::new());
         body.push(group.heading("**"));
         body.extend(group.bullets.iter().cloned());
-    }
-    if !double_check.is_empty() {
-        body.push(String::new());
-        body.push(DOUBLE_CHECK_HEADING.to_string());
-        for group in &double_check {
-            body.push(String::new());
-            body.push(group.heading("_"));
-            body.extend(group.bullets.iter().cloned());
+        if group.unanchored > 0 {
+            let word = if group.unanchored == 1 { "finding" } else { "findings" };
+            body.push(format!("- {} {word} could not be anchored to a line.", group.unanchored));
         }
     }
     if let Some(a) = attribution.filter(|a| !a.trim().is_empty()) {
@@ -591,13 +643,20 @@ pub fn render_github_review(
     DeliverOutcome {
         mode: "review".to_string(),
         review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments }),
+        reviewed_at_sha: None,
         entries,
+        dropped_non_findings,
     }
 }
 
-/// One rule's entries, in the order their findings arrived. The rule — not
-/// the confirmation procedure — is what heads a group: see
-/// [`render_github_review`]'s own doc.
+/// One rule's LEFTOVER body content, in the order its findings arrived —
+/// the rule (not the confirmation procedure) is what heads a group, same
+/// as before this packet, but the group's job narrowed (#2429): it no
+/// longer holds every finding's bullet, only what a gated mod could not
+/// turn into a suggestion (`bullets`) and how many of its findings had no
+/// anchor at all (`unanchored`). A rule whose every finding rendered
+/// inline never gets a `RuleGroup` with anything in it, and
+/// [`render_github_review`]'s own body loop skips an empty one.
 struct RuleGroup {
     rule_id: Option<String>,
     /// The rule's author-facing title, when one resolved. `None` falls the
@@ -605,13 +664,19 @@ struct RuleGroup {
     /// rule whose title was missing).
     title: Option<String>,
     bullets: Vec<String>,
+    /// (#2429 part 1) Findings for this rule with no `path`+`line` at all
+    /// — the one case that still reaches the body, and even then as a
+    /// count, never a claim.
+    unanchored: usize,
 }
 
 impl RuleGroup {
-    /// `emphasis` is the markdown wrapper for the rule's NAME — `**` for a
-    /// headline group, `_` for a group nested inside the double-check
-    /// tail. The rule id rides as a code span beside it: the author's
-    /// handle for re-running this exact check after a fix.
+    /// `emphasis` is the markdown wrapper for the rule's NAME — always
+    /// `**` now (#2429 removed the separate "Worth a double check" tail
+    /// section and its `_`-emphasis groups, since a leftover group is no
+    /// longer a lead sitting beneath a headline, it is the whole body).
+    /// The rule id rides as a code span beside it: the author's handle for
+    /// re-running this exact check after a fix.
     fn heading(&self, emphasis: &str) -> String {
         match (&self.rule_id, &self.title) {
             (Some(id), Some(title)) => format!("{emphasis}{title}{emphasis} {}", code_span(id)),
@@ -662,15 +727,15 @@ fn group_for<'g>(
     groups: &'g mut Vec<RuleGroup>,
     rule: Option<&str>,
     rule_titles: &BTreeMap<String, String>,
-) -> &'g mut Vec<String> {
+) -> &'g mut RuleGroup {
     let key = rule.map(str::to_string);
     if let Some(i) = groups.iter().position(|g| g.rule_id == key) {
-        return &mut groups[i].bullets;
+        return &mut groups[i];
     }
     let title = key.as_ref().and_then(|id| resolved_title(rule_titles, id)).map(inline_text);
-    groups.push(RuleGroup { rule_id: key, title, bullets: Vec::new() });
+    groups.push(RuleGroup { rule_id: key, title, bullets: Vec::new(), unanchored: 0 });
     let last = groups.len() - 1;
-    &mut groups[last].bullets
+    &mut groups[last]
 }
 
 /// Author-facing rule titles, read from the SAME registry
@@ -715,34 +780,49 @@ fn claim_sentence(window: &FindingWindow) -> String {
     }
 }
 
-/// The body entry for a change that rode out as inline suggestion(s): the
-/// location and the claim, plus where the change itself went.
-fn suggestion_bullet(window: &FindingWindow, suggested: usize) -> String {
-    let tail = if suggested == 1 { SUGGESTION_ATTACHED_ONE } else { SUGGESTION_ATTACHED_MANY };
-    format!("- {} — {} {tail}", window.span(), claim_sentence(window))
-}
-
-/// A finding whose rule asks a question: the claim IS the answer plus its
-/// reasoning (the crawl unit instructs the model to put both at the start
-/// of `why`), so it renders as the question, with any candidates the
-/// finding recorded.
-fn question_bullet(window: &FindingWindow) -> String {
-    let claim = claim(window);
-    let question = if claim.ends_with('?') { claim } else { format!("{claim}?") };
-    match window.evidence.as_deref().map(inline_text).filter(|e| !e.is_empty()) {
-        Some(candidates) => format!("- {} — {question} Candidates: {candidates}", window.span()),
-        None => format!("- {} — {question}", window.span()),
+/// (#2429 part 5) Whether `why` is a claim that should never have become a
+/// finding at all — a "No" or "can't tell" answer to a yes/no/can't-tell
+/// rule (`existing-solution`, `test-gap`, and any other `confirm:
+/// "question"` rule that asks one). Checked as a whole leading WORD: "No"
+/// must be followed by punctuation, whitespace, or end-of-string, so
+/// "Notably, ..." / "None of the callers ..." — real claims that happen to
+/// share the same first two letters — are never mistaken for a negative
+/// answer. Case-sensitive for "No" (a model writing a claim capitalizes
+/// its first word) but case-INSENSITIVE for "can't tell"/"cannot tell",
+/// since the rule text (`crawl::unit_step::pattern_block`) asks the
+/// question mid-sentence and a model echoing its own answer at the start
+/// of `why` may not capitalize it.
+fn is_dropped_non_finding(why: &str) -> bool {
+    let trimmed = why.trim_start();
+    let starts_no = match trimmed.get(..2) {
+        Some(s) if s.eq_ignore_ascii_case("no") => {
+            match trimmed[2..].chars().next() {
+                Some(c) => !c.is_alphanumeric(),
+                None => true,
+            }
+        }
+        _ => false,
+    };
+    if starts_no {
+        return true;
     }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("can't tell") || lower.starts_with("cannot tell")
 }
 
-/// A lead, not a headline — the tail section's entry shape.
-fn double_check_bullet(window: &FindingWindow) -> String {
-    format!(
-        "- {} — {} _Worth checking: {}_",
-        window.span(),
-        claim_sentence(window),
-        inline_text(window.evidence.as_deref().unwrap_or("the cited line"))
-    )
+/// A finding with no gate-passed mod, anchored to a `path`+`line`: a plain
+/// inline comment carrying the claim, in the same lead-in style a
+/// suggestion comment uses (`- <claim>`, [`render_gated_mod`]'s own
+/// `body`), with the rule that flagged it named on its own line the same
+/// way a group heading names it ([`RuleGroup::heading`]'s `code_span(id)`)
+/// — the comment has no group heading of its own to lean on, since it
+/// lives at the line rather than in the body.
+fn plain_finding_comment_body(window: &FindingWindow, rule: Option<&str>) -> String {
+    let claim = claim(window);
+    match rule {
+        Some(id) => format!("- {claim}\n\n{}", code_span(id)),
+        None => format!("- {claim}"),
+    }
 }
 
 /// DESIGN.md "rules run, hunks covered / total, findings by delivery form,
@@ -826,7 +906,7 @@ fn render_gated_mod(
     window: &FindingWindow,
     touched: &BTreeMap<String, BTreeSet<u32>>,
     comments: &mut Vec<GithubReviewComment>,
-    bullets: &mut Vec<String>,
+    group: &mut RuleGroup,
 ) -> ModRender {
     // Map the change out of container coordinates by the source the gate
     // recorded (a no-op for one already in repo coordinates, and for a
@@ -842,14 +922,14 @@ fn render_gated_mod(
         (_, raw) => raw.unwrap_or(""),
     };
     if m.record.kit_kind.as_deref() != Some("unified-diff") {
-        bullets.push(fenced_patch_bullet(window, kit, REASON_NOT_A_PATCH));
+        group.bullets.push(fenced_patch_bullet(window, kit, REASON_NOT_A_PATCH));
         return ModRender { suggestions: 0, patches: 1 };
     }
     let hunks = crate::diff::parse_diff(kit);
     if hunks.is_empty() {
         // Declared a unified diff but nothing parsed. Never guess at
         // intent; quote it as written, same as any other shape.
-        bullets.push(fenced_patch_bullet(window, kit, REASON_DID_NOT_PARSE));
+        group.bullets.push(fenced_patch_bullet(window, kit, REASON_DID_NOT_PARSE));
         return ModRender { suggestions: 0, patches: 1 };
     }
     let mut suggested = 0usize;
@@ -861,7 +941,7 @@ fn render_gated_mod(
                 // REPLACEMENT suggestion against — GitHub suggestions
                 // replace an existing line range; they cannot insert
                 // between two lines with no line of their own.
-                bullets.push(fenced_hunk_bullet(window, path, h, REASON_INSERTION));
+                group.bullets.push(fenced_hunk_bullet(window, path, h, REASON_INSERTION));
                 patched += 1;
                 continue;
             }
@@ -907,17 +987,19 @@ fn render_gated_mod(
                 });
                 suggested += 1;
             } else {
-                bullets.push(fenced_hunk_bullet(window, path, h, REASON_OUTSIDE_DIFF));
+                group.bullets.push(fenced_hunk_bullet(window, path, h, REASON_OUTSIDE_DIFF));
                 patched += 1;
             }
         }
     }
-    if suggested > 0 {
-        // Last, so a change that produced BOTH a suggestion and a quoted
-        // hunk reads in the order the hunks did, with the pointer to the
-        // attached suggestion closing the entry.
-        bullets.push(suggestion_bullet(window, suggested));
-    }
+    // (#2429 part 2) No trailing "a suggested change is attached to that
+    // line" pointer bullet any more: the suggestion comment itself already
+    // carries the claim (`body` above), so a body-side pointer would be a
+    // second copy of the same sentence, which is exactly the "claims in
+    // the body" this packet removes. The body still gets a bullet for
+    // every hunk that COULD NOT become a suggestion (`fenced_hunk_bullet`
+    // / `fenced_patch_bullet` above) — those are the change itself, not a
+    // claim about it, so they stay.
     ModRender { suggestions: suggested, patches: patched }
 }
 
@@ -946,32 +1028,6 @@ fn fenced_hunk_bullet(window: &FindingWindow, path: &str, h: &crate::diff::Hunk,
     format!("- {} — {} {reason}, {span}:\n\n{fence}\n{body}\n{fence}", window.span(), claim_sentence(window))
 }
 
-enum DeliveryForm {
-    Mod,
-    Search,
-    Question,
-}
-
-/// (#2310 P4c-2b fix) Reads `context.confirm` — the SAME key
-/// `crawl::unit_step::run` host-stamps on every real finding's
-/// `record_context` (`"confirm": single_confirm(&rules_by_id, &ctx.
-/// rule_ids)`, itself copied straight from a `Rule`'s own `confirm` field:
-/// `templates/builtin/rules/*.json`'s `"confirm": "mod"|"search"|
-/// "question"`). This function used to read `context.get("form")` — a key
-/// NOTHING in the codebase ever stamped (P4b wrote this module before P4c
-/// decided the crawl unit's own stamped key name), so every real finding
-/// silently rendered as `DeliveryForm::Mod` regardless of its rule's
-/// declared confirm form until #2310 P4c-2b's own end-to-end wiring
-/// surfaced the mismatch. `deliver_github_review`'s OWN tests below
-/// updated to the real key in the same fix.
-fn delivery_form(finding: &FindingRecord) -> DeliveryForm {
-    match finding.context.get("confirm").and_then(|v| v.as_str()) {
-        Some("search") => DeliveryForm::Search,
-        Some("question") => DeliveryForm::Question,
-        _ => DeliveryForm::Mod,
-    }
-}
-
 /// A finding's window + claim, projected out of its opaque `emitted`
 /// (`create_finding`'s fixed tool-arg shape: `{file, line, pattern,
 /// evidence, why}` — `runtime/src/tools/mod.rs`'s own `Tool::CreateFinding`
@@ -983,7 +1039,13 @@ struct FindingWindow {
     key: String,
     file: Option<String>,
     line: Option<u32>,
-    evidence: Option<String>,
+    /// (#2429) No longer read by this module — the "Candidates" suffix
+    /// that used to interpolate it into a question bullet is gone (part
+    /// 3), and no other renderer here needs the raw `evidence` string.
+    /// Kept off `FindingWindow` entirely rather than carried unused: a
+    /// dead field here would be exactly the kind of drift `darkmux
+    /// doctor`-style hygiene exists to catch, and this module is the
+    /// pure-function surface a golden test reads directly.
     why: Option<String>,
 }
 
@@ -994,7 +1056,6 @@ impl FindingWindow {
             key: finding.key.clone(),
             file: get("file"),
             line: finding.emitted.get("line").and_then(|v| v.as_u64()).map(|n| n as u32),
-            evidence: get("evidence"),
             why: get("why"),
         }
     }
@@ -1085,6 +1146,16 @@ struct DeliverConfig {
     scope: DeliverScope,
     attribution: Option<String>,
     emit: Option<PathBuf>,
+    /// (#2429 part 4) The sha this run's plan/units read the diff at —
+    /// launch-time data, same as `attribution`/`emit`: it names WHEN this
+    /// run looked, never WHAT it found, so it always comes from
+    /// `step.config` and never from a `records.gather` envelope.
+    /// `review.json`'s `deliver-step` passes it through as
+    /// `"head_sha": "{{head_sha}}"`, the same mission-launch param
+    /// `plan.sites` already reads. `None` for every caller that doesn't
+    /// set it (every test fixture below, and any embedder that never had a
+    /// head sha to begin with).
+    head_sha: Option<String>,
 }
 
 impl DeliverConfig {
@@ -1103,6 +1174,10 @@ impl DeliverConfig {
     fn from_step(step: &Step, input: &BTreeMap<String, String>) -> Result<Self> {
         let attribution = step.config.get("attribution").and_then(|v| v.as_str()).map(str::to_string);
         let emit = step.config.get("emit").and_then(|v| v.as_str()).map(PathBuf::from);
+        // (#2429 part 4) A blank `{{head_sha}}` (the param unset at launch)
+        // reads the same as absent — never echo an empty string into the
+        // payload as though it were a real sha.
+        let head_sha = step.config.get("head_sha").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).map(str::to_string);
 
         if step.config.get("findings").is_some() {
             let field = |key: &str| -> Result<serde_json::Value> {
@@ -1123,7 +1198,7 @@ impl DeliverConfig {
                     .with_context(|| format!("step `{}`: config.scope", step.id))?,
                 None => DeliverScope::default(),
             };
-            return Ok(Self { findings, mods, diff, scope, attribution, emit });
+            return Ok(Self { findings, mods, diff, scope, attribution, emit, head_sha });
         }
 
         let gathered = input.values().find_map(|raw| {
@@ -1143,7 +1218,7 @@ impl DeliverConfig {
             );
         };
         let body = gathered.body;
-        Ok(Self { findings: body.findings, mods: body.mods, diff: body.diff, scope: body.scope, attribution, emit })
+        Ok(Self { findings: body.findings, mods: body.mods, diff: body.diff, scope: body.scope, attribution, emit, head_sha })
     }
 }
 
@@ -1189,7 +1264,7 @@ impl StepKind for DeliverGithubReviewStepKind {
         // edge, so `render_github_review` stays a pure function over its
         // inputs and every golden test states the titles it renders under.
         let titles = rule_titles();
-        let outcome = render_github_review(
+        let mut outcome = render_github_review(
             &cfg.findings,
             &cfg.mods,
             &cfg.diff,
@@ -1197,6 +1272,13 @@ impl StepKind for DeliverGithubReviewStepKind {
             cfg.attribution.as_deref(),
             &titles,
         );
+        // (#2429 part 4) Echoed onto the outcome AFTER rendering — the sha
+        // names WHEN this run looked, not what it found, so it plays no
+        // part in `render_github_review`'s own pure logic (mode/body/
+        // comments never branch on it) and rides in unconditionally,
+        // including on the `noop`/`degraded` paths, so a poster always has
+        // it to compare against.
+        outcome.reviewed_at_sha = cfg.head_sha.clone();
         let payload = serde_json::to_string(&outcome).context("serializing the deliver outcome")?;
         match cfg.emit.as_deref() {
             Some(p) if p == std::path::Path::new("-") => println!("{payload}"),
@@ -1234,6 +1316,9 @@ impl StepKind for DeliverGithubReviewStepKind {
             // where it lives. Never the review text itself: the promoted
             // payload stays a summary surface (see the note above).
             "entries": outcome.entries,
+            // (#2429 part 5) A count, never the dropped claims themselves
+            // — same operator-provenance treatment as `entries` above.
+            "dropped_non_findings": outcome.dropped_non_findings,
         }))
         .context("serializing the deliver step output")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
@@ -1498,28 +1583,37 @@ mod tests {
     }
 
     #[test]
-    fn a_never_gated_mod_gate_passed_none_becomes_a_worth_a_double_check_thread() {
+    fn a_never_gated_mod_gate_passed_none_becomes_a_plain_inline_comment() {
         // (#2310 P4b review, M-A — proven-vacuous MUST FIX) No prior
         // fixture ever planted `gate_passed: None`, so a mutation from
         // `== Some(true)` to `!= Some(false)` slipped past every existing
         // test (`None != Some(false)` is ALSO true). This test plants
-        // exactly that shape and asserts the double-check outcome; see
+        // exactly that shape and asserts the never-gated outcome; see
         // the mutation self-check in this packet's own report for the
         // red-prove against the `!= Some(false)` mutation.
+        //
+        // (#2429) Since it is anchored (`path`+`line`), it now renders as
+        // an ordinary inline comment — never a suggestion, and never a
+        // body bullet either.
         let findings = vec![finding("s/9", "src/a.ts", 2, "ev", "a mod exists but nothing ever gated it", None)];
         let mods = vec![gated_mod("s/9", "some proposed kit text", None)];
         let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        assert!(review.comments.is_empty(), "never-gated must not become a suggestion: {review:?}");
-        assert!(review.body.contains("Worth a double check"));
-        // (#2310 delivery rewrite) The entry is headed by the LOCATION —
-        // the finding key is darkmux's own record id, meaningless to an
-        // author reading the review.
-        assert!(review.body.contains("`src/a.ts:2`"), "{}", review.body);
+        assert_eq!(review.comments.len(), 1, "never-gated must become a plain comment, not a suggestion: {review:?}");
+        assert!(!review.comments[0].body.contains("```suggestion"));
+        assert!(review.comments[0].body.contains("a mod exists but nothing ever gated it"));
+        assert!(
+            !review.body.contains("might duplicate")
+                && !review.body.contains("a mod exists but nothing ever gated it"),
+            "the claim rides the comment, never the body: {}",
+            review.body
+        );
+        // (#2310 delivery rewrite) The finding key is darkmux's own record
+        // id, meaningless to an author reading the review.
         assert!(!review.body.contains("s/9"), "the record key never renders: {}", review.body);
         assert!(
             !review.body.contains("some proposed kit text"),
-            "a never-gated mod's kit must not render at all, only the finding's own claim/evidence"
+            "a never-gated mod's kit must not render at all, only the finding's own claim"
         );
     }
 
@@ -1557,36 +1651,46 @@ mod tests {
     }
 
     #[test]
-    fn a_finding_with_no_mod_becomes_a_worth_a_double_check_thread() {
+    fn a_finding_with_no_mod_becomes_a_plain_inline_comment() {
+        // (#2429) Anchored, no gated mod: a plain inline comment, never a
+        // body bullet — the shape every anchored finding takes now,
+        // whatever its rule's confirm form.
         let findings = vec![finding("s/3", "src/a.ts", 2, "the cited line", "might duplicate an existing helper", None)];
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        assert!(review.comments.is_empty());
-        assert!(review.body.contains("Worth a double check"));
-        assert!(review.body.contains("`src/a.ts:2`"), "{}", review.body);
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        let comment = &review.comments[0];
+        assert_eq!(comment.path, "src/a.ts");
+        assert_eq!(comment.line, 2);
+        assert!(comment.body.contains("might duplicate an existing helper"));
+        assert!(!comment.body.contains("```suggestion"));
+        assert!(!review.body.contains("might duplicate an existing helper"), "the claim never repeats in the body: {}", review.body);
         assert!(!review.body.contains("s/3"), "the record key never renders: {}", review.body);
-        assert!(review.body.contains("might duplicate an existing helper"));
     }
 
     #[test]
-    fn a_gate_failed_mod_becomes_a_worth_a_double_check_thread_not_a_suggestion() {
+    fn a_gate_failed_mod_becomes_a_plain_inline_comment_not_a_suggestion() {
         let findings = vec![finding("s/4", "src/a.ts", 2, "ev", "claim", None)];
         let mods = vec![gated_mod("s/4", "kit text", Some(false))];
         let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        assert!(review.comments.is_empty());
-        assert!(review.body.contains("Worth a double check"));
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert!(!review.comments[0].body.contains("```suggestion"));
+        assert!(review.comments[0].body.contains("claim"));
         assert!(!review.body.contains("kit text"));
+        assert!(!review.body.contains("claim"), "the claim rides the comment, not the body: {}", review.body);
     }
 
     #[test]
-    fn a_searched_rule_with_no_change_is_a_lead_never_a_headline() {
-        // (#2310 delivery rewrite, rule 3) A rule confirmed by searching,
-        // with nobody proposing a change, cannot be told apart —
-        // mechanically — from one whose search came back all-clear
-        // (`create_finding` has no severity/holds field to read). So it is
-        // a thread to pull, under the tail section, never a headline that
-        // reads as a defect. Its own rule still heads it inside there.
+    fn a_searched_rule_with_no_change_is_still_an_inline_comment() {
+        // (#2310 delivery rewrite, rule 3 — #2429 superseded the headline/
+        // tail split entirely) A rule confirmed by searching, with nobody
+        // proposing a change, used to be undistinguishable from an
+        // all-clear search and so was demoted to a tail-section lead.
+        // #2429 makes the confirm form irrelevant to WHERE a finding
+        // renders: any anchored finding is an inline comment now, so this
+        // rule's own "cannot tell all-clear from a real hit" limitation no
+        // longer needs a body-side demotion to express.
         let findings = vec![finding_of_rule(
             "s/5",
             Some("shared-symbol-callers"),
@@ -1598,19 +1702,19 @@ mod tests {
         )];
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        let body = review.body;
-        let tail = body.find("Worth a double check").unwrap_or_else(|| panic!("no tail section:\n{body}"));
-        let entry = body.find("`src/mw.ts:10`").unwrap_or_else(|| panic!("no entry:\n{body}"));
-        assert!(entry > tail, "a searched rule with no change must sit UNDER the tail section:\n{body}");
-        assert!(
-            body[tail..].contains("_A shared function or type's signature or behavior changed_ `shared-symbol-callers`"),
-            "the rule still heads it inside the tail:\n{body}"
-        );
-        assert!(body.contains("14 endpoints use this middleware"), "the evidence is never dropped:\n{body}");
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert_eq!(review.comments[0].path, "src/mw.ts");
+        assert_eq!(review.comments[0].line, 10);
+        assert!(review.comments[0].body.contains("shared auth changed"), "the claim is never dropped: {:?}", review.comments[0]);
+        assert!(!review.body.contains("Worth a double check"), "the tail section is gone: {}", review.body);
     }
 
     #[test]
-    fn a_question_form_finding_renders_as_a_question_with_candidates() {
+    fn a_question_form_finding_renders_as_a_plain_inline_comment_with_no_candidates_suffix() {
+        // (#2429 part 3) The old renderer appended "? Candidates: <evidence>"
+        // to a question's claim. That suffix is gone — the comment carries
+        // only the claim, and the finding's own anchor already shows the
+        // line the candidates search was about.
         let findings = vec![finding(
             "s/6",
             "src/x.ts",
@@ -1621,8 +1725,12 @@ mod tests {
         )];
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        assert!(review.body.contains("Status enum, Kind enum"));
-        assert!(review.body.contains("did you check whether the repo already has this"));
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        let comment = &review.comments[0];
+        assert!(comment.body.contains("did you check whether the repo already has this"));
+        assert!(!comment.body.contains("Candidates"), "{comment:?}");
+        assert!(!comment.body.contains("Status enum, Kind enum"), "the evidence is not appended any more: {comment:?}");
+        assert!(!review.body.contains("Candidates"), "{}", review.body);
     }
 
     #[test]
@@ -1632,6 +1740,230 @@ mod tests {
         let out = render(&findings, &[], DIFF, &scope, None);
         let review = out.review.unwrap();
         assert!(review.body.contains("3 refused"));
+    }
+
+    /// (#2429, the issue's own fixture) A minimal unanchored finding —
+    /// `finding()`/`finding_of_rule()` both always set `file`/`line`, so an
+    /// un-anchored finding needs its own builder that leaves them out of
+    /// `emitted` entirely, the way a rule with no location to report ever
+    /// would.
+    fn unanchored_finding(key: &str, rule: &str, why: &str) -> FindingRecord {
+        FindingRecord {
+            key: key.to_string(),
+            dispatch: key.split('/').next().unwrap().to_string(),
+            seq: key.split('/').nth(1).unwrap().parse().unwrap(),
+            ts: "2026-09-06T00:00:00Z".to_string(),
+            tool_name: "create_finding".to_string(),
+            proposer: crate::findings::Proposer { handle: "reviewer".to_string(), model: "test".to_string(), machine_id: None },
+            mission_id: None,
+            phase_id: None,
+            step_id: None,
+            context: json!({ "rule": rule, "confirm": "question" }),
+            emitted: json!({ "pattern": "test", "evidence": "n/a", "why": why }),
+            source: None,
+            schema_version: crate::findings::FINDING_SCHEMA_VERSION.to_string(),
+            extras: Default::default(),
+        }
+    }
+
+    /// (#2429) The issue's own acceptance fixture: 1 gate-passed mod with
+    /// TWO hunks (both inside the diff, so both become suggestions) + 2
+    /// question-form findings (each anchored, so each becomes a plain
+    /// inline comment) + 1 un-anchored finding (falls back to a body
+    /// bullet, as a COUNT never a claim). Expected: 4 inline comments (2
+    /// suggestion + 2 plain), exactly 1 body bullet naming the un-anchored
+    /// count, no claim text anywhere in the body, and no `Candidates`
+    /// substring anywhere in the rendered payload.
+    #[test]
+    fn every_finding_becomes_an_inline_conversation_or_a_counted_fallback() {
+        const TWO_HUNK_KIT: &str = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,1 @@\n-function f() {\n+function f(): void {\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        let findings = vec![
+            finding_of_rule("s/1", Some("swallowed-error"), "src/a.ts", 1, "ev", "the failure is discarded", None),
+            finding_of_rule(
+                "s/2",
+                Some("existing-solution"),
+                "src/x.ts",
+                1,
+                "ev",
+                "did you check for an existing helper",
+                Some("question"),
+            ),
+            finding_of_rule(
+                "s/3",
+                Some("test-gap"),
+                "src/y.ts",
+                1,
+                "ev",
+                "does a test cover this new branch",
+                Some("question"),
+            ),
+            unanchored_finding("s/4", "unnamed-predicate", "the compound condition has no name"),
+        ];
+        let mods = vec![gated_mod_kind("s/1", TWO_HUNK_KIT, Some("unified-diff"), Some(true))];
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.clone().unwrap();
+
+        assert_eq!(review.comments.len(), 4, "2 suggestion hunks + 2 plain comments: {review:?}");
+        let suggestions: Vec<_> = review.comments.iter().filter(|c| c.body.contains("```suggestion")).collect();
+        let plain: Vec<_> = review.comments.iter().filter(|c| !c.body.contains("```suggestion")).collect();
+        assert_eq!(suggestions.len(), 2, "one comment per mod hunk: {review:?}");
+        assert_eq!(plain.len(), 2, "{review:?}");
+        assert!(plain.iter().any(|c| c.body.contains("did you check for an existing helper")), "{review:?}");
+        assert!(plain.iter().any(|c| c.body.contains("does a test cover this new branch")), "{review:?}");
+
+        // Exactly one body bullet — the un-anchored count — and it is a
+        // COUNT, never the dropped finding's own claim.
+        assert!(
+            review.body.contains("1 finding could not be anchored to a line."),
+            "the body states the count:\n{}",
+            review.body
+        );
+        assert!(
+            !review.body.contains("the compound condition has no name"),
+            "the un-anchored finding's claim never renders, only its count:\n{}",
+            review.body
+        );
+        // (#2429 part 2) No OTHER claim text leaks into the body either —
+        // every anchored finding's claim rides its own inline comment.
+        for claim in ["the failure is discarded", "did you check for an existing helper", "does a test cover this new branch"] {
+            assert!(!review.body.contains(claim), "{claim:?} must not repeat in the body:\n{}", review.body);
+        }
+        let payload = serde_json::to_string(&out).unwrap();
+        assert!(!payload.contains("Candidates"), "the `Candidates` suffix is gone entirely: {payload}");
+    }
+
+    /// (#2429 part 4) `reviewed_at_sha` rides the TOP LEVEL of the emitted
+    /// payload — set by the step (`DeliverGithubReviewStepKind::run`), not
+    /// by `render_github_review` itself (the sha names WHEN the run
+    /// looked, never what it found).
+    #[test]
+    fn reviewed_at_sha_rides_the_emitted_payload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out_path = dir.path().join("out.json");
+        let step = Step {
+            id: "deliver-step".into(),
+            task_id: "deliver-task".into(),
+            kind: DELIVER_GITHUB_REVIEW_KIND.into(),
+            gate: None,
+            status: crate::types::NodeStatus::Planned,
+            config: json!({
+                "findings": [],
+                "mods": [],
+                "diff": DIFF,
+                "scope": {},
+                "emit": out_path.to_string_lossy(),
+                "head_sha": "abc123def456",
+            }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = Task {
+            run_on: crate::types::default_run_on(),
+            id: "deliver-task".into(),
+            phase_id: "p".into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["deliver-step".into()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        let emitted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        assert_eq!(emitted["reviewed_at_sha"], json!("abc123def456"), "{emitted}");
+    }
+
+    /// (#2429 part 4) A blank `head_sha` (the mission-launch param unset,
+    /// so `{{head_sha}}` resolves to an empty string) reads as absent, not
+    /// as a real sha a poster would compare against.
+    #[test]
+    fn a_blank_head_sha_reads_as_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out_path = dir.path().join("out.json");
+        let step = Step {
+            id: "deliver-step".into(),
+            task_id: "deliver-task".into(),
+            kind: DELIVER_GITHUB_REVIEW_KIND.into(),
+            gate: None,
+            status: crate::types::NodeStatus::Planned,
+            config: json!({
+                "findings": [],
+                "mods": [],
+                "diff": DIFF,
+                "scope": {},
+                "emit": out_path.to_string_lossy(),
+                "head_sha": "",
+            }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = Task {
+            run_on: crate::types::default_run_on(),
+            id: "deliver-task".into(),
+            phase_id: "p".into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["deliver-step".into()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        let emitted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        assert!(emitted.get("reviewed_at_sha").is_none(), "{emitted}");
+    }
+
+    /// (#2429 part 5) A claim that answers a yes/no/can't-tell rule with
+    /// "No" is dropped unconditionally — no comment, no body bullet, no
+    /// `DeliveredEntry` row — and counted.
+    #[test]
+    fn a_claim_starting_no_is_dropped_and_counted() {
+        let findings = vec![
+            finding_of_rule(
+                "s/1",
+                Some("existing-solution"),
+                "src/a.ts",
+                2,
+                "ev",
+                "No, nothing exists that does this.",
+                Some("question"),
+            ),
+            finding_of_rule("s/2", Some("test-gap"), "src/b.ts", 3, "ev", "a real finding", None),
+        ];
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
+        assert_eq!(out.dropped_non_findings, 1, "{out:?}");
+        assert_eq!(out.entries.len(), 1, "the dropped finding gets no entry row: {out:?}");
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "only the real finding becomes a comment: {review:?}");
+        assert!(!review.comments[0].body.contains("nothing exists"), "{review:?}");
+        assert!(!review.body.contains("nothing exists"), "{}", review.body);
+    }
+
+    /// (#2429 part 5) "Can't tell" (either case) is dropped the same way —
+    /// and a claim that merely STARTS WITH the same two letters as "No"
+    /// ("Notably…") is never mistaken for a negative answer.
+    #[test]
+    fn cant_tell_is_dropped_and_no_word_boundary_false_positives() {
+        let findings = vec![
+            finding_of_rule("s/1", Some("test-gap"), "src/a.ts", 1, "ev", "Can't tell from this window alone.", Some("question")),
+            finding_of_rule("s/2", Some("test-gap"), "src/b.ts", 2, "ev", "can't tell — not enough context.", Some("question")),
+            finding_of_rule("s/3", Some("test-gap"), "src/c.ts", 3, "ev", "Notably, this branch has no test.", None),
+            finding_of_rule("s/4", Some("test-gap"), "src/d.ts", 4, "ev", "None of the existing tests cover this.", None),
+        ];
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
+        assert_eq!(out.dropped_non_findings, 2, "{out:?}");
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 2, "\"Notably\"/\"None\" are real claims, not dropped: {review:?}");
+        assert!(review.comments.iter().any(|c| c.body.contains("Notably")));
+        assert!(review.comments.iter().any(|c| c.body.contains("None of the existing tests")));
     }
 
     #[test]
@@ -1777,31 +2109,50 @@ mod tests {
     }
 
     #[test]
-    fn an_attack_payload_in_why_cannot_forge_a_header_in_the_double_check_bullet() {
+    fn an_attack_payload_in_why_cannot_forge_a_header_in_a_plain_inline_comment() {
+        // (#2429) The finding is anchored, so it renders as an inline
+        // comment now rather than a body bullet — the containment
+        // discipline has to hold on the COMMENT's body, since that is
+        // where the model's `why` actually lands.
         let findings = vec![finding("s/1", "src/a.ts", 2, "ev", ATTACK, None)];
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        assert_folded_onto_one_line(&review.body, "double-check bullet `why`");
-        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "double-check bullet `why`");
-        assert!(review.body.contains("Approved."), "the claim is folded into the bullet, never dropped: {}", review.body);
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        let comment_body = &review.comments[0].body;
+        assert_folded_onto_one_line(comment_body, "plain inline comment `why`");
+        assert_no_markdown_breakout(comment_body, &[], "plain inline comment `why`");
+        assert!(comment_body.contains("Approved."), "the claim is folded into the comment, never dropped: {comment_body}");
+        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "review body (should carry none of the attack)");
     }
 
     #[test]
-    fn an_attack_payload_in_evidence_cannot_forge_a_header_in_the_search_bullet() {
+    fn an_attack_payload_in_evidence_never_renders_anywhere() {
+        // (#2310 fix loop A, S5-4, superseded by #2429 part 3) `evidence`
+        // used to reach a "Candidates: <evidence>" suffix on a question's
+        // bullet — that suffix is gone, and with it every path that reads
+        // `evidence` at all. This test now asserts the stronger property:
+        // an attack payload planted in `evidence` never reaches the
+        // payload in any form, because nothing reads it.
         let findings = vec![finding("s/1", "src/a.ts", 2, ATTACK, "why", Some("search"))];
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        assert_folded_onto_one_line(&review.body, "search bullet `evidence`");
-        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "search bullet `evidence`");
+        let mut spoken = review.body.clone();
+        for c in &review.comments {
+            spoken.push('\n');
+            spoken.push_str(&c.body);
+        }
+        assert!(!spoken.contains("benign lead-in"), "`evidence` must never render: {spoken}");
     }
 
     #[test]
-    fn an_attack_payload_in_a_question_bullet_cannot_forge_a_header() {
+    fn an_attack_payload_in_a_question_forms_plain_inline_comment_cannot_forge_a_header() {
         let findings = vec![finding("s/1", "src/a.ts", 2, ATTACK, ATTACK, Some("question"))];
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        assert_folded_onto_one_line(&review.body, "question bullet");
-        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "question bullet");
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        let comment_body = &review.comments[0].body;
+        assert_folded_onto_one_line(comment_body, "question-form plain inline comment");
+        assert_no_markdown_breakout(comment_body, &[], "question-form plain inline comment");
     }
 
     /// Reads the FIRST code span off a bullet line the way a CommonMark
@@ -1837,9 +2188,18 @@ mod tests {
         // span via `FindingWindow::display` — both its backticks (which
         // would close a one-backtick delimiter early) and its line breaks
         // (which would reach column 0) must be contained.
+        //
+        // (#2429) `window.span()` no longer renders in a PLAIN inline
+        // comment's body (the comment is already anchored to `path`/`line`
+        // as structural JSON fields, so the text body carries only the
+        // claim) — it still renders in a gated mod's FENCED FALLBACK
+        // bullet (`fenced_patch_bullet`, unchanged by this packet), so this
+        // test exercises that path: a mod declared with no `kit_kind` never
+        // becomes a suggestion and always falls back to the body.
         const FILE: &str = "src/`a`.ts\n### darkmux review\n---";
         let findings = vec![finding("s/1", FILE, 2, "ev", "why", None)];
-        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let mods = vec![gated_mod("s/1", "not a unified diff", Some(true))];
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert_no_markdown_breakout(&review.body, &["### darkmux review"], "FindingWindow::display `file`");
         let bullet = review
@@ -2069,7 +2429,7 @@ mod tests {
             step_output["entries"],
             json!([
                 { "rule": "swallowed-error", "path": "src/a.ts", "line": 2, "key": "sess-a/1", "rendered_as": "suggestion" },
-                { "rule": "union-vs-enum", "path": "src/mw.ts", "line": 9, "key": "sess-a/2", "rendered_as": "double_check" },
+                { "rule": "union-vs-enum", "path": "src/mw.ts", "line": 9, "key": "sess-a/2", "rendered_as": "comment" },
             ]),
             "{step_output}"
         );
@@ -2224,14 +2584,17 @@ mod tests {
         let titles = titles_of(rules);
         assert!(!titles.contains_key("swallowed-error"), "a blank title is not a title: {titles:?}");
 
-        // …and the render is defensive about one arriving anyway.
+        // …and the render is defensive about one arriving anyway. The
+        // finding is anchored, so it renders as a plain inline comment
+        // (#2429) — the rule id still names it there, as a code span, and
+        // the scope line still calls out the missing title.
         let titles = BTreeMap::from([("swallowed-error".to_string(), "  ".to_string())]);
         let findings = vec![finding_of_rule("s/1", Some("swallowed-error"), "src/a.ts", 2, "ev", "a claim", None)];
-        let body =
-            render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None, &titles).review.unwrap().body;
-        assert!(body.contains("_swallowed-error_"), "the id is the fallback heading:\n{body}");
-        assert!(!body.contains("__ `swallowed-error`"), "never an empty emphasis pair:\n{body}");
-        assert!(body.contains("Titles unavailable for these rules: swallowed-error."), "{body}");
+        let review =
+            render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None, &titles).review.unwrap();
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert!(review.comments[0].body.contains("`swallowed-error`"), "the id names it in the comment: {:?}", review.comments[0]);
+        assert!(review.body.contains("Titles unavailable for these rules: swallowed-error."), "{}", review.body);
     }
 
     /// (PR #2398 review, item 4 follow-through) Every sentence darkmux
@@ -2381,6 +2744,11 @@ mod tests {
     /// module used to print are gone as organizers.
     #[test]
     fn entries_are_headed_by_the_rules_title_and_tagged_with_its_id() {
+        // (#2429) Both findings are anchored, so both render as inline
+        // comments now — the rule ID names each one there (a plain
+        // comment has no group heading to lean on; the TITLE only ever
+        // headed a body group, which no longer exists once a rule's
+        // findings all rendered inline).
         let findings = vec![
             finding_of_rule(
                 "s/1",
@@ -2393,17 +2761,13 @@ mod tests {
             ),
             finding_of_rule("s/2", Some("unnamed-predicate"), "src/a.ts", 2, "ev", "the condition has no name", None),
         ];
-        let body = render(&findings, &[], DIFF, &DeliverScope::default(), None).review.unwrap().body;
-        assert!(
-            body.contains("**A new routine looks re-implemented rather than reused** `existing-solution`"),
-            "the rule's title heads its group, tagged with the id:\n{body}"
-        );
-        assert!(
-            body.contains("cannot be tested on its own_ `unnamed-predicate`"),
-            "a rule inside the tail section is headed the same way:\n{body}"
-        );
-        for gone in ["Worth enumerating", "**Questions:**", "Proposed changes outside the diff"] {
-            assert!(!body.contains(gone), "{gone:?} must not organize the review any more:\n{body}");
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 2, "{review:?}");
+        assert!(review.comments.iter().any(|c| c.body.contains("`existing-solution`")), "{review:?}");
+        assert!(review.comments.iter().any(|c| c.body.contains("`unnamed-predicate`")), "{review:?}");
+        for gone in ["Worth enumerating", "**Questions:**", "Proposed changes outside the diff", "Worth a double check"] {
+            assert!(!review.body.contains(gone), "{gone:?} must not organize the review any more:\n{}", review.body);
         }
     }
 
@@ -2429,13 +2793,13 @@ mod tests {
         let review = out.review.unwrap();
         assert_eq!(review.comments.len(), 1, "the passed change must ride out as a suggestion: {review:?}");
         assert!(review.comments[0].body.contains("const x: Status = 1;"), "{}", review.comments[0].body);
-        let body = review.body;
-        let head = body
-            .find("**A new string-literal union or enum-like set may duplicate an existing one** `union-vs-enum`")
-            .unwrap_or_else(|| panic!("the rule heads a HEADLINE group:\n{body}"));
-        let entry = body.find("`src/a.ts:2`").unwrap_or_else(|| panic!("no entry:\n{body}"));
-        assert!(entry > head, "the entry sits under its rule's headline group:\n{body}");
-        assert!(!body.contains("Worth a double check"), "a passed change is never demoted to a lead:\n{body}");
+        assert!(review.comments[0].body.contains("this union duplicates the Status enum"), "{}", review.comments[0].body);
+        // (#2429) A gate-passed change that fully became a suggestion
+        // leaves NOTHING further to say for its rule in the body — no
+        // headline group (the body is a summary surface now), and no
+        // double-check tail (removed entirely).
+        assert!(!review.body.contains("union-vs-enum"), "{}", review.body);
+        assert!(!review.body.contains("Worth a double check"), "a passed change is never demoted to a lead:\n{}", review.body);
     }
 
     /// (#2310 delivery rewrite, rule 1) A rule whose title cannot be
@@ -2445,11 +2809,14 @@ mod tests {
     fn an_unresolvable_rule_heads_its_group_by_id_and_the_scope_line_says_so() {
         let findings =
             vec![finding_of_rule("s/1", Some("a-rule-nobody-shipped"), "src/a.ts", 2, "ev", "a claim", None)];
-        let body = render(&findings, &[], DIFF, &DeliverScope::default(), None).review.unwrap().body;
-        assert!(body.contains("_a-rule-nobody-shipped_"), "the id is the fallback heading:\n{body}");
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert!(review.comments[0].body.contains("`a-rule-nobody-shipped`"), "the id names it: {:?}", review.comments[0]);
         assert!(
-            body.contains("Titles unavailable for these rules: a-rule-nobody-shipped."),
-            "the scope line names it:\n{body}"
+            review.body.contains("Titles unavailable for these rules: a-rule-nobody-shipped."),
+            "the scope line names it:\n{}",
+            review.body
         );
     }
 
@@ -2487,7 +2854,15 @@ mod tests {
         let (findings, mods, scope) = every_form_fixture();
         let review = render(&findings, &mods, DIFF, &scope, Some("Advisory, not a merge gate.")).review.unwrap();
         assert_no_internal_vocabulary(&review);
-        assert!(review.body.contains("`union-vs-enum`"), "the rule id IS author-facing — it names what was violated");
+        // (#2429) Both `union-vs-enum` findings in this fixture are
+        // anchored — one rides a gate-passed mod fully into a suggestion,
+        // the other (gate-failed) into a plain comment — so neither ever
+        // reaches the body any more; the rule id is still author-facing,
+        // just on the comment side now.
+        assert!(
+            review.comments.iter().any(|c| c.body.contains("`union-vs-enum`")),
+            "the rule id IS author-facing — it names what was violated: {review:?}"
+        );
         assert!(review.body.contains("rules reviewed"), "the scope line's own author-meaningful counts stay");
         assert!(review.body.contains("hunks covered"));
     }
@@ -2522,27 +2897,56 @@ mod tests {
 
         // Sanity: every delivery form actually fired, or a broken fixture
         // could pass this golden vacuously.
+        //
+        // (#2429) Every ANCHORED finding is now an inline comment: the two
+        // gate-passed mods still ride out as suggestions (unchanged), and
+        // the five OTHER findings (no mod, or a gate-failed/never-gated
+        // one) each become a plain comment instead of a body bullet — only
+        // `sess-a/2`'s mod (declared with no `kit_kind`, so it can never
+        // become a suggestion) still falls back to the body.
         assert_eq!(outcome.mode, "review");
         let review = outcome.review.unwrap();
-        assert_eq!(review.comments.len(), 2, "two in-diff suggestions — one on a mod-confirmed rule, one on a searched rule");
+        assert_eq!(review.comments.len(), 7, "2 suggestions + 5 plain comments: {review:?}");
         assert!(review.comments.iter().all(|c| c.side.as_deref() == Some("RIGHT")));
         // (#2310 delivery rewrite, rule 2) The searched rule's passed
-        // change rides out as a suggestion, and heads its own group in the
-        // body — the shape the old form-first branch dropped entirely.
+        // change still rides out as a suggestion — the shape the old
+        // form-first branch dropped entirely.
         assert!(review.comments.iter().any(|c| c.body.contains("function f(): Status {")), "{review:?}");
-        assert!(
-            review.body.contains("**A new string-literal union or enum-like set may duplicate an existing one** `union-vs-enum`"),
-            "{}",
-            review.body
-        );
-        assert!(review.body.contains("the patch text"), "mod-outside-diff");
-        assert!(review.body.contains("might duplicate"), "no-mod double-check");
-        assert!(review.body.contains("a gate-failed claim"), "gate-failed double-check");
-        assert!(review.body.contains("a mod exists but nothing ever gated it"), "never-gated double-check");
+        assert!(review.comments.iter().any(|c| c.body.contains("const x = clamp(1);")), "{review:?}");
+        // Every OTHER finding's claim rides an inline comment now, tagged
+        // with its rule id — never the body.
+        for (claim, rule) in [
+            ("might duplicate an existing helper", "unnamed-predicate"),
+            ("a gate-failed claim", "union-vs-enum"),
+            ("a mod exists but nothing ever gated it", "swallowed-error"),
+            ("shared auth changed", "shared-symbol-callers"),
+            ("did you check whether the repo already has this", "existing-solution"),
+        ] {
+            assert!(
+                review.comments.iter().any(|c| c.body.contains(claim) && c.body.contains(&format!("`{rule}`"))),
+                "{claim:?} tagged with `{rule}` must be an inline comment: {review:?}"
+            );
+            assert!(!review.body.contains(claim), "{claim:?} must never repeat in the body: {}", review.body);
+        }
+        // The one mod that COULD NOT become a suggestion (no `kit_kind`)
+        // still falls back to the body, unchanged.
+        assert!(review.body.contains("the patch text"), "mod-outside-diff fallback still renders in the body");
         assert!(!review.body.contains("kit text nobody sees"), "a gate-failed mod's kit never renders");
         assert!(!review.body.contains("never-gated kit text"), "a never-gated mod's kit never renders");
-        assert!(review.body.contains("14 endpoints"), "search form");
-        assert!(review.body.contains("Status enum, Kind enum"), "question form");
+        // (#2429 part 3) The "Candidates" suffix — and the `evidence` it
+        // used to interpolate — is gone entirely.
+        assert!(!review.body.contains("Candidates") && review.comments.iter().all(|c| !c.body.contains("Candidates")), "{review:?}");
+        assert!(
+            !review.body.contains("Status enum, Kind enum")
+                && review.comments.iter().all(|c| !c.body.contains("Status enum, Kind enum")),
+            "`evidence` is not read any more: {review:?}"
+        );
+        assert!(!review.body.contains("14 endpoints"), "`evidence` is not read any more: {}", review.body);
+        // (#2429 part 2) The body is a summary surface — no per-finding
+        // claims other than the one fallback bullet above, and no leftover
+        // "Worth a double check" tail.
+        assert!(!review.body.contains("Worth a double check"), "{}", review.body);
+        assert!(!review.body.contains("could not be anchored"), "every finding here has an anchor: {}", review.body);
         assert!(review.body.contains("2 refused"));
         assert!(review.body.contains("Not attempted: architectural review."));
     }
@@ -2613,6 +3017,11 @@ mod tests {
     /// the strongest available: not one `<` survives anywhere in the body.
     #[test]
     fn a_model_supplied_angle_bracket_cannot_open_an_html_tag() {
+        // (#2429) Anchored, no mod: renders as a plain INLINE comment now,
+        // never a body bullet — the `<` containment has to hold there.
+        // `evidence` (the `<a href...>` string) is no longer read by any
+        // renderer in this module (part 3 dropped the "Candidates" suffix
+        // that used to interpolate it), so it must not leak ANYWHERE.
         let findings = vec![finding(
             "s/1",
             "src/a.ts",
@@ -2623,18 +3032,23 @@ mod tests {
         )];
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
-        assert!(review.comments.is_empty(), "no mod, so nothing is inline: {review:?}");
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        let comment_body = &review.comments[0].body;
         assert!(
-            !review.body.contains('<'),
-            "a raw `<` reached the posted body — an <img src> would load from every reader:\n{}",
-            review.body
+            !comment_body.contains('<'),
+            "a raw `<` reached the posted comment — an <img src> would load from every reader:\n{comment_body}"
         );
         // `>` is deliberately NOT escaped (see `inline_text`'s doc): it
         // only means anything at column 0, which this function's folding
         // already makes unreachable. Asserting the exact surviving `>`
         // pins that decision rather than leaving it implied.
-        assert!(review.body.contains("&lt;img src=x onerror=1>"), "{}", review.body);
-        assert!(review.body.contains("&lt;a href=\"https://evil.example/track\">click&lt;/a>"), "{}", review.body);
+        assert!(comment_body.contains("&lt;img src=x onerror=1>"), "{comment_body}");
+        assert!(!review.body.contains('<'), "{}", review.body);
+        assert!(
+            !review.body.contains("evil.example") && !comment_body.contains("evil.example"),
+            "`evidence` is never read any more, so it must not leak: body={} comment={comment_body}",
+            review.body
+        );
     }
 
     /// (#2310 fix loop E1-2) `scope_line`'s `not_attempted` / `errored`
