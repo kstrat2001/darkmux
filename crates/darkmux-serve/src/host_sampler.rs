@@ -423,17 +423,14 @@ pub(crate) fn spawn(
         // `interval_ms` unconditionally per the issue's "the ring keeps
         // sampling at the configured rate regardless" rule.
         let mut ticks_since_emit: u64 = 0;
-        // (#2413 C3) The live-vs-idle decision, cached across ticks —
-        // `any_dispatch_live_locally` parses the WHOLE day's flow file, so
-        // this used to run every tick (every `interval_ms`, typically
-        // 5s). Re-probing only right before an actual emission (below)
-        // cuts that to once per emission instead. One EAGER probe here,
-        // before the loop's first iteration, so the very first emission
-        // still reflects the real live/idle state rather than a hardcoded
-        // guess — every later re-probe happens right before the emission
-        // it gates, same as the steady-state case.
-        let mut cached_live =
-            crate::runs::any_dispatch_live_locally(darkmux_crew::host_probe::epoch_ms_now(), crate::runs::stale_after_ms());
+        // (#2413 C3, revised — found live 2026-09-06) The live-vs-idle
+        // decision, re-probed every tick (see inside the loop below) rather
+        // than only right before an emission — the prior once-per-emission
+        // scheme let `cached_live` go stale for up to `IDLE_EMIT_MULTIPLIER`
+        // ticks while idle. No eager pre-loop probe needed any more: the
+        // loop's first iteration probes (and assigns this) before it reads
+        // it for the first time.
+        let mut cached_live: bool;
         // (#2413 round 4 MF1) One rule for `interval_ms` on both host-sample
         // producers (this daemon sampler and the dispatch-owned one in
         // `dispatch_internal.rs`): the MEASURED gap since the previous
@@ -464,6 +461,23 @@ pub(crate) fn spawn(
                 let _ = darkmux_flow::record(rec);
             }
 
+            // (found live 2026-09-06) Re-probe liveness on a FIXED PER-TICK
+            // FLOOR — every `interval_ms`, independent of whether this tick
+            // actually emits — rather than only right before an emission.
+            // The prior "re-probe only right before an emission" scheme
+            // meant an idle machine's `cached_live` could go stale for up
+            // to `IDLE_EMIT_MULTIPLIER` ticks (~52s at the default 5s
+            // cadence): a dispatch that started and finished inside that
+            // window got 0-1 samples instead of the 1x cadence it should
+            // have gotten from the moment it appeared. The probe itself is
+            // ~15ms (already stamped below), so paying it every tick — not
+            // just every emission — is cheap relative to the visibility it
+            // buys; the switch to live cadence now lands within one
+            // interval instead of up to ten.
+            let probe_start = Instant::now();
+            cached_live = crate::runs::any_dispatch_live_locally(at_ms, crate::runs::stale_after_ms());
+            let liveness_probe_ms = probe_start.elapsed().as_millis() as u64;
+
             // (#2413, C2, and round 3 MF1) Opportunistically (re)acquire
             // the singleton lock every tick this thread doesn't already
             // hold it — a dispatch process that held it may have exited
@@ -487,18 +501,12 @@ pub(crate) fn spawn(
                     // above regardless — only the FLOW-RECORD WRITE is
                     // gated, per the observer-cost rule (the sample is
                     // already taken; only the write is the added cost).
-                    // (#2413 C3) `cached_live` drives THIS tick's
-                    // threshold check — the fresh probe (measured below)
-                    // only runs right before an actual emission, so a
-                    // live/idle transition is caught with at most one
-                    // extra cycle's delay rather than costing a full
-                    // day-file parse on every tick.
+                    // `cached_live` is now this TICK's fresh probe result
+                    // (probed unconditionally above), so a live/idle
+                    // transition gates THIS tick's decision directly.
                     let emit_every_n_ticks = if cached_live { 1 } else { IDLE_EMIT_MULTIPLIER };
                     if ticks_since_emit >= emit_every_n_ticks {
                         ticks_since_emit = 0;
-                        let probe_start = Instant::now();
-                        cached_live = crate::runs::any_dispatch_live_locally(at_ms, crate::runs::stale_after_ms());
-                        let liveness_probe_ms = probe_start.elapsed().as_millis() as u64;
                         // (#2413 round 4 MF1) Measured gap since the LAST
                         // emission, not the knob times the multiplier — a
                         // tick that ran late (a slow probe, a paused
@@ -936,6 +944,86 @@ mod tests {
             assert!(
                 (20..=500).contains(&second),
                 "second emission must stamp the MEASURED gap, in the neighborhood of 50ms: got {second}"
+            );
+        });
+    }
+
+    // (found live 2026-09-06) `cached_live` used to be re-probed only right
+    // before an emission, so from idle (up to `IDLE_EMIT_MULTIPLIER` x the
+    // base interval, ~52s at the default 5s cadence) a dispatch shorter
+    // than that window got 0-1 samples. Re-probing on a fixed per-tick
+    // floor catches the idle→live transition within one interval instead.
+    #[serial_test::serial]
+    #[test]
+    fn spawn_catches_a_new_dispatch_live_within_a_couple_of_intervals_from_idle() {
+        with_isolated_env(|flows_dir| {
+            let ring = HostSamplerRing::new();
+            let stop = Arc::new(AtomicBool::new(false));
+            let interval_ms = 50u64;
+            let handle = spawn(interval_ms, ring.clone(), Arc::clone(&stop)).unwrap();
+
+            // Let the sampler land its first (idle, 10x-cadence) emission —
+            // confirms it has settled into steady idle state — before the
+            // dispatch appears.
+            let _first = wait_for_n_machine_telemetry_records(flows_dir, 1, Duration::from_secs(5));
+
+            // A dispatch appears right after.
+            let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
+            let live_start = darkmux_flow::ts_utc_now();
+            let appeared_at = Instant::now();
+            {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&day_path).unwrap();
+                writeln!(
+                    f,
+                    "{}",
+                    serde_json::json!({
+                        "ts": live_start, "level": "info", "category": "work", "tier": "local",
+                        "stage": "dispatch", "action": "dispatch start", "handle": "h",
+                        "session_id": "just-appeared",
+                    })
+                )
+                .unwrap();
+            }
+
+            // The next emission after the dispatch appears must land well
+            // under the OLD idle cadence (10x interval = 500ms) — with the
+            // per-tick re-probe it lands within roughly 1-2 ticks.
+            let deadline = Duration::from_secs(5);
+            let poll_start = Instant::now();
+            let mut waited = None;
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&day_path) {
+                    let count = text
+                        .lines()
+                        .filter(|l| {
+                            serde_json::from_str::<serde_json::Value>(l)
+                                .ok()
+                                .and_then(|v| v.get("action").and_then(|a| a.as_str().map(str::to_string)))
+                                .as_deref()
+                                == Some("machine.telemetry")
+                        })
+                        .count();
+                    if count >= 2 {
+                        waited = Some(appeared_at.elapsed());
+                        break;
+                    }
+                }
+                if poll_start.elapsed() > deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap();
+
+            let waited = waited.expect("a second emission landed after the dispatch appeared");
+            // Generous slack for scheduler jitter, but well short of the
+            // pre-fix ~500ms (10x interval) an idle-cadence wait would take.
+            assert!(
+                waited <= Duration::from_millis(interval_ms * 6),
+                "expected the next emission within a few intervals of the dispatch appearing \
+                 (pre-fix this would wait out the whole idle 10x window, ~500ms), took {waited:?}"
             );
         });
     }
