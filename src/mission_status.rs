@@ -145,8 +145,15 @@ fn panel_deep_link(link_base: &str, target: &str) -> Option<String> {
 /// lookup for anything without a resolvable config (a `dispatch <role>`
 /// crew-of-one, or a hand-authored mission), which is exactly the shape the
 /// two-measured-shapes doc above already covers correctly.
+#[cfg(test)]
 fn display_label(m: &Mission) -> String {
-    if let Some(name) = config_title(m) {
+    display_label_cached(m, &mut BTreeMap::new())
+}
+
+/// The cached twin of [`display_label`] — see [`config_title_cached`] for
+/// why the render loop needs this instead of the plain version.
+fn display_label_cached(m: &Mission, cache: &mut BTreeMap<String, Option<String>>) -> String {
+    if let Some(name) = config_title_cached(m, cache) {
         return name;
     }
     let d = m.description.trim();
@@ -161,10 +168,37 @@ fn display_label(m: &Mission) -> String {
 /// without a resolvable config — a `dispatch <role>` crew-of-one names its
 /// `spec.config_id` `"dispatch"`, which is not a loadable config id, so
 /// `mission_config::load::load` refuses it and this returns `None`,
-/// leaving `display_label` on its existing description-based path.
+/// leaving `display_label` on its existing description-based path. A thin,
+/// uncached wrapper around [`config_title_cached`] — fine for a one-off
+/// call (a unit test, a single mission lookup), never for a board render.
+#[cfg(test)]
 fn config_title(m: &Mission) -> Option<String> {
+    config_title_cached(m, &mut BTreeMap::new())
+}
+
+/// (#2406 CONSIDER 6, round 2) The memoized, render-scoped twin of
+/// [`config_title`]. A board full of `review` rows used to pay for a fresh
+/// `mission_config::load::load("review")` — a disk/embedded read — for
+/// EVERY row, up to three times per row (`plan_layout`'s width pass, the
+/// row's own name, its description note). `cache` is one `BTreeMap` shared
+/// across a whole render (built once in `run()`), so each distinct
+/// `config_id` is resolved at most once no matter how many rows share it.
+///
+/// `"dispatch"` — the crew-of-one sentinel `config_id`, never a real
+/// loadable config — is short-circuited BEFORE touching `load` at all:
+/// every `dispatch <role>` row used to pay for a full `list_ids()` scan
+/// just to build a "not found" error `.ok()` immediately discarded.
+fn config_title_cached(m: &Mission, cache: &mut BTreeMap<String, Option<String>>) -> Option<String> {
     let config_id = m.spec.as_ref()?.config_id.as_str();
-    crew::mission_config::load::load(config_id).ok().map(|lc| lc.config.name)
+    if config_id == "dispatch" {
+        return None;
+    }
+    if let Some(cached) = cache.get(config_id) {
+        return cached.clone();
+    }
+    let name = crew::mission_config::load::load(config_id).ok().map(|lc| lc.config.name);
+    cache.insert(config_id.to_string(), name.clone());
+    name
 }
 
 /// (#2406 CONSIDER 6) The mission's own `description` as a one-line note,
@@ -174,17 +208,73 @@ fn config_title(m: &Mission) -> Option<String> {
 /// words of launcher documentation, and printing it whole on every row would
 /// reintroduce the exact wall-of-text this fix exists to keep off the
 /// board.
+#[cfg(test)]
 fn description_note(m: &Mission) -> Option<String> {
-    config_title(m)?; // description is already the title; no second line
+    description_note_cached(m, &mut BTreeMap::new())
+}
+
+/// The cached twin of [`description_note`] — see [`config_title_cached`].
+fn description_note_cached(m: &Mission, cache: &mut BTreeMap<String, Option<String>>) -> Option<String> {
+    config_title_cached(m, cache)?; // description is already the title; no second line
     let d = m.description.trim();
     if d.is_empty() {
         return None;
     }
-    let sentence = d.split(['.', '\n']).next().unwrap_or(d).trim();
+    let sentence = first_sentence(d);
     if sentence.is_empty() {
         return None;
     }
-    Some(format!("{sentence}."))
+    Some(cap_note(sentence, DESCRIPTION_NOTE_CAP_CHARS))
+}
+
+/// Board-row budget for [`description_note`] — well under a normal
+/// terminal width even after the ~8-column indent it prints at.
+const DESCRIPTION_NOTE_CAP_CHARS: usize = 120;
+
+/// The first SENTENCE of `d` — a `.` counts as a terminator only when it is
+/// followed by whitespace or end-of-string, never when the very next
+/// character is non-whitespace.
+///
+/// The real `review.json` description proved why the naive "split on the
+/// first '.'" version was wrong: it contains the literal step-kind name
+/// `` `review.*` ``, whose embedded `.` sits well before the sentence's
+/// actual terminator — so the naive split produced "...its ten Tier-3
+/// `review." on a live board, cut off mid-backtick-quoted identifier.
+/// Requiring trailing whitespace (or end-of-string) after the `.` treats
+/// that as ordinary punctuation inside a token rather than a sentence
+/// boundary, and finds the terminator several dozen characters later
+/// instead.
+fn first_sentence(d: &str) -> &str {
+    for (i, ch) in d.char_indices() {
+        if ch == '.' {
+            let after = &d[i + 1..];
+            if after.is_empty() || after.starts_with(char::is_whitespace) {
+                return d[..=i].trim();
+            }
+        }
+    }
+    d.trim()
+}
+
+/// Truncate `s` to at most `max` chars, ending "…", never mid-word. The
+/// true first sentence of a config's description (per [`first_sentence`])
+/// can still run to hundreds of characters — `review.json`'s is well over
+/// 300 — so finding the real sentence boundary is necessary but not
+/// sufficient; this is what actually keeps a board row from becoming this
+/// feature's own second wall of text. Backs off to the last whitespace
+/// inside the cut rather than hard-truncating at `max`, so the ellipsis
+/// never lands mid-identifier (e.g. mid backtick-quoted code, mid word).
+fn cap_note(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max).collect();
+    let cut = match truncated.rfind(char::is_whitespace) {
+        Some(i) => &truncated[..i],
+        None => &truncated,
+    };
+    let cut = cut.trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace());
+    format!("{cut}…")
 }
 
 /// (#1612) Single-role dispatch vs multi-phase graph, in one column-safe glyph.
@@ -276,10 +366,10 @@ fn relative_age(now: u64, then: u64) -> String {
 ///     (0/4 phases for ~20 days, no drift surfaced by either check above).
 ///
 /// (#2406) The former third bullet here — a PLANNED phase with an
-/// earlier-in-mission-order Abandoned phase, flagged "can never run" — is
-/// RETIRED: see `unreachable_phase_drifts`'s doc comment (kept in place as
-/// a marker of what was removed and why) for the real mission that proved
-/// the linear-order assumption false.
+/// earlier-in-mission-order Abandoned phase, flagged "can never run" — was
+/// RETIRED: see the "RETIRED (#2406)" comment block above `run()` (kept in
+/// place as a marker of what was removed and why) for the real mission that
+/// proved the linear-order assumption false.
 ///
 /// (#1463) The old "CLOSED mission with a non-terminal phase" arm RETIRED:
 /// `mission finalize` / `mission abort` now reconcile EVERY phase to a
@@ -367,9 +457,10 @@ fn live_step_drifts(
         }
     }
 
-    // (#1582) ONE drift per KIND, never one per instance — same rule
-    // `unreachable_phase_drifts` follows: this is one problem with N
-    // instances, and the instances ride `detail`.
+    // (#1582) ONE drift per KIND, never one per instance — the same rule
+    // the (now-retired, #2406) `unreachable_phase_drifts` used to follow:
+    // this is one problem with N instances, and the instances ride
+    // `detail`.
     if !in_terminal_phase.is_empty() {
         out.push(Drift {
             kind: "phase-terminal-live-step",
@@ -643,9 +734,16 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             }
         })
         .collect();
+    // (#2406 CONSIDER 2) One cache for the WHOLE render — shared between this
+    // layout pass and the row-print loop below, which is what actually
+    // collapses the redundant per-row `mission_config::load::load` calls a
+    // review-heavy board used to pay for (up to 3 per printed row: once
+    // here, once for the row's own name, once for its description note).
+    let mut config_name_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
     let layout = plan_layout(
         groups.iter().zip(&shown_counts).flat_map(|((_, g), n)| g.iter().take(*n).copied()),
         width,
+        &mut config_name_cache,
     );
 
     // Tracked across sections so the closing rollup can admit that some of the
@@ -660,7 +758,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         for v in g.iter().take(shown) {
             let prog = format!("{}/{}", v.complete, v.total);
             let bar = progress_bar(v.complete, v.total);
-            let name = ellipsize(&display_label(v.m), layout.name_width);
+            let name = ellipsize(&display_label_cached(v.m, &mut config_name_cache), layout.name_width);
             // (#1569 packet A) Pad BEFORE linking, and by the VISIBLE width:
             // `{:<width$}` counts the OSC 8 escape bytes, so formatting a
             // linkified name would silently destroy the column alignment the
@@ -725,7 +823,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             // (#2406 CONSIDER 6) The description, when the row's title above
             // came from the config's `name` instead — one dim line, one
             // sentence, never the whole ~200-word document.
-            if let Some(note) = description_note(v.m) {
+            if let Some(note) = description_note_cached(v.m, &mut config_name_cache) {
                 println!("      {} {}", style::dim("·"), style::dim(&note));
             }
             for d in &v.drifts {
@@ -1133,10 +1231,11 @@ struct Layout {
 fn plan_layout<'a>(
     rows: impl Iterator<Item = &'a MissionView<'a>>,
     width: Option<usize>,
+    label_cache: &mut BTreeMap<String, Option<String>>,
 ) -> Layout {
     let (max_name, max_handle, max_mix) = rows.fold((0, 0, 0), |(n, h, x), v| {
         (
-            n.max(display_label(v.m).chars().count()),
+            n.max(display_label_cached(v.m, &mut *label_cache).chars().count()),
             h.max(short_handle(&v.m.id).map_or(0, |s| s.chars().count())),
             x.max(phase_mix(v).chars().count()),
         )
@@ -1511,7 +1610,7 @@ mod tests {
         // it ran in.
         let m = mission("a-very-long-machine-minted-mission-id-0001", MissionStatus::Active);
         let v = view(&m, 3, 1);
-        let l = plan_layout([v].iter(), None);
+        let l = plan_layout([v].iter(), None, &mut BTreeMap::new());
         assert_eq!(l.name_width, 42);
         assert!(l.show_mix);
     }
@@ -1521,7 +1620,7 @@ mod tests {
         let short = mission("m1", MissionStatus::Active);
         let long = mission("m-longer-id", MissionStatus::Active);
         let rows = [view(&short, 1, 0), view(&long, 1, 0)];
-        let l = plan_layout(rows.iter(), Some(200));
+        let l = plan_layout(rows.iter(), Some(200), &mut BTreeMap::new());
         // Natural width, not the old hardcoded 30 — narrow boards stay narrow.
         assert_eq!(l.name_width, "m-longer-id".len());
         assert!(l.show_mix);
@@ -1575,7 +1674,7 @@ mod tests {
         // mix-shown/mix-dropped/id-truncated boundaries all at once.
         let m = mission("m-0123456789", MissionStatus::Active);
         for w in NARROWEST_HONORABLE..=90 {
-            let layout = plan_layout([view(&m, 2, 1)].iter(), Some(w));
+            let layout = plan_layout([view(&m, 2, 1)].iter(), Some(w), &mut BTreeMap::new());
             let row = render_row(&view(&m, 2, 1), &layout);
             let cols = row.chars().count();
             assert!(
@@ -1594,7 +1693,7 @@ mod tests {
         // still exactly the floor row — never wider.
         let m = mission("m-0123456789-0123456789", MissionStatus::Active);
         for w in 1..NARROWEST_HONORABLE {
-            let layout = plan_layout([view(&m, 2, 1)].iter(), Some(w));
+            let layout = plan_layout([view(&m, 2, 1)].iter(), Some(w), &mut BTreeMap::new());
             assert_eq!(layout.name_width, MIN_NAME_COLS, "at COLUMNS={w}");
             assert!(!layout.show_mix, "at COLUMNS={w} the mix must be gone before this point");
             let cols = render_row(&view(&m, 2, 1), &layout).chars().count();
@@ -1619,19 +1718,19 @@ mod tests {
         // One column short of fitting the mix: the mix goes, the name AND the
         // handle survive intact — the fraction and bar already carry the mix's
         // information, so it is the first thing worth losing.
-        let l = plan_layout([view(&m, 2, 1)].iter(), Some(base + MIX_GAP_COLS + mix_cols - 1));
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(base + MIX_GAP_COLS + mix_cols - 1), &mut BTreeMap::new());
         assert_eq!(l.name_width, name_cols, "the name must not shrink while the mix is droppable");
         assert!(l.show_handle, "the handle must not go before the mix");
         assert!(!l.show_mix);
 
         // And one column MORE than the widest with-mix row does fit it.
-        assert!(plan_layout([view(&m, 2, 1)].iter(), Some(base + MIX_GAP_COLS + mix_cols)).show_mix);
+        assert!(plan_layout([view(&m, 2, 1)].iter(), Some(base + MIX_GAP_COLS + mix_cols), &mut BTreeMap::new()).show_mix);
     }
 
     #[test]
     fn plan_layout_truncates_the_id_only_when_even_that_cannot_fit() {
         let m = mission("m-0123456789-0123456789", MissionStatus::Active);
-        let l = plan_layout([view(&m, 1, 0)].iter(), Some(ROW_FIXED_COLS + 15));
+        let l = plan_layout([view(&m, 1, 0)].iter(), Some(ROW_FIXED_COLS + 15), &mut BTreeMap::new());
         assert_eq!(l.name_width, 15);
         assert!(!l.show_mix);
     }
@@ -1641,7 +1740,7 @@ mod tests {
         // An absurdly narrow terminal overflows the row rather than rendering
         // an id too short to identify anything.
         let m = mission("m-0123456789-0123456789", MissionStatus::Active);
-        let l = plan_layout([view(&m, 1, 0)].iter(), Some(10));
+        let l = plan_layout([view(&m, 1, 0)].iter(), Some(10), &mut BTreeMap::new());
         assert_eq!(l.name_width, MIN_NAME_COLS);
     }
 
@@ -1670,8 +1769,21 @@ mod tests {
     /// per-launch `description` argument is always `None` on this path, so
     /// `Mission.description` falls to `config.description`). The title must
     /// be the config's declared `name` ("Review"), never that paragraph.
+    ///
+    /// `#[serial]` — resolves "review" through `mission_config::load::load`,
+    /// which reads `DARKMUX_HOME`-scoped user config dirs before falling
+    /// back to the compiled-in embedded copy; scoped to a fresh tempdir
+    /// here (round 2, #2434) so this never reads whatever the OPERATOR'S
+    /// real `~/.darkmux/mission-configs/` happens to hold on the machine
+    /// running the suite.
     #[test]
+    #[serial_test::serial]
     fn display_label_prefers_the_config_name_over_a_config_launched_missions_own_long_description() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+
         let mut m = mission("review-1788656497-cf872b", MissionStatus::Active);
         m.description = "(#2310 P4d) The code review, built on the shared mission building \
              blocks rather than a pipeline of its own — and, since P4d, the ONLY `review`: \
@@ -1683,9 +1795,17 @@ mod tests {
             origin: None,
         });
 
+        let label = display_label(&m);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
         assert_eq!(
-            display_label(&m),
-            "Review",
+            label, "Review",
             "the board must show the config's declared name, not its long description"
         );
     }
@@ -1694,7 +1814,10 @@ mod tests {
     /// `dispatch <role>` crew-of-one, whose `spec.config_id` is the literal
     /// `"dispatch"` sentinel, not a loadable config id) keeps the existing
     /// description-based label — `config_title` must refuse rather than
-    /// silently returning some other config's name.
+    /// silently returning some other config's name. No `DARKMUX_HOME`
+    /// scoping needed: `"dispatch"` is short-circuited before `load` ever
+    /// runs (round 2, #2434), so this never touches disk regardless of what
+    /// the ambient home holds.
     #[test]
     fn display_label_falls_back_to_description_when_no_config_resolves() {
         let mut m = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Active);
@@ -1705,24 +1828,96 @@ mod tests {
         assert_eq!(config_title(&m), None);
     }
 
-    /// (#2406 CONSIDER 6) The description only ever earns a SECOND line —
-    /// never printed at all when the config name didn't win the title (so a
-    /// `dispatch <role>` mission, or one with no spec, prints nothing extra),
-    /// and truncated to its first sentence when it does.
+    /// (#2406 CONSIDER 6, round 2) The description only ever earns a SECOND
+    /// line — never printed at all when the config name didn't win the
+    /// title (so a `dispatch <role>` mission, or one with no spec, prints
+    /// nothing extra) — and, when it does, it is cut at a real sentence
+    /// boundary and hard-capped, never mid-identifier.
+    ///
+    /// Uses the mission config's REAL, compiled-in `review.json`
+    /// description as its fixture (via `mission_config::load::load`, the
+    /// exact path `Mission.description` is populated from at launch) rather
+    /// than a hand-typed copy — a hand-edited fixture is exactly what let
+    /// the original bug (splitting on the FIRST bare `.`, which lands
+    /// inside the literal step-kind name `` `review.*` `` and produces
+    /// "...its ten Tier-3 `review.") stay green: the shortened fixture
+    /// simply didn't carry that clause. This one can't drift out of sync
+    /// with what the board actually prints, because it IS what the board
+    /// prints from.
+    ///
+    /// `#[serial]` for the same `DARKMUX_HOME` reason as the test above.
     #[test]
-    fn description_note_is_the_first_sentence_only_when_the_config_name_won_the_title() {
+    #[serial_test::serial]
+    fn description_note_is_the_first_sentence_capped_and_never_mid_identifier() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+
+        let real_description =
+            crew::mission_config::load::load("review").unwrap().config.description.unwrap();
+
         let mut m = mission("review-1788656497-cf872b", MissionStatus::Active);
-        m.description = "First sentence stands alone. Second sentence never shows up.".into();
+        m.description = real_description.clone();
 
         // No spec yet: the description IS the title, so no second line.
-        assert_eq!(description_note(&m), None);
+        let note_without_config = description_note(&m);
 
         m.spec = Some(crate::crew::types::MissionSpec {
             config_id: "review".to_string(),
             inputs_fingerprint: "x".to_string(),
             origin: None,
         });
-        assert_eq!(description_note(&m), Some("First sentence stands alone.".to_string()));
+        let note = description_note(&m);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        assert_eq!(note_without_config, None);
+
+        let note = note.expect("a config-launched mission with a non-empty description gets a note");
+        assert!(
+            note.chars().count() <= DESCRIPTION_NOTE_CAP_CHARS + 1, // +1 for the trailing "…"
+            "must respect the board-row cap: {note:?} ({} chars)",
+            note.chars().count()
+        );
+        assert!(note.ends_with('…'), "the true first sentence exceeds the cap, so it must be marked cut: {note:?}");
+        assert!(
+            !note.ends_with("review.…") && !note.ends_with("review."),
+            "must never reproduce the original defect (cut inside the literal `review.*` step-kind name): {note:?}"
+        );
+        assert_eq!(
+            note.matches('`').count() % 2,
+            0,
+            "an odd backtick count means the cut landed INSIDE a backtick-quoted identifier: {note:?}"
+        );
+        assert!(
+            real_description.starts_with(note.trim_end_matches('…').trim_end()),
+            "the note's text must be a verbatim PREFIX of the real description, not a rephrasing: {note:?}"
+        );
+    }
+
+    /// (#2406 CONSIDER 6, round 2) Isolates the sentence-boundary defect from
+    /// the cap: the real `review.json` description's mid-token dot (inside
+    /// `` `review.*` ``) sits at char ~198, well past the 120-char cap, so
+    /// an end-to-end test through `description_note` never actually
+    /// exercises the naive "split on the first '.'" bug — the cap happens
+    /// to truncate before reaching it either way. This crafts a SHORT
+    /// string with the identical defect shape (a mid-token dot before the
+    /// real terminator) that sits entirely inside the cap, so it fails
+    /// under the naive split regardless of any cap interaction.
+    #[test]
+    fn first_sentence_treats_a_mid_token_dot_as_punctuation_not_a_terminator() {
+        let d = "This mentions `review.*` inline. Full stop.";
+        assert_eq!(
+            first_sentence(d),
+            "This mentions `review.*` inline.",
+            "a `.` immediately followed by a non-whitespace character is punctuation INSIDE a token, not a sentence boundary"
+        );
     }
 
     /// Both minting formats seen in the wild yield a handle; hand-authored ids
@@ -1788,17 +1983,17 @@ mod tests {
 
         // Exactly wide enough for the handle but not the mix: handle stays.
         let with_handle = name_cols + ROW_FIXED_COLS + HANDLE_GAP_COLS + handle_cols;
-        let l = plan_layout([view(&m, 2, 1)].iter(), Some(with_handle));
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(with_handle), &mut BTreeMap::new());
         assert!(l.show_handle && !l.show_mix);
         assert_eq!(l.name_width, name_cols);
 
         // One column short: the handle goes, the name survives INTACT.
-        let l = plan_layout([view(&m, 2, 1)].iter(), Some(with_handle - 1));
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(with_handle - 1), &mut BTreeMap::new());
         assert!(!l.show_handle);
         assert_eq!(l.name_width, name_cols, "the name must not shrink while the handle is droppable");
 
         // Only below the no-handle row does the name finally truncate.
-        let l = plan_layout([view(&m, 2, 1)].iter(), Some(name_cols + ROW_FIXED_COLS - 1));
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(name_cols + ROW_FIXED_COLS - 1), &mut BTreeMap::new());
         assert!(!l.show_handle);
         assert!(l.name_width < name_cols);
     }
@@ -1808,7 +2003,7 @@ mod tests {
     #[test]
     fn plan_layout_plans_no_handle_column_when_no_row_has_one() {
         let m = mission("doom-loop-m4", MissionStatus::Active);
-        let l = plan_layout([view(&m, 2, 1)].iter(), Some(200));
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(200), &mut BTreeMap::new());
         assert!(!l.show_handle);
         assert_eq!(l.handle_width, 0);
     }
