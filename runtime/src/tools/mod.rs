@@ -1194,6 +1194,38 @@ mod tests {
         execute_create_finding(&raw, out, ws).unwrap().result
     }
 
+    /// (#2431 round 3) `answer` — a `confirm: "question"` rule's
+    /// structured yes/no/partly/cannot_tell field (`Tool::CreateFinding`'s
+    /// schema) — used to ride only the flow record's `emitted: verbatim`,
+    /// never the on-disk `FINDINGS_FILE` copy `crawl::unit_step`'s own
+    /// summary machinery can read directly. Parity: it is there now too.
+    #[test]
+    fn the_on_disk_record_carries_the_models_structured_answer() {
+        let ws = finding_workspace(&numbered_src(5, 2, "  if (a && b) {"));
+        let out = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({
+            "file": "src/a.rs", "line": 2, "pattern": "p",
+            "evidence": "  if (a && b) {", "why": "w", "answer": "cannot_tell",
+        })
+        .to_string();
+        execute_create_finding(&raw, out.path(), ws.path()).unwrap();
+        let record = last_finding(out.path());
+        assert_eq!(record["answer"], serde_json::json!("cannot_tell"), "{record}");
+    }
+
+    /// A call with no `answer` at all (every non-question rule, and any
+    /// question rule a unit forgot) records `null`, never a missing key
+    /// that would make a consumer's `.get("answer")` ambiguous between
+    /// "omitted" and "this finding predates the field".
+    #[test]
+    fn the_on_disk_record_carries_a_null_answer_when_the_model_omitted_it() {
+        let ws = finding_workspace(&numbered_src(5, 2, "  if (a && b) {"));
+        let out = tempfile::tempdir().unwrap();
+        report(ws.path(), out.path(), 2, "  if (a && b) {");
+        let record = last_finding(out.path());
+        assert_eq!(record["answer"], serde_json::Value::Null, "{record}");
+    }
+
     #[test]
     fn an_accepted_report_returns_the_emission_verbatim_with_its_ordinal_and_a_rejected_one_returns_none() {
         // (#2272) The trajectory's `args` is a 512-char viewer preview and
@@ -3143,6 +3175,15 @@ fn execute_create_finding_with(
         "context_end": captured.end,
         "evidence_had_line_prefix": captured.evidence_had_line_prefix,
         "why": args.why,
+        // (#2431 round 3) Parity with the EVENT payload (`emitted:
+        // verbatim`, below): the model's own structured `answer` (a
+        // `confirm: "question"` rule's yes/no/partly/cannot_tell field —
+        // `Tool::CreateFinding`'s schema documents it) rode the flow
+        // record but never this on-disk copy, so a reader of the
+        // container-local `FINDINGS_FILE` alone (rather than the flow
+        // stream) saw a finding with no `answer` at all. `None` when the
+        // model omitted it, same as every other optional key here.
+        "answer": verbatim.as_ref().and_then(|v| v.get("answer")),
         "ts": crate::trajectory::unix_ms(),
     });
 

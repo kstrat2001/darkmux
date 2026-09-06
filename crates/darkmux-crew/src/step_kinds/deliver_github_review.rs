@@ -273,13 +273,15 @@ pub struct DeliverOutcome {
 /// One rendered entry's provenance — the row `DeliverOutcome::entries`
 /// carries. `rendered_as` is the SHAPE the entry took — `"suggestion"` (a
 /// gate-passed mod's hunk, anchored inside the diff), `"comment"` (any
-/// other anchored finding, a plain inline comment), or `"body"` (a
-/// gate-passed mod's hunk that could not become a suggestion, OR a finding
-/// with no anchor at all — #2429 folded both into the one body-rendered
-/// shape) — one row per rendered artifact: a change whose patch spanned
-/// two hunks, one inside the diff and one outside, is two rows, because
-/// that is two things a reader sees. A finding [`is_dropped_non_finding`]
-/// drops gets NO row at all — see [`DeliverOutcome::dropped_non_findings`].
+/// other finding anchored INSIDE the diff, a plain inline comment), or
+/// `"body"` (a gate-passed mod's hunk that could not become a suggestion,
+/// a finding anchored OUTSIDE the diff, or a finding with no anchor at
+/// all — #2429 and #2431 round 2 MF-A folded all three into the one
+/// body-rendered shape) — one row per rendered artifact: a change whose
+/// patch spanned two hunks, one inside the diff and one outside, is two
+/// rows, because that is two things a reader sees. A finding
+/// [`should_withhold`] withholds gets NO row at all — see
+/// [`DeliverOutcome::dropped_non_findings`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeliveredEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -478,9 +480,10 @@ fn code_span(content: &str) -> String {
 /// the body is invisible to that gate; a claim on a `comments[]` entry is
 /// not.
 ///
-/// Only a finding with NO anchor at all (its own emission carries no
-/// `file`/`line`) falls back to the body — and even then it renders as a
-/// COUNT under its rule's heading, never its claim. The body is a summary
+/// Only a finding with no anchor INSIDE the diff (its own emission
+/// carries no `file`/`line`, or names a real line the diff never touches —
+/// #2431 round 2 MF-A) falls back to the body — and even then it renders
+/// as a COUNT under its rule's heading, never its claim. The body is a summary
 /// surface now: the coverage line, a per-rule heading for whatever a rule
 /// still has to say once its findings are all accounted for elsewhere (a
 /// gate-passed mod's fenced fallback when it can't become a suggestion, or
@@ -488,16 +491,23 @@ fn code_span(content: &str) -> String {
 /// disclaimer — never a second copy of a claim the reader already saw
 /// inline.
 ///
-/// (#2429 part 5, belt and braces) A finding whose own claim opens with
-/// "No"/"Can't tell" answered a yes/no/can't-tell rule NEGATIVELY and
-/// should never have called `create_finding` at all — the unit brief says
-/// so now (`crawl::unit_step::pattern_block`'s `ConfirmForm::Question`
-/// arm) — but a model that already didn't comply cannot be trusted to
-/// comply this run either, so [`is_dropped_non_finding`] drops it
-/// unconditionally, before it ever reaches a mod lookup or a comment: a
-/// "No, nothing exists that does this" is not a false positive worth a
-/// click, it is the reviewer's own answer that there is nothing here.
-/// Counted in [`DeliverOutcome::dropped_non_findings`], never posted.
+/// (#2429 part 5, redesigned #2431 round 2 MF-B) A finding whose
+/// STRUCTURED `answer` is `no`/`cannot_tell` answered a yes/no/can't-tell
+/// rule NEGATIVELY and should never have called `create_finding` at all —
+/// the unit brief says so now (`crawl::unit_step::pattern_block`'s
+/// `ConfirmForm::Question` arm, and `runtime/src/tools/mod.rs`'s
+/// `Tool::CreateFinding` schema, which documents the `answer` field) — but
+/// a model that already didn't comply cannot be trusted to comply this
+/// run either, so [`should_withhold`] drops it unconditionally, before it
+/// ever reaches a mod lookup or a comment. This is keyed ONLY on the
+/// structured field, never on the claim's own wording — an earlier
+/// word-heuristic version of this guard (judging whether `why` itself
+/// opened with "No"/"Can't tell") shipped and then had to be removed: it
+/// silently dropped real findings whose claim legitimately opened with
+/// those words ("No test in planning.spec.ts exercises this path") and,
+/// being case-sensitive for "No" but not "can't tell", also mis-dropped
+/// unrelated claims ("no-op wrapper…", "NO_COLOR is read…"). Counted in
+/// [`DeliverOutcome::dropped_non_findings`], never posted.
 ///
 /// Refused/rejected findings never reach this function at all (see
 /// [`DeliverScope::refused`]'s doc) — only their count feeds the summary
@@ -1152,15 +1162,21 @@ impl FindingWindow {
     /// rather than pasting it between two literal backticks (#2310 fix
     /// loop A, S5-4).
     ///
-    /// (#2310 delivery rewrite) The finding KEY used to lead this string.
-    /// It is darkmux's own record id, meaningless to the author reading
-    /// the review, so it renders only when there is no location at all —
-    /// where it is the one identifying thing left.
+    /// (#2310 delivery rewrite) The finding KEY used to lead this string
+    /// when there was no location at all — darkmux's own record id,
+    /// meaningless to the author reading the review. (#2431 round 3) It
+    /// still is, but the KEY itself no longer renders even here:
+    /// `fallback_comment` posts this text verbatim to the PR, and #2398
+    /// removed record keys from posted text everywhere else — a bare
+    /// `sess-a/3` surviving in the one code path nobody thought to check
+    /// would be exactly the leak that fix was for. `"(no anchor)"` names
+    /// the same fact (nothing to point the reader at) without exposing
+    /// the id.
     fn display(&self) -> String {
         match (&self.file, self.line) {
             (Some(f), Some(l)) => format!("{f}:{l}"),
             (Some(f), None) => f.clone(),
-            _ => self.key.clone(),
+            _ => "(no anchor)".to_string(),
         }
     }
 
@@ -2079,9 +2095,12 @@ mod tests {
         // line here regardless of how it rendered in the formal review.
         assert!(out.fallback_comment.contains("`src/a.ts:1` — the failure is discarded."), "{}", out.fallback_comment);
         assert!(out.fallback_comment.contains("`src/a.ts:2` — does a test cover this new branch."), "{}", out.fallback_comment);
-        // `s/3` has no anchor, so `window.span()` falls back to its own
-        // key (`FindingWindow::span`'s own doc).
-        assert!(out.fallback_comment.contains("the compound condition has no name."), "{}", out.fallback_comment);
+        // `s/3` has no anchor, so `window.span()` renders `(no anchor)`
+        // rather than the record key (#2431 round 3 — `fallback_comment`
+        // is posted verbatim to the PR, and a record key is meaningless,
+        // and #2398-forbidden, in author-facing text).
+        assert!(out.fallback_comment.contains("`(no anchor)` — the compound condition has no name."), "{}", out.fallback_comment);
+        assert!(!out.fallback_comment.contains("s/3"), "the record key must never render: {}", out.fallback_comment);
         // The withheld finding (`s/4`, `answer: "no"`) gets NO bullet —
         // withheld means withheld everywhere, including the fallback.
         assert!(!out.fallback_comment.contains("nothing exists"), "{}", out.fallback_comment);
@@ -2191,11 +2210,24 @@ mod tests {
             rendered.push_str(&c.body);
         }
         for line in rendered.lines() {
-            let claim = line.trim_start_matches("- ");
+            let after_dash = line.trim_start_matches("- ");
+            // (#2431 round 3) A BODY-rendered bullet leads with a
+            // `` `path:line` `` span before its claim
+            // (`fenced_patch_bullet`/`fenced_hunk_bullet`/the unanchored
+            // count line); a plain inline COMMENT has no span at all
+            // (`plain_finding_comment_body`). Stripping only "- " left
+            // every body bullet's claim hidden behind its own span, so
+            // this check could never fire on that half of the renderer's
+            // output — strip the span too, when there is one, so the
+            // actual claim text is what gets compared either way.
+            let claim = match after_dash.split_once(" — ") {
+                Some((span, rest)) if span.starts_with('`') && span.ends_with('`') => rest,
+                _ => after_dash,
+            };
             let lower = claim.to_ascii_lowercase();
             assert!(
                 !claim.starts_with("No.") && !lower.starts_with("can't tell"),
-                "a rendered claim begins with a withheld-shaped prefix: {claim:?}"
+                "a rendered claim begins with a withheld-shaped prefix: {claim:?} (line: {line:?})"
             );
         }
     }
