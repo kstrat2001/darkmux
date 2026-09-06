@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
+import { describe, it, expect } from "vitest";
+import { render } from "@testing-library/react";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency } from "./machineGauge";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
@@ -456,6 +456,74 @@ describe("MachineHealthRegion — the machine's own shrink hint", () => {
     expect(container.querySelectorAll(".mm-hint").length).toBe(1);
     expect(container.querySelector(".mm-hint")!.textContent).toContain("unpriceable");
   });
+
+  // #2440 cut 1 (acceptance criterion): `model_ledger.rs`'s own
+  // `shrink_hint` sets the machine-level hint AND the targeted row's hint
+  // to the SAME string when the hint names a resident (`amber_verdict_and_
+  // shrink_hint_key_on_projected_total_not_darkmux_alone`'s own assertion,
+  // `crates/darkmux-profiles/src/model_ledger.rs`). Rendering both was a
+  // literal verbatim duplicate on screen; this pins the fix at the
+  // component level rather than trusting the dedupe logic by inspection.
+  it("renders a reload suggestion that targets a resident row AT MOST ONCE, in the card", () => {
+    const RELOAD_TEXT = "reload priced-model at ctx 32768 (now 65536) — cuts 8.00 GB of KV commitment; Σ potential then fits the limit at load time";
+    const targeted: MachineResources = {
+      ...BASE,
+      models: [{ ...BASE.models[0], shrink_hint: RELOAD_TEXT } as MachineResourcesModel, BASE.models[1]],
+      machine: { ...BASE.machine, state: "amber", shrink_hint: RELOAD_TEXT } as MachineResources["machine"],
+    };
+    const { container } = renderRegion(targeted, { residencyRows: residencyRowsFor(targeted) });
+    const occurrences = [...container.querySelectorAll(".mm-hint")].filter((h) => h.textContent?.includes(RELOAD_TEXT));
+    expect(occurrences.length).toBe(1);
+    // ...and it lives in the resident row's own card, not standalone above it.
+    expect(occurrences[0].closest(".mm-row")).not.toBeNull();
+  });
+
+  // The inverted case: a hint that names NO resident row (the "unload a
+  // resident" no-shrinkable-context arm) has no card to fold into, so it
+  // still renders on its own — the dedupe must not swallow it.
+  it("still renders the machine-level hint on its own when it targets nothing resident", () => {
+    const untargeted: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, state: "amber", shrink_hint: "over the limit by 4.00 GiB with no shrinkable context — unload a resident or load a smaller quant to reach green at load time" } as MachineResources["machine"],
+    };
+    const { getByText } = renderRegion(untargeted);
+    expect(getByText(/unload a resident or load a smaller quant/)).toBeInTheDocument();
+  });
+});
+
+describe("MachineHealthRegion — #2440 cut 3: only ACTIVE lamps render", () => {
+  it("renders no lamp row at all when nothing is active", () => {
+    // A truly all-quiet payload, built explicitly rather than reusing BASE
+    // (whose unpriced resident would light the UNPRICED lamp): zero
+    // unpriced/estimated models, no pressure/over-limit condition, no
+    // messages, no residency change, no stale poll.
+    const quiet: MachineResources = {
+      ...BASE,
+      models: [BASE.models[0]],
+      machine: { ...BASE.machine, unpriced_models: 0, estimated_models: 0, state: "green" },
+      messages: [],
+    };
+    const { container } = renderRegion(quiet, { residencyRows: residencyRowsFor(quiet), residencyChanged: false });
+    expect(container.querySelectorAll(".mm-lamp").length).toBe(0);
+    expect(container.querySelector(".mm-lamps")).toBeNull();
+  });
+
+  it("renders EXACTLY the active lamps, none of the inactive ones", () => {
+    const pressured: MachineResources = {
+      ...BASE,
+      pressure: { ...BASE.pressure, red: true },
+      messages: [],
+    };
+    const { container } = renderRegion(pressured, { residencyRows: residencyRowsFor(pressured) });
+    const lamps = [...container.querySelectorAll(".mm-lamp")];
+    expect(lamps.length).toBe(2); // PRESSURE (explicit) + UNPRICED (BASE's unpriced model)
+    const words = lamps.map((l) => l.textContent);
+    expect(words.some((w) => w?.includes("PRESSURE"))).toBe(true);
+    expect(words.some((w) => w?.includes("STALE"))).toBe(false);
+    expect(words.some((w) => w?.includes("RESIDENCY"))).toBe(false);
+    // every rendered lamp is lit — none of the gray/inactive treatment survives
+    expect(lamps.every((l) => /is-lit-/.test(l.className))).toBe(true);
+  });
 });
 
 describe("MachineHealthRegion — structure the e2e/parity suites also check", () => {
@@ -574,25 +642,23 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(container.querySelector(".mm-kv--machine")!.textContent).not.toMatch(/reclaimable/);
   });
 
-  it("renders the pool in binary GiB, agreeing with the header's own figure (#1811)", () => {
+  it("leaves pool CAPACITY and USED to the gauge, agreeing with its own figures (#1811, narrowed #2440)", () => {
+    // (#2440 cut 2) `pool` and `used` are gone from this row — the gauge
+    // already draws both (the tick at 100% names the scale; the center
+    // readout names what's used), and the row restating them beside it was
+    // the redundancy this cut removed. Capacity still reaches the screen —
+    // just once, on the dial, not twice.
     const { container } = renderRegion(BASE);
     const kv = container.querySelector(".mm-kv--machine")!;
-    // Same `hw.memsize` the stage header renders as "128 GB". It used to read
-    // "137.44 GB" here — one number, two figures, on the one screen whose job
-    // is telling the operator how much room they have. The units are the fix;
-    // the reconciling " (128 GiB)" parenthetical that used to be asserted here
-    // is gone with them.
-    expect(kv.textContent).toContain("128.00 GiB");
-    expect(kv.textContent).not.toContain("137.44");
+    expect(kv.textContent).not.toContain("· pool");
+    expect(kv.textContent).not.toContain("· used");
+    const scaleLabels = [...container.querySelectorAll(".mm-gauge-scale-label")].map((n) => n.textContent);
+    expect(scaleLabels).toContain("128"); // 137438953472 B rounded to GiB
   });
 
-  it("distinguishes pool CAPACITY, USED, and AVAILABLE — three different fields (#1821)", () => {
+  it("keeps AVAILABLE in the row — the one pool figure the gauge does not draw (#1821, narrowed #2440)", () => {
     const { container } = renderRegion(BASE);
     const kv = container.querySelector(".mm-kv--machine")!;
-    // capacity 137438953472, used 69300000000, available 72000000000 — all
-    // three must render as DIFFERENT numbers, not one figure repeated.
-    expect(kv.textContent).toContain("128.00 GiB"); // capacity
-    expect(kv.textContent).toContain("64.54 GiB"); // used
     expect(kv.textContent).toContain("67.06 GiB"); // available (colloquial)
     // free_bytes (3738599424 -> "3.48 GiB") stays in the PAYLOAD but is
     // deliberately not given prime space in this row (operator-approved
@@ -620,10 +686,13 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     const wrap = container.querySelector('[data-act="machine-detail-rows"]');
     expect(wrap).not.toBeNull();
     const rows = wrap!.querySelectorAll(".mm-kv-row");
-    expect(rows.length).toBeGreaterThanOrEqual(5); // limit source, pool, used, available, unpriced (+ reclaim note)
+    // (#2440 cut 2) pool/used dropped — limit source, available, unpriced
+    // (+ reclaim note) is the floor now, not 5.
+    expect(rows.length).toBeGreaterThanOrEqual(3);
     expect(wrap!.textContent).toContain("physical pool");
-    expect(wrap!.textContent).toContain("128.00 GiB"); // pool
-    expect(wrap!.textContent).toContain("64.54 GiB"); // used
+    const labels = [...wrap!.querySelectorAll(".mm-kv-row__label")].map((n) => n.textContent);
+    expect(labels).not.toContain("pool");
+    expect(labels).not.toContain("used");
     expect(wrap!.textContent).toContain("67.06 GiB"); // available
     expect(wrap!.textContent).toContain("63.57 GiB reclaimable");
     expect(wrap!.textContent).toContain("model");
@@ -632,7 +701,7 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     const labelValueRows = [...rows].filter(
       (r) => r.querySelector(".mm-kv-row__label") && r.querySelector(".mm-kv-row__value"),
     );
-    expect(labelValueRows.length).toBeGreaterThanOrEqual(5);
+    expect(labelValueRows.length).toBeGreaterThanOrEqual(3);
   });
 
   it("stays the inline dotted form (no row markup) on desktop — the mobile branch is opt-in, not the new default", () => {
@@ -640,7 +709,7 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(container.querySelector('[data-act="machine-detail-rows"]')).toBeNull();
     expect(container.querySelector(".mm-kv-row")).toBeNull();
     const kv = container.querySelector(".mm-kv--machine")!;
-    expect(kv.textContent).toContain("limit source physical pool · pool 128.00 GiB");
+    expect(kv.textContent).toContain("limit source physical pool · available");
   });
 });
 
@@ -673,79 +742,27 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
  * notes would silently cease to exist on the surface the operator uses most.
  * A button works for tap, hover, and keyboard alike.
  */
-describe("MachineHealthRegion — the pressure tiles explain themselves on demand", () => {
-  it("renders no note until asked, and every tile offers the affordance", () => {
+describe("MachineHealthRegion — the pressure tiles' notes live in the one disclosure (#2440 cut 7)", () => {
+  it("renders no per-tile (i) affordance and no per-tile popover", () => {
     const { container } = renderRegion(BASE);
-    expect(container.querySelectorAll(".mm-odo-n").length).toBe(0);
-    expect(container.querySelectorAll(".mm-odo-i").length).toBe(3);
-  });
-
-  it("reveals THAT tile's note on click, and states the relationship for a screen reader", () => {
-    const { container } = renderRegion(BASE);
-    const btn = container.querySelectorAll(".mm-odo-i")[0] as HTMLButtonElement;
-    expect(btn.getAttribute("aria-expanded")).toBe("false");
-    fireEvent.click(btn);
-    expect(btn.getAttribute("aria-expanded")).toBe("true");
-    const notes = container.querySelectorAll(".mm-odo-n");
-    expect(notes.length).toBe(1); // exactly one — not all three
-    expect(notes[0].textContent).toMatch(/only figure that can trigger RED/i);
-  });
-
-  it("closes on a second click, and opening another tile closes the first", () => {
-    const { container } = renderRegion(BASE);
-    const [free, , comp] = [...container.querySelectorAll(".mm-odo-i")] as HTMLButtonElement[];
-    fireEvent.click(free);
-    fireEvent.click(free);
-    expect(container.querySelectorAll(".mm-odo-n").length).toBe(0);
-
-    fireEvent.click(free);
-    fireEvent.click(comp);
-    const notes = container.querySelectorAll(".mm-odo-n");
-    expect(notes.length).toBe(1);
-    expect(notes[0].textContent).toMatch(/macOS/);
-    expect(free.getAttribute("aria-expanded")).toBe("false");
-  });
-
-  it("dismisses on Escape — a popover must close by the gestures every popover supports", () => {
-    const { container } = renderRegion(BASE);
-    fireEvent.click(container.querySelector(".mm-odo-i")!);
-    expect(container.querySelectorAll(".mm-odo-n").length).toBe(1);
-    fireEvent.keyDown(document, { key: "Escape" });
+    expect(container.querySelectorAll(".mm-odo-i").length).toBe(0);
     expect(container.querySelectorAll(".mm-odo-n").length).toBe(0);
   });
 
-  it("dismisses on a click outside, but NOT on a click within the tile row", () => {
+  it("carries all three tile notes verbatim inside `how this was measured`, not lost with their buttons", () => {
     const { container } = renderRegion(BASE);
-    fireEvent.click(container.querySelector(".mm-odo-i")!);
-    // Inside the row: stays open (otherwise the popover would close before
-    // its own text could be selected).
-    fireEvent.mouseDown(container.querySelector(".mm-odo-n")!);
-    expect(container.querySelectorAll(".mm-odo-n").length).toBe(1);
-    // Outside: closes.
-    fireEvent.mouseDown(document.body);
-    expect(container.querySelectorAll(".mm-odo-n").length).toBe(0);
+    const about = container.querySelector(".mm-about")!;
+    expect(about.textContent).toMatch(/only figure that can trigger RED/i);
+    expect(about.textContent).toMatch(/monotonic high-water mark since boot/i);
+    expect(about.textContent).toMatch(/macOS's own memory compressor/i);
   });
 
-  it("registers no global listeners while closed — an idle page costs nothing", () => {
-    const add = vi.spyOn(document, "addEventListener");
+  it("names each note by its tile's own label, so the three don't run together unattributed", () => {
     const { container } = renderRegion(BASE);
-    const before = add.mock.calls.filter(([e]) => e === "keydown" || e === "mousedown").length;
-    expect(before).toBe(0);
-    fireEvent.click(container.querySelector(".mm-odo-i")!);
-    const after = add.mock.calls.filter(([e]) => e === "keydown" || e === "mousedown").length;
-    expect(after).toBe(2);
-    add.mockRestore();
-  });
-
-  it("is a real button — reachable without a pointer at all", () => {
-    const { container } = renderRegion(BASE);
-    const btn = container.querySelector(".mm-odo-i")!;
-    expect(btn.tagName).toBe("BUTTON");
-    expect(btn.getAttribute("type")).toBe("button");
-    // #1821 (operator-approved rename): this tile's label is "margin", not
-    // "memory free" — kern.memorystatus_level is neither free nor available
-    // memory (see the tile's own note test in machineGauge.test.ts).
-    expect(btn.getAttribute("aria-label")).toMatch(/margin/i);
+    const about = container.querySelector(".mm-about")!;
+    expect(about.textContent).toMatch(/margin:/);
+    expect(about.textContent).toMatch(/swap used:/);
+    expect(about.textContent).toMatch(/compressor:/);
   });
 });
 
@@ -880,13 +897,23 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
     expect(row.textContent).toContain("potential ~10.69 GiB (estimated)");
   });
 
-  it("the row carries an explanatory hint naming the assumption, like the unpriced row's own hint", () => {
-    const resources = withEstimated();
+  // (#2440 cuts 4+5) The row's own "estimated: priced from catalog…" hint
+  // is gone — it duplicated the chip's own `title` (asserted above) and the
+  // server's `messages` disclosure. What survives is a SINGLE machine-wide
+  // line (`estimatedSummaryLine`) pointing at the one disclosure that still
+  // carries the dense-attention assumption verbatim.
+  it("carries the dense-attention assumption in the ONE disclosure, not a per-row hint", () => {
+    const resources = withEstimated({
+      ...({} as Partial<MachineResources["machine"]>),
+    });
+    resources.messages = [
+      { severity: "info", text: "1 resident model(s) priced by ESTIMATE, not measurement — assumes dense attention, overstating hybrid-attention models" },
+    ];
     const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
     const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("phi-4"))!;
-    const hint = [...row.querySelectorAll(".mm-hint")].find((h) => h.textContent?.includes("estimated:"));
-    expect(hint).toBeTruthy();
-    expect(hint!.textContent?.toLowerCase()).toContain("dense");
+    expect([...row.querySelectorAll(".mm-hint")].some((h) => h.textContent?.includes("estimated:"))).toBe(false);
+    expect(container.querySelector(".mm-about")!.textContent?.toLowerCase()).toContain("dense");
+    expect(container.textContent).toMatch(/1 model priced by estimate \(no readable config\.json\)/);
   });
 
   it("decision 1: an estimated resident is disclosed on its own row and in the machine detail row", () => {
@@ -957,12 +984,15 @@ describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure
   }
 
   it("an info-only message does NOT light the WARN lamp", () => {
+    // (#2440 cut 3) An unlit lamp no longer renders AT ALL — asserting its
+    // absence is the honest form of "not lit" now, not a class check on an
+    // element that no longer exists.
     const infoOnly: MachineResources = {
       ...BASE,
       messages: [{ severity: "info", text: "N models priced by ESTIMATE" }],
     };
     const { container } = renderRegion(infoOnly);
-    expect(findWarnLamp(container).className).not.toMatch(/is-lit-/);
+    expect(findWarnLamp(container)).toBeUndefined();
   });
 
   it("the inverted case: a warn-severity message DOES light the WARN lamp", () => {
@@ -983,7 +1013,7 @@ describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure
     expect(findWarnLamp(container).className).toMatch(/is-lit-warn/);
   });
 
-  it("the message card renders each entry with a severity-keyed class, not a uniform amber treatment", () => {
+  it("the message card renders the alarm (warn/error) entries; the info entry moves into the disclosure instead (#2440 cut 4)", () => {
     const mixed: MachineResources = {
       ...BASE,
       messages: [
@@ -992,11 +1022,13 @@ describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure
       ],
     };
     const { container } = renderRegion(mixed);
-    expect(container.querySelector(".memmsg-info")).not.toBeNull();
+    // The info entry is no longer in the visible memcard at all — it moved
+    // into `how this was measured` verbatim.
+    expect(container.querySelector(".memmsg-info")).toBeNull();
     expect(container.querySelector(".memmsg-warn")).not.toBeNull();
-    // The inverted case: an info message must not ALSO carry the warn class.
-    const infoMsg = [...container.querySelectorAll(".memmsg")].find((m) => m.textContent?.includes("estimate disclosure"))!;
-    expect(infoMsg.className).not.toMatch(/memmsg-warn/);
+    const warnMsg = [...container.querySelectorAll(".memmsg")].find((m) => m.textContent?.includes("undercount warning"))!;
+    expect(warnMsg.className).not.toMatch(/memmsg-info/);
+    expect(container.querySelector(".mm-about")!.textContent).toContain("estimate disclosure");
   });
 });
 

@@ -137,37 +137,46 @@ describe("machine lens — at-rest prose budget", () => {
     expect(words).toBeLessThanOrEqual(262);
   });
 
-  it("an unpriced + estimated resident adds a short hint each, not two paragraphs", async () => {
+  it("an unpriced resident adds a short row hint; an estimated resident adds one machine-wide line, not a paragraph each", async () => {
     const { container } = mount(unpricedEstimatedMachine());
     await waitFor(() => expect(screen.getByText(/user:phi-4/)).toBeInTheDocument());
 
-    // The facts themselves survive the trim — this is a prose budget, not a
-    // deletion of the two states that most need naming.
+    // The unpriced fact still marks its own row (#2440 left this hint
+    // alone — only the ESTIMATED row's own duplicate hint was cut).
     const hints = [...container.querySelectorAll(".mm-hint")].map((h) => h.textContent ?? "");
     expect(hints.some((h) => /unprice/i.test(h))).toBe(true);
-    expect(hints.some((h) => /estimated/i.test(h))).toBe(true);
+    // The estimated fact no longer lives on the row at all (#2440 cut 5) —
+    // it is the ONE machine-wide summary line pointing at the disclosure.
+    expect(hints.some((h) => /estimated:/i.test(h))).toBe(false);
+    expect(container.textContent).toMatch(/1 model priced by estimate \(no readable config\.json\)/);
+    // (#2440 round 2, QA finding) `container.textContent` also matches a
+    // closed `<details>`'s BODY — the disclosure the pointer is supposed to
+    // sit OUTSIDE of. A regression that moved the pointer line itself
+    // inside `.mm-about` would still satisfy the assertion above; this one
+    // fails it, the way `visibleWords` above already treats a closed
+    // disclosure's body as off-screen.
+    expect(screen.getByText(/1 model priced by estimate/).closest("details")).toBeNull();
 
     const words = visibleWords(container.querySelector(".machine-lens") as HTMLElement);
-    // Measured 423 before the trim, 338 after — the two row hints alone
-    // were 70 words of it, now 20.
-    expect(words).toBeLessThanOrEqual(345);
+    // Measured 423 before the #1854-era trim, 338 after #1819, 317 after
+    // #2440 (the per-row estimated hint, the machine-level duplicate shrink
+    // hint, and the always-open info-message paragraph are all gone from
+    // the at-rest surface now). The ceiling only ever moves down.
+    expect(words).toBeLessThanOrEqual(322);
   });
 
-  // (fix-loop 4) The trim leaned on a REDUNDANCY that nothing pinned.
-  //
-  // Each row hint could shrink to a few words because the server already
-  // states the full caveat: `/machine/resources` computes `messages[]`
-  // itself (`darkmux_profiles::model_ledger::gather`), and the region renders
-  // every entry unconditionally, in the open, above the footer. The short
-  // hint MARKS the row; the message EXPLAINS it. Take the second away and
-  // the first is the only statement left, and the page is quietly less
-  // honest than it was before the trim — which is the failure mode a word
-  // ceiling actively rewards, since folding these into the existing
-  // `how this was measured` disclosure would score BETTER on the two tests
-  // above while deleting the explanation from the screen.
-  //
-  // So: the messages render, and they render OUTSIDE any `<details>`.
-  it("the server's own unpriced/estimated messages render in the open, never behind a disclosure", async () => {
+  // (#2440 cut 4 supersedes fix-loop 4's finding above) The operator's own
+  // 2026-09-06 call reverses fix-loop 4's "messages render in the open"
+  // rule for exactly the ONE severity that rule was protecting against a
+  // false economy on: `info`. An `info` message is a disclosure, not an
+  // alert (#1821 already drew this line for the WARN lamp); #2440 draws it
+  // for on-page placement too. `warn`/`error` — real degradations — keep
+  // fix-loop 4's guarantee unchanged: they still render in the open, never
+  // behind a `<details>`. Only `info` moved, and the fact is not deleted:
+  // it rides the disclosure verbatim, with an on-page one-liner pointing at
+  // it — the inverse of the failure fix-loop 4 was guarding against (this
+  // is a NAMED move with a replacement pointer, not a quiet deletion).
+  it("keeps a warn/error message in the open; moves an info message into the disclosure, with an on-page pointer", async () => {
     const UNPRICED_TEXT =
       "1 loaded model reports no memory commitment — the machine total below is a floor, not a ceiling.";
     const ESTIMATED_TEXT =
@@ -180,22 +189,25 @@ describe("machine lens — at-rest prose budget", () => {
     );
     await waitFor(() => expect(screen.getByText(/user:phi-4/)).toBeInTheDocument());
 
-    for (const text of [UNPRICED_TEXT, ESTIMATED_TEXT]) {
-      const el = screen.getByText(text, { exact: false });
-      expect(el.closest("details")).toBeNull();
-      // Not merely present in the DOM: present in the text the word counter
-      // above treats as ON SCREEN (it skips a closed disclosure's body), so
-      // this pin and the ceilings measure the same surface.
-      expect(el.className).toContain("memmsg");
-    }
+    // The warn message: unchanged from fix-loop 4 — in the open, `.memmsg`.
+    const warnEl = screen.getByText(UNPRICED_TEXT, { exact: false });
+    expect(warnEl.closest("details")).toBeNull();
+    expect(warnEl.className).toContain("memmsg");
+
+    // The info message: now INSIDE `how this was measured`, not `.memmsg`.
+    const infoEl = screen.getByText(ESTIMATED_TEXT, { exact: false });
+    expect(infoEl.closest("details")).not.toBeNull();
+    expect(infoEl.closest(".mm-about")).not.toBeNull();
+    expect(container.querySelectorAll(".memmsg-info").length).toBe(0);
 
     // The inverted case, same fixture family: with NO server messages, no
-    // `.memmsg` renders at all. Without this, a region that painted the two
-    // strings unconditionally — regardless of payload — would satisfy the
-    // loop above and pin nothing.
+    // `.memmsg` renders at all — a region that painted the string
+    // unconditionally would satisfy every assertion above and pin nothing.
     const { container: bare } = mount(unpricedEstimatedMachine());
     await waitFor(() => expect(bare.querySelector(".mm-row")).not.toBeNull());
     expect(bare.querySelectorAll(".memmsg").length).toBe(0);
-    expect(container.querySelectorAll(".memmsg").length).toBe(2);
+    // Only the warn entry renders as a `.memmsg` — the info entry does not,
+    // even though the payload carries one of each.
+    expect(container.querySelectorAll(".memmsg").length).toBe(1);
   });
 });

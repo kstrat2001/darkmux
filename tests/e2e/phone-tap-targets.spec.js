@@ -69,10 +69,15 @@ async function resolvesAt(page, sel, side, px) {
   );
 }
 
-// A minimal, well-formed `/machine/resources` ledger — enough for the lens to
-// render its odometer tiles and their "(i)" buttons. The hostile-string walk
-// over this same endpoint lives in `viewer-machine.spec.js`; this fixture is
-// deliberately boring, because the claim here is about geometry.
+// A minimal, well-formed `/machine/resources` ledger with one ESTIMATED
+// resident — enough for the lens to render the `.mm-odo-i` affordance
+// (#2440 moved this glyph off the odometer tiles, which no longer carry
+// their own per-tile popover, onto the single "N model priced by estimate
+// (no readable config.json)" line's `ⓘ`, which opens `how this was
+// measured`). The
+// hostile-string walk over this same endpoint lives in
+// `viewer-machine.spec.js`; this fixture is deliberately boring, because
+// the claim here is about geometry, not content.
 const LEDGER = {
   schema_version: '1.0',
   generated_at_ms: 1767225600000,
@@ -89,20 +94,21 @@ const LEDGER = {
       owner: 'darkmux',
       loaded_ctx: 65536,
       weights_bytes: 20000000000,
-      kv_per_token_bytes: 100,
-      kv_bytes_at_ctx: 6553600,
+      kv_per_token_bytes: null,
+      kv_bytes_at_ctx: null,
       potential_bytes: 26553600000,
+      potential_source: 'estimated',
       current_bytes: 20006553600,
       state: 'green',
     },
   ],
-  machine: { potential_bytes: 26553600000, unpriced_models: 0, current_bytes: 20006553600, state: 'green' },
+  machine: { potential_bytes: 26553600000, unpriced_models: 0, estimated_models: 1, current_bytes: 20006553600, state: 'green' },
   attribution: 'per_process',
   attribution_note: '1 worker rank-matched',
-  messages: [],
+  messages: [{ severity: 'info', text: '1 resident model(s) priced by ESTIMATE, not measurement' }],
 };
 
-test('(U1-1) the machine odometer\'s (i) buttons answer a tap 12px outside their 14px glyph', async ({ page }) => {
+test('(U1-1) the machine estimate-summary line\'s ⓘ answers a tap 12px outside its 14px glyph', async ({ page }) => {
   await page.route('**/machine/resources*', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(LEDGER) }),
   );
@@ -117,6 +123,12 @@ test('(U1-1) the machine odometer\'s (i) buttons answer a tap 12px outside their
     const r = await resolvesAt(page, '.mm-odo-i', side, 12);
     expect(r.ok, `${side}: resolved to ${r.hit}`).toBe(true);
   }
+
+  // And it actually opens the disclosure it names — a tap target that
+  // resolves geometrically but does nothing would be worse than an honest
+  // failure here.
+  await page.locator('.mm-odo-i').click();
+  await expect(page.locator('.mm-about')).toHaveJSProperty('open', true);
 });
 
 test('(U1-2) a nav tab answers a tap 4px above the strip — the 44px extension is not clipped', async ({ page }) => {

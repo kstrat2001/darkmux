@@ -336,10 +336,32 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
           )}
           {windowThermal && (
             <>
-              <Kv
-                label="highest severity"
-                value={fmtThermalState(windowThermal.worst_state)}
-              />
+              {/* (#2440 cut 6, operator finding) The ladder above already
+                  lights CURRENT `thermal.state`; this row named the
+                  WINDOW's worst state over the same span. When they agree —
+                  the common case, and the one the operator actually saw
+                  ("the bar highlights FAIR and the text repeats HIGHEST
+                  SEVERITY Fair") — the row was a literal restatement of
+                  what the lit step already shows, so it is dropped. When
+                  they differ (a real excursion the machine has since cooled
+                  from), this is the ONLY place that fact exists — the
+                  ladder shows where things stand NOW, not where they peaked
+                  — so it stays. No fact is lost either way: it is either a
+                  verbatim duplicate (cut) or genuinely new (kept).
+
+                  (#2440 round 2, operator finding) Relabeled from "highest
+                  severity" to "peak (N min)": the bare label read as a
+                  second, unscoped verdict sitting right beside a NOMINAL/
+                  FAIR ladder, and nothing on the row itself said this was a
+                  WINDOWED fact, not a current one. `windowMinutesLabel`
+                  reads the same `span_ms` `daemonWindowLabel` does — never a
+                  hardcoded "10 min" a fresh daemon hasn't earned yet. */}
+              {windowThermal.worst_state !== thermal.state && (
+                <Kv
+                  label={`peak (${windowMinutesLabel(load.window?.span_ms ?? 0)})`}
+                  value={fmtThermalState(windowThermal.worst_state)}
+                />
+              )}
               <Kv
                 label="above nominal"
                 value={fmtAboveNominal(windowThermal.above_nominal_ms)}
@@ -426,6 +448,20 @@ export function effectiveHostAggregate(
   };
 }
 
+/** The daemon sampler's ACTUAL window span, rendered as a bare "N min" /
+ * "<1 min" — never a hardcoded "10 min" the daemon may not have earned yet
+ * (the ring holds up to 10 minutes, `RING_CAPACITY` in
+ * `crates/darkmux-serve/src/host_sampler.rs`, but a fresh or just-restarted
+ * daemon has sampled less than that). Rounds to the nearest minute, capped
+ * at 10 (the ring's own ceiling) so a clock/measurement wobble can't read
+ * "11 min". Shared by `daemonWindowLabel` (below) and the thermal panel's
+ * "peak (N min)" row label (#2440 round 2) — one span-to-text rule, not
+ * two that could drift on the same number. */
+function windowMinutesLabel(spanMs: number): string {
+  if (spanMs < 60_000) return "<1 min";
+  return `${Math.min(10, Math.round(spanMs / 60_000))} min`;
+}
+
 /** (#2107, #1833, warm-up finding) Label the daemon sampler's ACTUAL window
  * span — never a hardcoded "last 10 min" the daemon may not have earned
  * yet. The ring holds up to 10 minutes of history (`RING_CAPACITY` in
@@ -438,9 +474,7 @@ export function effectiveHostAggregate(
  * than rounding down to a misleading "0 min". Capped at 10 (the ring's own
  * ceiling) so a clock/measurement wobble can't read "11 min". */
 export function daemonWindowLabel(spanMs: number): string {
-  if (spanMs < 60_000) return "last <1 min · daemon sampler";
-  const minutes = Math.min(10, Math.round(spanMs / 60_000));
-  return `last ${minutes} min · daemon sampler`;
+  return `last ${windowMinutesLabel(spanMs)} · daemon sampler`;
 }
 
 export interface MachineStatsInput {

@@ -142,17 +142,19 @@ test('machine lens renders the ledger inertly — gauge, lamps, odometer, rows, 
   // (`.mm-row-pot`) layer, plus their current fill.
   expect(await page.locator('.mm-row-pot').count()).toBe(2);
   expect(await page.locator('.mm-row-cur').count()).toBe(2);
-  // The tell-tale lamp row and odometer tiles render, unconditionally.
-  // SIX lamps, not seven: the STATE lamp is gone. It relabelled itself with
-  // the machine state AND changed its lit-ness, so a healthy machine showed
-  // the word "GREEN" in gray beside the same word in green on the machine
-  // chip. That chip has since been removed outright, which is what makes the
-  // lamp row the ONLY channel left here — and every lamp in it keys on a
-  // server-declared CONDITION (pressure, over-limit, unpriced), never on an
-  // assessment of whether the machine is doing well.
-  expect(await page.locator('.mm-lamp').count()).toBe(6);
+  // The tell-tale lamp row renders ONLY its lit lamps (#2440 cut 3 — a gray
+  // inactive lamp beside the one that matters was the redundancy that
+  // finding named). LEDGER lights exactly one: the fixture's single `warn`
+  // message (no unpriced resident, no pressure/over-limit condition, no
+  // stale poll, and — cold boot — no residency change either: the FIRST
+  // successful poll marks every row "live", never "new").
+  expect(await page.locator('.mm-lamp').count()).toBe(1);
+  await expect(page.locator('.mm-lamp').first()).toContainText('WARN');
   expect(await page.locator('.mm-lamp').filter({ hasText: /^STATE/ })).toHaveCount(0);
+  // The odometer tiles still render (the digits/label survive #2440 cut 7
+  // — only their per-tile (i) popover is gone, folded into the disclosure).
   expect(await page.locator('.mm-odo').count()).toBe(3);
+  expect(await page.locator('.mm-odo-i').count()).toBe(0);
   // The MACHINE's own shrink hint renders (escaped) — it sits ABOVE the
   // model rows (right after the machine k/v detail row it's a footnote to).
   await expect(page.locator('.mm-hint').first()).toContainText('shrink several contexts');
