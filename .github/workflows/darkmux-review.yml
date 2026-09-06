@@ -246,11 +246,18 @@ jobs:
           # $RUNNER_TEMP/qa/fallback.md (the summary fallback text) — the
           # caller writes both before calling this.
           post_review_or_fallback() {
-            # (#1583) A review takes tens of minutes, so the branch moving
-            # under it is NORMAL. If HEAD moved since the diff was taken,
-            # the inline anchors point at lines that no longer exist —
-            # skip straight to the summary rather than spending a
-            # guaranteed-422 API call to learn that.
+            # (#1583, revised #2429 part 4) A review takes tens of minutes,
+            # so the branch moving under it is NORMAL. `reviewed_at_sha`
+            # (the payload's own record of the sha `plan.sites` actually
+            # read the diff at — `DeliverOutcome::reviewed_at_sha`) is what
+            # gets compared here now, not the diff-fetch-time `$HEAD_SHA`
+            # captured before the dispatch even ran: those two can differ
+            # (a retry, a resumed run), and the payload's own field is the
+            # ground truth for what the anchors were computed against.
+            # Falls back to `$HEAD_SHA` when the field is absent (an older
+            # binary, or a non-CI caller that never set `head_sha`), so
+            # this still behaves exactly as before on either of those.
+            #
             # `|| HEAD_NOW=""` is load-bearing: under `set -e` a failing
             # command substitution in an assignment kills the STEP, which
             # would make one transient 502 on this extra call discard a
@@ -258,16 +265,25 @@ jobs:
             # the failure class this branch exists to remove, reintroduced
             # by the guard against it.
             HEAD_NOW=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha) || HEAD_NOW=""
+            REVIEWED_AT_SHA=$(jq -r '.reviewed_at_sha // empty' "$RUNNER_TEMP/qa/rendered.json")
+            REVIEWED_AT_SHA="${REVIEWED_AT_SHA:-$HEAD_SHA}"
             POSTED=""
-            # An UNKNOWN head is not a moved head. When the probe fails we
-            # attempt the inline post anyway — the 422 path below already
-            # covers a genuinely-moved branch, whereas treating unknown as
-            # moved would skip a post that would have succeeded and print a
-            # note claiming a SHA transition that was never observed.
-            if [ -n "$HEAD_NOW" ] && [ "$HEAD_NOW" != "$HEAD_SHA" ]; then
-              echo "::warning::branch moved during the review ($HEAD_SHA -> $HEAD_NOW) — posting the summary, inline anchors would not resolve"
-              REASON="the branch moved while the review was running (\`${HEAD_SHA:0:7}\` → \`${HEAD_NOW:0:7}\`), so the findings could not be anchored to diff lines"
-            elif gh api "repos/$REPO/pulls/$PR/reviews" --input "$RUNNER_TEMP/qa/review.json" \
+            # An UNKNOWN head is not a moved head — skip the disclaimer
+            # rather than claim a SHA transition that was never observed.
+            # (#2429 part 4) Never post SILENTLY against a moved branch:
+            # append a disclaimer line to the review body itself (both the
+            # run log AND the posted review name it) and still ATTEMPT the
+            # inline post — GitHub's own 422 on a truly-invalid anchor
+            # still falls through to the summary fallback below, unchanged.
+            if [ -n "$HEAD_NOW" ] && [ -n "$REVIEWED_AT_SHA" ] && [ "$HEAD_NOW" != "$REVIEWED_AT_SHA" ]; then
+              N_COMMENTS=$(jq '.comments | length' "$RUNNER_TEMP/qa/review.json")
+              STALE_LINE="Reviewed at ${REVIEWED_AT_SHA:0:7}; the branch has moved to ${HEAD_NOW:0:7} since, so $N_COMMENTS anchored comment(s) may be outdated."
+              echo "::warning::$STALE_LINE"
+              jq --arg line "$STALE_LINE" '.body = .body + "\n\n> [!WARNING]\n> " + $line' \
+                "$RUNNER_TEMP/qa/review.json" > "$RUNNER_TEMP/qa/review.json.tmp" \
+                && mv "$RUNNER_TEMP/qa/review.json.tmp" "$RUNNER_TEMP/qa/review.json"
+            fi
+            if gh api "repos/$REPO/pulls/$PR/reviews" --input "$RUNNER_TEMP/qa/review.json" \
                    2> "$RUNNER_TEMP/qa/post.err"; then
               POSTED="review"
             else
@@ -277,6 +293,9 @@ jobs:
               # contains them ("thread `line` must be part of the diff"), and
               # nesting them inside a code span breaks the rendered note.
               REASON="GitHub rejected the inline comments (\`$(tr -d '\n`' < "$RUNNER_TEMP/qa/post.err" | cut -c1-200)\`)"
+              if [ -n "$HEAD_NOW" ] && [ -n "$REVIEWED_AT_SHA" ] && [ "$HEAD_NOW" != "$REVIEWED_AT_SHA" ]; then
+                REASON="the branch moved while the review was running (\`${REVIEWED_AT_SHA:0:7}\` → \`${HEAD_NOW:0:7}\`), so the findings could not be anchored to diff lines"
+              fi
             fi
 
             # The findings are the product. Losing them to a posting error
@@ -297,8 +316,14 @@ jobs:
           MODE_RESULT=$(jq -r .mode "$RUNNER_TEMP/qa/rendered.json")
           case "$MODE_RESULT" in
             review)
+              # (#2431 round 2, MF-C) `.fallback_comment` — `DeliverOutcome`
+              # never had a `.comment` field, so this used to print the
+              # literal string "null" into the fallback comment whenever
+              # the formal review couldn't post. `fallback_comment` is the
+              # real field: the scope line plus one `path:line — claim`
+              # line per finding, whether it rendered inline or not.
               jq .review "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/review.json"
-              jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/fallback.md"
+              jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/fallback.md"
               post_review_or_fallback ;;
             partial)
               # (#1876/#1877) The judge stage did not rule on every flag (its
@@ -321,11 +346,11 @@ jobs:
                 # No confirmed findings this run (needs-check only, or
                 # nothing at all) — no formal review payload, post the
                 # comment the way `comment` mode does.
-                jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
+                jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
                 gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md"
               else
                 jq .review "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/review.json"
-                jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/fallback.md"
+                jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/fallback.md"
                 post_review_or_fallback
               fi
               echo "::error::review coverage was incomplete (mode=partial) — see the posted findings above; some flags never got a ruling"
@@ -334,7 +359,7 @@ jobs:
               # (#1113) NO review signal (dead dispatch / empty reply /
               # vacuous pass). Post the honest note, then FAIL this run —
               # a produced-nothing review must never read as a green check.
-              jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
+              jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md"
               echo "::error::review dispatch produced no usable review (mode=degraded)"
               exit 1 ;;
@@ -344,13 +369,13 @@ jobs:
               # `bundle_skip` breakdown) — post the neutral note and exit 0.
               # Distinct from `degraded`: this is an honest "nothing here",
               # never a failure, and never a green approval either.
-              jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
+              jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;
             comment)
               # Zero confirmed findings (needs-check only, or nothing at
               # all) — no formal review payload, just the honest prose
               # summary. A real signal-bearing outcome, so post and exit 0.
-              jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
+              jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;
             *)
               # (#1889) An unrecognized `Rendered.mode` must fail loudly,

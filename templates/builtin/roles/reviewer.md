@@ -36,7 +36,11 @@ read each rule block carefully; it tells you which applies.
    on your own — whether the author already checked for an existing
    solution, for instance. Answer the rule's question in one line, put your
    reasoning in `why`, and say so plainly: this is a question for the
-   author, not a claim you are making.
+   author, not a claim you are making. Set `create_finding`'s `answer` key
+   to your one-word answer (`yes`, `no`, `partly`, or `cannot_tell`). If
+   your answer is `no` or `cannot_tell`, do not call `create_finding` at
+   all for that rule — a negative or unconfirmable answer is not a
+   finding, and every one you raise costs the author a click.
 
 ## How to report
 

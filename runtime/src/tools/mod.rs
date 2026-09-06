@@ -340,6 +340,11 @@ impl Tool {
                     "why": {
                         "type": "string",
                         "description": "One or two sentences: why this line matches the pattern, and what it would cost."
+                    },
+                    "answer": {
+                        "type": "string",
+                        "enum": ["yes", "no", "partly", "cannot_tell"],
+                        "description": "ONLY when the pattern you were given asked you a yes/no/partly/can't-tell question (a `confirm: \"question\"` rule): your one-word answer. Omit entirely for a pattern that did not ask a question. If your answer here is \"no\" or \"cannot_tell\", do not call this tool at all for this pattern — see the pattern's own instructions."
                     }
                 },
                 "required": ["file", "line", "pattern", "evidence", "why"]
@@ -1187,6 +1192,38 @@ mod tests {
         })
         .to_string();
         execute_create_finding(&raw, out, ws).unwrap().result
+    }
+
+    /// (#2431 round 3) `answer` — a `confirm: "question"` rule's
+    /// structured yes/no/partly/cannot_tell field (`Tool::CreateFinding`'s
+    /// schema) — used to ride only the flow record's `emitted: verbatim`,
+    /// never the on-disk `FINDINGS_FILE` copy `crawl::unit_step`'s own
+    /// summary machinery can read directly. Parity: it is there now too.
+    #[test]
+    fn the_on_disk_record_carries_the_models_structured_answer() {
+        let ws = finding_workspace(&numbered_src(5, 2, "  if (a && b) {"));
+        let out = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({
+            "file": "src/a.rs", "line": 2, "pattern": "p",
+            "evidence": "  if (a && b) {", "why": "w", "answer": "cannot_tell",
+        })
+        .to_string();
+        execute_create_finding(&raw, out.path(), ws.path()).unwrap();
+        let record = last_finding(out.path());
+        assert_eq!(record["answer"], serde_json::json!("cannot_tell"), "{record}");
+    }
+
+    /// A call with no `answer` at all (every non-question rule, and any
+    /// question rule a unit forgot) records `null`, never a missing key
+    /// that would make a consumer's `.get("answer")` ambiguous between
+    /// "omitted" and "this finding predates the field".
+    #[test]
+    fn the_on_disk_record_carries_a_null_answer_when_the_model_omitted_it() {
+        let ws = finding_workspace(&numbered_src(5, 2, "  if (a && b) {"));
+        let out = tempfile::tempdir().unwrap();
+        report(ws.path(), out.path(), 2, "  if (a && b) {");
+        let record = last_finding(out.path());
+        assert_eq!(record["answer"], serde_json::Value::Null, "{record}");
     }
 
     #[test]
@@ -3138,6 +3175,15 @@ fn execute_create_finding_with(
         "context_end": captured.end,
         "evidence_had_line_prefix": captured.evidence_had_line_prefix,
         "why": args.why,
+        // (#2431 round 3) Parity with the EVENT payload (`emitted:
+        // verbatim`, below): the model's own structured `answer` (a
+        // `confirm: "question"` rule's yes/no/partly/cannot_tell field —
+        // `Tool::CreateFinding`'s schema documents it) rode the flow
+        // record but never this on-disk copy, so a reader of the
+        // container-local `FINDINGS_FILE` alone (rather than the flow
+        // stream) saw a finding with no `answer` at all. `None` when the
+        // model omitted it, same as every other optional key here.
+        "answer": verbatim.as_ref().and_then(|v| v.get("answer")),
         "ts": crate::trajectory::unix_ms(),
     });
 

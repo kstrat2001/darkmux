@@ -9,6 +9,6 @@ What evidence to cite: The hunk's changed line that most clearly diverges from t
 
 How to explain why: Quote the relevant sentence of the intent, quote the line that diverges, and state the gap in one sentence. This is a question for the author, not a claim you are certain of.
 
-Before you call create_finding for this pattern: answer this question in one line, then put your answer AND its reasoning at the start of `why` — this pattern's finding is a QUESTION for the author, not a claim, so be honest that it is unconfirmed: Does this hunk's change plainly accomplish what the stated intent describes? Answer yes, no, or partly, and say what — if anything — the hunk does instead.
+Before you call create_finding for this pattern: answer this question in one line, then put your answer AND its reasoning at the start of `why` — this pattern's finding is a QUESTION for the author, not a claim, so be honest that it is unconfirmed: Does this hunk's change plainly accomplish what the stated intent describes? Answer yes, no, or partly, and say what — if anything — the hunk does instead. Set the `answer` key to your one-word answer (`yes`, `no`, `partly`, or `cannot_tell`). If your answer is `no` or `cannot_tell`, do NOT call create_finding for this pattern at all — a negative or unconfirmable answer is not a finding, and every conversation you raise costs the author a click.
 </pattern>
 
