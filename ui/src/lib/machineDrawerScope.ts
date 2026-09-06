@@ -31,14 +31,15 @@ export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
  * shouldn't be reported as if it just happened to be quiet. */
 const LAST_KNOWN_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
-/** (#2413) Accepts BOTH the retired per-dispatch `telemetry.process`
- * (still emitted, at time of writing, by the separate legacy
- * `run_obs::HostTelemetrySampler` mechanism used by mission launches and
- * ACP sessions — see `FLOW_SCHEMA_VERSION` 1.42.0's changelog) and the new
- * machine-scoped `machine.telemetry` (`source: "host"`, no session_id) —
- * so a machine still running an older/partial rollout, or a mission/ACP
- * session whose own telemetry hasn't migrated yet, keeps showing SOMETHING
- * rather than going blank the moment this ships. */
+/** (#2413) Accepts BOTH the retired per-dispatch `telemetry.process` and the
+ * new machine-scoped `machine.telemetry` (`source: "host"`, no session_id).
+ * `telemetry.process` is fully retired as of `FLOW_SCHEMA_VERSION` 1.42.0 —
+ * see its changelog entry — nothing in the current binary emits it any
+ * more (the mission-launch/ACP `run_obs::HostTelemetrySampler` mechanism
+ * that used to was deleted in the same round). A reader still needs both
+ * arms for a pre-1.42.0 day file, which is lenient-on-read and un-migrated
+ * by design, so old records keep showing SOMETHING rather than going
+ * blank. */
 function isHostSampleRecord(r: FlowRecord): boolean {
   return (
     r.action === "telemetry.process" ||
