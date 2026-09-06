@@ -147,11 +147,13 @@ interface ProcSample {
   rx: number;
 }
 
-/** (#2413) Recognizes BOTH the retired per-dispatch `telemetry.process`
- * (still emitted, at time of writing, by mission launches' and ACP
- * sessions' separate legacy `run_obs::HostTelemetrySampler` — see
- * `FLOW_SCHEMA_VERSION` 1.42.0's changelog) and the new machine-scoped
- * `machine.telemetry` (`source: "host"`, no session_id). This readout was
+/** (#2413) Recognizes BOTH the retired per-dispatch `telemetry.process` and
+ * the new machine-scoped `machine.telemetry`. `telemetry.process` is fully
+ * retired as of `FLOW_SCHEMA_VERSION` 1.42.0 — see its changelog entry —
+ * nothing in the current binary emits it any more (mission launches' and
+ * ACP sessions' `run_obs::HostTelemetrySampler` mechanism was deleted in
+ * the same round); a pre-1.42.0 day file may still carry one, lenient-on-
+ * read. `machine.telemetry` (`source: "host"`, no session_id): this readout was
  * already machine-level rather than mission-scoped (see this function's
  * caller's own doc), so `machine.telemetry` is a direct, complete fit. */
 function isHostSampleRecord(r: FlowRecord): boolean {

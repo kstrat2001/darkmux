@@ -1,5 +1,5 @@
 {
-  "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-pipeline-dedicated profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_review_staffing_comment` below) whose models the review resourcing resolver scores per seat, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
+  "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-pipeline-oriented reference profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_review_staffing_comment` below), each a candidate for the review mission's single `reviewer` seat, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
 
   "schema_version": "1.5",
 
@@ -33,21 +33,21 @@
     },
 
     "devstral": {
-      "description": "Review pipeline — probe seat, plain draws. Dense wide-instruct model, no reasoning trace. (#2169) The observed case this issue was filed for was `mistralai/devstral-small-2-2512` — a DIFFERENT id from the `devstral-small-2507` pinned below; whether 2507 shares the same LM Studio Mistral-parser interaction (structured tool_calls whose `name` is model content sliced around its own [TOOL_CALLS] marker) is unconfirmed. Either way darkmux never executes a call like that regardless of which Devstral id produced it — partitioned + coalesced via the `malformed_tool_names` detector rather than dispatched. Not a reason to avoid this profile; worth knowing if that detector fires in a run's telemetry.",
+      "description": "Review pipeline — a `reviewer`-role candidate (`darkmux config set role_profiles.reviewer devstral`). Dense wide-instruct model, no reasoning trace. (#2169) The observed case this issue was filed for was `mistralai/devstral-small-2-2512` — a DIFFERENT id from the `devstral-small-2507` pinned below; whether 2507 shares the same LM Studio Mistral-parser interaction (structured tool_calls whose `name` is model content sliced around its own [TOOL_CALLS] marker) is unconfirmed. Either way darkmux never executes a call like that regardless of which Devstral id produced it — partitioned + coalesced via the `malformed_tool_names` detector rather than dispatched. Not a reason to avoid this profile; worth knowing if that detector fires in a run's telemetry.",
       "models": [
         { "id": "mistralai/devstral-small-2507", "n_ctx": 32000 }
       ]
     },
 
     "qwen3.6-27b-review": {
-      "description": "Review pipeline — probe seat, bundle-scoped draws. A second, distinct dense wide-instruct model so the probe seat isn't a single point of view.",
+      "description": "Review pipeline — a second `reviewer`-role candidate, a distinct dense wide-instruct model, useful for A/B-ing the seat against `devstral` (the shipped `review` mission has one `reviewer` seat, reused across every rule — not parallel probes).",
       "models": [
         { "id": "qwen/qwen3.6-27b", "n_ctx": 32000 }
       ]
     },
 
     "judge-35b-moe": {
-      "description": "Review pipeline — judge seat. MoE reasoner weighing the probe seat's findings; deliberately its own profile/model so it never doubles as a probe.",
+      "description": "Review pipeline — a third `reviewer`-role candidate: an MoE reasoner, for when the review unit benefits from a reasoning trace rather than the dense wide-instruct models above. (#2310 P4d retired the dedicated judge stage this profile originally staffed; it's now just another candidate for the single `reviewer` seat, same as the two above.)",
       "models": [
         { "id": "qwen/qwen3.6-35b-a3b", "n_ctx": 32000 }
       ]
@@ -73,5 +73,5 @@
     "utility": "qwen/qwen3-4b-instruct-2507"
   },
 
-  "_review_staffing_comment": "Review staffing is DERIVED via the role->profile flip (#1475), not declared. `darkmux mission launch review` resolves each of the five review roles (review-probe-high / -mid / -low, review-judge, review-verify) INDEPENDENTLY: a per-run launch override (`--param <role>=<profile>`) wins, else the machine-local `role_profiles` map in config.json (`darkmux config set role_profiles.<role> <profile>`), else `default_profile` (the fresh-user floor -- a bare machine runs every seat on one model). Recall diversity is role-borne: the three distinct probe roles bind to three (possibly different) profiles. Bind the map for the durable heterogeneous crew (e.g. review-probe-high -> a devstral profile, review-judge -> a judge-35b-moe profile); override per run to escalate one seat (`--param review-judge=<denser-profile>`) without editing config.json. A leftover `crews` key from a pre-2.0 file is harmless residue (`darkmux doctor` notes it)."
+  "_review_staffing_comment": "Review staffing is DERIVED via the role->profile flip (#1475), not declared. The shipped `review` mission config (#2310 P4d) has two dispatching roles, not five: `reviewer` (the per-unit `crawl.unit` dispatch that scans the diff for one rule — the same seat runs every rule, one dispatch per planned unit) and `coder` (the OPTIONAL `create-mod-dispatch` template, off by default, for an unattended runner writing a fix). Each resolves INDEPENDENTLY: a per-run launch override (`--param <role>=<profile>`) wins, else the machine-local `role_profiles` map in config.json (`darkmux config set role_profiles.<role> <profile>`), else `default_profile` (the fresh-user floor -- a bare machine runs every seat on one model). The three review-pipeline profiles above (devstral, qwen3.6-27b-review, judge-35b-moe) are reference candidates for the single `reviewer` seat, not roles darkmux resolves automatically — bind one: `darkmux config set role_profiles.reviewer devstral`. `coder` is shared with every other mission's coder seat (e.g. coder-phase); pin it globally, or scope the pin to just this mission's optional unattended path via `--param mod_seat_profile=<profile>` (`create-mod-dispatch`'s own override, read ahead of `role_profiles.coder`). A leftover `crews` key from a pre-2.0 file is harmless residue (`darkmux doctor` notes it)."
 }

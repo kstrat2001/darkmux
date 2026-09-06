@@ -58,7 +58,7 @@ loop. Install it: `cargo install cargo-nextest --locked`.
 | `cargo t-fast` | pure-logic crates, no I/O | **281 tests / 1.1s** |
 | `cargo t-flow` | flow records, sinks, audit chain, schema, config access | **252 / 1.3s** |
 | `cargo t-cli` | the whole root binary crate — every CLI verb module + all 11 integration targets | **632** |
-| `cargo t-review` | review funnel, bundler, lab harness, crew scheduler | **1324 / 5.3s** |
+| `cargo t-review` | lab harness (bundle scanning, review envelope, crawl) + crew scheduler/step kinds — `-p darkmux-lab -p darkmux-crew`; the bespoke review funnel this alias's name comes from was deleted in #2310 P4d, the crates weren't | **1324 / 5.3s** |
 | `cargo t-serve` | the HTTP daemon + bundled viewer | |
 | `cargo t-doctor` | preflight checks and their remedies | |
 | `cargo t-fleet` | roster + cross-machine routing | |
@@ -318,13 +318,19 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      its own `compactor_model` (a 4B utility agent) inside the specialist's role execution,
      emitting no bookends. That is correct by the sub-execution clause above; the defect is
      ATTRIBUTION, and it is the `emit_telemetry` violation already named.
-   - **The review pipeline bypasses the dispatch primitive entirely.** Its seats call the
-     raw chat primitive `single_shot_chat` directly (`src/mission_launch_review.rs:1083`),
-     and the launcher wraps the WHOLE multi-model crew mission in ONE
-     `with_dispatch_bookends` pair whose arguments are literally plural —
+   - **(Historical — fixed by deletion, not migration.) The review pipeline used to bypass
+     the dispatch primitive entirely.** Its bespoke launcher's seats called the raw chat
+     primitive `single_shot_chat` directly, and wrapped the WHOLE multi-model crew mission
+     in ONE `with_dispatch_bookends` pair whose arguments were literally plural —
      `crew.distinct_profile_names()` and `crew_model_summary(&crew)`, emitted as
-     `crew={names} models={summary}`. So those seat executions have no dispatch identity at
-     all, and the one "dispatch" record on the run denotes a mission.
+     `crew={names} models={summary}` — so those seat executions had no dispatch identity at
+     all. That launcher (`src/mission_launch_review.rs`) was deleted in #2310 P4d; the
+     shipped `review` mission config's seats now go through the generic building blocks
+     (`crawl.unit` → `darkmux_crew::dispatch::dispatch`, bookended, for `reviewer`;
+     `dispatch.internal` for the optional `coder` seat), so the bypass this bullet describes
+     no longer exists. The surviving `single_shot_chat` call site is the generic Tier-1
+     `dispatch.single_shot` kind (`crates/darkmux-crew/src/step_kinds/builtins.rs:794`,
+     hosted twin at `:738`) — not review-specific, and not used by `review.json`.
 
    **Retiring the run-grain use is a CONSUMER MIGRATION, not a free deletion.** An earlier
    draft of this entry claimed it "costs nothing in liveness" because the scheduler already
@@ -445,8 +451,8 @@ src/                          CLI command layer (clap)
   main.rs                     Entry point
   cli.rs                      The clap Command enum (the top-level verb surface)
   (dispatch is a top-level verb; the per-command modules:)
-  mission_launch.rs           `mission launch <config>`: mint + drive a mission instance from a config
-  mission_launch_review.rs    The `review` config's dedicated launcher (bundle→probe→dedup→judge→verify→synthesis)
+  mission_launch.rs           `mission launch <config>`: mint + drive a mission instance from a config (the `review` config's dedicated launcher — bundle→probe→dedup→judge→verify→synthesis — was deleted in #2310 P4d; `review` now runs through this generic launcher, same as any other config)
+  acp_panel.rs                Registry-advertised ACP panel commands (#1684 Packet 1); `synthesize_diff_launch_inputs` derives diff/head_sha/workspace params for a no-argument `/review`-style panel launch from the cwd's own git state
   crawl_launch.rs             The crawl launcher (#1959) — `mission launch crawl`'s Task/Step graph is computed at run time from a resolved crawl plan (darkmux-lab's `crawl::plan`), never declared in a mission-config document; routed by literal config id, BEFORE `mission_config::load` runs
   coder_phase.rs              coder-phase pipeline StepKinds (worktree/coder/verify): Tier-3 bespoke, launch-owned (`mission run` retired #1426 ship-4)
   mission_propose.rs          `mission propose`: utility-agent intent → mission config (stdin/file)
@@ -463,7 +469,6 @@ src/                          CLI command layer (clap)
   conventions.rs              Shared CLI helpers
   notebook.rs                 Notebook draft generator (surfaced as `lab notebook`)
   migrate.rs                  Storage-layout migrations
-  pr_review.rs                pr-review render/post plumbing (the `review` config's output path)
 crates/
   darkmux-types/              Profile / ProfileRegistry / config / flow record schemas + config_access
   darkmux-profiles/           Registry loader + lookup
@@ -471,8 +476,13 @@ crates/
   darkmux-crew/               Roles, dispatch core, the Task/Step scheduler + step_kinds/ (builtins/patterns), lessons
     src/rules.rs                 The general rule-file template kind (#1959) — promoted out of the crawl module; `resolve_default` reads `templates/builtin/rules/*.json` + a user-tier override dir
     src/workspace_spec/          The generic "named sources + include/exclude + edges" mission input (#1959) — promoted out of the crawl module's retired `CorpusManifest`; `mod.rs` (WorkspaceSpec/SourceSpec/EdgeSpec, load/validate), `glob.rs` (the one filter-language matcher), `materialize.rs` (git resolution + file walk, producing a `Materialized` any mission can plan from)
-  darkmux-lab/                Lab harness (lab/, providers/, workloads/) + the review pipeline (lab/review.rs)
+    src/step_kinds/mods_gate.rs           `mods.gate` (#2310 P4c-2b) — the create-mods confirmation gate: apply a mod's kit onto a scratch copy of the source checkout, run the declared `test_command` against that patched copy, record the outcome onto every mod naming the finding
+    src/step_kinds/records_gather.rs      `records.gather` (#2310 P4c-2b) — gathers a mission's finding + mod records, plus a diff and scope summary, into the typed shape `deliver.github_review` reads; mission-agnostic, not review-specific
+    src/step_kinds/deliver_github_review.rs  `deliver.github_review` (#2310 P4b) — findings + mods + a diff → a GitHub review payload (`{event, body, comments}`); pure render, no model
+  darkmux-lab/                Lab harness (lab/, providers/, workloads/) + the review envelope (lab/review.rs — data types + outcome mapping only; the executable pipeline these types used to describe was deleted in #2310 P4d, see darkmux-crew's step_kinds above and crawl/ below for what runs `review` now)
     src/crawl/                    The agentic bug crawler's mechanical planning half (#1959) — `plan.rs` (Materialized + [Rule] -> a token-estimated work-unit Plan; `manifest.rs`/`sources.rs` retired, superseded by `darkmux-crew`'s `workspace_spec`)
+    src/crawl/plan_sites_step.rs  `plan.sites` (#2310 P4c) — the generic diff/tree plan step; the `review` config's `plan-<rule>` tasks use this with `source: "diff"` to plan over a diff's hunks rather than a whole-tree walk
+    src/crawl/unit_step.rs        `crawl.unit` + `crawl.summary` (#2301) — the crawl's dispatch half as step kinds; `review`'s `unit-<rule>` tasks grow one `crawl.unit` dispatch per planned site with `role_id: "reviewer"`
   darkmux-fleet/              Roster + cross-machine routing
   darkmux-flow/               Flow sinks (LocalFile/Audit/Redis/Tee) + Keychain-secret machinery
   darkmux-serve/              HTTP daemon + the bundled viewer (assets/next.html, built from ui/src)
@@ -544,11 +554,11 @@ crates/darkmux-crew/src/step_kinds/
     registry.rs   — StepKindRegistry.
 ```
 
-Tier 3 — genuinely bespoke, single-purpose kinds — **never lives in `darkmux-crew` at all.** It stays physically co-located with the mission module that owns it: the PR-review pipeline's bundle/probe/dedup/judge/verify/synthesis kinds live in `crates/darkmux-lab/src/lab/review.rs`; the coder-phase pipeline's worktree/coder/verify kinds live in `src/coder_phase.rs` (the launch-owned module — `mission run` retired in #1426, ship-4). This is reserved for when a second plausible use case genuinely isn't visible yet — revisit if one shows up, same as any other "not yet, but named" call.
+Tier 3 — genuinely bespoke, single-purpose kinds — **never lives in `darkmux-crew` at all.** It stays physically co-located with the mission module that owns it: today's one surviving exemplar is the coder-phase pipeline's worktree/coder/verify kinds, living in `src/coder_phase.rs` (the launch-owned module — `mission run` retired in #1426, ship-4). (Historical: this section used to name a second exemplar — the PR-review pipeline's bundle/probe/dedup/judge/verify/synthesis kinds in `crates/darkmux-lab/src/lab/review.rs` — but that bespoke pipeline was deleted in #2310 P4d; `review` now runs on the shared Tier-1/Tier-2 building blocks like any other mission config, see `crates/darkmux-crew/src/step_kinds/` and `crates/darkmux-lab/src/crawl/` in the file map above.) This is reserved for when a second plausible use case genuinely isn't visible yet — revisit if one shows up, same as any other "not yet, but named" call.
 
 **The physical location IS the enforceable test.** Is this in `step_kinds/builtins.rs`? Config it. Is it in `step_kinds/patterns/`? Reuse it, plug in your own strategy. Is it inside a mission's own module? It's bespoke on purpose — don't look here for shared infrastructure. A fresh agent session asking "where does my new Step behavior go" answers the question by reading the directory, not by re-deriving the decision procedure from a comment that may have drifted.
 
-Two audited findings worth knowing before proposing a collapse yourself. First: the PR-review pipeline's probe/verify kinds LOOK like `dispatch.single_shot` wearing bespoke wrapping, but audited honestly they are NOT a clean Tier 1 collapse. Each is a whole per-item LOOP (probe's bundle × k-draw loop, verify's per-confirmed-flag loop) with cross-step shared state (a remote-token bucket shared across sibling probe steps, `MemberRecord` accumulation into a shared handle) that `dispatch.single_shot`'s one-call-per-`Step` shape doesn't have and can't gain without a real behavior/envelope change. Second: the coder-phase pipeline's coder kind (`src/coder_phase.rs`) wraps the SAME `crew::dispatch::dispatch` primitive Tier 1's `dispatch.internal` wraps, a genuine follow-up candidate, but its CLI printing, its own `mission.coder` flow-record vocabulary, and its `result_slot` readback mechanism are real differences a collapse would have to resolve first. Both are documented in place (code comments citing #1352) rather than forced. The general rule: a collapse that changes observable behavior isn't a tiering fix, it's a feature change wearing a tiering fix's clothes.
+One audited finding worth knowing before proposing a collapse yourself (a second, about the now-deleted PR-review pipeline's probe/verify kinds, is moot since #2310 P4d removed the code it was about): the coder-phase pipeline's coder kind (`src/coder_phase.rs`) wraps the SAME `crew::dispatch::dispatch` primitive Tier 1's `dispatch.internal` wraps, a genuine follow-up candidate, but its CLI printing, its own `mission.coder` flow-record vocabulary, and its `result_slot` readback mechanism are real differences a collapse would have to resolve first. Documented in place (code comments citing #1352) rather than forced. The general rule: a collapse that changes observable behavior isn't a tiering fix, it's a feature change wearing a tiering fix's clothes.
 
 ## Versioning — rules schema
 
