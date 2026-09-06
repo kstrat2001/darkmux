@@ -1,67 +1,11 @@
     use super::*;
     use tempfile::TempDir;
 
-    /// (#1475 packet 3, contract 6) The four probe personas — `review-probe`
-    /// and its three role→profile copies `review-probe-high`/`-mid`/`-low` — must
-    /// be BYTE-EQUAL. Probe recall diversity lives entirely in each role's
-    /// profile→model binding, never in the persona text (the frozen #1256
-    /// persona). This lock makes "one hash, not one intention" structural: a
-    /// future golden bump to `review-probe.md` that forgets to re-copy the three
-    /// siblings fails HERE, before it can silently desync the measured prompts.
-    #[test]
-    fn probe_persona_copies_are_byte_equal() {
-        let prompt_for = |id: &str| {
-            BUILTIN_ROLE_PROMPTS
-                .iter()
-                .find(|(pid, _)| *pid == id)
-                .map(|(_, c)| *c)
-                .unwrap_or_else(|| panic!("{id} prompt must be embedded"))
-        };
-        let base = prompt_for("review-probe");
-        for id in ["review-probe-high", "review-probe-mid", "review-probe-low"] {
-            assert_eq!(
-                prompt_for(id),
-                base,
-                "{id}.md must be byte-equal to review-probe.md — recall diversity is \
-                 role→profile-borne, not persona-borne (#1256 frozen text / #1475 packet 3)"
-            );
-        }
-    }
-
-    /// (#1550 cluster item 4) Every review-pipeline role's manifest
-    /// `description` must disclose that the review dispatch path
-    /// (`ChatCall`, not `dispatch_internal`/`DispatchOpts`) only reads the
-    /// sibling `.md` persona — `tool_palette`/`output_schema`/
-    /// `bail_after_compactions`/`feedback_templates` are inert there. Before
-    /// this note, `review-judge.json` read as if "deliberately no
-    /// output_schema" were an enforced contract (it isn't — the review path
-    /// never consumes the field at all, enforced or not), which is exactly
-    /// the trap: an operator adding `output_schema` to a review role
-    /// manifest, expecting grammar-constrained output, gets no error and no
-    /// effect.
-    #[test]
-    fn review_role_manifests_disclose_the_chatcall_path_limitation() {
-        for id in [
-            "review-judge",
-            "review-verify",
-            "review-probe",
-            "review-probe-high",
-            "review-probe-mid",
-            "review-probe-low",
-        ] {
-            let json = BUILTIN_ROLES
-                .iter()
-                .find(|(rid, _)| *rid == id)
-                .map(|(_, j)| *j)
-                .unwrap_or_else(|| panic!("{id} manifest must be embedded"));
-            let role: Role = serde_json::from_str(json).unwrap_or_else(|e| panic!("{id} must parse: {e}"));
-            assert!(
-                role.description.contains("Review-path note"),
-                "{id}.json's description must disclose the ChatCall-path limitation (#1550 cluster item 4): {}",
-                role.description
-            );
-        }
-    }
+    // (#1475 packet 3 / #1550 cluster item 4 — #2418) The review-probe byte-
+    // equality lock and the review-role ChatCall-path disclosure check were
+    // removed here along with the review-probe/-high/-mid/-low, review-judge,
+    // and review-verify role manifests — the review funnel that staffed them
+    // (`build_review_graph`) was deleted in #2310 P4d.
 
     /// (#1053) The pr-reviewer prompt must carry the intent-assessment
     /// directive — the cross-tier-validated lever against "restate-the-fix"
@@ -238,60 +182,10 @@
         }
     }
 
-    /// (#1260/#1177) The review-verify seat's contract, pinned — following
-    /// review-judge's pattern exactly:
-    /// - deliberately TOOL-LESS with an EXPLICIT deny list (an empty
-    ///   palette silently grants the full catalog — the #1197 bench-role
-    ///   rule); verification is scoped to the provided bundle evidence.
-    /// - NO output_schema (reason-freely-then-one-fenced-JSON keeps
-    ///   reasoning room open — a JSON-only grammar suppresses it).
-    /// - The prompt must carry the three-word ruling vocabulary
-    ///   ({verified, refuted, uncertain}), the evidence-scope directive,
-    ///   the refute-first posture, and the fenced-JSON contract's keys.
-    #[test]
-    fn review_verify_seat_contract() {
-        let role = load_roles()
-            .expect("builtin roles load")
-            .into_iter()
-            .find(|r| r.id == "review-verify")
-            .expect("review-verify must be embedded");
-        assert!(
-            role.output_schema.is_none(),
-            "review-verify must NOT declare an output_schema — the contract is \
-             reason-then-fenced-JSON so reasoning models keep their room (#1260)"
-        );
-        assert!(
-            role.tool_palette.allow.is_empty(),
-            "review-verify is tool-less by design — it rules on the provided evidence"
-        );
-        for denied in ["read", "write", "edit", "exec", "process", "update_plan"] {
-            assert!(
-                role.tool_palette.deny.iter().any(|t| t == denied),
-                "review-verify must EXPLICITLY deny {denied:?} — an empty palette \
-                 silently grants the full catalog (#1197 bench-role rule)"
-            );
-        }
-        let prompt = BUILTIN_ROLE_PROMPTS
-            .iter()
-            .find(|(id, _)| *id == "review-verify")
-            .map(|(_, c)| *c)
-            .expect("review-verify prompt must be embedded");
-        for needle in [
-            "\"verified\"",
-            "\"refuted\"",
-            "\"uncertain\"",
-            "Verify ONLY what the provided evidence proves",
-            "refute the finding first",
-            "decisive_evidence",
-            "note_for_author",
-            "exactly one fenced JSON block",
-        ] {
-            assert!(
-                prompt.contains(needle),
-                "review-verify.md must contain {needle:?} (#1260 contract)"
-            );
-        }
-    }
+    // (#1260/#1177 — #2418) The review-verify seat's pinned contract test
+    // was removed here along with the `review-verify` role manifest — the
+    // review funnel that staffed it (`build_review_graph`) was deleted in
+    // #2310 P4d.
 
     /// (#1196) The tool-bench harness role's contract, pinned:
     /// - An EXPLICIT non-empty tool allow-list. An empty palette makes the

@@ -49,6 +49,14 @@ darkmux release.
 - The old review funnel (bundle → probe → dedup → judge → verify →
   synthesis) and its ten Tier-3 `review.*` step kinds are deleted.
   Historical run records that used them still render in the viewer.
+- The review funnel's own embedded roles — `review-probe`,
+  `review-probe-high`, `review-probe-mid`, `review-probe-low`,
+  `review-judge`, `review-verify` — are deleted along with it ([#2418](https://github.com/kstrat2001/darkmux/issues/2418)).
+  Nothing shipped (mission configs, skills) referenced them; the shipped
+  `review` config stages its work through `reviewer`/`coder` instead. An
+  operator who had `role_profiles.<one of these>` bound in `config.json`,
+  or was dispatching one directly, needs to remove/repoint that binding —
+  `darkmux doctor` flags an unknown role id.
 - `review`'s `bundler` and `pr` inputs.
 - The `docs/guide/bundlers.html` guide page. `--bundler` survives only on
   `lab eval` / `lab review-bench`.

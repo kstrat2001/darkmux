@@ -89,7 +89,9 @@ impl StepKindRegistry {
     /// check validating `Step.kind`/`StepConfig.kind` references against
     /// `StepKindRegistry::with_builtins()`'s Tier 1 ids. Deliberately does
     /// NOT see Tier 2/3 kinds registered ad hoc inside a mission builder
-    /// (`build_review_graph`, `default_phase_graph`) — those register into
+    /// (`src/mission_launch.rs`'s `register_coder_phase_kinds` is the live
+    /// example today; `build_review_graph` and `default_phase_graph` did
+    /// the same before both were deleted, #2310 P4d) — those register into
     /// their OWN per-call registry instance, never this shared one; a
     /// caller that only has `with_builtins()` structurally cannot know
     /// about them (see the mission-config doctor check's own doc for why

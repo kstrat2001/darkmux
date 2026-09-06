@@ -1912,9 +1912,9 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
     .unwrap();
 
     let message = "fix it";
-    // `review-judge` is TOOL-LESS, so this takes the light single-shot hosted
-    // path (a host `curl` to the stub) rather than a `darkmux-runtime`
-    // container — no Docker, no image, no model.
+    // `dialectic-judge` is TOOL-LESS, so this takes the light single-shot
+    // hosted path (a host `curl` to the stub) rather than a
+    // `darkmux-runtime` container — no Docker, no image, no model.
     Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_PROFILES", &profiles_path)
@@ -1923,7 +1923,7 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
         .env("DARKMUX_MODS_DIR", mods.path())
         .env("DARKMUX_REDIS_URL", "")
         .args([
-            "dispatch", "review-judge", "--finding", "sess-pin/4", "--mod", "mod-9-pin",
+            "dispatch", "dialectic-judge", "--finding", "sess-pin/4", "--mod", "mod-9-pin",
             "--skip-preflight", message,
         ])
         .assert()
@@ -2402,7 +2402,7 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
 
     let config_dir = home.path().join("mission-configs");
     fs::create_dir_all(&config_dir).unwrap();
-    // (#2131) `review-judge` is deliberately TOOL-LESS
+    // (#2131) `dialectic-judge` is deliberately TOOL-LESS
     // (`tool_palette.allow: []`) — `dispatch_internal.rs` routes a
     // tool-less role's remote dispatch through the light single-shot
     // HOSTED path (a plain host-side `curl`, already `child_registry`-
@@ -2421,7 +2421,7 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
                 "steps": [{
                     "id": "s1",
                     "kind": "dispatch.internal",
-                    "config": { "role_id": "review-judge", "message": "hang please" }
+                    "config": { "role_id": "dialectic-judge", "message": "hang please" }
                 }]
             }]
         }]

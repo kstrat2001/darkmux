@@ -183,7 +183,7 @@ fn a_step_config_that_names_records_gets_their_blocks_in_the_brief() {
 
     let session_id = format!("brief-refs-graph-{}", std::process::id());
     let step = step_with(serde_json::json!({
-        "role_id": "review-judge",
+        "role_id": "dialectic-judge",
         "message": "the graph's own message",
         "session_id": session_id,
         "skip_preflight": true,
@@ -260,7 +260,7 @@ fn a_step_config_naming_a_missing_record_fails_the_step_before_any_container_wor
     // the failure would be about a model or a container, not about a mod. The
     // DISTINCT error text is the proof nothing downstream was reached.
     let step = step_with(serde_json::json!({
-        "role_id": "review-judge",
+        "role_id": "dialectic-judge",
         "message": "hi",
         "session_id": "brief-refs-graph-missing",
         "skip_preflight": true,
@@ -316,7 +316,7 @@ fn a_step_whose_task_names_the_phase_stamps_it_on_the_dispatch_record() {
     let _env = EnvGuard::set(&[("DARKMUX_FLOWS_DIR", flows.path())]);
     let session_id = format!("phase-stamp-graph-{}", std::process::id());
     let step = step_with(serde_json::json!({
-        "role_id": "review-judge",
+        "role_id": "dialectic-judge",
         "message": "phase stamp",
         "session_id": session_id,
         "skip_preflight": true,

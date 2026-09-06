@@ -1023,8 +1023,8 @@ fn check_role_profiles() -> Check {
     // (#1547) The role half: every role id darkmux can actually dispatch to
     // (user-defined + built-in), so a binding on a role id that doesn't exist
     // — e.g. the pre-#1547 doc examples' bare `judge`/`verify`/`probe-high`,
-    // none of which are real role ids (the real ones are `review-judge`,
-    // `review-verify`, `review-probe-high`) — is flagged instead of certified.
+    // none of which are real role ids (the real ones are `dialectic-judge`,
+    // `code-reviewer`, `analyst`) — is flagged instead of certified.
     let known_roles: std::collections::BTreeSet<String> = match darkmux_crew::loader::load_roles() {
         Ok(roles) => roles.into_iter().map(|r| r.id).collect(),
         Err(e) => {
@@ -1085,7 +1085,7 @@ fn role_profiles_status(
             status: Status::Pass,
             message: "no role->profile bindings configured; unmapped roles use default_profile".into(),
             hint: Some(
-                "Optional: bind a role to a profile with `darkmux config set role_profiles.<role> <profile>` (e.g. `role_profiles.review-judge qwen35b`). Profiles stay role-agnostic; the map welds a role to one on this machine. (#1475)".into(),
+                "Optional: bind a role to a profile with `darkmux config set role_profiles.<role> <profile>` (e.g. `role_profiles.dialectic-judge qwen35b`). Profiles stay role-agnostic; the map welds a role to one on this machine. (#1475)".into(),
             ),
         };
     }
@@ -8675,11 +8675,14 @@ mod tests {
     // is testable with no config.json / registry / role library on disk. A
     // dangling binding (role -> undefined profile, or an unknown role id)
     // WARNs; an all-resolving map (and the empty map) Pass. Bindings use REAL
-    // review-pipeline role ids (`review-judge`, `review-verify`,
-    // `review-probe-high`, `review-probe-low`) — the bare `judge`/`verify`/
-    // `probe-high` this suite used pre-#1547 are not real role ids and were
-    // themselves an instance of the trap #1547 fixes (a doc/test example that
-    // reads as live but no-ops).
+    // role ids (`dialectic-judge`, `code-reviewer`, `analyst`, `scribe`) —
+    // the bare `judge`/`verify`/`probe-high` this suite used pre-#1547 are
+    // not real role ids and were themselves an instance of the trap #1547
+    // fixes (a doc/test example that reads as live but no-ops). (#2418: the
+    // suite previously used the review funnel's own `review-judge`/
+    // `review-verify`/`review-probe-high`/`review-probe-low` role ids —
+    // those roles were retired along with the funnel, #2310 P4d, so this
+    // suite now names roles that still exist.)
     fn known(names: &[&str]) -> std::collections::BTreeMap<String, darkmux_types::Profile> {
         names
             .iter()
@@ -8695,7 +8698,7 @@ mod tests {
     fn roles(ids: &[&str]) -> std::collections::BTreeSet<String> {
         ids.iter().map(|n| n.to_string()).collect()
     }
-    const REAL_ROLES: &[&str] = &["review-judge", "review-verify", "review-probe-high", "review-probe-low"];
+    const REAL_ROLES: &[&str] = &["dialectic-judge", "code-reviewer", "analyst", "scribe"];
 
     #[test]
     fn role_profiles_empty_map_passes() {
@@ -8707,9 +8710,9 @@ mod tests {
     #[test]
     fn role_profiles_all_defined_passes() {
         let map = bindings(&[
-            ("review-judge", "qwen35b"),
-            ("review-verify", "qwen35b"),
-            ("review-probe-low", "qwen4b"),
+            ("dialectic-judge", "qwen35b"),
+            ("code-reviewer", "qwen35b"),
+            ("scribe", "qwen4b"),
         ]);
         let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]), &quarantined(&[]), &roles(REAL_ROLES));
         assert_eq!(c.status, Status::Pass);
@@ -8719,12 +8722,12 @@ mod tests {
 
     #[test]
     fn role_profiles_dangling_binding_warns_and_names_the_pair() {
-        let map = bindings(&[("review-judge", "qwen35b"), ("review-probe-high", "ghost27b")]);
+        let map = bindings(&[("dialectic-judge", "qwen35b"), ("analyst", "ghost27b")]);
         let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]), &quarantined(&[]), &roles(REAL_ROLES));
         assert_eq!(c.status, Status::Warn);
-        assert!(c.message.contains("review-probe-high -> ghost27b"), "names the dangling pair: {}", c.message);
+        assert!(c.message.contains("analyst -> ghost27b"), "names the dangling pair: {}", c.message);
         assert!(c.message.contains("undefined profile"), "genuinely-absent target reads as undefined: {}", c.message);
-        assert!(!c.message.contains("review-judge -> qwen35b"), "the resolving binding is not flagged: {}", c.message);
+        assert!(!c.message.contains("dialectic-judge -> qwen35b"), "the resolving binding is not flagged: {}", c.message);
         let hint = c.hint.unwrap();
         assert!(hint.contains("config set role_profiles"), "hint names the fix: {hint}");
         assert!(hint.contains("does NOT silently fall back"), "hint states the loud-resolution contract: {hint}");
@@ -8736,7 +8739,7 @@ mod tests {
         // its entry failed to parse) must NOT read as "undefined — add it": the
         // profile IS there. Doctor names it quarantined and points at fixing the
         // entry, not adding a new profile.
-        let map = bindings(&[("review-judge", "qwen35b"), ("review-verify", "broken")]);
+        let map = bindings(&[("dialectic-judge", "qwen35b"), ("code-reviewer", "broken")]);
         let c = super::role_profiles_status(
             &map,
             &known(&["qwen35b"]),
@@ -8744,7 +8747,7 @@ mod tests {
             &roles(REAL_ROLES),
         );
         assert_eq!(c.status, Status::Warn);
-        assert!(c.message.contains("review-verify -> broken"), "names the quarantined pair: {}", c.message);
+        assert!(c.message.contains("code-reviewer -> broken"), "names the quarantined pair: {}", c.message);
         assert!(c.message.contains("quarantined profile"), "flavored quarantined, not undefined: {}", c.message);
         assert!(!c.message.contains("undefined profile"), "not the add-it wording: {}", c.message);
         let hint = c.hint.unwrap();
@@ -8757,7 +8760,7 @@ mod tests {
     #[test]
     fn role_profiles_mixed_undefined_and_quarantined_names_both() {
         // Both kinds present: each gets its own message segment + hint.
-        let map = bindings(&[("review-judge", "ghost27b"), ("review-verify", "broken")]);
+        let map = bindings(&[("dialectic-judge", "ghost27b"), ("code-reviewer", "broken")]);
         let c = super::role_profiles_status(
             &map,
             &known(&["qwen35b"]),
@@ -8765,8 +8768,8 @@ mod tests {
             &roles(REAL_ROLES),
         );
         assert_eq!(c.status, Status::Warn);
-        assert!(c.message.contains("review-judge -> ghost27b"), "names the undefined pair: {}", c.message);
-        assert!(c.message.contains("review-verify -> broken"), "names the quarantined pair: {}", c.message);
+        assert!(c.message.contains("dialectic-judge -> ghost27b"), "names the undefined pair: {}", c.message);
+        assert!(c.message.contains("code-reviewer -> broken"), "names the quarantined pair: {}", c.message);
         assert!(c.message.contains("undefined profile"), "undefined segment present: {}", c.message);
         assert!(c.message.contains("quarantined profile"), "quarantined segment present: {}", c.message);
         let hint = c.hint.unwrap();
@@ -8777,7 +8780,7 @@ mod tests {
     /// (#1547) The trap this issue is named for: doctor's + config_cmd's own
     /// worked examples (and this very test file, pre-#1547) bound bare
     /// `judge`/`verify`/`probe-high` — none of which are real role ids (the
-    /// real ones are `review-judge`/`review-verify`/`review-probe-high`) — and
+    /// real ones are `dialectic-judge`/`code-reviewer`/`analyst`) — and
     /// `role_profiles_status` reported Pass because it never checked the role
     /// half. This is the RED case: an unknown role id must WARN even when the
     /// profile side resolves cleanly.
@@ -8794,13 +8797,13 @@ mod tests {
 
     #[test]
     fn role_profiles_unknown_role_and_undefined_profile_names_both_segments() {
-        let map = bindings(&[("judge", "qwen35b"), ("review-probe-high", "ghost27b")]);
+        let map = bindings(&[("judge", "qwen35b"), ("analyst", "ghost27b")]);
         let c = super::role_profiles_status(&map, &known(&["qwen35b"]), &quarantined(&[]), &roles(REAL_ROLES));
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("unknown role id"), "unknown-role segment present: {}", c.message);
         assert!(c.message.contains("undefined profile"), "undefined-profile segment present: {}", c.message);
         assert!(c.message.contains("judge -> qwen35b"), "names the unknown-role pair: {}", c.message);
-        assert!(c.message.contains("review-probe-high -> ghost27b"), "names the undefined-profile pair: {}", c.message);
+        assert!(c.message.contains("analyst -> ghost27b"), "names the undefined-profile pair: {}", c.message);
     }
 
     // ─── parse_semver / classify_version_vs_latest (issue #13) ───────────
