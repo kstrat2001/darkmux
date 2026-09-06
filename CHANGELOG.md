@@ -14,6 +14,22 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **The mission envelope carries a `records_emitted` block** ([#2421](https://github.com/kstrat2001/darkmux/issues/2421), [#2426](https://github.com/kstrat2001/darkmux/pull/2426)) —
+  `MISSION_ENVELOPE_SCHEMA` 1.2 → 1.3. At finalize, the envelope records this
+  mission's own flow-stream cost: counts by `action`, total records/bytes,
+  aggregate dispatch seconds (paired dispatch-bookend segments plus open
+  ones credited to finalize time — `dispatch_pairs`/`open_dispatches` say
+  which), wall-clock seconds, and machine-scoped host-telemetry samples
+  ([#2413](https://github.com/kstrat2001/darkmux/issues/2413)) inside that window. `darkmux mission debrief <id>` renders it —
+  top actions, totals, dispatch/wall time, host-sample coverage. A miss (no
+  records found) still yields an honest all-zero block plus a named
+  `warnings` entry, never a silent gap; the launch's own liveness wrapper
+  bookend (open for the whole `launch()` call) is excluded from dispatch
+  pairing so it can't inflate `dispatch_seconds` by a whole mission's wall
+  time. Old envelopes (no `records_emitted` key) still deserialize.
+
 ### Changed
 
 - **`review` is now the former `review-v2` pipeline** ([#2310](https://github.com/kstrat2001/darkmux/issues/2310) P4d) —

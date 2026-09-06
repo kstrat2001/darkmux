@@ -82,6 +82,9 @@ pub mod mission_config;
 // and `darkmux-lab`'s own `RemoteBucket`) into one public home both the
 // `dispatch.map` fan-out and `darkmux-lab`'s review pipeline construct.
 pub mod remote_budget;
+// (#2421) Mission-envelope records-emitted aggregation — see the module doc
+// for why this lives here rather than in `darkmux-serve`.
+pub mod records_emitted;
 pub mod resourcing;
 // (#1959) The rule registry — a named, searchable property bound to files
 // by glob, with match/no-match prose. Promoted out of the crawl module
