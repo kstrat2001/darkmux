@@ -2527,8 +2527,14 @@ mod tests {
         assert_eq!(cfg.id, "review");
         assert!(!cfg.inputs.is_empty(), "review declares its runtime inputs");
         // The workflow's frozen param names all stay declared, so
-        // `.github/workflows/darkmux-review.yml` runs unchanged.
-        for frozen in ["github", "head_sha", "diff_file", "intent_file", "mode", "envelope_out", "emit"] {
+        // `.github/workflows/darkmux-review.yml` runs unchanged. `mode` and
+        // `envelope_out` are deliberately NOT on this list any more
+        // (post-#2431 fix loop): both were CLI-surface-parity leftovers
+        // from the retired funnel launcher, `.github/workflows/
+        // darkmux-review.yml` never actually passed either one to this
+        // dispatch, and the workflow no longer even accepts a `mode` input
+        // — so nothing needs either name to stay declared.
+        for frozen in ["github", "head_sha", "diff_file", "intent_file", "emit"] {
             assert!(
                 cfg.inputs.iter().any(|i| i.name == frozen),
                 "the workflow's frozen `--param {frozen}=` must stay declared"

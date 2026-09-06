@@ -513,15 +513,15 @@ pub fn unreferenced_inputs(config: &MissionConfig, consumed_by_launcher: &[&str]
 /// option.** A blanket refusal on any inert declaration would be the
 /// stronger authoring gate, and it is what the issue asks for first — but
 /// when this was measured (on `review-v2.json`, before `mode`/
-/// `envelope_out` picked up their own `ignored: true` and before the
-/// #2310 P4d retirement deleted the then-unreferenced `review-probe-high`
-/// input entirely) it refused `mission launch review-v2` outright over
-/// knobs the operator never touched. `review.json` today declares no such
-/// case — `mode`/`envelope_out` are `ignored: true` and so exempt by
-/// construction (see this function's own filter, above) — but the
-/// supplied-only design this measurement motivated stays the general
-/// rule for the next config that adds an inert input without marking it
-/// `ignored`. Refusing a launch over a
+/// `envelope_out` picked up their own `ignored: true` (later deleted
+/// entirely — post-#2431 fix loop, once neither one turned out to be
+/// passed by anything) and before the #2310 P4d retirement deleted the
+/// then-unreferenced `review-probe-high` input entirely) it refused
+/// `mission launch review-v2` outright over knobs the operator never
+/// touched. `review.json` today declares no such case — the supplied-only
+/// design this measurement motivated stays the general rule for the next
+/// config that adds an inert input without marking it `ignored`.
+/// Refusing a launch over a
 /// knob the operator never touched trades one silent-wrong-run for a
 /// hard-blocked-run, so the refusal keys on the operator's own action — the
 /// issue's own "or at minimum warns loudly, pre-mint" covers the rest, which
@@ -956,10 +956,14 @@ mod tests {
     }
 
     /// `ignored: true` IS the document saying "consumed by nothing, declared
-    /// for CLI-surface parity" — `review.json`'s `mode`/`envelope_out`
-    /// today (`bundler` was the historical example before the #2310 P4d
-    /// funnel retirement removed that input entirely). The launcher's
-    /// existing supplied-an-ignored-input warning is what covers it.
+    /// for CLI-surface parity" — `review.json`'s `mode`/`envelope_out` used
+    /// to be the live example (`bundler` was the historical one before
+    /// them, removed by the #2310 P4d funnel retirement); the post-#2431
+    /// fix loop deleted `mode`/`envelope_out` from `review.json` too, once
+    /// neither one turned out to be passed by anything, so this mechanism
+    /// is now exercised only by the synthetic `bundler` input this test
+    /// plants below. The launcher's existing supplied-an-ignored-input
+    /// warning is what covers it.
     #[test]
     fn an_ignored_input_no_step_references_is_clean() {
         let mut cfg = minimal_config(vec![PhaseConfig {

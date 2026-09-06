@@ -13,12 +13,16 @@ write access launches it:
 
 ```bash
 gh workflow run darkmux-review.yml -f pr=<PR_NUMBER>
-# optional overrides, for testing the review pipeline against another setup:
-#   -f crew=<name>   review crew to dispatch (default: the DARKMUX_REVIEW_CREW
-#                    repo variable, falling back to "review-deep")
-#   -f mode=<mode>   sequential | parallel | auto (default: auto)
-#   -f k=<n>         override draws-per-seat for every staffing in the crew
 ```
+
+(post-#2431 fix loop) `pr` is the workflow's only `workflow_dispatch` input
+today. The `-f mode=<mode>` override once documented here (`sequential` |
+`parallel` | `auto`) belonged to the funnel-era pipeline (#2310 P4d deleted
+the funnel and its bespoke launcher); the workflow never actually forwarded
+it to the dispatch, so it has been removed from `workflow_dispatch.inputs`
+entirely rather than left as a knob that silently did nothing. Staffing
+lives on the runner's own `~/.darkmux/config.json` `role_profiles` map (see
+below), not a per-run flag.
 
 (or the **Run workflow** button under Actions → *darkmux self-review*). The job
 reads the PR **diff** plus its **title and description** via the GitHub API —
@@ -139,13 +143,14 @@ lms get qwen3-4b-instruct-2507
 lms get qwen/qwen3.6-35b-a3b
 ```
 
-**(d) Dispatch mode: `sequential` is the 32GB-tier default.** A 32GB machine
-can't hold every seat's model resident at once — `sequential` loads one seat's
-model at a time (each probe staffing in turn, then the judge last), unloading
-between seats. `parallel` is for machines with enough headroom to keep the
-whole crew loaded simultaneously; `auto` lets darkmux decide from the runner's
-observed RAM. Set it per dispatch with `-f mode=sequential` (or leave the
-workflow's `auto` default — it should reach the same conclusion on a 32GB box).
+**(d) Dispatch mode — retired (post-#2431 fix loop).** The `sequential` /
+`parallel` / `auto` residency split described here belonged to the funnel-era
+pipeline's probe/judge staffing, which #2310 P4d deleted along with its
+bespoke launcher. The shipped `review.json` pipeline runs each planned unit
+as a `crawl.unit` dispatch under the generic scheduler, which owns dispatch
+ordering directly — there is no residency knob to set. Staffing (which
+model each role resolves to) still lives on the runner's own
+`~/.darkmux/config.json` `role_profiles` map, per (c) above.
 
 **A note on deep-reasoner probe seats (do NOT add one on a 32GB M1-class box).**
 High-memory machines (64GB+, current-generation Max/Ultra bandwidth) can add a

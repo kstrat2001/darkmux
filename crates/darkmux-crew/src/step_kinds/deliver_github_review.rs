@@ -532,6 +532,16 @@ pub fn render_github_review(
     // (a moved branch, a 422, or a mode that never produces a `review`
     // payload at all). A withheld finding gets no line here either.
     let mut fallback_bullets: Vec<String> = Vec::new();
+    // (post-#2431 fix loop) One `(key, reason)` per finding that has a mod
+    // NOBODY ever verified — a mod exists (`create_mod`/`mod create` ran)
+    // but no member of it reached `gate_passed == Some(true)`, whether
+    // because nothing gated it at all (`review.json`'s `test_command` is
+    // unset, so `mods_gate.rs` skips every mod with `gate_skipped_reason`)
+    // or because it ran and failed. Before this, such a finding rendered
+    // exactly like one nobody ever proposed anything for — the scope line's
+    // own "N finding(s) considered, N refused" never mentioned it, and the
+    // author had no way to learn a change was sitting in the mod store.
+    let mut unverified_mods: Vec<(String, String)> = Vec::new();
 
     for finding in findings {
         let window = FindingWindow::from(finding);
@@ -581,17 +591,38 @@ pub fn render_github_review(
         // is exactly as unanchorable, for this purpose, as one with no
         // line at all.
         let has_anchor = window.file.is_some() && line_touched(&touched, window.file.as_deref().unwrap_or(""), window.line);
+        // (post-#2431 fix loop) `gated` is `None` here, so ANY mod naming
+        // this finding is, by construction, one nothing ever verified —
+        // never conflated with `gated` itself (a passed mod took the
+        // early-return branch above and never reaches this line).
+        let unverified: Vec<&GatedMod> =
+            mods.iter().filter(|m| m.record.r#for.iter().any(|k| k == &finding.key)).collect();
+        let unverified_note = unverified_mods_note(&unverified);
+        // (post-#2431 fix loop, round 2 CONSIDER 2) Every match, not just
+        // the first — a mod naming two findings would otherwise silently
+        // drop its second appearance from the scope-level tally.
+        // `dedup_unverified` (below, after the loop) collapses a mod
+        // pushed more than once (naming several findings this run) back
+        // down to one scope-line entry.
+        for m in &unverified {
+            unverified_mods.push((m.record.key.clone(), unverified_reason(m)));
+        }
         if has_anchor {
             // (#2429 part 1) No gated mod, but the finding names a real,
             // in-diff line: an inline comment, never a body bullet — the
             // shape every in-diff finding takes now, regardless of its
             // rule's confirm form.
+            let mut body = plain_finding_comment_body(&window, rule.as_deref());
+            if let Some(note) = &unverified_note {
+                body.push_str("\n\n");
+                body.push_str(note);
+            }
             comments.push(GithubReviewComment {
                 path: window.file.clone().expect("has_anchor checked file.is_some()"),
                 line: window.line.expect("has_anchor checked line via line_touched, which requires Some"),
                 start_line: None,
                 side: Some("RIGHT".to_string()),
-                body: plain_finding_comment_body(&window, rule.as_deref()),
+                body,
             });
             entries.push(DeliveredEntry::of(&window, rule.as_deref(), "comment"));
         } else {
@@ -600,17 +631,30 @@ pub fn render_github_review(
             // heading, never the claim.
             let group = group_for(&mut rule_groups, rule.as_deref(), rule_titles);
             group.unanchored += 1;
+            if let Some(note) = &unverified_note {
+                group.bullets.push(format!("- {note}"));
+            }
             entries.push(DeliveredEntry::of(&window, rule.as_deref(), "body"));
         }
         fallback_bullets.push(format!("- {} — {}", window.span(), claim_sentence(&window)));
     }
+    // (post-#2431 fix loop, round 2 CONSIDER 2) One mod naming several
+    // findings was pushed once per finding above; collapse back to one
+    // scope-line entry per unique mod key.
+    let unverified_mods = dedup_unverified(unverified_mods);
 
     let unresolved = unresolved_rule_titles(findings, rule_titles);
     // (#2431 round 2, MF-C) Built ONCE, reused across every `mode` this
     // function can return — the scope line, then every kept finding's own
     // `path:line — claim` bullet, in the order they arrived.
-    let fallback_comment =
-        build_fallback_comment(scope, findings.len(), &unresolved, dropped_non_findings, &fallback_bullets);
+    let fallback_comment = build_fallback_comment(
+        scope,
+        findings.len(),
+        &unresolved,
+        dropped_non_findings,
+        &unverified_mods,
+        &fallback_bullets,
+    );
 
     // Captured before `body` takes ownership below — whether there was
     // anything to say at all decides `mode`. A gate-passed mod whose every
@@ -654,7 +698,7 @@ pub fn render_github_review(
             vec![
                 "### darkmux review".to_string(),
                 String::new(),
-                scope_line_with_withheld(scope, findings.len(), &unresolved, dropped_non_findings),
+                scope_line_with_withheld(scope, findings.len(), &unresolved, dropped_non_findings, &unverified_mods),
             ];
         if let Some(a) = attribution.filter(|a| !a.trim().is_empty()) {
             body.push(String::new());
@@ -671,7 +715,7 @@ pub fn render_github_review(
     }
 
     let mut body = vec!["### darkmux review".to_string(), String::new()];
-    body.push(scope_line_with_withheld(scope, findings.len(), &unresolved, dropped_non_findings));
+    body.push(scope_line_with_withheld(scope, findings.len(), &unresolved, dropped_non_findings, &unverified_mods));
     // (#2429 part 2) The body is a summary surface now: only a group that
     // still has something to say (a gated mod's fenced fallback, or an
     // unanchored count) gets a heading at all — a rule whose every finding
@@ -714,9 +758,11 @@ fn build_fallback_comment(
     findings_considered: usize,
     unresolved_rules: &BTreeSet<String>,
     withheld: usize,
+    unverified: &[(String, String)],
     bullets: &[String],
 ) -> String {
-    let mut lines = vec![scope_line_with_withheld(scope, findings_considered, unresolved_rules, withheld)];
+    let mut lines =
+        vec![scope_line_with_withheld(scope, findings_considered, unresolved_rules, withheld, unverified)];
     if !bullets.is_empty() {
         lines.push(String::new());
         lines.extend(bullets.iter().cloned());
@@ -951,13 +997,124 @@ fn scope_line_with_withheld(
     findings_considered: usize,
     unresolved_rules: &BTreeSet<String>,
     withheld: usize,
+    unverified: &[(String, String)],
 ) -> String {
     let mut line = scope_line(scope, findings_considered, unresolved_rules);
     if withheld > 0 {
         let word = if withheld == 1 { "finding" } else { "findings" };
         line.push_str(&format!(" {withheld} {word} withheld: the unit answered no or could not tell."));
     }
+    if let Some(suffix) = unverified_scope_suffix(unverified) {
+        line.push(' ');
+        line.push_str(&suffix);
+    }
     line
+}
+
+/// (post-#2431 fix loop) A mod that exists for a finding but has not
+/// passed a gate — [`render_github_review`]'s own `unverified` list — WHY
+/// this exists: `mod-1788657840-b8bcdc` (a real review run, 2026-09-06)
+/// proposed a real change, `mods_gate.rs` skipped it (`review.json`'s
+/// `test_command` is unset by default, so nothing ever ran it), and the
+/// delivered review's scope line read "5 finding(s) considered, 0
+/// refused" — no mention that a proposed change existed at all. This
+/// names it, in the same voice as the rest of the scope line.
+fn unverified_reason(gated: &GatedMod) -> String {
+    if let Some(reason) = gated.record.gate_skipped_reason.as_deref() {
+        return reason.to_string();
+    }
+    match gated.gate_passed {
+        // (test-fixture note) Real records keep `gate_passed` and
+        // `record.gate` in sync (`records_gather.rs` derives the former
+        // FROM the latter) — reading `gate_passed` first, rather than
+        // `record.gate` directly, is what keeps this function honest even
+        // if a caller ever constructs a `GatedMod` the two ways out of
+        // step (as this module's own test helpers deliberately do, to
+        // isolate "which mod wins" from "what did the gate record").
+        Some(false) => gated
+            .record
+            .gate
+            .as_ref()
+            .and_then(|g| g.reason.clone())
+            .unwrap_or_else(|| "the gate ran and did not pass".to_string()),
+        _ => "not yet gated".to_string(),
+    }
+}
+
+/// The per-finding note ([`render_github_review`]'s comment/body path) —
+/// `None` when the finding has no unverified mod at all. `matches` holds
+/// every mod naming this finding that reached this point (i.e. none of
+/// them passed a gate, since a passed one would have taken the earlier
+/// `gated` branch and never reach here). (post-#2431 fix loop, round 2
+/// CONSIDER 3) Lists EVERY match, not just the first — the count already
+/// said N; a finding with two unverified mods now also names both keys,
+/// not just one, so `darkmux mod show <key>` actually resolves to
+/// something for each one the count promised.
+fn unverified_mods_note(matches: &[&GatedMod]) -> Option<String> {
+    if matches.is_empty() {
+        return None;
+    }
+    let word = if matches.len() == 1 { "change" } else { "changes" };
+    let details = matches
+        .iter()
+        .map(|m| format!("{}; `darkmux mod show {}`", unverified_reason(m), m.record.key))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some(format!("{} proposed {word} not verified — {details}", matches.len()))
+}
+
+/// (post-#2431 fix loop, round 2 CONSIDER 2) Dedup a `(key, reason)` list
+/// by key, keeping each key's FIRST occurrence — a single mod can name
+/// more than one finding (`ModRecord::r#for` is a list), so collecting one
+/// entry per FINDING that mod addresses would otherwise list the same mod
+/// twice in the scope line. The scope line only needs to name a given
+/// unverified mod once, however many findings it touches.
+fn dedup_unverified(list: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    list.into_iter().filter(|(key, _)| seen.insert(key.clone())).collect()
+}
+
+/// [`render_github_review`]'s own `unverified_mods` list, rebuilt from
+/// scratch for [`DeliverGithubReviewStepKind::run`]'s SEPARATE `summary`
+/// recomputation (the step's promoted `summary` field is computed directly
+/// from `cfg.scope`/`cfg.findings`/`cfg.mods`, never read back off the
+/// `DeliverOutcome` `render_github_review` already built) — so the two
+/// never drift on what counts as "not verified" for the same run. A
+/// withheld finding is skipped, matching the main loop's own
+/// `should_withhold` short-circuit. Collects EVERY unverified mod per
+/// finding, then [`dedup_unverified`]s the whole list — the same two-step
+/// shape the main loop itself now follows, so a mod naming several
+/// findings is still named only once here too.
+fn unverified_mods_for(findings: &[FindingRecord], mods: &[GatedMod]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for f in findings.iter().filter(|f| !should_withhold(FindingWindow::from(f).answer.as_deref())) {
+        let has_passed_mod =
+            mods.iter().any(|m| m.record.r#for.iter().any(|k| k == &f.key) && m.gate_passed == Some(true));
+        if has_passed_mod {
+            continue;
+        }
+        for m in mods.iter().filter(|m| m.record.r#for.iter().any(|k| k == &f.key)) {
+            out.push((m.record.key.clone(), unverified_reason(m)));
+        }
+    }
+    dedup_unverified(out)
+}
+
+/// The scope-line-level suffix, aggregating one `(key, reason)` per
+/// UNIQUE unverified mod (the caller is expected to have already run the
+/// list through [`dedup_unverified`]). `None` when there were none, so
+/// the caller never appends a stray space.
+fn unverified_scope_suffix(unverified: &[(String, String)]) -> Option<String> {
+    if unverified.is_empty() {
+        return None;
+    }
+    let word = if unverified.len() == 1 { "change" } else { "changes" };
+    let details = unverified
+        .iter()
+        .map(|(key, reason)| format!("{reason}; `darkmux mod show {key}`"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some(format!("{} proposed {word} not verified — {}.", unverified.len(), details))
 }
 
 /// (#2310 P4b review, M-B) A gate-passed mod's change becomes either
@@ -1412,6 +1569,7 @@ impl StepKind for DeliverGithubReviewStepKind {
             cfg.findings.len(),
             &unresolved_rule_titles(&cfg.findings, &titles),
             outcome.dropped_non_findings,
+            &unverified_mods_for(&cfg.findings, &cfg.mods),
         );
         let output = serde_json::to_string(&serde_json::json!({
             "mode": outcome.mode,
@@ -1529,6 +1687,19 @@ mod tests {
 
     fn gated_mod(for_key: &str, kit: &str, gate_passed: Option<bool>) -> GatedMod {
         gated_mod_kind(for_key, kit, None, gate_passed)
+    }
+
+    /// (post-#2431 fix loop, round 2 CONSIDER 1) Same as [`gated_mod`], but
+    /// with the caller's OWN key rather than the shared fixture default
+    /// `"mod-1-abcdef"` — needed wherever a fixture plants more than one
+    /// unverified mod side by side (`every_form_fixture`'s gate-failed and
+    /// never-gated mods), so a golden diff and a `darkmux mod show <key>`
+    /// note actually pin WHICH mod a given reason belongs to instead of
+    /// two mods sharing one indistinguishable key.
+    fn gated_mod_with_key(key: &str, for_key: &str, kit: &str, gate_passed: Option<bool>) -> GatedMod {
+        let mut m = gated_mod_kind(for_key, kit, None, gate_passed);
+        m.record.key = key.to_string();
+        m
     }
 
     /// (#2310 P4b review, M-B) Same as [`gated_mod`], with an explicit
@@ -1722,6 +1893,153 @@ mod tests {
             !review.body.contains("some proposed kit text"),
             "a never-gated mod's kit must not render at all, only the finding's own claim"
         );
+    }
+
+    /// (post-#2431 fix loop, real run 2026-09-06) `mod-1788657840-b8bcdc`
+    /// proposed a real change against `existing-solution`'s finding, and
+    /// `mods_gate.rs` skipped gating it (`review.json`'s default
+    /// `test_command` is unset) — `gate_skipped_reason: Some("no
+    /// test_command configured")`. Before this fix the delivered review's
+    /// scope line read "5 finding(s) considered, 0 refused" with no
+    /// mention that a proposed change existed at all, and the finding's
+    /// own comment carried nothing but the claim — an author reading
+    /// either had no way to learn a mod was sitting in the store. Both
+    /// surfaces must name it now.
+    #[test]
+    fn an_ungated_mod_with_a_skip_reason_is_named_in_the_comment_and_the_scope_line() {
+        let findings = vec![finding("s/9", "src/a.ts", 2, "ev", "reimplements the existing helper", None)];
+        let mods = vec![GatedMod {
+            record: ModRecord {
+                key: "mod-1788657840-b8bcdc".to_string(),
+                ts: "2026-09-06T01:24:00Z".to_string(),
+                by: "reviewer (qwen3.6-35b-a3b-turboquant-mlx)".to_string(),
+                r#for: vec!["s/9".to_string()],
+                kit: Some("Replace isLinkActive with a call to the existing isActive helper.".to_string()),
+                kit_looks_json: false,
+                kit_kind: None,
+                attachments: Vec::new(),
+                context: Default::default(),
+                warnings: Vec::new(),
+                mission_id: None,
+                phase_id: None,
+                step_id: None,
+                source: None,
+                gate: None,
+                gate_skipped_reason: Some("no test_command configured".to_string()),
+                schema_version: crate::mods::MOD_SCHEMA_VERSION.to_string(),
+                extras: Default::default(),
+            },
+            gate_passed: None,
+        }];
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert!(
+            review.comments[0].body.contains("1 proposed change not verified — no test_command configured"),
+            "the finding's own comment must name the unverified mod: {:?}",
+            review.comments[0]
+        );
+        assert!(
+            review.comments[0].body.contains("darkmux mod show mod-1788657840-b8bcdc"),
+            "and point at it by key: {:?}",
+            review.comments[0]
+        );
+        assert!(
+            review.body.contains("1 proposed change not verified — no test_command configured"),
+            "the scope line must name it too, so a reader who never opens a single comment still \
+             learns a change exists: {}",
+            review.body
+        );
+        assert!(
+            review.body.contains("darkmux mod show mod-1788657840-b8bcdc"),
+            "{}",
+            review.body
+        );
+        assert!(
+            out.fallback_comment.contains("1 proposed change not verified — no test_command configured"),
+            "the plain-comment fallback carries the same note: {}",
+            out.fallback_comment
+        );
+    }
+
+    /// (post-#2431 fix loop, round 2 CONSIDER 2 + 3) One mod names TWO
+    /// findings (`s/20` and `s/21`), and `s/20` also has a SECOND
+    /// unverified mod of its own. This proves both fixes at once: `s/20`'s
+    /// comment must name BOTH of its mods by key (not just the first),
+    /// and the scope line must list the SHARED mod's key only ONCE even
+    /// though it addresses two findings, not twice.
+    #[test]
+    fn a_mod_naming_two_findings_is_deduped_and_a_finding_with_two_mods_names_both() {
+        let findings = vec![
+            finding("s/20", "src/a.ts", 2, "ev", "shared claim one", None),
+            finding("s/21", "src/other.ts", 5, "ev", "shared claim two", None),
+        ];
+        let shared = GatedMod {
+            record: ModRecord {
+                key: "mod-shared".to_string(),
+                ts: "2026-09-06T00:00:00Z".to_string(),
+                by: "coder".to_string(),
+                r#for: vec!["s/20".to_string(), "s/21".to_string()],
+                kit: Some("a shared proposed change".to_string()),
+                kit_looks_json: false,
+                kit_kind: None,
+                attachments: Vec::new(),
+                context: Default::default(),
+                warnings: Vec::new(),
+                mission_id: None,
+                phase_id: None,
+                step_id: None,
+                source: None,
+                gate: None,
+                gate_skipped_reason: Some("no test_command configured".to_string()),
+                schema_version: crate::mods::MOD_SCHEMA_VERSION.to_string(),
+                extras: Default::default(),
+            },
+            gate_passed: None,
+        };
+        let second_on_20 = GatedMod {
+            record: ModRecord {
+                key: "mod-second-on-20".to_string(),
+                ts: "2026-09-06T00:00:01Z".to_string(),
+                by: "coder".to_string(),
+                r#for: vec!["s/20".to_string()],
+                kit: Some("a second proposed change on the same finding".to_string()),
+                kit_looks_json: false,
+                kit_kind: None,
+                attachments: Vec::new(),
+                context: Default::default(),
+                warnings: Vec::new(),
+                mission_id: None,
+                phase_id: None,
+                step_id: None,
+                source: None,
+                gate: None,
+                gate_skipped_reason: Some("no test_command configured".to_string()),
+                schema_version: crate::mods::MOD_SCHEMA_VERSION.to_string(),
+                extras: Default::default(),
+            },
+            gate_passed: None,
+        };
+        let mods = vec![shared, second_on_20];
+        let out = render(&findings, &mods, DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+
+        let s20 = review.comments.iter().find(|c| c.body.contains("shared claim one")).expect("s/20 rendered");
+        assert!(s20.body.contains("2 proposed changes not verified"), "{}", s20.body);
+        assert!(s20.body.contains("darkmux mod show mod-shared"), "names the shared mod: {}", s20.body);
+        assert!(s20.body.contains("darkmux mod show mod-second-on-20"), "AND the second one: {}", s20.body);
+
+        // The SCOPE LINE (the body's first paragraph, before either
+        // per-finding bullet) names `mod-shared` exactly ONCE, even though
+        // it addresses two findings — `s/21` (off-diff, so it ALSO gets
+        // its own per-finding bullet naming `mod-shared` again further
+        // down) is not double-counted in the aggregate tally itself.
+        let scope_line = review.body.lines().nth(2).expect("the scope line is the body's third line");
+        assert!(scope_line.contains("2 proposed changes not verified"), "{scope_line}");
+        let shared_mentions_in_scope_line = scope_line.matches("mod-shared").count();
+        assert_eq!(shared_mentions_in_scope_line, 1, "the shared mod is named once in the scope line: {scope_line}");
+        assert!(scope_line.contains("darkmux mod show mod-second-on-20"), "{scope_line}");
     }
 
     #[test]
@@ -2991,8 +3309,8 @@ mod tests {
             // suggestion.
             gated_mod_kind("sess-a/1", CLAMP_KIT, Some("unified-diff"), Some(true)),
             gated_mod("sess-a/2", "the patch text", Some(true)),
-            gated_mod("sess-a/4", "kit text nobody sees", Some(false)),
-            gated_mod("sess-a/7", "never-gated kit text nobody sees either", None),
+            gated_mod_with_key("mod-4-gatefailed", "sess-a/4", "kit text nobody sees", Some(false)),
+            gated_mod_with_key("mod-7-nevergated", "sess-a/7", "never-gated kit text nobody sees either", None),
             gated_mod_kind("sess-a/8", UNION_KIT, Some("unified-diff"), Some(true)),
         ];
         let scope = DeliverScope {
