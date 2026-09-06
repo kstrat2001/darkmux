@@ -235,18 +235,13 @@ describe("EventLogColumn", () => {
     expect(document.querySelector('[aria-labelledby="filters-title"]')).toBeInTheDocument();
   });
 
-  it("the modal's 'model only' quick action keeps reasoning/tool-call/turn rows and drops others", () => {
-    const records = [
-      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-reasoning" }),
-      rec({ ts: "2026-08-08T12:05:00.000Z", action: "machine.online", session_id: "s-machine" }),
-    ];
-    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    fireEvent.click(document.getElementById("fbtn")!);
-    fireEvent.click(screen.getByText("model only"));
-    const rows = document.querySelectorAll('[data-act="rec"]');
-    expect(rows.length).toBe(1);
-    expect(rows[0].textContent).toContain("s-reasoning");
-  });
+  // (operator, 2026-09-06) The modal's standalone "model only" quick-action
+  // button is REMOVED — replaced by the MODEL section's own header toggle
+  // (`FiltersDialog.tsx`'s `SectionHeader`, tested directly in
+  // `FiltersDialog.test.tsx`). This test used to click that button by its
+  // text; it's superseded by the section-header coverage there rather than
+  // rewritten here, since narrowing to "model activity only, everything else
+  // off" is no longer a single gesture — it now happens per section.
 
   it("the modal's checkbox grid filters by category/tier/source, not just activity", () => {
     const records = [
@@ -263,15 +258,11 @@ describe("EventLogColumn", () => {
     expect(rows[0].textContent).toContain("s-local");
   });
 
-  it("'clear all' restores every facet and empties the search text", () => {
-    const records = [rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-1", tier: "local" })];
-    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    fireEvent.click(document.getElementById("fbtn")!);
-    fireEvent.click(screen.getByLabelText("local"));
-    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(0);
-    fireEvent.click(screen.getByText("clear all"));
-    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(1);
-  });
+  // (operator, 2026-09-06) The modal's standalone "clear all" button is
+  // REMOVED along with "model only" — see the note above. Re-selecting a
+  // single unchecked value is exactly what the per-value checkbox already
+  // covers (the test above); a whole-panel reset is no longer a single
+  // gesture the panel offers.
 
   // (#2417 round 2, MF2) The button used to read "filters · 1" whether one
   // value or seventeen were hidden — a strict-subset-per-facet count capped

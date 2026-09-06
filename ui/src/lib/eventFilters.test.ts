@@ -2,11 +2,14 @@ import { describe, it, expect } from "vitest";
 import {
   absorbNewFacetValues,
   activityOf,
+  activitySectionOf,
+  ACT_ORDER,
   computeFacets,
   createFacetSeen,
   createStoredPicks,
   DEFAULT_ACTIVITIES,
   defaultFilterState,
+  groupActivitiesBySections,
   matchesFilters,
   MODEL_ACTIVITIES,
   activeFilterCount,
@@ -598,5 +601,70 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
     const restored = restoreFilterState(reappeared, s);
     expect(restored.act.has("heartbeat")).toBe(false);
     expect(restored.act.has("tool call")).toBe(false);
+  });
+});
+
+// ── operator finding (2026-09-06): activity facet sections replace
+// "model only" / "clear all" with per-section header toggles ────────────
+describe("activitySectionOf / groupActivitiesBySections (#2450-ish, filter panel sections)", () => {
+  it("maps every known ACT_ORDER value to exactly one section", () => {
+    const expected: Record<string, string> = {
+      reasoning: "MODEL",
+      "tool call": "MODEL",
+      checkpoint: "MODEL",
+      turn: "MODEL",
+      heartbeat: "DISPATCH",
+      "dispatch start": "DISPATCH",
+      "dispatch end": "DISPATCH",
+      "dispatch error": "DISPATCH",
+      feedback: "DISPATCH",
+      routing: "DISPATCH",
+      compaction: "DISPATCH",
+      "session end": "DISPATCH",
+      detector: "DISPATCH",
+      runtime: "DISPATCH",
+      tokens: "DISPATCH",
+      lms: "DISPATCH",
+      note: "MISSION",
+      "machine online": "MACHINE",
+      "machine offline": "MACHINE",
+      "host telemetry": "MACHINE",
+      telemetry: "MACHINE",
+      other: "OTHER",
+    };
+    for (const value of ACT_ORDER) {
+      expect(expected[value], `no expectation named for ACT_ORDER value ${JSON.stringify(value)}`).toBeDefined();
+      expect(activitySectionOf(value)).toBe(expected[value]);
+    }
+    // Every ACT_ORDER value has an expectation and vice versa (round-trip
+    // the fixture against the exported vocabulary rather than letting it drift).
+    expect(Object.keys(expected).sort()).toEqual([...ACT_ORDER].sort());
+  });
+
+  it("routes absorbed (unmapped) raw activity values by prefix, per the operator's mapping", () => {
+    expect(activitySectionOf("dispatch.rest")).toBe("DISPATCH");
+    expect(activitySectionOf("hook.fired")).toBe("MISSION");
+    expect(activitySectionOf("machine.thermal")).toBe("MACHINE");
+    expect(activitySectionOf("mission.grow")).toBe("MISSION");
+    expect(activitySectionOf("mission close")).toBe("MISSION");
+    expect(activitySectionOf("phase abandon")).toBe("MISSION");
+    expect(activitySectionOf("step timing")).toBe("MISSION");
+    expect(activitySectionOf("zzz-unknown")).toBe("OTHER");
+  });
+
+  it("groupActivitiesBySections orders sections MODEL, DISPATCH, MISSION, MACHINE, OTHER and preserves value order within a section", () => {
+    const groups = groupActivitiesBySections(["reasoning", "turn", "dispatch start", "note", "machine online", "zzz-unknown"]);
+    expect(groups.map((g) => g.title)).toEqual(["MODEL", "DISPATCH", "MISSION", "MACHINE", "OTHER"]);
+    expect(groups.find((g) => g.title === "MODEL")?.values).toEqual(["reasoning", "turn"]);
+    expect(groups.find((g) => g.title === "OTHER")?.values).toEqual(["zzz-unknown"]);
+  });
+
+  it("groupActivitiesBySections omits a section with zero present values", () => {
+    const groups = groupActivitiesBySections(["reasoning", "turn"]);
+    expect(groups.map((g) => g.title)).toEqual(["MODEL"]);
+  });
+
+  it("groupActivitiesBySections on an empty list returns no sections", () => {
+    expect(groupActivitiesBySections([])).toEqual([]);
   });
 });

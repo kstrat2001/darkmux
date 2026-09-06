@@ -11,13 +11,12 @@ import {
   computeFacets,
   createFacetSeen,
   createStoredPicks,
-  defaultFilterState,
   matchesFilters,
   type Facets,
   type FacetSeen,
   type StoredPicks,
   type FilterState, activeFilterCount, restoreFilterState, persistFilterState, storedFilterPicks, applyStoredPicks } from "../lib/eventFilters";
-import { FiltersDialog, FiltersBody, onlyModelFacet } from "./FiltersDialog";
+import { FiltersDialog, FiltersBody } from "./FiltersDialog";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { ActivityIcon } from "./ActivityIcon";
 import { recordDetail } from "../lib/recordDetail";
@@ -330,7 +329,7 @@ export function EventLogColumn({
   // passive reconcile fired that effect too and clobbered the visible
   // pane's picks — the per-scope storage key was the workaround. The actual
   // fix is upstream of storage entirely: only a real operator gesture
-  // (`setQuery`/`toggleFacet`/`onlyModel`/`clearAllFilters`, below) calls
+  // (`setQuery`/`toggleFacet`/`setFacetMany`, below) calls
   // `persistFilterState` now, each right where it changes `filters`. A pane
   // nobody has touched never calls any of those, so it never writes —
   // there is nothing left to clobber, and the one global key
@@ -496,13 +495,18 @@ export function EventLogColumn({
     setFilters(next);
     persistFilterState(next, facets);
   }
-  function onlyModel() {
-    const next = { ...filters, act: onlyModelFacet(facets) };
-    setFilters(next);
-    persistFilterState(next, facets);
-  }
-  function clearAllFilters() {
-    const next = defaultFilterState(facets);
+  // (operator, 2026-09-06) The filter panel's section-header toggle — turns
+  // every value in `values` on or off together in one gesture. Replaces the
+  // old whole-facet "model only" / "clear all" quick actions (`onlyModel`/
+  // `clearAllFilters`, removed) with a per-SECTION bulk toggle instead; see
+  // `FiltersDialog.tsx`'s `SectionHeader`.
+  function setFacetMany(key: keyof Facets, values: string[], on: boolean) {
+    const set = new Set(filters[key]);
+    for (const v of values) {
+      if (on) set.add(v);
+      else set.delete(v);
+    }
+    const next = { ...filters, [key]: set };
     setFilters(next);
     persistFilterState(next, facets);
   }
@@ -955,9 +959,8 @@ export function EventLogColumn({
               facets={facets}
               filters={filters}
               onToggle={toggleFacet}
+              onToggleMany={setFacetMany}
               onSetQuery={setQuery}
-              onOnlyModel={onlyModel}
-              onClearAll={clearAllFilters}
             />
           ) : visibleRecs.length ? (
             visibleRecs.map((r) => {
@@ -1021,9 +1024,8 @@ export function EventLogColumn({
         facets={facets}
         filters={filters}
         onToggle={toggleFacet}
+        onToggleMany={setFacetMany}
         onSetQuery={setQuery}
-        onOnlyModel={onlyModel}
-        onClearAll={clearAllFilters}
       />
     </div>
   );

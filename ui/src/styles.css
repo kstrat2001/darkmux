@@ -4891,6 +4891,24 @@ body {
   font-size: calc(16px * var(--fs-scale));
   cursor: pointer;
 }
+/* (operator, 2026-09-06) The search field now leads the panel — full
+   width, its own row, ABOVE the facet groups — instead of sharing a footer
+   row with the old "model only"/"clear all" buttons (removed; see
+   `FiltersDialog.tsx`'s own doc). 16px, not 12-14px: iOS Safari zooms the
+   whole page on focus of a text input under 16px, same rationale as
+   `.eventlog__searchbox input`'s own base rule. */
+.dialog__fsearch {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 4px;
+  padding: 10px 12px;
+  font: calc(16px * var(--fs-scale)) var(--font-mono);
+  margin-bottom: 14px;
+}
 .dialog__fgroup {
   margin-bottom: 14px;
 }
@@ -4910,6 +4928,34 @@ body {
   color: var(--fg);
   cursor: pointer;
 }
+/* (operator, 2026-09-06) Each activity SECTION (MODEL/DISPATCH/MISSION/
+   MACHINE/OTHER — `groupActivitiesBySections`, `lib/eventFilters.ts`)
+   replaces the old single flat activity group; every other facet
+   (category/tier/telemetry source) stays one `.dialog__fgroup` each, same
+   as before. */
+.dialog__fsection {
+  margin-bottom: 14px;
+}
+/* The section/facet header — a tri-state checkbox + its `h4` label, both
+   wrapped in one clickable `<label>` (`SectionHeader`, `FiltersDialog.tsx`).
+   Specificity note: `.dialog__fgroup .dialog__sectionhead` (two classes)
+   deliberately outranks the plain `.dialog__fgroup label` rule above (one
+   class + one type) so this header doesn't inherit that rule's per-value
+   checkbox spacing. */
+.dialog__fgroup .dialog__sectionhead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  cursor: pointer;
+}
+.dialog__sectionhead h4 {
+  margin: 0;
+}
+.dialog__sectionhead input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
 /* (#2116) The activity facet's own layout — the one group that can grow
    to ~40 checkboxes on a busy day (`computeFacets` derives it from the
    day's own records, `lib/eventFilters.ts`). `repeat(auto-fill,
@@ -4918,10 +4964,11 @@ body {
    content width (a 390px viewport's `min(90vw, 720px)`, minus the
    dialog's own padding) `auto-fill` already computes to exactly one
    column, the same single-column behavior every other facet group keeps
-   at every width via its own `inline-flex` wrap. `computeFacets` itself
-   sorts same-prefix actions (`mission.*`/`phase.*`/`step.*`/`dispatch.*`/
-   `hook.*`) together, so reading down a column groups related actions
-   the way reading across the old two-column swarm never did. */
+   at every width via its own `inline-flex` wrap. (operator, 2026-09-06)
+   Now applied PER SECTION rather than to the whole activity facet at
+   once — `groupActivitiesBySections` already orders/groups the values, so
+   each section's own grid is small and doesn't need the old namespace-
+   prefix secondary sort `computeFacets` used to lean on for readability. */
 .dialog__fgroup--activity {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
@@ -4934,31 +4981,21 @@ body {
   accent-color: var(--accent);
   cursor: pointer;
 }
-.dialog__filterfoot {
-  display: flex;
-  gap: 10px;
-  margin-top: 8px;
-  flex-wrap: wrap;
-}
-.dialog__filterfoot input {
-  flex: 1;
-  min-width: 120px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  color: var(--fg);
-  border-radius: 4px;
-  padding: 8px 10px;
-  font: calc(14px * var(--fs-scale)) var(--font-mono);
-}
-.dialog__clr {
-  background: var(--bg);
-  border: 1px solid var(--accent-dim);
-  color: var(--fg);
-  border-radius: 4px;
-  padding: 8px 12px;
-  cursor: pointer;
-  font: 600 calc(12px * var(--fs-scale)) var(--font-mono);
-  white-space: nowrap;
+/* (operator, 2026-09-06, "lit after tap") A touch tap leaves `:hover`
+   applied to the last-tapped element until another tap lands elsewhere —
+   gated behind `hover: hover` so it only ever applies where a real pointer
+   can hover, matching `.eventlog__fbtn`/`.eventlog__follow`'s own
+   precedent above. Scoped to elements that actually render inside
+   `FiltersBody`: the section/facet header and the per-value facet rows.
+   (There is no longer a `.dialog__clr` — the buttons it styled are
+   removed — so there is nothing left to gate for that selector.) */
+@media (hover: hover) {
+  .dialog__fgroup .dialog__sectionhead:hover h4 {
+    color: var(--fg);
+  }
+  .dialog__fgroup label:hover {
+    color: var(--accent);
+  }
 }
 .dialog__none {
   color: var(--dim);
