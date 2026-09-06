@@ -266,7 +266,7 @@ test.describe('phone drawer open: content starts right under the tab row, not ~4
 // clipped. Instrumented (`page.evaluate` walking every element under
 // `[data-act="phone-drawer-body"]` for `getBoundingClientRect().right >
 // panel.right + 1` or `scrollWidth > clientWidth`) against a 700-record
-// fixture carrying one genuinely unbreakable token (a 74-char hex string
+// fixture carrying one genuinely unbreakable token (a 72-char hex string
 // with no space or hyphen for the browser's default line breaker to land
 // on, standing in for a real `dispatch.tool` arg or session id shaped the
 // same way): `.eventlog__rec` measured `scrollWidth: 537` against a
@@ -306,8 +306,12 @@ test.describe('phone drawer Events tab: the event list never scrolls horizontall
       const panel = document.querySelector('[data-act="phone-drawer-body"]');
       const list = document.getElementById('logbody');
       const firstRow = document.querySelector('.eventlog__rec');
+      const follow = document.getElementById('follow');
+      const fbtn = document.getElementById('fbtn');
       const panelRect = panel.getBoundingClientRect();
       const rowRect = firstRow.getBoundingClientRect();
+      const followRect = follow.getBoundingClientRect();
+      const fbtnRect = fbtn.getBoundingClientRect();
       return {
         panelScrollWidth: panel.scrollWidth,
         panelClientWidth: panel.clientWidth,
@@ -317,6 +321,10 @@ test.describe('phone drawer Events tab: the event list never scrolls horizontall
         panelRight: panelRect.right,
         rowLeft: rowRect.left,
         rowRight: rowRect.right,
+        followWidth: followRect.width,
+        followHeight: followRect.height,
+        fbtnWidth: fbtnRect.width,
+        fbtnHeight: fbtnRect.height,
       };
     });
   }
@@ -334,6 +342,17 @@ test.describe('phone drawer Events tab: the event list never scrolls horizontall
       expect(m.listScrollWidth, `event list scrollWidth ${m.listScrollWidth} vs clientWidth ${m.listClientWidth}`).toBeLessThanOrEqual(m.listClientWidth + 1);
       expect(m.rowLeft, `first row's left edge (${m.rowLeft}) is left of the panel's own left (${m.panelLeft})`).toBeGreaterThanOrEqual(m.panelLeft - 1);
       expect(m.panelRight - m.rowRight, `first row's right edge is ${m.panelRight - m.rowRight}px from the panel's inner right edge (want <= 20px, i.e. the row fills the width)`).toBeLessThanOrEqual(20);
+
+      // (operator finding, round 2, 2026-09-06) 29.7x36 (#fbtn) and 33x36
+      // (#follow) measured under the 44px Apple-minimum tap target — a
+      // later, more specific `.phone-drawer__body` selector was overriding
+      // the codebase's own existing `@media (max-width: 768px)` 44x44
+      // rule. Both icon buttons must be >= 44x44 in the drawer regardless
+      // of viewport.
+      expect(m.followWidth, `#follow is ${m.followWidth}x${m.followHeight}, want >= 44x44`).toBeGreaterThanOrEqual(44);
+      expect(m.followHeight, `#follow is ${m.followWidth}x${m.followHeight}, want >= 44x44`).toBeGreaterThanOrEqual(44);
+      expect(m.fbtnWidth, `#fbtn is ${m.fbtnWidth}x${m.fbtnHeight}, want >= 44x44`).toBeGreaterThanOrEqual(44);
+      expect(m.fbtnHeight, `#fbtn is ${m.fbtnWidth}x${m.fbtnHeight}, want >= 44x44`).toBeGreaterThanOrEqual(44);
     });
   }
 });

@@ -1391,7 +1391,7 @@ body {
   border-color: var(--accent);
 }
 /* (operator, 2026-09-06) `.eventlog__fbtn` is `position: relative` so this
-   badge can pin to its own top-right corner — an icon button (`⏷`, matching
+   badge can pin to its own top-right corner — an icon button (`▾`, matching
    `.eventlog__follow`'s own long-standing icon-only convention) replaced
    the "filters" text label, and the active-filter count moved from an
    inline " · N" suffix to this badge so the button stays a fixed, small,
@@ -1557,7 +1557,7 @@ body {
    ENTIRE list, not just clipping. Every other (short) row then rendered
    inside that widened scrollable content at less than the panel's own
    width, with empty space beside it — measured: one 700-record fixture
-   with a single unbroken 74-char token produced `.eventlog__rec.scrollWidth
+   with a single unbroken 72-char token produced `.eventlog__rec.scrollWidth
    537` against a `364`px `clientWidth`. `overflow-wrap: anywhere` lets the
    browser break WITHIN a word only when nothing shorter fits — normal
    text (space/hyphen-delimited) wraps exactly as before. */
@@ -6606,15 +6606,41 @@ body {
     order: 1;
     margin-top: 0;
   }
-  .phone-drawer__body .eventlog__follow,
-  .phone-drawer__body .eventlog__fbtn,
   .phone-drawer__body .eventlog__qcount {
     box-sizing: border-box;
     min-width: 0;
-    height: 36px;
+    /* Matches the buttons' own 44px height (below) so all three share the
+       SAME top within the row's `align-items: center` — a mismatched
+       height here (this used to be a fixed 36px, before the buttons grew
+       to 44px for the tap-target fix) verticaly offsets the text a few px
+       from the icons even though everything is still one line. */
+    height: 44px;
     min-height: 0;
     max-height: none;
     padding: 0 10px;
+    display: inline-flex;
+    align-items: center;
+  }
+  /* (operator finding, round 2, 2026-09-06) Measured 29.7x36 (#fbtn) and
+     33x36 (#follow) — under the 44px Apple-minimum tap target. The
+     `@media (max-width: 768px)` rule a few hundred lines up (this file,
+     `.eventlog__follow, .eventlog__fbtn { min-width: 44px; min-height:
+     44px; }`) already says 44x44, but this LATER, more specific
+     `.phone-drawer__body` selector overrode it back down to a fixed 36px
+     height with no min-width floor. `min-width`/`min-height` (not a fixed
+     size) so the button grows evenly around its centered glyph (the
+     shared `.eventlog__follow, .eventlog__fbtn` base rule's own
+     `justify-content: center` still applies) rather than clipping or
+     stretching it. Row 2 still fits one line at both 390 and 320 — the
+     row's own height is driven by its tallest child (now 44px, up from
+     36px) and stays comfortably under a 48px cap. */
+  .phone-drawer__body .eventlog__follow,
+  .phone-drawer__body .eventlog__fbtn {
+    box-sizing: border-box;
+    min-width: 44px;
+    min-height: 44px;
+    max-height: none;
+    padding: 4px 10px;
     display: inline-flex;
     align-items: center;
   }

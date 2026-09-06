@@ -835,19 +835,24 @@ export function EventLogColumn({
                 onClick={() => (isMobile ? setFiltersInline((v) => !v) : openModalEl("modalbg"))}
                 aria-expanded={isMobile ? filtersInline : undefined}
               >
-                {/* (operator, 2026-09-06) An icon glyph — matching the
-                    follow button's own long-standing icon-only convention
-                    (`⏱`, no label) — replaces the "filters" text label so
-                    the phone drawer's two-row header (search; then follow +
-                    filters + the matches count on one line) has room for
-                    the count text to actually fit beside the icons instead
-                    of wrapping to a THIRD row. `aria-hidden` on both the
-                    glyph and the badge: `aria-label`/`title` above already
-                    carry the full semantics ("filters, 2 active"), so a
-                    screen reader is not asked to read the glyph AND the
-                    bare digit as if they were separate content. */}
+                {/* (operator, 2026-09-06, round 2) An icon glyph — matching
+                    the follow button's own long-standing icon-only
+                    convention (`⏱`, no label) — replaces the "filters" text
+                    label so the phone drawer's two-row header (search; then
+                    follow + filters + the matches count on one line) has
+                    room for the count text to actually fit beside the icons
+                    instead of wrapping to a THIRD row. `▾` is this
+                    codebase's EXISTING disclosure glyph (`styles.css`'s
+                    `content: "▾"` rules), used here rather than introducing
+                    a new codepoint (round 1 shipped `⏷`, U+23F7, which had
+                    no other use in the tree — round 2 caught it). `aria-
+                    hidden` on both the glyph and the badge: `aria-label`/
+                    `title` above already carry the full semantics
+                    ("filters, 2 active"), so a screen reader is not asked
+                    to read the glyph AND the bare digit as if they were
+                    separate content. */}
                 <span className="eventlog__ficon" aria-hidden="true">
-                  ⏷
+                  ▾
                 </span>
                 {activeFilters > 0 ? (
                   <span className="eventlog__fcount" aria-hidden="true">
