@@ -2950,6 +2950,75 @@ pub(crate) fn for_each_flow_record_across_days(
     }
 }
 
+/// Like [`for_each_flow_record_across_days`] but bounded to the day files
+/// whose name falls within `[from_day, to_day]` inclusive (UTC
+/// `YYYY-MM-DD`, string-comparable — filenames sort the same as their
+/// dates). A SEPARATE, smaller primitive rather than adding an optional
+/// range param to the unbounded walker — matching this crate's existing
+/// precedent (`runs::for_each_recent_flow_record`) of keeping a bounded
+/// scan physically distinct from the full-history one its OTHER callers
+/// still need (`/flow-mission/:id`, the catalog endpoints' own
+/// `collect_records_by_field` walk).
+///
+/// Written for [`join_host_samples_into_session_records`] (found live
+/// 2026-09-06): that join's window is a run's own `[start_ms, end_ms]`,
+/// almost always inside a single day, so scanning every day file on the
+/// machine (108 files / 181 MB measured live) to find the handful of
+/// samples inside one day's file is pure waste on a route the live run
+/// pane polls every 5s. Returns the number of day files actually opened,
+/// so a caller can stamp its own scan cost (CLAUDE.md "samplers stamp
+/// their own cost").
+pub(crate) fn for_each_flow_record_in_day_range(
+    flows_dir: &std::path::Path,
+    from_day: &str,
+    to_day: &str,
+    mut visit: impl FnMut(&str, &serde_json::Value) -> std::ops::ControlFlow<()>,
+) -> usize {
+    use std::io::BufRead;
+    let Ok(entries) = std::fs::read_dir(flows_dir) else {
+        return 0;
+    };
+    let mut day_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let Some(date) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if is_valid_date(date).is_none() {
+            continue;
+        }
+        if date < from_day || date > to_day {
+            continue;
+        }
+        day_files.push((date.to_string(), entry.path()));
+    }
+    day_files.sort_by(|a, b| a.0.cmp(&b.0));
+    let files_scanned = day_files.len();
+    for (date, path) in day_files {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
+                continue;
+            }
+            if visit(&date, &v).is_break() {
+                return files_scanned;
+            }
+        }
+    }
+    files_scanned
+}
+
 /// `GET /flow-missions` → the cross-day mission catalog: every `mission_id` seen
 /// across all day files, with a rollup (records, dispatch count, date span, ts
 /// span, machines), newest-activity first. The viewer lists these so you can
@@ -3136,42 +3205,65 @@ async fn catalog_records_response(
             .into_response();
     }
     let dir = state.flows_dir.clone();
-    let (records, truncated, fleet_state) = tokio::task::spawn_blocking(move || {
-        // (#1707 gate CONSIDER 5) The fleet half too — otherwise the
-        // missions lens now LISTS a peer's mission (#1705) and clicking
-        // through to replay it returns zero records: a dead end created by
-        // making the mission visible in the first place.
-        let fleet = fleet_flow_records();
-        let (mut records, truncated) = collect_records_by_field(&dir, &fleet.records, field, &id);
-        // (#2413 M4) A session's own record set carries no host cpu/ram/gpu
-        // samples any more — M3 retired the per-dispatch `telemetry.process`
-        // producer that used to write them WITH this session's `session_id`.
-        // Join the machine-scoped replacement back in by time before this
-        // response goes out, so the run-detail SYSTEM pane (which reads
-        // this same session-scoped record set) doesn't have to learn a
-        // second fetch.
-        if field == "session_id" {
-            join_host_samples_into_session_records(&dir, &fleet.records, &mut records);
-        }
-        (records, truncated, fleet.state)
-    })
-    .await
-    .unwrap_or_else(|e| {
-        // The replay of a PEER's mission lives entirely in the fleet half, so
-        // a degraded read here empties the exact view the operator opened.
-        eprintln!("darkmux serve: catalog record collection failed ({e}); serving no records");
-        (
-            Vec::new(),
-            false,
-            source_state::SourceState::Unavailable { detail: "the record collection failed" },
-        )
-    });
+    let (records, truncated, fleet_state, scan_ms, days_scanned, records_scanned) =
+        tokio::task::spawn_blocking(move || {
+            // (CLAUDE.md "samplers stamp their own cost") The consumer-side
+            // scan cost is stamped in `meta` exactly like the producer-side
+            // `sampler_cost_ms`/`liveness_probe_ms` are — so "this endpoint
+            // is cheap" is a verifiable claim in the response, not an
+            // assumption (found live 2026-09-06: this same scan was
+            // measured at 1.0-1.6s per request on a 5s poll before #1's fix).
+            let scan_start = std::time::Instant::now();
+            // (#1707 gate CONSIDER 5) The fleet half too — otherwise the
+            // missions lens now LISTS a peer's mission (#1705) and clicking
+            // through to replay it returns zero records: a dead end created by
+            // making the mission visible in the first place.
+            let fleet = fleet_flow_records();
+            let (mut records, truncated, mut records_scanned) =
+                collect_records_by_field(&dir, &fleet.records, field, &id);
+            // (#2413 M4) A session's own record set carries no host cpu/ram/gpu
+            // samples any more — M3 retired the per-dispatch `telemetry.process`
+            // producer that used to write them WITH this session's `session_id`.
+            // Join the machine-scoped replacement back in by time before this
+            // response goes out, so the run-detail SYSTEM pane (which reads
+            // this same session-scoped record set) doesn't have to learn a
+            // second fetch.
+            let mut days_scanned = 0usize;
+            if field == "session_id" {
+                let join_stats =
+                    join_host_samples_into_session_records(&dir, &fleet.records, &mut records, current_millis());
+                days_scanned = join_stats.days_scanned;
+                records_scanned += join_stats.records_scanned;
+            }
+            let scan_ms = scan_start.elapsed().as_millis() as u64;
+            (records, truncated, fleet.state, scan_ms, days_scanned, records_scanned)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            // The replay of a PEER's mission lives entirely in the fleet half, so
+            // a degraded read here empties the exact view the operator opened.
+            eprintln!("darkmux serve: catalog record collection failed ({e}); serving no records");
+            (
+                Vec::new(),
+                false,
+                source_state::SourceState::Unavailable { detail: "the record collection failed" },
+                0,
+                0,
+                0,
+            )
+        });
+    let mut meta = source_state::coverage_meta(&fleet_state);
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("scan_ms".into(), serde_json::json!(scan_ms));
+        obj.insert("days_scanned".into(), serde_json::json!(days_scanned));
+        obj.insert("records_scanned".into(), serde_json::json!(records_scanned));
+    }
     axum::Json(serde_json::json!({
         "records": records,
         "count": records.len(),
         "truncated": truncated,
         "generated_at_ms": current_millis(),
-        "meta": source_state::coverage_meta(&fleet_state),
+        "meta": meta,
     }))
     .into_response()
 }
@@ -3179,8 +3271,11 @@ async fn catalog_records_response(
 /// Collect every record whose top-level string `field` equals `id`, from the
 /// local day files AND the fleet stream (#1705), in chronological order,
 /// bounded at MAX_CATALOG_RECORDS. Returns the records + whether the cap
-/// truncated the result. Stops scanning the local side once the cap is hit
-/// (ControlFlow::Break) rather than reading the rest of history.
+/// truncated the result + the number of records VISITED during the local
+/// walk (matched or not — the scan-cost figure `catalog_records_response`
+/// stamps into `meta.records_scanned`). Stops scanning the local side once
+/// the cap is hit (ControlFlow::Break) rather than reading the rest of
+/// history.
 ///
 /// Same fleet-first de-dup as every other merged read: this machine's own
 /// records land in both sinks.
@@ -3189,9 +3284,10 @@ fn collect_records_by_field(
     fleet: &[serde_json::Value],
     field: &str,
     id: &str,
-) -> (Vec<serde_json::Value>, bool) {
+) -> (Vec<serde_json::Value>, bool, usize) {
     let mut records: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;
+    let mut records_scanned = 0usize;
     let mut fleet_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for v in fleet {
         if v.get(field).and_then(|f| f.as_str()) != Some(id) {
@@ -3206,6 +3302,7 @@ fn collect_records_by_field(
     }
     if !truncated {
         for_each_flow_record_across_days(flows_dir, |_date, v| {
+            records_scanned += 1;
             if v.get(field).and_then(|f| f.as_str()) == Some(id) {
                 if records.len() >= MAX_CATALOG_RECORDS {
                     truncated = true;
@@ -3227,7 +3324,19 @@ fn collect_records_by_field(
         };
         ts(a).cmp(&ts(b))
     });
-    (records, truncated)
+    (records, truncated, records_scanned)
+}
+
+/// Scan-cost figures [`join_host_samples_into_session_records`] returns so
+/// `catalog_records_response` can stamp them into `meta` (CLAUDE.md
+/// "samplers stamp their own cost") — `days_scanned` is the count of day
+/// files the BOUNDED local walk actually opened (0 when the join is a
+/// no-op), and `records_scanned` is every record visited during the join
+/// (fleet + local), matched or not.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HostSampleJoinStats {
+    days_scanned: usize,
+    records_scanned: usize,
 }
 
 /// (#2413 M4) After [`collect_records_by_field`] gathers a session's own
@@ -3238,16 +3347,16 @@ fn collect_records_by_field(
 /// records, or a record shape this join can't key on) or no parsable
 /// `dispatch.start` — the run-detail pane's own "no host samples" tile
 /// covers that case, not a synthesized window here.
+///
+/// `now_ms` is the request time (`current_millis()` at the real call site,
+/// injected here for testability) — see the `end_ms` computation below for
+/// why an open/abandoned run needs it.
 fn join_host_samples_into_session_records(
     flows_dir: &std::path::Path,
     fleet: &[serde_json::Value],
     records: &mut Vec<serde_json::Value>,
-) {
-    let Some(machine_uid) =
-        records.iter().find_map(|r| r.get("machine_uid").and_then(|m| m.as_str()).map(str::to_string))
-    else {
-        return;
-    };
+    now_ms: u64,
+) -> HostSampleJoinStats {
     // Both spellings: the crew and the CLI emit `dispatch start`/`dispatch
     // complete` (spaced); darkmux-lab and the runtime emit the dotted form.
     // Matching only the dotted one here meant no real run ever got a host
@@ -3261,11 +3370,32 @@ fn join_host_samples_into_session_records(
         let a = action_of(r);
         darkmux_flow::is_dispatch_complete(a) || darkmux_flow::is_dispatch_error(a) || a == "session.end"
     };
+    // (live finding, 2026-09-06) `machine_uid` must come from the
+    // dispatch-START record specifically, matching what the CLIENT gates
+    // on (`ui/src/lenses/session/sessionRun.ts`) — a plain "first record
+    // that carries one" reads whichever record happens to sort first,
+    // which on a cross-machine record set can be a DIFFERENT machine's
+    // record than the one that actually ran this dispatch. That windows
+    // the join against the wrong machine, the client then finds none of
+    // ITS machine's samples in the (wrong-windowed) result, and a run that
+    // genuinely has host samples renders "no host samples for this run".
+    // Falls back to the first record carrying one only when no start
+    // record does (pre-#2413 historical records, or a shape this join
+    // can't key on) — same leniency the prior behavior had.
+    let Some(machine_uid) = records
+        .iter()
+        .find(|r| is_start(r))
+        .and_then(|r| r.get("machine_uid").and_then(|m| m.as_str()))
+        .or_else(|| records.iter().find_map(|r| r.get("machine_uid").and_then(|m| m.as_str())))
+        .map(str::to_string)
+    else {
+        return HostSampleJoinStats::default();
+    };
     let ts_ms = |r: &serde_json::Value| -> Option<u64> {
         r.get("ts").and_then(|t| t.as_str()).and_then(runs::parse_flow_ts).map(|secs| secs.saturating_mul(1000))
     };
     let Some(start_ms) = records.iter().filter(|r| is_start(r)).filter_map(ts_ms).min() else {
-        return;
+        return HostSampleJoinStats::default();
     };
     // (#2413 round 3 CONSIDER 1) An open/abandoned run (no terminal
     // record yet) used to fall back to `u64::MAX` here, which would join
@@ -3277,35 +3407,57 @@ fn join_host_samples_into_session_records(
     // 2x the inactivity timeout) — a run this function has no OTHER record
     // of activity from beyond that point has no business claiming samples
     // from beyond it either.
+    //
+    // (live finding, 2026-09-06) That grace window must NOT be granted
+    // when the run is ALREADY stale at request time (`now_ms` is more
+    // than `stale_after_ms()` past `last_own_ts`) — liveness has already
+    // given up on this run (`any_dispatch_live_locally` would read it as
+    // dead), so extending its join window further into the future only
+    // gives it a chance to absorb the NEXT run's host samples on the same
+    // machine. A dead run's window ends where its own evidence ends.
     let end_ms = match records.iter().filter(|r| is_terminal(r)).filter_map(ts_ms).max() {
         Some(t) => t,
         None => {
             let last_own_ts = records.iter().filter_map(ts_ms).max().unwrap_or(start_ms);
-            last_own_ts.saturating_add(runs::stale_after_ms())
+            if now_ms.saturating_sub(last_own_ts) > runs::stale_after_ms() {
+                last_own_ts
+            } else {
+                last_own_ts.saturating_add(runs::stale_after_ms())
+            }
         }
     };
     let mut joined: Vec<serde_json::Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut records_scanned = fleet.len();
     for v in fleet {
         if runs::is_host_sample_in_window(v, &machine_uid, start_ms, end_ms) {
             seen.insert(flow_record_identity(v));
             joined.push(v.clone());
         }
     }
-    for_each_flow_record_across_days(flows_dir, |_date, v| {
+    // (found live 2026-09-06) Bounded to the day files this run's own
+    // window actually falls in — `for_each_flow_record_across_days` opened
+    // EVERY day file on the machine (108 files / 181 MB measured live)
+    // regardless of how narrow `[start_ms, end_ms]` was, on a route the
+    // live run pane polls every 5s.
+    let from_day = runs::day_string_from_epoch_ms(start_ms);
+    let to_day = runs::day_string_from_epoch_ms(end_ms);
+    let days_scanned = for_each_flow_record_in_day_range(flows_dir, &from_day, &to_day, |_date, v| {
+        records_scanned += 1;
         if runs::is_host_sample_in_window(v, &machine_uid, start_ms, end_ms) && !seen.contains(&flow_record_identity(v)) {
             joined.push(v.clone());
         }
         std::ops::ControlFlow::Continue(())
     });
     if joined.is_empty() {
-        return;
+        return HostSampleJoinStats { days_scanned, records_scanned };
     }
     records.extend(joined);
     records.sort_by(|a, b| {
         let ts = |r: &serde_json::Value| r.get("ts").and_then(|t| t.as_str()).unwrap_or_default().to_string();
         ts(a).cmp(&ts(b))
     });
+    HostSampleJoinStats { days_scanned, records_scanned }
 }
 
 /// Aggregate the day's flow records — Redis-when-available, file-otherwise.
@@ -3954,6 +4106,13 @@ fn push_flow_line(
     let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
         return;
     };
+    // (found live 2026-09-06) The day file's own `{"_type":"schema",…}`
+    // header line is not a flow record — `for_each_flow_record_across_days`
+    // already skips it; this reader didn't, so `GET /flow/<date>` served it
+    // as record 0 (no `ts`, no `action`) on every day file that has one.
+    if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
+        return;
+    }
     let index = *next_index;
     *next_index += 1;
 

@@ -1226,6 +1226,51 @@
         assert_eq!(records[0]["session_id"], "S1");
     }
 
+    /// (found live 2026-09-06) `meta` must stamp the consumer-side scan
+    /// cost — `scan_ms`, `days_scanned`, `records_scanned` — the same way
+    /// the producer side already stamps `sampler_cost_ms`/
+    /// `liveness_probe_ms`. `days_scanned` must equal the BOUNDED day
+    /// count the host-sample join actually opened, not the total day
+    /// files on the machine — three day files exist here, but the run's
+    /// own window sits in exactly one.
+    #[tokio::test]
+    async fn flow_session_meta_stamps_the_bounded_scan_cost() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("2026-05-11.jsonl"),
+            "{\"ts\":\"2026-05-11T10:00:00Z\",\"action\":\"machine.telemetry\",\"machine_uid\":\"m-1\",\"payload\":{\"cpu\":1}}\n",
+        ).unwrap();
+        fs::write(
+            tmp.path().join("2026-05-12.jsonl"),
+            "{\"ts\":\"2026-05-12T10:00:00Z\",\"action\":\"dispatch.start\",\"session_id\":\"S1\",\"machine_uid\":\"m-1\"}\n\
+             {\"ts\":\"2026-05-12T10:00:05Z\",\"action\":\"machine.telemetry\",\"machine_uid\":\"m-1\",\"payload\":{\"cpu\":2}}\n\
+             {\"ts\":\"2026-05-12T10:00:10Z\",\"action\":\"dispatch.complete\",\"session_id\":\"S1\",\"machine_uid\":\"m-1\"}\n",
+        ).unwrap();
+        fs::write(
+            tmp.path().join("2026-05-13.jsonl"),
+            "{\"ts\":\"2026-05-13T10:00:00Z\",\"action\":\"machine.telemetry\",\"machine_uid\":\"m-1\",\"payload\":{\"cpu\":3}}\n",
+        ).unwrap();
+        let app = build_router_local(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(Request::builder().uri("/flow-session/S1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let meta = &json["meta"];
+        assert!(meta["scan_ms"].is_u64(), "scan_ms must be present: {meta}");
+        assert!(meta["records_scanned"].is_u64(), "records_scanned must be present: {meta}");
+        assert_eq!(
+            meta["days_scanned"], 1,
+            "the run's window sits entirely in 2026-05-12 — the 05-11/05-13 files must not be opened: {meta}"
+        );
+        let telemetry: Vec<&serde_json::Value> =
+            json["records"].as_array().unwrap().iter().filter(|r| r["action"] == "machine.telemetry").collect();
+        assert_eq!(telemetry.len(), 1, "only the in-window, same-day sample joins: {:?}", json["records"]);
+        assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(2));
+    }
+
     #[tokio::test]
     async fn flow_catalog_rejects_invalid_id() {
         let tmp = TempDir::new().unwrap();
@@ -1313,10 +1358,12 @@
 
         let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
         let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        // Every non-empty JSON line is parsed (schema header + the record);
-        // the viewer's adapter ignores non-record entries downstream.
+        // (found live 2026-09-06) The day file's `{"_type":"schema",…}`
+        // header line is NOT a flow record — `push_flow_line` now skips it,
+        // same as `for_each_flow_record_across_days` always has, so it no
+        // longer shows up as a headerless "record 0" in this response.
         let items = arr.as_array().expect("expected a JSON array");
-        assert_eq!(items.len(), 2, "schema header line + one record");
+        assert_eq!(items.len(), 1, "the schema header is excluded — only the real record remains");
         assert!(
             items.iter().any(|r| r["handle"] == "test"),
             "the dispatch record should be present: {arr}"
@@ -2620,6 +2667,29 @@
                 (total - MAX_FLOW_FILE_RECORDS) as u64
             );
             assert_eq!(records.last().unwrap()["n"].as_u64().unwrap(), (total - 1) as u64);
+        }
+
+        /// (found live 2026-09-06) A day file's own `{"_type":"schema",…}`
+        /// header line is not a flow record — `for_each_flow_record_across_days`
+        /// already skipped it, but `push_flow_line` (the reader behind
+        /// `GET /flow/<date>`) did not, so it surfaced as a headerless
+        /// "record 0" with no `ts`/`action`.
+        #[tokio::test]
+        async fn flow_file_read_skips_the_schema_header_line() {
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            fs::write(
+                tmp.path().join(format!("{today}.jsonl")),
+                format!(
+                    "{{\"_type\":\"schema\",\"version\":\"1.0.0\"}}\n\
+                     {{\"ts\":\"{today}T00:00:00Z\",\"action\":\"dispatch.start\",\"session_id\":\"s1\"}}\n"
+                ),
+            )
+            .unwrap();
+
+            let records = read_flow_records_from_file(&today, tmp.path()).await;
+            assert_eq!(records.len(), 1, "the schema header must not count as a record: {records:?}");
+            assert_eq!(records[0]["action"], "dispatch.start");
         }
 
         /// (#2409) Cross-system contract 2 (dispatch liveness): the
@@ -5723,6 +5793,66 @@ const ROUTED_ICON_PATHS: &[&str] = &[
     "/apple-touch-icon.png",
 ];
 
+// ─── for_each_flow_record_in_day_range ───────────────────────────────────
+
+#[test]
+fn for_each_flow_record_in_day_range_bounds_to_the_window_days() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("2026-01-01.jsonl"), "{\"action\":\"a\",\"ts\":\"2026-01-01T00:00:00Z\"}\n").unwrap();
+    fs::write(tmp.path().join("2026-01-02.jsonl"), "{\"action\":\"b\",\"ts\":\"2026-01-02T00:00:00Z\"}\n").unwrap();
+    fs::write(tmp.path().join("2026-01-03.jsonl"), "{\"action\":\"c\",\"ts\":\"2026-01-03T00:00:00Z\"}\n").unwrap();
+
+    let mut seen_dates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let files_scanned = for_each_flow_record_in_day_range(tmp.path(), "2026-01-02", "2026-01-02", |date, _v| {
+        seen_dates.insert(date.to_string());
+        std::ops::ControlFlow::Continue(())
+    });
+    assert_eq!(
+        seen_dates,
+        std::collections::HashSet::from(["2026-01-02".to_string()]),
+        "only the middle day's file is walked"
+    );
+    assert_eq!(files_scanned, 1, "exactly one day file falls in the window");
+}
+
+#[test]
+fn for_each_flow_record_in_day_range_spans_a_midnight_boundary() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("2026-01-01.jsonl"), "{\"action\":\"a\",\"ts\":\"2026-01-01T23:59:00Z\"}\n").unwrap();
+    fs::write(tmp.path().join("2026-01-02.jsonl"), "{\"action\":\"b\",\"ts\":\"2026-01-02T00:01:00Z\"}\n").unwrap();
+    fs::write(tmp.path().join("2026-01-03.jsonl"), "{\"action\":\"c\",\"ts\":\"2026-01-03T00:00:00Z\"}\n").unwrap();
+
+    let mut seen_dates: Vec<String> = Vec::new();
+    let files_scanned = for_each_flow_record_in_day_range(tmp.path(), "2026-01-01", "2026-01-02", |date, _v| {
+        seen_dates.push(date.to_string());
+        std::ops::ControlFlow::Continue(())
+    });
+    seen_dates.sort();
+    assert_eq!(
+        seen_dates,
+        vec!["2026-01-01".to_string(), "2026-01-02".to_string()],
+        "a window spanning midnight opens exactly the two overlapping day files, never the third"
+    );
+    assert_eq!(files_scanned, 2);
+}
+
+#[test]
+fn for_each_flow_record_in_day_range_skips_the_schema_header_line() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("2026-01-01.jsonl"),
+        "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n{\"action\":\"a\",\"ts\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .unwrap();
+
+    let mut count = 0;
+    for_each_flow_record_in_day_range(tmp.path(), "2026-01-01", "2026-01-01", |_date, _v| {
+        count += 1;
+        std::ops::ControlFlow::Continue(())
+    });
+    assert_eq!(count, 1, "the schema header must not be visited as a record");
+}
+
 // ─── (#2413 M4) join_host_samples_into_session_records ──────────────────
 
 #[test]
@@ -5764,12 +5894,13 @@ fn join_host_samples_pulls_in_window_machine_telemetry_and_drops_out_of_window()
             "machine_uid": "m-1",
         }),
     ];
-    join_host_samples_into_session_records(tmp.path(), &[], &mut records);
+    let stats = join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
 
     let telemetry: Vec<&serde_json::Value> =
         records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
     assert_eq!(telemetry.len(), 1, "exactly the in-window, same-machine sample joins: {records:#?}");
     assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(42));
+    assert_eq!(stats.days_scanned, 1, "the run's whole window sits in one day file");
 }
 
 // (#2413 follow-up, found live 2026-09-06) The crew and the CLI emit the SPACED
@@ -5814,7 +5945,7 @@ fn join_host_samples_joins_when_the_bookends_use_the_spaced_spelling_production_
             "machine_uid": "m-1",
         }),
     ];
-    join_host_samples_into_session_records(tmp.path(), &[], &mut records);
+    join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
 
     let telemetry: Vec<&serde_json::Value> =
         records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
@@ -5831,17 +5962,75 @@ fn join_host_samples_is_a_noop_when_the_session_carries_no_machine_uid() {
         "session_id": "s-1",
     })];
     let before = records.clone();
-    join_host_samples_into_session_records(tmp.path(), &[], &mut records);
+    join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
     assert_eq!(records, before, "no machine_uid on any session record — nothing to join against");
 }
 
+// (live finding, 2026-09-06) `machine_uid` must come from the dispatch-START
+// record — the client (`ui/src/lenses/session/sessionRun.ts`) gates on that
+// same field. Picking "the first record carrying a machine_uid" reads
+// whichever record happens to sort first, which on a cross-machine record
+// set can be a DIFFERENT machine's record than the one that actually ran
+// this dispatch — windowing the join against the wrong machine and
+// silently dropping every real sample.
 #[test]
-fn join_host_samples_clamps_an_open_run_window_to_last_record_plus_staleness_allowance() {
+fn join_host_samples_windows_against_the_start_records_machine_not_just_the_first_seen() {
+    let tmp = TempDir::new().unwrap();
+    let day = "2026-01-01";
+    let contents = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:05Z", "action": "machine.telemetry",
+            "machine_uid": "m-real", "payload": {"cpu": 42},
+        }),
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:05Z", "action": "machine.telemetry",
+            "machine_uid": "m-other", "payload": {"cpu": 99},
+        }),
+    );
+    fs::write(tmp.path().join(format!("{day}.jsonl")), contents).unwrap();
+
+    let mut records = vec![
+        // An earlier-sorted, non-bookend record carrying a DIFFERENT
+        // machine_uid than the one that actually ran the dispatch.
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:00Z",
+            "action": "session.note",
+            "session_id": "s-1",
+            "machine_uid": "m-other",
+        }),
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:01Z",
+            "action": "dispatch.start",
+            "session_id": "s-1",
+            "machine_uid": "m-real",
+        }),
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:10Z",
+            "action": "dispatch.complete",
+            "session_id": "s-1",
+            "machine_uid": "m-real",
+        }),
+    ];
+    join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
+
+    let telemetry: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
+    assert_eq!(telemetry.len(), 1, "only the START record's own machine's sample joins: {records:#?}");
+    assert_eq!(telemetry[0]["machine_uid"], "m-real");
+}
+
+#[test]
+fn join_host_samples_grants_the_grace_window_when_the_run_is_still_recent_at_request_time() {
     // (#2413 round 3 CONSIDER 1) An open/abandoned run (no terminal yet)
     // must NOT join every later machine-scoped sample forever — before
     // this, `end_ms` fell back to `u64::MAX` on a missing terminal,
     // which would collect every sample ever written after this run's
-    // start, on this machine, for the rest of time.
+    // start, on this machine, for the rest of time. This test is the
+    // "not stale yet" branch: `now_ms` is comfortably inside
+    // `stale_after_ms()` of the run's last seen record, so the grace
+    // window still applies (see the sibling hard-clamp test below for the
+    // other branch).
     let tmp = TempDir::new().unwrap();
     let day = "2026-01-01";
     // Comfortably inside the staleness allowance after the run's last
@@ -5876,10 +6065,164 @@ fn join_host_samples_clamps_an_open_run_window_to_last_record_plus_staleness_all
             "machine_uid": "m-1",
         }),
     ];
-    join_host_samples_into_session_records(tmp.path(), &[], &mut records);
+    // 5s after the last-seen record — nowhere near `stale_after_ms()`.
+    let last_own_ms = super::runs::parse_flow_ts("2026-01-01T00:00:30Z").unwrap() * 1000;
+    let now_ms = last_own_ms + 5_000;
+    join_host_samples_into_session_records(tmp.path(), &[], &mut records, now_ms);
 
     let telemetry: Vec<&serde_json::Value> =
         records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
     assert_eq!(telemetry.len(), 1, "only the sample within the staleness allowance joins: {records:#?}");
     assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(11));
+}
+
+#[test]
+fn join_host_samples_hard_clamps_when_the_run_is_already_stale_at_request_time() {
+    // (live finding, 2026-09-06) If liveness has ALREADY given up on this
+    // run by the time the request lands (`now_ms` is more than
+    // `stale_after_ms()` past the run's last seen record — the same
+    // staleness `any_dispatch_live_locally` judges a bookend abandoned
+    // by), the grace window must NOT be granted: a dead run has no
+    // business absorbing the NEXT run's host samples on this machine.
+    let tmp = TempDir::new().unwrap();
+    let day = "2026-01-01";
+    // Would have joined under the OLD unconditional grace window.
+    let soon_after = serde_json::json!({
+        "ts": "2026-01-01T00:00:40Z",
+        "action": "machine.telemetry",
+        "machine_uid": "m-1",
+        "payload": {"cpu": 11},
+    });
+    let contents = format!("{soon_after}\n");
+    fs::write(tmp.path().join(format!("{day}.jsonl")), contents).unwrap();
+
+    let mut records = vec![
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:00Z",
+            "action": "dispatch.start",
+            "session_id": "s-open",
+            "machine_uid": "m-1",
+        }),
+        serde_json::json!({
+            "ts": "2026-01-01T00:00:30Z",
+            "action": "dispatch.turn.heartbeat",
+            "session_id": "s-open",
+            "machine_uid": "m-1",
+        }),
+    ];
+    let last_own_ms = super::runs::parse_flow_ts("2026-01-01T00:00:30Z").unwrap() * 1000;
+    // A full day past the last-seen record — comfortably past ANY
+    // reasonable `stale_after_ms()`.
+    let now_ms = last_own_ms + 24 * 60 * 60 * 1000;
+    join_host_samples_into_session_records(tmp.path(), &[], &mut records, now_ms);
+
+    let telemetry: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
+    assert!(
+        telemetry.is_empty(),
+        "a run already stale at request time must not absorb ANY later sample: {records:#?}"
+    );
+}
+
+// (found live 2026-09-06) Before bounding the local walk to the run's own
+// day range, the join scanned EVERY day file on the machine (108 files /
+// 181 MB measured live) regardless of how narrow `[start_ms, end_ms]` was.
+#[test]
+fn join_host_samples_bounds_the_local_scan_to_the_runs_own_day_range() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("2026-01-01.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ts": "2026-01-01T12:00:00Z", "action": "machine.telemetry",
+                "machine_uid": "m-1", "payload": {"cpu": 1},
+            })
+        ),
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("2026-01-02.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ts": "2026-01-02T00:00:05Z", "action": "machine.telemetry",
+                "machine_uid": "m-1", "payload": {"cpu": 2},
+            })
+        ),
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("2026-01-03.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ts": "2026-01-03T12:00:00Z", "action": "machine.telemetry",
+                "machine_uid": "m-1", "payload": {"cpu": 3},
+            })
+        ),
+    )
+    .unwrap();
+
+    let mut records = vec![
+        serde_json::json!({
+            "ts": "2026-01-02T00:00:00Z", "action": "dispatch.start",
+            "session_id": "s-1", "machine_uid": "m-1",
+        }),
+        serde_json::json!({
+            "ts": "2026-01-02T00:00:10Z", "action": "dispatch.complete",
+            "session_id": "s-1", "machine_uid": "m-1",
+        }),
+    ];
+    let stats = join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
+
+    let telemetry: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
+    assert_eq!(telemetry.len(), 1, "only the middle day's in-window sample joins: {records:#?}");
+    assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(2));
+    assert_eq!(stats.days_scanned, 1, "only the one day file the run's window falls in was opened");
+}
+
+#[test]
+fn join_host_samples_scans_both_days_when_the_run_spans_midnight() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("2026-01-01.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ts": "2026-01-01T23:59:30Z", "action": "machine.telemetry",
+                "machine_uid": "m-1", "payload": {"cpu": 1},
+            })
+        ),
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("2026-01-02.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ts": "2026-01-02T00:00:05Z", "action": "machine.telemetry",
+                "machine_uid": "m-1", "payload": {"cpu": 2},
+            })
+        ),
+    )
+    .unwrap();
+
+    let mut records = vec![
+        serde_json::json!({
+            "ts": "2026-01-01T23:59:00Z", "action": "dispatch.start",
+            "session_id": "s-1", "machine_uid": "m-1",
+        }),
+        serde_json::json!({
+            "ts": "2026-01-02T00:00:10Z", "action": "dispatch.complete",
+            "session_id": "s-1", "machine_uid": "m-1",
+        }),
+    ];
+    let stats = join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
+
+    let telemetry: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
+    assert_eq!(telemetry.len(), 2, "a run spanning midnight joins samples from both days: {records:#?}");
+    assert_eq!(stats.days_scanned, 2, "the run's window spans exactly the two overlapping day files");
 }

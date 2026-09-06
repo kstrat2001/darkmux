@@ -1861,9 +1861,10 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// The inverse of [`days_from_civil`] — a UTC civil date from days since
-/// the Unix epoch (same Howard Hinnant algorithm, public domain). Used only
-/// by [`cutoff_date_string`] to format the scan-window boundary as a
-/// `YYYY-MM-DD` day-file-name prefix.
+/// the Unix epoch (same Howard Hinnant algorithm, public domain). Used by
+/// [`cutoff_date_string`] to format the scan-window boundary as a
+/// `YYYY-MM-DD` day-file-name prefix, and by [`day_string_from_epoch_ms`]
+/// below for the same purpose from an arbitrary record timestamp.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
@@ -1876,6 +1877,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y = if m <= 2 { y + 1 } else { y };
     (y, m as u32, d as u32)
+}
+
+/// `YYYY-MM-DD` (UTC) day-file-name for an epoch-milliseconds timestamp —
+/// the same [`civil_from_days`] calendar math [`cutoff_date_string`] uses,
+/// exposed `pub(crate)` so `lib.rs`'s bounded day-range walker
+/// (`for_each_flow_record_in_day_range`) can compute a run's own
+/// `[start_ms, end_ms]` window as a day-file-name range without
+/// re-deriving the calendar algorithm.
+pub(crate) fn day_string_from_epoch_ms(ms: u64) -> String {
+    let days = (ms / 1000 / 86_400) as i64;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// (#2413 M4) Whether a raw flow record `v` is a `machine.telemetry`
