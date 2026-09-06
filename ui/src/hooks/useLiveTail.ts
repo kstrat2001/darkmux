@@ -108,7 +108,16 @@ async function reconcile(
 
 export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveTailStatus {
   const queryClient = useQueryClient();
-  const [status, setStatus] = useState<LiveTailStatus>("live");
+  // (2026-09-06, live review) Optimistic "live" before the stream has ever
+  // actually opened was a false claim in two shapes: a fresh mount reports
+  // "live" for the split second before the first `onOpen`, AND — the worse
+  // case — when `canStream` is false (no `EventSource`, no test factory)
+  // `openTail` is never called at all, so `onOpen` never fires and the
+  // status would stay "live" forever even though the polling backstop
+  // below is not a live stream. Starting pessimistic and only flipping to
+  // "live" on a real `onOpen` fixes both: a route where streaming is
+  // impossible now correctly reports "reconnecting" for its whole life.
+  const [status, setStatus] = useState<LiveTailStatus>("reconnecting");
   const { eventSourceFactory, fetchImpl, tickMs } = deps;
 
   useEffect(() => {

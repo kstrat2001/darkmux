@@ -320,6 +320,65 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
     vi.useRealTimers();
   });
 
+  it("(b3) live + reconnecting: a stream flapping faster than the hold still announces \"reconnecting\", via accumulated down-time rather than a per-flip debounce", () => {
+    // A naive setTimeout-per-transition debounce restarts on every flip
+    // back to "live" — 25 cycles of 1.2s down / 0.2s up never holds
+    // continuously for RECONNECTING_ANNOUNCE_DELAY_MS (1.5s) in either
+    // direction, so it would never announce anything even though the dot
+    // visibly flips the whole time. The fix latches on cumulative
+    // non-live time instead: two down segments (1.2s + 0.3s) sum past the
+    // 1.5s hold even though neither alone reaches it.
+    vi.useFakeTimers();
+    const queryClient = () => new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container, rerender } = renderMasthead({ kind: "fleet" } as Route, "reconnecting");
+    const readAnnounced = () => container.querySelector(".catalog-toggle")!.querySelector('[aria-live="polite"]')!.textContent;
+    const setStatus = (liveStatus: "live" | "reconnecting") =>
+      rerender(
+        <QueryClientProvider client={queryClient()}>
+          <Masthead route={{ kind: "fleet" } as Route} liveStatus={liveStatus} replayDate={null} />
+        </QueryClientProvider>,
+      );
+
+    // Step in 100ms increments (rather than jumping the full 1.2s/0.2s
+    // segment in one advance) so the measured crossing time is accurate —
+    // a coarse jump would overcount by up to a full segment.
+    const STEP_MS = 100;
+    let elapsedMs = 0;
+    outer: for (let cycle = 0; cycle < 25; cycle++) {
+      setStatus("reconnecting");
+      for (let t = 0; t < 1200; t += STEP_MS) {
+        act(() => {
+          vi.advanceTimersByTime(STEP_MS);
+        });
+        elapsedMs += STEP_MS;
+        if (readAnnounced() === "reconnecting") break outer;
+      }
+      setStatus("live");
+      for (let t = 0; t < 200; t += STEP_MS) {
+        act(() => {
+          vi.advanceTimersByTime(STEP_MS);
+        });
+        elapsedMs += STEP_MS;
+      }
+    }
+
+    expect(readAnnounced()).toBe("reconnecting");
+    // "within ~2s" per the review brief — two down segments (2.4s of raw
+    // down-time) comfortably cross the 1.5s hold well before 25 full
+    // cycles (35s) would otherwise elapse.
+    expect(elapsedMs).toBeLessThanOrEqual(2000);
+
+    // (b4) Recovery: once "reconnecting" is announced, only a FULL
+    // RECONNECTING_ANNOUNCE_DELAY_MS of continuous live re-arms the latch
+    // and announces "live" again.
+    setStatus("live");
+    act(() => {
+      vi.advanceTimersByTime(RECONNECTING_ANNOUNCE_DELAY_MS);
+    });
+    expect(readAnnounced()).toBe("live");
+    vi.useRealTimers();
+  });
+
   it("(c) mission replay: the pill shows the mission id and the replay glyph, no dot", () => {
     const { container } = renderMasthead(
       { kind: "mission", missionId: "review-1785400940-136e76", stepId: null } as Route,

@@ -138,6 +138,22 @@ function clampPct(pct: number): number {
   return Math.max(MIN_OPEN_PCT, Math.min(MAX_OPEN_PCT, pct));
 }
 
+/** The persisted height, sanitized for RESTORE — deliberately not just
+ * `clampPct(stored ?? DEFAULT_OPEN_PCT)`. The drag path (below) refuses to
+ * leave the sheet open anywhere at or under `CLOSE_SNAP_PCT` — releasing
+ * that low snaps fully closed instead. So a stored value in that range is
+ * not a height the interaction path could ever have produced; it's stale
+ * data (an old default, a manual edit, a future format change) and gets
+ * treated exactly like "nothing stored" rather than restored as a sliver
+ * the operator could never have dragged to on purpose. A stored value
+ * above `MAX_OPEN_PCT` still clamps down to it, same as `clampPct`'s
+ * general ceiling — only the FLOOR behavior differs from a plain clamp. */
+function loadInitialOpenPct(): number {
+  const stored = loadDrawerHeightPct();
+  if (stored == null || stored <= CLOSE_SNAP_PCT) return DEFAULT_OPEN_PCT;
+  return Math.min(MAX_OPEN_PCT, stored);
+}
+
 /** (#2108, operator finding — real device, masthead still covered) The
  * previous fix wrapped the open height in CSS `min(${openPct}vh,
  * calc(100vh - var(--masthead-h) - 8px))` — measured correctly under
@@ -223,9 +239,7 @@ export function PhoneDrawer({
   // whenever the two tabs' stored heights differed, which read as a
   // glitch. `lib/drawerStorage.ts`'s own doc has the full story; this
   // state is never re-derived from `activeTab` again after mount.
-  const [openPct, setOpenPct] = useState<number>(
-    () => clampPct(loadDrawerHeightPct() ?? DEFAULT_OPEN_PCT),
-  );
+  const [openPct, setOpenPct] = useState<number>(() => loadInitialOpenPct());
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef<{
     startY: number;

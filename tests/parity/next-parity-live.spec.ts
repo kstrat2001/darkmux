@@ -32,21 +32,32 @@
 //    the "an SSE record lands" test below: it seeds an EMPTY first response
 //    (closes immediately, and the reconnect is what carries the real
 //    record) rather than fighting the mechanism.
-// 2. For tests that just need a STABLE "connected" badge with no message
-//    traffic (render-sanity, date-rollover), the trick above is the wrong
-//    tool — a reconnect storm would just be noise. Instead, those routes
-//    NEVER resolve the request at all (`await new Promise(() => {})`
-//    inside the handler). A pending request never gets response headers, so
-//    the browser's `EventSource` never reaches `onopen` OR `onerror` — it
-//    just sits in `CONNECTING`. `useLiveTail`'s badge status starts at
-//    `"live"` and only changes on one of those two callbacks (see that
-//    hook's own doc for why — it mirrors legacy's `setBadges()` setting
-//    "● live" BEFORE `startLiveTail` even runs), so a permanently-pending
-//    request is the closest honest approximation this harness has to "a
-//    real daemon's stream that's open and simply has nothing to say yet."
-//    `page.on("request", ...)` still fires the instant the request is
-//    DISPATCHED (not when it resolves), so request-arrival assertions
-//    (which date a stream opened against) are unaffected by the hang.
+// 2. For tests that just need a STABLE, side-effect-free stream with no
+//    message traffic (render-sanity, date-rollover), the trick above is
+//    the wrong tool — a reconnect storm would just be noise. Instead,
+//    those routes NEVER resolve the request at all (`await new Promise(()
+//    => {})` inside the handler). A pending request never gets response
+//    headers, so the browser's `EventSource` never reaches `onopen` OR
+//    `onerror` — it just sits in `CONNECTING`. (2026-09-06: `useLiveTail`'s
+//    status USED to start at `"live"` and stay there through this hang —
+//    mirroring legacy's `setBadges()` setting "● live" BEFORE
+//    `startLiveTail` even ran — which made a permanently-pending request
+//    read as a passable approximation of "a real daemon's stream that's
+//    open and simply has nothing to say yet." That optimism was itself
+//    dishonest: a connection genuinely stuck in `CONNECTING` has NOT
+//    opened, and reporting "live" over it is exactly the false-positive
+//    the pill's honesty is supposed to rule out — see `useLiveTail.ts`'s
+//    own doc. The hook now starts at `"reconnecting"` and only flips to
+//    `"live"` on a real `onOpen`, so a permanently-pending request now
+//    correctly stays `"reconnecting"` for its whole life; the two tests
+//    below that use this trick assert that stayed-`"reconnecting"` state
+//    directly, rather than a `"live"` badge this mock cannot honestly
+//    produce.) `page.on("request", ...)` still fires the instant the
+//    request is DISPATCHED (not when it resolves), so request-arrival
+//    assertions (which date a stream opened against) are unaffected by
+//    the hang — and are what those two tests now use to confirm the
+//    stream actually attempted to open, in place of waiting on a "live"
+//    pill that this mock structurally cannot produce.
 const { test, expect } = require("@playwright/test");
 const { installFrozenClock, installControllableClock, regionText } = require("./lib/extract-lens.js");
 const { loadMeta, installCorpusRoutes, installBlankRoutes } = require("./lib/mock-routes.js");
@@ -252,20 +263,31 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
     await expect(page.locator(".masthead__pilldot")).toHaveAttribute("title", "reconnecting");
   });
 
-  test("render-sanity: zero pageerror, zero console.error, with the live stream connected (pending, per the module doc)", async ({ page }) => {
+  test("render-sanity: zero pageerror, zero console.error, with the stream request pending (per the module doc — a stuck CONNECTING honestly stays reconnecting)", async ({ page }) => {
     const meta = loadMeta();
     await installFrozenClock(page, meta.frozen_clock_ms);
     installCorpusRoutes(page, meta);
     await installHangingStream(page, (p) => p === `/flow/${meta.captured_date}/stream`);
     const pageErrors = [];
     const consoleErrors = [];
+    const seenStreamDates = new Set();
     page.on("pageerror", (e) => pageErrors.push(String(e)));
     page.on("console", (msg) => {
       if (msg.type() === "error") consoleErrors.push(msg.text());
     });
+    page.on("request", (r) => {
+      const m = new URL(r.url()).pathname.match(/^\/flow\/(\d{4}-\d{2}-\d{2})\/stream$/);
+      if (m) seenStreamDates.add(m[1]);
+    });
 
     await page.goto("/index.html");
-    await expect(page.locator(".masthead__pilldot")).toHaveClass(/\blive\b/, { timeout: 15000 });
+    // (2026-09-06) The stream request never resolves (see the module doc),
+    // so `onOpen` never fires — the pill honestly stays `reconnecting` for
+    // this test's whole life, it never claims `live` over a connection
+    // still stuck in `CONNECTING`. Confirming the boot actually happened
+    // now goes through the request having been DISPATCHED, not the pill.
+    await expect.poll(() => seenStreamDates.has(meta.captured_date), { timeout: 15000 }).toBe(true);
+    await expect(page.locator(".masthead__pilldot")).toHaveClass(/\bstale\b/);
 
     expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
     expect(consoleErrors, `console.error events: ${consoleErrors.join("; ")}`).toHaveLength(0);
@@ -289,8 +311,12 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
     });
 
     await page.goto("/index.html");
-    await expect(page.locator(".masthead__pilldot")).toHaveClass(/\blive\b/, { timeout: 15000 });
-    expect(seenStreamDates.has(meta.captured_date), "the initial stream must open against the captured day").toBe(true);
+    // (2026-09-06) The stream request never resolves (see the module doc),
+    // so the pill honestly stays `reconnecting` rather than claiming
+    // `live` over a connection stuck in `CONNECTING` — confirming the
+    // initial stream attempt now polls the request itself, same as the
+    // render-sanity test above.
+    await expect.poll(() => seenStreamDates.has(meta.captured_date), { timeout: 15000 }).toBe(true);
 
     // Jump the frozen clock's `Date.now()` straight across UTC midnight
     // WITHOUT firing any of the intermediate 5s ticks (`setSystemTime` sets

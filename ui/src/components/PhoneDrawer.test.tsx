@@ -230,19 +230,17 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("a stored height outside the drag range is clamped on load instead of trusted", () => {
+  it("a stored height outside the drag range is clamped or floored on load instead of trusted", () => {
     // (operator finding on a real phone, 2026-09-05) A persisted value
     // the drag logic could never have produced (a stale build's per-tab
     // key, a save taken against a keyboard-shrunk viewport, a hand
     // edit) opened the sheet at a height the layout wasn't designed
     // for — the Machine tab's content sat ~180px below the tab row and
-    // the sheet read as "won't open". `openPct` is clamped through the
-    // same `clampPct` the drag uses, so a stored 300 opens at
+    // the sheet read as "won't open". A stored 300 clamps down to
     // MAX_OPEN_PCT (90): `openHeightPx(90, 768, 64)` = min(691.2, 696)
-    // = 691.2, and a stored 3 opens at MIN_OPEN_PCT (14): 0.14*768 =
-    // 107.52.
+    // = 691.2.
     window.localStorage.setItem("dmux.phone-drawer.height", "300");
-    const { unmount } = render(
+    const { unmount: unmount1 } = render(
       <PhoneDrawer
         machineTab={NOOP_MACHINE_TAB}
         events={NO_EVENTS}
@@ -257,8 +255,39 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
       '[data-act="phone-drawer"]',
     ) as HTMLElement;
     expect(parseFloat(sheet.style.height)).toBeCloseTo(691.2, 5);
-    unmount();
+    unmount1();
+
+    // (2026-09-06, live review) A stored value AT OR BELOW `CLOSE_SNAP_PCT`
+    // (20) is not a height the drag path could ever have produced —
+    // releasing that low snaps the sheet fully CLOSED, it never leaves a
+    // sliver pinned open. Restoring a stored 3 by simply clamping it to
+    // `MIN_OPEN_PCT` (14, as this test used to assert) opened a 41px
+    // sliver the drag path would have closed instead. It now falls back
+    // to `DEFAULT_OPEN_PCT` (88) exactly as if nothing were stored:
+    // `openHeightPx(88, 768, 64)` = min(675.84, 696) = 675.84.
     window.localStorage.setItem("dmux.phone-drawer.height", "3");
+    const { unmount: unmount2 } = render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    sheet = document.querySelector(
+      '[data-act="phone-drawer"]',
+    ) as HTMLElement;
+    expect(parseFloat(sheet.style.height)).toBeCloseTo(675.84, 5);
+    unmount2();
+
+    // A stored value just ABOVE the floor (21, one past `CLOSE_SNAP_PCT`)
+    // IS a height the drag path could have produced (releasing at 21%
+    // stays open, per the snap-shut test above), so it restores verbatim:
+    // `openHeightPx(21, 768, 64)` = min(161.28, 696) = 161.28.
+    window.localStorage.setItem("dmux.phone-drawer.height", "21");
     render(
       <PhoneDrawer
         machineTab={NOOP_MACHINE_TAB}
@@ -273,7 +302,7 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     sheet = document.querySelector(
       '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    expect(parseFloat(sheet.style.height)).toBeCloseTo(107.52, 5);
+    expect(parseFloat(sheet.style.height)).toBeCloseTo(161.28, 5);
   });
 
   /** Drives the handle with CONTROLLED clock samples so the drag's
