@@ -1037,6 +1037,41 @@ fn the_summary_names_the_rule_whose_plan_step_errored() {
     assert_eq!(s.plans_errored, vec!["swallowed-error".to_string()], "{:?}", s.plans_errored);
 }
 
+/// (#2406) The `review` config mints its plan step under `plan.sites`
+/// (`plan_sites_step::PLAN_SITES_KIND`), not `crawl.plan`. Before this fix,
+/// `summarize_mission` only ever filtered on `CRAWL_PLAN_KIND`, so a
+/// `review` run whose `plan.sites` step errored closed with an empty
+/// `plans_errored` — a clean-planning claim — while `records.gather`
+/// (which already matches both kinds) reported the same step as failed.
+/// Same fixture as the test above, `plan.sites` kind instead of
+/// `crawl.plan`.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn the_summary_names_the_rule_whose_plan_sites_step_errored() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    darkmux_crew::lifecycle::save_step(
+        MISSION,
+        PHASE,
+        &Step {
+            id: "plan-swallowed-error-step".into(),
+            task_id: "plan-swallowed-error".into(),
+            kind: crate::crawl::plan_sites_step::PLAN_SITES_KIND.into(),
+            gate: None,
+            status: NodeStatus::Error,
+            config: serde_json::json!({ "rule": "swallowed-error" }),
+            started_ts: None,
+            completed_ts: None,
+            output: Some("workspace_spec::materialize failed: no such source".into()),
+        },
+    )
+    .unwrap();
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.plans_errored, vec!["swallowed-error".to_string()], "{:?}", s.plans_errored);
+}
+
 // ── the kinds through the REAL scheduler (#2301 review) ──────────────────
 //
 // `with_dispatch` had no caller outside the per-kind unit tests, so nothing

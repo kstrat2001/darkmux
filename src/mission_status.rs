@@ -129,12 +129,62 @@ fn panel_deep_link(link_base: &str, target: &str) -> Option<String> {
 ///
 /// Falls back to the id when a description is genuinely absent — an id is a
 /// poor label but never a wrong one.
-fn display_label(m: &Mission) -> &str {
+///
+/// (#2406 CONSIDER 6) For a CONFIG-launched mission (`review`, `crawl`,
+/// `coder-phase`, …) `m.description` is never actually operator prose: the
+/// generic launcher's mint site
+/// (`mission_launch::ensure_mission_and_phases_with_provenance_and_start_payload`)
+/// always passes `None` for its own per-launch `description` parameter, so
+/// `Mission.description` resolves to `config.description` — the config
+/// document's own ~200-word explanation of what the launcher does, meant to
+/// be read once in `mission config show`, not truncated into a board title.
+/// A live `review` board read that whole paragraph, ellipsized to a handful
+/// of words, as the row's name — never "Review." `config_title` resolves
+/// the ACTUAL config's declared `name` field instead, when the mission's
+/// `spec.config_id` names one; falls through to the description-based
+/// lookup for anything without a resolvable config (a `dispatch <role>`
+/// crew-of-one, or a hand-authored mission), which is exactly the shape the
+/// two-measured-shapes doc above already covers correctly.
+fn display_label(m: &Mission) -> String {
+    if let Some(name) = config_title(m) {
+        return name;
+    }
     let d = m.description.trim();
     if d.is_empty() {
-        return &m.id;
+        return m.id.clone();
     }
-    d.strip_prefix("dispatch: ").unwrap_or(d)
+    d.strip_prefix("dispatch: ").unwrap_or(d).to_string()
+}
+
+/// (#2406 CONSIDER 6) The originating `MissionConfig`'s declared `name`
+/// (e.g. `"Review"`), when `m` was minted from one. `None` for anything
+/// without a resolvable config — a `dispatch <role>` crew-of-one names its
+/// `spec.config_id` `"dispatch"`, which is not a loadable config id, so
+/// `mission_config::load::load` refuses it and this returns `None`,
+/// leaving `display_label` on its existing description-based path.
+fn config_title(m: &Mission) -> Option<String> {
+    let config_id = m.spec.as_ref()?.config_id.as_str();
+    crew::mission_config::load::load(config_id).ok().map(|lc| lc.config.name)
+}
+
+/// (#2406 CONSIDER 6) The mission's own `description` as a one-line note,
+/// printed BENEATH the title row — only when `config_title` already won the
+/// title above, so this is never a second copy of the same text. Truncated
+/// to its first sentence: `review.json`'s description runs to roughly 200
+/// words of launcher documentation, and printing it whole on every row would
+/// reintroduce the exact wall-of-text this fix exists to keep off the
+/// board.
+fn description_note(m: &Mission) -> Option<String> {
+    config_title(m)?; // description is already the title; no second line
+    let d = m.description.trim();
+    if d.is_empty() {
+        return None;
+    }
+    let sentence = d.split(['.', '\n']).next().unwrap_or(d).trim();
+    if sentence.is_empty() {
+        return None;
+    }
+    Some(format!("{sentence}."))
 }
 
 /// (#1612) Single-role dispatch vs multi-phase graph, in one column-safe glyph.
@@ -224,9 +274,12 @@ fn relative_age(now: u64, then: u64) -> String {
 ///   - (#1230 Packet 5) an ACTIVE mission with ZERO complete phases whose
 ///     `started_ts` is older than `stale_days` — the `doom-loop-m4` case
 ///     (0/4 phases for ~20 days, no drift surfaced by either check above).
-///   - (#1230 Packet 5, revised #1341 for linear phases) a PLANNED phase
-///     with an earlier-in-mission-order Abandoned phase — permanently
-///     stuck even though the phase itself is still Planned.
+///
+/// (#2406) The former third bullet here — a PLANNED phase with an
+/// earlier-in-mission-order Abandoned phase, flagged "can never run" — is
+/// RETIRED: see `unreachable_phase_drifts`'s doc comment (kept in place as
+/// a marker of what was removed and why) for the real mission that proved
+/// the linear-order assumption false.
 ///
 /// (#1463) The old "CLOSED mission with a non-terminal phase" arm RETIRED:
 /// `mission finalize` / `mission abort` now reconcile EVERY phase to a
@@ -262,7 +315,8 @@ fn detect_drift(
         out.push(d);
     }
 
-    out.extend(unreachable_phase_drifts(m, phases));
+    // (#2406) `unreachable_phase_drifts` retired — see its doc comment
+    // above for why the phase-order heuristic it used was simply wrong.
     out.extend(live_step_drifts(m, phases, live_steps));
 
     out
@@ -414,113 +468,37 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
     })
 }
 
-/// A Planned phase that can never legally run because an EARLIER phase in
-/// `Mission.phase_ids` order was Abandoned. (#1341) Phases are strictly
-/// linear now — no `depends_on` graph to walk (`reachable`/`PhaseNode` are
-/// gone) — so this is a linear scan: any phase abandoned before this one's
-/// position permanently blocks it (a strictly linear list has no
-/// alternate path around a dead predecessor, unlike the old DAG shape).
-/// This is the `doom-loop-m4` signal: `validate-cure` is still Planned but
-/// can never legally run because an earlier phase was abandoned.
-fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
-    let phase_by_id: BTreeMap<&str, &&Phase> = phases.iter().map(|p| (p.id.as_str(), p)).collect();
-
-    let mut blocked: Vec<&str> = Vec::new();
-    // Non-terminal phases that are NOT blocked — the ones a whole-mission
-    // abort would destroy that the per-phase teardown would spare. Whether
-    // any exist decides whether the bare-abort caveat below is a real warning
-    // or noise (see its comment).
-    //
-    // A RUNNING phase positioned after the abandoned ancestor counts as
-    // salvageable, which is deliberate and NOT an oversight of the linearity
-    // rule: strict linearity (#1341) is this detector's heuristic, not a
-    // lifecycle invariant — `lifecycle::phase_start` has no ancestor gate, so
-    // a Running phase there is genuinely live work, and `mission abort` is
-    // exactly what would reconcile it to Abandoned. It is real collateral, so
-    // the caveat must count it. (Only PLANNED phases after the dead ancestor
-    // are treated as blocked, which is what keeps the two sets disjoint.)
-    let mut salvageable = 0usize;
-    let mut dead_ancestor = false;
-    for phase_id in &m.phase_ids {
-        let Some(phase) = phase_by_id.get(phase_id.as_str()) else { continue };
-        let live = matches!(phase.status, PhaseStatus::Planned | PhaseStatus::Running);
-        if dead_ancestor && phase.status == PhaseStatus::Planned {
-            blocked.push(phase.id.as_str());
-        } else if live {
-            salvageable += 1;
-        }
-        if phase.status == PhaseStatus::Abandoned {
-            dead_ancestor = true;
-        }
-    }
-    if blocked.is_empty() {
-        return Vec::new();
-    }
-
-    // (#1582) ONE drift for the whole situation, not one per blocked phase.
-    // Every sibling shared the same abandoned ancestor and so emitted the
-    // same four lines of rationale verbatim — on a real board that was ~8 of
-    // 21 default lines saying nothing new. The rationale is the same fact
-    // whether one phase or five are blocked, so it is stated once in
-    // `detail`; the per-phase specifics ride the `suggest` list, where each
-    // command already gets its own line and the never-wrapped verbatim
-    // treatment.
-    //
-    // This deliberately narrows `--json`'s drift array from N entries to 1
-    // for this kind. That is the more accurate model — it is one problem
-    // with N instances, not N problems — and the per-phase detail is not
-    // lost: it is in `detail` and in one `suggest` entry per phase. Nothing
-    // counts drift ENTRIES (the attention rollup counts missions carrying
-    // any drift), so no consumer's arithmetic changes.
-    let names = blocked.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ");
-    let subject = if blocked.len() == 1 {
-        format!("phase {names} can never run")
-    } else {
-        format!("{n} phases can never run ({names})", n = blocked.len())
-    };
-    // (#1463 CONSIDER 5, re-scoped by #1582) This line distinguishes two
-    // commands rather than forbidding one. `stale-active` can fire on the
-    // SAME mission and offer `mission abort <id>` as a copyable command, so
-    // phrasing this as a prohibition made the board warn against a command it
-    // was simultaneously recommending. They are not in conflict — they answer
-    // different questions ("give up on this mission" vs "unblock it") — and
-    // saying so is what makes both readable together.
-    //
-    // It stays prose, and the whole-mission abort never becomes a copyable
-    // `→` line HERE: this drift's own recommendation is the per-phase
-    // teardown, and offering both as commands would just restate the
-    // ambiguity it exists to resolve.
-    //
-    // With nothing salvageable the distinction is vacuous — the two commands
-    // would destroy exactly the same work — so the line is dropped entirely
-    // rather than printed as a difference that makes no difference.
-    let caveat = if salvageable > 0 {
-        format!(
-            ". A bare `darkmux mission abort {mid}` ends the WHOLE mission, including \
-             {salvageable} {phase} that can still run — scope it per-phase instead if you \
-             intend to keep this mission going",
-            mid = m.id,
-            phase = if salvageable == 1 { "phase" } else { "phases" }
-        )
-    } else {
-        String::new()
-    };
-    let detail = format!(
-        "{subject} — an earlier phase in this mission was abandoned{caveat}. The mission closes \
-         on its own once every phase is terminal"
-    );
-
-    // No per-command rationale: `detail` just said what these are for, and
-    // repeating "abandon just this blocked phase" once per sibling would
-    // reintroduce the duplication this drift was collapsed to remove — the
-    // same defect one level down.
-    let suggest: Vec<String> = blocked
-        .iter()
-        .map(|pid| format!("darkmux mission abort {mid} --phase {pid}", mid = m.id))
-        .collect();
-
-    vec![Drift { kind: "unreachable-phase", detail, suggest }]
-}
+// RETIRED (#2406). `unreachable_phase_drifts` used to flag any Planned
+// phase sitting after an Abandoned one, on the theory that phases gate
+// strictly linearly by `Mission.phase_ids` order — and it suggested a
+// copy-pasteable `mission abort <id> --phase <blocked>` to tear the "dead"
+// phase down.
+//
+// That theory is false. The launcher gates a phase's TASKS only by their
+// own `depends_on`/`run_on` declarations (see `scheduler::stranded_reason`
+// and `mission_launch::lazy_close_prior_phases`), which are per-TASK and
+// document-wide, not "every phase depends on every phase before it in
+// sequence." A real run (`review-1788656497-cf872b`, filed against this
+// issue) had `review` Abandoned and `deliver` sitting Planned for 545s —
+// completely legally, since `deliver`'s tasks named no dependency inside
+// `review` — and this rule told the operator `deliver` "can never run"
+// with a command that would have aborted it mid-flight. An operator who
+// trusted the suggestion would have destroyed a delivery that was, in
+// fact, about to complete.
+//
+// A correct replacement would need to mirror the scheduler's own
+// reachability computation: load EVERY task across the WHOLE mission
+// (`depends_on` ids are document-wide, not phase-scoped), derive each
+// dependency's status from its steps, and evaluate `run_on` acceptance —
+// substantial production logic this read-only reporting module has no
+// business re-deriving from a snapshot of `Mission`+`Phase` records alone
+// (this module doesn't even load `Task`s today). Duplicating that logic
+// here risks the exact same class of bug — a false confident answer to a
+// question the board doesn't actually have enough data to answer — so
+// per the #2406 decision this drift is deleted outright rather than
+// reimplemented against phase order. If a real gating signal becomes
+// available from the mission store alone (e.g. a persisted reachability
+// verdict written by the scheduler itself), reintroduce it keyed on that.
 
 /// Entry from main.rs's dispatch. `--json` emits a structured board for the
 /// frontier / CI; otherwise a grouped, colorized human board ending with the
@@ -682,7 +660,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         for v in g.iter().take(shown) {
             let prog = format!("{}/{}", v.complete, v.total);
             let bar = progress_bar(v.complete, v.total);
-            let name = ellipsize(display_label(v.m), layout.name_width);
+            let name = ellipsize(&display_label(v.m), layout.name_width);
             // (#1569 packet A) Pad BEFORE linking, and by the VISIBLE width:
             // `{:<width$}` counts the OSC 8 escape bytes, so formatting a
             // linkified name would silently destroy the column alignment the
@@ -743,6 +721,12 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             // folded into the "N of M steps minted" arithmetic above.
             if let Some(line) = v.graph.as_ref().and_then(|g| g.grown_line()) {
                 println!("      {} {}", style::dim("·"), style::dim(&format!("graph: {line}")));
+            }
+            // (#2406 CONSIDER 6) The description, when the row's title above
+            // came from the config's `name` instead — one dim line, one
+            // sentence, never the whole ~200-word document.
+            if let Some(note) = description_note(v.m) {
+                println!("      {} {}", style::dim("·"), style::dim(&note));
             }
             for d in &v.drifts {
                 // The ⚠ marks the warning, not each of its lines — continuation
@@ -1552,7 +1536,7 @@ mod tests {
     fn render_row(v: &MissionView, layout: &Layout) -> String {
         let prog = format!("{}/{}", v.complete, v.total);
         let bar = progress_bar(v.complete, v.total);
-        let name = ellipsize(display_label(v.m), layout.name_width);
+        let name = ellipsize(&display_label(v.m), layout.name_width);
         let handle = if layout.show_handle {
             let h = short_handle(&v.m.id).unwrap_or("");
             format!("  {:<width$}", h, width = layout.handle_width)
@@ -1678,6 +1662,67 @@ mod tests {
         // No description at all: an id is a poor label, never a wrong one.
         m.description = "   ".into();
         assert_eq!(display_label(&m), "dispatch-code-reviewer-1785589698-5d6a-0");
+    }
+
+    /// (#2406 CONSIDER 6) A `review`-launched mission's `description` is the
+    /// config's own ~200-word launcher documentation (see
+    /// `ensure_mission_and_phases_with_provenance_and_start_payload` — the
+    /// per-launch `description` argument is always `None` on this path, so
+    /// `Mission.description` falls to `config.description`). The title must
+    /// be the config's declared `name` ("Review"), never that paragraph.
+    #[test]
+    fn display_label_prefers_the_config_name_over_a_config_launched_missions_own_long_description() {
+        let mut m = mission("review-1788656497-cf872b", MissionStatus::Active);
+        m.description = "(#2310 P4d) The code review, built on the shared mission building \
+             blocks rather than a pipeline of its own — and, since P4d, the ONLY `review`: \
+             the bespoke funnel launcher and its ten Tier-3 step kinds are deleted."
+            .into();
+        m.spec = Some(crate::crew::types::MissionSpec {
+            config_id: "review".to_string(),
+            inputs_fingerprint: "x".to_string(),
+            origin: None,
+        });
+
+        assert_eq!(
+            display_label(&m),
+            "Review",
+            "the board must show the config's declared name, not its long description"
+        );
+    }
+
+    /// (#2406 CONSIDER 6) A mission with no resolvable config (a
+    /// `dispatch <role>` crew-of-one, whose `spec.config_id` is the literal
+    /// `"dispatch"` sentinel, not a loadable config id) keeps the existing
+    /// description-based label — `config_title` must refuse rather than
+    /// silently returning some other config's name.
+    #[test]
+    fn display_label_falls_back_to_description_when_no_config_resolves() {
+        let mut m = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Active);
+        m.description = "dispatch: code-reviewer".into();
+        m.spec = Some(minted_spec()); // config_id: "dispatch" — not a real config
+
+        assert_eq!(display_label(&m), "code-reviewer");
+        assert_eq!(config_title(&m), None);
+    }
+
+    /// (#2406 CONSIDER 6) The description only ever earns a SECOND line —
+    /// never printed at all when the config name didn't win the title (so a
+    /// `dispatch <role>` mission, or one with no spec, prints nothing extra),
+    /// and truncated to its first sentence when it does.
+    #[test]
+    fn description_note_is_the_first_sentence_only_when_the_config_name_won_the_title() {
+        let mut m = mission("review-1788656497-cf872b", MissionStatus::Active);
+        m.description = "First sentence stands alone. Second sentence never shows up.".into();
+
+        // No spec yet: the description IS the title, so no second line.
+        assert_eq!(description_note(&m), None);
+
+        m.spec = Some(crate::crew::types::MissionSpec {
+            config_id: "review".to_string(),
+            inputs_fingerprint: "x".to_string(),
+            origin: None,
+        });
+        assert_eq!(description_note(&m), Some("First sentence stands alone.".to_string()));
     }
 
     /// Both minting formats seen in the wild yield a handle; hand-authored ids
@@ -2180,13 +2225,20 @@ mod tests {
         );
     }
 
-    // ─── unreachable-phase (#1230 Packet 5) ────────────────────────────
+    // ─── unreachable-phase, RETIRED (#2406) ────────────────────────────
+    //
+    // Every test in this section used to assert that `detect_drift` flagged
+    // a Planned phase sitting after an Abandoned one as `"unreachable-phase"`
+    // and suggested `mission abort <id> --phase <name>`. That rule is gone —
+    // see `detect_drift`'s doc and the (now-deleted) `unreachable_phase_drifts`
+    // doc comment for the real mission (`review-1788656497-cf872b`) that
+    // proved phase-order was never the launcher's actual gating rule. Each
+    // test below is KEPT and RENAMED, rather than silently deleted, to pin
+    // that its exact old-trigger shape no longer produces the retired kind.
 
     #[test]
-    fn planned_phase_after_abandoned_phase_drifts() {
-        // (#1341) Phases are strictly linear — ordered by `Mission.phase_ids`
-        // — so "blocked depends on dead" is now expressed by list order:
-        // `dead` comes before `blocked`.
+    fn planned_phase_after_abandoned_phase_no_longer_flags_unreachable() {
+        // (renamed from `planned_phase_after_abandoned_phase_drifts`)
         let mut dead = phase("dead", "m1", PhaseStatus::Abandoned);
         dead.abandoned_ts = Some(1);
         let blocked = phase("blocked", "m1", PhaseStatus::Planned);
@@ -2194,21 +2246,15 @@ mod tests {
         m.phase_ids = vec!["dead".to_string(), "blocked".to_string()];
 
         let d = detect_drift(&m, &[&dead, &blocked], &BTreeMap::new(), 0, 14);
-        // (#1463 CONSIDER 5) The suggestion must scope the teardown to the ONE
-        // blocked phase (`--phase blocked`), not a bare whole-mission abort that
-        // would abandon every healthy phase too.
-        assert!(d.iter().any(|dr| dr.kind == "unreachable-phase"
-            && dr.detail.contains("blocked")
-            && dr.suggest.iter().any(|c| c.contains("mission abort m1 --phase blocked"))));
+        assert!(
+            !d.iter().any(|dr| dr.kind == "unreachable-phase"),
+            "the phase-order rule is retired (#2406): {d:?}"
+        );
     }
 
-    /// (#1582) Siblings blocked by the SAME abandoned ancestor are one
-    /// problem with N instances, not N problems. Each used to emit the same
-    /// four lines of rationale verbatim — on a real board that was roughly 8
-    /// of 21 default lines saying nothing new, the #1569 "a default answers a
-    /// question" failure one level down.
     #[test]
-    fn siblings_blocked_by_one_dead_ancestor_state_the_rationale_once() {
+    fn siblings_blocked_by_one_dead_ancestor_no_longer_flags_unreachable() {
+        // (renamed from `siblings_blocked_by_one_dead_ancestor_state_the_rationale_once`)
         let mut dead = phase("dead", "m1", PhaseStatus::Abandoned);
         dead.abandoned_ts = Some(1);
         let a = phase("blocked-a", "m1", PhaseStatus::Planned);
@@ -2217,39 +2263,12 @@ mod tests {
         m.phase_ids = ["dead", "blocked-a", "blocked-b"].map(String::from).to_vec();
 
         let d = detect_drift(&m, &[&dead, &a, &b], &BTreeMap::new(), 0, 14);
-        let un: Vec<_> = d.iter().filter(|dr| dr.kind == "unreachable-phase").collect();
-        assert_eq!(un.len(), 1, "two blocked siblings must not repeat the rationale twice");
-
-        // The rationale is stated once and names every blocked phase…
-        assert!(un[0].detail.contains("blocked-a") && un[0].detail.contains("blocked-b"));
-        // …while the per-phase specifics stay one copyable command each.
-        let cmds: Vec<&str> = un[0].suggest.iter().map(|s| split_suggestion(s).0).collect();
-        assert!(cmds.contains(&"darkmux mission abort m1 --phase blocked-a"));
-        assert!(cmds.contains(&"darkmux mission abort m1 --phase blocked-b"));
-
-        // With nothing salvageable, the bare-abort caveat is noise — and
-        // worse than noise, because `stale-active` fires on this same
-        // mission and offers `mission abort m1` as a copyable command. The
-        // board must not warn against a command it is also recommending.
-        assert!(
-            !un[0].detail.contains("ends the WHOLE mission"),
-            "no salvageable phase -> the whole-vs-per-phase distinction is vacuous and must be \
-             dropped, not printed as a difference that makes no difference: {}",
-            un[0].detail
-        );
-        assert!(
-            !cmds.contains(&"darkmux mission abort m1"),
-            "the bare abort is never offered by THIS drift, salvageable or not"
-        );
+        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"), "{d:?}");
     }
 
-    /// (#1463 CONSIDER 5, re-scoped by #1582) The counter-example only earns
-    /// its line when a whole-mission abort would actually destroy something
-    /// the per-phase teardown spares.
     #[test]
-    fn bare_abort_caveat_appears_only_when_a_phase_would_be_lost() {
-        // `healthy` sits BEFORE the abandoned phase, so it is still runnable
-        // — real collateral for a bare abort.
+    fn bare_abort_caveat_no_longer_offered_because_the_drift_is_gone() {
+        // (renamed from `bare_abort_caveat_appears_only_when_a_phase_would_be_lost`)
         let healthy = phase("healthy", "m1", PhaseStatus::Planned);
         let mut dead = phase("dead", "m1", PhaseStatus::Abandoned);
         dead.abandoned_ts = Some(1);
@@ -2258,32 +2277,12 @@ mod tests {
         m.phase_ids = ["healthy", "dead", "blocked"].map(String::from).to_vec();
 
         let d = detect_drift(&m, &[&healthy, &dead, &blocked], &BTreeMap::new(), 0, 14);
-        let un = d.iter().find(|dr| dr.kind == "unreachable-phase").expect("unreachable drift");
-        assert!(un.detail.contains("ends the WHOLE mission"), "caveat missing: {}", un.detail);
-        assert!(
-            un.detail.contains("1 phase that can still run"),
-            "caveat must count the collateral, and pluralize it: {}",
-            un.detail
-        );
-        // Still prose, never a copyable command.
-        let cmds: Vec<&str> = un.suggest.iter().map(|s| split_suggestion(s).0).collect();
-        assert!(!cmds.contains(&"darkmux mission abort m1"));
+        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"), "{d:?}");
     }
 
-    /// (#1582 gate) A RUNNING phase sitting AFTER the abandoned ancestor is
-    /// salvageable, and that is a deliberate decision rather than an
-    /// oversight of the strict-linearity rule — so it is pinned here against
-    /// a future refactor "fixing" it.
-    ///
-    /// Strict linearity (#1341) is THIS DETECTOR's heuristic, not a lifecycle
-    /// invariant: `lifecycle::phase_start` has no ancestor gate, so a Running
-    /// phase after a dead predecessor is genuinely live work — and
-    /// `mission abort` is precisely what reconciles it to Abandoned. It is
-    /// real collateral, so the caveat must count it. Only PLANNED phases
-    /// after the dead ancestor are treated as blocked, which keeps the
-    /// blocked and salvageable sets disjoint.
     #[test]
-    fn a_running_phase_after_the_dead_ancestor_counts_as_collateral() {
+    fn a_running_phase_after_the_dead_ancestor_still_not_flagged() {
+        // (renamed from `a_running_phase_after_the_dead_ancestor_counts_as_collateral`)
         let mut dead = phase("dead", "m1", PhaseStatus::Abandoned);
         dead.abandoned_ts = Some(1);
         let running = phase("in-flight", "m1", PhaseStatus::Running);
@@ -2292,16 +2291,7 @@ mod tests {
         m.phase_ids = ["dead", "in-flight", "blocked"].map(String::from).to_vec();
 
         let d = detect_drift(&m, &[&dead, &running, &blocked], &BTreeMap::new(), 0, 14);
-        let un = d.iter().find(|dr| dr.kind == "unreachable-phase").expect("unreachable drift");
-        assert!(
-            un.detail.contains("1 phase that can still run"),
-            "the Running phase is live work a bare abort would destroy: {}",
-            un.detail
-        );
-        // …and it is NOT reported as blocked: only Planned phases are.
-        assert!(!un.detail.contains("in-flight"), "a Running phase is not blocked: {}", un.detail);
-        let cmds: Vec<&str> = un.suggest.iter().map(|s| split_suggestion(s).0).collect();
-        assert_eq!(cmds, vec!["darkmux mission abort m1 --phase blocked"]);
+        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"), "{d:?}");
     }
 
     #[test]
@@ -2328,24 +2318,19 @@ mod tests {
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
     }
 
-    /// (#1230 Packet 5 acceptance, revised #1341 for linear phases)
-    /// Reproduces the REAL `doom-loop-m4` mission read from
-    /// `~/.darkmux/missions/doom-loop-m4/` on disk: `mission.json` (Active,
+    /// (renamed from `doom_loop_m4_mission_status_fixture_flags_both_drift_variants`,
+    /// #2406) Reproduces the REAL `doom-loop-m4` mission that used to be this
+    /// rule's own acceptance fixture: `mission.json` (Active,
     /// `started_ts: 1782141824`) + its four phases IN ORDER —
     /// `runtime-capture` (Planned), `file-match` (Abandoned),
     /// `sovereignty-verbs` (Planned), `validate-cure` (Planned). Under the
-    /// pre-#1341 DAG shape only `validate-cure` (which explicitly declared
-    /// `file-match` as a dependency) was unreachable; under strict
-    /// linearity BOTH `sovereignty-verbs` and `validate-cure` are
-    /// unreachable, since they both sit after the abandoned `file-match`
-    /// in `Mission.phase_ids` order and a linear list has no alternate
-    /// path around a dead predecessor. The mission has sat at 0/4 phases
-    /// since `started_ts`, which is `> stale_days` ago as of any `now`
-    /// after that timestamp — real elapsed wall-clock, not a synthetic
-    /// offset, since the operator's live board (read-only, never mutated
-    /// by this test) is the acceptance target.
+    /// retired rule, both `sovereignty-verbs` and `validate-cure` were
+    /// flagged "can never run" purely from sitting after `file-match` in
+    /// list order — with no regard for whether their own tasks actually
+    /// depended on anything inside it. `stale-active` is unaffected (it
+    /// never depended on phase order) and still fires.
     #[test]
-    fn doom_loop_m4_mission_status_fixture_flags_both_drift_variants() {
+    fn doom_loop_m4_mission_status_fixture_no_longer_flags_unreachable() {
         let m = Mission {
             id: "doom-loop-m4".to_string(),
             description: "M4 doom-loop arc".to_string(),
@@ -2370,10 +2355,6 @@ mod tests {
         file_match.abandoned_ts = Some(1_782_147_136);
         let sovereignty_verbs =
             phase("sovereignty-verbs", "doom-loop-m4", PhaseStatus::Planned);
-        // (#1341) `file-match` sits before `validate-cure` in
-        // `m.phase_ids` (set above) — that ordering alone now makes
-        // `validate-cure` unreachable once `file-match` is Abandoned; no
-        // separate `depends_on` declaration.
         let validate_cure = phase("validate-cure", "doom-loop-m4", PhaseStatus::Planned);
         let phases: Vec<&Phase> =
             vec![&runtime_capture, &file_match, &sovereignty_verbs, &validate_cure];
@@ -2383,46 +2364,44 @@ mod tests {
 
         assert!(
             d.iter().any(|dr| dr.kind == "stale-active"),
-            "doom-loop-m4 has sat at 0/4 phases for weeks — must flag stale-active: {d:?}"
+            "doom-loop-m4 has sat at 0/4 phases for weeks — must still flag stale-active: {d:?}"
         );
         assert!(
-            d.iter().any(|dr| dr.kind == "unreachable-phase"
-                && dr.detail.contains("validate-cure")),
-            "validate-cure sits after abandoned file-match in phase_ids order — must flag \
-             unreachable-phase: {d:?}"
+            !d.iter().any(|dr| dr.kind == "unreachable-phase"),
+            "the phase-order rule is retired (#2406) — no phase in this fixture should be \
+             flagged unreachable any more: {d:?}"
         );
-        // (#1341) Phases are strictly linear now — `sovereignty-verbs` ALSO
-        // sits after the abandoned `file-match` in `phase_ids` order, so it
-        // is genuinely blocked too (there's no such thing as an
-        // "independent phase" anymore under strict linearity — every
-        // phase depends on every phase before it in sequence). This is a
-        // real, correct behavior change from the pre-#1341 DAG-shaped
-        // fixture (where `sovereignty-verbs` had no explicit dependency on
-        // `file-match` and stayed reachable) — not a regression.
-        assert!(
-            d.iter().any(|dr| dr.kind == "unreachable-phase"
-                && dr.detail.contains("sovereignty-verbs")),
-            "sovereignty-verbs also sits after abandoned file-match — must flag too under \
-             strict linearity: {d:?}"
-        );
-        // (#1582) Exactly TWO now, not three: both blocked phases share one
-        // abandoned ancestor, so they are one drift with two instances
-        // rather than two drifts repeating the same rationale verbatim.
-        // Both phase names are still asserted individually above, so the
-        // collapse cannot silently drop one.
-        assert_eq!(d.len(), 2, "unexpected drift set: {d:?}");
+        assert_eq!(d.len(), 1, "only stale-active should fire now: {d:?}");
+    }
 
-        // (#1582) This real shape is also the case that earns the bare-abort
-        // caveat: `runtime-capture` is Planned and sits BEFORE the abandoned
-        // `file-match`, so it is still runnable and a whole-mission abort
-        // would genuinely destroy it. On a mission with nothing salvageable
-        // the caveat is suppressed — see
-        // `siblings_blocked_by_one_dead_ancestor_state_the_rationale_once`.
-        let un = d.iter().find(|dr| dr.kind == "unreachable-phase").unwrap();
+    /// (#2406) The actual repro that killed the retired rule: a real mission
+    /// (`review-1788656497-cf872b`) with `review` Abandoned and `deliver`
+    /// sitting Planned — legitimately, since `deliver`'s tasks named no
+    /// dependency inside `review` — for 545s before it went on to run and
+    /// complete. The retired rule read this shape as "`deliver` can never
+    /// run" and suggested `mission abort review-1788656497-cf872b --phase
+    /// deliver`, which would have destroyed the delivery mid-flight had the
+    /// operator trusted it. This pins that the board now says nothing of the
+    /// kind for this exact shape: no `"unreachable-phase"` drift, and no
+    /// `mission abort ... --phase deliver` suggestion anywhere on the board.
+    #[test]
+    fn a_planned_phase_after_an_abandoned_one_that_actually_goes_on_to_run_is_never_told_to_abort() {
+        let mut review = phase("review", "review-1788656497-cf872b", PhaseStatus::Abandoned);
+        review.abandoned_ts = Some(1_788_657_000);
+        let deliver = phase("deliver", "review-1788656497-cf872b", PhaseStatus::Planned);
+        let mut m = mission("review-1788656497-cf872b", MissionStatus::Active);
+        m.phase_ids = vec!["review".to_string(), "deliver".to_string()];
+        m.started_ts = Some(1_788_656_497);
+
+        let d = detect_drift(&m, &[&review, &deliver], &BTreeMap::new(), 1_788_657_100, 14);
+
         assert!(
-            un.detail.contains("1 phase that can still run"),
-            "runtime-capture is salvageable here — the caveat must fire and count it: {}",
-            un.detail
+            !d.iter().any(|dr| dr.kind == "unreachable-phase"),
+            "must never flag `deliver` unreachable while it is legitimately about to run: {d:?}"
+        );
+        assert!(
+            !d.iter().any(|dr| dr.suggest.iter().any(|c| c.contains("--phase deliver"))),
+            "must never suggest aborting the phase that is about to complete: {d:?}"
         );
     }
 

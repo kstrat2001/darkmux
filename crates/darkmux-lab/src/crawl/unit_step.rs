@@ -1619,7 +1619,10 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
     let phases = darkmux_crew::loader::load_phases().context("loading phase records to find the run's units")?;
     for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
         let Ok(steps) = darkmux_crew::lifecycle::load_steps_for_phase(mission_id, &phase.id) else { continue };
-        for step in steps.iter().filter(|s| s.kind == crate::crawl::plan_step::CRAWL_PLAN_KIND) {
+        for step in steps.iter().filter(|s| {
+            s.kind == crate::crawl::plan_step::CRAWL_PLAN_KIND
+                || s.kind == crate::crawl::plan_sites_step::PLAN_SITES_KIND
+        }) {
             if step.status != darkmux_crew::types::NodeStatus::Complete {
                 let rule = step
                     .config
