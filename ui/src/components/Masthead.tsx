@@ -426,7 +426,7 @@ function pillLabel(
             title={connected ? undefined : "reconnecting"}
           >
             {connected ? "●" : "◌"}
-          </span>{" "}
+          </span>
           <span className="masthead__pilltext">{LIVE_CHIP}</span>
         </span>
         <span className="mm-sr-only" aria-live="polite">
@@ -445,7 +445,7 @@ function pillLabel(
     <>
       <span className="masthead__pilldot masthead__pilldot--replay" aria-hidden="true">
         {REPLAY_GLYPH}
-      </span>{" "}
+      </span>
       {/* (#2412 round 2, reviewer finding) A 44-char mission id rendered
           435px wide with nothing to stop it, wrapping the masthead onto a
           second row on a 390px phone. `title` carries the untruncated id

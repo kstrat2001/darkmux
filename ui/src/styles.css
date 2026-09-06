@@ -401,7 +401,10 @@ body {
    itself is scoped to `.live` alone so a `.stale`/`--replay` dot never
    pulses. */
 .masthead__pilldot {
-  margin-right: 0.35em;
+  /* The ONLY spacing between dot and label: the JSX carries no literal
+     space (a space + this margin + the chip's 0.12em letter-spacing read
+     as a gap on the phone, operator screenshot 2026-09-06). */
+  margin-right: 0.3em;
 }
 .masthead__pilldot.live {
   animation: var(--beat);
@@ -1276,6 +1279,14 @@ body {
   min-height: 44px;
   display: flex;
   align-items: center;
+  /* The list row is inline and its JSX spaces render; here the same spaces
+     are whitespace-only flex text nodes, which never render, so the gap
+     carries the spacing instead. */
+  gap: 0.3em;
+  /* An unmapped raw `action` label (`activityOf`'s `|| "other"` fallback
+     only covers the empty case) of 25+ chars would zero the preview and
+     run past the row; clip rather than widen the strip. */
+  overflow: hidden;
   padding-left: 26px;
   position: relative;
 }
@@ -1324,6 +1335,17 @@ body {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+/* (#2441 fallout, operator screenshot 2026-09-06) The base row's
+   `overflow-wrap: anywhere` also shrinks a flex item's min-content width
+   to one character, so in THIS row — the only flex-laid-out `.eventlog__rec`
+   — the ellipsized preview squeezed the timestamp and activity label into
+   stacks of two-character lines ("09:" / "58:" / "30"). The strip's
+   fixed-width children never wrap: the preview is the one that yields. */
+.eventlog__rec.eventlog__rec--stripback .eventlog__rectime,
+.eventlog__rec.eventlog__rec--stripback .eventlog__ractivity {
+  flex: none;
+  white-space: nowrap;
 }
 /* The record card's own scroll region — the ONLY one inside the pushed
    screen (the strip above it is fixed, `flex: none`, via the shared
@@ -1402,7 +1424,8 @@ body {
   position: relative;
 }
 .eventlog__ficon {
-  font-size: calc(13px * var(--fs-scale));
+  display: inline-flex;
+  align-items: center;
   line-height: 1;
 }
 .eventlog__fcount {
@@ -1419,10 +1442,16 @@ body {
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
-.eventlog__follow:hover,
-.eventlog__fbtn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+/* Hover only where a pointer can hover. A touch screen keeps `:hover`
+   on the last tapped element until the next tap elsewhere, so both
+   buttons stayed lit after any tap and their real state never showed
+   (operator, 2026-09-06: "always lit"). */
+@media (hover: hover) {
+  .eventlog__follow:hover,
+  .eventlog__fbtn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
 }
 .eventlog__follow.on,
 .eventlog__fbtn.on {
@@ -3244,6 +3273,13 @@ body {
   }
   .rv__row {
     flex-wrap: wrap;
+    /* Every pair stacks label-over-value here (the key takes the full row
+       below), so the base rule's 10px `gap` landed BETWEEN a label and its
+       own value while pairs sat 2px apart — the spacing read inverted
+       (operator screenshot, 2026-09-06). Inside a pair: 2px. Between
+       pairs: the row padding. */
+    row-gap: 2px;
+    padding: 5px 0;
   }
   .rv__key {
     width: auto;
@@ -6647,8 +6683,10 @@ body {
   .phone-drawer__body .eventlog__qcount {
     flex: 1 1 auto;
     min-width: 0;
-    margin-left: auto;
-    justify-content: flex-end;
+    /* The box is `inline-flex` (rule above), so centering is the flex
+       axis's job, not `text-align`'s (operator: "text could be centered in
+       the event accounting box", 2026-09-06). */
+    justify-content: center;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -6708,7 +6746,11 @@ body {
     border-left: 1px solid var(--border);
   }
   .phone-drawer__tabvalue {
-    font: 600 calc(11px * var(--fs-scale))/1.3 var(--font-mono);
+    /* The row is a 44px tap target either way (operator, 2026-09-06: "if
+       these tabs have to take so much space the text might as well be
+       bigger"), so the label is sized to use it: 14px base, not the 11px
+       the event-row chrome uses. */
+    font: 600 calc(14px * var(--fs-scale))/1.3 var(--font-mono);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
     display: inline-flex;
