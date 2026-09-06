@@ -18,7 +18,7 @@ A review that lands as conversations, and a run that says what it cost.
 
 This release finishes the review path 3.6.0 started. `review` is no longer a
 funnel with ten bespoke step kinds: it is the generic mission path every other
-pipeline runs on (plan -> review -> summarize -> create-mods -> deliver), and
+pipeline runs on (plan → review → summarize → create-mods → deliver), and
 its output arrives as inline PR conversations, one per finding, with a one-click
 suggestion whenever a mod passed its gate. The observability half caught up in
 the same batch: one host sampler per machine instead of one per dispatch, a
