@@ -387,6 +387,40 @@ describe("EventLogColumn", () => {
     expect(storedAfterB.q).toBe("s-cloud");
   });
 
+  // (#2444 review finding) `setFacetMany` — the section header's gesture —
+  // had no mounted-column coverage: `FiltersDialog.test.tsx` mocks the
+  // callback, so flipping `set.delete(v)` to `set.add(v)` stayed green.
+  // This drives the real header through the real column and asserts BOTH
+  // the visible rows and the persisted store, the same store shape four
+  // individual unchecks would write (the reviewer proved byte-equality).
+  it("a section header sets exactly its present values, through the mounted column, and persists them", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s1" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", action: "dispatch.tool", session_id: "s1" }),
+      rec({ ts: "2026-08-08T12:02:00.000Z", action: "machine.online", session_id: "s1" }),
+    ];
+    const { container } = render(<EventLogColumn scopeLabel="fleet" paneId="a" records={records} visible />);
+    // Default view: the two MODEL rows show; machine online is off by default.
+    expect(container.querySelectorAll('[data-act="rec"]').length).toBe(2);
+    fireEvent.click(document.getElementById("fbtn")!);
+    // The dialog is display-toggled by class, which jsdom does not compute,
+    // so role queries treat it as hidden; query the header by its label.
+    const headerOf = () =>
+      [...document.querySelectorAll<HTMLInputElement>("input[aria-label]")].find((i) =>
+        /^model:/i.test(i.getAttribute("aria-label") ?? ""),
+      )!;
+    const header = headerOf();
+    expect(header.checked).toBe(true);
+    fireEvent.click(header);
+    expect(container.querySelectorAll('[data-act="rec"]').length).toBe(0);
+    const stored = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    expect([...stored.act.exclude].sort()).toEqual(["reasoning", "tool call"]);
+    expect(stored.act.include).toEqual([]);
+    // Back on: the same header, now unchecked, re-includes exactly those two.
+    fireEvent.click(headerOf());
+    expect(container.querySelectorAll('[data-act="rec"]').length).toBe(2);
+  });
+
   // RED-PROVED (real regression, caught by
   // tests/parity/next-parity-live.spec.ts, not invented for this test): a
   // first draft seeded `filters` via a plain `useState(() =>

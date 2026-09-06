@@ -629,7 +629,7 @@ describe("activitySectionOf / groupActivitiesBySections (#2450-ish, filter panel
       "machine online": "MACHINE",
       "machine offline": "MACHINE",
       "host telemetry": "MACHINE",
-      telemetry: "MACHINE",
+      telemetry: "DISPATCH",
       other: "OTHER",
     };
     for (const value of ACT_ORDER) {

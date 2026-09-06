@@ -180,10 +180,9 @@ const DISPATCH_SECTION_VALUES = new Set([
   "compaction",
   "feedback",
   "routing",
-  "session end",
-]);
+  "session end", "telemetry"]);
 const MISSION_SECTION_VALUES = new Set(["note"]);
-const MACHINE_SECTION_VALUES = new Set(["machine online", "machine offline", "host telemetry", "telemetry"]);
+const MACHINE_SECTION_VALUES = new Set(["machine online", "machine offline", "host telemetry"]);
 
 /** Which section a single activity value (a mapped `ACT_ORDER` label, or a
  * raw value `activityOf`'s fallback passed through unmapped) belongs under.
@@ -195,6 +194,11 @@ const MACHINE_SECTION_VALUES = new Set(["machine online", "machine offline", "ho
  * a value is checked against each section's curated set/prefix in the same
  * MODEL → DISPATCH → MISSION → MACHINE → OTHER order the sections render
  * in, so no value can match two sections. */
+/* "telemetry" (the generic label, in practice `telemetry.context` — a
+ * dispatch's own context-window usage per compaction) is DISPATCH, not
+ * MACHINE: it is per-dispatch bookkeeping, unlike "host telemetry"
+ * (`machine.telemetry`, the machine-scoped sampler). Review finding on
+ * the sectioned panel, 2026-09-06. */
 export function activitySectionOf(value: string): ActivitySectionTitle {
   if (MODEL_SECTION_VALUES.has(value)) return "MODEL";
   if (DISPATCH_SECTION_VALUES.has(value) || value.startsWith("dispatch.")) return "DISPATCH";
