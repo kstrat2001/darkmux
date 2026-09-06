@@ -96,6 +96,7 @@ it against your own copy if you keep one ([#2433](https://github.com/kstrat2001/
 
 ### Changed
 
+- Machine lens trimmed: the reload suggestion renders once per model, the gauge's caption replaces a summary line that restated its numbers, only lit status lamps render, the pricing methodology and the three tile notes live behind `how this was measured`, and the thermal bar no longer repeats its severity as text. Phone height 2,566 → 1,899 px with no fact removed ([#2440](https://github.com/kstrat2001/darkmux/issues/2440), [#2442](https://github.com/kstrat2001/darkmux/pull/2442)).
 - The review workflow's header and security note describe the shipped pipeline (`plan.sites` → `crawl.unit` → `crawl.summary` → create-mods → `deliver.github_review`) and what the runner actually does with the reviewed tree: an anonymous read-only clone at `head_sha`, never executed ([#2438](https://github.com/kstrat2001/darkmux/pull/2438)).
 - **`review` is now the former `review-v2` pipeline** ([#2310](https://github.com/kstrat2001/darkmux/issues/2310) P4d) —
   the generic launch path (plan → review → summarize → create-mods →
@@ -157,6 +158,7 @@ it against your own copy if you keep one ([#2433](https://github.com/kstrat2001/
 
 ### Fixed
 
+- The phone drawer's event list no longer scrolls sideways: one unbreakable token in a row's preview was widening the row past the panel, and the list scrolls on both axes; rows now wrap anywhere and an e2e pins no horizontal overflow at 390 and 320 px. The Events toolbar is two rows: the search field, then the clock and a filter icon button (active count as a badge, 44 px targets) with the count text on the same line ([#2441](https://github.com/kstrat2001/darkmux/pull/2441)).
 - A finding whose mod exists but was never gated (no `test_command`, or the gate failed) is named in the delivered review with the skip reason and a `darkmux mod show <key>` pointer instead of rendering as if nobody proposed a change; a runtime-written mod whose kit is not a unified diff records a warning saying so ([#2438](https://github.com/kstrat2001/darkmux/pull/2438)).
 - Folds and scans fail loud: `records.gather` names failed steps of a kind it does not recognize and lists inputs it could not read, an undeclared `--param` gets a did-you-mean, dispatch bookend literals in the daemon go through the shared flow helpers with a tripwire, error-shaped activities (`step error`, `phase abandon`) are on by default in the event filters, and `darkmux doctor` warns about a hook rule that has never matched because its `match.action` uses the other bookend spelling ([#2437](https://github.com/kstrat2001/darkmux/pull/2437)).
 - **The playback scrubber spans the open run, not the whole loaded day**
