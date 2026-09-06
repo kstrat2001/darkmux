@@ -14,6 +14,22 @@ darkmux release.
 
 ## [Unreleased]
 
+### Migration — the review funnel is gone
+
+Operators who copied the old funnel-based `review.json` into
+`~/.darkmux/mission-configs/` under another name (the guide's own
+`review-lean` example among them, or a hand-rolled `review-standard` /
+`review-deep` / `review-mixed` variant) now hold a config naming step kinds
+that no longer exist (`review.probe`, `review.judge`, …) — `darkmux doctor`
+flags it; delete the copy and re-derive your variant from the new
+`review.json` if you still want one. An operator with
+`role_profiles.<review-probe*|review-judge|review-verify>` bound in
+`config.json`, or dispatching one of those roles directly, gets a doctor
+warning naming the unknown role — delete or repoint the binding.
+`profiles.example.json`'s review-pipeline profile descriptions were rewritten
+for the two roles `review` actually dispatches (`reviewer`, `coder`) — diff
+it against your own copy if you keep one ([#2433](https://github.com/kstrat2001/darkmux/pull/2433)).
+
 ### Added
 
 - **The mission envelope carries a `records_emitted` block** ([#2421](https://github.com/kstrat2001/darkmux/issues/2421), [#2426](https://github.com/kstrat2001/darkmux/pull/2426)) —
@@ -30,8 +46,58 @@ darkmux release.
   pairing so it can't inflate `dispatch_seconds` by a whole mission's wall
   time. Old envelopes (no `records_emitted` key) still deserialize.
 
+- **Every review finding renders as an inline PR conversation** ([#2429](https://github.com/kstrat2001/darkmux/issues/2429), [#2431](https://github.com/kstrat2001/darkmux/pull/2431)) —
+  a `path`+`line` finding becomes a `comments[]` entry: a one-click
+  suggestion when a gate-passed mod exists, a plain claim plus its rule id
+  otherwise. An unanchored finding — no line, or a line outside the PR's
+  diff — rolls up into a per-rule count in the body instead of forcing text
+  onto a line GitHub would reject the whole review over. The body is
+  summary-only now (coverage line, one heading per rule that still has
+  something to say); the old `? Candidates: <evidence>` suffix is gone.
+  `darkmux-review.yml` re-checks the PR's head sha at post time and appends
+  a disclaimer if it moved since the run started.
+
+- **The create-mod seat is a hook, not a dispatch** ([#2310](https://github.com/kstrat2001/darkmux/issues/2310), [#2393](https://github.com/kstrat2001/darkmux/pull/2393)) —
+  `review`'s create-mod task waits (bounded by a new `mod_wait_seconds`
+  input, default `0` — don't wait) for a mod naming the finding's key,
+  instead of dispatching a local coder seat: live testing found local
+  models detect problems well but write applying patches badly. The new
+  `darkmux-mod-create` skill (shipped, embedded) reads a finding by key from
+  the hook outbox and writes the mod via `darkmux mod create --for <key>`
+  from a watching frontier session. **Optional cloud-endpoint seat for the
+  unattended path** ([#2395](https://github.com/kstrat2001/darkmux/pull/2395)) —
+  a disabled-by-default `create-mod-dispatch` template lets a self-hosted
+  runner (no orchestrator session to answer the hook) staff create-mod with
+  an endpoint profile instead; `TaskConfig.excludes` (mission config schema
+  3.5) lets the two templates for one seat declare each other so only one
+  is ever enabled at once, with `validate` refusing an enabled conflicting
+  pair.
+
+- **Bounded, interruptible step commands** ([#2361](https://github.com/kstrat2001/darkmux/issues/2361), [#2372](https://github.com/kstrat2001/darkmux/pull/2372)) —
+  `mods.gate`'s `test_command` and `procedural.shell` now run in their own
+  process group under a deadline with interrupt polling (SIGKILL to the
+  group on expiry or on launch cancellation), configurable via
+  `runtime.step_command_timeout_seconds` / `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS`
+  (default 600s) — `CONFIG_SCHEMA_VERSION` 1.19 → 1.20, written visibly by
+  `init`. A step that hits the bound records why instead of hanging the
+  launch; a command left holding an unfinished stdout drain has its process
+  group killed rather than leaking ([#2375](https://github.com/kstrat2001/darkmux/pull/2375)).
+
+- **Dispatch-free steps get their own concurrency track** ([#2394](https://github.com/kstrat2001/darkmux/issues/2394), [#2397](https://github.com/kstrat2001/darkmux/pull/2397)) —
+  every `StepKind` now declares a `SeatClaim` (`LocalModel` /
+  `RemoteEndpoint` / `NoModel` / an unresolved seat with a reason) instead of
+  defaulting to a residency guess. A step claiming no model
+  (`procedural.shell`, `mods.gate`, `records.gather`,
+  `deliver.github_review`) now runs on its own bounded track
+  (`runtime.dispatch_free_concurrency` / `DARKMUX_DISPATCH_FREE_CONCURRENCY`,
+  default 8 — `CONFIG_SCHEMA_VERSION` 1.20 → 1.21) instead of serializing
+  behind the remote-endpoint cap a mission launch sets to 1. Six shell waits
+  that used to run one at a time now run together.
+
 ### Changed
 
+- Machine lens trimmed: the reload suggestion renders once per model, the gauge's caption replaces a summary line that restated its numbers, only lit status lamps render, the pricing methodology and the three tile notes live behind `how this was measured`, and the thermal bar no longer repeats its severity as text. Phone height 2,566 → 1,899 px with no fact removed ([#2440](https://github.com/kstrat2001/darkmux/issues/2440), [#2442](https://github.com/kstrat2001/darkmux/pull/2442)).
+- The review workflow's header and security note describe the shipped pipeline (`plan.sites` → `crawl.unit` → `crawl.summary` → create-mods → `deliver.github_review`) and what the runner actually does with the reviewed tree: an anonymous read-only clone at `head_sha`, never executed ([#2438](https://github.com/kstrat2001/darkmux/pull/2438)).
 - **`review` is now the former `review-v2` pipeline** ([#2310](https://github.com/kstrat2001/darkmux/issues/2310) P4d) —
   the generic launch path (plan → review → summarize → create-mods →
   deliver), built on the shared mission building blocks. The `review-v2`
@@ -46,7 +112,7 @@ darkmux release.
 - `mode`/`envelope_out` are accepted on `review` for CLI-surface parity
   with the retired funnel launcher but IGNORED, with a warning when
   supplied.
-- **One host sampler per machine** ([#2413](https://github.com/kstrat2001/darkmux/issues/2413)). `telemetry.process`
+- **One host sampler per machine** ([#2413](https://github.com/kstrat2001/darkmux/issues/2413), [#2419](https://github.com/kstrat2001/darkmux/pull/2419)). `telemetry.process`
   (the per-dispatch, 2s-cadence CPU/mem/gpu emitter) is RETIRED — FLOW
   1.42.0 — and `machine.telemetry` becomes machine-scoped: exactly one
   process per machine (the daemon, or a live dispatch when no daemon
@@ -55,25 +121,191 @@ darkmux release.
   run's SYSTEM pane now joins to the machine-scoped curve by
   `machine_uid` + a time window instead of by session. Same-process
   parallel dispatches (a crawl's sibling units) no longer all believe
-  they own the sampler.
+  they own the sampler. A run with no samples in its window (the join
+  comes up empty) now renders an explicit "no host samples for this run"
+  tile instead of silently omitting the CPU/RAM/GPU tiles.
 - `CONFIG_SCHEMA_VERSION` 1.22 also drops `runtime.telemetry_record_every_samples`
   — the per-dispatch downsample knob it configured has nothing left to
   configure. Read leniently; `darkmux doctor` warns on it.
+- **Findings and mods render by the rule, not by how they were confirmed**
+  ([#2398](https://github.com/kstrat2001/darkmux/pull/2398)) — entries in a
+  posted review are grouped under the rule's own title and tagged with its
+  id, the way a lint rule name is the durable handle for re-running the
+  check. A gate-passed patch always renders as a one-click suggestion
+  regardless of whether the rule's own confirm form is a mod, a search, or
+  a question; the form only decides the rendering when nothing passed.
+- **The header's LIVE badge folds into the playback pill**
+  ([#2412](https://github.com/kstrat2001/darkmux/issues/2412), [#2420](https://github.com/kstrat2001/darkmux/pull/2420)) —
+  one transport control instead of two. The pill's own dot pulses on a
+  connected live stream, holds still and turns red with a "reconnecting"
+  title when the stream drops, and switches to a `▣` glyph plus the mission
+  id or date in playback. The standalone badge (`#modebadge`) is gone, and
+  "today" is gone from the header entirely — the fleet view's 24h window
+  can run into yesterday, so it was sometimes wrong as well as redundant.
+- **Event filters default to model activity, not everything** ([#2416](https://github.com/kstrat2001/darkmux/issues/2416), [#2417](https://github.com/kstrat2001/darkmux/pull/2417)) —
+  a fresh session now shows reasoning / checkpoints / tool calls / turns /
+  dispatch errors by default; heartbeat and the telemetry curves start
+  hidden. Picks are stored under one global key — an unchecked value stays
+  unchecked everywhere, including after it briefly disappears from the
+  offered facets and comes back — and the Filters button / pane chip now
+  count actual hidden records instead of "1 per facet with anything
+  hidden."
+- **The PR-review parity suite (`next-parity-live`) now runs in CI**
+  ([#2422](https://github.com/kstrat2001/darkmux/pull/2422)) — it was the
+  one suite the parity loop skipped, which is how a red test (broken by the
+  event-filter default above) reached `main`. Contributors touching the
+  viewer's live/SSE path should expect this suite to run on their PR.
+
+### Fixed
+
+- The phone drawer's event list no longer scrolls sideways: one unbreakable token in a row's preview was widening the row past the panel, and the list scrolls on both axes; rows now wrap anywhere and an e2e pins no horizontal overflow at 390 and 320 px. The Events toolbar is two rows: the search field, then the clock and a filter icon button (active count as a badge, 44 px targets) with the count text on the same line ([#2441](https://github.com/kstrat2001/darkmux/pull/2441)).
+- A finding whose mod exists but was never gated (no `test_command`, or the gate failed) is named in the delivered review with the skip reason and a `darkmux mod show <key>` pointer instead of rendering as if nobody proposed a change; a runtime-written mod whose kit is not a unified diff records a warning saying so ([#2438](https://github.com/kstrat2001/darkmux/pull/2438)).
+- Folds and scans fail loud: `records.gather` names failed steps of a kind it does not recognize and lists inputs it could not read, an undeclared `--param` gets a did-you-mean, dispatch bookend literals in the daemon go through the shared flow helpers with a tripwire, error-shaped activities (`step error`, `phase abandon`) are on by default in the event filters, and `darkmux doctor` warns about a hook rule that has never matched because its `match.action` uses the other bookend spelling ([#2437](https://github.com/kstrat2001/darkmux/pull/2437)).
+- **The playback scrubber spans the open run, not the whole loaded day**
+  ([#2346](https://github.com/kstrat2001/darkmux/issues/2346), [#2347](https://github.com/kstrat2001/darkmux/pull/2347)) —
+  a run that ended mid-day used to leave the scrubber's range pinned at the
+  day's last record; a dispatch or mission focus now bookends the range on
+  the run's own start/terminal, and rewind lands on the run's start.
+- **`flows`/`audit` dirs default under the resolved root**
+  ([#2359](https://github.com/kstrat2001/darkmux/issues/2359), [#2363](https://github.com/kstrat2001/darkmux/pull/2363)) —
+  a `DARKMUX_HOME` install no longer writes flow records or audit files
+  into the real `~/.darkmux` behind the operator's back; both now derive
+  from the same resolved root the findings/mods/lab/hooks dirs already use.
+- **`materialize` checks the mirror it finds and serializes concurrent
+  callers** ([#2399](https://github.com/kstrat2001/darkmux/issues/2399), [#2400](https://github.com/kstrat2001/darkmux/pull/2400)) —
+  a corrupted mirror (non-bare, or `origin` pointing somewhere else) is
+  quarantined (renamed `<mirror>.corrupt-<ts>`, never deleted) and
+  re-cloned instead of fetched into blind; a per-workspace advisory lock
+  serializes concurrent plan/materialize calls against one workspace.
+- **The runtime binary cache is version-keyed** ([#2402](https://github.com/kstrat2001/darkmux/pull/2402)) —
+  a warm `~/.darkmux/runtime/darkmux-runtime` cache (from `dispatch --image`)
+  now invalidates itself on a version mismatch, so an upgrade that adds a
+  new runtime flag can no longer leave the cache serving an old binary that
+  exits 2 on it. **No operator action is needed on upgrade** — the first
+  `dispatch --image` after it re-extracts on its own (previously this
+  needed a manual `rm`). `darkmux doctor` gained a matching
+  `runtime binary cache` check alongside the existing
+  `runtime image freshness` one.
+- **`create_finding` hands back its own key; `create_mod` refuses an
+  ungrounded one** ([#2386](https://github.com/kstrat2001/darkmux/issues/2386), [#2402](https://github.com/kstrat2001/darkmux/pull/2402)) —
+  the runtime now knows its own dispatch id (`--session-id` forwarded
+  host-side), so `create_finding` replies with the finding's real key
+  instead of a bare "Recorded.", and `create_mod` rejects a `for` key this
+  dispatch never actually recorded. A launch input supplied but consumed
+  by neither a placeholder nor the launcher is refused before minting, by
+  name, instead of silently doing nothing.
+- **Crawl/review unit dispatches no longer collide on one container name**
+  ([#2360](https://github.com/kstrat2001/darkmux/issues/2360), [#2362](https://github.com/kstrat2001/darkmux/pull/2362), [#2383](https://github.com/kstrat2001/darkmux/issues/2383), [#2385](https://github.com/kstrat2001/darkmux/pull/2385)) —
+  a unit's on-disk home and its dispatch session id both now carry the
+  rule segment (`units/<rule>/<unit>/out`, `crawl-<mission>-<rule>-<unit>`),
+  so two rules planning the same `u-0001` no longer fight over one
+  directory or one `darkmux-dispatch-…` container name.
+- **Mod kits from a coder seat actually apply** ([#2387](https://github.com/kstrat2001/darkmux/issues/2387), [#2388](https://github.com/kstrat2001/darkmux/pull/2388), [#2390](https://github.com/kstrat2001/darkmux/pull/2390), [#2391](https://github.com/kstrat2001/darkmux/pull/2391), [#2392](https://github.com/kstrat2001/darkmux/pull/2392), [#2401](https://github.com/kstrat2001/darkmux/pull/2401)) —
+  live create-mod runs turned up several ways a model-written unified diff
+  failed at the gate: a missing trailing newline read as a corrupt patch
+  (now normalized before `git apply`); a kit written in container
+  coordinates (`/workspace/<source>/…`) is now mapped to the checkout's
+  real path at the gate, with `--recount` trusting the diff body over a
+  miscounted hunk header; the gate now stamps the resolved source id onto
+  the mod record so `deliver.github_review` maps the same kit before
+  rendering it as a suggestion. The shared create-mod message itself now
+  states the path mapping and "a diff pasted into the reply is not a mod"
+  in plain terms, for models that don't resolve it silently.
+- **`/flow/<date>` and the run-detail SYSTEM pane keep the records that
+  matter** ([#2409](https://github.com/kstrat2001/darkmux/issues/2409), [#2410](https://github.com/kstrat2001/darkmux/pull/2410), [#2414](https://github.com/kstrat2001/darkmux/pull/2414), [#2424](https://github.com/kstrat2001/darkmux/pull/2424), [#2436](https://github.com/kstrat2001/darkmux/pull/2436)) —
+  a busy day's telemetry volume could push a `dispatch.start` out of the
+  route's newest-10k window entirely, blanking the fleet lens's activity
+  bars; every dispatch bookend (both the dotted and legacy spaced spelling)
+  is now kept unconditionally, and the Redis+local union sorts by
+  timestamp so a kept bookend can't land behind newer telemetry. The
+  run-detail host-sample join recognizes the spaced bookends production
+  actually emits, is bounded to the run's own day range (a daemon poll
+  dropped from ~1.6s to ~0.65s on a real flows dir), stamps its own scan
+  cost into the response, skips the day file's schema header, and
+  hard-clamps a dead run's window so it can't absorb the next run's
+  samples.
+- **The mission board stops declaring a phase unreachable that is about to
+  run** ([#2406](https://github.com/kstrat2001/darkmux/issues/2406), [#2434](https://github.com/kstrat2001/darkmux/pull/2434)) —
+  `plans_errored` now counts a `plan.sites` step's failure too, not only
+  the older `crawl.plan` kind; the `"can never run"` drift rule (which
+  assumed phases gate strictly in declared order) is removed outright
+  rather than patched, since phase order was never actually how the
+  scheduler gates — a legitimately-waiting phase was getting a
+  copy-pasteable `mission abort` suggestion that would have destroyed work
+  seconds from finishing. The mission board's title for a config-launched
+  run now prefers the config's own declared name over its (often
+  paragraph-length) description.
+- **Run-detail metric tiles share one anatomy** ([#2403](https://github.com/kstrat2001/darkmux/pull/2403)) —
+  label / value / sub, consistently: the context tile no longer restates
+  its own value in its label, `262.144K` reads as `262k`, and every tile is
+  the same height.
+- **Phone drawer handle and open state** ([#2407](https://github.com/kstrat2001/darkmux/pull/2407), [#2415](https://github.com/kstrat2001/darkmux/pull/2415), [#2435](https://github.com/kstrat2001/darkmux/pull/2435)) —
+  a stored drawer height the drag interaction could never itself produce
+  (opening a sliver a few percent tall that read as "won't open") is now
+  clamped to the drag's own range on load; the drag handle's hit target
+  grew 14px → 24px → 32px; the dead band above the first section is gone.
+- **The live-status pill announces reconnects under a flapping stream**
+  ([#2435](https://github.com/kstrat2001/darkmux/pull/2435)) — a stream
+  that drops and recovers faster than the announcement's hold window used
+  to announce nothing at all even though the dot visibly changed; the hold
+  now latches on cumulative down-time instead of resetting on every
+  transition. The pill also starts in "reconnecting", not an optimistic
+  "live", until the stream actually opens.
+- **`mission.grow`, the unit dispatch message, and run-view attribution**
+  ([#2374](https://github.com/kstrat2001/darkmux/pull/2374), [#2379](https://github.com/kstrat2001/darkmux/pull/2379), [#2380](https://github.com/kstrat2001/darkmux/pull/2380)) —
+  `FLOW_SCHEMA_VERSION` 1.39.0 → 1.40.0: `mission.grow` gains
+  `producer_step`, a documented `producer_status` vocabulary, a
+  `producer_errored` reason, and `source` now means one thing (the
+  producing step's id) instead of varying by arm. `MOD_SCHEMA_VERSION`
+  "1" → "2" documents the stored mod shape
+  (`kit_kind`/`source`/`gate`/`gate_skipped_reason`). The create-mod
+  dispatch message is now frozen against a golden. A run with steps that
+  never ran is reported `Degraded`, not silently clean, its rule count
+  reflects distinct rules rather than tasks, its dedup only collapses a
+  ref against an earlier draw (not within the same draw), and the
+  terminal summary line and the envelope now classify a step's outcome
+  from the same partition instead of two that could disagree.
+- **Step seat classification** ([#2397](https://github.com/kstrat2001/darkmux/pull/2397)) —
+  `FLOW_SCHEMA_VERSION` 1.40.0 → 1.41.0: `step start` carries
+  `payload.seat_class`, and a new `"step seat unresolved"` action replaces
+  a silent fail-open default.
+- **Machine lens says less at rest** ([#2378](https://github.com/kstrat2001/darkmux/pull/2378), [#2381](https://github.com/kstrat2001/darkmux/pull/2381)) —
+  explanatory prose in the machine lens is trimmed (measured: 112 words of
+  boilerplate down to 25 in the worst case, payload unchanged), collapsed
+  into one "how this was measured" disclosure per region; ages are computed
+  against the daemon's own clock so a client running behind it no longer
+  renders a blank "snapshot" age; the phone drawer's Machine tab stays
+  host-only (no model id, context size, or residency vocabulary — that
+  stays in the dedicated machine lens).
+- **Phone drawer inset, record-key wrapping, and the static demo's mission
+  events** ([#2373](https://github.com/kstrat2001/darkmux/pull/2373)) —
+  the mission graph canvas now ends where the drawer's tabs begin instead
+  of running under them; long record keys wrap instead of clipping;
+  `#mission=<id>` on the static demo reads the loaded day's own records, so
+  its EVENTS pane is no longer always empty.
+- **CI stopped failing on every push to `main` from a stale generated TS
+  binding** ([#2389](https://github.com/kstrat2001/darkmux/pull/2389)) —
+  a struct field added without regenerating its TypeScript export left the
+  `quality` workflow's badge step unable to commit, silently spawning an
+  orphan `badges` branch on every push. A new PR-time check
+  (`git diff --exit-code` on the generated bindings) fails loudly with the
+  regenerate command instead.
 
 ### Removed
 
+- The review workflow's `mode` input (validated but never forwarded) and `review.json`'s `mode` / `envelope_out` inputs, which nothing passed ([#2438](https://github.com/kstrat2001/darkmux/pull/2438)).
 - The old review funnel (bundle → probe → dedup → judge → verify →
   synthesis) and its ten Tier-3 `review.*` step kinds are deleted.
   Historical run records that used them still render in the viewer.
 - The review funnel's own embedded roles — `review-probe`,
   `review-probe-high`, `review-probe-mid`, `review-probe-low`,
-  `review-judge`, `review-verify` — are deleted along with it ([#2418](https://github.com/kstrat2001/darkmux/issues/2418)).
+  `review-judge`, `review-verify` — are deleted along with it ([#2418](https://github.com/kstrat2001/darkmux/issues/2418), [#2427](https://github.com/kstrat2001/darkmux/pull/2427)).
   Nothing shipped (mission configs, skills) referenced them; the shipped
   `review` config stages its work through `reviewer`/`coder` instead. An
   operator who had `role_profiles.<one of these>` bound in `config.json`,
   or was dispatching one directly, needs to remove/repoint that binding —
   `darkmux doctor` flags an unknown role id.
-- `review`'s `bundler` and `pr` inputs.
+- `review`'s `bundler` and `pr` inputs ([#2404](https://github.com/kstrat2001/darkmux/pull/2404)).
 - The `docs/guide/bundlers.html` guide page. `--bundler` survives only on
   `lab eval` / `lab review-bench`.
 - `darkmux-review.yml` no longer builds `darkmux-bundler-rust`.
