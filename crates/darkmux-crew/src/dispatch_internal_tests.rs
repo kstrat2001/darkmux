@@ -4798,7 +4798,23 @@
             fx["attachment"]["content"].as_str().unwrap(),
             "the attachment decodes to the bytes the container read"
         );
-        assert!(rec.warnings.is_empty(), "a clean emission warns about nothing: {rec:?}");
+        // (post-#2431 fix loop round 3) `create_mod_wire.json`'s kit is
+        // deliberately a JSON string (proving an oversized integer literal
+        // round-trips byte-exact as a STRING, never re-parsed) — genuinely
+        // not diff-shaped, so `create_from_emission`'s kit-shape check
+        // (mods.rs, post-#2431 fix loop) legitimately warns about it. This
+        // test's own claim is the WIRE SHAPE (kit/attachments/key content
+        // match the shared fixture byte-for-byte), never "warns about
+        // nothing" — that assertion predates the kit-shape warning and was
+        // never this test's actual subject.
+        assert_eq!(
+            rec.warnings,
+            vec![format!(
+                "mod {}'s kit does not look like a unified diff (no `@@ ` hunk header) — it will render as a fenced block in the review body, never a one-click suggestion",
+                rec.key
+            )],
+            "the only warning is the kit-shape one — the wire shape itself must still round-trip clean: {rec:?}"
+        );
         restore_env(prev);
     }
 
@@ -4848,7 +4864,14 @@
         assert_eq!(rec.kit.as_deref(), Some("the change nobody may lose"));
         assert_eq!(rec.r#for, vec!["sess-ok/1".to_string()], "only the addressable key survives");
         assert_eq!(rec.attachments, vec!["good.txt".to_string()], "only the decodable one");
-        assert_eq!(rec.warnings.len(), 5, "one per dropped part: {:?}", rec.warnings);
+        // (post-#2431 fix loop round 3) The fixture's kit ("the change
+        // nobody may lose") is plain prose, not a diff, so
+        // `create_from_emission`'s kit-shape check (mods.rs) ALSO fires —
+        // a 6th warning this test's own claim ("one per dropped part") was
+        // never about. Bumped from 5 to 6; the substring loop below still
+        // only names the 5 dropped-part warnings this test actually cares
+        // about.
+        assert_eq!(rec.warnings.len(), 6, "5 dropped parts + 1 kit-shape warning: {:?}", rec.warnings);
         let joined = rec.warnings.join(" | ");
         for expected in ["sess/extra/1", "not a string", "no-bytes.txt", "bad.txt", "dir/good.txt"] {
             assert!(joined.contains(expected), "{expected} must be named: {joined}");
