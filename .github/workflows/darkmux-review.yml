@@ -2,28 +2,36 @@
 # crew of models.
 #
 # darkmux dogfooding itself: a PR diff is dispatched to the **review pipeline**
-# (`templates/builtin/mission-configs/review.json`, #1284/#1513) — an explicit
-# task graph declaring probe/judge/verify TASKS, each carrying its own
-# `role_id`. Staffing is resolved on the runner from the `role_profiles` map
-# in the runner's own `~/.darkmux/config.json` (#1475) — this workflow names
-# no models and no profile; it only supplies the diff/source params below.
-# The probe tasks surface findings, the judge double-confirms them, and
-# verify renders the final adjudication — running on a self-hosted runner.
-# No cloud API is involved. The findings post back as native inline PR
-# comments.
+# (`templates/builtin/mission-configs/review.json`, #2310 P4d — built on the
+# shared mission building blocks, no bespoke funnel launcher) — a `plan.sites`
+# task per rule plans the diff's own hunks, one `crawl.unit` task per rule
+# GROWS a dispatch per planned site under `role_id: "reviewer"`, `crawl.summary`
+# folds each unit's findings, `create-mods` waits (bounded) for a mod and gates
+# it, and `deliver.github_review` gathers this run's finding/mod stores and
+# renders the GitHub review payload. Staffing is resolved on the runner from
+# the `role_profiles` map in the runner's own `~/.darkmux/config.json` (#1475)
+# — this workflow names no models and no profile; it only supplies the
+# diff/source params below. Running on a self-hosted runner. No cloud API is
+# involved by default (see the `mod_seat_profile` review.json input for the
+# one opt-in exception). The findings post back as native inline PR comments.
 #
 # SECURITY (public repo + self-hosted runner): the trigger is **workflow_dispatch
 # only** — it never fires on a `pull_request` event, so a stranger's PR (or a
 # fork) can NOT auto-run anything on the runner. Only someone with write access
 # launches it (`gh workflow run darkmux-review.yml -f pr=<n>`), and even then the
 # job NEVER checks out the reviewed PR's code: it reads only the PR *diff* via
-# the API (data, not executed) and feeds it to the sandboxed, network-isolated
-# internal runtime. The review pipeline's `github` input (inside the `darkmux
-# mission launch review` dispatch below) fetches changed-file + one-hop-import
-# CONTENTS via the same GitHub API — also read as data and never executed,
-# the same trust class as the diff. The repo checkout below is of trusted
-# `main` (the review tooling), not the PR. Runner registration + prerequisites:
-# see .github/DARKMUX_REVIEW_RUNNER.md.
+# the API (data, not executed). What actually leaves this machine, and where
+# it goes: the diff (`diff_file`), the PR title/body as intent text
+# (`intent_file`), and the materialized source tree `plan.sites` derives from
+# `github`+`head_sha` when no `workspace` is given — all read as data, never
+# executed, and dispatched to the LOCAL reviewer model named by the runner's
+# own `role_profiles.reviewer` (`review.json`'s `github` input itself is
+# reached by `plan.sites`'s config but not consumed there — no fetch path
+# exists; see that step's own module doc). The one opt-in exception is
+# `mod_seat_profile`, which — only when explicitly set — sends a finding and
+# its named source to a hosted endpoint for a coder seat; unset by default.
+# The repo checkout below is of trusted `main` (the review tooling), not the
+# PR. Runner registration + prerequisites: see .github/DARKMUX_REVIEW_RUNNER.md.
 name: darkmux self-review
 
 on:
@@ -32,11 +40,6 @@ on:
       pr:
         description: "PR number to review"
         required: true
-        type: string
-      mode:
-        description: "Review dispatch mode: sequential (one seat model loaded at a time — the 32GB-tier default), parallel (multiple seat models resident at once), or auto (darkmux picks)."
-        required: false
-        default: "auto"
         type: string
 
 concurrency:
@@ -55,7 +58,6 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ inputs.pr }}
       REPO: ${{ github.repository }}
-      MODE: ${{ inputs.mode }}
     steps:
       - name: Checkout review tooling (trusted main — NOT the reviewed PR)
         uses: actions/checkout@v4
@@ -166,21 +168,16 @@ jobs:
         if: steps.diff.outputs.has_diff == 'true'
         run: |
           set -euo pipefail
-          # Defense-in-depth: `mode` is maintainer-supplied (workflow_dispatch
-          # is maintainer-only), but constrain it to a known enum before it
-          # reaches the dispatch args.
-          case "$MODE" in sequential|parallel|auto) ;; *) echo "mode input must be one of: sequential, parallel, auto"; exit 1 ;; esac
           # Staffing lives on the MACHINE, not in this public workflow
-          # (#1475, #1513): the review config declares explicit probe/judge/
-          # verify TASKS, each carrying its own `role_id`; each role resolves
-          # via the runner's `role_profiles` map in `~/.darkmux/config.json`
-          # (falling back to `default_profile`). This workflow names no
-          # model and no profile — it only supplies the diff/source params
-          # below.
+          # (#1475, #1513): the review config's `crawl.unit` task dispatches
+          # under `role_id: "reviewer"`, which resolves via the runner's own
+          # `role_profiles` map in `~/.darkmux/config.json` (falling back to
+          # `default_profile`). This workflow names no model and no profile
+          # — it only supplies the diff/source params below.
           #
-          # Resilient: a hiccup leaves no/empty envelope; the review dispatch's own
-          # degraded-mode handling (below) turns that into a loud comment plus
-          # a failed run rather than a silent green check.
+          # Resilient: a hiccup leaves no/empty rendered payload; the review
+          # dispatch's own degraded-mode handling (below) turns that into a
+          # loud comment plus a failed run rather than a silent green check.
           # (#2310 P4d) `review` reads `diff_file` directly — there is no
           # bundler stage in this pipeline any more (the funnel that had
           # one was deleted), so darkmux reviewing its own Rust PRs no
@@ -198,17 +195,13 @@ jobs:
           # review.json; see that config's own `inputs` doc for the mapping
           # table. `--timeout` is the ONE exception: it stayed the generic
           # `mission launch` CLI flag every config-launched dispatch shares,
-          # rather than becoming its own `--param`.
-          # `mode`/`envelope_out` are declared `ignored: true` by review.json
-          # (CLI-surface parity with the retired funnel launcher only) and
-          # passing either one just prints a warning every run — dropped
-          # here rather than carried forward for no effect. Nothing
-          # downstream reads `envelope_out`'s VALUE: the "Upload review
-          # envelope" step below names a fixed temp path, never populated
-          # either way since review.json's `deliver.github_review` writes
-          # only the rendered `{mode, review}` payload (`emit`), never a
-          # separate envelope file — that upload step no-ops on
-          # `if-no-files-found: ignore` regardless of this param.
+          # rather than becoming its own `--param`. (post-#2431 fix loop)
+          # This workflow no longer accepts a `mode` input at all — the
+          # retired funnel launcher's sequential/parallel residency split
+          # has no counterpart in this pipeline (the generic scheduler owns
+          # dispatch ordering), and the input was never forwarded to this
+          # dispatch call in the first place, so keeping it only invited a
+          # maintainer to believe it did something.
           "$DARKMUX_BIN" mission launch review \
             --param "github=$REPO" \
             --param "head_sha=$HEAD_SHA" \
@@ -229,7 +222,7 @@ jobs:
             # crashed before its own degraded-mode fallback could run). Same
             # "never read as a green check" contract as mode=degraded (#1113).
             gh pr comment "$PR" --repo "$REPO" --body \
-              ":warning: darkmux PR review produced no output (mode=\`$MODE\`) — see workflow logs."
+              ":warning: darkmux PR review produced no output — see workflow logs."
             echo "::error::review dispatch produced no rendered payload"
             exit 1
           fi

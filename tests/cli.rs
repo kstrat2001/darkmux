@@ -574,56 +574,89 @@ fn mission_config_show_review_names_every_phase_and_flags_unconstructible_kinds(
     }
 }
 
-/// (#2310 P4c-2 review item 3 — proven; #2404 P4d round 3: `bundler` this
-/// test originally used was removed outright — see review.json's own
-/// `inputs` doc — so it now proves the same rendering against `mode`,
-/// review's other still-ignored CLI-parity input.) `mission config show
-/// review` must render an ignored input's `ignored`/`ignored_reason` —
-/// both in `--json` (typed fields, always present) and in the text form
-/// (`(optional, ignored: <reason>)`), so an operator sees the same signal
-/// launch-time gives without having to launch first.
+/// (#2310 P4c-2 review item 3 — proven; #2404 P4d round 3: `bundler`, the
+/// shipped `review.json` input this test originally used, was removed
+/// outright, so the test was retargeted to review's `mode` input; the
+/// post-#2431 fix loop then deleted `mode` too — see review.json's own
+/// `inputs` doc — once nothing turned out to pass it. Retargeting a THIRD
+/// time to some other shipped config's ignored input would just repeat the
+/// same fragility, so this test now plants its OWN synthetic config with
+/// one `ignored: true` input, same as `an_ignored_input_no_step_references_
+/// is_clean` does at the unit level in `mission_config/inputs.rs` — the
+/// rendering this proves has nothing to do with WHICH config declares the
+/// input.) `mission config show` must render an ignored input's
+/// `ignored`/`ignored_reason` — both in `--json` (typed fields, always
+/// present) and in the text form (`(optional, ignored: <reason>)`), so an
+/// operator sees the same signal launch-time gives without having to
+/// launch first.
 #[test]
-fn mission_config_show_review_renders_the_ignored_mode_input() {
+fn mission_config_show_renders_an_ignored_input() {
     let tmp = TempDir::new().unwrap();
+    let config_dir = tmp.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "ignored-input-test",
+        "name": "Ignored Input Test",
+        "schema_version": "3.1",
+        "inputs": [
+            {
+                "name": "legacy_flag",
+                "description": "kept for CLI-surface parity; nothing in this document reads it",
+                "required": false,
+                "ignored": true,
+                "ignored_reason": "no step in this document consumes it"
+            },
+            {"name": "message", "description": "the noop step's own config value", "required": true}
+        ],
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{"id": "s1", "kind": "procedural.noop", "config": {"text": "{{message}}"}}]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("ignored-input-test.json"), config_json).unwrap();
+
     let json_out = Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_HOME", tmp.path())
-        .args(["mission", "config", "show", "review", "--json"])
+        .args(["mission", "config", "show", "ignored-input-test", "--json"])
         .output()
-        .expect("mission config show review --json runs");
+        .expect("mission config show ignored-input-test --json runs");
     assert!(json_out.status.success(), "stderr: {}", String::from_utf8_lossy(&json_out.stderr));
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&json_out.stdout)).expect("valid JSON");
-    let mode = v["inputs"]
+    let legacy = v["inputs"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["name"] == serde_json::json!("mode"))
-        .expect("the mode input is listed");
-    assert_eq!(mode["ignored"], serde_json::json!(true), "{mode}");
-    let reason = mode["ignored_reason"].as_str().expect("a reason string");
-    assert!(!reason.is_empty(), "{mode}");
+        .find(|i| i["name"] == serde_json::json!("legacy_flag"))
+        .expect("the legacy_flag input is listed");
+    assert_eq!(legacy["ignored"], serde_json::json!(true), "{legacy}");
+    let reason = legacy["ignored_reason"].as_str().expect("a reason string");
+    assert!(!reason.is_empty(), "{legacy}");
 
     let text_out = Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_HOME", tmp.path())
-        .args(["mission", "config", "show", "review"])
+        .args(["mission", "config", "show", "ignored-input-test"])
         .output()
-        .expect("mission config show review runs");
+        .expect("mission config show ignored-input-test runs");
     assert!(text_out.status.success(), "stderr: {}", String::from_utf8_lossy(&text_out.stderr));
     let text = String::from_utf8_lossy(&text_out.stdout);
     assert!(
-        text.contains(&format!("mode (optional, ignored: {reason})")),
+        text.contains(&format!("legacy_flag (optional, ignored: {reason})")),
         "text output must render the ignored form:\n{text}"
     );
 
     // A LIVE (non-ignored) input on the same config must NOT get the
     // ignored suffix.
     assert!(
-        text.contains("diff_file (required)\n") || text.contains("diff_file (required,"),
+        text.contains("message (required)\n") || text.contains("message (required,"),
         "a live input keeps the plain form:\n{text}"
     );
     assert!(
-        !text.contains("diff_file (required, ignored"),
+        !text.contains("message (required, ignored"),
         "a live input must never render an ignored suffix:\n{text}"
     );
 }

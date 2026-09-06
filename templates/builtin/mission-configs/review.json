@@ -35,20 +35,6 @@
       "required": false
     },
     {
-      "name": "mode",
-      "description": "Accepted for CLI-surface parity with the retired funnel launcher (`.github/workflows/darkmux-review.yml` still passes it) and IGNORED: this document has no sequential/parallel residency split to switch on -- each `unit-<rule>` task's dispatches are scheduled by the generic scheduler.",
-      "required": false,
-      "ignored": true,
-      "ignored_reason": "review has no exec-mode split; the scheduler owns dispatch ordering"
-    },
-    {
-      "name": "envelope_out",
-      "description": "Accepted for CLI-surface parity with the retired funnel launcher and IGNORED: `deliver.github_review` writes the rendered `{mode, review}` payload only (via `emit`), never a separate full envelope file -- there is no envelope shape in this document's own pipeline for this to name.",
-      "required": false,
-      "ignored": true,
-      "ignored_reason": "review writes its rendered payload via emit; there is no separate envelope artifact"
-    },
-    {
       "name": "emit",
       "description": "Path to write the rendered `{mode, review}` payload the `deliver` phase's `deliver-step` produces. `-` (or omitted) writes to stdout, matching the frozen `review` config's own `emit` contract.",
       "required": false

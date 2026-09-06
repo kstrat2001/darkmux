@@ -578,14 +578,17 @@ pub fn launch(
     }
 
     // (#2310 P4c-2 item 4) An input the document declares `"ignored":
-    // true` on (`review.json`'s `mode`/`envelope_out`, accepted for
-    // CLI-surface parity with the retired funnel launcher's own params
-    // but never consumed by review's own pipeline) gets a named warning
-    // when the operator supplies it — STRUCTURAL, any config on any
-    // input, never keyed on a config id (replaces the old
-    // `config.id == "review"` special case). BEFORE the `--dry-run`
-    // short-circuit below so the signal is visible on the free path too,
-    // not only on a real (costly) launch.
+    // true` on (`review.json`'s `mode`/`envelope_out` were the motivating
+    // example — CLI-surface parity with the retired funnel launcher's own
+    // params, never consumed by review's own pipeline; the post-#2431 fix
+    // loop deleted both from the document once neither one turned out to
+    // be passed by anything, so the mechanism now has no live shipped
+    // example, only this generic one) gets a named warning when the
+    // operator supplies it — STRUCTURAL, any config on any input, never
+    // keyed on a config id (replaces the old `config.id == "review"`
+    // special case). BEFORE the `--dry-run` short-circuit below so the
+    // signal is visible on the free path too, not only on a real (costly)
+    // launch.
     for input in &config.inputs {
         if input.ignored == Some(true) && collected.contains_key(&input.name) {
             let reason = input.ignored_reason.as_deref().unwrap_or("it has no effect on this config");
@@ -7348,11 +7351,14 @@ mod tests {
     /// it used to route to the now-deleted dedicated review launcher
     /// before this check ran, so its inputs were that launcher's to
     /// account for. It now runs the same generic path as every other
-    /// config, so it gets the same check as everything else — its own
-    /// `mode`/`envelope_out` inputs are marked `ignored: true` in the
-    /// document itself (CLI-surface parity with the retired funnel
-    /// launcher) rather than needing an exclusion here, and the empty
-    /// `expected` set below stays true only as long as that holds.
+    /// config, so it gets the same check as everything else. It used to
+    /// also declare `mode`/`envelope_out` — CLI-surface-parity leftovers
+    /// from the retired funnel launcher, marked `ignored: true` rather
+    /// than excluded here — but nothing ever passed either one (verified
+    /// against `.github/`, `src/`, `skills/`, `docs/`), so the
+    /// post-#2431 fix loop deleted both from the document instead of
+    /// carrying dead ignored-input ceremony forward; the empty `expected`
+    /// set below stays true either way.
     #[test]
     fn no_shipped_config_declares_an_input_nothing_consumes() {
         let expected: &[(&str, &str)] = &[];

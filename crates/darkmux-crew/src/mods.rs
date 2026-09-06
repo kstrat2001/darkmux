@@ -1154,6 +1154,21 @@ pub fn create_from_emission(
     }
 
     let key = mint_key();
+    // (#2310 P4c, widened by the post-#2431 fix loop) `looks_like_unified_diff`
+    // only tells this producer WHETHER the kit is diff-shaped; when it isn't,
+    // the mod is silently stuck rendering as a fenced body block forever (see
+    // `deliver_github_review.rs`'s own `render_gated_mod` doc), and nothing
+    // ever recorded that fact anywhere a reader of the mod itself would see
+    // it. A warning here — on the record `warnings` already carries the
+    // missing-`for`-key case above — names it at the one place both `mod
+    // show <key>` and `records.gather`'s mission envelope can surface it.
+    let kit_kind = looks_like_unified_diff(&kit).then(|| "unified-diff".to_string());
+    if kit_kind.is_none() {
+        warnings.push(format!(
+            "mod {key}'s kit does not look like a unified diff (no `@@ ` hunk header) — it will \
+             render as a fenced block in the review body, never a one-click suggestion"
+        ));
+    }
     let record = ModRecord {
         key: key.clone(),
         ts: darkmux_flow::ts_utc_now(),
@@ -1172,7 +1187,7 @@ pub fn create_from_emission(
         // forever, per `mods.rs`'s own #2310 P4b review note this replaces:
         // a review finding's mod never becomes a GitHub suggestion block
         // without this, no matter how diff-shaped the kit actually is.
-        kit_kind: looks_like_unified_diff(&kit).then(|| "unified-diff".to_string()),
+        kit_kind,
         attachments: names.clone(),
         context: finding_context(findings_root, &for_keys)?,
         warnings,
@@ -1343,8 +1358,16 @@ mod tests {
         assert!(!rec.context.findings[0].missing);
         assert_eq!(
             rec.warnings,
-            vec!["a part the host could not keep".to_string()],
-            "what the host could not keep rides ON the record, not only on stderr"
+            vec![
+                "a part the host could not keep".to_string(),
+                format!(
+                    "mod {}'s kit does not look like a unified diff (no `@@ ` hunk header) — it will \
+                     render as a fenced block in the review body, never a one-click suggestion",
+                    rec.key
+                ),
+            ],
+            "what the host could not keep rides ON the record, not only on stderr, and the host's \
+             OWN kit-shape observation joins it rather than replacing it"
         );
 
         let stored = load_at(&root, &rec.key).unwrap().expect("the mod is readable");
@@ -1436,6 +1459,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rec.kit_kind.as_deref(), Some("unified-diff"), "{rec:?}");
+        // A diff-shaped kit needs no shape warning — it already renders as
+        // the suggestion a reader wants.
+        assert!(
+            rec.warnings.is_empty(),
+            "a detected unified-diff kit gets no shape warning: {:?}",
+            rec.warnings
+        );
 
         let plain = create_from_emission(
             &root,
@@ -1450,6 +1480,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plain.kit_kind, None, "{plain:?}");
+        // (post-#2431 fix loop) A prose kit — the shape the runtime's
+        // `create_mod` tool always writes today, since it has no `kit_kind`
+        // argument — stays `None` (correctly: it is not a diff), but this
+        // producer now says so, naming the mod, so `mod show`/the review
+        // delivery can point at WHY it never became a suggestion.
+        assert!(
+            plain.warnings.iter().any(|w| w.contains(&plain.key) && w.contains("unified diff")),
+            "a non-diff kit gets a shape warning naming the mod: {:?}",
+            plain.warnings
+        );
     }
 
     /// A kit that is empty, or two attachments that would collide, are refused
