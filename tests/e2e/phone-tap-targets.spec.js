@@ -73,7 +73,8 @@ async function resolvesAt(page, sel, side, px) {
 // resident — enough for the lens to render the `.mm-odo-i` affordance
 // (#2440 moved this glyph off the odometer tiles, which no longer carry
 // their own per-tile popover, onto the single "N model priced by estimate
-// (no config.json)" line's `ⓘ`, which opens `how this was measured`). The
+// (no readable config.json)" line's `ⓘ`, which opens `how this was
+// measured`). The
 // hostile-string walk over this same endpoint lives in
 // `viewer-machine.spec.js`; this fixture is deliberately boring, because
 // the claim here is about geometry, not content.

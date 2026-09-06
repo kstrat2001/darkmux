@@ -696,6 +696,9 @@ export function MachineHealthRegion({
   // open anything to see.
   const infoMessages = messages.filter((m) => m.severity === "info");
   const alarmMessages = messages.filter((m) => m.severity !== "info");
+  // `infoMessages` has exactly one producer today: `model_ledger.rs`'s
+  // `LedgerMessage::info(...)` push at ~L932 (the ESTIMATED-residents
+  // disclosure) — the fact `estimateLine` below points at, below.
   const estimatedCount = Number(b.machine.estimated_models) || 0;
   const unpricedCount = Number(b.machine.unpriced_models) || 0;
   const estimateLine = estimatedSummaryLine(estimatedCount);

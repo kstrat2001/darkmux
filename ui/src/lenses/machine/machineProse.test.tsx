@@ -148,7 +148,14 @@ describe("machine lens — at-rest prose budget", () => {
     // The estimated fact no longer lives on the row at all (#2440 cut 5) —
     // it is the ONE machine-wide summary line pointing at the disclosure.
     expect(hints.some((h) => /estimated:/i.test(h))).toBe(false);
-    expect(container.textContent).toMatch(/1 model priced by estimate \(no config\.json\)/);
+    expect(container.textContent).toMatch(/1 model priced by estimate \(no readable config\.json\)/);
+    // (#2440 round 2, QA finding) `container.textContent` also matches a
+    // closed `<details>`'s BODY — the disclosure the pointer is supposed to
+    // sit OUTSIDE of. A regression that moved the pointer line itself
+    // inside `.mm-about` would still satisfy the assertion above; this one
+    // fails it, the way `visibleWords` above already treats a closed
+    // disclosure's body as off-screen.
+    expect(screen.getByText(/1 model priced by estimate/).closest("details")).toBeNull();
 
     const words = visibleWords(container.querySelector(".machine-lens") as HTMLElement);
     // Measured 423 before the #1854-era trim, 338 after #1819, 317 after

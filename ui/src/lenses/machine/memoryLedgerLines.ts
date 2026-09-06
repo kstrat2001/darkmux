@@ -70,10 +70,19 @@ export function overPriceHint(m: Pick<MachineResourcesModel, "over_price_bytes" 
  * -reserves) is not lost: it still rides the server's `messages` array
  * verbatim, moved into the `how this was measured` disclosure this line
  * points at — see `MachineHealthRegion.tsx`'s render. `null` when nothing
- * is estimated, so the line (and its `ⓘ`) simply doesn't render. */
+ * is estimated, so the line (and its `ⓘ`) simply doesn't render.
+ *
+ * (#2440 round 2, operator finding) "(no readable config.json)", not "(no
+ * config.json)": the server's own text (`model_ledger.rs`'s
+ * `LedgerMessage::info` producer, ~L932) reads "no readable config.json —
+ * commonly a GGUF download", and the ESTIMATED fallback also fires when a
+ * config.json IS present but its arch facts are unreadable, or the GGUF
+ * header itself can't be parsed — "no config.json" flatly overclaimed the
+ * cause. This line quotes the disclosure's own qualifier verbatim rather
+ * than compressing it into something the disclosure then contradicts. */
 export function estimatedSummaryLine(estimatedCount: number): string | null {
   if (!(estimatedCount > 0)) return null;
-  return `${estimatedCount} model${estimatedCount === 1 ? "" : "s"} priced by estimate (no config.json)`;
+  return `${estimatedCount} model${estimatedCount === 1 ? "" : "s"} priced by estimate (no readable config.json)`;
 }
 
 /** The configured utility-tier model's id, or `null` — the ONE thing the

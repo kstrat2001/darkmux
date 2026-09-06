@@ -913,7 +913,7 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
     const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("phi-4"))!;
     expect([...row.querySelectorAll(".mm-hint")].some((h) => h.textContent?.includes("estimated:"))).toBe(false);
     expect(container.querySelector(".mm-about")!.textContent?.toLowerCase()).toContain("dense");
-    expect(container.textContent).toMatch(/1 model priced by estimate \(no config\.json\)/);
+    expect(container.textContent).toMatch(/1 model priced by estimate \(no readable config\.json\)/);
   });
 
   it("decision 1: an estimated resident is disclosed on its own row and in the machine detail row", () => {

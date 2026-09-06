@@ -984,7 +984,10 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     // panel's one row anatomy; same labels, same values).
     expect(screen.getByText("Fair")).toBeInTheDocument();
     expect(kvValue("CPU speed limit")).toBe("87%");
-    expect(kvValue("highest severity")).toBe("Serious");
+    // (#2440 round 2) "peak (N min)", not "highest severity" — relabeled
+    // so the row reads as windowed, not a second current-state verdict.
+    // span_ms 90_000 -> round(90_000/60_000) = 2.
+    expect(kvValue("peak (2 min)")).toBe("Serious");
     expect(kvValue("above nominal")).toBe("45s");
 
     // Power: total now/avg/p95/max in W (≥1000 mW), per-channel row, and
@@ -1006,12 +1009,14 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
   // `thermal.state`; "highest severity" restated it verbatim whenever the
   // window's worst state matched — the exact case the operator saw ("the
   // bar highlights FAIR and the text repeats HIGHEST SEVERITY Fair"). This
-  // is the acceptance criterion's own case: bar present, severity text
-  // absent. The inverted case — worst state genuinely differs from current
-  // — is already covered above ("Fair" ladder + "Serious" highest severity,
-  // both rendered) and must keep passing: dropping the row unconditionally
-  // would have deleted a real, non-duplicate fact.
-  it("drops the redundant 'highest severity' row when it exactly matches the lit ladder state", async () => {
+  // is the acceptance criterion's own case: bar present, peak row absent.
+  // The inverted case — worst state genuinely differs from current — is
+  // already covered above ("Fair" ladder + "Serious" peak, both rendered)
+  // and must keep passing: dropping the row unconditionally would have
+  // deleted a real, non-duplicate fact. (#2440 round 2: the row itself is
+  // now labeled "peak (N min)", not "highest severity" — see that rename's
+  // own comment in `machineStatsContent.tsx`.)
+  it("drops the redundant 'peak' row when it exactly matches the lit ladder state", async () => {
     const SAME_STATE_LOAD = {
       ...FULL_LOAD,
       load: {
@@ -1037,7 +1042,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     openDesktop();
 
     await waitFor(() => expect(screen.getByText("Fair")).toBeInTheDocument());
-    expect(kvValue("highest severity")).toBeNull();
+    expect(kvValue("peak (2 min)")).toBeNull();
     // "above nominal" is untouched — it names a different fact (time spent
     // above nominal), never restated by the ladder.
     expect(kvValue("above nominal")).toBe("45s");
@@ -1393,7 +1398,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     // Same facts, same wording as desktop (kvValue normalizes the NBSPs).
     expect(kvValue("total")).toBe("9.0 W now · 7.8 W avg · 9.2 W p95 · 11.0 W max");
     expect(kvValue("channels")).toBe("CPU 5.2 W · GPU 3.4 W · ANE 400 mW");
-    expect(kvValue("highest severity")).toBe("Serious");
+    expect(kvValue("peak (2 min)")).toBe("Serious"); // #2440 round 2 rename
     expect(kvValue("above nominal")).toBe("45s");
     // The raw value binds each item's internal spaces with NBSP and allows
     // a break only after the " · " separator — the whole mid-item-wrap fix.
