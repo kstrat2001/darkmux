@@ -800,7 +800,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
                     "total_records": 46,
                     "total_bytes": 12345,
                     "dispatch_seconds": 210.0,
+                    "dispatch_pairs": 3,
+                    "open_dispatches": 0,
                     "wall_seconds": 300.0,
+                    "machine_uid": "mac-9",
                     "host_samples_in_window": 9
                 }
             }"#,
@@ -825,13 +828,17 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let re = report.records_emitted.expect("records_emitted read from envelope.json");
         assert_eq!(re.total_records, 46);
         assert_eq!(re.dispatch_seconds, 210.0);
+        assert_eq!(re.dispatch_pairs, 3);
+        assert_eq!(re.open_dispatches, 0);
         assert_eq!(re.wall_seconds, 300.0);
+        assert_eq!(re.machine_uid.as_deref(), Some("mac-9"));
         assert_eq!(re.host_samples_in_window, 9);
         assert_eq!(lines[0], "    40  dispatch.turn", "the highest count sorts first");
         assert!(lines.iter().any(|l| l.contains("46 total records")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("210s dispatch time")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("3 pair(s), 0 open")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("300s wall clock")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("9 host samples in window")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("9 host samples in window (machine `mac-9`)")), "{lines:?}");
     }
 
     #[test]

@@ -2619,7 +2619,7 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
 
     println!(
         "{}",
-        style::header("records emitted — this mission's own flow-stream cost (#2421)")
+        style::header("records emitted — this mission's own flow-stream cost")
     );
     print_records_emitted(&report.records_emitted);
     println!();
@@ -2667,9 +2667,13 @@ fn format_records_emitted_lines(records_emitted: &Option<crew::records_emitted::
         .map(|(action, count)| format!("{count:>6}  {action}"))
         .collect();
     lines.push(format!(
-        "{} total records, {} bytes, {:.0}s dispatch time, {:.0}s wall clock, {} host samples in window",
-        re.total_records, re.total_bytes, re.dispatch_seconds, re.wall_seconds, re.host_samples_in_window
+        "{} total records, {} bytes, {:.0}s dispatch time ({} pair(s), {} open), {:.0}s wall clock",
+        re.total_records, re.total_bytes, re.dispatch_seconds, re.dispatch_pairs, re.open_dispatches, re.wall_seconds
     ));
+    lines.push(match &re.machine_uid {
+        Some(mu) => format!("{} host samples in window (machine `{mu}`)", re.host_samples_in_window),
+        None => "no machine_uid on this mission's records — host samples not joined".to_string(),
+    });
     lines
 }
 

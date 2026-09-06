@@ -518,6 +518,22 @@ fn classify_mission_close_refusal(current: Option<MissionStatus>) -> FinalizeRef
     }
 }
 
+/// (#2426 round 2 (4)) Pure — real records, but none of them carry a
+/// `machine_uid`, means the host-sample join has nothing to join against:
+/// `host_samples_in_window: 0` would otherwise look identical to "the host
+/// sampler simply wasn't running" instead of "this mission's records
+/// predate #640 / came from a non-macOS emitter." Named, not silent.
+/// Callers only reach this on the non-miss path (`total_records > 0`) —
+/// the miss warning takes priority and is constructed separately (it also
+/// needs the day-files-searched list, which this function doesn't see).
+fn missing_machine_uid_warning(emitted: &crate::records_emitted::RecordsEmitted) -> Option<String> {
+    if emitted.machine_uid.is_none() {
+        Some("records carry no machine_uid; host samples not joined".to_string())
+    } else {
+        None
+    }
+}
+
 pub fn finalize_mission(envelope: &MissionEnvelope) {
     finalize_mission_with_payload(envelope, None)
 }
@@ -588,15 +604,16 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
     // resolved and this degrades to an honest all-zero block plus a named
     // warning, same shape as the "no records found" miss below.
     let finalize_secs = crate::records_emitted::now_secs();
-    let (records_emitted, miss_reason) = match lifecycle::load_mission_by_id(&envelope.mission_id) {
+    let mut records_emitted_warnings: Vec<String> = Vec::new();
+    let records_emitted = match lifecycle::load_mission_by_id(&envelope.mission_id) {
         Ok(mission) => {
             let (emitted, day_files_searched) = crate::records_emitted::records_emitted_for_mission(
                 &envelope.mission_id,
                 mission.created_ts,
                 finalize_secs,
             );
-            let miss = if emitted.total_records == 0 {
-                Some(format!(
+            if emitted.total_records == 0 {
+                records_emitted_warnings.push(format!(
                     "no flow records found for mission `{}` (searched day file(s): {})",
                     envelope.mission_id,
                     if day_files_searched.is_empty() {
@@ -604,21 +621,21 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
                     } else {
                         day_files_searched.join(", ")
                     }
-                ))
-            } else {
-                None
-            };
-            (emitted, miss)
+                ));
+            } else if let Some(reason) = missing_machine_uid_warning(&emitted) {
+                records_emitted_warnings.push(format!("mission `{}`'s {reason}", envelope.mission_id));
+            }
+            emitted
         }
-        Err(e) => (
-            crate::records_emitted::RecordsEmitted::default(),
-            Some(format!(
+        Err(e) => {
+            records_emitted_warnings.push(format!(
                 "could not resolve mission `{}`'s created_ts to scan day files for records-emitted: {e:#}",
                 envelope.mission_id
-            )),
-        ),
+            ));
+            crate::records_emitted::RecordsEmitted::default()
+        }
     };
-    if let Some(reason) = miss_reason {
+    for reason in records_emitted_warnings {
         envelope.warnings.push(format!("records-emitted: {reason}"));
     }
     envelope.records_emitted = Some(records_emitted);
@@ -1090,6 +1107,18 @@ mod tests {
     }
 
     // ── records_emitted (#2421) ──────────────────────────────────────────
+
+    #[test]
+    fn missing_machine_uid_warning_fires_only_when_the_field_is_none() {
+        let mut re = crate::records_emitted::RecordsEmitted { total_records: 5, ..Default::default() };
+        assert_eq!(
+            missing_machine_uid_warning(&re),
+            Some("records carry no machine_uid; host samples not joined".to_string())
+        );
+        re.machine_uid = Some("mac-1".to_string());
+        assert_eq!(missing_machine_uid_warning(&re), None);
+    }
+
 
     /// Same leniency shape as the pre-#1877 `outcome` test above, for the
     /// 1.2 -> 1.3 bump: an envelope with no `records_emitted` key at all

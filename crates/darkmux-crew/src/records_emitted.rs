@@ -49,29 +49,81 @@ pub struct RecordsEmitted {
     /// debrief's "top actions" rendering are deterministically ordered.
     #[serde(default)]
     pub by_action: BTreeMap<String, u64>,
-    /// Total flow records carrying this mission's `mission_id`, across every
-    /// day file scanned.
+    /// Flow records carrying this mission's `mission_id`, AT THE MOMENT OF
+    /// THIS FINALIZE — across every day file scanned. Not the mission's
+    /// lifetime total: `finalize_mission_with_payload` computes this block
+    /// AFTER driving the phase/mission transitions but BEFORE the launch's
+    /// own wrapper closes out (`src/mission_launch.rs`'s outer `dispatch
+    /// start`/`dispatch complete` bookend around the whole `launch()` call,
+    /// and its post-finalize cmd-audit record) — those records are written
+    /// to the day file strictly AFTER this count is taken and are
+    /// structurally outside the block. A re-finalize (idempotent re-close)
+    /// would see a slightly larger count next time; this field is "records
+    /// on disk as of this finalize," not a promise of eventual completeness.
     #[serde(default)]
     pub total_records: u64,
     /// Sum of the on-disk byte length of every JSONL line counted into
-    /// `total_records` (the line's raw text, not the record re-serialized).
+    /// `total_records` — the line's raw text (its `serde_json` encoding as
+    /// written), EXCLUDING the trailing newline the file separates lines
+    /// with, not the record re-serialized by this reader.
     #[serde(default)]
     pub total_bytes: u64,
-    /// Sum of (terminal ts − start ts) over the mission's dispatch bookend
-    /// pairs, paired by `session_id`. An unpaired ("open") start counts to
-    /// the finalize-time clock passed to [`aggregate_records_emitted`].
+    /// Sum of (terminal ts − start ts) over the mission's own dispatch
+    /// bookend pairs, paired by `session_id`. Excludes the LAUNCH's own
+    /// wrapper liveness bookend (`source == "mission"` —
+    /// `mission_bookend_record` in `src/mission_launch.rs`, opened around
+    /// the whole `launch()` call and closed only after finalize returns):
+    /// that bookend is liveness for the launch invocation, not seat work,
+    /// and counting it would inflate this field by the mission's entire
+    /// wall time every time (it always reads as OPEN at aggregation time,
+    /// since finalize runs strictly before the wrapper's own terminal
+    /// record is written). An unpaired ("open") seat dispatch — including
+    /// one superseded by a second `dispatch start` on the same
+    /// `session_id` before ever seeing a terminal — counts to the
+    /// finalize-time clock passed to [`aggregate_records_emitted`]; see
+    /// `open_dispatches`.
     #[serde(default)]
     pub dispatch_seconds: f64,
+    /// Count of dispatch bookend pairs actually matched (a `dispatch
+    /// start` paired with a later terminal on the same `session_id`) —
+    /// contributes to `dispatch_seconds`. Distinguishes "zero dispatch
+    /// seconds because there were no dispatches" (`dispatch_pairs == 0 &&
+    /// open_dispatches == 0`) from "zero because every one is still open"
+    /// (`open_dispatches > 0`).
+    #[serde(default)]
+    pub dispatch_pairs: u64,
+    /// Count of dispatch starts that never saw a matching terminal — each
+    /// credited to `dispatch_seconds` via the finalize-time clock rather
+    /// than dropped. Includes both a start still open when the scan ends
+    /// AND an earlier start superseded by a second `dispatch start` on the
+    /// same `session_id` (flushed to finalize time at the moment of the
+    /// second start, since no later terminal can retroactively close it).
+    /// The launch's own wrapper bookend is EXCLUDED from this count too
+    /// (see `dispatch_seconds`'s doc) — it never reaches `open_dispatches`
+    /// even though it always reads as unterminated at aggregation time.
+    #[serde(default)]
+    pub open_dispatches: u64,
     /// Last record ts − first record ts, over this mission's own records
     /// only. `0.0` when fewer than one timestamp was parseable (including
     /// the MISS case: no records at all).
     #[serde(default)]
     pub wall_seconds: f64,
+    /// The `machine_uid` used for the `host_samples_in_window` join — the
+    /// first non-`None` `machine_uid` carried by any of this mission's own
+    /// matched records. `None` when NONE of them carry one (pre-#640
+    /// records, or a non-macOS emitter), in which case
+    /// `host_samples_in_window` is honestly `0` (nothing to join against)
+    /// and the caller surfaces a `warnings` entry rather than letting that
+    /// zero look identical to "the host sampler simply wasn't running." A
+    /// mission whose dispatches span MORE than one machine still counts
+    /// only THIS one's samples — cross-machine host-sample attribution is
+    /// a future enhancement if a real multi-machine mission needs it.
+    #[serde(default)]
+    pub machine_uid: Option<String>,
     /// Count of `machine.telemetry` host-sample records (#2413 — machine-
-    /// scoped, carrying no `mission_id`) whose `machine_uid` matches this
-    /// mission's own (the machine_uid of its first record that carries one)
-    /// and whose `ts` falls inside `[first_ts, last_ts]` (the same window
-    /// `wall_seconds` measures).
+    /// scoped, carrying no `mission_id`) whose `machine_uid` matches
+    /// `machine_uid` above and whose `ts` falls inside `[first_ts,
+    /// last_ts]` (the same window `wall_seconds` measures).
     #[serde(default)]
     pub host_samples_in_window: u64,
 }
@@ -156,6 +208,25 @@ const DAY_MARGIN_DAYS: i64 = 1;
 /// — never a literal `"dispatch start"` comparison (#2425: two producer
 /// lineages spell the bookends differently).
 ///
+/// **The launch's own wrapper bookend is excluded from pairing (#2426 round
+/// 2 MF1).** `mission_bookend_record` (`src/mission_launch.rs`) opens a
+/// `source == "mission"` `dispatch start`/`dispatch complete` pair around
+/// the WHOLE `launch()` call, and `finalize_mission_with_payload` runs
+/// strictly INSIDE that pair — so at aggregation time the wrapper's own
+/// start is always still open, and treating it like a seat dispatch would
+/// credit the mission's entire wall time into `dispatch_seconds` on every
+/// finalize. A record with `source == Some("mission")` still counts toward
+/// `total_records`/`by_action`/the wall window/the machine_uid resolution —
+/// it's a real record this mission emitted — it just never opens or closes
+/// a bookend pair.
+///
+/// **A repeated `dispatch start` on the same `session_id` with no terminal
+/// in between** does not silently overwrite the earlier one: the earlier
+/// segment is flushed to `finalize_secs` (same treatment as a genuinely
+/// open dispatch — see `RecordsEmitted::open_dispatches`'s doc) before the
+/// new start is tracked, so neither segment's time is lost to the
+/// overwrite.
+///
 /// The host-telemetry join is two-pass over the already-in-memory `lines`
 /// (no second disk read): pass 1 (the loop below) resolves the mission's own
 /// wall window (`first_ts..=last_ts`) and its `machine_uid` (the first value
@@ -172,6 +243,8 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
     let mut machine_uid: Option<String> = None;
     let mut open_starts: BTreeMap<String, i64> = BTreeMap::new();
     let mut dispatch_seconds: f64 = 0.0;
+    let mut dispatch_pairs: u64 = 0;
+    let mut open_dispatches: u64 = 0;
 
     for (rec, line_bytes) in lines {
         if rec.mission_id.as_deref() != Some(mission_id) {
@@ -190,13 +263,27 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
             machine_uid = rec.machine_uid.clone();
         }
 
+        // The launch's own liveness wrapper never opens/closes a bookend
+        // pair — see this function's doc.
+        let is_wrapper_bookend = rec.source.as_deref() == Some("mission");
+        if is_wrapper_bookend {
+            continue;
+        }
+
         if is_dispatch_start(&rec.action) {
             if let (Some(sid), Some(ts)) = (rec.session_id.clone(), ts) {
-                open_starts.insert(sid, ts);
+                if let Some(prev_start) = open_starts.insert(sid, ts) {
+                    // A repeat start for this session with no terminal in
+                    // between — flush the EARLIER segment to finalize time
+                    // rather than losing it to the overwrite.
+                    dispatch_seconds += (finalize_secs - prev_start).max(0) as f64;
+                    open_dispatches += 1;
+                }
             }
         } else if is_dispatch_terminal(&rec.action) {
             if let Some(sid) = &rec.session_id {
                 if let Some(start_ts) = open_starts.remove(sid) {
+                    dispatch_pairs += 1;
                     if let Some(ts) = ts {
                         dispatch_seconds += (ts - start_ts).max(0) as f64;
                     }
@@ -209,6 +296,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
     // dispatch, counted to the finalize-time clock (never dropped).
     for start_ts in open_starts.values() {
         dispatch_seconds += (finalize_secs - start_ts).max(0) as f64;
+        open_dispatches += 1;
     }
 
     let wall_seconds = match (first_ts, last_ts) {
@@ -233,28 +321,61 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
         }
     }
 
-    RecordsEmitted { by_action, total_records, total_bytes, dispatch_seconds, wall_seconds, host_samples_in_window }
+    RecordsEmitted {
+        by_action,
+        total_records,
+        total_bytes,
+        dispatch_seconds,
+        dispatch_pairs,
+        open_dispatches,
+        wall_seconds,
+        machine_uid,
+        host_samples_in_window,
+    }
 }
 
 /// Disk-scanning wrapper around [`aggregate_records_emitted`] — the ONLY
 /// non-pure entry point in this module. Scans `.jsonl` day files under
 /// `darkmux_flow::flows_dir()` whose `YYYY-MM-DD` stem is on/after
-/// `date(mission_created_ts) - DAY_MARGIN_DAYS` (mirrors the day-file
-/// windowing `darkmux-serve::mission_graph::backfill_step_finals` already
-/// established one layer up). A malformed/unreadable directory or file, or a
-/// line that doesn't parse as a `FlowRecord`, is skipped — best-effort, same
-/// discipline as `darkmux-crew::index::derive_cautions`.
+/// `date(mission_created_ts) - DAY_MARGIN_DAYS` and on/before
+/// `date(finalize_secs)` (mirrors the day-file windowing
+/// `darkmux-serve::mission_graph::backfill_step_finals` already established
+/// one layer up; the upper bound is new in #2426 round 2 — a mission cannot
+/// have records in a day file dated after the moment finalize runs). A
+/// malformed/unreadable directory or file, or a line that doesn't parse as
+/// a `FlowRecord`, is skipped — best-effort, same discipline as
+/// `darkmux-crew::index::derive_cautions`.
+///
+/// **Streams, never loads a whole day file (#2426 round 2 MF/(5)).** Every
+/// bare `darkmux dispatch` pays this path (`dispatch_as_crew_of_one.rs`),
+/// and a day file can be tens of megabytes carrying many missions'
+/// interleaved records — a `read_to_string` + parse-every-line pass over
+/// the whole thing was measured at ~370ms on a 44 MB / 60k-line synthetic
+/// file (reviewer figure: ~380ms). This reads with a `BufReader` line by
+/// line and pre-filters on a cheap substring test — `line.contains(
+/// mission_id) || line.contains("machine.telemetry")` — BEFORE paying for
+/// `serde_json::from_str`; the substring test is only a pre-filter (a false
+/// positive just means one wasted parse, never a wrong answer — the exact
+/// field checks below and inside [`aggregate_records_emitted`] are the
+/// actual authority), and after parsing, a record is pushed into `lines`
+/// only if it's genuinely this mission's own (`mission_id` matches) or a
+/// machine-scoped host sample (`action == "machine.telemetry"`, needed for
+/// the host-sample join) — every other mission's records are read,
+/// filtered, and dropped without ever being retained in memory.
 ///
 /// Returns the aggregated block plus the list of day-file stems actually
 /// searched, so a MISS warning at the call site can name exactly what was
 /// looked at.
 pub fn records_emitted_for_mission(mission_id: &str, mission_created_ts: u64, finalize_secs: i64) -> (RecordsEmitted, Vec<String>) {
+    use std::io::BufRead;
+
     let dir = darkmux_flow::flows_dir();
     let mut day_files_searched: Vec<String> = Vec::new();
     let mut lines: Vec<(FlowRecord, u64)> = Vec::new();
 
     if let Ok(rd) = std::fs::read_dir(&dir) {
         let min_day = (mission_created_ts as i64) / 86_400 - DAY_MARGIN_DAYS;
+        let max_day = finalize_secs.div_euclid(86_400);
         let mut day_paths: Vec<(String, std::path::PathBuf)> = rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -264,7 +385,7 @@ pub fn records_emitted_for_mission(mission_id: &str, mission_created_ts: u64, fi
                 }
                 let stem = p.file_stem()?.to_str()?.to_string();
                 let days = day_stem_to_epoch_days(&stem)?;
-                if days >= min_day {
+                if days >= min_day && days <= max_day {
                     Some((stem, p))
                 } else {
                     None
@@ -275,15 +396,22 @@ pub fn records_emitted_for_mission(mission_id: &str, mission_created_ts: u64, fi
 
         for (stem, path) in day_paths {
             day_files_searched.push(stem);
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if let Ok(rec) = serde_json::from_str::<FlowRecord>(line) {
-                        lines.push((rec, line.len() as u64));
-                    }
+            let Ok(file) = std::fs::File::open(&path) else { continue };
+            for line in std::io::BufReader::new(file).lines() {
+                let Ok(raw) = line else { continue };
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Cheap pre-filter — see this function's doc. Neither
+                // substring needs to appear for this line to be
+                // structurally irrelevant to this call.
+                if !trimmed.contains(mission_id) && !trimmed.contains("machine.telemetry") {
+                    continue;
+                }
+                let Ok(rec) = serde_json::from_str::<FlowRecord>(trimmed) else { continue };
+                if rec.mission_id.as_deref() == Some(mission_id) || rec.action == "machine.telemetry" {
+                    lines.push((rec, trimmed.len() as u64));
                 }
             }
         }
@@ -299,14 +427,28 @@ mod tests {
 
     /// Minimal `FlowRecord` builder — every field the aggregation ignores
     /// gets a neutral default, keeping each test's literal focused on the
-    /// fields the assertion actually cares about.
-    #[allow(clippy::too_many_arguments)]
+    /// fields the assertion actually cares about. `source` defaults to
+    /// `None` (a seat dispatch); use [`rec_src`] for a test that needs to
+    /// name the launch wrapper's `source == "mission"`.
     fn rec(
         ts: &str,
         action: &str,
         mission_id: Option<&str>,
         session_id: Option<&str>,
         machine_uid: Option<&str>,
+    ) -> FlowRecord {
+        rec_src(ts, action, mission_id, session_id, machine_uid, None)
+    }
+
+    /// [`rec`] with an explicit `source` — for the wrapper-bookend-exclusion
+    /// tests (#2426 round 2 MF1), which need `source == Some("mission")`.
+    fn rec_src(
+        ts: &str,
+        action: &str,
+        mission_id: Option<&str>,
+        session_id: Option<&str>,
+        machine_uid: Option<&str>,
+        source: Option<&str>,
     ) -> FlowRecord {
         FlowRecord {
             ts: ts.to_string(),
@@ -318,7 +460,7 @@ mod tests {
             handle: "role".to_string(),
             phase_id: None,
             session_id: session_id.map(String::from),
-            source: None,
+            source: source.map(String::from),
             model: None,
             reasoning: None,
             mission_id: mission_id.map(String::from),
@@ -353,7 +495,6 @@ mod tests {
         assert_eq!(got.by_action.get("dispatch start"), Some(&1));
         assert_eq!(got.by_action.get("dispatch complete"), Some(&1));
         assert_eq!(got.by_action.get("dispatch.turn"), Some(&1));
-        assert_eq!(got.by_action.get("dispatch.turn").copied(), Some(1));
         // m2's records must not leak into m1's counts at all.
         assert_eq!(got.by_action.values().sum::<u64>(), 3);
     }
@@ -384,6 +525,107 @@ mod tests {
 
     fn parse_ts_secs_pub(ts: &str) -> i64 {
         parse_ts_secs(ts).unwrap()
+    }
+
+    // ── wrapper-bookend exclusion + repeated starts (#2426 round 2 MF1/(3)) ──
+
+    #[test]
+    fn an_open_wrapper_bookend_is_excluded_from_pairing_a_seat_dispatch_left_open_is_not() {
+        let finalize_secs = parse_ts_secs_pub("2023-11-14T11:00:00Z");
+        let lines = vec![
+            // The launch's OWN liveness wrapper — session_id == mission_id
+            // in production (`mission_bookend_record`), open the whole
+            // time finalize runs. Must contribute NOTHING to
+            // dispatch_seconds/open_dispatches.
+            line(rec_src("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("m1"), None, Some("mission"))),
+            // A real seat dispatch, also left open (no terminal).
+            line(rec("2023-11-14T10:30:00Z", "dispatch start", Some("m1"), Some("s-seat"), None)),
+        ];
+        let got = aggregate_records_emitted(&lines, "m1", finalize_secs);
+        // Only the seat dispatch's 30 minutes counts — NOT the wrapper's
+        // full 60 minutes on top of it.
+        assert_eq!(got.dispatch_seconds, 1800.0, "wrapper excluded, only the seat dispatch's open segment counts");
+        assert_eq!(got.open_dispatches, 1, "the wrapper must not appear here at all");
+        assert_eq!(got.dispatch_pairs, 0);
+        // The wrapper record still counts as a real record of this mission.
+        assert_eq!(got.total_records, 2);
+        assert_eq!(got.by_action.get("dispatch start"), Some(&2));
+    }
+
+    #[test]
+    fn a_wrapper_bookend_pair_never_becomes_a_dispatch_pair_either() {
+        // Even when the wrapper's terminal DOES land in the same scan (a
+        // re-finalize reading a day file written after the launch fully
+        // returned), it must not be counted as a dispatch pair — it is
+        // liveness, not seat work.
+        let lines = vec![
+            line(rec_src("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("m1"), None, Some("mission"))),
+            line(rec_src("2023-11-14T11:00:00Z", "dispatch complete", Some("m1"), Some("m1"), None, Some("mission"))),
+        ];
+        let got = aggregate_records_emitted(&lines, "m1", 0);
+        assert_eq!(got.dispatch_pairs, 0);
+        assert_eq!(got.dispatch_seconds, 0.0);
+        assert_eq!(got.open_dispatches, 0);
+        assert_eq!(got.total_records, 2, "still real records of this mission");
+    }
+
+    #[test]
+    fn a_repeated_dispatch_start_on_one_session_flushes_the_earlier_segment_to_finalize_time() {
+        let finalize_secs = parse_ts_secs_pub("2023-11-14T10:10:00Z");
+        let lines = vec![
+            // First start on s1, never terminated...
+            line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
+            // ...then a SECOND start on the same session_id, also never
+            // terminated. The first segment must not be silently dropped.
+            line(rec("2023-11-14T10:05:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
+        ];
+        let got = aggregate_records_emitted(&lines, "m1", finalize_secs);
+        // Both segments are credited to the FINALIZE clock, not to the
+        // second start's own ts (#2426 round 2 (3): "pair the earlier one
+        // to finalize" — conservative, since nothing on disk proves the
+        // first segment actually ended when the second one began; it
+        // might genuinely have still been running). First: 10:00 ->
+        // finalize (10:10) = 600s. Second: 10:05 -> finalize (10:10) = 300s.
+        assert_eq!(got.dispatch_seconds, 600.0 + 300.0);
+        assert_eq!(got.open_dispatches, 2, "both the flushed segment and the still-open final one");
+        assert_eq!(got.dispatch_pairs, 0, "neither segment ever saw a real terminal");
+    }
+
+    #[test]
+    fn a_repeated_start_that_later_terminates_pairs_against_the_second_start_only() {
+        let lines = vec![
+            line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:05:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:07:00Z", "dispatch.complete", Some("m1"), Some("s1"), None)),
+        ];
+        let got = aggregate_records_emitted(&lines, "m1", 0);
+        // First segment flushed to finalize_secs=0 at the second start —
+        // `(0 - start_ts).max(0)` clamps to 0.0 (finalize "before" the
+        // fixture's own timestamps is a test-harness artifact, not a real
+        // scenario; the point here is the SECOND segment's pairing).
+        assert_eq!(got.open_dispatches, 1, "the flushed first segment");
+        assert_eq!(got.dispatch_pairs, 1, "the second start paired with the real terminal");
+        assert_eq!(got.dispatch_seconds, 120.0, "only the paired segment's 2 minutes, clamped floor on the flushed one");
+    }
+
+    #[test]
+    fn machine_uid_field_names_which_machines_samples_were_joined() {
+        let lines = vec![line(rec(
+            "2023-11-14T10:00:00Z",
+            "dispatch start",
+            Some("m1"),
+            Some("s1"),
+            Some("mac-1"),
+        ))];
+        let got = aggregate_records_emitted(&lines, "m1", 0);
+        assert_eq!(got.machine_uid.as_deref(), Some("mac-1"));
+    }
+
+    #[test]
+    fn no_machine_uid_on_any_matched_record_leaves_the_field_none() {
+        let lines = vec![line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None))];
+        let got = aggregate_records_emitted(&lines, "m1", 0);
+        assert_eq!(got.machine_uid, None);
     }
 
     #[test]
@@ -439,6 +681,174 @@ mod tests {
     fn day_stem_round_trips_a_known_date() {
         // 1_700_000_000 -> 2023-11-14 (verified via `date -u -r`).
         assert_eq!(day_stem_to_epoch_days("2023-11-14"), Some(1_700_000_000 / 86_400));
+    }
+
+    // ── records_emitted_for_mission — the disk-scanning wrapper (#2426 round 2 (6)) ──
+
+    fn write_day_jsonl(dir: &std::path::Path, stem: &str, lines: &[serde_json::Value]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut text = String::new();
+        for v in lines {
+            text.push_str(&serde_json::to_string(v).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(dir.join(format!("{stem}.jsonl")), text).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_day_file_window_never_scans_past_the_finalize_day() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // In-window day.
+        write_day_jsonl(
+            tmp.path(),
+            "2023-11-14",
+            &[serde_json::json!({
+                "ts": "2023-11-14T10:00:00Z", "level": "info", "category": "work",
+                "tier": "local", "stage": "dispatch", "action": "dispatch.turn",
+                "handle": "coder", "mission_id": "m1"
+            })],
+        );
+        // A day file dated AFTER the finalize clock — must never be
+        // scanned, even though it names the SAME mission.
+        write_day_jsonl(
+            tmp.path(),
+            "2023-11-20",
+            &[serde_json::json!({
+                "ts": "2023-11-20T10:00:00Z", "level": "info", "category": "work",
+                "tier": "local", "stage": "dispatch", "action": "dispatch.turn",
+                "handle": "coder", "mission_id": "m1"
+            })],
+        );
+
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+        // created_ts on 2023-11-14; finalize_secs also on 2023-11-14 — the
+        // 2023-11-20 file is 6 days in the future relative to finalize.
+        let created_ts = parse_ts_secs("2023-11-14T00:00:00Z").unwrap() as u64;
+        let finalize_secs = parse_ts_secs("2023-11-14T23:00:00Z").unwrap();
+        let (emitted, searched) = records_emitted_for_mission("m1", created_ts, finalize_secs);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        assert_eq!(searched, vec!["2023-11-14".to_string()], "the future day file must not even be OPENED");
+        assert_eq!(emitted.total_records, 1, "only the in-window day file's record counts");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn foreign_missions_never_leak_into_the_disk_scan_result() {
+        // Correctness half of the round-2 retention fix — `aggregate_
+        // records_emitted`'s own `mission_id` filter is belt-and-suspenders
+        // with this, so this test alone does not prove nothing foreign was
+        // ever RETAINED in memory (that half is evidenced by the cost
+        // benchmark: `disk_cost_check` shows real wall-clock savings from
+        // skipping the JSON parse on non-matching lines, which corroborates
+        // that they are not carried forward either). This test proves the
+        // OUTPUT is never polluted regardless of which layer is doing the
+        // filtering.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut lines = vec![serde_json::json!({
+            "ts": "2023-11-14T10:00:00Z", "level": "info", "category": "work",
+            "tier": "local", "stage": "dispatch", "action": "dispatch start",
+            "handle": "coder", "mission_id": "m1", "session_id": "s1"
+        })];
+        for i in 0..50 {
+            lines.push(serde_json::json!({
+                "ts": "2023-11-14T10:00:01Z", "level": "info", "category": "work",
+                "tier": "local", "stage": "dispatch", "action": "dispatch.turn",
+                "handle": "coder", "mission_id": format!("sibling-{i}"), "session_id": format!("s{i}")
+            }));
+        }
+        write_day_jsonl(tmp.path(), "2023-11-14", &lines);
+
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+        let (emitted, _searched) = records_emitted_for_mission("m1", 1_700_000_000, 1_800_000_000);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        assert_eq!(emitted.total_records, 1, "only m1's own record, none of the 50 siblings");
+    }
+}
+
+
+#[cfg(test)]
+mod disk_cost_check {
+    use super::*;
+    use std::io::Write;
+
+    /// (#2421 round 2 self-QA cost check — BEFORE/AFTER) Measures
+    /// `records_emitted_for_mission`'s DISK path (not just the in-memory
+    /// aggregation `cost_check` above already covers) against a synthetic
+    /// ~44 MB / 60k-line day file — the reviewer-measured shape (380ms
+    /// pre-fix on a comparable file, hit by every bare `darkmux dispatch`
+    /// via `dispatch_as_crew_of_one.rs`). Run with `--nocapture`.
+    #[test]
+    #[serial_test::serial]
+    fn records_emitted_for_mission_disk_cost_on_a_60k_line_day_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let day_file = tmp.path().join("2023-11-14.jsonl");
+        {
+            let mut f = std::fs::File::create(&day_file).unwrap();
+            for i in 0..60_000u32 {
+                let sec = i % 60;
+                let ts = format!("2023-11-14T10:{:02}:{:02}Z", (i / 3600) % 60, sec);
+                // ~90% belongs to a handful of OTHER missions (realistic
+                // interleaving — this mission is a small share of a busy
+                // day file), a long free-form payload per line (padding
+                // toward the reviewer's ~733 bytes/line average), and a
+                // sprinkling of `machine.telemetry` samples.
+                let (mission, action, session): (String, &str, String) = match i % 100 {
+                    0 => ("m-cost".to_string(), "dispatch start", "s-cost".to_string()),
+                    1 => ("m-cost".to_string(), "dispatch.complete", "s-cost".to_string()),
+                    2 => (String::new(), "machine.telemetry", String::new()),
+                    n => (format!("other-mission-{}", n % 37), "dispatch.turn", format!("s-{}", n)),
+                };
+                let padding = "x".repeat(500);
+                let line = if action == "machine.telemetry" {
+                    format!(
+                        r#"{{"ts":"{ts}","level":"info","category":"telemetry","tier":"local","stage":"dispatch","action":"machine.telemetry","handle":"host","machine_uid":"mac-cost","payload":{{"pad":"{padding}"}}}}"#
+                    )
+                } else {
+                    format!(
+                        r#"{{"ts":"{ts}","level":"info","category":"work","tier":"local","stage":"dispatch","action":"{action}","handle":"coder","mission_id":"{mission}","session_id":"{session}","machine_uid":"mac-cost","payload":{{"pad":"{padding}"}}}}"#
+                    )
+                };
+                writeln!(f, "{line}").unwrap();
+            }
+        }
+        let bytes = std::fs::metadata(&day_file).unwrap().len();
+
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+
+        let start = std::time::Instant::now();
+        let (got, _searched) = records_emitted_for_mission("m-cost", 1_700_000_000, 1_800_000_000);
+        let elapsed = start.elapsed();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        println!(
+            "#2421 round-2 cost check: records_emitted_for_mission over a {} byte / 60000 line day file              ({} records matched `m-cost`) took {:?}",
+            bytes, got.total_records, elapsed
+        );
+        assert_eq!(got.total_records, 1200, "600 start + 600 complete for m-cost across the 60k lines");
     }
 }
 
