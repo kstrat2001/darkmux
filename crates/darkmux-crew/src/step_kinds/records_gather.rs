@@ -188,7 +188,7 @@ impl StepKind for RecordsGatherStepKind {
         // `not_attempted`/`errored` come from this mission's own
         // plan/unit step records — a rule whose plan step errored, or a
         // unit that never converged, both surface here (MUST FIX C/D).
-        let scan = scan_unit_and_plan_steps(&mission_id);
+        let scan = scan_unit_and_plan_steps(&mission_id, &task.id);
         // (#2361 item 2) Coverage counts what a COMPLETED unit reviewed —
         // never what a plan intended. See `plan_totals`.
         let (rules_run, hunks_covered) = plan_totals(&mission_id, hunks_total, &scan.completed_units);
@@ -441,10 +441,17 @@ struct StepScan {
 /// through a step kind named anything else used to produce an EMPTY scope
 /// here, silently: zero rejected findings, zero un-planned rules, zero
 /// completed units, with no way to tell "nothing to report" from "nobody
-/// taught the scan this kind's name". (Silent-miss audit, 2026-09-06):
-/// fixed by the `_` arm below, which now names any OTHER step that did
-/// not reach `Complete` in `errored` — an unrecognized-kind failure is
-/// exactly the kind of thing this scan exists to surface, not swallow.
+/// taught the scan this kind's name". (Silent-miss audit, 2026-09-06,
+/// narrowed round-2 same day): fixed by the `other` arm below, which
+/// names any OTHER step that reached `Error`/`Abandoned` in `errored` —
+/// an unrecognized-kind failure is exactly the kind of thing this scan
+/// exists to surface, not swallow. Deliberately NOT "anything not
+/// Complete": `records.gather` runs INSIDE the mission it scans, so its
+/// own task's steps are `Running`/`Planned` at scan time — ordinary
+/// in-flight state, not failures — and `exclude_task_id` (the caller's
+/// own `task.id`) skips them entirely rather than relying on status
+/// alone, since a LATER phase's not-yet-scheduled step is equally
+/// `Planned` and equally not a failure.
 ///
 /// Left as a closed match deliberately: two configs use it (`review.json`,
 /// `crawl.json`), the fields the named arms read (`config.rule`,
@@ -463,7 +470,7 @@ struct StepScan {
 /// depend on `darkmux-lab` — this module's own doc) kept honest by a
 /// conformance test in `src/mission_launch.rs`, which has access to both
 /// crates' real constants and the full `StepKindRegistry`.
-fn scan_unit_and_plan_steps(mission_id: &str) -> StepScan {
+fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan {
     let mut scan = StepScan::default();
     let phases = match crate::loader::load_phases() {
         Ok(p) => p,
@@ -481,6 +488,29 @@ fn scan_unit_and_plan_steps(mission_id: &str) -> StepScan {
             }
         };
         for step in &steps {
+            // (round-2 audit, 2026-09-06) `records.gather` runs INSIDE
+            // the mission it scans, sharing its own TASK with a sibling
+            // deliver step (`review.json`'s `deliver` task holds both
+            // `records-gather-step` and `deliver-step`). At scan time
+            // this very gather step is `Running` (not yet `Complete` —
+            // it hasn't returned), and its sibling deliver step is still
+            // `Planned` (scheduled to run right after). Neither is a
+            // failure; both are simply this task's own in-flight
+            // machinery, not review/crawl work to report on. Skipping
+            // the gather's own task here is what keeps a clean run from
+            // permanently reading as "Errored: deliver.github_review
+            // `deliver-step` (Planned), records.gather `records-gather-
+            // step` (Running)" on every single comment. Skipping by TASK
+            // ID rather than relying on the Error/Abandoned narrowing
+            // alone also covers a stale on-disk record from an earlier
+            // aborted attempt at this same task (e.g. a previous
+            // `deliver-step` left `Error` on disk before a retry) — that
+            // is this task's own machinery re-running, not review/crawl
+            // work to report on, regardless of what status it happens to
+            // carry on disk right now.
+            if step.task_id == exclude_task_id {
+                continue;
+            }
             match step.kind.as_str() {
                 SCANNED_CRAWL_UNIT_KIND => {
                     if step.status != crate::types::NodeStatus::Complete {
@@ -530,14 +560,23 @@ fn scan_unit_and_plan_steps(mission_id: &str) -> StepScan {
                     scan.errored.push(format!("plan `{}` ({:?})", step.id, step.status));
                 }
                 other => {
-                    // (silent-miss audit, 2026-09-06) A step of ANY other
-                    // kind that did not reach `Complete` is exactly what
-                    // this scan exists to name — an unrecognized kind is
-                    // no reason to treat its failure as invisible. This
+                    // (silent-miss audit, 2026-09-06; narrowed round-2
+                    // 2026-09-06) A step of ANY other kind that has
+                    // genuinely FAILED (`Error`/`Abandoned`) is exactly
+                    // what this scan exists to name — an unrecognized
+                    // kind is no reason to treat its failure as
+                    // invisible. Narrowed from "anything not Complete"
+                    // to "Error | Abandoned only": `Planned`/`Running`
+                    // are not failures — they are ordinary in-flight or
+                    // not-yet-scheduled state for steps elsewhere in the
+                    // SAME mission (a later phase that simply hasn't run
+                    // yet), and flagging every such step as "errored"
+                    // would make a clean, still-in-progress run
+                    // permanently unable to report a clean scope. This
                     // cannot know a "rule" for an arbitrary kind, so it
                     // only ever contributes to `errored`, never
                     // `not_attempted`.
-                    if step.status != crate::types::NodeStatus::Complete {
+                    if matches!(step.status, crate::types::NodeStatus::Error | crate::types::NodeStatus::Abandoned) {
                         scan.errored.push(format!("{other} `{}` ({:?})", step.id, step.status));
                     }
                 }
@@ -1298,6 +1337,178 @@ mod tests {
         assert!(
             wrapped.body.scope.errored.is_empty(),
             "a completed step of an unrecognized kind is not a failure: {:?}",
+            wrapped.body.scope
+        );
+    }
+
+    /// (round-2 audit, 2026-09-06 — the reviewer's own probe) `records.
+    /// gather` runs INSIDE the mission it scans, sharing its own TASK
+    /// (`deliver`, per the `task()` helper) with the `deliver.
+    /// github_review` step that runs right after it in the SAME task —
+    /// exactly `review.json`'s real shape. At scan time the gather step
+    /// itself is `Running` (it hasn't returned yet) and its sibling
+    /// deliver step is `Planned` (scheduled next); NEITHER is a failure.
+    /// Before this fix, the unrecognized-kind fallthrough treated "not
+    /// Complete" as failure for ANY kind, so a review's own delivery
+    /// machinery permanently poisoned its own scope with "Errored:
+    /// deliver.github_review `deliver-step` (Planned), records.gather
+    /// `records-gather-step` (Running)" on every single comment — the
+    /// clean path could never be taken.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn the_gathers_own_in_flight_task_siblings_are_never_named_as_errored() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        // The gather step ITSELF, persisted `Running` — it hasn't
+        // returned at scan time, same task id `task()` names.
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "records-gather-step".into(),
+                task_id: "deliver".into(),
+                kind: RECORDS_GATHER_KIND.into(),
+                gate: None,
+                status: NodeStatus::Running,
+                config: json!({}),
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        )
+        .unwrap();
+        // Its sibling deliver step, still `Planned` — scheduled to run
+        // right after this gather step, same task.
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "deliver-step".into(),
+                task_id: "deliver".into(),
+                kind: super::super::deliver_github_review::DELIVER_GITHUB_REVIEW_KIND.into(),
+                gate: None,
+                status: NodeStatus::Planned,
+                config: json!({ "emit": "-" }),
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        )
+        .unwrap();
+
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert!(
+            wrapped.body.scope.errored.is_empty(),
+            "the gather step's own in-flight task siblings must never read as failures: {:?}",
+            wrapped.body.scope
+        );
+    }
+
+    /// (round-2 audit, 2026-09-06) Discriminates the task-id skip from
+    /// the Error/Abandoned narrowing above: even a stale on-disk `Error`/
+    /// `Abandoned` record for the gather's OWN task (e.g. left over from
+    /// an earlier aborted attempt, before a retry) must still be skipped
+    /// — it is this task's own re-running machinery, not review/crawl
+    /// work. Red-proved by removing the `task_id == exclude_task_id`
+    /// skip alone (leaving the status narrowing in place): this test then
+    /// fails because both statuses here ARE `Error`/`Abandoned`, so the
+    /// narrowing alone would still name them.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn a_stale_errored_record_for_the_gathers_own_task_is_still_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "records-gather-step".into(),
+                task_id: "deliver".into(),
+                kind: RECORDS_GATHER_KIND.into(),
+                gate: None,
+                status: NodeStatus::Error,
+                config: json!({}),
+                started_ts: None,
+                completed_ts: None,
+                output: Some("dispatch error".into()),
+            },
+        )
+        .unwrap();
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "deliver-step".into(),
+                task_id: "deliver".into(),
+                kind: super::super::deliver_github_review::DELIVER_GITHUB_REVIEW_KIND.into(),
+                gate: None,
+                status: NodeStatus::Abandoned,
+                config: json!({ "emit": "-" }),
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        )
+        .unwrap();
+
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert!(
+            wrapped.body.scope.errored.is_empty(),
+            "a stale Error/Abandoned record for the gather's OWN task must still be skipped, \
+             not named as review/crawl work: {:?}",
+            wrapped.body.scope
+        );
+    }
+
+    /// (round-2 audit, 2026-09-06 — C3) No existing test in this module
+    /// ever saved an actual `crawl.plan` STEP record (line-searching the
+    /// module before this fix: `"crawl.plan"` only ever appeared as a
+    /// `kind` field INSIDE a plan file's JSON body, never as a Step's own
+    /// `kind`) — so the `SCANNED_CRAWL_PLAN_KIND` arm of the match was
+    /// exercised by construction (`| SCANNED_CRAWL_PLAN_KIND`) but never
+    /// by a real fixture proving it actually fires. Red-proved by
+    /// deleting `| SCANNED_CRAWL_PLAN_KIND` from the match (leaving only
+    /// `SCANNED_PLAN_SITES_KIND`): the step then falls to the generic
+    /// `other` arm, which names it in `errored` but — having no
+    /// rule/unit convention of its own — never in `not_attempted`, so
+    /// this test's `not_attempted` assertion goes red.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn a_crawl_plan_step_that_errored_names_its_rule_as_not_attempted() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "plan-step-1".into(),
+                task_id: "plan-task".into(),
+                kind: SCANNED_CRAWL_PLAN_KIND.into(),
+                gate: None,
+                status: NodeStatus::Error,
+                config: json!({ "rule": "existing-solution" }),
+                started_ts: None,
+                completed_ts: None,
+                output: Some("dispatch error".into()),
+            },
+        )
+        .unwrap();
+
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert!(
+            wrapped.body.scope.not_attempted.contains(&"existing-solution".to_string()),
+            "an errored `crawl.plan` step must name its rule as not attempted: {:?}",
+            wrapped.body.scope
+        );
+        assert!(
+            wrapped.body.scope.errored.iter().any(|e| e.contains("plan-step-1")),
+            "{:?}",
             wrapped.body.scope
         );
     }

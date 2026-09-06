@@ -6347,6 +6347,52 @@ mod tests {
         assert!(!rule.message.contains("NEVER MATCHED"), "{}", rule.message);
     }
 
+    /// (round-2 audit, 2026-09-06 — C4) The other half of the negative
+    /// space: a rule that HAS actually delivered (a real `.last` sidecar
+    /// from a genuine terminal outcome, the same shape the drainer
+    /// writes) must stay Pass even when today's flow day file ALSO
+    /// happens to carry the other spelling of its configured action —
+    /// the alias-drift Warn is specifically for a rule that has NEVER
+    /// matched anything; a rule that clearly HAS matched (and delivered)
+    /// is not that case, whatever else today's records contain. Red-proved
+    /// by replacing the `undelivered == 0 && last_delivery_ts.is_none()`
+    /// gate with `if true`: this test then fails because it would warn
+    /// regardless of the genuine prior delivery.
+    #[test]
+    fn hooks_check_no_alias_warn_when_the_rule_has_actually_delivered() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let m = HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() };
+        let url = "http://127.0.0.1:8790/events".to_string();
+        let rules = vec![HookRule {
+            r#match: Some(m.clone()),
+            http: Some(url.clone()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        // A genuine prior delivery: the `.last` sidecar the drainer
+        // itself writes on a terminal outcome (`write_last_status`).
+        let key = darkmux_flow::hooks::rule_key(&m, &url);
+        std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
+
+        let mut today_actions = std::collections::HashSet::new();
+        today_actions.insert("dispatch complete".to_string()); // the other spelling, ALSO present today
+
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions);
+        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
+        assert!(
+            !rule.message.contains("NEVER MATCHED"),
+            "a rule with an actual prior delivery must not be flagged, even with the other \
+             spelling also present today: {}",
+            rule.message
+        );
+    }
+
     /// (#2093 merge-gate finding 15) A `*.outbox.jsonl` file that belongs
     /// to no CURRENTLY-configured rule — the artifact of a rule since
     /// removed (or, before content-hash keying, silently reassigned by a
