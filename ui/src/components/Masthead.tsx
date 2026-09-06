@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
 import { openModalEl } from "../lib/dialogManager";
@@ -356,21 +356,56 @@ const REPLAY_GLYPH = "▣";
  * is never delayed; only the bad news waits to be sure it is real. */
 export const RECONNECTING_ANNOUNCE_DELAY_MS = 1500;
 
-/** The `aria-live="polite"` text `pillLabel` announces, debounced against
+/** The `aria-live="polite"` text `pillLabel` announces, latched against
  * `RECONNECTING_ANNOUNCE_DELAY_MS` — see that constant's own doc. Starts
  * optimistic ("live") on mount so a route that boots already-reconnecting
  * gets the SAME hold a live-to-reconnecting transition gets, rather than a
- * special-cased instant announcement nothing else in this function has. */
+ * special-cased instant announcement nothing else in this function does.
+ *
+ * The latch is on CUMULATIVE non-live time, not a per-transition debounce —
+ * a stream flapping faster than the hold (down 1.2s / up 0.2s, say) would
+ * reset a naive `setTimeout`-per-transition debounce on every up-flip and
+ * never announce "reconnecting" at all, even though the dot visibly flips
+ * for the whole flap. `badAccumRef` carries the total down-time across
+ * live blips that don't sustain the hold window — only a live streak that
+ * holds continuously for the FULL window resets it (and re-announces
+ * "live" at that moment); a shorter blip resets nothing, so the next down
+ * segment picks up the accumulator right where the last one left off. */
 function useAnnouncedLiveStatus(liveStatus: LiveTailStatus): "live" | "reconnecting" {
   const [announced, setAnnounced] = useState<"live" | "reconnecting">("live");
+  const badAccumRef = useRef(0);
+
   useEffect(() => {
+    const segmentStart = Date.now();
+    let timer: ReturnType<typeof setTimeout>;
+
     if (liveStatus === "live") {
-      setAnnounced("live");
-      return;
+      // Only a live streak that holds for the FULL window counts as
+      // recovered. If this fires, the stream stayed live continuously for
+      // the hold window — re-arm the latch and announce "live".
+      timer = setTimeout(() => {
+        badAccumRef.current = 0;
+        setAnnounced("live");
+      }, RECONNECTING_ANNOUNCE_DELAY_MS);
+    } else {
+      // Pick up wherever the accumulator already is — a prior down segment
+      // (or several, separated by live blips too short to re-arm) may have
+      // already used up part of the hold window.
+      const remaining = Math.max(0, RECONNECTING_ANNOUNCE_DELAY_MS - badAccumRef.current);
+      timer = setTimeout(() => setAnnounced("reconnecting"), remaining);
     }
-    const timer = setTimeout(() => setAnnounced("reconnecting"), RECONNECTING_ANNOUNCE_DELAY_MS);
-    return () => clearTimeout(timer);
+
+    return () => {
+      clearTimeout(timer);
+      // Only non-live segments accrue — a live segment that didn't reach
+      // the full hold (this cleanup fires before the timer above does)
+      // must not erase the accumulator either; it just leaves it as-is.
+      if (liveStatus !== "live") {
+        badAccumRef.current += Date.now() - segmentStart;
+      }
+    };
   }, [liveStatus]);
+
   return announced;
 }
 

@@ -99,8 +99,16 @@ describe("useLiveTail", () => {
       wrapper: wrapper(queryClient),
     });
 
-    // Default before any open/error — matches legacy's `setBadges()` setting
-    // "● live" text BEFORE `startLiveTail` even runs.
+    // (2026-09-06) Default before the stream has ever actually opened is
+    // "reconnecting", not an optimistic "live" — a route that boots
+    // already-reconnecting (or never manages to open at all) must not
+    // falsely claim "live" for even a moment. `onOpen` below is what
+    // flips it.
+    expect(result.current).toBe("reconnecting");
+
+    act(() => {
+      MockEventSource.instances[0].open();
+    });
     expect(result.current).toBe("live");
 
     act(() => {
@@ -259,7 +267,13 @@ describe("useLiveTail", () => {
     unmount();
   });
 
-  it("without EventSource support (no factory, jsdom has none), never crashes and stays reporting live", async () => {
+  it("without EventSource support (no factory, jsdom has none), never crashes and stays reporting reconnecting — the polling backstop is not a live stream", async () => {
+    // (2026-09-06) `canStream` is false here, so `openTail` is never
+    // called and `onOpen` never fires — the status must stay pessimistic
+    // for the hook's whole life, not just its first render. Before this
+    // fix, an optimistic-"live" initial state had no path back to
+    // "reconnecting" for a route where streaming is structurally
+    // impossible, so it falsely reported "live" forever.
     const queryClient = new QueryClient();
     expect(typeof globalThis.EventSource).toBe("undefined");
 
@@ -267,7 +281,7 @@ describe("useLiveTail", () => {
       wrapper: wrapper(queryClient),
     });
 
-    expect(result.current).toBe("live");
+    expect(result.current).toBe("reconnecting");
     expect(MockEventSource.instances).toHaveLength(0);
 
     unmount();
