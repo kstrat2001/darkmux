@@ -40,6 +40,15 @@ describe("activityOf", () => {
       "host telemetry",
     );
   });
+
+  // (silent-miss audit, 2026-09-06) `"step error"`/`"phase abandon"` have
+  // no dedicated branch above — they fall through the literal `return a ||
+  // "other"`, so `activityOf` hands them back UNCHANGED as the facet value.
+  it("scheduler step/phase actions with no dedicated branch pass through verbatim", () => {
+    expect(activityOf(rec({ action: "step error" }))).toBe("step error");
+    expect(activityOf(rec({ action: "phase abandon" }))).toBe("phase abandon");
+    expect(activityOf(rec({ action: "step start" }))).toBe("step start");
+  });
 });
 
 describe("computeFacets / defaultFilterState", () => {
@@ -405,6 +414,26 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
     const filters = defaultFilterState(facets);
     expect(filters.act.has("tool call")).toBe(true);
     expect(filters.act.has("heartbeat")).toBe(false);
+  });
+
+  // (silent-miss audit, 2026-09-06) `"step error"`/`"phase abandon"` are
+  // NOT in the curated `DEFAULT_ACTIVITIES` allowlist (they weren't a
+  // known value when it was written), but a failure/abandonment activity
+  // must never default off — that's the exact "operator never sees it"
+  // failure mode `DEFAULT_ACTIVITIES`'s own `dispatch error` entry exists
+  // to prevent, just reached through an unanticipated VALUE this time.
+  // `"step start"` is the control: it names neither failure nor
+  // abandonment and must stay off, same as any other non-curated value.
+  it("error/abandon-shaped activities default ON even when absent from DEFAULT_ACTIVITIES", () => {
+    const facets = computeFacets([
+      rec({ action: "step error" }),
+      rec({ action: "phase abandon" }),
+      rec({ action: "step start" }),
+    ]);
+    const filters = defaultFilterState(facets);
+    expect(filters.act.has("step error")).toBe(true);
+    expect(filters.act.has("phase abandon")).toBe(true);
+    expect(filters.act.has("step start")).toBe(false);
   });
 
   // (b)

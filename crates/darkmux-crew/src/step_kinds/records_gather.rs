@@ -67,6 +67,20 @@ pub const RECORDS_GATHER_OUTPUT_KIND: &str = "records.gather";
 
 pub const GATHER_OUTPUT_SCHEMA_VERSION: &str = "1.0";
 
+/// Local literal duplicate of `darkmux_lab::crawl::unit_step::
+/// CRAWL_UNIT_KIND`. `darkmux-crew` cannot depend on `darkmux-lab` (see
+/// `scan_unit_and_plan_steps`'s own doc), so this crate keeps its own
+/// copy of the string; a conformance test in `src/mission_launch.rs`
+/// (which depends on both crates) asserts the two literals stay equal and
+/// that both resolve against `all_step_kinds`'s real registry.
+pub const SCANNED_CRAWL_UNIT_KIND: &str = "crawl.unit";
+/// Local literal duplicate of `darkmux_lab::crawl::plan_sites_step::
+/// PLAN_SITES_KIND`. See [`SCANNED_CRAWL_UNIT_KIND`].
+pub const SCANNED_PLAN_SITES_KIND: &str = "plan.sites";
+/// Local literal duplicate of `darkmux_lab::crawl::plan_step::
+/// CRAWL_PLAN_KIND`. See [`SCANNED_CRAWL_UNIT_KIND`].
+pub const SCANNED_CRAWL_PLAN_KIND: &str = "crawl.plan";
+
 /// What [`RecordsGatherStepKind`] produces — everything
 /// `deliver_github_review::render_github_review` needs, gathered from this
 /// mission's own stores.
@@ -77,6 +91,21 @@ pub struct GatherOutput {
     pub mods: Vec<GatedMod>,
     pub diff: String,
     pub scope: DeliverScope,
+    /// (silent-miss audit, 2026-09-06) What [`scan_unit_and_plan_steps`]
+    /// could not read while building `scope` — a failed `load_phases`,
+    /// a failed `load_steps_for_phase` for one phase, or a `crawl.unit`
+    /// step whose own output failed to parse. Each of these previously
+    /// vanished into a default/skip/zero with no trace; see
+    /// [`StepScan::unreadable`]. Deliberately NOT a field on
+    /// [`DeliverScope`] (`deliver_github_review.rs` is owned by another
+    /// concurrent change and is not touched by this fix) — sits beside
+    /// `scope` on the envelope instead. **Follow-up owed**: wire this
+    /// into `render_github_review`'s scope-line rendering (or an
+    /// adjacent line) the next time `deliver_github_review.rs` is
+    /// touched, so an unreadable input is visible on the PR comment
+    /// itself, not only in the raw envelope.
+    #[serde(default)]
+    pub unreadable: Vec<String>,
 }
 
 pub struct RecordsGatherStepKind;
@@ -202,6 +231,7 @@ impl StepKind for RecordsGatherStepKind {
             mods,
             diff,
             scope,
+            unreadable: scan.unreadable,
         };
         let wrapped = crate::step_output::Output::wrap(
             RECORDS_GATHER_OUTPUT_KIND,
@@ -376,6 +406,19 @@ struct StepScan {
     /// grown task stamps (`rule`/`unit` in `review.json`'s and
     /// `crawl.json`'s `grow.config`).
     completed_units: std::collections::BTreeSet<(String, String)>,
+    /// (silent-miss audit, 2026-09-06) Every place this scan could not
+    /// read something it needed and previously swallowed the `Err` into a
+    /// default/skip/clean outcome: `load_phases()` failing (the whole scan
+    /// returns empty — no rule, unit, or rejection is ever named), a
+    /// per-phase `load_steps_for_phase` failing (that phase's steps are
+    /// invisible to every count above), and a `crawl.unit` step's own
+    /// output failing to parse (`findings_rejected` reads as `0` — a
+    /// parse failure and a genuinely clean unit are indistinguishable
+    /// without this). Each entry names what was unreadable and why, so a
+    /// gather that silently undercounts everything is at least named as
+    /// having done so, rather than rendering as a clean, fully-scanned
+    /// run.
+    unreadable: Vec<String>,
 }
 
 /// (#2310 P4c-2b PR #2357 review MUST FIX C/D, CONSIDER F) Scan every
@@ -384,37 +427,62 @@ struct StepScan {
 /// summarize_mission` uses) for `crawl.unit` steps (to total
 /// `findings_rejected`, and to name any that never converged) and
 /// `plan.sites`/`crawl.plan` steps (to name any rule that never finished
-/// planning). An unreadable phase/step list is skipped, not an error — a
-/// mission this step cannot fully inspect still delivers what it CAN see,
-/// the same descriptive-not-refusing posture `plan_totals` takes.
+/// planning). An unreadable phase/step list no longer vanishes into a
+/// default/skip — see [`StepScan::unreadable`] (silent-miss audit,
+/// 2026-09-06): the mission this step cannot fully inspect still delivers
+/// what it CAN see, but now says so, rather than rendering the same as a
+/// mission with nothing wrong.
 ///
-/// **The scan keys on LITERAL kind ids** (#2310 swarm F): `"crawl.unit"`,
-/// and `"plan.sites"`/`"crawl.plan"`. This is a closed list, matched by
-/// string, and there is no generic property ("this kind declares
-/// residency") behind it — so a THIRD config that reviews work through a
-/// step kind named anything else produces an EMPTY scope here, silently:
-/// zero rejected findings, zero un-planned rules, zero completed units.
-/// Empty, not unknown — the caller cannot tell "nothing to report" from
-/// "nobody taught the scan this kind's name", and `deliver.github_review`
-/// renders the resulting scope line as fact.
+/// **The scan keys on kind ids held as local constants**
+/// ([`SCANNED_CRAWL_UNIT_KIND`]/[`SCANNED_PLAN_SITES_KIND`]/
+/// [`SCANNED_CRAWL_PLAN_KIND`], #2310 swarm F). This is a closed list,
+/// matched by string, and there is no generic property ("this kind
+/// declares residency") behind it — so a THIRD config that reviews work
+/// through a step kind named anything else used to produce an EMPTY scope
+/// here, silently: zero rejected findings, zero un-planned rules, zero
+/// completed units, with no way to tell "nothing to report" from "nobody
+/// taught the scan this kind's name". (Silent-miss audit, 2026-09-06):
+/// fixed by the `_` arm below, which now names any OTHER step that did
+/// not reach `Complete` in `errored` — an unrecognized-kind failure is
+/// exactly the kind of thing this scan exists to surface, not swallow.
 ///
-/// Left literal deliberately: two configs use it (`review.json`,
-/// `crawl.json`), the fields it reads (`config.rule`, `config.unit`,
-/// `output`'s `findings_rejected`) are conventions of those two kinds
-/// rather than of any registered interface, and inventing a `StepKind`
-/// trait method for one consumer is the extension-point drift #1352
-/// exists to stop. The obligation this doc creates instead: **a new
-/// review-shaped step kind must be added to this match at the same time
-/// it is written**, or its work is invisible to every scope line the
-/// delivery renders.
+/// Left as a closed match deliberately: two configs use it (`review.json`,
+/// `crawl.json`), the fields the named arms read (`config.rule`,
+/// `config.unit`, `output`'s `findings_rejected`) are conventions of
+/// those two kinds rather than of any registered interface, and inventing
+/// a `StepKind` trait method for one consumer is the extension-point
+/// drift #1352 exists to stop. The obligation this doc creates instead:
+/// **a new review-shaped step kind wanting its OWN rule/unit/
+/// findings_rejected accounting must be added to this match at the same
+/// time it is written** — a step of any other kind that merely fails is
+/// now caught by the fallthrough, but its rule/unit specifics are not.
+/// [`SCANNED_CRAWL_UNIT_KIND`]/[`SCANNED_PLAN_SITES_KIND`]/
+/// [`SCANNED_CRAWL_PLAN_KIND`] are local literal duplicates of
+/// `darkmux_lab::crawl::{unit_step::CRAWL_UNIT_KIND, plan_sites_step::
+/// PLAN_SITES_KIND, plan_step::CRAWL_PLAN_KIND}` (this crate cannot
+/// depend on `darkmux-lab` — this module's own doc) kept honest by a
+/// conformance test in `src/mission_launch.rs`, which has access to both
+/// crates' real constants and the full `StepKindRegistry`.
 fn scan_unit_and_plan_steps(mission_id: &str) -> StepScan {
     let mut scan = StepScan::default();
-    let Ok(phases) = crate::loader::load_phases() else { return scan };
+    let phases = match crate::loader::load_phases() {
+        Ok(p) => p,
+        Err(e) => {
+            scan.unreadable.push(format!("phase records: {e:#}"));
+            return scan;
+        }
+    };
     for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
-        let Ok(steps) = crate::lifecycle::load_steps_for_phase(mission_id, &phase.id) else { continue };
+        let steps = match crate::lifecycle::load_steps_for_phase(mission_id, &phase.id) {
+            Ok(s) => s,
+            Err(e) => {
+                scan.unreadable.push(format!("phase `{}` steps: {e:#}", phase.id));
+                continue;
+            }
+        };
         for step in &steps {
             match step.kind.as_str() {
-                "crawl.unit" => {
+                SCANNED_CRAWL_UNIT_KIND => {
                     if step.status != crate::types::NodeStatus::Complete {
                         scan.errored.push(format!("unit `{}` ({:?})", step.id, step.status));
                         continue;
@@ -430,7 +498,17 @@ fn scan_unit_and_plan_steps(mission_id: &str) -> StepScan {
                     let Some(raw) = step.output.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
                         continue;
                     };
-                    let Ok((doc, _)) = crate::step_output::resolve_output_doc(raw) else { continue };
+                    let doc = match crate::step_output::resolve_output_doc(raw) {
+                        Ok((doc, _)) => doc,
+                        Err(e) => {
+                            // (silent-miss audit, 2026-09-06) Previously
+                            // swallowed here, which read as `findings_rejected
+                            // == 0` — indistinguishable from a genuinely
+                            // clean unit. Named instead.
+                            scan.unreadable.push(format!("unit `{}` output: {e:#}", step.id));
+                            continue;
+                        }
+                    };
                     let rejected = doc
                         .pointer("/body/findings_rejected")
                         .or_else(|| doc.get("findings_rejected"))
@@ -438,7 +516,7 @@ fn scan_unit_and_plan_steps(mission_id: &str) -> StepScan {
                         .unwrap_or(0);
                     scan.findings_rejected += rejected as usize;
                 }
-                "plan.sites" | "crawl.plan" => {
+                SCANNED_PLAN_SITES_KIND | SCANNED_CRAWL_PLAN_KIND => {
                     if step.status == crate::types::NodeStatus::Complete {
                         continue;
                     }
@@ -451,7 +529,18 @@ fn scan_unit_and_plan_steps(mission_id: &str) -> StepScan {
                     scan.not_attempted.push(rule);
                     scan.errored.push(format!("plan `{}` ({:?})", step.id, step.status));
                 }
-                _ => {}
+                other => {
+                    // (silent-miss audit, 2026-09-06) A step of ANY other
+                    // kind that did not reach `Complete` is exactly what
+                    // this scan exists to name — an unrecognized kind is
+                    // no reason to treat its failure as invisible. This
+                    // cannot know a "rule" for an arbitrary kind, so it
+                    // only ever contributes to `errored`, never
+                    // `not_attempted`.
+                    if step.status != crate::types::NodeStatus::Complete {
+                        scan.errored.push(format!("{other} `{}` ({:?})", step.id, step.status));
+                    }
+                }
             }
         }
     }
@@ -1131,5 +1220,158 @@ mod tests {
         // field.
         let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(step_output["emit"], json!("-"));
+    }
+
+    /// (silent-miss audit, 2026-09-06) Before this fix, `_ => {}` meant a
+    /// step of any kind OTHER than `crawl.unit`/`plan.sites`/`crawl.plan`
+    /// that ended `Error` was invisible to the scope entirely — a
+    /// `crawl.json` config that grows a `crawl.summary`/`finding`/
+    /// `dispatch.internal` step which then errors produced a scope
+    /// identical to one where that step never ran into trouble. Red-proved
+    /// by reverting the `other =>` arm to `_ => {}`: this test then fails
+    /// because `scope.errored` no longer names `weird-step-1`.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn an_unrecognized_kind_that_errored_is_named_not_swallowed() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "weird-step-1".into(),
+                task_id: "weird-task".into(),
+                kind: "crawl.summary".into(),
+                gate: None,
+                status: NodeStatus::Error,
+                config: json!({}),
+                started_ts: None,
+                completed_ts: None,
+                output: Some("dispatch error".into()),
+            },
+        )
+        .unwrap();
+
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert!(
+            wrapped.body.scope.errored.iter().any(|e| e.contains("crawl.summary") && e.contains("weird-step-1")),
+            "an unrecognized kind that errored must still be named: {:?}",
+            wrapped.body.scope
+        );
+        assert!(
+            wrapped.body.scope.not_attempted.is_empty(),
+            "a generic errored step names no rule — it cannot know one: {:?}",
+            wrapped.body.scope
+        );
+    }
+
+    /// The flip side of the test above: an unrecognized kind that reached
+    /// `Complete` is not a failure, and must not appear in `errored` —
+    /// only genuinely troubled steps of unknown kinds get named.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn an_unrecognized_kind_that_completed_is_not_named_as_errored() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "weird-step-2".into(),
+                task_id: "weird-task-2".into(),
+                kind: "crawl.summary".into(),
+                gate: None,
+                status: NodeStatus::Complete,
+                config: json!({}),
+                started_ts: None,
+                completed_ts: None,
+                output: Some("ok".into()),
+            },
+        )
+        .unwrap();
+
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert!(
+            wrapped.body.scope.errored.is_empty(),
+            "a completed step of an unrecognized kind is not a failure: {:?}",
+            wrapped.body.scope
+        );
+    }
+
+    /// (silent-miss audit, 2026-09-06) A `crawl.unit` step's own output
+    /// that fails to parse used to be swallowed by `let Ok((doc, _)) = ...
+    /// else { continue }` — `findings_rejected` for that unit silently
+    /// read as `0`, indistinguishable from a genuinely clean unit. Now
+    /// named on `GatherOutput::unreadable`. Red-proved by reverting the
+    /// `resolve_output_doc` match back to the `let-else`: this test then
+    /// fails because `unreadable` is empty.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn a_units_unparseable_output_is_named_unreadable_not_counted_as_clean() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        crate::lifecycle::save_step(
+            MISSION,
+            PHASE,
+            &Step {
+                id: "unit-step-bad".into(),
+                task_id: "unit-task-bad".into(),
+                kind: "crawl.unit".into(),
+                gate: None,
+                status: NodeStatus::Complete,
+                config: json!({}),
+                started_ts: None,
+                completed_ts: None,
+                // Not valid `Output::read`-able JSON — the runtime wrote a
+                // malformed/truncated envelope.
+                output: Some("{ this is not json".into()),
+            },
+        )
+        .unwrap();
+
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert_eq!(
+            wrapped.body.scope.refused, 0,
+            "an unreadable output contributes no count either way: {:?}",
+            wrapped.body.scope
+        );
+        assert!(
+            wrapped.body.unreadable.iter().any(|u| u.contains("unit-step-bad")),
+            "the unparseable unit output must be named as unreadable, not treated as clean: {:?}",
+            wrapped.body.unreadable
+        );
+    }
+
+    /// (silent-miss audit, 2026-09-06) An unreadable `steps_dir` for one
+    /// phase (a `.json` file that fails to parse as a `Step`) used to be
+    /// swallowed by `load_steps_for_phase`'s `Err` being skipped via
+    /// `let Ok(steps) = ... else { continue }` — that phase's steps
+    /// (including any `crawl.unit`/`plan.sites` records) became entirely
+    /// invisible to the scan, no different from a phase with nothing to
+    /// report. Now named on `GatherOutput::unreadable`.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn an_unreadable_phase_step_directory_is_named_unreadable() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        let steps_dir = crate::lifecycle::steps_dir(MISSION, PHASE);
+        std::fs::create_dir_all(&steps_dir).unwrap();
+        std::fs::write(steps_dir.join("corrupt.json"), "{ not valid json at all").unwrap();
+
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert!(
+            wrapped.body.unreadable.iter().any(|u| u.contains(PHASE)),
+            "an unreadable phase step directory must be named, not silently treated as \
+             'nothing to report': {:?}",
+            wrapped.body.unreadable
+        );
     }
 }

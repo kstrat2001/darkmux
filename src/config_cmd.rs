@@ -477,18 +477,25 @@ fn get_path<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
 /// "Did you mean" suffix for an unknown key — up to 3 closest known keys by
 /// Levenshtein distance (≤ 3), else a pointer to `config list`.
 fn suggestion(key: &str) -> String {
-    let mut scored: Vec<(usize, &str)> = KEYS
-        .iter()
-        .map(|(k, _)| (levenshtein(key, k), *k))
-        .filter(|(d, _)| *d <= 3)
-        .collect();
-    scored.sort_by_key(|(d, _)| *d);
-    let near: Vec<&str> = scored.into_iter().take(3).map(|(_, k)| k).collect();
+    let near = nearest(key, KEYS.iter().map(|(k, _)| *k));
     if near.is_empty() {
         " — run `darkmux config list` to see the settable keys".to_string()
     } else {
         format!(" — did you mean: {}?", near.join(", "))
     }
+}
+
+/// Up to 3 entries of `candidates` closest to `key` by Levenshtein distance
+/// (≤ 3), nearest first. The general form behind [`suggestion`]'s
+/// `config.json`-specific "did you mean" — `mission_launch`'s undeclared-
+/// `--param` warning reuses this directly rather than re-implementing
+/// distance scoring a second time in the same crate (silent-miss audit,
+/// 2026-09-06).
+pub(crate) fn nearest<'a>(key: &str, candidates: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut scored: Vec<(usize, &'a str)> =
+        candidates.map(|c| (levenshtein(key, c), c)).filter(|(d, _)| *d <= 3).collect();
+    scored.sort_by_key(|(d, _)| *d);
+    scored.into_iter().take(3).map(|(_, c)| c).collect()
 }
 
 /// Tiny inline Levenshtein (two-row DP) — a 10-line need beats a crate, per the
