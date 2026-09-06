@@ -96,6 +96,7 @@ it against your own copy if you keep one ([#2433](https://github.com/kstrat2001/
 
 ### Changed
 
+- The review workflow's header and security note describe the shipped pipeline (`plan.sites` → `crawl.unit` → `crawl.summary` → create-mods → `deliver.github_review`) and what the runner actually does with the reviewed tree: an anonymous read-only clone at `head_sha`, never executed ([#2438](https://github.com/kstrat2001/darkmux/pull/2438)).
 - **`review` is now the former `review-v2` pipeline** ([#2310](https://github.com/kstrat2001/darkmux/issues/2310) P4d) —
   the generic launch path (plan → review → summarize → create-mods →
   deliver), built on the shared mission building blocks. The `review-v2`
@@ -156,6 +157,8 @@ it against your own copy if you keep one ([#2433](https://github.com/kstrat2001/
 
 ### Fixed
 
+- A finding whose mod exists but was never gated (no `test_command`, or the gate failed) is named in the delivered review with the skip reason and a `darkmux mod show <key>` pointer instead of rendering as if nobody proposed a change; a runtime-written mod whose kit is not a unified diff records a warning saying so ([#2438](https://github.com/kstrat2001/darkmux/pull/2438)).
+- Folds and scans fail loud: `records.gather` names failed steps of a kind it does not recognize and lists inputs it could not read, an undeclared `--param` gets a did-you-mean, dispatch bookend literals in the daemon go through the shared flow helpers with a tripwire, error-shaped activities (`step error`, `phase abandon`) are on by default in the event filters, and `darkmux doctor` warns about a hook rule that has never matched because its `match.action` uses the other bookend spelling ([#2437](https://github.com/kstrat2001/darkmux/pull/2437)).
 - **The playback scrubber spans the open run, not the whole loaded day**
   ([#2346](https://github.com/kstrat2001/darkmux/issues/2346), [#2347](https://github.com/kstrat2001/darkmux/pull/2347)) —
   a run that ended mid-day used to leave the scrubber's range pinned at the
@@ -288,6 +291,7 @@ it against your own copy if you keep one ([#2433](https://github.com/kstrat2001/
 
 ### Removed
 
+- The review workflow's `mode` input (validated but never forwarded) and `review.json`'s `mode` / `envelope_out` inputs, which nothing passed ([#2438](https://github.com/kstrat2001/darkmux/pull/2438)).
 - The old review funnel (bundle → probe → dedup → judge → verify →
   synthesis) and its ten Tier-3 `review.*` step kinds are deleted.
   Historical run records that used them still render in the viewer.
