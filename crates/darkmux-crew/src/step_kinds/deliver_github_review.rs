@@ -231,6 +231,21 @@ pub struct DeliverOutcome {
     /// threading a second out-of-band value through the workflow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_at_sha: Option<String>,
+    /// (#2431 round 2, MF-C) A summary safe to post as a PLAIN PR comment
+    /// when the formal review cannot be — a moved branch, a GitHub 422 on
+    /// the inline anchors, or `mode` never producing a `review` payload at
+    /// all (`degraded`/`noop`). `darkmux-review.yml`'s own fallback path
+    /// used to read a `.comment` field this type never had (silently
+    /// posting the literal text "null"); this is that field, for real.
+    /// The scope line (same text `scope_line` renders), then one
+    /// `path:line — claim` bullet per KEPT finding — whether it rendered
+    /// inline, as a body count, or not at all yet (a withheld finding
+    /// never gets a bullet here either; see [`should_withhold`]) — so an
+    /// author reading the fallback comment sees the same findings the
+    /// formal review would have raised, just without the one-click
+    /// suggestions. Always present, even when empty of bullets (a clean
+    /// `noop` run's fallback is just its scope line).
+    pub fallback_comment: String,
     /// (PR #2398 review, item 5) What was delivered, one row per rendered
     /// entry — the operator's index back from a posted review to the
     /// records behind it, now that the finding KEY no longer renders in
@@ -501,15 +516,23 @@ pub fn render_github_review(
     let mut rule_groups: Vec<RuleGroup> = Vec::new();
     let mut entries: Vec<DeliveredEntry> = Vec::new();
     let mut dropped_non_findings = 0usize;
+    // (#2431 round 2, MF-C) One `- path:line — claim` line per KEPT
+    // finding, gathered alongside the main loop — this is what
+    // `fallback_comment` posts verbatim when the formal review cannot be
+    // (a moved branch, a 422, or a mode that never produces a `review`
+    // payload at all). A withheld finding gets no line here either.
+    let mut fallback_bullets: Vec<String> = Vec::new();
 
     for finding in findings {
         let window = FindingWindow::from(finding);
-        // (#2429 part 5) Dropped before anything else runs: a finding
-        // whose own claim is a "No"/"can't tell" answer gets no mod
-        // lookup, no comment, no body bullet, and no `DeliveredEntry` row
-        // — it is treated as though the unit never called `create_finding`
-        // for it at all.
-        if is_dropped_non_finding(window.why.as_deref().unwrap_or("")) {
+        // (#2431 round 2, MF-B) Withheld before anything else runs: a
+        // finding whose STRUCTURED `answer` is `no`/`cannot_tell` gets no
+        // mod lookup, no comment, no body bullet, and no `DeliveredEntry`
+        // row — it is treated as though the unit never called
+        // `create_finding` for it at all. A finding with no `answer` field
+        // (every non-question finding, and a question-form one from a
+        // unit that omitted it) is NEVER withheld here.
+        if should_withhold(window.answer.as_deref()) {
             dropped_non_findings += 1;
             continue;
         }
@@ -536,17 +559,26 @@ pub fn render_github_review(
             for _ in 0..rendered.patches {
                 entries.push(DeliveredEntry::of(&window, rule.as_deref(), "body"));
             }
+            fallback_bullets.push(format!("- {} — {}", window.span(), claim_sentence(&window)));
             continue;
         }
-        let has_anchor = window.file.is_some() && window.line.is_some();
+        // (#2431 round 2, MF-A) A `file`+`line` alone is not enough: GitHub
+        // rejects the WHOLE review if even one comment anchors to a line
+        // outside the PR diff (darkmux-review.yml's own 422 fallback
+        // comment names this), the same `line_touched` predicate
+        // `render_gated_mod` already uses to decide whether a suggestion's
+        // hunk sits inside the diff. A finding at a real but off-diff line
+        // is exactly as unanchorable, for this purpose, as one with no
+        // line at all.
+        let has_anchor = window.file.is_some() && line_touched(&touched, window.file.as_deref().unwrap_or(""), window.line);
         if has_anchor {
-            // (#2429 part 1) No gated mod, but the finding names a real
-            // line: an inline comment, never a body bullet — the shape
-            // every finding takes now, regardless of its rule's confirm
-            // form.
+            // (#2429 part 1) No gated mod, but the finding names a real,
+            // in-diff line: an inline comment, never a body bullet — the
+            // shape every in-diff finding takes now, regardless of its
+            // rule's confirm form.
             comments.push(GithubReviewComment {
                 path: window.file.clone().expect("has_anchor checked file.is_some()"),
-                line: window.line.expect("has_anchor checked line.is_some()"),
+                line: window.line.expect("has_anchor checked line via line_touched, which requires Some"),
                 start_line: None,
                 side: Some("RIGHT".to_string()),
                 body: plain_finding_comment_body(&window, rule.as_deref()),
@@ -560,9 +592,15 @@ pub fn render_github_review(
             group.unanchored += 1;
             entries.push(DeliveredEntry::of(&window, rule.as_deref(), "body"));
         }
+        fallback_bullets.push(format!("- {} — {}", window.span(), claim_sentence(&window)));
     }
 
     let unresolved = unresolved_rule_titles(findings, rule_titles);
+    // (#2431 round 2, MF-C) Built ONCE, reused across every `mode` this
+    // function can return — the scope line, then every kept finding's own
+    // `path:line — claim` bullet, in the order they arrived.
+    let fallback_comment =
+        build_fallback_comment(scope, findings.len(), &unresolved, dropped_non_findings, &fallback_bullets);
 
     // Captured before `body` takes ownership below — whether there was
     // anything to say at all decides `mode`. A gate-passed mod whose every
@@ -589,6 +627,7 @@ pub fn render_github_review(
                 mode: "noop".to_string(),
                 review: None,
                 reviewed_at_sha: None,
+                fallback_comment,
                 entries,
                 dropped_non_findings,
             };
@@ -602,7 +641,11 @@ pub fn render_github_review(
         // its own `Errored:` section, `scope_line`'s own doc) IS the
         // payload.
         let mut body =
-            vec!["### darkmux review".to_string(), String::new(), scope_line(scope, findings.len(), &unresolved)];
+            vec![
+                "### darkmux review".to_string(),
+                String::new(),
+                scope_line_with_withheld(scope, findings.len(), &unresolved, dropped_non_findings),
+            ];
         if let Some(a) = attribution.filter(|a| !a.trim().is_empty()) {
             body.push(String::new());
             body.push(format!("_{a}_"));
@@ -611,13 +654,14 @@ pub fn render_github_review(
             mode: "degraded".to_string(),
             review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments: Vec::new() }),
             reviewed_at_sha: None,
+            fallback_comment,
             entries,
             dropped_non_findings,
         };
     }
 
     let mut body = vec!["### darkmux review".to_string(), String::new()];
-    body.push(scope_line(scope, findings.len(), &unresolved));
+    body.push(scope_line_with_withheld(scope, findings.len(), &unresolved, dropped_non_findings));
     // (#2429 part 2) The body is a summary surface now: only a group that
     // still has something to say (a gated mod's fenced fallback, or an
     // unanchored count) gets a heading at all — a rule whose every finding
@@ -644,9 +688,30 @@ pub fn render_github_review(
         mode: "review".to_string(),
         review: Some(GithubReviewPayload { event: "COMMENT".to_string(), body: body.join("\n"), comments }),
         reviewed_at_sha: None,
+        fallback_comment,
         entries,
         dropped_non_findings,
     }
+}
+
+/// (#2431 round 2, MF-C) [`DeliverOutcome::fallback_comment`]'s builder —
+/// the scope line, then one `- path:line — claim` bullet per KEPT finding
+/// (`fallback_bullets`, gathered in [`render_github_review`]'s own main
+/// loop), so a poster can fall back to a plain `gh pr comment` and still
+/// show the author every finding a formal review would have raised.
+fn build_fallback_comment(
+    scope: &DeliverScope,
+    findings_considered: usize,
+    unresolved_rules: &BTreeSet<String>,
+    withheld: usize,
+    bullets: &[String],
+) -> String {
+    let mut lines = vec![scope_line_with_withheld(scope, findings_considered, unresolved_rules, withheld)];
+    if !bullets.is_empty() {
+        lines.push(String::new());
+        lines.extend(bullets.iter().cloned());
+    }
+    lines.join("\n")
 }
 
 /// One rule's LEFTOVER body content, in the order its findings arrived —
@@ -780,34 +845,25 @@ fn claim_sentence(window: &FindingWindow) -> String {
     }
 }
 
-/// (#2429 part 5) Whether `why` is a claim that should never have become a
-/// finding at all — a "No" or "can't tell" answer to a yes/no/can't-tell
-/// rule (`existing-solution`, `test-gap`, and any other `confirm:
-/// "question"` rule that asks one). Checked as a whole leading WORD: "No"
-/// must be followed by punctuation, whitespace, or end-of-string, so
-/// "Notably, ..." / "None of the callers ..." — real claims that happen to
-/// share the same first two letters — are never mistaken for a negative
-/// answer. Case-sensitive for "No" (a model writing a claim capitalizes
-/// its first word) but case-INSENSITIVE for "can't tell"/"cannot tell",
-/// since the rule text (`crawl::unit_step::pattern_block`) asks the
-/// question mid-sentence and a model echoing its own answer at the start
-/// of `why` may not capitalize it.
-fn is_dropped_non_finding(why: &str) -> bool {
-    let trimmed = why.trim_start();
-    let starts_no = match trimmed.get(..2) {
-        Some(s) if s.eq_ignore_ascii_case("no") => {
-            match trimmed[2..].chars().next() {
-                Some(c) => !c.is_alphanumeric(),
-                None => true,
-            }
-        }
-        _ => false,
-    };
-    if starts_no {
-        return true;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("can't tell") || lower.starts_with("cannot tell")
+/// (#2431 round 2, MF-B) Whether a `confirm: "question"` finding should be
+/// WITHHELD — never rendered, never a comment, never a body bullet — read
+/// from the STRUCTURED `answer` field the unit brief now asks a model to
+/// set (`crawl::unit_step::pattern_block`'s `ConfirmForm::Question` arm;
+/// `runtime/src/tools/mod.rs`'s `Tool::CreateFinding` schema documents the
+/// four values). This REPLACES an earlier word-heuristic version of this
+/// function that judged the claim's own FIRST WORD ("No"/"Can't tell") —
+/// proven, live, to drop real findings whose claim legitimately opened
+/// with those words ("No test in planning.spec.ts exercises this path",
+/// "No caller updates the cache…") and, because the "No" check was
+/// case-sensitive while "can't tell" was not, to ALSO drop unrelated
+/// claims like "no-op wrapper…" and "NO_COLOR is read…". A structured
+/// field the model sets DELIBERATELY (or leaves absent) cannot misfire on
+/// a claim's incidental wording — a finding with no `answer` at all
+/// (every `confirm: "mod"`/`"search"` finding, and a `"question"` finding
+/// from a unit that never sets the field) is never withheld by this
+/// function; it renders exactly as before.
+fn should_withhold(answer: Option<&str>) -> bool {
+    matches!(answer.map(str::trim).map(str::to_ascii_lowercase).as_deref(), Some("no") | Some("cannot_tell"))
 }
 
 /// A finding with no gate-passed mod, anchored to a `path`+`line`: a plain
@@ -870,6 +926,27 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize, unresolved_rules
     // a reader is most likely to mistake it for a complete review.
     line.push(' ');
     line.push_str(STANDING_NARROWNESS);
+    line
+}
+
+/// (#2431 round 2, MF-B) `scope_line`, with a trailing clause naming how
+/// many findings this run WITHHELD — a `confirm: "question"` finding whose
+/// structured `answer` was `no`/`cannot_tell` (`should_withhold`). A
+/// separate helper rather than a new `scope_line` parameter: most of
+/// `scope_line`'s own direct callers (its unit tests) have no withheld
+/// count to report, and this keeps that signature — and every one of
+/// those tests — untouched.
+fn scope_line_with_withheld(
+    scope: &DeliverScope,
+    findings_considered: usize,
+    unresolved_rules: &BTreeSet<String>,
+    withheld: usize,
+) -> String {
+    let mut line = scope_line(scope, findings_considered, unresolved_rules);
+    if withheld > 0 {
+        let word = if withheld == 1 { "finding" } else { "findings" };
+        line.push_str(&format!(" {withheld} {word} withheld: the unit answered no or could not tell."));
+    }
     line
 }
 
@@ -1047,6 +1124,14 @@ struct FindingWindow {
     /// doctor`-style hygiene exists to catch, and this module is the
     /// pure-function surface a golden test reads directly.
     why: Option<String>,
+    /// (#2431 round 2, MF-B) The unit's own structured yes/no/partly/
+    /// cannot_tell answer, for a `confirm: "question"` finding — optional
+    /// on the wire (`runtime/src/tools/mod.rs`'s `Tool::CreateFinding`
+    /// schema), and simply `None` on any finding whose unit never set it
+    /// (every `mod`/`search`-confirmed finding, and a `question`-confirmed
+    /// one from a unit that omitted it). [`should_withhold`] is the only
+    /// reader.
+    answer: Option<String>,
 }
 
 impl FindingWindow {
@@ -1057,6 +1142,7 @@ impl FindingWindow {
             file: get("file"),
             line: finding.emitted.get("line").and_then(|v| v.as_u64()).map(|n| n as u32),
             why: get("why"),
+            answer: get("answer"),
         }
     }
 
@@ -1305,7 +1391,12 @@ impl StepKind for DeliverGithubReviewStepKind {
         // model-authored text that would then be copied verbatim into a
         // flow record, and the close payload is a summary surface, not a
         // second copy of the artifact.
-        let summary = scope_line(&cfg.scope, cfg.findings.len(), &unresolved_rule_titles(&cfg.findings, &titles));
+        let summary = scope_line_with_withheld(
+            &cfg.scope,
+            cfg.findings.len(),
+            &unresolved_rule_titles(&cfg.findings, &titles),
+            outcome.dropped_non_findings,
+        );
         let output = serde_json::to_string(&serde_json::json!({
             "mode": outcome.mode,
             "summary": summary,
@@ -1669,6 +1760,35 @@ mod tests {
     }
 
     #[test]
+    fn a_finding_anchored_outside_the_diff_falls_back_to_a_body_count_not_a_comment() {
+        // (#2431 round 2, MF-A) `has_anchor` used to mean only "the
+        // finding's own emission carries a `file`+`line`" — it never
+        // checked whether that line is actually IN the PR diff. GitHub
+        // rejects an ENTIRE review if even one comment anchors to a line
+        // outside the diff (a single bad anchor 422s the whole POST, per
+        // darkmux-review.yml's own fallback comment), so a finding at a
+        // real but off-diff line must take the SAME "could not be
+        // anchored" body-count path an unanchored finding does.
+        let findings = vec![finding("s/1", "src/z.ts", 1, "ev", "a claim about a line outside the diff", None)];
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
+        assert_eq!(out.dropped_non_findings, 0, "{out:?}");
+        assert_eq!(out.entries.len(), 1, "{out:?}");
+        assert_eq!(out.entries[0].rendered_as, "body", "{out:?}");
+        let review = out.review.unwrap();
+        assert!(review.comments.is_empty(), "an off-diff anchor must never become a comment: {review:?}");
+        assert!(
+            review.body.contains("1 finding could not be anchored to a line."),
+            "an off-diff line is exactly as unanchorable as no line at all: {}",
+            review.body
+        );
+        assert!(
+            !review.body.contains("a claim about a line outside the diff"),
+            "the claim never renders, only the count: {}",
+            review.body
+        );
+    }
+
+    #[test]
     fn a_gate_failed_mod_becomes_a_plain_inline_comment_not_a_suggestion() {
         let findings = vec![finding("s/4", "src/a.ts", 2, "ev", "claim", None)];
         let mods = vec![gated_mod("s/4", "kit text", Some(false))];
@@ -1691,11 +1811,16 @@ mod tests {
         // renders: any anchored finding is an inline comment now, so this
         // rule's own "cannot tell all-clear from a real hit" limitation no
         // longer needs a body-side demotion to express.
+        // (#2431 round 2, MF-A) Anchored to a line INSIDE the diff
+        // (`src/a.ts:2`, one of `DIFF`'s own touched lines) — an anchor
+        // outside the diff falls to the body-count path instead (see
+        // `a_finding_anchored_outside_the_diff_falls_back_to_a_body_count_not_a_comment`),
+        // which is not what this test is about.
         let findings = vec![finding_of_rule(
             "s/5",
             Some("shared-symbol-callers"),
-            "src/mw.ts",
-            10,
+            "src/a.ts",
+            2,
             "14 endpoints use this middleware",
             "shared auth changed",
             Some("search"),
@@ -1703,8 +1828,8 @@ mod tests {
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         let review = out.review.unwrap();
         assert_eq!(review.comments.len(), 1, "{review:?}");
-        assert_eq!(review.comments[0].path, "src/mw.ts");
-        assert_eq!(review.comments[0].line, 10);
+        assert_eq!(review.comments[0].path, "src/a.ts");
+        assert_eq!(review.comments[0].line, 2);
         assert!(review.comments[0].body.contains("shared auth changed"), "the claim is never dropped: {:?}", review.comments[0]);
         assert!(!review.body.contains("Worth a double check"), "the tail section is gone: {}", review.body);
     }
@@ -1715,9 +1840,12 @@ mod tests {
         // to a question's claim. That suffix is gone — the comment carries
         // only the claim, and the finding's own anchor already shows the
         // line the candidates search was about.
+        // (#2431 round 2, MF-A) Anchored inside the diff (`src/a.ts:1`) —
+        // this test is about the Candidates suffix, not the diff-anchor
+        // check.
         let findings = vec![finding(
             "s/6",
-            "src/x.ts",
+            "src/a.ts",
             1,
             "Status enum, Kind enum",
             "did you check whether the repo already has this",
@@ -1777,13 +1905,19 @@ mod tests {
     #[test]
     fn every_finding_becomes_an_inline_conversation_or_a_counted_fallback() {
         const TWO_HUNK_KIT: &str = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,1 @@\n-function f() {\n+function f(): void {\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        // (#2431 round 2, MF-A) All three anchored findings sit on lines
+        // `DIFF` actually touches (`src/a.ts` 1-3) — an anchor OUTSIDE the
+        // diff renders as a body count instead of a comment (see
+        // `a_finding_anchored_outside_the_diff_falls_back_to_a_body_count_not_a_comment`),
+        // which would silently turn this fixture's "2 plain comments"
+        // into 0.
         let findings = vec![
             finding_of_rule("s/1", Some("swallowed-error"), "src/a.ts", 1, "ev", "the failure is discarded", None),
             finding_of_rule(
                 "s/2",
                 Some("existing-solution"),
-                "src/x.ts",
-                1,
+                "src/a.ts",
+                2,
                 "ev",
                 "did you check for an existing helper",
                 Some("question"),
@@ -1791,8 +1925,8 @@ mod tests {
             finding_of_rule(
                 "s/3",
                 Some("test-gap"),
-                "src/y.ts",
-                1,
+                "src/a.ts",
+                3,
                 "ev",
                 "does a test cover this new branch",
                 Some("question"),
@@ -1921,49 +2055,149 @@ mod tests {
         assert!(emitted.get("reviewed_at_sha").is_none(), "{emitted}");
     }
 
-    /// (#2429 part 5) A claim that answers a yes/no/can't-tell rule with
-    /// "No" is dropped unconditionally — no comment, no body bullet, no
-    /// `DeliveredEntry` row — and counted.
+    /// (#2431 round 2, MF-C) `fallback_comment` — the field
+    /// `darkmux-review.yml`'s post step reads for every mode's plain
+    /// `gh pr comment` fallback, instead of the `.comment` key
+    /// `DeliverOutcome` never had (which used to post the literal text
+    /// "null"). Present and populated on the `review`, `degraded`, AND
+    /// `noop` paths.
     #[test]
-    fn a_claim_starting_no_is_dropped_and_counted() {
+    fn fallback_comment_is_present_and_names_every_kept_finding() {
         let findings = vec![
-            finding_of_rule(
-                "s/1",
-                Some("existing-solution"),
-                "src/a.ts",
-                2,
-                "ev",
-                "No, nothing exists that does this.",
-                Some("question"),
-            ),
-            finding_of_rule("s/2", Some("test-gap"), "src/b.ts", 3, "ev", "a real finding", None),
+            finding_of_rule("s/1", Some("swallowed-error"), "src/a.ts", 1, "ev", "the failure is discarded", None),
+            finding_of_rule("s/2", Some("test-gap"), "src/a.ts", 2, "ev", "does a test cover this new branch", Some("question")),
+            unanchored_finding("s/3", "unnamed-predicate", "the compound condition has no name"),
+            finding_with_answer("s/4", Some("existing-solution"), "src/a.ts", 3, "ev", "No, nothing exists that does this.", "no"),
+        ];
+        let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
+        assert_eq!(out.mode, "review", "{out:?}");
+        // The scope line, first.
+        assert!(out.fallback_comment.contains("review ran:"), "{}", out.fallback_comment);
+        // One bullet per KEPT finding — inline (`s/1`), a body count
+        // (`s/2` is anchored so it becomes a plain comment too, `s/3` is
+        // unanchored) — every one of them still gets a `path:line — claim`
+        // line here regardless of how it rendered in the formal review.
+        assert!(out.fallback_comment.contains("`src/a.ts:1` — the failure is discarded."), "{}", out.fallback_comment);
+        assert!(out.fallback_comment.contains("`src/a.ts:2` — does a test cover this new branch."), "{}", out.fallback_comment);
+        // `s/3` has no anchor, so `window.span()` falls back to its own
+        // key (`FindingWindow::span`'s own doc).
+        assert!(out.fallback_comment.contains("the compound condition has no name."), "{}", out.fallback_comment);
+        // The withheld finding (`s/4`, `answer: "no"`) gets NO bullet —
+        // withheld means withheld everywhere, including the fallback.
+        assert!(!out.fallback_comment.contains("nothing exists"), "{}", out.fallback_comment);
+        assert!(!out.fallback_comment.contains("Candidates"), "{}", out.fallback_comment);
+    }
+
+    /// (#2431 round 2, MF-C) `fallback_comment` on the `degraded`/`noop`
+    /// paths, where `review`'s own body is either the SAME scope line
+    /// (`degraded`) or absent entirely (`noop`, `review: None`) — the
+    /// workflow's plain-comment fallback needs `fallback_comment` on
+    /// EVERY mode, not just `review`.
+    #[test]
+    fn fallback_comment_is_present_on_degraded_and_noop() {
+        let errored_scope = DeliverScope { errored: vec!["unit `x` (Error)".to_string()], ..Default::default() };
+        let degraded = render(&[], &[], DIFF, &errored_scope, None);
+        assert_eq!(degraded.mode, "degraded", "{degraded:?}");
+        assert!(!degraded.fallback_comment.is_empty(), "{degraded:?}");
+        assert!(degraded.fallback_comment.contains("Errored:"), "{}", degraded.fallback_comment);
+
+        let clean = render(&[], &[], DIFF, &DeliverScope::default(), None);
+        assert_eq!(clean.mode, "noop", "{clean:?}");
+        assert!(!clean.fallback_comment.is_empty(), "even a clean noop's fallback states the scope line: {clean:?}");
+    }
+
+    /// A structured helper: `finding_of_rule` plus the unit's own
+    /// `answer` field on `emitted` — the wire shape
+    /// `runtime/src/tools/mod.rs`'s `Tool::CreateFinding` schema declares.
+    #[allow(clippy::too_many_arguments)]
+    fn finding_with_answer(
+        key: &str,
+        rule: Option<&str>,
+        file: &str,
+        line: u32,
+        evidence: &str,
+        why: &str,
+        answer: &str,
+    ) -> FindingRecord {
+        let mut f = finding_of_rule(key, rule, file, line, evidence, why, Some("question"));
+        f.emitted["answer"] = json!(answer);
+        f
+    }
+
+    /// (#2431 round 2, MF-B) A finding whose STRUCTURED `answer` is `no`
+    /// is withheld unconditionally — no comment, no body bullet, no
+    /// `DeliveredEntry` row — and counted; the scope line names the count.
+    /// A sibling finding with no `answer` field renders normally.
+    #[test]
+    fn a_finding_with_answer_no_is_withheld_and_counted() {
+        let findings = vec![
+            finding_with_answer("s/1", Some("existing-solution"), "src/a.ts", 2, "ev", "No, nothing exists that does this.", "no"),
+            finding_of_rule("s/2", Some("test-gap"), "src/a.ts", 1, "ev", "a real finding", None),
         ];
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
         assert_eq!(out.dropped_non_findings, 1, "{out:?}");
-        assert_eq!(out.entries.len(), 1, "the dropped finding gets no entry row: {out:?}");
+        assert_eq!(out.entries.len(), 1, "the withheld finding gets no entry row: {out:?}");
         let review = out.review.unwrap();
         assert_eq!(review.comments.len(), 1, "only the real finding becomes a comment: {review:?}");
         assert!(!review.comments[0].body.contains("nothing exists"), "{review:?}");
         assert!(!review.body.contains("nothing exists"), "{}", review.body);
+        assert!(
+            review.body.contains("1 finding withheld: the unit answered no or could not tell."),
+            "the scope line states the decision: {}",
+            review.body
+        );
     }
 
-    /// (#2429 part 5) "Can't tell" (either case) is dropped the same way —
-    /// and a claim that merely STARTS WITH the same two letters as "No"
-    /// ("Notably…") is never mistaken for a negative answer.
+    /// (#2431 round 2, MF-B) `cannot_tell` (case-insensitive) is withheld
+    /// the same way as `no`. The load-bearing half of this test is the
+    /// SECOND and THIRD findings: their claims literally start with "No."
+    /// and "Can't tell" — the exact shape the removed word-heuristic
+    /// version of this guard used to misjudge — but since NEITHER sets
+    /// the structured `answer` field, both render normally. This is the
+    /// red-proof that #132's real finding ("No test in planning.spec.ts
+    /// exercises this path") would no longer be silently dropped.
     #[test]
-    fn cant_tell_is_dropped_and_no_word_boundary_false_positives() {
+    fn cannot_tell_is_withheld_and_a_claim_starting_no_with_no_answer_field_still_renders() {
         let findings = vec![
-            finding_of_rule("s/1", Some("test-gap"), "src/a.ts", 1, "ev", "Can't tell from this window alone.", Some("question")),
-            finding_of_rule("s/2", Some("test-gap"), "src/b.ts", 2, "ev", "can't tell — not enough context.", Some("question")),
-            finding_of_rule("s/3", Some("test-gap"), "src/c.ts", 3, "ev", "Notably, this branch has no test.", None),
-            finding_of_rule("s/4", Some("test-gap"), "src/d.ts", 4, "ev", "None of the existing tests cover this.", None),
+            finding_with_answer("s/1", Some("test-gap"), "src/a.ts", 1, "ev", "Can't tell from this window alone.", "cannot_tell"),
+            finding_of_rule("s/2", Some("test-gap"), "src/a.ts", 2, "ev", "No test in planning.spec.ts exercises this path.", None),
+            finding_of_rule("s/3", Some("test-gap"), "src/a.ts", 3, "ev", "Notably, this branch has no test.", None),
         ];
         let out = render(&findings, &[], DIFF, &DeliverScope::default(), None);
-        assert_eq!(out.dropped_non_findings, 2, "{out:?}");
+        assert_eq!(out.dropped_non_findings, 1, "only the `cannot_tell`-answered finding is withheld: {out:?}");
         let review = out.review.unwrap();
-        assert_eq!(review.comments.len(), 2, "\"Notably\"/\"None\" are real claims, not dropped: {review:?}");
+        assert_eq!(review.comments.len(), 2, "{review:?}");
+        assert!(
+            review.comments.iter().any(|c| c.body.contains("No test in planning.spec.ts exercises this path")),
+            "a real finding whose CLAIM happens to start with \"No\" renders, since it set no `answer` field: {review:?}"
+        );
         assert!(review.comments.iter().any(|c| c.body.contains("Notably")));
-        assert!(review.comments.iter().any(|c| c.body.contains("None of the existing tests")));
+    }
+
+    /// (#2429 part 5, item 5's own conformance ask) The renderer's OWN
+    /// test fixtures never claim, via a rendered comment or body bullet,
+    /// something that opens with "No."/"Can't tell" — a TEST-SUITE
+    /// hygiene check, not a runtime rule (the runtime rule is
+    /// `should_withhold`, keyed on the structured `answer` field, never on
+    /// a claim's own wording). Exercised over `every_form_fixture()`,
+    /// the widest fixture this module's tests share.
+    #[test]
+    fn no_rendered_claim_in_the_shared_fixture_begins_with_no_or_cant_tell() {
+        let (findings, mods, scope) = every_form_fixture();
+        let review = render(&findings, &mods, DIFF, &scope, None).review.unwrap();
+        let mut rendered = review.body.clone();
+        for c in &review.comments {
+            rendered.push('\n');
+            rendered.push_str(&c.body);
+        }
+        for line in rendered.lines() {
+            let claim = line.trim_start_matches("- ");
+            let lower = claim.to_ascii_lowercase();
+            assert!(
+                !claim.starts_with("No.") && !lower.starts_with("can't tell"),
+                "a rendered claim begins with a withheld-shaped prefix: {claim:?}"
+            );
+        }
     }
 
     #[test]
@@ -2425,11 +2659,14 @@ mod tests {
         });
         let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
         let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        // (#2431 round 2, MF-A) `sess-a/2` sits at `src/mw.ts:9`, a path
+        // `DIFF` (which touches only `src/a.ts`) never covers — an
+        // off-diff anchor renders as a body count now, not a comment.
         assert_eq!(
             step_output["entries"],
             json!([
                 { "rule": "swallowed-error", "path": "src/a.ts", "line": 2, "key": "sess-a/1", "rendered_as": "suggestion" },
-                { "rule": "union-vs-enum", "path": "src/mw.ts", "line": 9, "key": "sess-a/2", "rendered_as": "comment" },
+                { "rule": "union-vs-enum", "path": "src/mw.ts", "line": 9, "key": "sess-a/2", "rendered_as": "body" },
             ]),
             "{step_output}"
         );
@@ -2749,11 +2986,14 @@ mod tests {
         // comment has no group heading to lean on; the TITLE only ever
         // headed a body group, which no longer exists once a rule's
         // findings all rendered inline).
+        // (#2431 round 2, MF-A) Both anchors sit inside `DIFF`'s own
+        // touched lines (`src/a.ts` 1-3) — an off-diff anchor renders as a
+        // body count instead, which is a different test's concern.
         let findings = vec![
             finding_of_rule(
                 "s/1",
                 Some("existing-solution"),
-                "src/x.ts",
+                "src/a.ts",
                 1,
                 "Status enum",
                 "did you check whether the repo already has this",
@@ -2898,29 +3138,33 @@ mod tests {
         // Sanity: every delivery form actually fired, or a broken fixture
         // could pass this golden vacuously.
         //
-        // (#2429) Every ANCHORED finding is now an inline comment: the two
-        // gate-passed mods still ride out as suggestions (unchanged), and
-        // the five OTHER findings (no mod, or a gate-failed/never-gated
-        // one) each become a plain comment instead of a body bullet — only
-        // `sess-a/2`'s mod (declared with no `kit_kind`, so it can never
-        // become a suggestion) still falls back to the body.
+        // (#2429, revised #2431 round 2 MF-A) Every finding anchored
+        // INSIDE the diff is an inline comment: the two gate-passed mods
+        // still ride out as suggestions (unchanged), and three of the
+        // OTHER findings (no mod, or a gate-failed/never-gated one) become
+        // plain comments. TWO findings — `shared-symbol-callers` at
+        // `src/mw.ts:10` and `existing-solution` at `src/x.ts:1`, neither
+        // of which `DIFF` (which only touches `src/a.ts`) covers — now
+        // fall to the SAME "could not be anchored" body-count path an
+        // unanchored finding takes: an off-diff anchor 422s the whole
+        // GitHub review if it were posted, so it can never become a
+        // comment. `sess-a/2`'s mod (declared with no `kit_kind`, so it
+        // can never become a suggestion) still falls back to the body too.
         assert_eq!(outcome.mode, "review");
         let review = outcome.review.unwrap();
-        assert_eq!(review.comments.len(), 7, "2 suggestions + 5 plain comments: {review:?}");
+        assert_eq!(review.comments.len(), 5, "2 suggestions + 3 plain comments: {review:?}");
         assert!(review.comments.iter().all(|c| c.side.as_deref() == Some("RIGHT")));
         // (#2310 delivery rewrite, rule 2) The searched rule's passed
         // change still rides out as a suggestion — the shape the old
         // form-first branch dropped entirely.
         assert!(review.comments.iter().any(|c| c.body.contains("function f(): Status {")), "{review:?}");
         assert!(review.comments.iter().any(|c| c.body.contains("const x = clamp(1);")), "{review:?}");
-        // Every OTHER finding's claim rides an inline comment now, tagged
-        // with its rule id — never the body.
+        // Every OTHER in-diff finding's claim rides an inline comment now,
+        // tagged with its rule id — never the body.
         for (claim, rule) in [
             ("might duplicate an existing helper", "unnamed-predicate"),
             ("a gate-failed claim", "union-vs-enum"),
             ("a mod exists but nothing ever gated it", "swallowed-error"),
-            ("shared auth changed", "shared-symbol-callers"),
-            ("did you check whether the repo already has this", "existing-solution"),
         ] {
             assert!(
                 review.comments.iter().any(|c| c.body.contains(claim) && c.body.contains(&format!("`{rule}`"))),
@@ -2928,6 +3172,22 @@ mod tests {
             );
             assert!(!review.body.contains(claim), "{claim:?} must never repeat in the body: {}", review.body);
         }
+        // The two OFF-DIFF findings become body counts under their own
+        // rule's heading — never a comment, and never their claim.
+        for (claim, rule_heading) in [
+            ("shared auth changed", "**A shared function or type's signature or behavior changed** `shared-symbol-callers`"),
+            ("did you check whether the repo already has this", "**A new routine looks re-implemented rather than reused** `existing-solution`"),
+        ] {
+            assert!(!review.comments.iter().any(|c| c.body.contains(claim)), "{claim:?} is off-diff, never a comment: {review:?}");
+            assert!(!review.body.contains(claim), "{claim:?} must never repeat in the body: {}", review.body);
+            assert!(review.body.contains(rule_heading), "{rule_heading:?} still heads its own group: {}", review.body);
+        }
+        assert_eq!(
+            review.body.matches("1 finding could not be anchored to a line.").count(),
+            2,
+            "one count bullet per off-diff rule: {}",
+            review.body
+        );
         // The one mod that COULD NOT become a suggestion (no `kit_kind`)
         // still falls back to the body, unchanged.
         assert!(review.body.contains("the patch text"), "mod-outside-diff fallback still renders in the body");
@@ -2946,7 +3206,6 @@ mod tests {
         // claims other than the one fallback bullet above, and no leftover
         // "Worth a double check" tail.
         assert!(!review.body.contains("Worth a double check"), "{}", review.body);
-        assert!(!review.body.contains("could not be anchored"), "every finding here has an anchor: {}", review.body);
         assert!(review.body.contains("2 refused"));
         assert!(review.body.contains("Not attempted: architectural review."));
     }

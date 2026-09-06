@@ -316,8 +316,14 @@ jobs:
           MODE_RESULT=$(jq -r .mode "$RUNNER_TEMP/qa/rendered.json")
           case "$MODE_RESULT" in
             review)
+              # (#2431 round 2, MF-C) `.fallback_comment` — `DeliverOutcome`
+              # never had a `.comment` field, so this used to print the
+              # literal string "null" into the fallback comment whenever
+              # the formal review couldn't post. `fallback_comment` is the
+              # real field: the scope line plus one `path:line — claim`
+              # line per finding, whether it rendered inline or not.
               jq .review "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/review.json"
-              jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/fallback.md"
+              jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/fallback.md"
               post_review_or_fallback ;;
             partial)
               # (#1876/#1877) The judge stage did not rule on every flag (its
@@ -340,11 +346,11 @@ jobs:
                 # No confirmed findings this run (needs-check only, or
                 # nothing at all) — no formal review payload, post the
                 # comment the way `comment` mode does.
-                jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
+                jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
                 gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md"
               else
                 jq .review "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/review.json"
-                jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/fallback.md"
+                jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/fallback.md"
                 post_review_or_fallback
               fi
               echo "::error::review coverage was incomplete (mode=partial) — see the posted findings above; some flags never got a ruling"
@@ -353,7 +359,7 @@ jobs:
               # (#1113) NO review signal (dead dispatch / empty reply /
               # vacuous pass). Post the honest note, then FAIL this run —
               # a produced-nothing review must never read as a green check.
-              jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
+              jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md"
               echo "::error::review dispatch produced no usable review (mode=degraded)"
               exit 1 ;;
@@ -363,13 +369,13 @@ jobs:
               # `bundle_skip` breakdown) — post the neutral note and exit 0.
               # Distinct from `degraded`: this is an honest "nothing here",
               # never a failure, and never a green approval either.
-              jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
+              jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;
             comment)
               # Zero confirmed findings (needs-check only, or nothing at
               # all) — no formal review payload, just the honest prose
               # summary. A real signal-bearing outcome, so post and exit 0.
-              jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
+              jq -r .fallback_comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;
             *)
               # (#1889) An unrecognized `Rendered.mode` must fail loudly,

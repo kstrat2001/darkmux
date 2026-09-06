@@ -340,6 +340,11 @@ impl Tool {
                     "why": {
                         "type": "string",
                         "description": "One or two sentences: why this line matches the pattern, and what it would cost."
+                    },
+                    "answer": {
+                        "type": "string",
+                        "enum": ["yes", "no", "partly", "cannot_tell"],
+                        "description": "ONLY when the pattern you were given asked you a yes/no/partly/can't-tell question (a `confirm: \"question\"` rule): your one-word answer. Omit entirely for a pattern that did not ask a question. If your answer here is \"no\" or \"cannot_tell\", do not call this tool at all for this pattern — see the pattern's own instructions."
                     }
                 },
                 "required": ["file", "line", "pattern", "evidence", "why"]
