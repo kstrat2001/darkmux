@@ -6681,6 +6681,13 @@ body {
      stretching it. Row 2 still fits one line at both 390 and 320 — the
      row's own height is driven by its tallest child (now 44px, up from
      36px) and stays comfortably under a 48px cap. */
+  /* `auto-fill minmax(180px, 1fr)` needs 372px for two columns; a 390px
+     phone's panel is ~366px wide, so the activity grid fell to ONE column
+     there (a 430px phone got two). Two fixed columns: the longest mapped
+     label ("everything present", 18ch) fits a 175px column at this size. */
+  .phone-drawer__body .dialog__fgroup--activity {
+    grid-template-columns: 1fr 1fr;
+  }
   .phone-drawer__body .eventlog__follow,
   .phone-drawer__body .eventlog__fbtn {
     box-sizing: border-box;
