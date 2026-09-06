@@ -826,10 +826,15 @@ export function EventLogColumn({
                   glyph-only. */}
               <button
                 type="button"
-                className="eventlog__fbtn"
+                className={`eventlog__fbtn${isMobile && filtersInline ? " on" : ""}`}
                 id="fbtn"
                 data-act="filters"
-                data-active={activeFilters > 0 ? "1" : undefined}
+                /* On the phone the badge already says how many filters are
+                   active, and the default allowlist means that is nearly
+                   always non-zero — so `data-active` would keep the button
+                   lit forever. The lit state there is the inline panel
+                   being OPEN (`filtersInline`), a state the tap toggles. */
+                data-active={!isMobile && activeFilters > 0 ? "1" : undefined}
                 title={activeFilters > 0 ? `${activeFilters} filter${activeFilters === 1 ? "" : "s"} hiding events` : "filters"}
                 aria-label={activeFilters > 0 ? `filters, ${activeFilters} active` : "filters"}
                 onClick={() => (isMobile ? setFiltersInline((v) => !v) : openModalEl("modalbg"))}
@@ -841,18 +846,20 @@ export function EventLogColumn({
                     label so the phone drawer's two-row header (search; then
                     follow + filters + the matches count on one line) has
                     room for the count text to actually fit beside the icons
-                    instead of wrapping to a THIRD row. `▾` is this
-                    codebase's EXISTING disclosure glyph (`styles.css`'s
-                    `content: "▾"` rules), used here rather than introducing
-                    a new codepoint (round 1 shipped `⏷`, U+23F7, which had
-                    no other use in the tree — round 2 caught it). `aria-
-                    hidden` on both the glyph and the badge: `aria-label`/
-                    `title` above already carry the full semantics
-                    ("filters, 2 active"), so a screen reader is not asked
-                    to read the glyph AND the bare digit as if they were
-                    separate content. */}
+                    instead of wrapping to a THIRD row. Round 3 (operator,
+                    2026-09-06): the glyph is a funnel, drawn the way
+                    `ActivityIcon` draws its own (stroke `currentColor`,
+                    round caps, 24-unit viewBox) — a disclosure caret said
+                    "opens a menu", not "filters", and no Unicode codepoint
+                    draws a funnel. `aria-hidden` on both the icon and the
+                    badge: `aria-label`/`title` above already carry the
+                    full semantics ("filters, 2 active"), so a screen
+                    reader is not asked to read the icon AND the bare digit
+                    as if they were separate content. */}
                 <span className="eventlog__ficon" aria-hidden="true">
-                  ▾
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M3 5h18l-7 8.5V19l-4 2v-7.5z" />
+                  </svg>
                 </span>
                 {activeFilters > 0 ? (
                   <span className="eventlog__fcount" aria-hidden="true">

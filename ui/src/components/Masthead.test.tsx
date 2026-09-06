@@ -195,7 +195,7 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     // A closed mission names ITSELF (operator, in #2412: "pill shows the
     // mission id"), not the day it happened to close on.
     const known = renderMasthead({ kind: "mission", missionId: "m1", stepId: null } as never, "live", "2026-08-07");
-    expect(known.container.querySelector(".catalog-toggle")?.textContent).toBe("▣ m1");
+    expect(known.container.querySelector(".catalog-toggle")?.textContent).toBe("▣m1");
     expect(known.container.querySelector("#modebadge")).toBeNull();
     vi.unstubAllGlobals();
   });
@@ -204,7 +204,7 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const today = new Date().toISOString().slice(0, 10);
     const { container } = renderMasthead({ kind: "playback", date: today } as never);
-    expect(container.querySelector(".catalog-toggle")?.textContent).toBe(`▣ ${today}`);
+    expect(container.querySelector(".catalog-toggle")?.textContent).toBe(`▣${today}`);
     vi.unstubAllGlobals();
   });
 
@@ -386,7 +386,7 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
       "2026-08-07",
     );
     const toggle = container.querySelector(".catalog-toggle")!;
-    expect(toggle.textContent).toBe("▣ review-1785400940-136e76");
+    expect(toggle.textContent).toBe("▣review-1785400940-136e76");
     expect(toggle.querySelector(".masthead__pilldot.live")).toBeNull();
     expect(toggle.querySelector(".masthead__pilldot.stale")).toBeNull();
     expect(toggle.querySelector(".masthead__pilldot--replay")?.textContent).toBe("▣");
@@ -410,7 +410,7 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
   it("(d) date replay: the pill shows the date and the replay glyph", () => {
     const { container } = renderMasthead({ kind: "playback", date: "2026-08-07" } as Route);
     const toggle = container.querySelector(".catalog-toggle")!;
-    expect(toggle.textContent).toBe("▣ 2026-08-07");
+    expect(toggle.textContent).toBe("▣2026-08-07");
     expect(toggle.querySelector(".masthead__pilldot--replay")?.textContent).toBe("▣");
   });
 

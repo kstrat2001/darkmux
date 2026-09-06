@@ -1131,7 +1131,7 @@ describe("App", () => {
     mockDaemonReplay();
     window.location.hash = "#dispatch=s1";
     renderApp();
-    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("▣ 2026-08-07"));
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("▣2026-08-07"));
     await screen.findByRole("group", { name: "playback transport" });
     expect(document.querySelector("#modebadge")).toBeNull();
   });
@@ -1223,7 +1223,7 @@ describe("App", () => {
     mockDaemonReplay();
     window.location.hash = "#mission=m-one";
     renderApp();
-    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("▣ m-one"));
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("▣m-one"));
     expect(document.querySelector("#modebadge")).toBeNull();
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
