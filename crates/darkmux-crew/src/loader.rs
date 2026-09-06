@@ -52,26 +52,14 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("dialectic-prosecutor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-prosecutor.json"))),
     ("dialectic-defender", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-defender.json"))),
     ("dialectic-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-judge.json"))),
-    // (#1222 Phase B packet 4) Review seats: probe (k-draw, per-bundle
-    // defect-finding) and judge (double-confirm ruling on each surviving
-    // flag). Both mirror dialectic-judge's tool-less, no-output_schema,
-    // bail-with-explanation shape — the review dispatches both through the
-    // container-free single-shot chat primitive, never the agent loop.
-    ("review-probe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe.json"))),
-    // (#1475 packet 2) The three DISTINCT probe roles the role->profile flip
-    // staffs — each shares the FROZEN probe persona (#1256) byte-for-byte with
-    // review-probe (their .md is a verbatim copy); only the role_profiles
-    // binding (and thus model) differs. The crew's recall diversity IS these
-    // three distinct role->profile->model bindings.
-    ("review-probe-high", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-high.json"))),
-    ("review-probe-mid", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-mid.json"))),
-    ("review-probe-low", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-low.json"))),
-    ("review-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-judge.json"))),
-    // (#1260/#1177) Optional fourth review seat: one adjudication call per
-    // double-confirmed finding (in practice staffed by a frontier endpoint).
-    // Same tool-less, no-output_schema, bail-with-explanation shape as
-    // review-judge — dispatched through the single-shot chat primitive.
-    ("review-verify", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-verify.json"))),
+    // (#1222 Phase B packet 4 - #2418) Review seats (probe: k-draw,
+    // per-bundle defect-finding; judge: double-confirm ruling on each
+    // surviving flag) were removed here — they were the review funnel's
+    // own seats, and the funnel itself (`build_review_graph`) was deleted
+    // in #2310 P4d. The shipped `review` config stages its work through
+    // `reviewer`/`coder` instead. `dialectic-judge` remains as the
+    // general-purpose tool-less, no-output_schema, bail-with-explanation
+    // role these seats were modeled on.
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.json"))),
     ("voice-editor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/voice-editor.json"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.json"))),
@@ -130,20 +118,10 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("dialectic-prosecutor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-prosecutor.md"))),
     ("dialectic-defender", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-defender.md"))),
     ("dialectic-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-judge.md"))),
-    // (#1222 Phase B packet 4) Review seat prompts — frozen texts
-    // (see the role JSON descriptions above for provenance).
-    ("review-probe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe.md"))),
-    // (#1475 packet 2) The three probe roles' prompts are byte-identical copies
-    // of review-probe.md (the FROZEN #1256 persona) — probe recall diversity
-    // lives in the role->profile MODEL binding, never in the persona text.
-    ("review-probe-high", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-high.md"))),
-    ("review-probe-mid", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-mid.md"))),
-    ("review-probe-low", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-low.md"))),
-    ("review-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-judge.md"))),
-    // (#1260) The verify seat's persona — frozen text (contract 6): the
-    // byte-lock golden lives beside the other review-seat goldens in
-    // `darkmux-lab`'s review tests (`verify_prompt_matches_frozen_golden`).
-    ("review-verify", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-verify.md"))),
+    // (#1222 Phase B packet 4 - #2418) The review-probe/review-probe-{high,
+    // mid,low}/review-judge/review-verify seat prompts were removed here
+    // along with their role manifests above — the review funnel that
+    // staffed them (`build_review_graph`) was deleted in #2310 P4d.
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
     // (#1698 Packet A) Frozen model-facing text (contract 6) — byte-locked
     // by `radio::tests::radio_router_role_prompt_matches_frozen_golden`.

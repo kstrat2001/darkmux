@@ -1527,11 +1527,11 @@ mod tests {
         let registry = StepKindRegistry::new();
         let mut cfg = doc(vec![phase(
             "p1",
-            vec![task("t1", Some("review-judge"), vec![step("s1", "k")])],
+            vec![task("t1", Some("example-judge"), vec![step("s1", "k")])],
         )]);
         cfg.inputs = vec![
             MissionInput {
-                name: "review-judge".to_string(),
+                name: "example-judge".to_string(),
                 description: None,
                 required: Some(false),
                 default: None,
@@ -1552,8 +1552,8 @@ mod tests {
         let loaded = loaded_doc(cfg);
         let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, Err("n/a"), &[]);
         let text = render_show_text(&show);
-        assert!(text.contains("role overrides: review-judge (optional)"), "got:\n{text}");
-        assert!(!text.contains("    review-judge (optional)\n"), "must not ALSO list it individually:\n{text}");
+        assert!(text.contains("role overrides: example-judge (optional)"), "got:\n{text}");
+        assert!(!text.contains("    example-judge (optional)\n"), "must not ALSO list it individually:\n{text}");
         assert!(text.contains("diff_file (required)"), "an unrelated required input must render normally:\n{text}");
     }
 
@@ -1590,8 +1590,8 @@ mod tests {
 
     #[test]
     fn param_parsing_accepts_role_equals_profile() {
-        let map = parse_role_overrides(&["review-judge=review-mid".to_string()]).unwrap();
-        assert_eq!(map.get("review-judge"), Some(&"review-mid".to_string()));
+        let map = parse_role_overrides(&["example-judge=review-mid".to_string()]).unwrap();
+        assert_eq!(map.get("example-judge"), Some(&"review-mid".to_string()));
     }
 
     // ── binding precedence (merge-gate CONSIDER 4) ─────────────────────

@@ -376,7 +376,7 @@ mod tests {
     fn member_record_serializes_with_the_pre_move_shape() {
         let local = MemberRecord {
             model: "darkmux:probe-a".into(),
-            seat: "review-probe".into(),
+            seat: "example-probe".into(),
             draws: 2,
             wall_ms: 1500,
             total_tokens: 4200,
@@ -386,7 +386,7 @@ mod tests {
             serde_json::to_value(&local).unwrap(),
             serde_json::json!({
                 "model": "darkmux:probe-a",
-                "seat": "review-probe",
+                "seat": "example-probe",
                 "draws": 2,
                 "wall_ms": 1500,
                 "total_tokens": 4200
@@ -396,7 +396,7 @@ mod tests {
 
         let remote = MemberRecord {
             model: "gpt-4o".into(),
-            seat: "review-judge".into(),
+            seat: "example-judge".into(),
             remote: true,
             endpoint: Some("myorg.cognitiveservices.azure.com".into()),
             served_model: Some("gpt-4o-2024-08-06".into()),
@@ -406,7 +406,7 @@ mod tests {
             serde_json::to_value(&remote).unwrap(),
             serde_json::json!({
                 "model": "gpt-4o",
-                "seat": "review-judge",
+                "seat": "example-judge",
                 "draws": 0,
                 "wall_ms": 0,
                 "total_tokens": 0,
@@ -615,7 +615,7 @@ mod tests {
     /// needs its own full case matrix.
     #[test]
     fn staffing_snapshot_strips_endpoint_userinfo_too() {
-        let judge = staffing_remote("review-judge", "https://tok@proxy.example.com/v1");
+        let judge = staffing_remote("example-judge", "https://tok@proxy.example.com/v1");
 
         let snap = staffing_snapshot(&[], &judge, None, false);
 
@@ -638,8 +638,8 @@ mod tests {
     /// present — restored before committing.
     #[test]
     fn staffing_snapshot_serializes_with_the_pre_move_shape() {
-        let probes = vec![staffing("review-probe-high", "probe-model", 1)];
-        let judge = staffing("review-judge", "judge-model", 1);
+        let probes = vec![staffing("example-probe-high", "probe-model", 1)];
+        let judge = staffing("example-judge", "judge-model", 1);
 
         let snap = staffing_snapshot(&probes, &judge, None, false);
 
@@ -647,16 +647,16 @@ mod tests {
             serde_json::to_value(&snap).unwrap(),
             serde_json::json!({
                 "probes": [{
-                    "name": "review-probe-high",
-                    "role_id": "review-review-probe-high",
+                    "name": "example-probe-high",
+                    "role_id": "review-example-probe-high",
                     "model": seat_identifier(&probes[0].pm),
                     "k": 1,
                     "passes": 2,
                     "n_ctx": 32000
                 }],
                 "judge": {
-                    "name": "review-judge",
-                    "role_id": "review-review-judge",
+                    "name": "example-judge",
+                    "role_id": "review-example-judge",
                     "model": seat_identifier(&judge.pm),
                     "k": 1,
                     "passes": 2,
@@ -672,15 +672,15 @@ mod tests {
     /// complement of the test above.
     #[test]
     fn staffing_snapshot_with_verify_and_request_changes_serializes_both() {
-        let probes = vec![staffing("review-probe-high", "probe-model", 1)];
-        let judge = staffing("review-judge", "judge-model", 1);
-        let verify = staffing("review-verify", "verify-model", 1);
+        let probes = vec![staffing("example-probe-high", "probe-model", 1)];
+        let judge = staffing("example-judge", "judge-model", 1);
+        let verify = staffing("example-verify", "verify-model", 1);
 
         let snap = staffing_snapshot(&probes, &judge, Some(&verify), true);
 
         let value = serde_json::to_value(&snap).unwrap();
         assert_eq!(value["request_changes"], serde_json::json!(true));
-        assert_eq!(value["verify"]["name"], serde_json::json!("review-verify"));
+        assert_eq!(value["verify"]["name"], serde_json::json!("example-verify"));
         assert_eq!(value["verify"]["model"], serde_json::json!(seat_identifier(&verify.pm)));
     }
 }

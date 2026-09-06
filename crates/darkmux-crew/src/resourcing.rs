@@ -100,10 +100,11 @@ pub struct ResolvedSeatStaffing {
     pub role_id: Option<String>,
     pub pm: ProfileModel,
     /// Historically the probe-seat draw BREADTH (a union over multiple
-    /// dispatches of the same role). (#1512) `build_review_graph` no longer
-    /// multiplies a probe role's task by `k` — one role is one task is one
-    /// dispatch; recall breadth is now a review.json edit (declare another
-    /// probe role), never a per-run draw multiplier. The field survives for
+    /// dispatches of the same role). (#1512) The since-deleted
+    /// `build_review_graph` (#2310 P4d) stopped multiplying a probe role's
+    /// task by `k` — one role is one task is one dispatch; recall breadth
+    /// is a `review.json` edit (declare another probe role), never a
+    /// per-run draw multiplier. The field survives for
     /// back-compat (envelope staffing snapshots, `review-bench --k`
     /// reporting) and is always `1` for every seat this module resolves.
     /// Ignored by the judge/verify seats regardless.

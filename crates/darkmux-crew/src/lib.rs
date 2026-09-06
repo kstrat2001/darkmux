@@ -71,7 +71,11 @@ pub mod mods;
 // built-in transcriptions of `build_review_graph`/`default_phase_graph`'s
 // former hand-built graphs. Packet 3 added `mission_config::interpret`,
 // which those two functions (`darkmux-lab::lab::review`, `src/coder_phase.rs`)
-// now call as thin launchers — the configs ARE the executable graphs.
+// called as thin launchers for a while — the configs ARE the executable
+// graphs. Both functions are gone now: `build_review_graph` was deleted
+// along with the review funnel (#2310 P4d), and `default_phase_graph` was
+// retired the same way once coder-phase's own launch went fully
+// config-driven; `mission_config::interpret` is the only path left.
 pub mod mission_config;
 // (#1877 first extraction) The shared remote-token-bucket type — the
 // promotion of what was two hand-copied buckets (`step_kinds::MapRemoteBucket`

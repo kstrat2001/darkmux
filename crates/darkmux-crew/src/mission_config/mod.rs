@@ -5,14 +5,20 @@
 //! step naming a REGISTERED step-kind id (`step_kinds::StepKind::id()`)
 //! plus a kind-specific `config` object. [`interpret`] (#1284 Packet 3)
 //! turns a resolved config into the executable `Vec<Task>`/`BTreeMap<String,
-//! Step>` shape `darkmux-crew`'s `scheduler::run_step_graph` consumes — the
-//! SAME shape `build_review_graph` (`darkmux-lab`'s `lab::review`) and
-//! `default_phase_graph` (the `darkmux` binary's `coder_phase.rs`) used to
-//! build BY HAND, one Rust function per mission type, before Packet 3 cut
-//! both over to load their config through this module and call
-//! [`interpret`] instead. Packet 1 built the schema, the loader, the
-//! built-in transcriptions of those two graphs, and the `darkmux doctor`
-//! surface. Packet 3 added [`interpret`] itself (schema 1.0 → 1.1, additive
+//! Step>` shape `darkmux-crew`'s `scheduler::run_step_graph` consumes.
+//! Before Packet 3, two hand-written Rust functions built that same shape
+//! directly, one per mission type: `build_review_graph` (`darkmux-lab`'s
+//! `lab::review`) and `default_phase_graph` (the `darkmux` binary's
+//! `coder_phase.rs`). Packet 3 cut both over to load their mission as a
+//! config through this module and call [`interpret`] instead. Packet 1
+//! built the schema, the loader, the built-in transcriptions of those two
+//! graphs, and the `darkmux doctor` surface. Neither hand-written builder
+//! survived long past the cutover: `build_review_graph` was deleted
+//! entirely along with the review funnel (#2310 P4d), and
+//! `default_phase_graph` was retired the same way once coder-phase's own
+//! launch went fully config-driven — [`interpret`] is now the only path any
+//! mission config takes to become a graph. Packet 3 added [`interpret`]
+//! itself (schema 1.0 → 1.1, additive
 //! per contract 5) plus, at the time, a typed expansion primitive that
 //! replaced review.json's original `expands_per_staffed_seat` placeholder
 //! bool — retired in schema 2.0 (#1550 cluster item 2; a MAJOR bump — see
@@ -531,9 +537,11 @@ pub struct MissionInput {
 }
 
 /// One phase, as data. `id` is a SUFFIX — the launcher composes the real
-/// `Phase.id` (e.g. `<mission-id>-<suffix>`), matching
-/// `build_review_graph`'s caller-supplied `investigate_phase_id`-style
-/// convention. **A phase with zero tasks is valid by design** — it
+/// `Phase.id` (e.g. `<mission-id>-<suffix>`), a convention this format
+/// inherited from the review pipeline's now-deleted `build_review_graph`
+/// (#2310 P4d), which took its own phase id as a caller-supplied
+/// `investigate_phase_id`-style parameter and composed the real id the
+/// same way. **A phase with zero tasks is valid by design** — it
 /// expresses a manual/freeform phase (operator-driven transitions, no
 /// automated Task/Step graph underneath): a duration-container phase
 /// ("wait for the trip") or a blog-post phase ("draft by hand, no
@@ -569,30 +577,34 @@ pub struct PhaseConfig {
 /// unit: role/profile/workdir/image fixed for the task's whole duration,
 /// `depends_on` the only cross-task dependency/concurrency declaration).
 /// `id` and `depends_on` entries are DOCUMENT-WIDE (not phase-scoped) —
-/// `depends_on` may name a task in an EARLIER phase, exactly as
-/// `build_review_graph`'s `report` phase's `synthesis` task depends on the
-/// `investigate` phase's `dedup` task. `profile_name`/`workdir`/`image` are
+/// `depends_on` may name a task in an EARLIER phase, exactly as the shipped
+/// `review` config's `create-mods` phase's `create-mod` task depends on the
+/// earlier `summarize` phase's `summary` task. `profile_name`/`workdir`/`image` are
 /// deliberately NOT fields here (unlike the real `Task`) — those are
 /// genuinely per-launch values (a worktree path, an image override) that
 /// belong in [`MissionConfig::inputs`], not the static document; see the
 /// packet report for how the two built-in configs use `role_id` as an
 /// overridable default and push workdir/image to `inputs` entirely.
 ///
-/// **Placeholder-prefix rule (task AND step ids).** When the Rust builder a
-/// config transcribes composes its `Task`/`Step` ids from a caller-supplied
-/// phase id (`default_phase_graph`'s `format!("{phase_id}-worktree")` /
-/// `-coder` / `-verify`, steps appending `-step`), the config writes those
-/// ids with the owning [`PhaseConfig::id`] as a LITERAL prefix — that
-/// literal prefix stands in for the real phase id: at launch (#1284
-/// Packet 3), the launcher substitutes its composed phase id for the
-/// phase-config id wherever it prefixes a task/step id, so the persisted
-/// ids match what the Rust builder produces today byte for byte (task ids
-/// surface in `mission status`, the viewer, and lifecycle records — a
-/// silent id-scheme change at cutover is exactly what this rule prevents).
-/// A config whose builder uses FIXED ids (`build_review_graph`'s
-/// `review-bundle-task` etc.) writes them verbatim — no substitution. Each
-/// built-in config names which convention it uses in its own top-level
-/// `description`.
+/// **Placeholder-prefix rule (task AND step ids).** A config MAY compose its
+/// `Task`/`Step` ids from its own [`PhaseConfig::id`] as a literal prefix
+/// (the shipped `coder-phase` config's `build` phase does this: `build-worktree`
+/// / `build-coder` / `build-verify` tasks, `-step`-suffixed step ids) — that
+/// literal prefix stands in for the real phase id: at launch (#1284 Packet
+/// 3), the launcher substitutes its composed phase id for the phase-config
+/// id wherever it prefixes a task/step id (task ids surface in `mission
+/// status`, the viewer, and lifecycle records, so a silent id-scheme change
+/// at launch time would be visible everywhere). This traces back to how the
+/// pre-Packet-3 Rust builders composed their own ids by hand
+/// (`default_phase_graph`'s `format!("{phase_id}-worktree")` etc., before
+/// either builder was retired — see the module doc above); the rule survives
+/// them because `coder-phase.json` still uses the same phase-prefixed
+/// convention today. A config whose ids are FIXED instead — never
+/// phase-prefixed, e.g. the shipped `review` config's `deliver-step` (the
+/// convention `build_review_graph`'s `review-bundle-task` and friends
+/// originally used, before that launcher was deleted, #2310 P4d) — writes
+/// them verbatim, no substitution. Each built-in config names which
+/// convention it uses in its own top-level `description`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskConfig {
     pub id: String,
@@ -862,8 +874,10 @@ impl MissionConfig {
     /// `StepKindRegistry::with_builtins().ids()`). A step whose `kind`
     /// isn't in it produces a `Warning`, NEVER an `Error`: Tier 3 kinds
     /// (#1352) register into their OWN per-mission registry at
-    /// COMPOSITION time (`build_review_graph`, `default_phase_graph`),
-    /// which no document-level check can see — an "unknown" kind here may
+    /// COMPOSITION time (`src/mission_launch.rs`'s `register_coder_phase_kinds`
+    /// is the live example today; the review pipeline's own composition-time
+    /// registration in `build_review_graph` was deleted along with it, #2310
+    /// P4d), which no document-level check can see — an "unknown" kind here may
     /// simply be a Tier 3 id this call site's registry doesn't carry, not
     /// a real mistake. Pass `&[]` to skip the kind-reference check
     /// entirely (an empty universe is treated as "unverifiable", not
@@ -2056,9 +2070,10 @@ mod tests {
 
     #[test]
     fn cross_phase_depends_on_resolves_cleanly() {
-        // A later phase's task depending on an earlier phase's task is
-        // exactly `build_review_graph`'s synthesis→dedup shape — must NOT
-        // be flagged as dangling.
+        // A later phase's task depending on an earlier phase's task — the
+        // shape the shipped `review` config's `create-mod` task (phase
+        // `create-mods`) uses to depend on the earlier `summarize` phase's
+        // `summary` task — must NOT be flagged as dangling.
         let cfg = doc(vec![
             phase("p1", vec![task("t1", &[], vec![step("s1", "dispatch.internal")])]),
             phase("p2", vec![task("t2", &["t1"], vec![step("s2", "dispatch.internal")])]),
@@ -2560,9 +2575,11 @@ mod tests {
         let phase = &cfg.phases[0];
         assert_eq!(phase.id, "build");
 
-        // Task ids match `default_phase_graph`'s exact construction
+        // Task ids match the shipped `coder-phase.json` config's own ids
         // (`{phase_id}-worktree` / `-coder` / `-verify` — NO `-task`
-        // suffix), with the literal `build-` prefix standing in for the
+        // suffix, inherited from the pre-Packet-3 Rust builder
+        // `default_phase_graph`'s identical construction, since retired),
+        // with the literal `build-` prefix standing in for the
         // launcher-composed phase id per the placeholder-prefix rule (see
         // `TaskConfig`'s doc). #1284 review round 1 caught the original
         // `-task`-suffixed divergence — persisted Task.ids surface in

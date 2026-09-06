@@ -760,10 +760,12 @@ where
 /// actually started (`started_ts.is_some()` at the call site).
 ///
 /// `fold_step_finals`'s correlation keys (`step_id`/`session_id`/`handle` —
-/// `step_for_record`) are exact string matches, but the review pipeline's
-/// step ids are literal constants reused by EVERY review mission instance
-/// (`"review-verify-step"` names the verify step on every review run, not
-/// just this one), and the backfill's day-file window has no upper bound.
+/// `step_for_record`) are exact string matches, but the shipped `review`
+/// config's own step ids are literal constants reused by EVERY review
+/// mission instance (`"deliver-step"` names the deliver step on every
+/// review run, not just this one — same FIXED-id convention the retired
+/// review funnel's `"review-verify-step"` used before it, #2310 P4d), and
+/// the backfill's day-file window has no upper bound.
 /// So a match found by `fold_step_finals` can legitimately belong to an
 /// unrelated, earlier mission that ran the same-named step for real — a
 /// not-yet-started step in THIS mission cannot have produced any of those
@@ -1090,9 +1092,10 @@ pub fn build_mission_graph(
                     // backfilled finalized totals — but ONLY to a step that
                     // has actually STARTED. The fold's correlation keys
                     // (`step_id`/`session_id`/`handle` — see
-                    // `step_for_record`) are the review pipeline's literal,
-                    // NON-mission-scoped step ids ("review-verify-step" is
-                    // the same string on every review mission instance), and
+                    // `step_for_record`) are the shipped `review` config's
+                    // own literal, NON-mission-scoped step ids
+                    // ("deliver-step" is the same string on every review
+                    // mission instance), and
                     // the backfill's day-file window has no upper bound —
                     // so an EARLIER, unrelated mission's real completed
                     // dispatch on the same literal step id can fold onto
@@ -1279,15 +1282,15 @@ mod tests {
 
     #[test]
     fn fold_finals_step_result_record_folds_total_tokens() {
-        let step_ids = ids(&["review-judge-step"]);
+        let step_ids = ids(&["example-judge-step"]);
         let rec = serde_json::json!({
             "action": "step result",
-            "payload": { "step_id": "review-judge-step", "total_tokens": 4200 }
+            "payload": { "step_id": "example-judge-step", "total_tokens": 4200 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
-        assert_eq!(out["review-judge-step"].tokens, Some(4200));
-        assert_eq!(out["review-judge-step"].turns, None);
-        assert!(!out["review-judge-step"].cloud);
+        assert_eq!(out["example-judge-step"].tokens, Some(4200));
+        assert_eq!(out["example-judge-step"].turns, None);
+        assert!(!out["example-judge-step"].cloud);
     }
 
     /// (#1877, final wiring step, schema leniency) `darkmux-crew::
@@ -1354,7 +1357,7 @@ mod tests {
         // without the gate a reload of A's page folds B's totals into A's
         // meter forever. All three correlation keys are exercised because the
         // gate must fire BEFORE any key matching, not inside one branch.
-        let step_ids = ids(&["review-judge-step"]);
+        let step_ids = ids(&["example-judge-step"]);
         let foreign = |extra: serde_json::Value| {
             let mut rec = serde_json::json!({
                 "action": "step result",
@@ -1365,9 +1368,9 @@ mod tests {
             rec
         };
         let recs = vec![
-            foreign(serde_json::json!({ "payload": { "step_id": "review-judge-step", "total_tokens": 4200 } })),
-            foreign(serde_json::json!({ "session_id": "step-review-judge-step" })),
-            foreign(serde_json::json!({ "handle": "review-judge-step" })),
+            foreign(serde_json::json!({ "payload": { "step_id": "example-judge-step", "total_tokens": 4200 } })),
+            foreign(serde_json::json!({ "session_id": "step-example-judge-step" })),
+            foreign(serde_json::json!({ "handle": "example-judge-step" })),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
         assert!(
@@ -1465,13 +1468,13 @@ mod tests {
     /// id must keep matching `step_ids`, which is what this pins).
     #[test]
     fn fold_finals_review_vocabulary_tokens_payload_folds() {
-        let step_ids = ids(&["review-judge-step"]);
+        let step_ids = ids(&["example-judge-step"]);
         let rec = serde_json::json!({
             "action": "step result",
-            "payload": { "step_id": "review-judge-step", "kind": "dispatch.map", "tokens": 4200 }
+            "payload": { "step_id": "example-judge-step", "kind": "dispatch.map", "tokens": 4200 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
-        assert_eq!(out["review-judge-step"].tokens, Some(4200), "a `tokens` payload folds");
+        assert_eq!(out["example-judge-step"].tokens, Some(4200), "a `tokens` payload folds");
     }
 
     /// (#1445 gate should-fix) `total_tokens` wins when both keys are

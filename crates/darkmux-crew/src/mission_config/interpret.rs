@@ -3,9 +3,16 @@
 //!
 //! [`interpret`] turns a parsed [`super::MissionConfig`] plus launch-time
 //! [`LaunchParams`] into the `Vec<Task>` + `BTreeMap<String, Step>` shape
-//! `darkmux-crew`'s `scheduler::run_step_graph` consumes — the SAME shape
-//! `build_review_graph` (`darkmux-lab::lab::review`) and `default_phase_graph`
-//! (`src/coder_phase.rs`) used to build by hand. This module owns exactly
+//! `darkmux-crew`'s `scheduler::run_step_graph` consumes. Before Packet 3,
+//! two hand-written Rust functions built that same shape directly, one per
+//! mission type: `build_review_graph` (`darkmux-lab::lab::review`, since
+//! deleted along with the review funnel — #2310 P4d) and
+//! `default_phase_graph` (`src/coder_phase.rs`, since retired the same way
+//! once coder-phase's own launch went fully config-driven). Both cut over
+//! to load their mission as a config through this module and call
+//! [`interpret`] instead, and neither hand-written builder exists anymore —
+//! every mission config today, `coder-phase` and `review` included, becomes
+//! a graph through this one interpreter. This module owns exactly
 //! two things, and only these two (per the packet's own scope — Tier 3
 //! `StepKind` construction/registration stays mission-owned, #1352):
 //!
@@ -17,8 +24,9 @@
 //! template expands into N real Task/Step copies, one per launcher-supplied
 //! collection item" primitive (`ExpansionSpec`/`expand`/`LaunchParams::
 //! expansions`) — lived here from Packet 3 (schema 1.1) through #1512's
-//! review dissolution, then retired here: BOTH production launchers
-//! (`build_review_graph` and `src/mission_launch.rs`) always constructed
+//! review dissolution, then retired here: at the time, BOTH production
+//! launchers — `build_review_graph` (since deleted, #2310 P4d) and
+//! today's generic `src/mission_launch.rs` — always constructed
 //! `LaunchParams` with an empty `expansions` map, so a document declaring
 //! `expand` interpreted to ZERO real copies on every real run — fully
 //! specified, fully interpreted, never actually fed. #1512's dissolution is
@@ -36,8 +44,10 @@
 //! DOES at runtime — a launcher calls [`interpret`], gets back real
 //! `Task`/`Step` values, and separately registers its own Tier 3 kinds
 //! against the SAME kind ids [`interpret`] produced (see
-//! `darkmux_lab::lab::review::build_review_graph` and `coder_phase.rs`'s
-//! `default_phase_graph` for the two production launchers).
+//! `src/mission_launch.rs`'s `register_coder_phase_kinds` for the still-live
+//! example; the review pipeline's own composition-time registrations in
+//! `darkmux_lab::lab::review::build_review_graph` were deleted along with
+//! it, #2310 P4d).
 //!
 //! [`interpret`] assumes the config is well-formed (document-wide-unique
 //! ids, no dangling `depends_on`) — the SAME assumption every other
@@ -414,8 +424,9 @@ fn substitute_phase_id(doc_phase_id: &str, params: &LaunchParams) -> String {
 /// The placeholder-prefix rule (`TaskConfig`'s doc in `mod.rs`): if `id` is
 /// literally prefixed by `"<doc_phase_id>-"`, replace that PREFIX with
 /// `"<real_phase_id>-"`, keeping everything after it unchanged. An id with
-/// no such prefix (the FIXED-id convention, e.g. `build_review_graph`'s
-/// `review-bundle-task`) passes through verbatim. Requires the literal `-`
+/// no such prefix (the FIXED-id convention — e.g. the shipped `review`
+/// config's `deliver-step`, which names no phase-prefix placeholder)
+/// passes through verbatim. Requires the literal `-`
 /// separator (not just any shared prefix) so a phase id like `"build"`
 /// doesn't accidentally match an unrelated id like `"buildup-task"`.
 fn substitute_id(id: &str, doc_phase_id: &str, real_phase_id: &str) -> String {
@@ -751,8 +762,10 @@ mod tests {
 
     #[test]
     fn cross_phase_depends_on_resolves_across_phases() {
-        // Mirrors `build_review_graph`'s synthesis -> dedup (investigate) +
-        // verify (report) cross-phase edge.
+        // A later phase's task depending on an earlier phase's task — e.g.
+        // a "report" phase's synthesis task depending on an "investigate"
+        // phase's dedup task, the shape the review pipeline's now-deleted
+        // `build_review_graph` (#2310 P4d) once built by hand.
         let cfg = doc(vec![
             phase(
                 "investigate",
