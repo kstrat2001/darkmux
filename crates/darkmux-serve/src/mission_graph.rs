@@ -713,7 +713,11 @@ where
         let action = rec.get("action").and_then(|a| a.as_str()).unwrap_or("");
         let payload = rec.get("payload");
         let endpoint = payload.and_then(|p| p.get("endpoint")).map(|v| !v.is_null()).unwrap_or(false);
-        let is_complete = action == "dispatch complete" || action == "dispatch.complete";
+        // (silent-miss audit, 2026-09-06) Was a hand-spelled literal pair —
+        // exactly the drift risk `darkmux_flow::is_dispatch_complete`
+        // exists to close off; see `runs.rs`'s `is_dispatch_lifecycle_
+        // action`/`terminal_status_for_action` for the sibling fix.
+        let is_complete = darkmux_flow::is_dispatch_complete(action);
         let is_step_result = action == "step result";
         if !endpoint && !is_complete && !is_step_result {
             continue;

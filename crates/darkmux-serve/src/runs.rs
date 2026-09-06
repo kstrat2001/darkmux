@@ -1595,19 +1595,29 @@ fn is_dispatch_start_action(action: &str) -> bool {
 }
 
 fn is_dispatch_lifecycle_action(action: &str) -> bool {
-    is_dispatch_start_action(action)
-        || action == "dispatch complete"
-        || action == "dispatch.complete"
-        || action == "dispatch error"
-        || action == "dispatch.error"
+    // (silent-miss audit, 2026-09-06) Was four hand-spelled literal
+    // comparisons alongside the start check — every one a spot that could
+    // silently drift from `darkmux-flow`'s own bookend vocabulary (see
+    // `CLAUDE.md`'s "Dispatch liveness" contract), the same drift risk
+    // `mission_graph.rs`'s `is_complete` line already had before this
+    // audit. `is_dispatch_terminal` already covers BOTH spellings of
+    // BOTH complete and error.
+    is_dispatch_start_action(action) || darkmux_flow::is_dispatch_terminal(action)
 }
 
 /// The `RunStatus` a session's TERMINAL flow action implies — `None` for
 /// any non-terminal action (turns, tools, telemetry, the start itself).
 fn terminal_status_for_action(action: &str) -> Option<RunStatus> {
+    // (silent-miss audit, 2026-09-06) Hand-spelled literals replaced with
+    // the shared `darkmux_flow` matchers — see `is_dispatch_lifecycle_
+    // action`'s own comment just above.
+    if darkmux_flow::is_dispatch_complete(action) {
+        return Some(RunStatus::Complete);
+    }
+    if darkmux_flow::is_dispatch_error(action) {
+        return Some(RunStatus::Error);
+    }
     match action {
-        "dispatch complete" | "dispatch.complete" => Some(RunStatus::Complete),
-        "dispatch error" | "dispatch.error" => Some(RunStatus::Error),
         // The presence reconciler's crash/kill/timeout close-edge — a
         // session whose heartbeat disappeared with no clean dispatch
         // terminal ever landing (`presence_reconciler.rs`'s own doc).
@@ -1925,6 +1935,205 @@ mod tests {
     use darkmux_crew::types::{MissionSpec, NodeStatus, PhaseStatus};
     use std::io::Write;
     use tempfile::TempDir;
+
+    // ── literal-bookend tripwire (silent-miss audit, 2026-09-06) ────────
+
+    /// Strips every `#[cfg(test)]`-gated item out of `src` before the
+    /// tripwire below scans for hand-spelled bookend literals — test
+    /// fixtures legitimately construct raw JSON records naming BOTH
+    /// spellings on purpose (that is the whole point of a dual-spelling
+    /// fixture), and those must not trip a check aimed at PRODUCTION code
+    /// re-inventing `darkmux_flow`'s matchers. From the line AFTER each
+    /// `#[cfg(test)]` attribute, brace-depth-tracks forward through the
+    /// item it gates and drops every line up to and including whichever
+    /// closes first: the matching close brace (`mod tests { ... }`, a
+    /// `fn ... { ... }`), OR — round-2 audit, 2026-09-06, C2 — a BARE
+    /// `;`-terminated item with no braces at all (`mod wire_fixtures;`,
+    /// a `#[path = "..."] mod tests;` pair). Before this fix, a
+    /// brace-less gated item made the scan keep hunting forward for the
+    /// NEXT `{` in the file — which is ordinary PRODUCTION code's own
+    /// brace, not this item's — silently swallowing every line in
+    /// between out of the scan. `lib.rs`'s own `#[cfg(test)] mod
+    /// wire_fixtures;` (no body — the module lives in a separate file)
+    /// hit exactly this: the stripper used to hunt past it for the next
+    /// `{`, dropping a real stretch of production code from the
+    /// tripwire's coverage with nothing ever reporting it missing.
+    fn strip_cfg_test_regions(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim_start().starts_with("#[cfg(test)]") {
+                let mut depth: i32 = 0;
+                let mut opened = false;
+                // Scanning starts at the line AFTER the attribute itself
+                // — the attribute line can never open a brace or end the
+                // item, and starting here (rather than at `i`) is what
+                // lets a lone semicolon on the very next line close a
+                // brace-less item without first needing a `{` anywhere.
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let line = lines[j];
+                    for ch in line.chars() {
+                        match ch {
+                            '{' => {
+                                depth += 1;
+                                opened = true;
+                            }
+                            '}' => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    // A line that never opened a brace and ends the
+                    // statement with `;` is a COMPLETE bare item on its
+                    // own — `mod wire_fixtures;`, or (when this is the
+                    // line right after a stacked `#[path = "..."]`
+                    // attribute) `mod tests;`. Stop right there instead
+                    // of continuing to hunt for a `{` that may be pages
+                    // away, in code this item has nothing to do with.
+                    let bare_semicolon_close = !opened && line.trim_end().ends_with(';');
+                    j += 1;
+                    if opened && depth <= 0 {
+                        break;
+                    }
+                    if bare_semicolon_close {
+                        break;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+        }
+        out
+    }
+
+    /// (round-2 audit, 2026-09-06 — C2) A brace-less `#[cfg(test)] mod x;`
+    /// item — `lib.rs`'s real `#[cfg(test)] mod wire_fixtures;` shape —
+    /// must strip ONLY itself, never hunt forward for the next `{`
+    /// (which belongs to unrelated PRODUCTION code and would get
+    /// silently swallowed along with it). Red-proved by reverting the
+    /// scan-start back to `let mut j = i;` and dropping the
+    /// `bare_semicolon_close` check (the pre-fix behavior): this test
+    /// then fails because `"dispatch complete"` inside `fn after()`
+    /// disappears from the stripped output along with everything between
+    /// the two lines.
+    #[test]
+    fn strip_cfg_test_regions_stops_at_a_bare_semicolon_not_the_next_brace() {
+        let src = "#[cfg(test)]\nmod wire_fixtures;\n\nfn after() {\n    let x = \"dispatch complete\";\n}\n";
+        let stripped = strip_cfg_test_regions(src);
+        assert!(!stripped.contains("wire_fixtures"), "the gated bare item itself must be stripped: {stripped:?}");
+        assert!(
+            stripped.contains("dispatch complete"),
+            "production code AFTER the bare `;`-terminated gated item must survive stripping, \
+             not be swallowed while hunting for a distant unrelated `{{`: {stripped:?}"
+        );
+    }
+
+    /// The stacked-attribute form (`#[cfg(test)]` immediately followed by
+    /// another attribute, THEN the bare `;`-terminated item) — `lib.rs`'s
+    /// real `#[cfg(test)] #[path = "lib_tests.rs"] mod tests;` shape.
+    #[test]
+    fn strip_cfg_test_regions_handles_a_stacked_attribute_before_the_bare_semicolon() {
+        let src = "#[cfg(test)]\n#[path = \"lib_tests.rs\"]\nmod tests;\n\nfn after() {\n    let x = \"dispatch start\";\n}\n";
+        let stripped = strip_cfg_test_regions(src);
+        assert!(!stripped.contains("lib_tests.rs"), "{stripped:?}");
+        assert!(!stripped.contains("mod tests;"), "{stripped:?}");
+        assert!(
+            stripped.contains("dispatch start"),
+            "production code after the stacked-attribute bare item must survive: {stripped:?}"
+        );
+    }
+
+    /// The ORIGINAL brace-block form must keep working unchanged — a
+    /// `#[cfg(test)] mod tests { ... }` body (including a nested literal
+    /// that legitimately names both spellings on purpose) is stripped in
+    /// full, and code after its closing brace survives.
+    #[test]
+    fn strip_cfg_test_regions_still_strips_a_full_brace_delimited_mod() {
+        let src = "#[cfg(test)]\nmod tests {\n    fn t() {\n        let x = \"dispatch complete\";\n    }\n}\n\nfn after() {\n    let y = \"dispatch start\";\n}\n";
+        let stripped = strip_cfg_test_regions(src);
+        assert!(!stripped.contains("\"dispatch complete\""), "the test-gated body must be gone: {stripped:?}");
+        assert!(
+            stripped.contains("\"dispatch start\""),
+            "code after the closing brace must survive: {stripped:?}"
+        );
+    }
+
+    /// (silent-miss audit, 2026-09-06) `darkmux-flow`'s `is_dispatch_start`/
+    /// `is_dispatch_complete`/`is_dispatch_error`/`is_dispatch_terminal`
+    /// exist EXACTLY because a hand-spelled `action == "dispatch complete"
+    /// || action == "dispatch.complete"` silently stops matching the
+    /// instant either spelling drifts (a schema rename, a third spelling
+    /// added upstream) with no error anywhere — `mission_graph.rs`'s
+    /// `is_complete` line and two spots in this file (`runs.rs`'s
+    /// `is_dispatch_lifecycle_action`/`terminal_status_for_action`) had
+    /// exactly this shape until this audit fixed them. This test pins
+    /// that fix by scanning every non-test `.rs` file in this crate's
+    /// `src/` for the QUOTED LITERAL ANYWHERE in non-test source —
+    /// comments included, deliberately not restricted to executable code
+    /// — and failing on any (round-2 audit, 2026-09-06, C1: a re-spelled
+    /// literal sitting in a comment is just as much a drift risk as one
+    /// in a live `==` comparison — someone copies the comment's example
+    /// into new code next).
+    ///
+    /// Six literals: three bookends (start/complete/error) × two
+    /// spellings each (round-2 audit, 2026-09-06, M2 — the original list
+    /// omitted `"dispatch error"`/`"dispatch.error"`, so restoring a
+    /// hand-spelled error-bookend comparison stayed green here).
+    ///
+    /// Deliberately non-recursive (`src/` has no subdirectories today) and
+    /// deliberately excludes `lib_tests.rs` and `wire_fixtures.rs` by name
+    /// — both are ENTIRELY `#[cfg(test)]`-gated from their very first item
+    /// (verified: `lib.rs`'s `#[cfg(test)] #[path = "lib_tests.rs"] mod
+    /// tests;`, `wire_fixtures.rs`'s own leading `#[cfg(test)] mod tests`),
+    /// so `strip_cfg_test_regions` alone already empties them — named here
+    /// too so the intent doesn't rely solely on the stripper being
+    /// correct.
+    #[test]
+    fn no_hand_spelled_dispatch_bookend_literals_outside_flow_helpers() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let literals = [
+            "\"dispatch complete\"",
+            "\"dispatch.complete\"",
+            "\"dispatch start\"",
+            "\"dispatch.start\"",
+            "\"dispatch error\"",
+            "\"dispatch.error\"",
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("reading darkmux-serve's own src dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name == "lib_tests.rs" || name == "wire_fixtures.rs" {
+                continue; // entirely test-gated — see this test's own doc.
+            }
+            let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            let production_only = strip_cfg_test_regions(&raw);
+            for (lineno, line) in production_only.lines().enumerate() {
+                for lit in literals {
+                    if line.contains(lit) {
+                        offenders.push(format!("{}:{}: {}", path.display(), lineno + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "quoted dispatch-bookend literal found ANYWHERE in non-test source (comments \
+             included) outside `darkmux_flow`'s matchers — use `is_dispatch_start`/\
+             `is_dispatch_complete`/`is_dispatch_error`/`is_dispatch_terminal` instead, or, if \
+             this really is prose naming the literal spelling on purpose, keep it out of a \
+             quoted string:\n{}",
+            offenders.join("\n")
+        );
+    }
 
     // ── parse_flow_ts / civil calendar round-trip ───────────────────────
 

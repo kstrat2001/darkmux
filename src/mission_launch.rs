@@ -502,11 +502,22 @@ pub fn launch(
         }
     }
 
-    // (#1284 review round 1, consider 2) A supplied input the config never
-    // declared still shapes the derived instance id below — so a TYPO'D key
-    // wouldn't just be ignored, it would silently derive a DIFFERENT
-    // instance. Warn loudly; don't block (a config author may deliberately
-    // accept undeclared pass-through values).
+    // (#1284 review round 1, consider 2; consequence rewritten silent-miss
+    // audit 2026-09-06) A supplied input the config never declared is a
+    // TYPO'D key — the previous wording ("it still shapes the derived
+    // instance id") went stale under #1503, which mints `mission_id` from
+    // a random token (`mint_run_id`) with no dependency on `collected` at
+    // all. The TRUE consequence: the undeclared value is still carried
+    // into `collected` (printed as `resolved inputs:` on a dry run, and
+    // hashed whole into `spec_fingerprint` → `Mission.spec.
+    // inputs_fingerprint`), while `apply_input_defaults` — which only
+    // ever checks `collected.contains_key`, never "did the operator mean
+    // this" — fills the config's ACTUAL declared input (e.g. `rules`)
+    // with its document DEFAULT, because the typo'd key never touched it.
+    // A misspelled `--param rulez=only-this-one-rule` therefore runs the
+    // config's full default rule set, silently. Warn loudly; don't block
+    // (a config author may deliberately accept undeclared pass-through
+    // values).
     //
     // (#1959) `dry_run` is exempt — it's a LAUNCHER-level flag (the CLI's
     // `--dry-run`, injected as a synthetic param), not a config-declared
@@ -515,14 +526,7 @@ pub fn launch(
     // dry run, since none of them declare it.
     for key in collected.keys() {
         if key != "dry_run" && !config.inputs.iter().any(|i| i.name == *key) {
-            eprintln!(
-                "{}",
-                style::warn(&format!(
-                    "mission launch: input `{key}` is not declared by config \"{config_id}\"'s \
-                     inputs — it still shapes the derived instance id, so a typo here would \
-                     silently launch a different instance"
-                ))
-            );
+            eprintln!("{}", style::warn(&undeclared_param_warning(config_id, key, config)));
         }
     }
 
@@ -2306,6 +2310,41 @@ fn declared_inert_input_warning(config_id: &str, name: &str, has_default: bool) 
              `ignored_reason`, reference it as `{{{{{name}}}}}` in a step's config, or delete it"
         )
     }
+}
+
+/// (#1284 review round 1, consider 2; consequence rewritten + did-you-mean
+/// added, silent-miss audit 2026-09-06) The WARN text for one `--param`
+/// key the config never declared — extracted to a pure function (mirrors
+/// [`declared_inert_input_warning`] above) so both the wording and the
+/// suggestion are unit-testable without capturing the `eprintln!` this
+/// feeds at its one call site.
+///
+/// The consequence clause used to say the undeclared value "still shapes
+/// the derived instance id" — true before #1503, stale after: `mint_run_id`
+/// mints `mission_id` from a random token with no dependency on `collected`
+/// at all. The TRUE consequence: the value is still carried into
+/// `collected` (`resolved inputs:` on a dry run) and hashed whole into
+/// `spec_fingerprint` → `Mission.spec.inputs_fingerprint`, while
+/// `apply_input_defaults` — which only ever checks `collected.
+/// contains_key`, never "did the operator mean this" — fills whichever
+/// declared input the typo was aimed at with its document DEFAULT, since
+/// the typo never touches it. A misspelled `--param rulez=<csv>` against a
+/// config that declares `rules` therefore runs with the config's full
+/// default rule set, silently — the did-you-mean suffix (via
+/// `config_cmd::nearest`, reused rather than re-implemented here) is what
+/// lets the operator catch this before the run, not after.
+fn undeclared_param_warning(config_id: &str, key: &str, config: &MissionConfig) -> String {
+    let declared_names = config.inputs.iter().map(|i| i.name.as_str());
+    let near = crate::config_cmd::nearest(key, declared_names);
+    let did_you_mean =
+        if near.is_empty() { String::new() } else { format!(" — did you mean: {}?", near.join(", ")) };
+    format!(
+        "mission launch: input `{key}` is not declared by config \"{config_id}\"'s \
+         inputs{did_you_mean} — it is still carried into the resolved inputs and \
+         `Mission.spec`, but whichever declared input `{key}` was meant for keeps its document \
+         DEFAULT instead of your value, since the typo never reaches it. A misspelled `rules` \
+         param, for example, runs the config's full default rule set, silently"
+    )
 }
 
 /// (#1503) Mint a fresh, UNIQUE run id for one `mission launch` call — never
@@ -5184,6 +5223,84 @@ mod tests {
         assert_ne!(defaulted, unset);
     }
 
+    /// (silent-miss audit, 2026-09-06) `--param rulez=` against a config
+    /// declaring `rules` must name `rules` in a did-you-mean suggestion —
+    /// this is the exact typo class the previous "shapes the derived
+    /// instance id" wording (stale since #1503) gave no hint how to fix.
+    /// Also asserts the rewritten consequence clause names the true
+    /// effect (resolved inputs / `Mission.spec`, and the DEFAULT the
+    /// actually-declared input keeps) rather than the retired one.
+    #[test]
+    fn undeclared_param_warning_suggests_the_closest_declared_input() {
+        let input = |name: &str| mission_config::MissionInput {
+            name: name.to_string(),
+            description: None,
+            required: Some(false),
+            default: Some(serde_json::json!("all-rules")),
+            ignored: None,
+            ignored_reason: None,
+            extras: BTreeMap::new(),
+        };
+        let cfg = MissionConfig {
+            id: "review".to_string(),
+            name: "Review".to_string(),
+            description: None,
+            schema_version: None,
+            inputs: vec![input("rules"), input("workdir")],
+            phases: Vec::new(),
+            panel: None,
+            cmd: None,
+            outcome_from: None,
+            extras: BTreeMap::new(),
+        };
+
+        let warn = undeclared_param_warning("review", "rulez", &cfg);
+        assert!(warn.contains("did you mean: rules"), "{warn}");
+        assert!(warn.contains("`rulez`"), "{warn}");
+        assert!(
+            warn.contains("resolved inputs") && warn.contains("Mission.spec"),
+            "the rewritten consequence must name the TRUE effect: {warn}"
+        );
+        assert!(
+            warn.contains("document") && warn.contains("DEFAULT"),
+            "must say the actually-declared input keeps its default: {warn}"
+        );
+        assert!(
+            !warn.contains("derived instance id"),
+            "the stale #1503 consequence must be gone: {warn}"
+        );
+    }
+
+    /// A key with no close declared-input match falls back cleanly (no
+    /// dangling "did you mean:" with nothing after it).
+    #[test]
+    fn undeclared_param_warning_with_no_close_match_has_no_did_you_mean_suffix() {
+        let input = |name: &str| mission_config::MissionInput {
+            name: name.to_string(),
+            description: None,
+            required: Some(false),
+            default: None,
+            ignored: None,
+            ignored_reason: None,
+            extras: BTreeMap::new(),
+        };
+        let cfg = MissionConfig {
+            id: "review".to_string(),
+            name: "Review".to_string(),
+            description: None,
+            schema_version: None,
+            inputs: vec![input("workdir")],
+            phases: Vec::new(),
+            panel: None,
+            cmd: None,
+            outcome_from: None,
+            extras: BTreeMap::new(),
+        };
+
+        let warn = undeclared_param_warning("review", "zzz_totally_unrelated", &cfg);
+        assert!(!warn.contains("did you mean"), "{warn}");
+    }
+
     // ── coder-phase wiring — registration only, never a live dispatch ──
     // (mocked dispatches only, never real LMStudio — the actual
     // `MissionCoderStepKind::run` dispatch is exercised, mocked, by
@@ -6040,6 +6157,61 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// (silent-miss audit, 2026-09-06) `darkmux-crew`'s `records_gather`
+    /// scan (`scan_unit_and_plan_steps`) cannot depend on `darkmux-lab`,
+    /// so it keeps its own literal-string copies of the three step kind
+    /// ids it recognizes — `SCANNED_CRAWL_UNIT_KIND`/
+    /// `SCANNED_PLAN_SITES_KIND`/`SCANNED_CRAWL_PLAN_KIND`. This test
+    /// lives here because `src/` is the one place that depends on BOTH
+    /// crates and can hold both real constants side by side, plus the
+    /// fully-assembled `StepKindRegistry` (`all_step_kinds`) that proves
+    /// each literal actually resolves to a registered, constructible
+    /// kind — not just a string that happens to match today.
+    ///
+    /// Two ways this drifts silently without the test: (1) a lab-side
+    /// rename of one of the three constants leaves `records_gather`'s
+    /// copy stale — the scan then matches nothing for that kind, forever,
+    /// with no error; (2) a crew-side typo in one of the `SCANNED_*`
+    /// literals does the same from the other direction. Either failure
+    /// mode reproduces exactly the "closed list drifts silently" defect
+    /// this module's own doc names for a NEW kind — this guards the
+    /// EXISTING three from drifting the same way.
+    #[test]
+    fn records_gather_scanned_kinds_match_the_real_crawl_constants_and_are_registered() {
+        assert_eq!(
+            crew::step_kinds::SCANNED_CRAWL_UNIT_KIND,
+            darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND,
+            "records.gather's local literal has drifted from darkmux-lab's real \
+             `CRAWL_UNIT_KIND` — the scan will silently stop matching `crawl.unit` steps"
+        );
+        assert_eq!(
+            crew::step_kinds::SCANNED_PLAN_SITES_KIND,
+            darkmux_lab::crawl::plan_sites_step::PLAN_SITES_KIND,
+            "records.gather's local literal has drifted from darkmux-lab's real \
+             `PLAN_SITES_KIND` — the scan will silently stop matching `plan.sites` steps"
+        );
+        assert_eq!(
+            crew::step_kinds::SCANNED_CRAWL_PLAN_KIND,
+            darkmux_lab::crawl::plan_step::CRAWL_PLAN_KIND,
+            "records.gather's local literal has drifted from darkmux-lab's real \
+             `CRAWL_PLAN_KIND` — the scan will silently stop matching `crawl.plan` steps"
+        );
+
+        let registry = all_step_kinds().expect("all_step_kinds must build cleanly in a test process");
+        let known = registry.ids();
+        for kind in [
+            crew::step_kinds::SCANNED_CRAWL_UNIT_KIND,
+            crew::step_kinds::SCANNED_PLAN_SITES_KIND,
+            crew::step_kinds::SCANNED_CRAWL_PLAN_KIND,
+        ] {
+            assert!(
+                known.iter().any(|k| k == kind),
+                "records.gather's scan recognizes `{kind}`, but `all_step_kinds`'s registry \
+                 has no such id — the scan would be matching a kind nothing can ever produce"
+            );
         }
     }
 

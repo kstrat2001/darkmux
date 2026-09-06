@@ -99,13 +99,35 @@ export const ACT_ORDER: string[] = [
  * it no longer needs to carry liveness here. */
 export const DEFAULT_ACTIVITIES = new Set(["reasoning", "checkpoint", "tool call", "turn", "dispatch error"]);
 
+/** (silent-miss audit, 2026-09-06) Suffixes that mark an activity value as
+ * failure- or abandonment-shaped, checked in ADDITION to `DEFAULT_ACTIVITIES`
+ * membership by `isDefaultOn` below. `activityOf`'s literal `return a ||
+ * "other"` fallback means any scheduler action with no dedicated branch —
+ * `"step error"`, `"phase abandon"` (`darkmux-crew`'s `scheduler.rs`/
+ * `lifecycle.rs`) — surfaces here as a value `DEFAULT_ACTIVITIES` was never
+ * curated to anticipate, and defaulted OFF: the exact "operator never sees
+ * it" failure `DEFAULT_ACTIVITIES`'s own `dispatch error` entry exists to
+ * prevent, just reached through a kind this allowlist didn't name instead
+ * of a value it forgot. A suffix check closes that off structurally — ANY
+ * future action reading as an error or an abandonment (whatever new kind
+ * introduces it) defaults on without needing its own allowlist entry. A
+ * non-failure activity like `"step start"` matches no suffix and stays off,
+ * same as today. */
+const DEFAULT_ON_ACTIVITY_SUFFIXES = ["error", "abandon", "abandoned", "failed"];
+
+function looksLikeFailureActivity(value: string): boolean {
+  return DEFAULT_ON_ACTIVITY_SUFFIXES.some((suffix) => value.endsWith(suffix));
+}
+
 /** Whether facet value `v` under key `k` is ON absent any operator
  * override. `cat`/`tier`/`src` default fully on; `act` defaults to
- * `DEFAULT_ACTIVITIES` only. This one function is the single place that
+ * `DEFAULT_ACTIVITIES` PLUS anything failure/abandonment-shaped (see
+ * `looksLikeFailureActivity`). This one function is the single place that
  * distinction lives — `defaultFilterState`, `absorbNewFacetValues` and
  * `applyStoredPicks` all defer to it rather than re-deriving it. */
 function isDefaultOn(key: keyof Facets, value: string): boolean {
-  return key === "act" ? DEFAULT_ACTIVITIES.has(value) : true;
+  if (key !== "act") return true;
+  return DEFAULT_ACTIVITIES.has(value) || looksLikeFailureActivity(value);
 }
 
 /** (#2416) The "model only" quick filter's underlying vocabulary — what
@@ -216,11 +238,22 @@ const FACET_KEYS = ["act", "cat", "tier", "src"] as const;
  * this as active filtering (see its own doc), so a busy stream with most of
  * its activity hidden never reads as a quiet system. */
 export function defaultFilterState(facets: Facets): FilterState {
+  // (silent-miss audit, 2026-09-06) Was `facets.act.filter((v) =>
+  // DEFAULT_ACTIVITIES.has(v))` — a SECOND, independent re-derivation of
+  // exactly what `isDefaultOn` computes, contradicting that function's own
+  // doc comment ("`defaultFilterState` ... defer to it rather than
+  // re-deriving it"). The two stayed silently in sync only because
+  // `isDefaultOn("act", v)` happened to equal `DEFAULT_ACTIVITIES.has(v)`
+  // exactly — the moment `isDefaultOn` grew the failure/abandonment suffix
+  // check, this call site would have kept the stale, narrower rule with no
+  // error anywhere. Routed through `isDefaultOn` for every facet (a no-op
+  // change for `cat`/`tier`/`src`, which it already returns `true` for
+  // unconditionally) so there is exactly one place this decision is made.
   return {
-    act: new Set(facets.act.filter((v) => DEFAULT_ACTIVITIES.has(v))),
-    cat: new Set(facets.cat),
-    tier: new Set(facets.tier),
-    src: new Set(facets.src),
+    act: new Set(facets.act.filter((v) => isDefaultOn("act", v))),
+    cat: new Set(facets.cat.filter((v) => isDefaultOn("cat", v))),
+    tier: new Set(facets.tier.filter((v) => isDefaultOn("tier", v))),
+    src: new Set(facets.src.filter((v) => isDefaultOn("src", v))),
     q: "",
   };
 }
