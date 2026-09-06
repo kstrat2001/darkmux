@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef } from "react";
 import {
   computeGaugeGeometry,
   computeBandGeometry,
@@ -26,7 +26,7 @@ import {
   type ResidencyRowView,
 } from "./machineGauge";
 import { memBytes, reclaimableNote, relAgoFrom } from "../../lib/format";
-import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
+import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, estimatedSummaryLine, LOADING_MESSAGE, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import { Meter, CX, type MeterBand, type MeterTick } from "../../components/Meter";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
@@ -327,6 +327,15 @@ function LampRow({
   const alarmMessagesCount = Array.isArray(resources.messages)
     ? resources.messages.filter((m) => m.severity === "warn" || m.severity === "error").length
     : 0;
+  // #2440 (operator finding): all six lamps used to render every poll,
+  // lit or not — a row of five gray tell-tales beside whichever one was
+  // actually on. A tell-tale that is always visible whether or not its
+  // condition holds is furniture, the same defect the STATE lamp was cut
+  // for (see this function's own doc). Filtering to the LIT subset here,
+  // not in `deriveLamps`, keeps that function's contract intact (it still
+  // answers "what is every lamp's state", independently unit-tested) and
+  // makes this the one place the display rule — active only, no row when
+  // none — lives.
   const lamps = deriveLamps({
     state: resources.machine.state,
     pressureRed: !!resources.pressure?.red,
@@ -335,11 +344,12 @@ function LampRow({
     alarmMessagesCount,
     resourcesErrored,
     residencyChanged,
-  });
+  }).filter((l) => l.lit);
+  if (lamps.length === 0) return null;
   return (
     <div className="mm-lamps">
       {lamps.map((l) => (
-        <span key={l.key} className={`mm-lamp${l.lit ? ` is-lit-${l.severity}` : ""}`} title={l.title}>
+        <span key={l.key} className={`mm-lamp is-lit-${l.severity}`} title={l.title}>
           {l.word}
         </span>
       ))}
@@ -350,101 +360,48 @@ function LampRow({
 // ── Odometer tiles ───────────────────────────────────────────────────────
 
 /**
- * The three pressure instruments. Each tile's explanatory note is revealed
- * ON DEMAND behind an `(i)` toggle rather than rendered permanently.
- *
- * The notes used to be a third, always-on line of 8.5px `#4a5162` text under
- * every tile — the operator's read, and it is right: "very small and dim
- * text at the very bottom that adds an extra row under the meters. no one
- * will read all this." Each note says something true and worth knowing
- * exactly ONCE (which figure can trigger red; that swap and compressor are
- * high-water marks; that the compressor is macOS's, not darkmux's
- * compactor), and then it is permanent furniture — the same defect that got
- * the `darkmux/utility` card deleted, one row down.
- *
- * Deliberately a `<button>` that TOGGLES, not a `title` tooltip: this
- * dashboard is read over the tailnet on a phone, where hover does not exist
- * and a `title` is simply invisible. Tap and hover both work on a button,
- * it is keyboard-reachable, and `aria-expanded` states the relationship for
- * a screen reader. The revealed note is the SAME text either way — no
- * desktop-only knowledge.
+ * The three pressure instruments. Each tile's own `(i)` popover is gone
+ * (#2440, cut 7): MARGIN / SWAP USED / COMPRESSOR each opened an
+ * independent explanation, three separate on-page disclosure mechanisms for
+ * one page that already has one (`how this was measured`, below). The notes
+ * themselves are not lost — `MachineHealthRegion`'s render folds all three
+ * (`odometerTiles(...).map(t => t.note)`) into that single disclosure, so
+ * the fact still exists exactly once, just behind the one control rather
+ * than three.
  */
 function Odometer({ resources }: { resources: MachineResources }) {
   const tiles = odometerTiles(resources.pressure);
-  const [openLabel, setOpenLabel] = useState<string | null>(null);
-  const rowRef = useRef<HTMLDivElement>(null);
-
-  // A popover has to be dismissible by the two gestures every popover
-  // supports, or it is just a div that will not go away: Escape, and a click
-  // anywhere outside it. Both listeners exist ONLY while one is open — an
-  // idle machine page registers nothing (the observer-must-not-perturb rule
-  // applies to the client too, and this component re-renders on every 5s
-  // poll).
-  useEffect(() => {
-    if (openLabel == null) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpenLabel(null);
-    };
-    const onDown = (e: MouseEvent) => {
-      if (!rowRef.current?.contains(e.target as Node)) setOpenLabel(null);
-    };
-    document.addEventListener("keydown", onKey);
-    document.addEventListener("mousedown", onDown);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("mousedown", onDown);
-    };
-  }, [openLabel]);
 
   return (
-    <div className="mm-odorow" ref={rowRef}>
-      {tiles.map((t) => {
-        const open = openLabel === t.label;
-        return (
-          <div className="mm-odo" key={t.label}>
-            <span className="mm-odo-cells">
-              {t.digits.map((d, i) =>
-                isSevenSegDot(d) ? (
-                  <span className="mm-odo-dot" key={i} aria-hidden="true" />
-                ) : (
-                  <svg
-                    className="mm-odo-seg"
-                    key={i}
-                    viewBox={`0 0 ${SEVEN_SEG_CELL.w} ${SEVEN_SEG_CELL.h}`}
-                    aria-hidden="true"
-                  >
-                    {sevenSegmentPolygons(d).map((sg, j) => (
-                      <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
-                    ))}
-                  </svg>
-                ),
-              )}
-              {/* The figure stays available to assistive tech as TEXT — the
-                  glyphs above are decorative shapes and a screen reader would
-                  otherwise read nothing at all where a number used to be. */}
-              <span className="mm-sr-only">{t.digits.join("")}</span>
-            </span>
-            <span className="mm-odo-unit">{t.unit}</span>
-            <div className="mm-odo-k">
-              {t.label}{" "}
-              <button
-                type="button"
-                className={`mm-odo-i${open ? " is-open" : ""}`}
-                aria-expanded={open}
-                aria-label={`What is ${t.label}?`}
-                onClick={() => setOpenLabel(open ? null : t.label)}
-              >
-                i
-              </button>
-            </div>
-            {open && (
-              <div className="mm-odo-n" role="note">
-                {t.note}
-              </div>
+    <div className="mm-odorow">
+      {tiles.map((t) => (
+        <div className="mm-odo" key={t.label}>
+          <span className="mm-odo-cells">
+            {t.digits.map((d, i) =>
+              isSevenSegDot(d) ? (
+                <span className="mm-odo-dot" key={i} aria-hidden="true" />
+              ) : (
+                <svg
+                  className="mm-odo-seg"
+                  key={i}
+                  viewBox={`0 0 ${SEVEN_SEG_CELL.w} ${SEVEN_SEG_CELL.h}`}
+                  aria-hidden="true"
+                >
+                  {sevenSegmentPolygons(d).map((sg, j) => (
+                    <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
+                  ))}
+                </svg>
+              ),
             )}
-          </div>
-        );
-      })}
+            {/* The figure stays available to assistive tech as TEXT — the
+                glyphs above are decorative shapes and a screen reader would
+                otherwise read nothing at all where a number used to be. */}
+            <span className="mm-sr-only">{t.digits.join("")}</span>
+          </span>
+          <span className="mm-odo-unit">{t.unit}</span>
+          <div className="mm-odo-k">{t.label}</div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -592,22 +549,23 @@ function ModelRow({
       ) : (
         <div className="mm-row-kv">{modelKvLine(m)}</div>
       )}
-      {/* (operator finding, 2026-09-05) Both hints below were trimmed to the
-          one fact the row does NOT already state. The chip beside the name
-          already says UNPRICED / ESTIMATED, and its `title` carries the full
-          caveat verbatim (which weights reader failed, which attention
-          assumption the figure rests on, which architectures it over- and
-          under-reserves). What survives here is the CONSEQUENCE — the part a
-          reader cannot derive from the chip: that the machine total is short
-          by this model, and that this row's potential is a guess rather than
-          a measurement. The estimated hint was 52 words of the same content
-          the chip title, the lamp title and the server's own `messages` entry
-          each carry; the same sentence in four places is furniture. */}
+      {/* (operator finding, 2026-09-05; narrowed further #2440 cut 5) The
+          hint below is trimmed to the one fact the row does NOT already
+          state. The chip beside the name already says UNPRICED / ESTIMATED,
+          and its `title` carries the full caveat verbatim (which weights
+          reader failed, which attention assumption the figure rests on,
+          which architectures it over- and under-reserves) — the SAME text
+          the `how this was measured` disclosure now also carries in full.
+          What survives here is the CONSEQUENCE — the part a reader cannot
+          derive from the chip: that the machine total is short by this
+          model. The ESTIMATED row's own second hint line ("estimated:
+          priced from catalog size…") is gone: it was the chip title, the
+          lamp title, the disclosure's info message AND this line all saying
+          the same thing — collapsed into the one summary line + disclosure
+          this region now renders once, machine-wide (see the
+          `estimatedSummaryLine` render below), rather than once per row. */}
       {!isGhost && pot == null && (
         <div className="mm-hint">↳ unpriceable — machine committed total undercounts by this model</div>
-      )}
-      {!isGhost && isEstimatedRow(m) && (
-        <div className="mm-hint">↳ estimated: priced from catalog size at a dense-attention rate, not measured</div>
       )}
       {/* #1854 — the row this is ABOUT carries the fact (which resident, by
           how much, what the projection now counts); the machine caption one
@@ -696,6 +654,15 @@ export function MachineHealthRegion({
 }: HealthRegionProps) {
   const measuredIsMobile = useIsMobile();
   const isMobile = isMobileOverride ?? measuredIsMobile;
+  // #2440 cut 7: the one control every disclosed detail on this page opens
+  // through — the odometer tiles' own notes and the estimate summary line
+  // both trigger this ref rather than owning a popover apiece. Declared
+  // before every early return below (Rules of Hooks); harmless on the
+  // early-return branches, which render no `<details>` for it to point at.
+  const aboutRef = useRef<HTMLDetailsElement>(null);
+  const openAbout = () => {
+    if (aboutRef.current) aboutRef.current.open = true;
+  };
   if (!isLocalMach) {
     return (
       <div className="memcard">
@@ -722,6 +689,32 @@ export function MachineHealthRegion({
   // severity, rendered below (an `info` disclosure must not look like a
   // `warn`/`error`).
   const messages = Array.isArray(b.messages) ? b.messages : [];
+  // #2440 cut 4: an `info` message is a disclosure, not an alert (#1821's
+  // own distinction) — it belongs behind `how this was measured`, condensed
+  // to one on-page line. `warn`/`error` stay visible where they always
+  // rendered: those name a real degradation the operator should not have to
+  // open anything to see.
+  const infoMessages = messages.filter((m) => m.severity === "info");
+  const alarmMessages = messages.filter((m) => m.severity !== "info");
+  const estimatedCount = Number(b.machine.estimated_models) || 0;
+  const unpricedCount = Number(b.machine.unpriced_models) || 0;
+  const estimateLine = estimatedSummaryLine(estimatedCount);
+  // #2440 cut 1: the machine-level shrink hint and a targeted row's own
+  // shrink hint are the SAME string when the hint names a resident row
+  // (`model_ledger.rs`'s `shrink_hint` sets both from one call) — rendering
+  // both was a literal verbatim duplicate, not two facts. Suppressed here
+  // ONLY when a rendered row already carries the identical text; the
+  // machine-level line still renders on its own when the hint targets
+  // nothing resident (e.g. "unload a resident" with no single shrinkable
+  // row) — there is no card to duplicate it in.
+  const rowShrinkHints = new Set(
+    residencyRows
+      .filter((r) => r.status !== "ghost")
+      .map((r) => (r.model as { shrink_hint?: string }).shrink_hint)
+      .filter((h): h is string => !!h),
+  );
+  const machineShrinkHint = (b.machine as { shrink_hint?: string }).shrink_hint;
+  const showMachineShrinkHint = !!machineShrinkHint && !rowShrinkHints.has(machineShrinkHint);
   // Two clocks, not one. `nowMs` is the READING browser's; `generated_at_ms`
   // is the daemon HOST's, and this lens is read off-box over the tailnet by
   // design (#1286 constraint 2 — the display renders off-machine). A reader
@@ -775,10 +768,17 @@ export function MachineHealthRegion({
           wrapping run; desktop keeps the inline dotted form unchanged.
           Every string is computed ONCE (`unpricedValue`/`estimatedValue`/
           `reclaim` below) and reused by both branches, so the two forms
-          can never drift apart on the actual numbers, only on layout. */}
+          can never drift apart on the actual numbers, only on layout.
+
+          (#2440 cut 2, operator finding) `pool` and `used` are GONE from
+          this row: the gauge above already draws both — the needle IS
+          `pool.used_bytes` (`Gauge`'s own `centerVal`), and the dial's
+          scale IS `pool.capacity_bytes` (the ticks running 0→LIMIT). This
+          strip now states only what the gauge cannot: WHERE the limit
+          number came from, how much is left (+ how much of that is
+          reclaimable), and the two priced-with-caveats counts — the gauge's
+          own sub-caption, not a second restatement of its numbers. */}
       {(() => {
-        const unpricedCount = Number(b.machine.unpriced_models) || 0;
-        const estimatedCount = Number(b.machine.estimated_models) || 0;
         const reclaim = reclaimableNote(b.pool?.available_bytes, b.pool?.free_bytes);
         // A non-breaking space, not a plain one: a count severed from its
         // unit ("0" alone on one line, "models" on the next) is the same
@@ -802,14 +802,6 @@ export function MachineHealthRegion({
               <div className="mm-kv-row">
                 <span className="mm-kv-row__label">limit source</span>
                 <span className="mm-kv-row__value">{limitDescription(b.limit_source)}</span>
-              </div>
-              <div className="mm-kv-row">
-                <span className="mm-kv-row__label">pool</span>
-                <span className="mm-kv-row__value">{memBytes(b.pool?.capacity_bytes)}</span>
-              </div>
-              <div className="mm-kv-row">
-                <span className="mm-kv-row__label">used</span>
-                <span className="mm-kv-row__value">{memBytes(b.pool?.used_bytes)}</span>
               </div>
               <div className="mm-kv-row">
                 <span className="mm-kv-row__label">available</span>
@@ -853,8 +845,7 @@ export function MachineHealthRegion({
                 stay in the payload but are deliberately NOT given prime space
                 here — two figures both reading as "how much is left" was the
                 defect being fixed, not something to preserve under a new name. */}
-            limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
-            · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>
+            limit source <b>{limitDescription(b.limit_source)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>
             {reclaim}{" "}
             · unpriced{" "}
             {/* A non-breaking space, not a plain one: this k/v strip is a flat text
@@ -892,10 +883,14 @@ export function MachineHealthRegion({
           MACHINE level, `model_ledger.rs::shrink_hint`). Stage 1 rendered
           this as `.memhint` under the old flat card; Stage 2/3 has no card
           left to hang it under, so it renders here, right after the detail
-          row it's a footnote to. */}
-      {(b.machine as { shrink_hint?: string }).shrink_hint && (
-        <div className="mm-hint">↳ {(b.machine as { shrink_hint?: string }).shrink_hint}</div>
-      )}
+          row it's a footnote to. (#2440 cut 1) Gated on `showMachineShrinkHint`
+          — when the hint targets a resident row, that row's own card already
+          carries this EXACT string (`model_ledger.rs` sets both from one
+          call), so rendering it here too was a verbatim duplicate, not a
+          second fact. Still renders on its own when the hint has no
+          resident row to live in (the "unload a resident" no-shrinkable-
+          context arm). */}
+      {showMachineShrinkHint && <div className="mm-hint">↳ {machineShrinkHint}</div>}
 
       <div className={stale ? "is-stale" : ""}>
         <ModelRows rows={residencyRows} nowMs={nowMs} utilityModelId={utilityModelId} machineState={b.machine.state} />
@@ -906,17 +901,39 @@ export function MachineHealthRegion({
           NOT render with the same alarm treatment as a `warn`/`error`.
           `.memmsg-*` in styles.css keys color+icon off the severity; a
           plain `.memwarn` uniformly-amber treatment is exactly the defect
-          this replaces. */}
-      {messages.length > 0 && (
+          this replaces. (#2440 cut 4) Only `alarmMessages` (warn/error)
+          render here now — those name a real degradation the operator
+          should see without opening anything. The `info` disclosures
+          (`infoMessages`) moved below, into `how this was measured`, with
+          `estimateLine` as their on-page pointer. */}
+      {alarmMessages.length > 0 && (
         <div className="memcard">
           <div className="memhdr">
             <div className="memname">messages</div>
           </div>
-          {messages.map((m, i) => (
+          {alarmMessages.map((m, i) => (
             <div className={`memmsg memmsg-${m.severity}`} key={i}>
-              {m.severity === "error" ? "✕" : m.severity === "warn" ? "⚠" : "ℹ"} {m.text}
+              {m.severity === "error" ? "✕" : "⚠"} {m.text}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* (#2440 cuts 4+5) The one-line stand-in for the info-severity
+          methodology paragraph AND the per-row ESTIMATED hint — both said
+          "priced by a size-based guess, not measurement" in their own
+          place; this is the ONE place that fact lives on-page, and its `ⓘ`
+          opens the disclosure that carries the full caveat verbatim
+          (`infoMessages`, below). Reuses `.mm-hint`/`.mm-odo-i` — the same
+          hint-line and disclosure-affordance treatment already used
+          elsewhere on this page, rather than inventing a third visual
+          language for "there is more below". */}
+      {estimateLine && (
+        <div className="mm-hint">
+          ↳ {estimateLine}{" "}
+          <button type="button" className="mm-odo-i" aria-label="how this was measured" onClick={openAbout}>
+            i
+          </button>
         </div>
       )}
 
@@ -937,14 +954,34 @@ export function MachineHealthRegion({
 
           A `<details>` rather than a `title` for the same reason the
           odometer's note is a button and not a tooltip: this page is read
-          on a phone over the tailnet, where hover does not exist. */}
+          on a phone over the tailnet, where hover does not exist.
+
+          (#2440 cuts 4+5+7) Three more sources fold into THIS disclosure
+          rather than each keeping its own: the odometer tiles' own MARGIN /
+          SWAP USED / COMPRESSOR notes (`odometerTiles(b.pressure)`, reused
+          here purely for `.label`/`.note` — the digits/unit fields are the
+          `<Odometer>` component's own concern), and the `info`-severity
+          messages (the estimate methodology paragraph) verbatim. Nothing
+          here is paraphrased — every sentence that used to stand alone on
+          the page is reproduced exactly, just behind one control instead of
+          four. */}
       <div className="memfoot">snapshot {relAgoFrom(ageRef, b.generated_at_ms)}</div>
-      <details className="mm-about">
+      <details className="mm-about" ref={aboutRef}>
         <summary>how this was measured</summary>
         <div className="memfoot">{attributionLine(b)}</div>
         <div className="memfoot" id="memstamp">
           {stampLine(b)}
         </div>
+        {odometerTiles(b.pressure).map((t) => (
+          <div className="memfoot" key={t.label}>
+            {t.label}: {t.note}
+          </div>
+        ))}
+        {infoMessages.map((m, i) => (
+          <div className="memfoot" key={i}>
+            {m.text}
+          </div>
+        ))}
       </details>
     </>
   );

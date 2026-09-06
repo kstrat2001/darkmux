@@ -3917,40 +3917,14 @@ body {
   color: var(--fg);
   border-color: var(--dim);
 }
-.mm-odo-i.is-open {
-  color: var(--bg);
-  background: var(--dim);
-  border-color: var(--dim);
-}
-/* Revealed on demand — so it can afford to be READABLE, which the permanent
-   8.5px `#4a5162` line it replaced could not. It is asked for, not endured.
-
-   A POPOVER, not an inline reveal: it is absolutely positioned so opening one
-   does not reflow the page. The first cut expanded the tile in place, which
-   pushed every row below it down — the operator's read, and correct: a
-   disclosure that moves the thing you were looking at costs more than the
-   sentence it shows you. `z-index` clears the sibling tiles; the tile itself
-   is the positioning context. */
+/* `.mm-odo-i.is-open` and `.mm-odo-n` (the per-tile popover this glyph used
+   to toggle) are gone (#2440 cut 7): MARGIN / SWAP USED / COMPRESSOR each
+   opened their own explanation; all three notes now live inside the ONE
+   `how this was measured` disclosure (`.mm-about`, below) instead. `.mm-odo`
+   keeps `position: relative` — it is still the odometer tile's own layout
+   box, independent of the popover that used to anchor to it. */
 .mm-odo {
   position: relative;
-}
-.mm-odo-n {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 5;
-  width: max-content;
-  max-width: 30ch;
-  padding: 7px 9px;
-  font-size: calc(9.5px * var(--fs-scale));
-  line-height: 1.5;
-  color: var(--fg);
-  text-align: left;
-  background: #11151f;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
 }
 
 .mm-kv {

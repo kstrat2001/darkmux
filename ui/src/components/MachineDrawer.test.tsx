@@ -1002,6 +1002,47 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     expect(screen.getByText(/4400 MHz/)).toBeInTheDocument();
   });
 
+  // (#2440 cut 6, operator finding) The ladder already lights CURRENT
+  // `thermal.state`; "highest severity" restated it verbatim whenever the
+  // window's worst state matched — the exact case the operator saw ("the
+  // bar highlights FAIR and the text repeats HIGHEST SEVERITY Fair"). This
+  // is the acceptance criterion's own case: bar present, severity text
+  // absent. The inverted case — worst state genuinely differs from current
+  // — is already covered above ("Fair" ladder + "Serious" highest severity,
+  // both rendered) and must keep passing: dropping the row unconditionally
+  // would have deleted a real, non-duplicate fact.
+  it("drops the redundant 'highest severity' row when it exactly matches the lit ladder state", async () => {
+    const SAME_STATE_LOAD = {
+      ...FULL_LOAD,
+      load: {
+        ...FULL_LOAD.load,
+        now: { ...FULL_LOAD.load.now, thermal: { state: "fair", cpu_speed_limit_pct: 100 } },
+        window: { ...FULL_LOAD.load.window, thermal: { ...FULL_LOAD.load.window.thermal, worst_state: "fair" } },
+      },
+    };
+    stubFetch(SAME_STATE_LOAD);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+
+    await waitFor(() => expect(screen.getByText("Fair")).toBeInTheDocument());
+    expect(kvValue("highest severity")).toBeNull();
+    // "above nominal" is untouched — it names a different fact (time spent
+    // above nominal), never restated by the ladder.
+    expect(kvValue("above nominal")).toBe("45s");
+  });
+
   /** (operator finding — "GPU memory is wrapping") A host with no IOReport
    * GPU perf-state (`gpu_mhz: null`, common on this hardware) leaves the
    * GPU-extra line with exactly ONE item (memory). `InlineOrCells`' mobile

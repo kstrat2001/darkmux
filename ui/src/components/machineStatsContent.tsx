@@ -336,10 +336,21 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
           )}
           {windowThermal && (
             <>
-              <Kv
-                label="highest severity"
-                value={fmtThermalState(windowThermal.worst_state)}
-              />
+              {/* (#2440 cut 6, operator finding) The ladder above already
+                  lights CURRENT `thermal.state`; this row named the
+                  WINDOW's worst state over the same span. When they agree —
+                  the common case, and the one the operator actually saw
+                  ("the bar highlights FAIR and the text repeats HIGHEST
+                  SEVERITY Fair") — the row was a literal restatement of
+                  what the lit step already shows, so it is dropped. When
+                  they differ (a real excursion the machine has since cooled
+                  from), this is the ONLY place that fact exists — the
+                  ladder shows where things stand NOW, not where they peaked
+                  — so it stays. No fact is lost either way: it is either a
+                  verbatim duplicate (cut) or genuinely new (kept). */}
+              {windowThermal.worst_state !== thermal.state && (
+                <Kv label="highest severity" value={fmtThermalState(windowThermal.worst_state)} />
+              )}
               <Kv
                 label="above nominal"
                 value={fmtAboveNominal(windowThermal.above_nominal_ms)}

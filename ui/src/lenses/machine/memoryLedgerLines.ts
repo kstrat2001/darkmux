@@ -61,6 +61,21 @@ export function overPriceHint(m: Pick<MachineResourcesModel, "over_price_bytes" 
 }
 
 
+/** #2440 (cuts 4+5): the one line that stands in for BOTH the messages
+ * block's own info-severity estimate disclosure and the ESTIMATED chip's
+ * own per-row hint ("estimated: priced from catalog size…") — three
+ * renderings of one fact (N residents are priced by a size-based guess, not
+ * a measurement) collapsed to one. The full caveat (which weights reader
+ * failed, the dense-attention assumption, which architectures it over/under
+ * -reserves) is not lost: it still rides the server's `messages` array
+ * verbatim, moved into the `how this was measured` disclosure this line
+ * points at — see `MachineHealthRegion.tsx`'s render. `null` when nothing
+ * is estimated, so the line (and its `ⓘ`) simply doesn't render. */
+export function estimatedSummaryLine(estimatedCount: number): string | null {
+  if (!(estimatedCount > 0)) return null;
+  return `${estimatedCount} model${estimatedCount === 1 ? "" : "s"} priced by estimate (no config.json)`;
+}
+
 /** The configured utility-tier model's id, or `null` — the ONE thing the
  * machine page still needs to know about the utility tier, used to badge
  * whichever residency row is that model (`isUtilityTierRow`).
