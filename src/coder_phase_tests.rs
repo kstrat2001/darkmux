@@ -771,6 +771,82 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(missing.is_err(), "an unknown mission errors");
     }
 
+    /// (#2421) `gather_debrief` reads `records_emitted` off a persisted
+    /// `envelope.json` — separate from `finalize_mission`'s own wiring test
+    /// in `darkmux-crew::envelope` (which proves the block gets COMPUTED
+    /// correctly); this proves the debrief command's READ path picks up
+    /// whatever finalize already wrote. `#[serial]` — mutates DARKMUX_HOME.
+    #[test]
+    #[serial_test::serial]
+    fn gather_debrief_reads_records_emitted_from_the_envelope() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mid = "m-records-emitted";
+        let mdir = home.path().join("missions").join(mid);
+        std::fs::create_dir_all(mdir.join("phases")).unwrap();
+        std::fs::write(
+            mdir.join("mission.json"),
+            format!(r#"{{"id":"{mid}","description":"d","status":"finalized","phase_ids":[],"created_ts":1700000000}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            mdir.join("envelope.json"),
+            r#"{
+                "mission_id": "m-records-emitted",
+                "schema_version": "1.3",
+                "status": "clean",
+                "phases": [],
+                "records_emitted": {
+                    "by_action": {"dispatch start": 3, "dispatch.complete": 3, "dispatch.turn": 40},
+                    "total_records": 46,
+                    "total_bytes": 12345,
+                    "dispatch_seconds": 210.0,
+                    "wall_seconds": 300.0,
+                    "host_samples_in_window": 9
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let report = gather_debrief(mid);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        let report = report.expect("mission found");
+        // The human-readable rendering: top actions by count (highest
+        // first), then the totals line naming dispatch/wall seconds.
+        let lines = format_records_emitted_lines(&report.records_emitted);
+        let re = report.records_emitted.expect("records_emitted read from envelope.json");
+        assert_eq!(re.total_records, 46);
+        assert_eq!(re.dispatch_seconds, 210.0);
+        assert_eq!(re.wall_seconds, 300.0);
+        assert_eq!(re.host_samples_in_window, 9);
+        assert_eq!(lines[0], "    40  dispatch.turn", "the highest count sorts first");
+        assert!(lines.iter().any(|l| l.contains("46 total records")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("210s dispatch time")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("300s wall clock")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("9 host samples in window")), "{lines:?}");
+    }
+
+    #[test]
+    fn format_records_emitted_lines_names_the_gap_on_none_and_on_a_miss() {
+        assert_eq!(
+            format_records_emitted_lines(&None),
+            vec!["(not available — no envelope.json yet, or it predates #2421)".to_string()]
+        );
+        let miss = crew::records_emitted::RecordsEmitted::default();
+        assert_eq!(
+            format_records_emitted_lines(&Some(miss)),
+            vec!["(no flow records found for this mission — see the envelope's warnings)".to_string()]
+        );
+    }
+
     /// (#1000) Closing a mission nudges the debrief — and that nudge emits a
     /// `Stage::Debrief` flow record (the variant's first real emission; #999
     /// added it unemitted). `#[serial]` — mutates DARKMUX_FLOWS_DIR.

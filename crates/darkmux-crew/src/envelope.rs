@@ -154,7 +154,16 @@ use serde::{Deserialize, Serialize};
 /// (`crates/darkmux-serve/src/runs.rs`'s `mission_run_status`). Leniency
 /// widens what counts as "understood," it does not promise every possible
 /// malformed document parses.
-pub const MISSION_ENVELOPE_SCHEMA: &str = "1.2";
+/// **1.2 -> 1.3 (#2421):** adds the optional `records_emitted` field
+/// ([`MissionEnvelope::records_emitted`]) — a mission's own stream-cost
+/// summary (counts by flow-record `action`, total bytes, aggregate dispatch
+/// seconds, wall seconds, host-telemetry sample coverage). Additive per the
+/// documented rule: a 1.2-or-earlier envelope has no `records_emitted` key
+/// at all and deserializes cleanly as `records_emitted: None` — a MINOR
+/// bump, not major. `finalize_mission_with_payload` always populates the
+/// field going forward (never leaves it `None` on a NEWLY finalized
+/// envelope, even on a miss — see `records_emitted::RecordsEmitted`'s doc).
+pub const MISSION_ENVELOPE_SCHEMA: &str = "1.3";
 
 /// The overall outcome a mission's run reached — see the module doc's
 /// "Status decision" section for how each value is decided and consumed.
@@ -369,6 +378,14 @@ pub struct MissionEnvelope {
     /// on read — always present on write, just possibly `Null`).
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub payload: serde_json::Value,
+    /// (#2421, schema 1.3) This mission's own flow-stream cost summary —
+    /// see [`crate::records_emitted::RecordsEmitted`]. `None` only for an
+    /// envelope constructed but not yet finalized, or one persisted before
+    /// this field existed; `finalize_mission_with_payload` always populates
+    /// it (as `Some`, `total_records: 0` on a miss) on every envelope it
+    /// saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records_emitted: Option<crate::records_emitted::RecordsEmitted>,
 }
 
 impl MissionEnvelope {
@@ -398,6 +415,7 @@ impl MissionEnvelope {
             warnings: Vec::new(),
             remote_budgets: Vec::new(),
             payload: serde_json::Value::Null,
+            records_emitted: None,
         }
     }
 
@@ -515,6 +533,11 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
 /// when that output is a JSON object; everything else about finalization
 /// is unchanged, and a `None` payload is byte-identical to before.
 pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option<serde_json::Value>) {
+    // (#2421) Owned from here on so `records_emitted` can be attached before
+    // the persisted save below — every other read of `envelope` in this
+    // function only ever needed a shared borrow, so this clone changes
+    // nothing about the finalize decision itself, only what gets saved.
+    let mut envelope = envelope.clone();
     for phase in &envelope.phases {
         let result = match phase.outcome {
             PhaseOutcomeKind::Complete => lifecycle::phase_complete(&phase.phase_id),
@@ -554,7 +577,53 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
             );
         }
     }
-    let _ = lifecycle::save_envelope(&envelope.mission_id, envelope);
+
+    // (#2421) Every finalize computes + attaches the mission's own
+    // stream-cost block — never left silently absent on a freshly-finalized
+    // envelope. `mission_created_ts` anchors the day-file scan window
+    // ([`crate::records_emitted::records_emitted_for_mission`]); when the
+    // mission itself can't be loaded (should not happen — it was just
+    // driven through the transitions above — but best-effort throughout
+    // this function is the established discipline), the window can't be
+    // resolved and this degrades to an honest all-zero block plus a named
+    // warning, same shape as the "no records found" miss below.
+    let finalize_secs = crate::records_emitted::now_secs();
+    let (records_emitted, miss_reason) = match lifecycle::load_mission_by_id(&envelope.mission_id) {
+        Ok(mission) => {
+            let (emitted, day_files_searched) = crate::records_emitted::records_emitted_for_mission(
+                &envelope.mission_id,
+                mission.created_ts,
+                finalize_secs,
+            );
+            let miss = if emitted.total_records == 0 {
+                Some(format!(
+                    "no flow records found for mission `{}` (searched day file(s): {})",
+                    envelope.mission_id,
+                    if day_files_searched.is_empty() {
+                        "none".to_string()
+                    } else {
+                        day_files_searched.join(", ")
+                    }
+                ))
+            } else {
+                None
+            };
+            (emitted, miss)
+        }
+        Err(e) => (
+            crate::records_emitted::RecordsEmitted::default(),
+            Some(format!(
+                "could not resolve mission `{}`'s created_ts to scan day files for records-emitted: {e:#}",
+                envelope.mission_id
+            )),
+        ),
+    };
+    if let Some(reason) = miss_reason {
+        envelope.warnings.push(format!("records-emitted: {reason}"));
+    }
+    envelope.records_emitted = Some(records_emitted);
+
+    let _ = lifecycle::save_envelope(&envelope.mission_id, &envelope);
 }
 
 #[cfg(test)]
@@ -1018,5 +1087,153 @@ mod tests {
             serde_json::from_str(json).expect("an unrecognized status value must degrade, not fail the whole parse");
         assert_eq!(envelope.status, MissionOutcomeStatus::Unknown);
         assert_eq!(envelope.mission_id, "m2");
+    }
+
+    // ── records_emitted (#2421) ──────────────────────────────────────────
+
+    /// Same leniency shape as the pre-#1877 `outcome` test above, for the
+    /// 1.2 -> 1.3 bump: an envelope with no `records_emitted` key at all
+    /// (every envelope persisted before this field existed) must still
+    /// deserialize, with the field defaulting to `None` rather than failing
+    /// the whole parse.
+    #[test]
+    fn old_envelope_without_records_emitted_deserializes() {
+        let old_json = r#"{
+            "mission_id": "m-old-2421",
+            "schema_version": "1.2",
+            "status": "clean",
+            "phases": []
+        }"#;
+        let envelope: MissionEnvelope = serde_json::from_str(old_json)
+            .expect("a pre-#2421 envelope (no records_emitted key) must still deserialize");
+        assert_eq!(envelope.mission_id, "m-old-2421");
+        assert!(envelope.records_emitted.is_none());
+    }
+
+    /// Writes one day-file JSONL line directly (bypassing `flow::record` —
+    /// these tests only need it to sit on disk under `DARKMUX_FLOWS_DIR`,
+    /// not to exercise a real sink).
+    fn write_flow_line(day_file: &std::path::Path, json: &serde_json::Value) {
+        use std::io::Write;
+        if let Some(parent) = day_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(day_file).unwrap();
+        writeln!(f, "{}", serde_json::to_string(json).unwrap()).unwrap();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn finalize_populates_records_emitted_from_the_flow_stream() {
+        let _g = CrewGuard::new();
+        seed_mission("m9"); // created_ts = 1_700_000_000 -> UTC day 2023-11-14
+        seed_phase("m9", "p1");
+
+        let day_file = darkmux_flow::flows_dir().join("2023-11-14.jsonl");
+        write_flow_line(
+            &day_file,
+            &serde_json::json!({
+                "ts": "2023-11-14T10:00:00Z", "level": "info", "category": "work",
+                "tier": "local", "stage": "dispatch", "action": "dispatch start",
+                "handle": "coder", "mission_id": "m9", "session_id": "s1",
+                "machine_uid": "mac-1"
+            }),
+        );
+        write_flow_line(
+            &day_file,
+            &serde_json::json!({
+                "ts": "2023-11-14T10:00:05Z", "level": "info", "category": "work",
+                "tier": "local", "stage": "dispatch", "action": "dispatch.complete",
+                "handle": "coder", "mission_id": "m9", "session_id": "s1"
+            }),
+        );
+        // A sibling mission's record in the SAME day file — must not leak in.
+        write_flow_line(
+            &day_file,
+            &serde_json::json!({
+                "ts": "2023-11-14T10:00:02Z", "level": "info", "category": "work",
+                "tier": "local", "stage": "dispatch", "action": "dispatch start",
+                "handle": "coder", "mission_id": "sibling-mission", "session_id": "sX"
+            }),
+        );
+        // A machine-scoped host sample (#2413) inside the window, same machine.
+        write_flow_line(
+            &day_file,
+            &serde_json::json!({
+                "ts": "2023-11-14T10:00:03Z", "level": "info", "category": "telemetry",
+                "tier": "local", "stage": "dispatch", "action": "machine.telemetry",
+                "handle": "host", "machine_uid": "mac-1"
+            }),
+        );
+
+        let envelope = MissionEnvelope::new("m9", MissionOutcomeStatus::Clean, &["p1"]);
+        finalize_mission(&envelope);
+
+        let persisted = lifecycle::load_envelope("m9")
+            .expect("load_envelope must succeed")
+            .expect("an envelope.json must exist after finalize_mission");
+        let re = persisted.records_emitted.expect("finalize must always populate records_emitted");
+        // `finalize_mission` itself emits real, clock-stamped `phase
+        // complete` + `mission close` records for m9 as part of driving the
+        // transitions — those are genuinely this mission's own records too,
+        // so they count. What must NOT show up is the sibling mission's
+        // record, and every count not touched by that real "now" stamp
+        // (dispatch bookend pairing; the synthetic actions) stays exact —
+        // see this crate's own clock-check discipline: no assertion here
+        // mixes a fixed-ts fixture with a clock-relative value, so
+        // `wall_seconds` (which DOES span into "now") is deliberately not
+        // asserted to an exact number, only bounded below.
+        assert_eq!(
+            re.total_records, 4,
+            "m9's 2 synthetic + finalize's own `phase complete` + `mission close`, never the sibling's"
+        );
+        assert_eq!(re.by_action.get("dispatch start"), Some(&1));
+        assert_eq!(re.by_action.get("dispatch.complete"), Some(&1));
+        assert_eq!(re.by_action.get("phase complete"), Some(&1));
+        assert_eq!(re.by_action.get("mission close"), Some(&1));
+        assert_eq!(re.by_action.values().sum::<u64>(), 4, "no sibling leakage into the totals");
+        assert_eq!(re.dispatch_seconds, 5.0, "the ONLY dispatch bookend pair present, unaffected by the lifecycle records");
+        assert!(re.wall_seconds >= 5.0, "wall_seconds spans at least the synthetic window: {}", re.wall_seconds);
+        assert_eq!(re.host_samples_in_window, 1);
+        assert!(persisted.warnings.is_empty(), "a clean hit must not warn: {:?}", persisted.warnings);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn finalize_on_a_records_emitted_miss_warns_and_zeroes_the_block() {
+        let _g = CrewGuard::new();
+        seed_mission("m10");
+        seed_phase("m10", "p1");
+
+        // Force a genuine MISS: point `DARKMUX_FLOWS_DIR` at a path that
+        // exists as a plain FILE, not a directory. `records_emitted_for_
+        // mission`'s `read_dir` then fails outright (no day files found at
+        // all — not even a nonexistent-dir no-op), and finalize's OWN
+        // lifecycle flow records (`phase complete` / `mission close`, which
+        // a real flows dir would also pick up and legitimately count) never
+        // land anywhere either — the sink write fails the same way, best-
+        // effort. `total_records` is genuinely 0, which is exactly the
+        // scenario the miss warning exists for (a wrong or unreadable flows
+        // location must never look like a silent, honest zero-activity run).
+        let bad_flows_path = std::env::temp_dir().join(format!("darkmux-2421-not-a-dir-{}", std::process::id()));
+        std::fs::write(&bad_flows_path, b"not a directory").unwrap();
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe {
+            std::env::set_var("DARKMUX_FLOWS_DIR", &bad_flows_path);
+        }
+
+        let envelope = MissionEnvelope::new("m10", MissionOutcomeStatus::Clean, &["p1"]);
+        finalize_mission(&envelope);
+
+        std::fs::remove_file(&bad_flows_path).ok();
+
+        let persisted = lifecycle::load_envelope("m10").unwrap().unwrap();
+        let re = persisted.records_emitted.expect("a miss still populates the block, never leaves it absent");
+        assert_eq!(re, crate::records_emitted::RecordsEmitted::default());
+        assert!(
+            persisted.warnings.iter().any(|w| w.starts_with("records-emitted:") && w.contains("m10")),
+            "a miss must name the mission id in a warning: {:?}",
+            persisted.warnings
+        );
     }
 }

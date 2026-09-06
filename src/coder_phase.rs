@@ -2444,6 +2444,14 @@ struct DebriefReport {
     cautions: Vec<String>,
     /// The reviewer's adjudication notes (#849), as recorded.
     corrections: Vec<String>,
+    /// (#2421) This mission's own stream-cost summary, read from
+    /// `envelope.json`'s `records_emitted` block. `None` when the mission
+    /// never finalized (no envelope yet) or finalized under a binary that
+    /// predates this field (schema < 1.3) — the debrief renders an honest
+    /// "not available" line rather than fabricating zeros in that case
+    /// (distinct from a MISS, which `finalize` itself already records as an
+    /// all-zero block PLUS an envelope warning naming why).
+    records_emitted: Option<crew::records_emitted::RecordsEmitted>,
 }
 
 /// (#1000) Gather the debrief raw material for `mission_id`: the loop
@@ -2479,6 +2487,14 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
         .iter()
         .filter(|s| s.mission_id.as_str() == mission_id)
         .collect();
+
+    // (#2421) Best-effort, same discipline as everything else in this
+    // gatherer — a missing/unreadable envelope degrades to `None`
+    // (rendered as "not available"), never a debrief-wide failure.
+    let records_emitted = crew::lifecycle::load_envelope(mission_id)
+        .ok()
+        .flatten()
+        .and_then(|env| env.records_emitted);
 
     // The mission's exact dispatch session ids — the coder-phase dispatch id
     // for each phase, so the collectors scope to THIS mission's sessions (no
@@ -2521,8 +2537,14 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
             .into_iter()
             .take(DEBRIEF_DISPLAY)
             .collect(),
+        records_emitted,
     })
 }
+
+/// (#2421) How many `by_action` rows the human-readable debrief prints —
+/// same "readable summary, not a raw dump" rationale `DEBRIEF_DISPLAY`
+/// already applies to cautions/corrections above.
+const RECORDS_EMITTED_TOP_ACTIONS: usize = 8;
 
 /// (#1000) `darkmux mission debrief <id>` — surface a completed mission's
 /// debrief material (cautions + corrections + phases) for the post-mission
@@ -2550,6 +2572,7 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
             "phases": phases_json,
             "cautions": report.cautions,
             "corrections": report.corrections,
+            "records_emitted": report.records_emitted,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(0);
@@ -2596,12 +2619,58 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
 
     println!(
         "{}",
+        style::header("records emitted — this mission's own flow-stream cost (#2421)")
+    );
+    print_records_emitted(&report.records_emitted);
+    println!();
+
+    println!(
+        "{}",
         style::dim(
             "distill these into durable lessons (with the why) for the next crew:\n  \
              run the `darkmux-mission-debrief` skill, or:  darkmux memory lesson add --title <t> --body <b>"
         )
     );
     Ok(0)
+}
+
+/// (#2421) Human-readable rendering of a mission's `records_emitted` block —
+/// top actions by count, totals, dispatch/wall seconds, host-sample
+/// coverage. `None` (no envelope yet, or one that predates schema 1.3)
+/// prints an honest "not available" line, distinct from an actual MISS
+/// (which `finalize` already records as an all-zero block plus a named
+/// envelope warning — that case still renders real numbers here, all zero).
+fn print_records_emitted(records_emitted: &Option<crew::records_emitted::RecordsEmitted>) {
+    for line in format_records_emitted_lines(records_emitted) {
+        println!("  {line}");
+    }
+}
+
+/// Pure formatter behind [`print_records_emitted`] — kept separate so the
+/// actual rendered content (top actions, totals, dispatch/wall seconds) is
+/// unit-testable without capturing stdout. Each returned line is printed
+/// with a 2-space indent by the caller; nothing here calls `style::` (the
+/// caller applies `style::dim` where it wants color) so plain-text
+/// assertions in tests aren't fighting ANSI escapes.
+fn format_records_emitted_lines(records_emitted: &Option<crew::records_emitted::RecordsEmitted>) -> Vec<String> {
+    let Some(re) = records_emitted else {
+        return vec!["(not available — no envelope.json yet, or it predates #2421)".to_string()];
+    };
+    if re.total_records == 0 {
+        return vec!["(no flow records found for this mission — see the envelope's warnings)".to_string()];
+    }
+    let mut top_actions: Vec<(&String, &u64)> = re.by_action.iter().collect();
+    top_actions.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let mut lines: Vec<String> = top_actions
+        .into_iter()
+        .take(RECORDS_EMITTED_TOP_ACTIONS)
+        .map(|(action, count)| format!("{count:>6}  {action}"))
+        .collect();
+    lines.push(format!(
+        "{} total records, {} bytes, {:.0}s dispatch time, {:.0}s wall clock, {} host samples in window",
+        re.total_records, re.total_bytes, re.dispatch_seconds, re.wall_seconds, re.host_samples_in_window
+    ));
+    lines
 }
 
 /// (#1000) Soft nudge printed when a mission is closed — the natural reflection
