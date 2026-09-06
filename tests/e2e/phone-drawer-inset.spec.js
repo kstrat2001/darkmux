@@ -27,6 +27,8 @@
 // exist in this harness, and those two cases went green against an empty
 // stage.
 const { test, expect } = require('@playwright/test');
+const fs = require('fs');
+const path = require('path');
 
 const MISSION_ID = 'drawer-inset';
 
@@ -255,4 +257,83 @@ test.describe('phone drawer open: content starts right under the tab row, not ~4
       GUTTER_MAX_PX,
     );
   });
+});
+
+// (operator finding, real iPhone, 2026-09-06 evening, daemon build bf128cb9 /
+// 583c384e) The Events tab's own list scrolled HORIZONTALLY — rows rendered
+// at ~78% of the panel width with an empty band on the right, and the list
+// sat scrolled so a row's left edge (the time column's first digit) was
+// clipped. Instrumented (`page.evaluate` walking every element under
+// `[data-act="phone-drawer-body"]` for `getBoundingClientRect().right >
+// panel.right + 1` or `scrollWidth > clientWidth`) against a 700-record
+// fixture carrying one genuinely unbreakable token (a 74-char hex string
+// with no space or hyphen for the browser's default line breaker to land
+// on, standing in for a real `dispatch.tool` arg or session id shaped the
+// same way): `.eventlog__rec` measured `scrollWidth: 537` against a
+// `clientWidth: 364` — a `.preview-text` span rendered that token as ONE
+// unbreakable inline run past the row's own right edge, and because
+// `.eventlog__body` (the row's scroll ancestor, `#logbody`) is `overflow:
+// auto` on BOTH axes, that overflow became real horizontal scroll room for
+// the whole list — every ordinary (short) row then rendered inside the
+// widened scrollable content at less than the panel's own width, which is
+// the "78%, empty band on the right" the operator saw. The fix
+// (`ui/src/styles.css`, `.eventlog__rec`) adds `overflow-wrap: anywhere` —
+// normal text still wraps at its existing spaces/hyphens exactly as before;
+// only a run with NO such break point gets broken now, inside the row
+// instead of past it. Note: the Events tab (unlike the Machine tab) never
+// mounts a `.phone-drawer__panel` wrapper — `PhoneDrawer.tsx` renders
+// `<EventLogColumn>` directly into `.phone-drawer__body` — so `panel` below
+// is that body element, the real outer bound for this tab's content, and
+// `#logbody` (`.eventlog__body`) is the actual scroll container that was
+// growing.
+test.describe('phone drawer Events tab: the event list never scrolls horizontally', () => {
+  const FIXTURE = fs.readFileSync(
+    path.join(__dirname, '..', 'fixtures', 'hscroll-overflow-flow.jsonl'),
+    'utf8',
+  );
+
+  async function openEventsWithOverflowFixture(page) {
+    await page.route('**/filters-overflow-flow.jsonl', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: FIXTURE }),
+    );
+    await page.goto('/index-filters-overflow.html');
+    await page.click('[data-act="phone-drawer-tab-events"]');
+    await expect(page.locator('.eventlog__rec').first()).toBeVisible();
+  }
+
+  async function measure(page) {
+    return page.evaluate(() => {
+      const panel = document.querySelector('[data-act="phone-drawer-body"]');
+      const list = document.getElementById('logbody');
+      const firstRow = document.querySelector('.eventlog__rec');
+      const panelRect = panel.getBoundingClientRect();
+      const rowRect = firstRow.getBoundingClientRect();
+      return {
+        panelScrollWidth: panel.scrollWidth,
+        panelClientWidth: panel.clientWidth,
+        listScrollWidth: list.scrollWidth,
+        listClientWidth: list.clientWidth,
+        panelLeft: panelRect.left,
+        panelRight: panelRect.right,
+        rowLeft: rowRect.left,
+        rowRight: rowRect.right,
+      };
+    });
+  }
+
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 320, height: 568 },
+  ]) {
+    test(`no horizontal overflow at ${viewport.width}px`, async ({ page }) => {
+      await page.setViewportSize(viewport);
+      await openEventsWithOverflowFixture(page);
+      const m = await measure(page);
+
+      expect(m.panelScrollWidth, `drawer body scrollWidth ${m.panelScrollWidth} vs clientWidth ${m.panelClientWidth}`).toBeLessThanOrEqual(m.panelClientWidth + 1);
+      expect(m.listScrollWidth, `event list scrollWidth ${m.listScrollWidth} vs clientWidth ${m.listClientWidth}`).toBeLessThanOrEqual(m.listClientWidth + 1);
+      expect(m.rowLeft, `first row's left edge (${m.rowLeft}) is left of the panel's own left (${m.panelLeft})`).toBeGreaterThanOrEqual(m.panelLeft - 1);
+      expect(m.panelRight - m.rowRight, `first row's right edge is ${m.panelRight - m.rowRight}px from the panel's inner right edge (want <= 20px, i.e. the row fills the width)`).toBeLessThanOrEqual(20);
+    });
+  }
 });

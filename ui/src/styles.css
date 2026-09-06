@@ -1390,7 +1390,33 @@ body {
   color: var(--accent);
   border-color: var(--accent);
 }
+/* (operator, 2026-09-06) `.eventlog__fbtn` is `position: relative` so this
+   badge can pin to its own top-right corner — an icon button (`⏷`, matching
+   `.eventlog__follow`'s own long-standing icon-only convention) replaced
+   the "filters" text label, and the active-filter count moved from an
+   inline " · N" suffix to this badge so the button stays a fixed, small,
+   icon-sized target instead of growing with the digit count. `aria-hidden`
+   in the markup — `title`/`aria-label` on the button itself already carry
+   the full "filters, N active" semantics. */
+.eventlog__fbtn {
+  position: relative;
+}
+.eventlog__ficon {
+  font-size: calc(13px * var(--fs-scale));
+  line-height: 1;
+}
 .eventlog__fcount {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--bg);
+  font: 600 9px/14px var(--font-mono);
+  text-align: center;
   font-variant-numeric: tabular-nums;
 }
 .eventlog__follow:hover,
@@ -1518,6 +1544,23 @@ body {
      on desktop (nothing behind it to chain into). */
   overscroll-behavior: contain;
 }
+/* (operator finding, real iPhone, phone drawer Events tab — hscroll
+   regression) `.eventlog__rec` had no wrap fallback for a genuinely
+   unbreakable token (a `dispatch.tool` arg or session id with no space or
+   hyphen for the browser's default line breaker to land on — e.g. a raw
+   hash or path pasted whole into `prettyArgs()`'s output). Normal wrap
+   only breaks at existing whitespace/hyphens; one long delimiter-free run
+   inside `.preview-text` (or `.eventlog__recsession`) rendered as a SINGLE
+   unbreakable inline run past the row's own right edge, and since
+   `.eventlog__body` (the row's scroll ancestor) is `overflow: auto` —
+   BOTH axes — that overflow became real horizontal scroll room for the
+   ENTIRE list, not just clipping. Every other (short) row then rendered
+   inside that widened scrollable content at less than the panel's own
+   width, with empty space beside it — measured: one 700-record fixture
+   with a single unbroken 74-char token produced `.eventlog__rec.scrollWidth
+   537` against a `364`px `clientWidth`. `overflow-wrap: anywhere` lets the
+   browser break WITHIN a word only when nothing shorter fits — normal
+   text (space/hyphen-delimited) wraps exactly as before. */
 .eventlog__rec {
   font: calc(11px * var(--fs-scale))/1.5 var(--font-mono);
   color: var(--dim);
@@ -1525,6 +1568,7 @@ body {
   border-bottom: 1px solid var(--border);
   cursor: pointer;
   border-left: 2px solid transparent;
+  overflow-wrap: anywhere;
 }
 .eventlog__rec:hover {
   background: #161b28;
@@ -6574,27 +6618,40 @@ body {
     display: inline-flex;
     align-items: center;
   }
-  .phone-drawer__body .eventlog__qcount {
-    justify-content: center;
-  }
-  /* (#2417 round 3, MF-A) The events chip overflowed the drawer at 390px
-     once the "· N hidden" suffix (#2417 round 2) landed on a busy stream —
-     `.eventlog__headbtns` was `inline-flex` with no wrap and `.eventlog__
-     qcount` was `white-space: nowrap`, so a chip like "50 of 1140 events ·
-     4952 hidden" pushed the row's right edge past the drawer's own bounds
-     instead of wrapping. Scoped to `.phone-drawer__body` — the standalone
-     desktop layout (real vertical room, no fixed-width sheet) is untouched.
-     `flex-wrap: wrap` on the button row lets the chip drop to its own line
-     under follow/filters once `flex: 1 1 100%` forces it to claim the
-     whole row's width the moment it doesn't fit beside its siblings. */
+  /* (#2417 round 3, MF-A — SUPERSEDED by the operator's 2026-09-06 one-row
+     redesign below) The events chip used to overflow the drawer at 390px
+     once the "· N hidden" suffix (#2417 round 2) landed on a busy stream,
+     and the fix at the time was to let it WRAP to its own second line
+     (`flex: 1 1 100%` + `flex-wrap: wrap`). The operator's own follow-up
+     finding (2026-09-06) was that this made the toolbar THREE stacked rows
+     (search; follow+filters; the wrapped chip) — "bad use of vertical
+     space... could fit on one line." Two changes made room for a real
+     single row instead of a wider wrap target: the filters button became
+     an icon+badge (`EventLogColumn.tsx`'s own doc on `.eventlog__ficon`/
+     `.eventlog__fcount`) instead of a "filters · N" text label, and the
+     count text itself is abbreviated on mobile (`compactCountLabel()`,
+     "50 of 684 events · 12889 hidden" -> "50/684 · 12.9k hidden"). `flex-
+     wrap: nowrap` + `.eventlog__qcount`'s own `flex: 1 1 auto; min-width:
+     0` (below) — filling the remaining width and eliding via `text-
+     overflow` — replaces the old wrap-to-second-line behavior; `title`
+     carries the untruncated string (`EventLogColumn.tsx`) for whichever
+     case still doesn't fit. Scoped to `.phone-drawer__body` — the
+     standalone desktop layout (real vertical room, no fixed-width sheet)
+     is untouched. */
   .phone-drawer__body .eventlog__headbtns {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    align-items: center;
     width: 100%;
   }
   .phone-drawer__body .eventlog__qcount {
-    flex: 1 1 100%;
-    white-space: normal;
+    flex: 1 1 auto;
+    min-width: 0;
+    margin-left: auto;
+    justify-content: flex-end;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   /* 16px stays — dropping it re-triggers iOS Safari's zoom-on-focus for
      any input under 16px (`.eventlog__searchbox input`'s own base-rule
