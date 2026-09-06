@@ -12,7 +12,21 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
-## [Unreleased]
+## [3.7.0] - 2026-09-06
+
+A review that lands as conversations, and a run that says what it cost.
+
+This release finishes the review path 3.6.0 started. `review` is no longer a
+funnel with ten bespoke step kinds: it is the generic mission path every other
+pipeline runs on (plan -> review -> summarize -> create-mods -> deliver), and
+its output arrives as inline PR conversations, one per finding, with a one-click
+suggestion whenever a mod passed its gate. The observability half caught up in
+the same batch: one host sampler per machine instead of one per dispatch, a
+`records_emitted` block in every mission envelope, and a viewer that defaults to
+showing model activity rather than every record the stream carries. Verified on
+a full attended run of the pipeline against a real PR: 5/5 phases, 1,914 flow
+records, 656 machine-scoped host samples, one sampler owner, twelve concurrent
+units at peak.
 
 ### Migration — the review funnel is gone
 
@@ -150,6 +164,12 @@ it against your own copy if you keep one ([#2433](https://github.com/kstrat2001/
   offered facets and comes back — and the Filters button / pane chip now
   count actual hidden records instead of "1 per facet with anything
   hidden."
+- **The filter panel is sectioned, and the sections toggle** ([#2444](https://github.com/kstrat2001/darkmux/pull/2444)) —
+  activity facets group under MODEL / DISPATCH / MISSION / MACHINE / OTHER,
+  each with a tri-state header checkbox that turns its whole section on or off,
+  and the search field sits at the top on its own line instead of sharing a row
+  with the count. The one-off "model only" and "clear all" buttons are gone: a
+  header toggle does both jobs and names which group it is doing them to.
 - **The PR-review parity suite (`next-parity-live`) now runs in CI**
   ([#2422](https://github.com/kstrat2001/darkmux/pull/2422)) — it was the
   one suite the parity loop skipped, which is how a red test (broken by the
@@ -244,6 +264,13 @@ it against your own copy if you keep one ([#2433](https://github.com/kstrat2001/
   (opening a sliver a few percent tall that read as "won't open") is now
   clamped to the drag's own range on load; the drag handle's hit target
   grew 14px → 24px → 32px; the dead band above the first section is gone.
+- **Phone pass on the LIVE pill, the event count, and the drill-in strip**
+  ([#2443](https://github.com/kstrat2001/darkmux/pull/2443)) — the pill's dot
+  sits beside its label instead of a word away; the event-count box centers its
+  text and takes the whole row; the drill-in back strip stops stacking its
+  timestamp one character per line; the filter control reads as a funnel rather
+  than a caret; and the filter and clock buttons stop rendering permanently lit
+  on a touch screen, where `:hover` never releases.
 - **The live-status pill announces reconnects under a flapping stream**
   ([#2435](https://github.com/kstrat2001/darkmux/pull/2435)) — a stream
   that drops and recovers faster than the announcement's hold window used
@@ -310,7 +337,7 @@ it against your own copy if you keep one ([#2433](https://github.com/kstrat2001/
   `lab eval` / `lab review-bench`.
 - `darkmux-review.yml` no longer builds `darkmux-bundler-rust`.
 
-[Unreleased]: https://github.com/kstrat2001/darkmux/compare/v3.6.0...HEAD
+[3.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.7.0
 
 ## [3.6.0] - 2026-09-04
 
