@@ -158,6 +158,87 @@ export interface Facets {
   src: string[];
 }
 
+/** (operator, 2026-09-06) The five groupings the activity facet's header
+ * toggles are organized under, replacing the modal's old "model only" /
+ * "clear all" quick actions (see `FiltersDialog.tsx`) with a header-per-
+ * section toggle instead. Order is the render order: the model's own
+ * per-turn signal first, then dispatch-lifecycle/harness bookkeeping, then
+ * mission/phase/step/hook scheduler activity, then fleet-machine activity,
+ * then everything else. */
+export type ActivitySectionTitle = "MODEL" | "DISPATCH" | "MISSION" | "MACHINE" | "OTHER";
+
+const MODEL_SECTION_VALUES = new Set(["reasoning", "tool call", "checkpoint", "turn"]);
+const DISPATCH_SECTION_VALUES = new Set([
+  "dispatch start",
+  "dispatch end",
+  "dispatch error",
+  "heartbeat",
+  "detector",
+  "runtime",
+  "tokens",
+  "lms",
+  "compaction",
+  "feedback",
+  "routing",
+  "session end", "telemetry"]);
+const MISSION_SECTION_VALUES = new Set(["note"]);
+const MACHINE_SECTION_VALUES = new Set(["machine online", "machine offline", "host telemetry"]);
+
+/** Which section a single activity value (a mapped `ACT_ORDER` label, or a
+ * raw value `activityOf`'s fallback passed through unmapped) belongs under.
+ * Mapped values are matched by exact membership first; a raw/absorbed value
+ * that matches none of the curated sets falls through to the PREFIX rules
+ * the operator specified (`dispatch.` for DISPATCH; `mission`/`phase`/
+ * `step`/`hook.` for MISSION; `machine` for MACHINE), and anything left
+ * over — including the literal `"other"` — lands in OTHER. Order matters:
+ * a value is checked against each section's curated set/prefix in the same
+ * MODEL → DISPATCH → MISSION → MACHINE → OTHER order the sections render
+ * in, so no value can match two sections. */
+/* "telemetry" (the generic label, in practice `telemetry.context` — a
+ * dispatch's own context-window usage per compaction) is DISPATCH, not
+ * MACHINE: it is per-dispatch bookkeeping, unlike "host telemetry"
+ * (`machine.telemetry`, the machine-scoped sampler). Review finding on
+ * the sectioned panel, 2026-09-06. */
+export function activitySectionOf(value: string): ActivitySectionTitle {
+  if (MODEL_SECTION_VALUES.has(value)) return "MODEL";
+  if (DISPATCH_SECTION_VALUES.has(value) || value.startsWith("dispatch.")) return "DISPATCH";
+  if (
+    MISSION_SECTION_VALUES.has(value) ||
+    value.startsWith("mission") ||
+    value.startsWith("phase") ||
+    value.startsWith("step") ||
+    value.startsWith("hook.")
+  ) {
+    return "MISSION";
+  }
+  if (MACHINE_SECTION_VALUES.has(value) || value.startsWith("machine")) return "MACHINE";
+  return "OTHER";
+}
+
+export interface ActivitySectionGroup {
+  title: ActivitySectionTitle;
+  values: string[];
+}
+
+const ACTIVITY_SECTION_ORDER: ActivitySectionTitle[] = ["MODEL", "DISPATCH", "MISSION", "MACHINE", "OTHER"];
+
+/** Groups an ordered list of PRESENT activity values (`facets.act`, already
+ * ordered by `computeFacets`) into the five sections above, preserving each
+ * value's relative order within its section. A section with nothing present
+ * is omitted entirely, not rendered empty (`FiltersDialog.tsx`'s `FiltersBody`
+ * relies on this to skip rendering a header nobody can act on). */
+export function groupActivitiesBySections(values: string[]): ActivitySectionGroup[] {
+  const buckets: Record<ActivitySectionTitle, string[]> = {
+    MODEL: [],
+    DISPATCH: [],
+    MISSION: [],
+    MACHINE: [],
+    OTHER: [],
+  };
+  for (const v of values) buckets[activitySectionOf(v)].push(v);
+  return ACTIVITY_SECTION_ORDER.map((title) => ({ title, values: buckets[title] })).filter((g) => g.values.length > 0);
+}
+
 /** `recompute()`'s facet derivation — viewer.html:1054-1058.
  *
  * One DELIBERATE divergence from legacy, named here because the file it

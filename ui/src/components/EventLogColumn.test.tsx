@@ -235,18 +235,13 @@ describe("EventLogColumn", () => {
     expect(document.querySelector('[aria-labelledby="filters-title"]')).toBeInTheDocument();
   });
 
-  it("the modal's 'model only' quick action keeps reasoning/tool-call/turn rows and drops others", () => {
-    const records = [
-      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-reasoning" }),
-      rec({ ts: "2026-08-08T12:05:00.000Z", action: "machine.online", session_id: "s-machine" }),
-    ];
-    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    fireEvent.click(document.getElementById("fbtn")!);
-    fireEvent.click(screen.getByText("model only"));
-    const rows = document.querySelectorAll('[data-act="rec"]');
-    expect(rows.length).toBe(1);
-    expect(rows[0].textContent).toContain("s-reasoning");
-  });
+  // (operator, 2026-09-06) The modal's standalone "model only" quick-action
+  // button is REMOVED — replaced by the MODEL section's own header toggle
+  // (`FiltersDialog.tsx`'s `SectionHeader`, tested directly in
+  // `FiltersDialog.test.tsx`). This test used to click that button by its
+  // text; it's superseded by the section-header coverage there rather than
+  // rewritten here, since narrowing to "model activity only, everything else
+  // off" is no longer a single gesture — it now happens per section.
 
   it("the modal's checkbox grid filters by category/tier/source, not just activity", () => {
     const records = [
@@ -263,15 +258,11 @@ describe("EventLogColumn", () => {
     expect(rows[0].textContent).toContain("s-local");
   });
 
-  it("'clear all' restores every facet and empties the search text", () => {
-    const records = [rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-1", tier: "local" })];
-    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    fireEvent.click(document.getElementById("fbtn")!);
-    fireEvent.click(screen.getByLabelText("local"));
-    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(0);
-    fireEvent.click(screen.getByText("clear all"));
-    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(1);
-  });
+  // (operator, 2026-09-06) The modal's standalone "clear all" button is
+  // REMOVED along with "model only" — see the note above. Re-selecting a
+  // single unchecked value is exactly what the per-value checkbox already
+  // covers (the test above); a whole-panel reset is no longer a single
+  // gesture the panel offers.
 
   // (#2417 round 2, MF2) The button used to read "filters · 1" whether one
   // value or seventeen were hidden — a strict-subset-per-facet count capped
@@ -394,6 +385,40 @@ describe("EventLogColumn", () => {
 
     const storedAfterB = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
     expect(storedAfterB.q).toBe("s-cloud");
+  });
+
+  // (#2444 review finding) `setFacetMany` — the section header's gesture —
+  // had no mounted-column coverage: `FiltersDialog.test.tsx` mocks the
+  // callback, so flipping `set.delete(v)` to `set.add(v)` stayed green.
+  // This drives the real header through the real column and asserts BOTH
+  // the visible rows and the persisted store, the same store shape four
+  // individual unchecks would write (the reviewer proved byte-equality).
+  it("a section header sets exactly its present values, through the mounted column, and persists them", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s1" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", action: "dispatch.tool", session_id: "s1" }),
+      rec({ ts: "2026-08-08T12:02:00.000Z", action: "machine.online", session_id: "s1" }),
+    ];
+    const { container } = render(<EventLogColumn scopeLabel="fleet" paneId="a" records={records} visible />);
+    // Default view: the two MODEL rows show; machine online is off by default.
+    expect(container.querySelectorAll('[data-act="rec"]').length).toBe(2);
+    fireEvent.click(document.getElementById("fbtn")!);
+    // The dialog is display-toggled by class, which jsdom does not compute,
+    // so role queries treat it as hidden; query the header by its label.
+    const headerOf = () =>
+      [...document.querySelectorAll<HTMLInputElement>("input[aria-label]")].find((i) =>
+        /^model:/i.test(i.getAttribute("aria-label") ?? ""),
+      )!;
+    const header = headerOf();
+    expect(header.checked).toBe(true);
+    fireEvent.click(header);
+    expect(container.querySelectorAll('[data-act="rec"]').length).toBe(0);
+    const stored = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    expect([...stored.act.exclude].sort()).toEqual(["reasoning", "tool call"]);
+    expect(stored.act.include).toEqual([]);
+    // Back on: the same header, now unchecked, re-includes exactly those two.
+    fireEvent.click(headerOf());
+    expect(container.querySelectorAll('[data-act="rec"]').length).toBe(2);
   });
 
   // RED-PROVED (real regression, caught by
