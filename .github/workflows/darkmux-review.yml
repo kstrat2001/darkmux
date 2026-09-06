@@ -18,20 +18,25 @@
 # SECURITY (public repo + self-hosted runner): the trigger is **workflow_dispatch
 # only** — it never fires on a `pull_request` event, so a stranger's PR (or a
 # fork) can NOT auto-run anything on the runner. Only someone with write access
-# launches it (`gh workflow run darkmux-review.yml -f pr=<n>`), and even then the
-# job NEVER checks out the reviewed PR's code: it reads only the PR *diff* via
-# the API (data, not executed). What actually leaves this machine, and where
-# it goes: the diff (`diff_file`), the PR title/body as intent text
-# (`intent_file`), and the materialized source tree `plan.sites` derives from
-# `github`+`head_sha` when no `workspace` is given — all read as data, never
-# executed, and dispatched to the LOCAL reviewer model named by the runner's
-# own `role_profiles.reviewer` (`review.json`'s `github` input itself is
-# reached by `plan.sites`'s config but not consumed there — no fetch path
-# exists; see that step's own module doc). The one opt-in exception is
-# `mod_seat_profile`, which — only when explicitly set — sends a finding and
-# its named source to a hosted endpoint for a coder seat; unset by default.
-# The repo checkout below is of trusted `main` (the review tooling), not the
-# PR. Runner registration + prerequisites: see .github/DARKMUX_REVIEW_RUNNER.md.
+# launches it (`gh workflow run darkmux-review.yml -f pr=<n>`). The job does
+# clone the reviewed PR's tree — `plan.sites` (`crates/darkmux-lab/src/crawl/
+# plan_sites_step.rs`'s `derive_workspace_spec`), given no `workspace` param,
+# parses `github` (`owner/repo`) into an ANONYMOUS `https://github.com/<owner>/
+# <repo>` origin and materializes it (`workspace_spec::materialize` — a bare
+# mirror clone, then a checkout at `head_sha`, `read_only: true`) into a
+# read-only scratch tree — this reaches PUBLIC repositories only, and no
+# token is read, injected, or inferred. What actually leaves this machine,
+# and where it goes: the diff (`diff_file`), the PR title/body as intent text
+# (`intent_file`), and that read-only materialized tree — all read as data,
+# NEVER EXECUTED (the runner configures no `test_command`, so `create-mods`'s
+# gate never runs a command against it either), and dispatched to the LOCAL
+# reviewer model named by the runner's own `role_profiles.reviewer`. The one
+# opt-in exception is `mod_seat_profile`, which — only when explicitly set —
+# sends a finding and its named source to a hosted endpoint for a coder seat;
+# unset by default. The repo checkout below (this workflow's OWN checkout
+# step, distinct from the materialized PR tree above) is of trusted `main`
+# (the review tooling), never the PR ref. Runner registration + prerequisites:
+# see .github/DARKMUX_REVIEW_RUNNER.md.
 name: darkmux self-review
 
 on:

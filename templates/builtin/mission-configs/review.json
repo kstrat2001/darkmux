@@ -31,7 +31,7 @@
     },
     {
       "name": "github",
-      "description": "owner/repo — mirrors the frozen `review` config's input. Reaches each `plan-<rule>` step's config but is not yet consumed (no fetch path exists yet — see `plan_sites_step.rs`'s module doc).",
+      "description": "owner/repo — mirrors the frozen `review` config's input. Consumed by each `plan-<rule>` step's `plan.sites` kind when no `workspace` param is given: `derive_workspace_spec` parses it into an ANONYMOUS `https://github.com/<owner>/<repo>` origin, paired with `head_sha` as the checkout ref, and materializes that (a bare mirror clone + checkout, `read_only: true`) into a read-only scratch tree — see `plan_sites_step.rs`'s module doc. Reaches PUBLIC repositories only; a private repo needs an explicit `workspace` spec instead.",
       "required": false
     },
     {
