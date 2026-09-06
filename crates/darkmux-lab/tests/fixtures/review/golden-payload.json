@@ -2,7 +2,7 @@
   "mode": "review",
   "review": {
     "event": "COMMENT",
-    "body": "### darkmux review\n\nreview ran: 5 of 5 rules reviewed, 5/5 hunks covered, 5 finding(s) considered, 0 refused. This review checks a fixed set of rules; it is not a full design review.\n\n_darkmux — advisory, not a merge gate._",
+    "body": "### darkmux review\n\nreview ran: 5 of 5 rules reviewed, 5/5 hunks covered, 5 finding(s) considered, 0 refused. This review checks a fixed set of rules; it is not a full design review. 1 proposed change not verified — the gate ran and did not pass; `darkmux mod show mod-<key>`.\n\n_darkmux — advisory, not a merge gate._",
     "comments": [
       {
         "path": "src/billing.ts",
@@ -14,7 +14,7 @@
         "path": "src/auth.ts",
         "line": 3,
         "side": "RIGHT",
-        "body": "- the condition is hard to read at a glance\n\n`unnamed-predicate`"
+        "body": "- the condition is hard to read at a glance\n\n`unnamed-predicate`\n\n1 proposed change not verified — the gate ran and did not pass; `darkmux mod show mod-<key>`"
       },
       {
         "path": "src/retry.ts",
@@ -36,5 +36,5 @@
       }
     ]
   },
-  "fallback_comment": "review ran: 5 of 5 rules reviewed, 5/5 hunks covered, 5 finding(s) considered, 0 refused. This review checks a fixed set of rules; it is not a full design review.\n\n- `src/billing.ts:5` — the catch block swallows the error.\n- `src/auth.ts:3` — the condition is hard to read at a glance.\n- `src/retry.ts:3` — did you check for an existing retry helper.\n- `src/status.ts:3` — a new string-literal union may duplicate an existing enum.\n- `src/shared.ts:4` — a shared function's signature changed."
+  "fallback_comment": "review ran: 5 of 5 rules reviewed, 5/5 hunks covered, 5 finding(s) considered, 0 refused. This review checks a fixed set of rules; it is not a full design review. 1 proposed change not verified — the gate ran and did not pass; `darkmux mod show mod-<key>`.\n\n- `src/billing.ts:5` — the catch block swallows the error.\n- `src/auth.ts:3` — the condition is hard to read at a glance.\n- `src/retry.ts:3` — did you check for an existing retry helper.\n- `src/status.ts:3` — a new string-literal union may duplicate an existing enum.\n- `src/shared.ts:4` — a shared function's signature changed."
 }

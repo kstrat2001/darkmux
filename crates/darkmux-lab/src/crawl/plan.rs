@@ -3869,7 +3869,12 @@ line two
             assert!(!spoken.contains(word), "the review speaks darkmux's own procedure word {word:?}: {spoken}");
         }
 
-        let actual = serde_json::to_string_pretty(&payload).unwrap();
+        // (#2438) The delivered text now names an unverified mod's KEY
+        // (`darkmux mod show mod-<epoch>-<hex>`), and the fixture mints its
+        // mod through the real emission path, whose key is wall-clock by
+        // design. Normalize keys to a stable token before comparing so the
+        // golden pins the RENDERING, not the clock.
+        let actual = normalize_mod_keys(&serde_json::to_string_pretty(&payload).unwrap());
         let golden_path = review_fixture_dir().join("golden-payload.json");
         if std::env::var("DARKMUX_REVIEW_V2_GOLDEN_UPDATE").is_ok() {
             fs::write(&golden_path, format!("{actual}\n")).unwrap();
@@ -3884,5 +3889,31 @@ line two
                 golden_path.display()
             );
         }
+    }
+
+    /// Replace every `mod-<digits>-<6 hex>` key with `mod-<key>` so goldens
+    /// that embed a minted mod key stay byte-stable across runs.
+    fn normalize_mod_keys(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if text[i..].starts_with("mod-") {
+                let rest = &text[i + 4..];
+                let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                if digits > 0 && rest[digits..].starts_with('-') {
+                    let hex = rest[digits + 1..].chars().take_while(|c| c.is_ascii_hexdigit()).count();
+                    if hex == 6 {
+                        out.push_str("mod-<key>");
+                        i += 4 + digits + 1 + 6;
+                        continue;
+                    }
+                }
+            }
+            let ch = text[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
     }
 }
