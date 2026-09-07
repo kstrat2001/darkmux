@@ -222,12 +222,25 @@ fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
 
     // Anti-vacuity: the negative assertions below mean nothing unless this
     // command really does write a roster somewhere.
+    //
+    // (#2450) Under EITHER helper root, not `HOME`'s specifically. Before
+    // #2450 the roster came from `dirs::home_dir()`, so it could only land
+    // under `<child_home>/.darkmux`; now `fleet_file` resolves through
+    // `paths::resolve`, whose first branch is `DARKMUX_HOME` — so it
+    // correctly lands under `child_darkmux_home` instead. Pinning the HOME
+    // root specifically would make this guard fail on a fix that is working,
+    // which is exactly what it did when the two branches first met. What the
+    // guard is actually for is unchanged: the child wrote its state inside
+    // the helper's own tree rather than into the operator's.
+    let roster_under_home = child_home.join(".darkmux").join("fleet.json");
+    let roster_under_darkmux_home = child_darkmux_home.join("fleet.json");
     assert!(
-        child_home.join(".darkmux").join("fleet.json").is_file(),
-        "(#2184) `machine add` wrote no roster under the helper's own root ({}) — either the \
-         isolation is pointing somewhere unexpected, or this probe no longer writes state and \
-         the assertions below are vacuous",
-        child_home.display()
+        roster_under_home.is_file() || roster_under_darkmux_home.is_file(),
+        "(#2184/#2450) `machine add` wrote no roster under either of the helper's own roots \
+         ({} or {}) — either the isolation is pointing somewhere unexpected, or this probe no \
+         longer writes state and the assertions below are vacuous",
+        roster_under_home.display(),
+        roster_under_darkmux_home.display()
     );
     assert!(
         !empty_cwd.path().join(".darkmux").exists(),
