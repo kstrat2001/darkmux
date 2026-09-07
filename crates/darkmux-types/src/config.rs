@@ -503,9 +503,35 @@ pub struct RuntimeBehaviorConfig {
 /// below `min_cpu_speed_limit_pct`, the host writes the pace file with
 /// `pause: true, reason: "thermal-critical"` — the in-flight unit pauses
 /// with its checkpoint persisted (#2114), never killed — and, for a crawl
-/// mission, also drops the crawl's `STOP` file so no further unit gets
-/// dispatched. Resume is the operator's call (`darkmux dispatch --resume`);
-/// the breaker does not un-pause itself on recovery.
+/// mission, also drops the crawl's `STOP` file. **Read side (#2454):**
+/// `crawl.unit`'s own step kind checks that file (via
+/// `thermal_governor::stop_file_path_from_record_context`, never a raw
+/// re-join) before preparing each unit's dispatch, so a unit that has not
+/// started yet is skipped rather than dispatched — reported in the crawl's
+/// summary as `stopped_by: "thermal"` with a per-unit `thermal_stop` result,
+/// never silently folded into `error`. A unit already in flight is
+/// unaffected here; that one keeps resting on the pace file above. Known
+/// gap: a crawl spec with an explicit `root:` override cannot be
+/// reconstructed from the dispatch's `record_context` alone, so the STOP
+/// file is neither written nor read for that case (see
+/// `stop_file_path_from_record_context`'s own doc) — symmetric, so such a
+/// crawl gets no breaker rather than a half-working one.
+///
+/// **Scope of the STOP file (#2454).** Nothing removes it — not the
+/// retired launcher, not the governor — and its path
+/// (`<root>/crawl/<manifest>/STOP`) is keyed to the WORKSPACE, not to a
+/// run. So the breaker STAMPS the mission it fired in
+/// (`thermal_governor::stop_file_body`) and a unit honors the file only
+/// when it names its OWN mission: the stop binds the run the breaker was
+/// protecting, and a LATER crawl on the same workspace is not refused by
+/// an older run's thermal event. Without that scoping one transient
+/// thermal event would disable every future crawl on that workspace
+/// permanently. A STOP file naming NO mission — hand-written, or from a
+/// build older than #2454 — is still honored by every mission, and only a
+/// human removes it; the skip message names the exact `rm` for it.
+///
+/// Resume within a run is the operator's call (`darkmux dispatch
+/// --resume`); the breaker does not un-pause itself on recovery.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThermalConfig {
     /// The gate: `true`/absent → governor + breaker active; `false` → the

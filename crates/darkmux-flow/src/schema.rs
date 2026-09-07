@@ -976,6 +976,29 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.42.0";
 //           step id must do it per-side, never across: on the old side
 //           the value may be a filesystem path belonging to whichever
 //           machine wrote it, which joins to no step record anywhere.
+//
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2454: 1.39.0's own
+//           entry above claimed `units_skipped` "is now always 0 (there
+//           is no between-units skip loop left to stop early)". That
+//           stopped being true the moment `crawl.unit`'s own step kind
+//           learned to read the thermal breaker's `STOP` file
+//           (`thermal_governor::stop_file_path_from_record_context`)
+//           before dispatching each unit — the between-units skip loop
+//           came BACK, just moved from the retired launcher into the
+//           step kind itself. `units_skipped` now counts units the
+//           breaker skipped before they ever dispatched, and
+//           `mission close`'s `stopped_by` gains a fourth value,
+//           `"thermal"`, alongside 1.39.0's `"error"`/`"done"`. No wire
+//           shape changed — still a `usize` and a `String` in the same
+//           positions — so this is a VALUE-RANGE correction to that
+//           entry's claim, not a new key or a reason to bump.
+//
+//           A reader keying on `stopped_by` must therefore treat it as an
+//           OPEN string, not a two-value enum: `"thermal"` is the fourth
+//           value the field has carried (the retired launcher also wrote
+//           `"limit"` and `"kill_file"`), and the generated
+//           `CrawlSummary.ts` types it as a bare `string` for exactly this
+//           reason. Nothing in the viewer switches on its value today.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

@@ -20,9 +20,12 @@ export type CrawlSummary = { schema_version: string, mission_id: string, workspa
  */
 units_selected: number, units_not_run: number, units_completed: number, units_errored: number, units_interrupted: number, units_budget_exhausted: number, 
 /**
- * The scheduler runs every grown unit; there is no between-units skip
- * loop to stop early any more, so this is always 0. Kept, present, for
- * readers keyed on the retired launcher's shape.
+ * (#2454) Every grown unit is still SCHEDULED — the scheduler has no
+ * between-units skip loop of its own — but a unit's own `run` can
+ * decline to dispatch when the thermal breaker's `STOP` file is
+ * present, and this counts exactly those. Before #2454 this was
+ * always 0 (kept, present, for readers keyed on the retired launcher's
+ * shape); it is no longer a dead field.
  */
 units_skipped: number, findings: bigint, prompt_tokens: bigint, completion_tokens: bigint, wall_ms: bigint, tokens_per_hour: bigint, stopped_by: string, est_tokens: bigint, model: string | null, profile: string | null, sources: Array<PlanSourceRef>, 
 /**

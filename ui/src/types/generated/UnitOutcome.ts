@@ -19,7 +19,9 @@ unit: string,
  */
 rule: string | null, source: string, 
 /**
- * `stop` | `unit_budget_exhausted` | `timeout` | `error`.
+ * `stop` | `unit_budget_exhausted` | `timeout` | `error` |
+ * `thermal_stop` (#2454 — the breaker's STOP file was present before
+ * this unit ever dispatched).
  */
 result: string, 
 /**

@@ -6203,6 +6203,20 @@ mod tests {
              `CRAWL_PLAN_KIND` — the scan will silently stop matching `crawl.plan` steps"
         );
 
+        // (#2454) The same crate-boundary duplication, one level down: the
+        // scan reads a `crawl.unit` outcome's `result` to tell a unit that
+        // REVIEWED its windows from one the thermal breaker skipped before
+        // it ever dispatched. Drift here is silent AND produces a false
+        // claim rather than a mere blind spot — a skipped unit would go
+        // back to counting as covered, so the posted review would assert
+        // coverage of hunks a thermally shortened run never looked at.
+        assert_eq!(
+            crew::step_kinds::UNIT_RESULT_THERMAL_STOP,
+            darkmux_lab::crawl::unit_step::THERMAL_STOP,
+            "records.gather's local literal has drifted from darkmux-lab's real `THERMAL_STOP` — \
+             thermally-skipped units would silently count as reviewed coverage again"
+        );
+
         let registry = all_step_kinds().expect("all_step_kinds must build cleanly in a test process");
         let known = registry.ids();
         for kind in [
