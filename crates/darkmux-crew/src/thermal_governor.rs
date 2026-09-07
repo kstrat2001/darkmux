@@ -167,11 +167,73 @@ pub fn stop_file_path_from_record_context(
         return None;
     }
     let manifest_name = ctx.get("workspace")?.as_str()?;
-    if manifest_name.trim().is_empty() {
+    if !valid_crawl_manifest_name(manifest_name) {
         return None;
     }
     let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
     Some(root.join("crawl").join(manifest_name).join("STOP"))
+}
+
+/// (#2157) A crawl manifest name is safe to join onto `<darkmux
+/// root>/crawl/` only if it is a SINGLE path component that cannot smuggle
+/// an absolute path, a `..` traversal, an embedded/trailing separator, or
+/// an empty segment through the `PathBuf::join` above — `Path::join`
+/// REPLACES the accumulated path outright when the joined component is
+/// absolute, and does nothing to strip `..`, so `/etc/passwd` or
+/// `../../../etc/passwd` sail straight through unless the NAME is
+/// validated before the join. The result can't be checked after the fact
+/// either: it may not exist on disk yet (this runs before the STOP file is
+/// ever written), and `canonicalize` would follow symlinks — the wrong
+/// tool for validating a name, not a location (see this module's own
+/// symlink-hazard note on `write_stop_file`, which this function does not
+/// address).
+///
+/// Deliberately a REJECT, not a sanitize: `record_context.workspace` is
+/// caller/crew-supplied, and a value carrying a path separator or a
+/// `.`/`..` segment is either a caller bug or an attack — it should fail
+/// derivation loudly (surfaced via [`stop_file_unresolved_reason`]), not
+/// get silently rewritten to some OTHER name the operator never chose and
+/// would not think to look for. Rejecting also keeps this validator
+/// STRUCTURAL rather than a blacklist of "bad substrings" a sanitizer
+/// could miss: the whitelist below cannot express an absolute path or a
+/// `..` component by construction, so there is no way past it for the
+/// exploit class this exists to close.
+///
+/// Same character class `workspace_spec::valid_source_id` already enforces
+/// for the identical reason on a different join (a workspace SOURCE id
+/// onto its own materialized root) — kept independently defined rather
+/// than shared, per this module's existing "must not depend on the crawl
+/// module" boundary (see [`stop_file_path_from_record_context`]'s own doc).
+///
+/// **This validator is deliberately STRICTER than its own source, and that
+/// is a known one-way divergence (#2157 review).** The value being checked
+/// is `WorkspaceSpec::effective_name()` (spec `name`, else the spec file's
+/// stem), which reaches here as `record_context.workspace` via
+/// `materialized.name` -> `crawl::plan::Plan::workspace`. `WorkspaceSpec`
+/// validates each source `id` against this class but does NOT validate the
+/// spec's own `name` — so a spec named `q1 corpus` or `_scratch` loads
+/// fine, materializes to `<root>/workspaces/<name>`, and would be REJECTED
+/// here. The divergence is safe in this direction (a rejected name means
+/// no STOP path is derived, and [`stop_file_unresolved_reason`] says so
+/// out loud rather than failing silently) but it is a false negative, not
+/// a no-op: such a crawl's breaker cannot write its STOP file. Closing it
+/// properly means validating `name` at its SOURCE in
+/// `WorkspaceSpec::validate()` — same class, same reason it already
+/// applies to `id` — which would additionally close the same-class
+/// unvalidated join at `workspace_spec::resolved_root()`. Tracked
+/// separately; not fixed here because it changes `WorkspaceSpec::load()`'s
+/// accept/reject contract, which is a wider blast radius than this
+/// module's own bug.
+fn valid_crawl_manifest_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        // Also rejects "." and ".." outright — neither starts with an
+        // alphanumeric — and rejects an empty string the same way the
+        // caller's old `trim().is_empty()` check did, so this subsumes it.
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// (#2110/#2109 review finding 5) Companion to
@@ -201,12 +263,36 @@ pub fn stop_file_unresolved_reason(record_context: Option<&serde_json::Value>) -
         return None;
     }
     match ctx.get("workspace").and_then(|v| v.as_str()) {
-        Some(name) if !name.trim().is_empty() => None,
-        Some(_) => Some("record_context.workspace is present but empty"),
+        Some(name) if valid_crawl_manifest_name(name) => None,
+        Some(name) if name.trim().is_empty() => Some("record_context.workspace is present but empty"),
+        // (#2157) A non-empty value that still fails validation — an
+        // absolute path, a `..` component, an embedded/trailing
+        // separator — is a DISTINCT reason from "empty": surfaced
+        // separately so a rejected traversal attempt doesn't read in logs
+        // as an ordinary missing-field case.
+        Some(_) => Some(
+            "record_context.workspace is not a valid manifest name (must be a single path \
+             segment: alphanumeric, `.`, `_`, `-` only — no `/`, no `..`)",
+        ),
         None => Some("record_context.workspace is missing or not a string"),
     }
 }
 
+/// **Known, unfixed gap (#2157 audit):** `stop_file`'s NAME is validated
+/// (see [`valid_crawl_manifest_name`]), but this function does not verify
+/// its final PATH component before writing. If `<root>/crawl/<name>`
+/// already exists as a symlink to somewhere else — planted by anything
+/// with write access to `<root>/crawl/` before the breaker ever fires —
+/// `create_dir_all` follows it and the fixed `thermal-critical\n` content
+/// lands wherever the symlink points, not under `<root>/crawl/`.
+/// Reachability requires local write access to `<root>/crawl/` already,
+/// which is a strictly stronger position than the unvalidated-name bug
+/// this module fixes for #2157 (that one is reachable from a plain crawl
+/// manifest name/`record_context` value, no filesystem write access
+/// needed at all). Left unfixed here because it doesn't fall out of the
+/// name-validation fix — closing it needs a pre-write check (e.g.
+/// `symlink_metadata` on `stop_file` and its parent, refusing a symlink)
+/// that this function doesn't have today.
 fn write_stop_file(stop_file: &Path) {
     if let Some(parent) = stop_file.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1119,6 +1205,246 @@ mod tests {
     #[test]
     fn stop_file_path_none_when_absent() {
         assert_eq!(stop_file_path_from_record_context(None), None);
+    }
+
+    // ── #2157: manifest name must not escape <root>/crawl/ ──
+
+    #[test]
+    fn stop_file_path_none_for_absolute_manifest_name() {
+        // `PathBuf::join` REPLACES the accumulated path outright when the
+        // joined component is absolute — unvalidated, this would return
+        // `/etc/passwd/STOP`, discarding `<root>/crawl/` entirely.
+        let ctx = serde_json::json!({ "workspace": "/etc/passwd", "unit": "unit-1" });
+        assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
+    }
+
+    #[test]
+    fn stop_file_path_none_for_dotdot_traversal() {
+        let ctx = serde_json::json!({ "workspace": "../../../../etc/passwd", "unit": "unit-1" });
+        assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
+    }
+
+    #[test]
+    fn stop_file_path_none_for_nested_dotdot_that_only_escapes_after_joining() {
+        // A name that looks locally harmless component-by-component but
+        // still escapes `<root>/crawl/` once joined and walked.
+        let ctx = serde_json::json!({ "workspace": "a/../../b", "unit": "unit-1" });
+        assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
+    }
+
+    #[test]
+    fn stop_file_path_none_for_bare_separator() {
+        let ctx = serde_json::json!({ "workspace": "/", "unit": "unit-1" });
+        assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
+    }
+
+    #[test]
+    fn stop_file_path_none_for_trailing_separator() {
+        let ctx = serde_json::json!({ "workspace": "my-manifest/", "unit": "unit-1" });
+        assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
+    }
+
+    #[test]
+    fn stop_file_path_none_for_embedded_empty_component() {
+        let ctx = serde_json::json!({ "workspace": "a//b", "unit": "unit-1" });
+        assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
+    }
+
+    #[test]
+    fn stop_file_path_ordinary_manifest_name_still_resolves() {
+        // The direction most likely to be broken by an over-eager fix: a
+        // realistic manifest name (digits, dot, underscore, hyphen) must
+        // still produce the expected path.
+        let ctx = serde_json::json!({ "workspace": "crawl_v2.1-final", "unit": "unit-1" });
+        let path = stop_file_path_from_record_context(Some(&ctx)).unwrap();
+        assert!(path.ends_with("crawl/crawl_v2.1-final/STOP"), "{}", path.display());
+    }
+
+    #[test]
+    fn stop_file_unresolved_reason_some_when_workspace_is_traversal() {
+        let ctx = serde_json::json!({ "workspace": "../escape", "unit": "unit-1" });
+        assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None, "sibling still returns None");
+        assert!(
+            stop_file_unresolved_reason(Some(&ctx)).is_some(),
+            "an invalid manifest name must warn, not silently agree with the non-crawl case"
+        );
+    }
+
+
+    // ── #2157 REVIEW: adversarial corpus against the central claim ──
+
+    /// The central claim, asserted STRUCTURALLY rather than case by case:
+    /// no `record_context.workspace` value can make the derivation produce
+    /// a path outside `<root>/crawl/`.
+    ///
+    /// Note the containment check is deliberately TWO assertions.
+    /// `Path::starts_with` alone is VACUOUS here: it compares components
+    /// lexically, so `<root>/crawl/../../etc/STOP` *does* start_with
+    /// `<root>/crawl` (components: .., .., etc are simply *after* the
+    /// prefix). A containment test written with `starts_with` on its own
+    /// would pass for the very traversal it exists to reject — so the
+    /// absence of any `ParentDir` component is asserted separately, and
+    /// the shape is pinned exactly (`<name>/STOP`, two components past
+    /// `<root>/crawl`).
+    #[test]
+    fn no_workspace_value_can_escape_the_crawl_root() {
+        let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
+        let crawl_root = root.join("crawl");
+
+        let corpus = [
+            // absolute / separator smuggling
+            "/etc/passwd",
+            "/",
+            "//",
+            "../../../../Users/x/Library/LaunchAgents",
+            "..",
+            ".",
+            "./ok",
+            "ok/..",
+            "a/../../b",
+            "ok/",
+            "/ok",
+            "a//b",
+            // windows-shaped
+            r"C:\Windows\System32",
+            r"a\b",
+            r"..\..\evil",
+            // unicode that renders or normalizes like a separator
+            "\u{FF0F}etc\u{FF0F}passwd", // FULLWIDTH SOLIDUS
+            "a\u{2044}b",                // FRACTION SLASH
+            "a\u{2215}b",                // DIVISION SLASH
+            "\u{0430}bc",                // CYRILLIC homoglyph 'a'
+            "\u{FF41}bc",                // FULLWIDTH LATIN SMALL A
+            "caf\u{00E9}",               // ordinary non-ASCII
+            "e\u{0301}tude",             // combining acute
+            "\u{202E}gnp.exe",           // RTL override
+            "\u{FEFF}ok",                // BOM
+            // control / whitespace
+            "",
+            " ",
+            "\t",
+            "   ",
+            " ok ",
+            "a\nb",
+            "a\0b",
+            "\0",
+            // dotfiles
+            ".hidden",
+            "-rf",
+            "_scratch",
+        ];
+
+        for name in corpus {
+            let ctx = serde_json::json!({ "workspace": name, "unit": "u1" });
+            let Some(path) = stop_file_path_from_record_context(Some(&ctx)) else {
+                continue; // rejected outright — the desired outcome
+            };
+            assert!(
+                path.starts_with(&crawl_root),
+                "escaped <root>/crawl: {:?} -> {}",
+                name,
+                path.display()
+            );
+            assert!(
+                !path.components().any(|c| matches!(c, std::path::Component::ParentDir)),
+                "resolved path carries a `..` component: {:?} -> {}",
+                name,
+                path.display()
+            );
+            let rest: Vec<_> = path.strip_prefix(&crawl_root).unwrap().components().collect();
+            assert_eq!(
+                rest.len(),
+                2,
+                "must be exactly <name>/STOP under <root>/crawl: {:?} -> {}",
+                name,
+                path.display()
+            );
+        }
+    }
+
+
+    /// Pins the accepted CHARACTER CLASS exactly, which the containment
+    /// corpus above cannot do on its own: a non-ASCII character is not a
+    /// containment threat on POSIX (nothing normalizes U+FF0F FULLWIDTH
+    /// SOLIDUS into U+002F, and APFS's normalization-insensitivity is
+    /// NFC/NFD only), so widening the class to Unicode would leave
+    /// `no_workspace_value_can_escape_the_crawl_root` perfectly green.
+    /// The ASCII restriction is defense-in-depth against homoglyph
+    /// confusion, and it needs its own guard or it can be dropped
+    /// silently.
+    #[test]
+    fn accepted_character_class_is_ascii_only() {
+        let sweep = (0u32..=0x2FF)
+            .chain([0x2044, 0x2215, 0xFEFF, 0xFF0F, 0xFF41, 0x202E, 0x1D400])
+            .filter_map(char::from_u32);
+        for c in sweep {
+            let want_lead = c.is_ascii_alphanumeric();
+            let want_tail = c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+
+            let lead = serde_json::json!({ "workspace": format!("{c}x"), "unit": "u1" });
+            assert_eq!(
+                stop_file_path_from_record_context(Some(&lead)).is_some(),
+                want_lead,
+                "leading char U+{:04X} ({c:?})",
+                c as u32
+            );
+
+            let tail = serde_json::json!({ "workspace": format!("x{c}"), "unit": "u1" });
+            assert_eq!(
+                stop_file_path_from_record_context(Some(&tail)).is_some(),
+                want_tail,
+                "trailing char U+{:04X} ({c:?})",
+                c as u32
+            );
+        }
+    }
+
+    /// The inverse direction: names that are legitimate single components
+    /// must still resolve, or the breaker silently stops working for real
+    /// crawls. Pins that the validator is not over-broad.
+    #[test]
+    fn ordinary_names_still_resolve() {
+        for name in ["a", "1", "acme", "crawl_v2.1-final", "a..b", "a.", "UPPER-case_9"] {
+            let ctx = serde_json::json!({ "workspace": name, "unit": "u1" });
+            let path = stop_file_path_from_record_context(Some(&ctx))
+                .unwrap_or_else(|| panic!("legitimate name rejected: {name:?}"));
+            assert!(path.ends_with(format!("crawl/{name}/STOP")), "{}", path.display());
+        }
+    }
+
+    /// A very long name is accepted by the character class (the write
+    /// itself would fail with ENAMETOOLONG, which `write_stop_file`
+    /// already swallows) — pinned so the behavior is deliberate, and to
+    /// prove it cannot escape either.
+    #[test]
+    fn very_long_name_is_contained_even_though_accepted() {
+        let name = "a".repeat(4096);
+        let ctx = serde_json::json!({ "workspace": name, "unit": "u1" });
+        let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
+        let path = stop_file_path_from_record_context(Some(&ctx)).unwrap();
+        assert!(path.starts_with(root.join("crawl")));
+    }
+
+    /// The two predicates must never disagree: for EVERY input, the path
+    /// resolving is exactly the reason-being-`None` case, on a
+    /// crawl-shaped context. This is the drift guard — one predicate is
+    /// shared today, and this fails the moment a second one is introduced.
+    #[test]
+    fn path_and_unresolved_reason_never_disagree() {
+        let names = [
+            "ok", "", " ", "..", ".", "/etc", "a/b", "a\\b", "caf\u{00E9}", "a..b", "-x", "_x",
+            "\u{FF0F}x", "1",
+        ];
+        for name in names {
+            let ctx = serde_json::json!({ "workspace": name, "unit": "u1" });
+            let path = stop_file_path_from_record_context(Some(&ctx));
+            let reason = stop_file_unresolved_reason(Some(&ctx));
+            assert_eq!(
+                path.is_some(),
+                reason.is_none(),
+                "predicates disagree for {name:?}: path={path:?} reason={reason:?}"
+            );
+        }
     }
 
     // ── finding 5: distinguishable warning when the STOP path can't be derived ──
