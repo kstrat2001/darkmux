@@ -97,8 +97,9 @@ fn default_roster_version() -> String {
 }
 
 /// Resolve the roster file path. Precedence (#661 Slice 3):
-/// `env(DARKMUX_FLEET_FILE) > config.dirs.fleet_file > ~/.darkmux/fleet.json`
-/// (with a `.darkmux/fleet.json` HOME-less fallback). Delegates to the single
+/// `env(DARKMUX_FLEET_FILE) > config.dirs.fleet_file > <darkmux root>/fleet.json`
+/// (#2450: the root resolution honors `DARKMUX_HOME` and a project-local
+/// `./.darkmux` before falling back to `~/.darkmux`). Delegates to the single
 /// resolver in `darkmux_types::config_access`. Tests bypass via the env override.
 pub fn roster_path() -> PathBuf {
     darkmux_types::config_access::fleet_file()

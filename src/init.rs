@@ -361,9 +361,30 @@ fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Op
     }
 }
 
+/// (#2450) The profile registry `init` bootstraps, routed through the SAME
+/// root resolution `init`'s own `config.json` write already uses
+/// (`resolve(ForceUser)`, which honors `DARKMUX_HOME`) rather than straight at
+/// `dirs::home_dir()`.
+///
+/// Probed and confirmed broken before this fix, and it was the worst-shaped
+/// member of the class because it SPLIT THE INSTALL IN HALF:
+/// `HOME=$A DARKMUX_HOME=$B darkmux init` wrote `config.json` to
+/// `$B/config.json` (correct — that write already used `resolve`) while
+/// writing `profiles.json` to `$A/.darkmux/profiles.json`, the operator's REAL
+/// home. One command, two roots, no warning.
+///
+/// `ForceUser` (not `Auto`) keeps this byte-identical to the old behavior
+/// whenever `DARKMUX_HOME` is unset — `resolve(ForceUser).root` IS
+/// `~/.darkmux` then — so no existing install's registry moves. It only
+/// changes where a `DARKMUX_HOME`-scoped install looks, which is the bug.
+/// `darkmux_profiles::default_locations` was taught the same tier in the same
+/// change, so the reader and this writer cannot disagree.
 fn user_profile_registry_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
-    Ok(home.join(".darkmux").join("profiles.json"))
+    use darkmux_types::paths::{ResolveScope, resolve};
+    // `.profiles` is the field `paths.rs` documents as "the canonical registry
+    // path" — reading it here rather than re-joining the literal is what makes
+    // that claim true instead of aspirational.
+    Ok(resolve(ResolveScope::ForceUser).profiles)
 }
 
 /// Bootstrap `<root>/config.json` (#661). Writes the **full self-documenting

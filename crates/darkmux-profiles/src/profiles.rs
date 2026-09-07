@@ -14,6 +14,19 @@ pub struct LoadedRegistry {
 /// set. `DARKMUX_PROFILES`, if set, short-circuits this list — see `load_registry`.
 pub fn default_locations() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
+    // (#2450) `DARKMUX_HOME` is the bootstrap pointer that RELOCATES the
+    // darkmux root entirely, so when it is set it outranks the cwd candidates
+    // below — the same precedence `paths::resolve` gives it ("it overrides the
+    // darkmux root directory entirely ... and wins over the project/user
+    // auto-resolve"). Before this fix the registry LOADER never consulted it,
+    // so a `DARKMUX_HOME`-scoped install read the operator's real
+    // `~/.darkmux/profiles.json`, and `darkmux init` (fixed in the same
+    // change) wrote there too — config.json in the scoped root, profiles.json
+    // in the real home. Gated on the var being SET so that an install without
+    // it keeps this list byte-identical to before.
+    if env::var("DARKMUX_HOME").is_ok_and(|v| !v.trim().is_empty()) {
+        out.push(darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).profiles);
+    }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     out.push(cwd.join(".darkmux.json"));
     out.push(cwd.join(".darkmux").join("profiles.json"));
@@ -363,6 +376,45 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// (#2450) The registry LOADER must consult `DARKMUX_HOME`, because
+    /// `darkmux init` writes the registry there. Before the fix the two
+    /// disagreed: `init` wrote `config.json` into the scoped root but
+    /// `profiles.json` into the operator's REAL `~/.darkmux`, and the loader
+    /// only ever looked at the real home — one command, two roots. Proven live
+    /// on the built binary before and after.
+    #[serial_test::serial]
+    #[test]
+    fn default_locations_prefers_darkmux_home_when_set() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()); }
+        let with_home = default_locations();
+        unsafe { std::env::remove_var("DARKMUX_HOME"); }
+        let without_home = default_locations();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(
+            with_home.first(),
+            Some(&tmp.path().join("profiles.json")),
+            "DARKMUX_HOME must be the FIRST candidate — it relocates the root entirely"
+        );
+        // ...and an install without it is byte-identical to the old list, so
+        // no existing operator's registry lookup moves.
+        assert!(
+            !without_home.contains(&tmp.path().join("profiles.json")),
+            "unset DARKMUX_HOME must not inject a scoped candidate"
+        );
+        assert_eq!(
+            without_home.first(),
+            Some(&std::env::current_dir().unwrap().join(".darkmux.json")),
+            "unset DARKMUX_HOME must still lead with the cwd candidate"
+        );
+    }
 
     fn write(path: &Path, contents: &str) {
         let mut f = fs::File::create(path).unwrap();

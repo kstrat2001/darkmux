@@ -119,7 +119,28 @@ pub fn validate_workdir(path: &Path) -> Result<PathBuf> {
 }
 
 /// Resolve the per-machine darkmux worktrees base directory:
-/// `~/.darkmux/worktrees` (HOME-less fallback `/tmp/darkmux/worktrees`).
+/// `<darkmux root>/worktrees`.
+///
+/// (#2450) Routed through `paths::resolve` rather than straight at
+/// `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped install keeps its worktrees
+/// inside its own root — the same bug class #1585 fixed for `lab_dir`, #2093
+/// for `hooks_outbox_dir`, #2363 for `flows_dir` and #2450 for `fleet_file`.
+/// Probed and confirmed broken (a `DARKMUX_HOME` tempdir still resolved to the
+/// real `~/.darkmux/worktrees`) before this fix.
+///
+/// **`ForceUser`, deliberately — NOT the `Auto` its sibling defaults use.**
+/// `Auto` would prefer a project-local `./.darkmux` when the process happens
+/// to be standing in one, making this base CWD-DEPENDENT. That is unacceptable
+/// here specifically because this value feeds a SECURITY check: the daemon's
+/// `worktree_contained` / `validate_remote_workdir` containment test (#840)
+/// compares a tailnet-supplied workdir against this base, and `darkmux serve`
+/// (whose cwd is wherever the operator launched it) must agree with
+/// `coder_phase` (whose cwd is the repo) about what "the worktrees base" IS.
+/// Under `Auto` those two disagree exactly when one of them stands in a repo
+/// carrying a `./.darkmux` — which `lessons.rs` creates in every repo a coder
+/// dispatch has recorded a lesson in. `ForceUser` still honors `DARKMUX_HOME`
+/// (that branch short-circuits ahead of the scope match), which is the whole
+/// bug being fixed, while keeping the base a single per-machine constant.
 ///
 /// The single canonical implementation — previously triplicated across
 /// `coder_phase.rs`, this module, and `darkmux-serve/src/lib.rs`, two of
@@ -131,9 +152,7 @@ pub fn validate_workdir(path: &Path) -> Result<PathBuf> {
 /// `worktree_contained` in darkmux-serve). Unified on `dirs::home_dir()`
 /// semantics here; both other call sites now re-point at this function.
 pub fn worktrees_base_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".darkmux").join("worktrees"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/worktrees"))
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("worktrees")
 }
 
 /// Validate a workdir path for **queue-originated (remote) dispatches**.
@@ -508,6 +527,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a directory"), "got: {err}");
+    }
+
+    /// (#2450) The worktrees base must scope under `DARKMUX_HOME`. Probed
+    /// before the fix and confirmed broken: with `DARKMUX_HOME` pointed at a
+    /// throwaway root, `worktrees_base_dir()` still returned the operator's
+    /// REAL `~/.darkmux/worktrees` — and this base is both a WRITE target
+    /// (`coder_phase` creates git worktrees under it) and the daemon's
+    /// remote-workdir containment base (#840).
+    #[test]
+    #[serial_test::serial]
+    fn worktrees_base_dir_honors_darkmux_home() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let base = worktrees_base_dir();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(
+            base,
+            tmp.path().join("worktrees"),
+            "must scope under DARKMUX_HOME, not the real user home"
+        );
     }
 
     /// The public wrapper resolves the real worktrees base from `HOME`,

@@ -321,8 +321,9 @@ fn hooks_outbox_dir_default() -> std::path::PathBuf {
 /// Test builds must never default onto the operator's real
 /// `~/.darkmux/hooks` — same isolation discipline as `lab_dir_default`'s
 /// own test-build variant (#994). A test that DID isolate itself (a
-/// `DARKMUX_HOME` tempdir, or a project-local `./.darkmux`) is honored
-/// verbatim, because a test that isolated itself means it.
+/// `DARKMUX_HOME` tempdir) is honored verbatim, because a test that isolated
+/// itself means it. A project-local `./.darkmux` does NOT apply here — the
+/// production resolution is `ForceUser`, see its own doc for why.
 #[cfg(any(test, feature = "test-support"))]
 fn hooks_outbox_dir_default() -> std::path::PathBuf {
     let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
@@ -339,6 +340,32 @@ fn hooks_outbox_dir_default() -> std::path::PathBuf {
 pub fn hooks_outbox_dir() -> std::path::PathBuf {
     pick_dir(None, config().hooks.as_ref().and_then(|h| h.outbox_dir.as_deref()), hooks_outbox_dir_default)
 }
+/// (#2450 review) The PROVENANCE of `hooks_enabled` — `"env"`, `"config.json"`
+/// or `"default"` — resolved against the SAME tiers `hooks_enabled` itself
+/// reads, in the one place this project keeps precedence
+/// (`darkmux_types::config_access`).
+///
+/// It exists because `darkmux doctor`'s `check_hooks` had grown its own second
+/// copy of the ladder, and that copy asked the config tier via
+/// `DarkmuxConfig::load_resolved()` directly rather than through `config()`.
+/// `load_resolved()` has no #811 test seam, so the check read the operator's
+/// REAL `~/.darkmux/config.json` from inside a unit test: on any machine whose
+/// config carries a `hooks.enabled` key — which is EVERY machine `darkmux init`
+/// has ever run on, since init writes the block visibly with `enabled: false`
+/// — `check_hooks_disabled_by_default_is_pass` failed, asserting `default` and
+/// getting `config.json`. CI passed only because CI has no `~/.darkmux`.
+/// Proven by re-running that one test with `DARKMUX_HOME` pointed at an empty
+/// root: red before, green after.
+pub fn hooks_enabled_provenance() -> &'static str {
+    if env_str("DARKMUX_HOOKS_ENABLED").is_some() {
+        "env"
+    } else if config().hooks.as_ref().and_then(|h| h.enabled).is_some() {
+        "config.json"
+    } else {
+        "default"
+    }
+}
+
 /// The configured hook rules, verbatim (raw `HookRule`s — match validation
 /// and URL-loopback validation happen at `HookSink` construction, not here;
 /// this accessor is a pure config-tier read). CONFIG-ONLY, same reasoning
@@ -1174,26 +1201,81 @@ fn lab_dir_default() -> std::path::PathBuf {
 /// (#703) Host cache dir for the extracted static `darkmux-runtime` binary,
 /// bind-mounted into operator-named images (`dispatch --image <tag>`)
 /// so darkmux can inject its agent into ANY Linux image rather than ship a
-/// per-language image catalog. `~/.darkmux/runtime` (HOME-less fallback
-/// `/tmp/darkmux/runtime`). Internal cache — no env/config override tier.
+/// per-language image catalog. `<darkmux root>/runtime`. Internal cache — no
+/// env/config override tier.
+///
+/// (#2450) Derived from the SAME root resolution every other darkmux
+/// directory resolves through — `paths::resolve(Auto)`, which honors
+/// `DARKMUX_HOME` and a project-local `./.darkmux` before `~/.darkmux` —
+/// mirroring `fleet_file_default`/`flows_dir_default`. Before this fix, this
+/// went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped install
+/// still cached the extracted runtime binary under the operator's REAL
+/// `~/.darkmux/runtime`, the same bug class fixed elsewhere for #1585,
+/// #2093, #2363, and `fleet_file` (#2450) itself. Probed and confirmed
+/// broken (not assumed from shape) before this fix.
+///
+/// Carries the same `#[cfg(test)]` `/tmp/darkmux-test-isolated` redirect its
+/// sibling defaults do (`fleet_file_default`, `flows_dir_default`,
+/// `hooks_outbox_dir_default`, `lab_dir_default`).
+///
+/// An earlier cut of #2450 left the redirect OFF here, on the argument that
+/// this accessor's callers are "read-mostly". They are not: the primary
+/// caller, `ensure_runtime_binary_cached`, does `fs::create_dir_all` on this
+/// directory and then writes BOTH the extracted runtime binary and its
+/// version stamp into it. `darkmux-doctor`'s check is the read-only one; the
+/// dispatch path is not. The accurate narrow claim was only that no CURRENT
+/// unit test reaches those writes, because they sit inside `dispatch()` behind
+/// a real docker spawn — which is a fact about today's test suite, not a
+/// property of the accessor, and it stops being true the first time someone
+/// gives the docker path a seam. The redirect costs nothing in release builds
+/// (it is `cfg`'d out entirely) and makes the bypass unrepresentable rather
+/// than merely unused, which is the same reasoning `paths.rs` gives for
+/// `DarkmuxPaths::runs` being `pub(crate)` (#1882).
+///
+/// It also makes `doctor`'s runtime-cache check HERMETIC under test: before
+/// this, its `run()` tests read the operator's real `~/.darkmux/runtime`, so
+/// the check's outcome depended on whether that machine happened to have a
+/// cached binary.
+#[cfg(not(any(test, feature = "test-support")))]
 pub fn runtime_cache_dir() -> std::path::PathBuf {
-    use std::path::PathBuf;
-    dirs::home_dir()
-        .map(|h| h.join(".darkmux").join("runtime"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/runtime"))
+    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("runtime")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn runtime_cache_dir() -> std::path::PathBuf {
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/runtime");
+    }
+    resolved.root.join("runtime")
 }
 
 /// (#703 Slice 3) Host dir for the shared toolchain build/download cache,
 /// bind-mounted into every dispatch at `/darkmux-cache` so the inner verify
 /// loop doesn't re-download deps each run (cargo registry, npm, pip). The
 /// registry/download caches are concurrency-safe; per-dispatch `target/` stays
-/// in the workspace (so concurrent dispatches don't contend). `~/.darkmux/cache`
-/// (HOME-less fallback `/tmp/darkmux/cache`). Internal cache — no override tier.
+/// in the workspace (so concurrent dispatches don't contend). `<darkmux
+/// root>/cache`. Internal cache — no override tier.
+///
+/// (#2450) Same root-resolution fix as `runtime_cache_dir` above — see its
+/// doc for the bug this closes, and for why both carry the test-build
+/// redirect. This one's sole caller opens the dispatch path with
+/// `fs::create_dir_all(&cache_dir)`, so it is a write target too. Probed and
+/// confirmed broken before this fix.
+#[cfg(not(any(test, feature = "test-support")))]
 pub fn cache_dir() -> std::path::PathBuf {
-    use std::path::PathBuf;
-    dirs::home_dir()
-        .map(|h| h.join(".darkmux").join("cache"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/cache"))
+    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("cache")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn cache_dir() -> std::path::PathBuf {
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/cache");
+    }
+    resolved.root.join("cache")
 }
 
 /// The crew-state directory **override** (`env(DARKMUX_CREW_DIR) >
@@ -1210,20 +1292,87 @@ pub fn crew_dir_override() -> Option<std::path::PathBuf> {
 }
 
 /// The fleet roster file: `env(DARKMUX_FLEET_FILE) > config.dirs.fleet_file >
-/// ~/.darkmux/fleet.json` (with a `.darkmux/fleet.json` HOME-less fallback).
-/// Backs `fleet::roster::roster_path`.
+/// `<darkmux root>/fleet.json`. Backs `fleet::roster::roster_path`.
 pub fn fleet_file() -> std::path::PathBuf {
-    use std::path::PathBuf;
     pick_dir(
         env_str("DARKMUX_FLEET_FILE"),
         config().dirs.as_ref().and_then(|d| d.fleet_file.as_deref()),
-        || {
-            dirs::home_dir()
-                .map(|h| h.join(".darkmux").join("fleet.json"))
-                .unwrap_or_else(|| PathBuf::from(".darkmux/fleet.json"))
-        },
+        fleet_file_default,
     )
 }
+
+/// (#2450) Derived from the SAME root resolution every other darkmux
+/// directory resolves through — `paths::resolve(Auto)`, which honors
+/// `DARKMUX_HOME` and a project-local `./.darkmux` before `~/.darkmux` —
+/// mirroring `flows_dir_default`/`hooks_outbox_dir_default`/`lab_dir_default`.
+/// Before this fix, `fleet_file`'s fallback went straight to
+/// `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped install with no
+/// `DARKMUX_FLEET_FILE` override still wrote the operator's roster into the
+/// operator's REAL `~/.darkmux/fleet.json` — the same bug class #1585 fixed
+/// for `lab_dir`, #2093 fixed for `hooks_outbox_dir`, and #2363 fixed for
+/// `flows_dir`, one directory over.
+///
+/// **Behavior change for existing operators, stated out loud (#2450 review).**
+/// `Auto` does not only add the `DARKMUX_HOME` tier — it also prefers a
+/// project-local `./.darkmux` over `~/.darkmux` whenever the process happens
+/// to be standing in a directory that has one. So `darkmux machine add` /
+/// `machine list` run from such a directory now read and write
+/// `./.darkmux/fleet.json` instead of the user-global roster, and the
+/// operator's real fleet appears EMPTY there. This is reachable, not
+/// theoretical: `crew::lessons::repo_db_path` creates `<repo>/.darkmux/` in
+/// every repo a coder dispatch has recorded a lesson in, so any such repo is
+/// already a directory where this switch fires. Verified live with the built
+/// binary: from a cwd containing `./.darkmux`, `machine add` reported
+/// `roster: <cwd>/.darkmux/fleet.json`.
+///
+/// It is kept as `Auto` for consistency with every sibling default
+/// (`flows_dir`, `findings_dir`, `mods_dir`, `lab_dir`, `hooks_outbox_dir`),
+/// which all resolve project-local-first. If the roster should instead be a
+/// per-MACHINE constant — a defensible reading, since a fleet roster is not
+/// project-scoped state the way a run record or a finding is — the one-word
+/// change is `ResolveScope::ForceUser`, which still closes the `DARKMUX_HOME`
+/// escape this issue is about while dropping the cwd sensitivity.
+/// `workdir::worktrees_base_dir` and `dispatch::identity_path` took exactly
+/// that `ForceUser` route in this same change, for that same reason.
+fn fleet_file_default() -> std::path::PathBuf {
+    // `ForceUser`, NOT `Auto` (#2450 review decision). Closing the
+    // `DARKMUX_HOME` escape must not smuggle in a NEW cwd sensitivity: before
+    // this fix the roster was `dirs::home_dir()/.darkmux/fleet.json`,
+    // unconditionally user-global, so `Auto` would have changed behavior for
+    // operators who never set `DARKMUX_HOME` at all. And it is reachable, not
+    // theoretical — `crew::lessons::repo_db_path` creates `<repo>/.darkmux/`
+    // in every repository a coder dispatch has recorded a lesson in, so
+    // `machine add` run from such a repo would silently read and write a
+    // project-local roster and report the fleet as empty.
+    //
+    // A fleet roster is user-global state by nature, unlike a run record or a
+    // finding: the machines you own do not change because you cd'd. Same call,
+    // for the same reason, as `worktrees_base_dir` and `identity_path`.
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("fleet.json")
+}
+
+// NO test-build guard here, deliberately — see #2450's CI failure.
+//
+// The sibling accessors guard by comparing the resolved root against
+// `dirs::home_dir()/.darkmux` and redirecting to `/tmp/darkmux-test-isolated`
+// when they match, on the premise that "resolved to the home root" means "this
+// test forgot to isolate itself". That premise is FALSE for any test that
+// isolates by moving `HOME` rather than by setting `DARKMUX_HOME`: the guard's
+// own yardstick moves with it, the two roots match, and a correctly-isolated
+// test is hijacked into the shared `/tmp` root.
+//
+// Not hypothetical. `tests/fleet_concurrent_add_no_lost_writes.rs` isolates
+// exactly that way (`.env("HOME", …).env_remove("DARKMUX_HOME")`) and asserts
+// the roster lands under its own temp home; the guard turned it red, in CI and
+// locally, with the roster written to `/tmp/darkmux-test-isolated/fleet.json`.
+// `worktrees_base_dir` is left unguarded for the same reason and about the
+// same kind of test.
+//
+// Dropping it does not weaken #2450: `DARKMUX_HOME` is honored by
+// `paths::resolve`'s own early return, which is the escape this issue was
+// about. The residual exposure — an in-process test isolating NEITHER var —
+// is exactly what `main` has today, and #2184's spawn helper narrows it
+// further.
 
 // The next two are **override-only** (`env > config.dirs.X`, else `None`):
 // each caller keeps its own no-HOME default/error handling, so the accessor
@@ -1911,6 +2060,41 @@ mod tests {
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v); } }
     }
 
+    /// (#2450) `fleet_file`'s built-in default must scope under `DARKMUX_HOME`,
+    /// exactly as its sibling dirs (`flows_dir`, `findings_dir`, `mods_dir`,
+    /// `lab_dir`, `hooks_outbox_dir`) already do — mirrors
+    /// `flows_dir_honors_darkmux_home` exactly. Before this fix, `fleet_file`
+    /// went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped install
+    /// with no `DARKMUX_FLEET_FILE` override still wrote the operator's roster
+    /// into the operator's REAL `~/.darkmux/fleet.json`.
+    #[serial_test::serial]
+    #[test]
+    fn fleet_file_honors_darkmux_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_fleet = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_FLEET_FILE");
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let file = fleet_file();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_fleet {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_FILE"),
+            }
+        }
+        assert_eq!(
+            file,
+            tmp.path().join("fleet.json"),
+            "must scope under DARKMUX_HOME, not the real user home"
+        );
+    }
+
     #[serial_test::serial]
     #[test]
     fn override_only_dir_accessors_env_then_none() {
@@ -2342,5 +2526,57 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_HOOKS_MAX_OUTBOX_MB"),
             }
         }
+    }
+
+    // ─── (#2450) cache_dir / runtime_cache_dir must honor DARKMUX_HOME ──
+
+    /// Probed (not assumed from shape) — confirmed `runtime_cache_dir()` went
+    /// straight to `dirs::home_dir()` before this fix, the same bug class as
+    /// `fleet_file`. Mirrors `fleet_file_honors_darkmux_home` exactly.
+    #[serial_test::serial]
+    #[test]
+    fn runtime_cache_dir_honors_darkmux_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let dir = runtime_cache_dir();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(
+            dir,
+            tmp.path().join("runtime"),
+            "must scope under DARKMUX_HOME, not the real user home"
+        );
+    }
+
+    /// Probed (not assumed from shape) — confirmed `cache_dir()` went straight
+    /// to `dirs::home_dir()` before this fix, the same bug class as
+    /// `fleet_file`. Mirrors `fleet_file_honors_darkmux_home` exactly.
+    #[serial_test::serial]
+    #[test]
+    fn cache_dir_honors_darkmux_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let dir = cache_dir();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(
+            dir,
+            tmp.path().join("cache"),
+            "must scope under DARKMUX_HOME, not the real user home"
+        );
     }
 }
