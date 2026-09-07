@@ -5,11 +5,18 @@
 //!
 //! Safe to re-run; refreshes the bundled skills after a darkmux upgrade. The
 //! skill-install step passes `refresh_darkmux: true` (#1426), so a re-run
-//! overwrites the installed `darkmux-*` skills with this binary's embedded
-//! copies — never touching the operator's own non-darkmux skills. This is what
-//! the doctor freshness check's fix_hint (`run darkmux init to refresh`) relies
-//! on. The profile registry and config file keep their never-overwrite
-//! discipline; only the darkmux-owned skills refresh.
+//! overwrites an installed `darkmux-*` skill with this binary's embedded
+//! copy — but ONLY when that installed copy is unmodified (#1927: content
+//! hash-verified against what darkmux itself last wrote there). A
+//! locally-edited `darkmux-*` skill, or one with no recorded provenance at
+//! all (every skill installed before #1927), is protected instead — the edit
+//! survives, and `--force` is the explicit "yes, overwrite it" escape hatch.
+//! Never touches the operator's own non-darkmux skills either way. This is
+//! what the doctor freshness check's fix_hint relies on; that hint (#1927)
+//! now describes the mechanism rather than promising a refresh will happen.
+//! The profile registry and config file keep their own never-overwrite
+//! discipline; only the darkmux-owned skills ever refresh, and only when
+//! provably safe to.
 
 use crate::skills;
 use anyhow::{Context, Result, anyhow};
@@ -51,6 +58,13 @@ pub struct InitReport {
     /// (#1449) Retired `darkmux-*` skills the install step pruned (or, in
     /// dry-run, would prune).
     pub skills_pruned: Vec<String>,
+    /// (#1927) `darkmux-*` skills whose installed copy is locally modified
+    /// (or has no recorded provenance) and so was NOT refreshed — the edit
+    /// survives. Pass `--force` to overwrite one of these anyway.
+    pub skills_protected: Vec<String>,
+    /// (#1927) `darkmux-*` skills from `skills_protected` that `--force`
+    /// overwrote anyway. Always a subset of `skills_overwritten`.
+    pub skills_force_overwrote_modified: Vec<String>,
     pub hook_added: Option<PathBuf>,
     pub hook_already_present: bool,
     pub claude_md_path: Option<PathBuf>,
@@ -126,9 +140,11 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     report.config_created = config_created;
 
     // 3) Skills install. `refresh_darkmux: true` (#1426) makes a re-run after a
-    //    binary upgrade refresh the installed darkmux-* skills (idempotent
-    //    refresh); the installer only ever writes darkmux-* names, so the
-    //    operator's own skills are never touched.
+    //    binary upgrade refresh an installed darkmux-* skill (idempotent
+    //    refresh) — but only an unmodified one (#1927); a locally-edited copy
+    //    is protected and needs `--force` to overwrite. The installer only
+    //    ever writes darkmux-* names, so the operator's own skills are never
+    //    touched regardless.
     let skills_report = skills::install_skills(&skills::InstallOptions {
         target: None,
         force: opts.force,
@@ -140,6 +156,8 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     report.skills_overwritten = skills_report.overwritten;
     report.skills_skipped = skills_report.skipped;
     report.skills_pruned = skills_report.pruned;
+    report.skills_protected = skills_report.protected;
+    report.skills_force_overwrote_modified = skills_report.force_overwrote_modified;
 
     // 4) SessionStart hook (optional)
     if opts.with_hook {

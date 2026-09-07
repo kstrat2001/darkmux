@@ -154,6 +154,17 @@ pub struct InstallReport {
     /// removed by the prune pass. In `dry_run` these are the prospective
     /// prunes — reported, not removed.
     pub pruned: Vec<String>,
+    /// (#1927) `darkmux-*` skills `refresh_darkmux` declined to touch because
+    /// the installed copy is locally modified (or has no recorded provenance,
+    /// which is treated the same — unknown means protect). Present only when
+    /// `refresh_darkmux` was set and `force` was not; `--force` overrides this
+    /// protection and such names land in `force_overwrote_modified` instead.
+    pub protected: Vec<String>,
+    /// (#1927) `darkmux-*` skills that WERE locally modified but got
+    /// overwritten anyway because `--force` was passed. Always a subset of
+    /// `overwritten` — surfaced separately so callers can say plainly what a
+    /// forced install just discarded.
+    pub force_overwrote_modified: Vec<String>,
 }
 
 pub fn install_skills(opts: &InstallOptions) -> Result<InstallReport> {
@@ -196,6 +207,16 @@ pub fn install_skills(opts: &InstallOptions) -> Result<InstallReport> {
         for s in sub_report.skipped {
             if !report.skipped.contains(&s) {
                 report.skipped.push(s);
+            }
+        }
+        for s in sub_report.protected {
+            if !report.protected.contains(&s) {
+                report.protected.push(s);
+            }
+        }
+        for s in sub_report.force_overwrote_modified {
+            if !report.force_overwrote_modified.contains(&s) {
+                report.force_overwrote_modified.push(s);
             }
         }
     }
@@ -301,6 +322,111 @@ fn retired_darkmux_skills(
     retired
 }
 
+/// (#1927) Provenance sidecar filename, written alongside `SKILL.md` inside
+/// every installed `darkmux-*` skill directory. Holds the BLAKE3 hash of
+/// exactly the bytes this binary last wrote to that skill's `SKILL.md`,
+/// stamped every time `install_skills` (via `darkmux init`) writes one.
+///
+/// The extension and the `blake3:` content prefix both name the algorithm on
+/// purpose. A BLAKE3 digest is 64 hex characters — exactly a SHA-256's
+/// width — so a bare hex file called `.sha256` reads as verifiable with
+/// `shasum -a 256`, fails that check every time, and tells an operator
+/// inspecting their own `~/.claude/skills` that darkmux corrupted the file.
+/// Naming the algorithm is the difference between a checkable claim and a
+/// misleading one.
+///
+/// A skill whose live `SKILL.md` still hashes to the stamped value has not
+/// been touched by anything but darkmux since darkmux's own last write, so
+/// `refresh_darkmux` may overwrite it without asking. A skill with no stamp
+/// (every skill installed before this file existed) or a stamp that no
+/// longer matches (an operator's edit landed since darkmux last wrote it) is
+/// unknown-or-modified — `refresh_darkmux` alone must decline; only
+/// `--force` may overwrite it. Never written for non-`darkmux-*` skills:
+/// `refresh_darkmux` never touches those regardless, so provenance for them
+/// is meaningless.
+const PROVENANCE_FILE: &str = ".darkmux-installed.blake3";
+
+/// Prefix written into `PROVENANCE_FILE` ahead of the hex digest, so the file
+/// says what it holds. Read is lenient (a bare digest is still accepted) in
+/// keeping with the config-leniency contract.
+const PROVENANCE_PREFIX: &str = "blake3:";
+
+fn content_hash(content: &str) -> String {
+    blake3::hash(content.as_bytes()).to_hex().to_string()
+}
+
+fn read_provenance_hash(skill_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(skill_dir.join(PROVENANCE_FILE)).ok()?;
+    let trimmed = raw.trim();
+    // Lenient on read: accept `blake3:<hex>` (what we write) or a bare digest.
+    Some(
+        trimmed
+            .strip_prefix(PROVENANCE_PREFIX)
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string(),
+    )
+}
+
+fn write_provenance_hash(skill_dir: &Path, content: &str) -> Result<()> {
+    let path = skill_dir.join(PROVENANCE_FILE);
+    let body = format!("{PROVENANCE_PREFIX}{}\n", content_hash(content));
+    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Whether an installed `darkmux-*` skill has drifted from what darkmux
+/// itself last wrote, and so must not be silently refreshed. Content
+/// byte-identical to what would be written now is never "modified" — there
+/// is nothing to lose by rewriting it. Otherwise: a recorded provenance hash
+/// matching the installed content's hash means nothing touched the file
+/// since darkmux's last write (an older bundled version, safe to refresh);
+/// no stamp, or one that doesn't match, is unknown-or-edited and protected.
+fn is_locally_modified(skill_dir: &Path, installed_content: &str, bundled_content: &str) -> bool {
+    if installed_content == bundled_content {
+        return false;
+    }
+    match read_provenance_hash(skill_dir) {
+        Some(stored) => stored != content_hash(installed_content),
+        None => true,
+    }
+}
+
+/// What to do with one already-installed skill. `force` always overwrites
+/// (the explicit "yes, discard it" escape hatch); short of that,
+/// `refresh_darkmux` (scoped to `darkmux-*` names) overwrites only an
+/// unmodified copy and protects a modified-or-unknown one; anything else is
+/// the pre-#1927 skip.
+enum ExistingSkillAction {
+    Overwrite { modified: bool },
+    Protect,
+    Skip,
+}
+
+fn decide_existing_skill_action(
+    dst_skill_dir: &Path,
+    installed_content: &str,
+    bundled_content: &str,
+    is_darkmux: bool,
+    opts: &InstallOptions,
+) -> ExistingSkillAction {
+    let modified = is_darkmux && is_locally_modified(dst_skill_dir, installed_content, bundled_content);
+    if opts.force {
+        return ExistingSkillAction::Overwrite { modified };
+    }
+    // (#1426) `refresh_darkmux` refreshes an already-installed darkmux-*
+    // skill without requiring --force, so `darkmux init` re-runs pick up an
+    // upgraded binary's skills. Never applies to non-darkmux names.
+    let refresh = opts.refresh_darkmux && is_darkmux;
+    if !refresh {
+        return ExistingSkillAction::Skip;
+    }
+    if modified {
+        ExistingSkillAction::Protect
+    } else {
+        ExistingSkillAction::Overwrite { modified: false }
+    }
+}
+
 fn install_from_disk(
     source: &Path,
     target: &Path,
@@ -334,24 +460,45 @@ fn install_from_disk(
         }
         let dst_skill_dir = target.join(&skill_name);
         let dst_skill_md = dst_skill_dir.join("SKILL.md");
+        let is_darkmux = skill_name.starts_with("darkmux-");
 
         let already_exists = dst_skill_md.exists();
-        // (#1426) `refresh_darkmux` refreshes an already-installed darkmux-*
-        // skill without requiring --force, so `darkmux init` re-runs pick up
-        // an upgraded binary's skills. Never applies to non-darkmux names.
-        let refresh = opts.refresh_darkmux && skill_name.starts_with("darkmux-");
-        if already_exists && !opts.force && !refresh {
-            report.skipped.push(skill_name.clone());
-            continue;
+        let bundled_content = fs::read_to_string(&src_skill_md)
+            .with_context(|| format!("reading {}", src_skill_md.display()))?;
+
+        if already_exists {
+            let installed_content = fs::read_to_string(&dst_skill_md).unwrap_or_default();
+            match decide_existing_skill_action(
+                &dst_skill_dir,
+                &installed_content,
+                &bundled_content,
+                is_darkmux,
+                opts,
+            ) {
+                ExistingSkillAction::Skip => {
+                    report.skipped.push(skill_name.clone());
+                    continue;
+                }
+                ExistingSkillAction::Protect => {
+                    report.protected.push(skill_name.clone());
+                    continue;
+                }
+                ExistingSkillAction::Overwrite { modified } => {
+                    if modified {
+                        report.force_overwrote_modified.push(skill_name.clone());
+                    }
+                }
+            }
         }
 
         if !opts.dry_run {
             fs::create_dir_all(&dst_skill_dir)
                 .with_context(|| format!("creating {}", dst_skill_dir.display()))?;
-            fs::copy(&src_skill_md, &dst_skill_md)
-                .with_context(|| {
-                    format!("copying {} → {}", src_skill_md.display(), dst_skill_md.display())
-                })?;
+            fs::write(&dst_skill_md, &bundled_content)
+                .with_context(|| format!("writing {}", dst_skill_md.display()))?;
+            if is_darkmux {
+                write_provenance_hash(&dst_skill_dir, &bundled_content)?;
+            }
         }
 
         if already_exists {
@@ -374,14 +521,27 @@ fn install_from_embedded(target: &Path, opts: &InstallOptions) -> Result<Install
     for (skill_name, body) in EMBEDDED_SKILLS {
         let dst_skill_dir = target.join(skill_name);
         let dst_skill_md = dst_skill_dir.join("SKILL.md");
+        let is_darkmux = skill_name.starts_with("darkmux-");
 
         let already_exists = dst_skill_md.exists();
-        // (#1426) See install_from_disk: refresh darkmux-* skills on init
-        // re-run without requiring --force.
-        let refresh = opts.refresh_darkmux && skill_name.starts_with("darkmux-");
-        if already_exists && !opts.force && !refresh {
-            report.skipped.push((*skill_name).to_string());
-            continue;
+
+        if already_exists {
+            let installed_content = fs::read_to_string(&dst_skill_md).unwrap_or_default();
+            match decide_existing_skill_action(&dst_skill_dir, &installed_content, body, is_darkmux, opts) {
+                ExistingSkillAction::Skip => {
+                    report.skipped.push((*skill_name).to_string());
+                    continue;
+                }
+                ExistingSkillAction::Protect => {
+                    report.protected.push((*skill_name).to_string());
+                    continue;
+                }
+                ExistingSkillAction::Overwrite { modified } => {
+                    if modified {
+                        report.force_overwrote_modified.push((*skill_name).to_string());
+                    }
+                }
+            }
         }
 
         if !opts.dry_run {
@@ -389,6 +549,9 @@ fn install_from_embedded(target: &Path, opts: &InstallOptions) -> Result<Install
                 .with_context(|| format!("creating {}", dst_skill_dir.display()))?;
             fs::write(&dst_skill_md, body)
                 .with_context(|| format!("writing {}", dst_skill_md.display()))?;
+            if is_darkmux {
+                write_provenance_hash(&dst_skill_dir, body)?;
+            }
         }
 
         if already_exists {
@@ -597,18 +760,135 @@ mod tests {
         assert_eq!(fs::read_to_string(target.join("alpha/SKILL.md")).unwrap(), "v2-source");
     }
 
-    /// (#1426) `refresh_darkmux: true` (what `darkmux init` passes) overwrites an
-    /// already-installed `darkmux-*` skill WITHOUT requiring `--force`, so a
-    /// re-run after a binary upgrade refreshes the bundled skills.
+    /// (#1927) `refresh_darkmux: true` (what `darkmux init` passes) overwrites an
+    /// already-installed `darkmux-*` skill WITHOUT requiring `--force` ONLY when
+    /// the operator never touched it — the very first `install_skills` call
+    /// stamps provenance for the skill it just wrote, and a second call whose
+    /// bundled content moved on (a binary upgrade) but whose installed copy is
+    /// byte-identical to what the first call wrote is safe to refresh silently.
+    /// This is #1426's whole point and has to survive #1927's fix.
     #[serial_test::serial]
     #[test]
-    fn refresh_darkmux_overwrites_existing_darkmux_skill_without_force() {
+    fn refresh_darkmux_overwrites_unmodified_darkmux_skill_without_force() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("skills");
+        write_skill(&src, "darkmux-alpha", "v1-source");
+        let target = tmp.path().join("dest");
+
+        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
+        // First install establishes provenance for v1 — nothing to refresh yet.
+        install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: false,
+            refresh_darkmux: false,
+        })
+        .unwrap();
+
+        // Binary upgrade: the bundled skill moves to v2. The operator never
+        // touched the installed copy in between.
+        fs::write(src.join("darkmux-alpha/SKILL.md"), "v2-source").unwrap();
+
+        let report = install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: false,
+            refresh_darkmux: true,
+        })
+        .unwrap();
+        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
+
+        assert!(report.overwritten.contains(&"darkmux-alpha".to_string()));
+        assert!(report.protected.is_empty());
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            fs::read_to_string(target.join("darkmux-alpha/SKILL.md")).unwrap(),
+            "v2-source"
+        );
+    }
+
+    /// (#1927) The exact bug from the issue: an operator customizes a
+    /// darkmux-installed skill, the binary is upgraded, and `darkmux init` runs
+    /// again. `refresh_darkmux` alone must NOT discard the edit — it has to be
+    /// protected — and `--force` remains the explicit "yes, overwrite my edits"
+    /// escape hatch.
+    #[serial_test::serial]
+    #[test]
+    fn refresh_darkmux_protects_operator_edit_but_force_overwrites_it() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("skills");
+        write_skill(&src, "darkmux-alpha", "v1-source");
+        let target = tmp.path().join("dest");
+
+        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
+        // First install establishes provenance for v1.
+        install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: false,
+            refresh_darkmux: false,
+        })
+        .unwrap();
+
+        // The operator customizes the installed copy.
+        fs::write(target.join("darkmux-alpha/SKILL.md"), "operator-customized").unwrap();
+
+        // Binary upgrade ships a new bundled version.
+        fs::write(src.join("darkmux-alpha/SKILL.md"), "v2-source").unwrap();
+
+        let report = install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: false,
+            refresh_darkmux: true,
+        })
+        .unwrap();
+
+        assert!(report.protected.contains(&"darkmux-alpha".to_string()));
+        assert!(report.overwritten.is_empty());
+        assert_eq!(
+            fs::read_to_string(target.join("darkmux-alpha/SKILL.md")).unwrap(),
+            "operator-customized",
+            "the edit survives a refresh-only re-run"
+        );
+
+        // --force is still the explicit "yes, discard my edit" escape hatch.
+        let forced = install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: true,
+            dry_run: false,
+            refresh_darkmux: true,
+        })
+        .unwrap();
+        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
+
+        assert!(forced.overwritten.contains(&"darkmux-alpha".to_string()));
+        assert!(forced.force_overwrote_modified.contains(&"darkmux-alpha".to_string()));
+        assert_eq!(
+            fs::read_to_string(target.join("darkmux-alpha/SKILL.md")).unwrap(),
+            "v2-source",
+            "--force discards the edit"
+        );
+    }
+
+    /// (#1927) Migration case: a `darkmux-*` skill installed by a pre-#1927
+    /// binary has content on disk (possibly customized, possibly just an old
+    /// bundled version) but no recorded provenance — because provenance
+    /// recording did not exist yet. `refresh_darkmux` cannot tell those two
+    /// cases apart, and operator sovereignty says unknown means protect: it
+    /// must decline, the same as a proven-modified skill, until the operator
+    /// passes `--force` once to establish trust going forward.
+    #[serial_test::serial]
+    #[test]
+    fn refresh_darkmux_protects_skill_with_no_recorded_provenance() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("skills");
         write_skill(&src, "darkmux-alpha", "v2-source");
         let target = tmp.path().join("dest");
+        // Simulates a pre-#1927 install: content on disk, no provenance sidecar
+        // — install_skills() was never called against this directory.
         fs::create_dir_all(target.join("darkmux-alpha")).unwrap();
-        fs::write(target.join("darkmux-alpha/SKILL.md"), "v1-stale").unwrap();
+        fs::write(target.join("darkmux-alpha/SKILL.md"), "v1-stale-or-edited").unwrap();
 
         unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
         let report = install_skills(&InstallOptions {
@@ -620,11 +900,199 @@ mod tests {
         .unwrap();
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
 
-        assert!(report.overwritten.contains(&"darkmux-alpha".to_string()));
-        assert!(report.skipped.is_empty());
+        assert!(report.protected.contains(&"darkmux-alpha".to_string()));
+        assert!(report.overwritten.is_empty());
         assert_eq!(
             fs::read_to_string(target.join("darkmux-alpha/SKILL.md")).unwrap(),
-            "v2-source"
+            "v1-stale-or-edited"
+        );
+    }
+
+    /// (#1927) The SAME protection has to hold on the EMBEDDED install path,
+    /// not just the on-disk one. This is the path every `brew` / `cargo
+    /// install` user actually runs — they have no `skills/` source dir and no
+    /// `DARKMUX_SKILLS_DIR`, so `install_from_embedded` is the only code that
+    /// ever touches their `~/.claude/skills`. #1927's bug was reported from
+    /// exactly there. Without this test the whole decision block in
+    /// `install_from_embedded` can be replaced with an unconditional
+    /// `Overwrite` and every other test still passes.
+    #[serial_test::serial]
+    #[test]
+    fn embedded_install_protects_operator_edit_and_refreshes_a_darkmux_written_copy() {
+        unsafe { env::set_var("DARKMUX_SKILLS_DIR", "/no/such/path") };
+        let prev = env::current_dir().unwrap();
+        let tmp = TempDir::new().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+        let target = tmp.path().join("dest");
+
+        // Fresh install via the embedded path — stamps provenance for each.
+        let first = install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: false,
+            refresh_darkmux: false,
+        })
+        .unwrap();
+        assert_eq!(first.source, PathBuf::from("<embedded>"));
+
+        let edited = EMBEDDED_SKILLS[0].0;
+        let darkmux_written = EMBEDDED_SKILLS[1].0;
+
+        // The operator customizes one skill: no stamp matches it any more.
+        fs::write(target.join(edited).join("SKILL.md"), "operator-customized").unwrap();
+
+        // A second skill holds an OLDER copy that darkmux itself wrote — the
+        // stamp matches the installed bytes, so it is provably untouched.
+        let older = "an older bundled body darkmux wrote";
+        fs::write(target.join(darkmux_written).join("SKILL.md"), older).unwrap();
+        write_provenance_hash(&target.join(darkmux_written), older).unwrap();
+
+        let report = install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: false,
+            refresh_darkmux: true,
+        })
+        .unwrap();
+        env::set_current_dir(prev).unwrap();
+        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
+
+        assert!(
+            report.protected.contains(&edited.to_string()),
+            "the operator's edit must be protected on the embedded path too: {:?}",
+            report.protected
+        );
+        assert_eq!(
+            fs::read_to_string(target.join(edited).join("SKILL.md")).unwrap(),
+            "operator-customized",
+            "the edit survives"
+        );
+        assert!(
+            report.overwritten.contains(&darkmux_written.to_string()),
+            "a darkmux-written older copy must still refresh: {:?}",
+            report.overwritten
+        );
+        assert!(!report.protected.contains(&darkmux_written.to_string()));
+        assert_eq!(
+            fs::read_to_string(target.join(darkmux_written).join("SKILL.md")).unwrap(),
+            EMBEDDED_SKILLS[1].1,
+            "the stale-but-unmodified copy was refreshed"
+        );
+    }
+
+    /// (#1927 + the namespace contract) The provenance sidecar is darkmux's own
+    /// state and is written ONLY into the `darkmux-*` namespace. A third-party
+    /// skill that darkmux happens to write (only reachable via `--force` with a
+    /// custom source) must come away with its `SKILL.md` and nothing else — no
+    /// darkmux bookkeeping file left inside a directory the operator owns.
+    #[serial_test::serial]
+    #[test]
+    fn provenance_is_never_stamped_into_a_non_darkmux_skill() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("skills");
+        write_skill(&src, "plain-skill", "v1-source");
+        write_skill(&src, "darkmux-alpha", "v1-source");
+        let target = tmp.path().join("dest");
+
+        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
+        install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: true,
+            dry_run: false,
+            refresh_darkmux: true,
+        })
+        .unwrap();
+        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
+
+        assert!(
+            target.join("darkmux-alpha").join(PROVENANCE_FILE).exists(),
+            "a darkmux-* skill IS stamped"
+        );
+        assert!(
+            !target.join("plain-skill").join(PROVENANCE_FILE).exists(),
+            "a non-darkmux skill must never receive darkmux bookkeeping state"
+        );
+    }
+
+    /// (#1927) The sidecar names its algorithm. A BLAKE3 digest is 64 hex
+    /// characters — the same width as a SHA-256 — so a bare hex file named
+    /// `.sha256` invites an operator to `shasum -a 256` their own skill, get a
+    /// mismatch, and conclude darkmux corrupted it. Both the filename and the
+    /// content prefix say `blake3`, and the recorded digest must actually be
+    /// the BLAKE3 of the installed bytes.
+    #[serial_test::serial]
+    #[test]
+    fn provenance_sidecar_names_its_algorithm_and_records_the_real_digest() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("skills");
+        write_skill(&src, "darkmux-alpha", "the installed body");
+        let target = tmp.path().join("dest");
+
+        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
+        install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: false,
+            refresh_darkmux: false,
+        })
+        .unwrap();
+        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
+
+        assert!(
+            !PROVENANCE_FILE.contains("sha"),
+            "the sidecar filename must not claim a SHA family: {PROVENANCE_FILE}"
+        );
+        let raw = fs::read_to_string(target.join("darkmux-alpha").join(PROVENANCE_FILE)).unwrap();
+        assert!(
+            raw.starts_with(PROVENANCE_PREFIX),
+            "the sidecar body names its algorithm: {raw:?}"
+        );
+        assert_eq!(
+            read_provenance_hash(&target.join("darkmux-alpha")).unwrap(),
+            content_hash("the installed body"),
+            "the recorded digest is the BLAKE3 of the bytes darkmux wrote"
+        );
+        // And a bare digest with no prefix still reads (lenient on read).
+        fs::write(
+            target.join("darkmux-alpha").join(PROVENANCE_FILE),
+            content_hash("the installed body"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_provenance_hash(&target.join("darkmux-alpha")).unwrap(),
+            content_hash("the installed body")
+        );
+    }
+
+    /// (#1927) `--dry-run` has to say which skills WOULD be protected, not just
+    /// which would be rewritten — this is what lets an operator catch the loss
+    /// before it happens.
+    #[serial_test::serial]
+    #[test]
+    fn dry_run_reports_protected_skill_without_writing_anything() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("skills");
+        write_skill(&src, "darkmux-alpha", "v2-source");
+        let target = tmp.path().join("dest");
+        fs::create_dir_all(target.join("darkmux-alpha")).unwrap();
+        fs::write(target.join("darkmux-alpha/SKILL.md"), "operator-customized").unwrap();
+
+        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
+        let report = install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: true,
+            refresh_darkmux: true,
+        })
+        .unwrap();
+        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
+
+        assert!(report.protected.contains(&"darkmux-alpha".to_string()));
+        assert!(report.overwritten.is_empty());
+        assert_eq!(
+            fs::read_to_string(target.join("darkmux-alpha/SKILL.md")).unwrap(),
+            "operator-customized",
+            "dry-run never writes"
         );
     }
 

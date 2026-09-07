@@ -403,7 +403,10 @@ pub(crate) enum Cmd {
         /// Use `./AGENTS.md` for a project-relative path, or any custom path.
         #[arg(long)]
         with_agents_md: Option<std::path::PathBuf>,
-        /// Overwrite existing skills / hook entries.
+        /// Overwrite existing skills / hook entries, including a locally
+        /// edited darkmux-* skill (#1927). Without --force, an edited (or
+        /// unrecognized-provenance) darkmux-* skill is left alone even on a
+        /// refresh — only an unmodified one refreshes silently.
         #[arg(long, short = 'f')]
         force: bool,
         /// Show what would be installed without writing.

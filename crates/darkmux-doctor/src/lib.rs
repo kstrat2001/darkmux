@@ -317,8 +317,12 @@ pub fn check_installed_skills_freshness(
 
     // (#1449) WARN when EITHER a skill is stale (older darkmux installed it) OR a
     // retired skill is left on disk (a live dead-verb skill an agent will
-    // invoke). Both are now fixed by `darkmux init` — stale ones refresh, retired
-    // ones prune. The "up to date" pass path holds when neither is present.
+    // invoke). Retired ones are always pruned by `darkmux init`. A stale one is
+    // only SOMETIMES fixed by `darkmux init` (#1927): the installer can't tell
+    // "stale" (an older bundled version, safe to refresh) apart from "edited"
+    // from content alone, so the hint below describes what `init` actually does
+    // rather than promising a refresh — describe, don't adjudicate (#1839).
+    // The "up to date" pass path holds when neither is present.
     if stale.is_empty() && retired.is_empty() {
         Check {
             name: SKILLS_FRESHNESS_CHECK_NAME.into(),
@@ -333,7 +337,14 @@ pub fn check_installed_skills_freshness(
                 retired.join(", ")
             )
         } else {
-            "installed from an older darkmux; run `darkmux init` to refresh (and prune retired skills)"
+            "content differs from this binary's bundled copy — an older darkmux installed it, or \
+             it was edited locally. `darkmux init` refreshes a copy it can prove darkmux itself \
+             wrote (a provenance stamp recorded at install time) and leaves every other one alone, \
+             so a skill installed before darkmux started recording provenance stays listed here \
+             even after `init` runs. `darkmux init --force` takes this binary's version of ALL of \
+             them, discarding any local edit, and records provenance so later runs refresh \
+             silently; to take just one, delete that skill's directory and re-run `init`. Either \
+             way `init` prunes retired skills"
                 .into()
         };
         Check {
