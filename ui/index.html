@@ -32,7 +32,39 @@
     <meta name="apple-mobile-web-app-title" content="darkmux" />
   </head>
   <body>
-    <div id="root"></div>
+    <!-- (#1709) The LAST line of defence, and the only one that covers a
+         failure BEFORE any of our code runs: a bundle with a syntax error, a
+         script that 404s or is blocked by CSP, or a module-level throw during
+         the import graph — all of which happen before `mountApp()` registers
+         its `window.onerror` listener, because `mountApp` is the last thing
+         in that graph, not the first. Measured in a real browser (2026-09-07):
+         each of those cases rendered a completely blank page with no
+         diagnosis path, which is #1709's original symptom surviving #1709's
+         own fix.
+
+         React replaces the whole content of this container on its first
+         commit, so this is invisible the instant the app mounts; it is only
+         ever on screen when the app did NOT mount. Styles are inline
+         attributes on purpose — the stylesheet may be part of what failed to
+         load, and a fallback that depends on the thing that broke is not a
+         fallback. -->
+    <div id="root">
+      <div
+        role="alert"
+        style="max-width: 70ch; margin: 32px auto; padding: 20px; border: 1px solid #f56565; border-radius: 6px; font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #e6e8ee; background: #0b0e14"
+      >
+        <div style="color: #f56565; font-weight: 700; margin-bottom: 8px">darkmux failed to load</div>
+        <div style="margin-bottom: 10px">
+          The viewer's script never ran, so nothing below this point started. That is usually a bundle
+          that failed to download, a browser extension or content-security policy blocking it, or a
+          build that did not finish.
+        </div>
+        <div style="color: #8b93a7">
+          The browser console holds the real error. If this is a served daemon, check that
+          <code>GET /</code> returned the whole document; if this is a local build, rebuild the viewer.
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

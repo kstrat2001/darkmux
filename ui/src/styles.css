@@ -6029,6 +6029,74 @@ body {
   margin-bottom: 12px;
 }
 
+/* (#1709) The boot-failure screen. Same idiom as `.lenscrash` just above —
+   same tokens, same "loud and plain" posture — but full-page and fixed:
+   there is no "rest of the app" left beside it when boot itself fails, the
+   way there still is when one lens crashes. Painted by TWO different
+   mechanisms that render the identical markup shape by hand
+   (`BootErrorScreen.tsx` via React, `mountApp.tsx`'s `paintBootError` via
+   raw DOM for the cases React itself can't be trusted to render) — see
+   `mountApp.tsx`'s own doc for why there are two. */
+.bootcrash-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow: auto;
+  background: var(--bg);
+  padding: 32px 16px;
+}
+.bootcrash {
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  padding: 20px;
+  max-width: 70ch;
+  width: 100%;
+  font: calc(12px * var(--fs-scale))/1.6 var(--font-mono);
+}
+.bootcrash__title {
+  color: var(--bad);
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.bootcrash__msg {
+  color: var(--fg);
+  overflow-wrap: anywhere;
+  margin-bottom: 10px;
+  user-select: text;
+}
+.bootcrash__build {
+  color: var(--dim);
+  margin-bottom: 10px;
+}
+.bootcrash__stack {
+  color: var(--dim);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-bottom: 12px;
+  user-select: text;
+}
+.bootcrash__hint {
+  color: var(--dim);
+  margin-bottom: 12px;
+}
+/* The action row. `dismiss` only appears on the raw-DOM path and only when a
+   live app is still mounted behind the overlay (`mountApp.tsx`), so this row
+   holds one button or two. */
+.bootcrash__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 /* ── (#2107, #1833, extraction packet) The compact CPU/GPU/MEM dial ──────
    Used by the global machine drawer/modal AND the machine lens's own
    live-stats section. Draws through the SAME `<Meter>` component and the
