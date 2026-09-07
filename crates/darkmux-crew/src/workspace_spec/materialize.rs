@@ -154,7 +154,13 @@ pub struct Materialized {
 
 /// Resolve every source in the spec, then walk + filter each tree.
 pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Materialized> {
-    let root = spec.resolved_root();
+    // (#2455 review) Fallible since the workspace name is CONTAINED at
+    // this join — the `?` is the whole point: a spec that never went
+    // through `WorkspaceSpec::load()` (a struct literal, e.g.
+    // `crawl::plan_sites_step::derive_workspace_spec`) is refused here
+    // rather than silently `create_dir_all`ing and cloning under an
+    // attacker-named path. See `WorkspaceSpec::resolved_root`'s doc.
+    let root = spec.resolved_root()?;
     let mirror_root = root.join("mirror");
     let tree_root = root.join("tree");
     fs::create_dir_all(&mirror_root)
@@ -2125,6 +2131,83 @@ mod tests {
                  across a second materialize now deadlocks"
             ),
         }
+    }
+
+    // ── #2455 review: the name containment holds at the JOIN, not only at
+    // load time ──
+    //
+    // `WorkspaceSpec::validate()` refuses a traversal-shaped `name`, but
+    // `validate()` only runs inside `WorkspaceSpec::load()`. Specs are
+    // ALSO built as struct literals that never touch `load()` — see
+    // `darkmux_lab::crawl::plan_sites_step::derive_workspace_spec`, which
+    // hands its spec straight to `materialize()`. So the load-time check
+    // is worth exactly as much as every caller remembering to call it,
+    // which is the shape `darkmux_types::paths` already rejected in
+    // writing ("making the bypass unrepresentable is cheaper than
+    // remembering not to take it", #1882). This test drives the bypass:
+    // a spec built the way that function builds one, with a `name` that
+    // is an absolute path, handed to `materialize()` directly.
+    //
+    // Before the containment landed in `resolved_root()` this test failed
+    // exactly as predicted: `materialize` returned `Ok`, the escape
+    // directory held a real `mirror/app.git` + a checked-out `tree/app`,
+    // and `<DARKMUX_HOME>/workspaces` was never created at all.
+    //
+    // Both locations under test are tempdirs; nothing here can write
+    // outside one even when the guard is removed.
+    #[test]
+    #[serial_test::serial]
+    fn a_spec_built_without_load_cannot_escape_the_workspaces_root_via_name() {
+        let home = TempDir::new().unwrap();
+        let escape = TempDir::new().unwrap();
+        let source = init_source_repo();
+
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        std::env::set_var("DARKMUX_HOME", home.path());
+
+        // Exactly `derive_workspace_spec`'s construction shape: a struct
+        // literal, no `root:`, never passed through `validate()`.
+        let spec = WorkspaceSpec {
+            schema_version: None,
+            name: Some(escape.path().join("pwned").to_string_lossy().into_owned()),
+            root: None,
+            sources: vec![SourceSpec {
+                id: "app".to_string(),
+                git: None,
+                path: Some(source.path().to_string_lossy().into_owned()),
+                git_ref: Some("main".to_string()),
+                extras: Default::default(),
+            }],
+            include: None,
+            exclude: None,
+            edges: Vec::new(),
+            rules: Vec::new(),
+            extras: Default::default(),
+        };
+
+        let result = materialize(&spec, RW);
+
+        // Restore before any assertion can panic — this test is
+        // `#[serial]`, but a leaked DARKMUX_HOME would still poison every
+        // later test in this process.
+        match &prev {
+            Some(v) => std::env::set_var("DARKMUX_HOME", v),
+            None => std::env::remove_var("DARKMUX_HOME"),
+        }
+
+        let err = result.err().unwrap_or_else(|| {
+            panic!(
+                "materialize accepted an absolute `name` on a spec that never went through \
+                 load() — escape dir now holds: {:?}",
+                fs::read_dir(escape.path()).unwrap().map(|e| e.unwrap().path()).collect::<Vec<_>>()
+            )
+        });
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pwned"), "the refusal must name the offending value: {msg}");
+        assert!(
+            !escape.path().join("pwned").exists(),
+            "refused, but the escape path was created anyway: {msg}"
+        );
     }
 
 }

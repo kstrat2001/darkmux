@@ -205,25 +205,44 @@ pub fn stop_file_path_from_record_context(
 /// than shared, per this module's existing "must not depend on the crawl
 /// module" boundary (see [`stop_file_path_from_record_context`]'s own doc).
 ///
-/// **This validator is deliberately STRICTER than its own source, and that
-/// is a known one-way divergence (#2157 review).** The value being checked
-/// is `WorkspaceSpec::effective_name()` (spec `name`, else the spec file's
-/// stem), which reaches here as `record_context.workspace` via
-/// `materialized.name` -> `crawl::plan::Plan::workspace`. `WorkspaceSpec`
-/// validates each source `id` against this class but does NOT validate the
-/// spec's own `name` — so a spec named `q1 corpus` or `_scratch` loads
-/// fine, materializes to `<root>/workspaces/<name>`, and would be REJECTED
-/// here. The divergence is safe in this direction (a rejected name means
-/// no STOP path is derived, and [`stop_file_unresolved_reason`] says so
-/// out loud rather than failing silently) but it is a false negative, not
-/// a no-op: such a crawl's breaker cannot write its STOP file. Closing it
-/// properly means validating `name` at its SOURCE in
-/// `WorkspaceSpec::validate()` — same class, same reason it already
-/// applies to `id` — which would additionally close the same-class
-/// unvalidated join at `workspace_spec::resolved_root()`. Tracked
-/// separately; not fixed here because it changes `WorkspaceSpec::load()`'s
-/// accept/reject contract, which is a wider blast radius than this
-/// module's own bug.
+/// **The one-way divergence this doc used to describe is closed (#2455).**
+/// The value being checked is `WorkspaceSpec::effective_name()` (spec
+/// `name`, else the spec file's stem), which reaches here as
+/// `record_context.workspace` via `materialized.name` ->
+/// `crawl::plan::Plan::workspace`. Until #2455, `WorkspaceSpec` validated
+/// each source `id` against this class but not the spec's own `name` — so
+/// a spec named `q1 corpus` or `_scratch` loaded fine, materialized to
+/// `<root>/workspaces/<name>`, and was then REJECTED here: a false
+/// negative where such a crawl's breaker could never write its STOP file.
+/// #2455 validates `name` at its SOURCE, in `WorkspaceSpec::validate()`,
+/// against the identical character class — so any spec that reached
+/// `load()` successfully now already has a `name` this function accepts
+/// too. The two validators stay independently DEFINED (this module still
+/// must not depend on the crawl module — see
+/// [`stop_file_path_from_record_context`]'s own doc) but no longer
+/// diverge in what they accept, for any spec that loaded through the
+/// normal path. This function is kept rather than removed: it is still
+/// the only defense against a `record_context.workspace` value that
+/// didn't come from a validated `WorkspaceSpec` at all (a caller/crew bug,
+/// or a hand-built `record_context`) — and #2455's join-time containment
+/// in `resolved_root()` is no substitute here, since it guards a
+/// DIFFERENT join under a DIFFERENT root and never runs on this path.
+///
+/// **The narrow residue, stated rather than rounded off (#2455 review).**
+/// "Any spec that loaded through `load()`" is the honest scope, and it is
+/// not every spec: a `WorkspaceSpec` built as a struct literal skips
+/// `validate()` entirely, and one production caller does exactly that —
+/// `darkmux_lab::crawl::plan_sites_step::derive_workspace_spec` names the
+/// workspace after the GitHub repo under review. So a review of
+/// `owner/.github` (a real and common repository) yields
+/// `record_context.workspace == ".github"`: structurally safe, contained
+/// by `resolved_root()`, and still REJECTED here for its leading dot.
+/// That residue is deliberately left rather than papered over by relaxing
+/// this class — it is the same safe direction as before (no STOP path is
+/// derived, [`stop_file_unresolved_reason`] says so out loud), it costs
+/// only a breaker's STOP file on one unusual repo name, and widening a
+/// path-component whitelist to buy that back is the wrong trade. Revisit
+/// if a real crawl ever runs against such a repo.
 fn valid_crawl_manifest_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {

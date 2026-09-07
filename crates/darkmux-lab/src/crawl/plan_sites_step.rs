@@ -504,6 +504,53 @@ mod tests {
         assert_eq!(from_url.sources[0].git, from_slug.sources[0].git);
     }
 
+    /// (#2455 review) This function is the ONE production caller that
+    /// builds a `WorkspaceSpec` from external input as a struct literal
+    /// and hands it straight to `materialize()` — it never calls
+    /// `WorkspaceSpec::validate()`, so the load-time name check does not
+    /// protect this path at all. What DOES protect it is the containment
+    /// at the join, in `WorkspaceSpec::resolved_root()`.
+    ///
+    /// `owner/repo` parsing is not itself a containment guard: `foo/..`
+    /// parses cleanly to `repo == ".."`, which is a name, not an error.
+    /// This test drives that value the whole way to `resolved_root()` —
+    /// the exact call `materialize()` makes first, before its
+    /// `create_dir_all` and its `git clone` — and pins the refusal.
+    /// Without the join-time guard, `<darkmux root>/workspaces/..` is
+    /// `<darkmux root>` itself, and everything below would be cloned into
+    /// the operator's darkmux root rather than under `workspaces/`.
+    #[test]
+    fn a_derived_spec_with_a_traversal_repo_name_is_refused_at_the_join() {
+        for (github, repo) in [("foo/..", ".."), ("foo/.", "."), ("https://github.com/foo/..", "..")] {
+            let spec = derive_workspace_spec(github, "sha1")
+                .unwrap_or_else(|e| panic!("{github:?} is a parseable owner/repo, not an error: {e}"));
+            assert_eq!(spec.name.as_deref(), Some(repo), "the slug parser yields the raw repo name");
+            let err = spec.resolved_root().err().unwrap_or_else(|| {
+                panic!(
+                    "{github:?} resolved a workspace root outside `workspaces/` — \
+                     the join-time guard is gone"
+                )
+            });
+            assert!(
+                err.to_string().contains("single non-escaping path component"),
+                "{github:?} refused for the wrong reason: {err}"
+            );
+        }
+    }
+
+    /// The direction a stricter guard would break, pinned so nobody
+    /// "unifies" the join-time containment with the load-time charset:
+    /// `owner/.github` is a real and common repository, and reviewing it
+    /// must keep working. `.github` is one contained component; only the
+    /// charset (which never runs on this path) objects to its leading dot.
+    #[test]
+    fn a_derived_spec_for_a_dot_prefixed_repo_still_resolves() {
+        let spec = derive_workspace_spec("kstrat2001/.github", "sha1").unwrap();
+        assert_eq!(spec.name.as_deref(), Some(".github"));
+        let root = spec.resolved_root().expect(".github is a safe single component");
+        assert!(root.ends_with("workspaces/.github"), "{}", root.display());
+    }
+
     #[test]
     fn a_github_value_that_is_not_owner_slash_repo_is_refused_by_name() {
         let err = derive_workspace_spec("darkmux", "sha1").unwrap_err();
