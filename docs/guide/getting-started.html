@@ -72,7 +72,7 @@ Next steps:
   3. With Docker running, a first dispatch: <code>darkmux dispatch code-reviewer "What do you do?"</code> (the runtime image is pulled on first use)</div>
     </div>
     <p class="session-caption">Verbatim, captured 2026-08-28 on an M5 Max from a home directory with no <code>~/.darkmux</code>, LM Studio installed with a few models downloaded.</p>
-    <p>If Homebrew refuses the tap as untrusted, run <code>brew trust kstrat2001/darkmux</code> once and install again. Update later with <code>brew upgrade darkmux</code>. <code>init</code> is safe to re-run: it refreshes the skills and never overwrites a registry or config you have edited.</p>
+    <p>If Homebrew refuses the tap as untrusted, run <code>brew trust kstrat2001/darkmux</code> once and install again. Update later with <code>brew upgrade darkmux</code>. <code>init</code> is safe to re-run: it refreshes a skill it can prove it wrote itself, leaves an edited one alone, and never overwrites a registry or config you have edited. A skill installed by an older darkmux carries no such proof, so the first re-run after upgrading reports every skill as kept rather than refreshed — <code>darkmux init --force</code> takes the new versions and discards any edits.</p>
   </div>
 </section>
 

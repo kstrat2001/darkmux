@@ -2022,6 +2022,65 @@ fn cmd_init(
             report.skills_skipped.join(", ")
         );
     }
+    if !report.skills_protected.is_empty() {
+        // (#1927) These darkmux-* skills differ from the bundled copy and
+        // have no recorded provenance (or a broken one) — could be an older
+        // bundled version, could be an operator edit; refresh alone can't
+        // tell, so it declines rather than guess. --force overwrites anyway.
+        //
+        // `init` is where the decision is made, so `init` is where the whole
+        // decision has to be legible: WHAT was kept, WHY it was kept, and the
+        // exact command that takes the new version. Naming the "installed by
+        // an older darkmux, so it has no stamp at all" case explicitly is the
+        // load-bearing part — on the first run after upgrading, that case is
+        // every skill on the machine, and an operator who does not know it is
+        // expected reads this list as darkmux refusing to work.
+        println!(
+            "  kept as-is, not refreshed ({}): {}",
+            report.skills_protected.len(),
+            report.skills_protected.join(", ")
+        );
+        for line in [
+            "    why: darkmux refreshes a skill only when it can prove it wrote the installed copy",
+            "         itself, by matching a provenance stamp it records at install time. These",
+            "         differ from the bundled copy and carry no stamp, or carry one that no longer",
+            "         matches.",
+            "    a skill installed by a darkmux older than this one has no stamp at all, so the",
+            "         first run after an upgrade lists every skill here even if you never edited one.",
+            "    to take this binary's version: `darkmux init --force` — overwrites ALL of the above",
+            "         (any edit of yours included) and records provenance, so later runs refresh",
+            "         silently.",
+            "    to refresh just ONE of them, keeping the rest: delete that skill's directory under",
+            "         the target above and re-run `darkmux init` — it reinstalls the missing one and",
+            "         leaves the others exactly as they are. `--force` is all-or-nothing; this is not.",
+            "    to keep an edit: do nothing. `darkmux doctor` keeps flagging these as differing",
+            "         from the bundled copy; that is the reminder, not an error.",
+        ] {
+            println!("{line}");
+        }
+    }
+    if !report.skills_force_overwrote_modified.is_empty() {
+        // (#1927) --force is the explicit "yes, discard it" escape hatch —
+        // say plainly which of the "overwritten" names above it applied to.
+        //
+        // Wording matters here (#1839, describe don't adjudicate). darkmux
+        // does NOT know these carried an operator edit; it knows only that it
+        // could not prove otherwise, which is also true of every skill an
+        // older darkmux installed. Claiming "discarded your changes" for a
+        // set that is usually "16 skills you never touched" is a verdict the
+        // evidence does not support — and an alarming one.
+        println!(
+            "  --force overwrote without proof they were unmodified ({}): {}",
+            report.skills_force_overwrote_modified.len(),
+            report.skills_force_overwrote_modified.join(", ")
+        );
+        println!(
+            "    any local edit in those is gone. darkmux had no provenance stamp for them (or a"
+        );
+        println!(
+            "    stale one), so it could not tell an edit from a copy an older darkmux installed."
+        );
+    }
     if !report.skills_pruned.is_empty() {
         // (#1449) Retired darkmux-* skills removed from the install target so an
         // upgraded machine stops teaching dead verbs.
