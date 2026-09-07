@@ -45,6 +45,36 @@ impl Drop for FlockGuard {
 /// Open (creating if absent) `path` and acquire a blocking exclusive
 /// `flock(2)` on it, returning a guard that releases the lock when
 /// dropped. Creates the parent directory if it doesn't exist yet.
+///
+/// (#2259) Creates at mode `0o600` on POSIX (owner read/write only). This is
+/// the creation point behind the hook outbox (`append_outbox_line`, and the
+/// trailing-newline fixup), the audit-log append, the fleet roster and the
+/// lab fixture-registry lock — none of which set a mode of their own, so
+/// they landed at the process umask default (typically `0o644`,
+/// world-readable) instead. Fixed here rather than at each of those call
+/// sites, per the module's own "extracted from four independently
+/// hand-rolled copies" rationale: one fix covers every present AND future
+/// caller.
+///
+/// NOT every hook file routes through here, and the ones that don't set
+/// their own mode: the `.quarantine` sibling opens append-only in
+/// `hooks::quarantine_line`, the `.last` status sidecar goes through
+/// `hooks::write_owner_only_file`, and outbox COMPACTION renames a fresh
+/// temp file over the outbox (so the surviving mode is that temp's, not the
+/// one set here). Each is fixed at its own writer.
+///
+/// `.mode()` applies ONLY at creation — an already-existing file (e.g. one
+/// created by a pre-#2259 binary) keeps whatever mode it already has; this
+/// function does not retroactively `chmod` it. Deliberate: silently
+/// tightening permissions on a file the operator may have intentionally
+/// widened (an unlikely but real case for a shared audit log) is a
+/// separate, louder decision than "make new files safe by default".
+///
+/// The consequence, stated plainly because nothing else states it: a
+/// pre-#2259 outbox already on disk at `0o644` STAYS world-readable, and
+/// there is no check anywhere today that finds or reports it — `darkmux
+/// doctor` has no file-mode check. Surfacing that is unbuilt work, not a
+/// guarantee this comment can lean on.
 pub fn lock_exclusive(path: &Path) -> Result<FlockGuard> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -52,6 +82,19 @@ pub fn lock_exclusive(path: &Path) -> Result<FlockGuard> {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening lock file {}", path.display()))?
+    };
+    #[cfg(not(unix))]
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -104,6 +147,23 @@ pub fn try_lock_exclusive(path: &Path) -> Result<Option<FlockGuard>> {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
+    // (#2259) Same owner-only creation mode as `lock_exclusive` — see its
+    // doc comment for the full rationale. Kept in sync deliberately (two
+    // call sites, not a shared helper) since each also has its own
+    // `#[cfg(unix)]`/`#[cfg(not(unix))]` split per the module doc.
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening lock file {}", path.display()))?
+    };
+    #[cfg(not(unix))]
     let file = OpenOptions::new()
         .read(true)
         .write(true)

@@ -610,7 +610,10 @@ fn write_last_status(rt: &RuleRuntime, ok: bool, error: Option<&str>) {
         stalled: rt.stalled.load(Ordering::Acquire),
     };
     if let Ok(json) = serde_json::to_string(&status) {
-        if let Err(e) = fs::write(&rt.rule.last_status_path, json) {
+        // (#2259) Owner-only on POSIX — this sidecar carries the last
+        // delivery's error detail, which can echo record content back
+        // (e.g. an HTTP error body).
+        if let Err(e) = write_owner_only_file(&rt.rule.last_status_path, json.as_bytes()) {
             eprintln!("flow::HookSink: failed to write last-status {}: {e:#}", rt.rule.last_status_path.display());
         }
     }
@@ -633,7 +636,10 @@ fn write_cursor_write_status(path: &Path, cursor_write_failures: u64, stalled: b
     status.cursor_write_failures = cursor_write_failures;
     status.stalled = stalled;
     if let Ok(json) = serde_json::to_string(&status) {
-        if let Err(e) = fs::write(path, json) {
+        // (#2259) Same owner-only writer as `write_last_status` — this
+        // is the SAME `.last` sidecar file, just a read-modify-write of
+        // a subset of its fields.
+        if let Err(e) = write_owner_only_file(path, json.as_bytes()) {
             eprintln!("flow::HookSink: failed to write cursor-write status {}: {e:#}", path.display());
         }
     }
@@ -1078,7 +1084,21 @@ fn quarantine_path(outbox_path: &Path) -> PathBuf {
 
 fn quarantine_line(outbox_path: &Path, line: &str) {
     let path = quarantine_path(outbox_path);
-    match fs::OpenOptions::new().create(true).append(true).open(&path) {
+    // (#2259) Owner-only on POSIX — a quarantined line is a raw copy of
+    // whatever the outbox held (a torn write, potentially mid-record), so
+    // it needs the same protection the outbox itself gets. Open-coded
+    // here rather than routed through `write_owner_only_file` because
+    // that helper truncates on every call; this is append-only across the
+    // lifetime of the outbox (every subsequent invalid line joins the
+    // same file), so `.mode()` is set inline instead.
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path)
+    };
+    #[cfg(not(unix))]
+    let opened = fs::OpenOptions::new().create(true).append(true).open(&path);
+    match opened {
         Ok(mut f) => {
             if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.write_all(b"\n")) {
                 eprintln!("flow::HookSink: failed to quarantine invalid outbox line into {}: {e:#}", path.display());
@@ -1264,7 +1284,29 @@ fn maybe_compact_outbox(outbox_path: &Path, cursor_path: &Path, threshold_bytes:
         let mut remaining = Vec::new();
         file.read_to_end(&mut remaining).with_context(|| format!("reading tail of {}", outbox_path.display()))?;
         let tmp_path = PathBuf::from(format!("{}.compact.tmp", outbox_path.display()));
-        fs::write(&tmp_path, &remaining).with_context(|| format!("writing {}", tmp_path.display()))?;
+        // (#2259) The temp file BECOMES the outbox — `rename` replaces the
+        // outbox's inode with this one, so the surviving mode is this
+        // file's, not the 0o600 the creator gave the original. Written
+        // owner-only so the undelivered records it holds are never
+        // world-readable, not even in the window between the write and the
+        // `set_permissions` below. That window is why this call is NOT
+        // redundant with it — but it is also not pinned by a test: a
+        // mode-at-rest assertion can only observe the file after both
+        // statements have run. Do not "simplify" it away on the strength of
+        // the tests staying green.
+        write_owner_only_file(&tmp_path, &remaining)?;
+        // `write_owner_only_file`'s `.mode()` only applies when it CREATES.
+        // A `.compact.tmp` left behind at 0o644 by a pre-#2259 binary (or by
+        // a crash between the write and the rename — the exact case this
+        // temp+rename shape exists to survive) is reused, not recreated, so
+        // set the mode explicitly too: otherwise one stale temp file
+        // reintroduces the world-readable outbox this fix removes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("setting owner-only mode on {}", tmp_path.display()))?;
+        }
         fs::rename(&tmp_path, outbox_path)
             .with_context(|| format!("renaming {} to {}", tmp_path.display(), outbox_path.display()))?;
         drop(guard);
@@ -4268,6 +4310,98 @@ mod tests {
 
         assert_eq!(read_cursor(&cursor_path), 8, "cursor untouched below threshold");
         assert_eq!(std::fs::read_to_string(&outbox_path).unwrap(), "{\"n\":0}\n{\"n\":1}\n", "file untouched below threshold");
+    }
+
+    /// (#2259) Compaction must PRESERVE the outbox's owner-only mode.
+    /// `maybe_compact_outbox` replaces the outbox by `rename`-ing a
+    /// sibling temp file over it, so the surviving inode is the TEMP
+    /// file's — its mode, not the original outbox's. A temp written with
+    /// plain `fs::write` lands at the umask default (`0o644`), so a
+    /// single compaction silently reverted a `0o600` outbox to
+    /// world-readable, taking the still-undelivered records (whole flow
+    /// records; a crawl finding's `evidence` is a verbatim source line
+    /// from the operator's repository) with it.
+    #[cfg(unix)]
+    #[test]
+    fn maybe_compact_outbox_preserves_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outbox_path = tmp.path().join("0-x.outbox.jsonl");
+        let cursor_path = tmp.path().join("0-x.cursor");
+
+        // Create the outbox exactly as production does — through the
+        // locking creator, which lands it at 0o600.
+        {
+            let _guard = darkmux_types::flock::lock_exclusive(&outbox_path).unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&outbox_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "precondition: the creator lands the outbox at 0o600"
+        );
+        // `fs::write` onto the ALREADY-created file truncates without
+        // touching its mode, so the 0o600 above is what compaction sees.
+        let delivered = "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n{\"n\":4}\n";
+        let undelivered = "{\"n\":5}\n{\"n\":6}\n{\"n\":7}\n";
+        std::fs::write(&outbox_path, format!("{delivered}{undelivered}")).unwrap();
+        write_cursor(&cursor_path, delivered.len() as u64).unwrap();
+
+        maybe_compact_outbox(&outbox_path, &cursor_path, 10); // threshold: 10 bytes
+
+        assert_eq!(
+            std::fs::read_to_string(&outbox_path).unwrap(),
+            undelivered,
+            "setup guard: compaction must actually have run"
+        );
+        let mode = std::fs::metadata(&outbox_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "compaction must not widen the outbox's mode — undelivered records survive the rewrite; got {mode:o}"
+        );
+        // The transient temp file must be owner-only too while it exists;
+        // it holds the same undelivered bytes.
+        let tmp_path = std::path::PathBuf::from(format!("{}.compact.tmp", outbox_path.display()));
+        assert!(!tmp_path.exists(), "the compaction temp file must not survive the rename");
+    }
+
+    /// (#2259) The stale-temp half of the above. `write_owner_only_file`'s
+    /// `.mode()` applies only when it CREATES the file — a `.compact.tmp`
+    /// left behind at `0o644` (by a pre-#2259 binary, or by a crash between
+    /// the write and the rename, which is the very case this temp+rename
+    /// shape exists to survive) is REUSED. Without an explicit
+    /// `set_permissions`, that one stale file renames a world-readable
+    /// outbox back into place.
+    #[cfg(unix)]
+    #[test]
+    fn maybe_compact_outbox_owner_only_even_over_a_stale_world_readable_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outbox_path = tmp.path().join("0-x.outbox.jsonl");
+        let cursor_path = tmp.path().join("0-x.cursor");
+        {
+            let _guard = darkmux_types::flock::lock_exclusive(&outbox_path).unwrap();
+        }
+        let delivered = "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n{\"n\":4}\n";
+        let undelivered = "{\"n\":5}\n{\"n\":6}\n{\"n\":7}\n";
+        std::fs::write(&outbox_path, format!("{delivered}{undelivered}")).unwrap();
+        write_cursor(&cursor_path, delivered.len() as u64).unwrap();
+
+        // Leftover temp from an interrupted earlier compaction, at the
+        // umask default rather than owner-only.
+        let stale_tmp = std::path::PathBuf::from(format!("{}.compact.tmp", outbox_path.display()));
+        std::fs::write(&stale_tmp, b"stale").unwrap();
+        std::fs::set_permissions(&stale_tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        maybe_compact_outbox(&outbox_path, &cursor_path, 10);
+
+        assert_eq!(
+            std::fs::read_to_string(&outbox_path).unwrap(),
+            undelivered,
+            "setup guard: compaction must actually have run over the stale temp"
+        );
+        let mode = std::fs::metadata(&outbox_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a stale world-readable temp must not become a world-readable outbox; got {mode:o}");
     }
 
     #[test]
