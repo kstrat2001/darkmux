@@ -2805,7 +2805,12 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     // single-shot HOSTED path (a plain host-side `curl`, already
     // `child_registry`-wired) rather than a `darkmux-runtime` container,
     // which this test environment has neither Docker nor the image for.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_darkmux"))
+    // (#2184) Through the isolating helper, not a raw spawn — the structural
+    // guard in this file refuses the latter. Both overrides below are the
+    // helper's own documented escape: a later `.env` wins, so this test still
+    // gets the specific roots it seeds and asserts against, while the DEFAULT
+    // is isolation rather than a raw inherit.
+    let mut child = darkmux_std_cmd()
         .env("HOME", os_home.path())
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
@@ -2915,7 +2920,12 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
     }"#;
     fs::write(workloads_dir.join("sigterm-lab-hang-test.json"), workload_json).unwrap();
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_darkmux"))
+    // (#2184) Through the isolating helper, not a raw spawn — the structural
+    // guard in this file refuses the latter. Both overrides below are the
+    // helper's own documented escape: a later `.env` wins, so this test still
+    // gets the specific roots it seeds and asserts against, while the DEFAULT
+    // is isolation rather than a raw inherit.
+    let mut child = darkmux_std_cmd()
         .env("HOME", os_home.path())
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
