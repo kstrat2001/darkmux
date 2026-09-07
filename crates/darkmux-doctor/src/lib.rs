@@ -180,6 +180,7 @@ pub fn run() -> DoctorReport {
         check_binary_split_brain(),
         check_audit_integrity(),
         check_audit_write_drops(),
+        check_state_file_permissions(),
         check_daemon_auth(),
         check_utility_model_binding(),
         check_unpriceable_residents(),
@@ -804,6 +805,316 @@ fn check_audit_write_drops() -> Check {
             ),
         }
     }
+}
+
+/// Name of the state-file-permissions check (#2452).
+const STATE_FILE_PERMS_CHECK_NAME: &str = "state file permissions";
+
+/// Total files this check will `stat` across every store it walks, per
+/// `darkmux doctor` invocation. `findings/**` and `mods/**` can hold years
+/// of an operator's history — stat-ing all of it on every run would make
+/// `doctor` slow exactly where it should stay instant. Once the budget is
+/// spent the scan stops and the check SAYS SO, rather than silently
+/// reporting a partial sweep as a clean one.
+///
+/// Measured (#2452 review, warm page cache, M5 Max): 772 files → ~17 ms;
+/// a 4,921-file tree clamped by this budget → ~54 ms, against a ~2.5 s
+/// `doctor` baseline. ~2% — not material, so the budget stays where it is
+/// rather than being tightened or made lazy.
+#[cfg(unix)]
+const STATE_FILE_SCAN_BUDGET: usize = 2_000;
+
+/// One darkmux-owned state location this check inspects — a human `label`
+/// (the ONLY thing this check ever prints about an offending file, see
+/// [`build_state_file_permissions_check`]), the root (a single file, e.g.
+/// `fleet.json`, or a directory), and whether darkmux nests content in
+/// subdirectories under that root (`findings/**`, `mods/**`) versus keeping
+/// it flat (the hooks outbox, the flow day-files).
+#[cfg(unix)]
+struct ScanRoot {
+    label: &'static str,
+    path: std::path::PathBuf,
+    recursive: bool,
+}
+
+/// What one [`ScanRoot`]'s walk found. Counts and modes only — deliberately
+/// NO paths (see [`build_state_file_permissions_check`] for why a file name
+/// must not reach this check's output).
+#[cfg(unix)]
+#[derive(Default)]
+struct RootTally {
+    /// Regular files actually stat'd.
+    checked: usize,
+    /// Of those, how many were group- or world-readable.
+    violations: usize,
+    /// The distinct offending modes, for the report. A mode is darkmux's
+    /// own fact about the file, never operator content.
+    modes: std::collections::BTreeSet<u32>,
+    /// Symlinks encountered and deliberately NOT followed (see
+    /// [`check_one_state_file`]). Reported so the blind spot is disclosed
+    /// rather than silent.
+    symlinks_skipped: usize,
+}
+
+/// Stat one file and record a violation when the group or other READ bit is
+/// set.
+///
+/// A symlink is COUNTED as skipped and never followed. Two reasons, and the
+/// count exists because neither of them makes the file uninteresting:
+/// following one would let a link planted inside the store aim this check —
+/// and the `chmod` remedy it prints — at an arbitrary path outside it, the
+/// same confused-deputy shape `brief_refs`'s own `attachments/` symlink
+/// refusal exists to stop (#2295); and a symlink's own mode is not the mode
+/// that governs the data. So the target's exposure is real but unreported,
+/// which is exactly why the count is surfaced instead of dropped.
+#[cfg(unix)]
+fn check_one_state_file(path: &std::path::Path, tally: &mut RootTally) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(sym_md) = std::fs::symlink_metadata(path) else { return };
+    if sym_md.file_type().is_symlink() {
+        tally.symlinks_skipped += 1;
+        return;
+    }
+    if !sym_md.file_type().is_file() {
+        return;
+    }
+    tally.checked += 1;
+    let mode = sym_md.permissions().mode() & 0o777;
+    // 0o044 = the group-read and other-read bits. #2259/#2451 create these
+    // files at 0o600, so ANY of these bits is drift from what darkmux
+    // itself would have written: 0o640 (group-read) and 0o604 (other-read)
+    // are both caught, pinned by `state_file_perms_mask_catches_every_read_bit`.
+    // Deliberately NOT 0o077: "group- or world-READABLE" is the literal
+    // criterion #2452 names. A file at 0o620 — group-writable but not
+    // readable — is therefore NOT reported here; see that test's own note.
+    if mode & 0o044 != 0 {
+        tally.violations += 1;
+        tally.modes.insert(mode);
+    }
+}
+
+/// Walk one [`ScanRoot`] into `tally`, stat-ing at most `allowance` files.
+/// Returns `true` when that allowance was exhausted mid-walk, so the caller
+/// can say the root's sweep was partial. Iterative (an explicit stack, not
+/// recursion) so a very deep mission/finding tree can't blow the stack.
+///
+/// A root that is ITSELF a symlink is skipped whole, for the same reason a
+/// symlinked entry is — and counted the same way. Before #2452's review this
+/// split incoherently: `Path::is_file()` follows links, so a symlinked
+/// single-file root (`fleet.json` → elsewhere) fell into the file arm and was
+/// then dropped by `check_one_state_file` without a trace, while a symlinked
+/// DIRECTORY root fell into `read_dir`, which follows too, and was walked in
+/// full.
+#[cfg(unix)]
+fn scan_state_root(root: &ScanRoot, tally: &mut RootTally, allowance: usize) -> bool {
+    let Ok(root_md) = std::fs::symlink_metadata(&root.path) else { return false };
+    if root_md.file_type().is_symlink() {
+        tally.symlinks_skipped += 1;
+        return false;
+    }
+    if root_md.file_type().is_file() {
+        if tally.checked >= allowance {
+            return true;
+        }
+        check_one_state_file(&root.path, tally);
+        return false;
+    }
+    let mut stack = vec![root.path.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            if tally.checked >= allowance {
+                return true;
+            }
+            let Ok(file_type) = entry.file_type() else { continue };
+            if file_type.is_symlink() {
+                tally.symlinks_skipped += 1;
+                continue;
+            }
+            if file_type.is_dir() {
+                if root.recursive {
+                    stack.push(entry.path());
+                }
+                continue;
+            }
+            if file_type.is_file() {
+                check_one_state_file(&entry.path(), tally);
+            }
+        }
+    }
+    false
+}
+
+/// Render one root's violations for the message — its LABEL, the count, and
+/// the distinct modes. Never a file name; see
+/// [`build_state_file_permissions_check`].
+#[cfg(unix)]
+fn describe_root_violations(label: &str, tally: &RootTally) -> String {
+    let modes: Vec<String> = tally.modes.iter().map(|m| format!("{m:o}")).collect();
+    let word = if modes.len() == 1 { "mode" } else { "modes" };
+    format!("{label} ({}, {word} {})", tally.violations, modes.join(", "))
+}
+
+/// Pure builder — every root is caller-supplied, so this is testable
+/// against synthetic tempdir fixtures with no `config_access` involved at
+/// all (mirrors `build_hooks_check`'s own split). [`check_state_file_permissions`]
+/// is the thin production wrapper that supplies the REAL darkmux-owned
+/// roots, resolved through `config_access`.
+///
+/// **This check never prints a file name, deliberately (#2452 review).** It
+/// would be the more actionable report if it did, and the first draft did.
+/// But `darkmux doctor`'s stdout is not a private surface: `/panel/doctor`
+/// runs this verb and the viewer's console lens renders its output verbatim
+/// in a `<pre>`, and under the documented `tailscale serve` phone-dashboard
+/// pattern every tailnet peer reaches that daemon as loopback — the one case
+/// bearer auth is exempt from (see `panel::PANEL_HEADER`'s own doc). The
+/// names in these stores are operator content, not darkmux's: a mod
+/// attachment keeps its source basename verbatim (#2457 was filed because
+/// that is how a `prod-credentials.diff` gets there), a hooks outbox file is
+/// keyed by its destination host and port, and a crawl mission's plan files
+/// are named for the operator's own rules. A check written to report a
+/// disclosure risk must not become one, so the message carries the ROOT
+/// LABEL, a count and the modes; the hint carries the root PATHS — darkmux's
+/// own directory names, which `check_hooks` and the workspaces check already
+/// print — plus the two commands that enumerate and fix the files locally.
+/// The operator can still act; the names stay on their machine.
+///
+/// (#1839) Describes, never adjudicates: the message states counts and
+/// modes; the hint states the remedy. Neither ever characterizes the
+/// operator's exposure ("safe", "at risk", "for compliance") — see
+/// `daemon_auth_status`'s own doc for the same rule applied to the
+/// serve-token check.
+#[cfg(unix)]
+fn build_state_file_permissions_check(roots: &[ScanRoot], budget: usize) -> Check {
+    let mut checked = 0usize;
+    let mut violations = 0usize;
+    let mut symlinks_skipped = 0usize;
+    let mut per_root: Vec<(&'static str, RootTally)> = Vec::new();
+    let mut truncated: Vec<&str> = Vec::new();
+
+    // A SHARED budget spent in declaration order starves whatever comes
+    // last: measured on a 4,921-file tree, `findings` alone consumed all
+    // 2,000 stats and `mods` — the store #2457 is actually about — was
+    // never reached, on every run, deterministically. So each root gets an
+    // equal share and any share it doesn't spend rolls forward. The total
+    // stayed bounded by `budget` either way; what changes is that no root
+    // is permanently invisible behind a larger sibling.
+    let n = roots.len().max(1);
+    let share = budget / n;
+    let mut carry = budget % n;
+    for root in roots {
+        let allowance = share + carry;
+        let mut tally = RootTally::default();
+        if scan_state_root(root, &mut tally, allowance) {
+            truncated.push(root.label);
+        }
+        carry = allowance.saturating_sub(tally.checked);
+        checked += tally.checked;
+        violations += tally.violations;
+        symlinks_skipped += tally.symlinks_skipped;
+        if tally.violations > 0 {
+            per_root.push((root.label, tally));
+        }
+    }
+
+    let mut suffix = String::new();
+    if !truncated.is_empty() {
+        suffix.push_str(&format!(
+            " — the {budget}-file scan budget ran out in: {}; those store(s) are not exhaustive",
+            truncated.join(", ")
+        ));
+    }
+    if symlinks_skipped > 0 {
+        suffix.push_str(&format!(
+            "{} {symlinks_skipped} symlink(s) skipped — their targets are not inspected",
+            if suffix.is_empty() { " —" } else { ";" }
+        ));
+    }
+
+    if violations == 0 {
+        return Check {
+            name: STATE_FILE_PERMS_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: format!(
+                "{checked} darkmux state file(s) checked; none are group- or world-readable{suffix}"
+            ),
+            hint: None,
+        };
+    }
+
+    let breakdown: Vec<String> =
+        per_root.iter().map(|(label, t)| describe_root_violations(label, t)).collect();
+    let message = format!(
+        "{violations} of {checked} darkmux state file(s) are group- or world-readable — {}{suffix}",
+        breakdown.join(", ")
+    );
+
+    // Only the roots that actually have violations, so the commands the
+    // operator pastes do exactly what the message just said.
+    let offending_paths: Vec<String> = roots
+        .iter()
+        .filter(|r| per_root.iter().any(|(label, _)| *label == r.label))
+        .map(|r| format!("\"{}\"", r.path.display()))
+        .collect();
+    let targets = offending_paths.join(" ");
+    let hint = Some(format!(
+        "darkmux sets the mode only when IT creates a file — one written by an older binary, or \
+         loosened by hand afterward, keeps whatever mode it already had. File NAMES are omitted \
+         from this report on purpose: `darkmux doctor` output is republished verbatim by the \
+         viewer's console lens, and the names in these stores are yours, not darkmux's. List them \
+         on this machine, then restrict them:\n  \
+         find {targets} -type f \\( -perm -g+r -o -perm -o+r \\) -print\n  \
+         find {targets} -type f \\( -perm -g+r -o -perm -o+r \\) -exec chmod go-rwx {{}} +"
+    ));
+
+    Check { name: STATE_FILE_PERMS_CHECK_NAME.into(), status: Status::Warn, message, hint }
+}
+
+/// `state file permissions` (#2452): #2259/#2451 made darkmux create its
+/// own state files owner-only (`0o600`), but `.mode()` only applies AT
+/// CREATION — a file already on disk from an older binary, or an operator
+/// who loosened one on purpose, keeps whatever mode it had. Silently
+/// leaving that alone is only defensible if something reports it; this is
+/// that report.
+///
+/// Every root is resolved through `darkmux_types::config_access` (and
+/// `darkmux_crew::loader::missions_dir`, which resolves through the same
+/// `paths::resolve` ladder) — never `DarkmuxConfig::load_resolved()`
+/// directly and never `dirs::home_dir()` — so this check inherits the SAME
+/// env>config>default precedence, and the SAME #811/#994 test-build
+/// isolation, every sibling accessor already has. `check_hooks`'s own doc
+/// names the failure this avoids: a check with its own copy of the config
+/// ladder reads the developer's REAL `~/.darkmux` from inside a unit test.
+///
+/// Two of these six roots have NO test-build isolation of their own, and
+/// that is the reason `run_returns_static_plus_eureka_checks` and
+/// `platform_check_always_present` now pin `DARKMUX_HOME` to a tempdir:
+/// `fleet_file()` is unguarded deliberately (see `fleet_file_default`'s own
+/// doc — the guard broke a `HOME`-relocating CI test) and
+/// `darkmux_crew::loader::missions_dir()` resolves through
+/// `user_state_root()`, whose crate exposes an EMPTY `test-support` feature.
+/// Both resolve to the developer's real `~/.darkmux` in an un-isolated test
+/// build, verified by probe. Every other check in `run()` was already
+/// reading that tree; this one would have WALKED it.
+#[cfg(unix)]
+fn check_state_file_permissions() -> Check {
+    let roots = vec![
+        ScanRoot { label: "hooks outbox", path: darkmux_types::config_access::hooks_outbox_dir(), recursive: false },
+        ScanRoot { label: "fleet roster", path: darkmux_types::config_access::fleet_file(), recursive: false },
+        ScanRoot { label: "mission/phase state", path: darkmux_crew::loader::missions_dir(), recursive: true },
+        ScanRoot { label: "findings", path: darkmux_types::config_access::findings_dir(), recursive: true },
+        ScanRoot { label: "mods", path: darkmux_types::config_access::mods_dir(), recursive: true },
+        ScanRoot { label: "flow records", path: darkmux_types::config_access::flows_dir(), recursive: false },
+    ];
+    build_state_file_permissions_check(&roots, STATE_FILE_SCAN_BUDGET)
+}
+
+/// Windows file ACLs are a separate story (same posture as
+/// `tests/state_files_owner_only_mode.rs`'s own `#![cfg(unix)]` gate) — no
+/// POSIX mode bits to read, so there is nothing this check can say.
+#[cfg(not(unix))]
+fn check_state_file_permissions() -> Check {
+    not_applicable(STATE_FILE_PERMS_CHECK_NAME, "POSIX file modes only — Windows ACLs are a separate story")
 }
 
 /// Pure decision for `check_daemon_auth` (#881) — split out so both arms are
@@ -8537,9 +8848,38 @@ mod tests {
         assert!(which("definitely-not-a-real-binary-zzzz").is_none());
     }
 
+    /// (#2452 review) Both `run()` tests below pin `DARKMUX_HOME` to an empty
+    /// tempdir, and must keep doing so. `run()` calls
+    /// `check_state_file_permissions`, which WALKS six state roots — and two
+    /// of the six carry no test-build isolation of their own:
+    /// `config_access::fleet_file()` is deliberately unguarded
+    /// (`fleet_file_default`'s doc explains which CI test the guard broke)
+    /// and `darkmux_crew::loader::missions_dir()` resolves through
+    /// `user_state_root()`, whose crate's `test-support` feature is empty.
+    /// Un-isolated, this test recursively stats the DEVELOPER's real
+    /// `~/.darkmux/missions` — up to the whole scan budget — which is the
+    /// #2411/#2450 failure class one directory over, and makes the test's
+    /// runtime a function of the machine's own history.
+    /// `every_state_root_resolves_under_an_isolated_darkmux_home` pins that
+    /// `DARKMUX_HOME` is sufficient to cover all six.
+    fn with_isolated_darkmux_home<T>(f: impl FnOnce() -> T) -> T {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        out
+    }
+
     #[test]
+    #[serial_test::serial]
     fn run_returns_static_plus_eureka_checks() {
-        let r = run();
+        let r = with_isolated_darkmux_home(run);
         // 55 static checks via run() (#1405 removed the 4 openclaw-gated
         // checks; #1426 removed recommendation-drift +
         // recommended-profile-not-shadowed with the retired recommendations
@@ -8578,22 +8918,22 @@ mod tests {
         // hooks checks are a different, disabled-by-default surface] + one
         // per active eureka rule.
         //
-        // (round-3 merge fix) The constant here is 55, not 54: #2413 M5
-        // added `check_removed_telemetry_record_every_samples` to the
-        // static array (recount it before touching this number — `grep -c`
-        // inside the `let checks = vec![...]` block), `check_hooks()`
-        // always contributes exactly 1 more (disabled by default → the
-        // single overview check), and only THEN does `eureka_checks()` add
-        // one per active rule. A prior rebase kept an origin/main-side
-        // "53" that predated this branch's own `check_runtime_binary_cache`
-        // addition to the static array, silently undercounting by exactly
-        // the one check the OTHER side of that same merge conflict had
-        // just added — proof that a colliding-file rebase needs its
-        // literal counts re-derived, not just its prose reconciled.
+        // (round-3 merge fix) The constant here is 56, not 55: #2452 added
+        // `check_state_file_permissions` to the static array (recount it
+        // before touching this number — `grep -c` inside the
+        // `let checks = vec![...]` block), `check_hooks()` always
+        // contributes exactly 1 more (disabled by default → the single
+        // overview check), and only THEN does `eureka_checks()` add one per
+        // active rule. A prior rebase kept an origin/main-side "53" that
+        // predated this branch's own `check_runtime_binary_cache` addition
+        // to the static array, silently undercounting by exactly the one
+        // check the OTHER side of that same merge conflict had just added —
+        // proof that a colliding-file rebase needs its literal counts
+        // re-derived, not just its prose reconciled.
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 55 + darkmux_eureka::all_rules().len();
+        let expected = 56 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -8708,6 +9048,395 @@ mod tests {
         let (_, msg, hint) = daemon_auth_status(false);
         assert!(msg.contains("loopback-only"), "still reports the actual state: {msg}");
         assert!(hint.unwrap().contains("darkmux-serve-token"), "still actionable");
+    }
+
+    // ─── check_state_file_permissions (#2452) ──────────────────────────
+    //
+    // #2259/#2451 made darkmux CREATE its own state files owner-only
+    // (0o600). `.mode()` only applies at creation, so a file already on
+    // disk from an older binary — or loosened by hand — keeps whatever
+    // mode it had. Nothing reported that until now.
+    //
+    // (#2452 review) There is deliberately NO umask "anti-vacuity control"
+    // in this block, and the first draft's was removed rather than fixed.
+    // It was lifted from `tests/state_files_owner_only_mode.rs`, where the
+    // fixture files are created by PRODUCTION code whose `.mode()` call is
+    // the thing under test — there, a strict umask really can hide a
+    // deleted `.mode()` and the control is load-bearing. Here every fixture
+    // sets its mode EXPLICITLY via `chmod_for_test`, so the umask cannot
+    // reach these assertions at all; the control asserted a premise that is
+    // false in this file, and it turned the suite red under
+    // `zsh -c 'umask 0077; cargo test'` for a reason that had nothing to do
+    // with the code. Non-vacuity is proven the way it should be — by
+    // mutation (`mode & 0o044 != 0` → `false` reds
+    // `state_file_perms_reports_violations_by_root_count_and_mode`) and by
+    // `state_file_perms_mask_catches_every_read_bit`, which pins the
+    // predicate against a table of modes, umask-independently.
+
+    #[cfg(unix)]
+    fn chmod_for_test(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_at_mode(dir: &std::path::Path, name: &str, mode: u32) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, b"{}").unwrap();
+        chmod_for_test(&p, mode);
+        p
+    }
+
+    /// The mask is the whole predicate, so it gets a table rather than one
+    /// example: every mode that sets EITHER read bit must be caught, and
+    /// 0o600 — what #2259/#2451 actually create — must not be.
+    ///
+    /// 0o620 is in the table as a deliberate NON-catch: it is group-WRITABLE
+    /// with no read bit, which `mode & 0o044` cannot see. That is the
+    /// literal reading of #2452 ("group- or world-readable"), and it is
+    /// recorded here rather than left to be re-derived, because widening to
+    /// `mode & 0o077` is a real (and defensible) follow-up: a mod kit is
+    /// briefed to a model and its attachments are bind-mounted into a
+    /// dispatch container, so a writable one is a tampering surface, not
+    /// just a disclosure one.
+    #[cfg(unix)]
+    #[test]
+    fn state_file_perms_mask_catches_every_read_bit() {
+        for (mode, should_flag) in [
+            (0o600, false),
+            (0o400, false),
+            (0o620, false), // group-writable, NOT readable — see this test's doc
+            (0o640, true),  // group-read
+            (0o604, true),  // other-read
+            (0o644, true),
+            (0o664, true),
+            (0o666, true),
+            (0o755, true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("findings");
+            write_at_mode(&dir, "finding.json", mode);
+            let roots = vec![ScanRoot { label: "findings", path: dir, recursive: true }];
+            let check = build_state_file_permissions_check(&roots, 100);
+            let flagged = check.status == Status::Warn;
+            assert_eq!(
+                flagged, should_flag,
+                "mode {mode:o} should {} be flagged; got: {}",
+                if should_flag { "" } else { "NOT" },
+                check.message
+            );
+        }
+    }
+
+    /// The report names the ROOT, the count and the modes — and the remedy
+    /// is runnable. See `build_state_file_permissions_check`'s doc for why
+    /// no file name may appear; `state_file_perms_never_prints_a_file_name`
+    /// is the guard on that.
+    #[cfg(unix)]
+    #[test]
+    fn state_file_perms_reports_violations_by_root_count_and_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("findings");
+        write_at_mode(&dir, "finding.json", 0o644);
+        write_at_mode(&dir, "finding2.json", 0o600);
+        let clean = tmp.path().join("mods");
+        write_at_mode(&clean, "mod.json", 0o600);
+
+        let roots = vec![
+            ScanRoot { label: "findings", path: dir.clone(), recursive: true },
+            ScanRoot { label: "mods", path: clean.clone(), recursive: true },
+        ];
+        let check = build_state_file_permissions_check(&roots, 100);
+
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("1 of 3"), "counts both stores: {}", check.message);
+        assert!(check.message.contains("findings (1, mode 644)"), "{}", check.message);
+        assert!(
+            !check.message.contains("mods"),
+            "a store with no violation must not appear: {}",
+            check.message
+        );
+
+        let hint = check.hint.expect("a warn carries a remedy");
+        assert!(hint.contains("chmod go-rwx"), "remedy must be actionable: {hint}");
+        assert!(
+            hint.contains(&dir.display().to_string()),
+            "remedy must name the offending ROOT so the command runs: {hint}"
+        );
+        assert!(
+            !hint.contains(&clean.display().to_string()),
+            "a clean store must not be swept by the remedy: {hint}"
+        );
+    }
+
+    /// (#2452 review, the disclosure guard) `darkmux doctor`'s stdout is
+    /// republished verbatim by the viewer's console lens over the same
+    /// daemon a tailnet peer reaches as loopback, and these stores hold
+    /// operator-named files — a mod attachment keeps its source basename
+    /// (#2457), a hooks outbox file is keyed by destination host:port, a
+    /// crawl plan file by the operator's rule name. So NO leaf name may
+    /// appear in either the message or the hint, however tempting the
+    /// actionability. The remedy is the `find` command, which runs on the
+    /// operator's own machine.
+    #[cfg(unix)]
+    #[test]
+    fn state_file_perms_never_prints_a_file_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let attachments = tmp.path().join("mods").join("mod-3-abc").join("attachments");
+        write_at_mode(&attachments, "prod-credentials.diff", 0o644);
+        write_at_mode(&tmp.path().join("hooks"), "hooks.internal.example-443-abc.outbox.jsonl", 0o644);
+
+        let roots = vec![
+            ScanRoot { label: "mods", path: tmp.path().join("mods"), recursive: true },
+            ScanRoot { label: "hooks outbox", path: tmp.path().join("hooks"), recursive: false },
+        ];
+        let check = build_state_file_permissions_check(&roots, 100);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+
+        let text = format!("{} {}", check.message, check.hint.clone().unwrap_or_default());
+        for leaked in ["prod-credentials", "hooks.internal.example", "mod-3-abc", "attachments"] {
+            assert!(
+                !text.contains(leaked),
+                "operator file name {leaked:?} reached doctor's output, which the viewer's \
+                 console lens republishes verbatim: {text}"
+            );
+        }
+        // ...while still naming the stores and the counts.
+        assert!(check.message.contains("mods (1, mode 644)"), "{}", check.message);
+        assert!(check.message.contains("hooks outbox (1, mode 644)"), "{}", check.message);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_file_perms_passes_when_everything_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("mods");
+        write_at_mode(&dir, "mod.json", 0o600);
+
+        let roots = vec![ScanRoot { label: "mods", path: dir, recursive: true }];
+        let check = build_state_file_permissions_check(&roots, 100);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.hint.is_none());
+    }
+
+    /// (#1839) Same bar as `daemon_auth_and_redis_hints_state_facts_without_rendering_a_verdict`:
+    /// this check states the mode and the remedy, never a verdict on whether
+    /// the operator's machine is safe.
+    #[cfg(unix)]
+    #[test]
+    fn state_file_perms_states_facts_without_rendering_a_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("findings");
+        write_at_mode(&dir, "finding.json", 0o644);
+
+        let roots = vec![ScanRoot { label: "findings", path: dir, recursive: true }];
+        let check = build_state_file_permissions_check(&roots, 100);
+        // Pin the arm under test: without this the whole assertion below is
+        // satisfied by a Pass, whose text has no verdict to render.
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+
+        let verdicts =
+            ["safe as-is", "is fine", "secure", "protected", "no risk", "for compliance", "unsafe", "insecure", "at risk", "vulnerable", "dangerous"];
+        let text = format!("{} {}", check.message.to_lowercase(), check.hint.unwrap_or_default().to_lowercase());
+        for v in verdicts {
+            assert!(!text.contains(v), "doctor must not adjudicate the operator's posture ({v:?}): {text}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_file_perms_scan_is_bounded_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("findings");
+        for i in 0..10 {
+            write_at_mode(&dir, &format!("f{i}.json"), 0o600);
+        }
+        let roots = vec![ScanRoot { label: "findings", path: dir, recursive: true }];
+        // Budget smaller than the file count — the scan must stop early and
+        // say it did not finish, rather than silently claiming a clean sweep.
+        let check = build_state_file_permissions_check(&roots, 3);
+        assert!(
+            check.message.contains("budget") && check.message.contains("findings"),
+            "must name the cost bound it hit: {}",
+            check.message
+        );
+    }
+
+    /// (#2452 review) The budget is shared, so spending it in declaration
+    /// order lets one large store starve every later one — permanently, on
+    /// every run, not randomly. Measured on a 4,921-file tree, `findings`
+    /// consumed all 2,000 stats and `mods` (the store #2457 is about) was
+    /// never reached at all. Each root gets its own share; unspent share
+    /// rolls forward.
+    #[cfg(unix)]
+    #[test]
+    fn state_file_perms_budget_is_shared_fairly_so_a_big_store_cannot_starve_a_later_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = tmp.path().join("findings");
+        for i in 0..50 {
+            write_at_mode(&big, &format!("f{i}.json"), 0o600);
+        }
+        let small = tmp.path().join("mods");
+        write_at_mode(&small, "leaky.json", 0o644);
+
+        let roots = vec![
+            ScanRoot { label: "findings", path: big, recursive: true },
+            ScanRoot { label: "mods", path: small, recursive: true },
+        ];
+        // 10 files of budget against a 50-file first root: under a single
+        // shared cursor the second root is never opened.
+        let check = build_state_file_permissions_check(&roots, 10);
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "the later root must still be scanned out of its own share: {}",
+            check.message
+        );
+        assert!(check.message.contains("mods (1, mode 644)"), "{}", check.message);
+        assert!(
+            check.message.contains("findings"),
+            "and the starved-of-budget root must still be named as partial: {}",
+            check.message
+        );
+    }
+
+    /// (#2452 review) Symlinks are skipped — following one would let a link
+    /// planted in the store aim the printed `chmod` at an arbitrary path
+    /// (the confused-deputy shape `brief_refs` refuses for `attachments/`,
+    /// #2295). But skipped must not mean SILENT: a symlinked state file
+    /// whose target is world-readable is a real exposure this check cannot
+    /// see, so it says how many it passed over. Before this fix the count
+    /// did not exist and the two root shapes disagreed — `Path::is_file()`
+    /// follows a link, so a symlinked FILE root vanished without a trace
+    /// while a symlinked DIRECTORY root was walked in full.
+    #[cfg(unix)]
+    #[test]
+    fn state_file_perms_discloses_the_symlinks_it_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let target = write_at_mode(&outside, "real.json", 0o644);
+
+        let dir = tmp.path().join("findings");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("link.json")).unwrap();
+
+        // A single-FILE root that is itself a symlink — the shape that used
+        // to disappear entirely.
+        let roster_link = tmp.path().join("fleet.json");
+        std::os::unix::fs::symlink(&target, &roster_link).unwrap();
+
+        let roots = vec![
+            ScanRoot { label: "findings", path: dir, recursive: true },
+            ScanRoot { label: "fleet roster", path: roster_link, recursive: false },
+        ];
+        let check = build_state_file_permissions_check(&roots, 100);
+
+        assert_eq!(check.status, Status::Pass, "a skipped symlink is not a violation");
+        assert!(
+            check.message.contains("2 symlink(s) skipped"),
+            "both symlink shapes must be counted and disclosed: {}",
+            check.message
+        );
+        assert!(
+            check.message.starts_with("0 darkmux state file(s) checked"),
+            "and a symlink must not be counted as a file that WAS checked: {}",
+            check.message
+        );
+    }
+
+    /// (#2411/#2450-class regression guard) The production check must
+    /// resolve every path through `darkmux_types::config_access` — never
+    /// `DarkmuxConfig::load_resolved()` and never `dirs::home_dir()`
+    /// directly — so it inherits the SAME env>config>default ladder AND the
+    /// SAME test-build isolation every sibling accessor already has. This
+    /// drives `check_state_file_permissions()` itself (not the pure
+    /// builder), isolated via `DARKMUX_HOME`, and proves a file planted at
+    /// the resolved `findings_dir()` is the one the check finds.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn check_state_file_permissions_resolves_paths_through_config_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+
+        let findings_dir = darkmux_types::config_access::findings_dir();
+        assert!(
+            findings_dir.starts_with(tmp.path()),
+            "test setup sanity: findings_dir() must resolve under our isolated DARKMUX_HOME, got {}",
+            findings_dir.display()
+        );
+        write_at_mode(&findings_dir, "leaky.json", 0o644);
+
+        let check = check_state_file_permissions();
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("findings (1, mode 644)"),
+            "check must have scanned the config_access-resolved findings_dir(): {}",
+            check.message
+        );
+    }
+
+    /// (#2452 review) The production wrapper's SIX roots must every one of
+    /// them land under an isolated `DARKMUX_HOME`. Two do not isolate
+    /// themselves in a test build — `fleet_file()` carries no test guard by
+    /// design (`fleet_file_default`'s doc) and `missions_dir()` resolves via
+    /// `darkmux_crew`'s `user_state_root()`, whose `test-support` feature is
+    /// empty — so an un-isolated `run()` would WALK the developer's real
+    /// `~/.darkmux/missions`. This pins that `DARKMUX_HOME` covers all six,
+    /// which is what makes the isolation on the two `run()` tests sufficient.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn every_state_root_resolves_under_an_isolated_darkmux_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+
+        let resolved = [
+            ("hooks outbox", darkmux_types::config_access::hooks_outbox_dir()),
+            ("fleet roster", darkmux_types::config_access::fleet_file()),
+            ("mission/phase state", darkmux_crew::loader::missions_dir()),
+            ("findings", darkmux_types::config_access::findings_dir()),
+            ("mods", darkmux_types::config_access::mods_dir()),
+            ("flow records", darkmux_types::config_access::flows_dir()),
+        ];
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        let real = dirs::home_dir().map(|h| h.join(".darkmux"));
+        for (label, path) in resolved {
+            assert!(
+                path.starts_with(tmp.path()),
+                "root {label:?} escaped the isolated DARKMUX_HOME and resolved to {}",
+                path.display()
+            );
+            if let Some(real) = real.as_ref() {
+                assert!(
+                    !path.starts_with(real),
+                    "root {label:?} resolved into the operator's real tree: {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     // ─── check_utility_model_binding (#590) ───────────────────────────
@@ -9069,8 +9798,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn platform_check_always_present() {
-        let r = run();
+        let r = with_isolated_darkmux_home(run);
         assert!(r.checks.iter().any(|c| c.name.contains("platform")));
     }
 
