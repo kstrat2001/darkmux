@@ -1777,11 +1777,24 @@ pub(crate) fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
     // Try the atomic-create path: we win the create race → write header +
     // record together. If file already exists (other process or earlier
     // call), fall through to append-only.
-    match fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-    {
+    //
+    // (#2451) Owner-only on POSIX — every flow record darkmux writes lands
+    // in this file, and this creator had no mode of its own, landing at the
+    // umask default (typically 0o644, world-readable; confirmed on disk
+    // this way pre-fix). `.mode()` only takes effect on the branch that
+    // WINS the create race — the losing branch below opens an
+    // ALREADY-EXISTING file (never creates one), so it needs no mode of its
+    // own; whatever the winning creator set stands for the file's whole
+    // life. A day-file already on disk at 0o644 from a pre-#2451 binary is
+    // NOT retroactively `chmod`'d, the same call #2259 makes.
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = fs::OpenOptions::new().create_new(true).write(true).open(path);
+    match opened {
         Ok(mut file) => {
             file.write_all(format!("{header_line}\n{record_line}\n").as_bytes())
                 .with_context(|| format!("writing initial flow log {}", path.display()))?;
