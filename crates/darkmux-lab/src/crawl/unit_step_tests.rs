@@ -225,6 +225,188 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     assert_eq!(first["rule"], serde_json::json!("unnamed-predicate"));
 }
 
+/// (#2454) The thermal breaker's between-units gate: a `STOP` file present
+/// at the mission-relative path `thermal_governor::
+/// stop_file_path_from_record_context` derives (`<darkmux root>/crawl/
+/// <manifest name>/STOP` — `write_plan` stamps every fixture plan's
+/// `workspace` as `"fixture-ws"`, so that IS the manifest name here) must
+/// stop the unit from ever being dispatched — proven by a stub dispatcher
+/// that records whether it was called at all, not merely by asserting the
+/// STEP output afterward. The absent reader this issue exists to fix would
+/// have called the dispatcher regardless of the file, so this is the
+/// assertion that would have caught it.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_thermal_stop_file_prevents_the_unit_from_dispatching() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+
+    let stop_dir = home.path().join("crawl").join("fixture-ws");
+    fs::create_dir_all(&stop_dir).unwrap();
+    fs::write(stop_dir.join("STOP"), b"thermal-critical\n").unwrap();
+
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = called.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_opts: DispatchOpts| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        ok_result(envelope("stop", 100, 20, 5_000), PathBuf::new())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+
+    assert!(
+        !called.load(std::sync::atomic::Ordering::SeqCst),
+        "the STOP file must stop the unit BEFORE dispatch — the dispatcher must never be called"
+    );
+
+    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .expect("a skipped unit is still a typed UnitOutcome, just an unrun one")
+        .body;
+    assert_eq!(parsed.result, THERMAL_STOP);
+    assert_eq!(parsed.unit, "u-0001");
+    assert_eq!(parsed.rule.as_deref(), Some("unnamed-predicate"));
+    assert_eq!(parsed.findings, 0);
+    assert!(
+        parsed.reason.as_deref().unwrap_or_default().contains("thermal breaker"),
+        "the reason must name the breaker so the run says WHY: {:?}",
+        parsed.reason
+    );
+    // (#2454) Nothing has ever removed this file, so a reason that only
+    // says "stopped" leaves the operator with a workspace that refuses
+    // every crawl and no clue why. The remedy has to be IN the message.
+    let reason = parsed.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains(&format!("rm {}", stop_dir.join("STOP").display())),
+        "the reason must tell the operator how to get unstuck, by exact path: {reason:?}"
+    );
+}
+
+/// (#2454) The anti-brick regression. `<root>/crawl/<manifest>/STOP` is
+/// scoped to the WORKSPACE, not to a run, and NOTHING in this repo has ever
+/// deleted one — not the retired launcher (`src/crawl_launch.rs`, which only
+/// ever read it), not the governor that writes it. So a STOP honored on
+/// PRESENCE alone converts one transient thermal event into a permanent,
+/// silent refusal of every future crawl on that workspace. A file naming a
+/// DIFFERENT mission is a previous run's event: this run was launched by the
+/// operator after it, and must dispatch.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_stop_file_from_a_previous_mission_does_not_block_this_one() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 1, 0);
+
+    let stop_dir = home.path().join("crawl").join("fixture-ws");
+    fs::create_dir_all(&stop_dir).unwrap();
+    // Written by an EARLIER crawl on the same workspace — the shape
+    // `thermal_governor::stop_file_body` produces when it knows its mission.
+    fs::write(stop_dir.join("STOP"), b"thermal-critical mission=crawl-an-older-run
+").unwrap();
+
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = called.clone();
+    let out_for_dispatch = out.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_opts: DispatchOpts| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        ok_result(envelope("stop", 100, 20, 5_000), out_for_dispatch.clone())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+
+    assert!(
+        called.load(std::sync::atomic::Ordering::SeqCst),
+        "a STOP file from a PREVIOUS mission must not refuse this run — otherwise one thermal \
+         event bricks the workspace forever, since nothing ever removes the file"
+    );
+    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+    assert_eq!(parsed.result, "stop");
+}
+
+/// (#2454) The other half of the scoping: this run's OWN breaker still
+/// stops it. Without this, "ignore a foreign mission's STOP" could be
+/// widened to "ignore every STOP" and the feature would be gone.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_stop_file_naming_this_mission_still_stops_it() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+
+    let stop_dir = home.path().join("crawl").join("fixture-ws");
+    fs::create_dir_all(&stop_dir).unwrap();
+    fs::write(stop_dir.join("STOP"), format!("thermal-critical mission={MISSION}\n")).unwrap();
+
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = called.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_opts: DispatchOpts| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        ok_result(envelope("stop", 100, 20, 5_000), PathBuf::new())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+
+    assert!(
+        !called.load(std::sync::atomic::Ordering::SeqCst),
+        "this mission's own breaker must still stop its remaining units"
+    );
+    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+    assert_eq!(parsed.result, THERMAL_STOP);
+}
+
+/// (#2454) The opposite direction, guarding against an over-eager fix: no
+/// `STOP` file present must dispatch exactly as before.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn no_thermal_stop_file_dispatches_normally() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 1, 0);
+
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = called.clone();
+    let out_for_dispatch = out.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_opts: DispatchOpts| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        ok_result(envelope("stop", 100, 20, 5_000), out_for_dispatch.clone())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+
+    assert!(called.load(std::sync::atomic::Ordering::SeqCst), "no STOP file present — the unit must dispatch");
+    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+    assert_eq!(parsed.result, "stop");
+    assert_eq!(parsed.findings, 1);
+}
+
 /// (#2360) Two DIFFERENT rules whose plans both mint a unit named
 /// `u-0001` — exactly the shape a real crawl/review mission produces,
 /// since a per-rule plan numbers its own units starting from 1
@@ -812,6 +994,43 @@ fn the_summary_totals_every_unit_and_keeps_the_retired_launchers_payload_keys() 
     assert!(
         errored.reason.as_deref().is_some_and(|r| r.contains("timeout")),
         "the scheduler's error text is carried as the row's reason: {errored:?}"
+    );
+}
+
+/// (#2454) The summary's own accounting of a thermally shortened run, and
+/// the `stopped_by` precedence that goes with it. A unit that errored
+/// BEFORE the breaker tripped is entirely possible, so this pins both
+/// halves: the skipped units are their own bucket (never folded into
+/// `units_errored`, which would read as "five units broke" when nothing
+/// broke), and `stopped_by` names the thing that actually ENDED the run
+/// while `units_errored` stays exact for the reader who needs it.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_thermal_stop_gets_its_own_bucket_and_names_the_run_without_hiding_the_error_count() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", "stop", 1, 100, 1_000)));
+    // Errored while the machine was still cool — before the breaker fired.
+    save_unit_step(
+        MISSION,
+        PHASE,
+        "u2",
+        NodeStatus::Error,
+        Some("`crawl.unit`: unit `u-0002` ended `timeout` — dispatch ended `timeout`"),
+    );
+    // Then the breaker tripped and the last two never dispatched.
+    save_unit_step(MISSION, PHASE, "u3", NodeStatus::Complete, Some(&outcome_json("u-0003", THERMAL_STOP, 0, 0, 0)));
+    save_unit_step(MISSION, PHASE, "u4", NodeStatus::Complete, Some(&outcome_json("u-0004", THERMAL_STOP, 0, 0, 0)));
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_skipped, 2, "the two never-dispatched units are their own bucket");
+    assert_eq!(s.units_errored, 1, "and are NOT folded into the error count — nothing broke");
+    assert_eq!(s.units_completed, 1);
+    assert_eq!(
+        s.stopped_by, "thermal",
+        "the breaker is what ended the run, so it is what `stopped_by` names — even with an \
+         earlier error present"
     );
 }
 

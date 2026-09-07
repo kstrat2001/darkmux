@@ -45,6 +45,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, DispatchResult};
 use darkmux_crew::rules::{self, Rule};
 use darkmux_crew::step_kinds::{Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
+use darkmux_crew::thermal_governor;
 use darkmux_crew::types::{Step, Task};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -69,6 +70,15 @@ const FINDING_FILE_KEY: &str = "file";
 /// `units_errored`: "ran out of room to work in" and "genuinely broke"
 /// are different operator questions (#2193).
 const UNIT_BUDGET_EXHAUSTED: &str = "unit_budget_exhausted";
+
+/// (#2454) A unit `run` refused to dispatch because the thermal breaker's
+/// `STOP` file (`thermal_governor::stop_file_path_from_record_context`) was
+/// present before this unit ever started — a between-units gate, distinct
+/// from `unit_budget_exhausted` (a unit that DID dispatch and ran out of
+/// room) and from `error` (a unit that dispatched and failed). Counted in
+/// its own summary bucket so a thermally-shortened run reads as exactly
+/// that, not as an unexplained pile of errors.
+pub const THERMAL_STOP: &str = "thermal_stop";
 
 /// A rough multiple of turns per site — read the site, maybe grep around
 /// it, decide, call `create_finding` (or not). Deliberately generous: a
@@ -166,7 +176,9 @@ pub struct UnitOutcome {
     /// payload uses).
     pub rule: Option<String>,
     pub source: String,
-    /// `stop` | `unit_budget_exhausted` | `timeout` | `error`.
+    /// `stop` | `unit_budget_exhausted` | `timeout` | `error` |
+    /// `thermal_stop` (#2454 — the breaker's STOP file was present before
+    /// this unit ever dispatched).
     pub result: String,
     /// Accepted `create_finding` calls this unit's dispatch made.
     ///
@@ -1123,6 +1135,94 @@ impl StepKind for CrawlUnitStepKind {
         // the live dir collision; #2383 for the container-name one).
         let rule_dir = unit_rule_dir(cfg.rule.as_deref(), &unit_rules(unit))?;
         let ctx = unit_context(&the_plan, unit, &mission_id, &rule_dir)?;
+
+        // (#2454) The thermal breaker's between-units gate: a unit that has
+        // not started must not start once the breaker has tripped (#2109).
+        // The in-flight unit's own pause is `runtime/src/pace.rs`'s job, not
+        // this one's — this only stops the NEXT unit from ever dispatching.
+        // The probe context carries exactly the two keys
+        // `stop_file_path_from_record_context` requires (`workspace`,
+        // `unit`) — the SAME shape (and the same `ctx.workspace`/
+        // `ctx.unit_id` values) this step stamps onto its own dispatch's
+        // `record_context` below, so the path derived here is guaranteed to
+        // be the one the breaker's writer (`dispatch_internal.rs`) used.
+        // Never re-joins the path itself (#2157 — a reader that re-derives
+        // independently reintroduces the traversal vector the shared
+        // function closed).
+        let stop_probe_ctx = json!({"workspace": ctx.workspace, "unit": ctx.unit_id});
+        if let Some(stop_path) = thermal_governor::stop_file_path_from_record_context(Some(&stop_probe_ctx)) {
+            // (#2454) Scoped to the RUN that wrote it, not to the workspace
+            // the file sits under: nothing has ever removed this file, so a
+            // STOP honored on presence alone would refuse every unit of
+            // every future crawl on this workspace forever. A file naming
+            // ANOTHER mission is a previous run's thermal event and does not
+            // bind this one; a file naming no mission at all (a human's
+            // `touch`, or a pre-#2454 breaker) still binds everyone, because
+            // only a human knows what that one meant. See
+            // `thermal_governor::stop_hold_for_mission`.
+            if let Some(hold) = thermal_governor::stop_hold_for_mission(&stop_path, &mission_id) {
+                // The operator MUST be able to get unstuck from the message
+                // alone — the file is invisible otherwise, and the way out
+                // differs by which kind of stop this is.
+                let remedy = match hold {
+                    thermal_governor::StopHold::ThisMission => format!(
+                        "let the machine cool, then launch the crawl again — a new mission is not \
+                         bound by this run's stop; to clear it by hand: rm {}",
+                        stop_path.display()
+                    ),
+                    thermal_governor::StopHold::Unattributed => format!(
+                        "this STOP file names no mission (a hand-written one, or one from a build \
+                         older than #2454), so EVERY crawl on this workspace will keep skipping \
+                         until it is removed: rm {}",
+                        stop_path.display()
+                    ),
+                };
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::warn(&format!(
+                        "`{CRAWL_UNIT_KIND}`: unit `{}` skipped — the thermal breaker's STOP file is \
+                         present at {} (#2109); this unit was never dispatched. {remedy}",
+                        ctx.unit_id,
+                        stop_path.display()
+                    ))
+                );
+                let outcome_record = UnitOutcome {
+                    schema_version: UNIT_OUTCOME_SCHEMA_VERSION.to_string(),
+                    unit: ctx.unit_id.clone(),
+                    rule: single_rule_id(&ctx.rule_ids),
+                    source: ctx.source.clone(),
+                    result: THERMAL_STOP.to_string(),
+                    findings: 0,
+                    findings_rejected: 0,
+                    wall_ms: 0,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    model: None,
+                    out_dir: String::new(),
+                    rules: ctx.rule_ids.clone(),
+                    workspace: ctx.workspace.clone(),
+                    sha: ctx.sha.clone(),
+                    rest_ms: 0,
+                    reason: Some(format!(
+                        "thermal breaker tripped (#2109) — STOP file present at {}. {remedy}",
+                        stop_path.display()
+                    )),
+                    detections: None,
+                    host: None,
+                    finding_refs: Vec::new(),
+                };
+                return Ok(StepOutcome {
+                    output: darkmux_crew::step_output::Output::wrap(
+                        UNIT_OUTCOME_KIND,
+                        outcome_record,
+                        darkmux_crew::step_output::Producer::of(&mission_id, &task.id, &step.id),
+                    )
+                    .to_output_string()?,
+                    flow_records: Vec::new(),
+                });
+            }
+        }
+
         // The step's own `rule` (the grow item's `rule`, when present) must
         // agree with the plan — a silent mismatch would stamp every finding
         // with the wrong rule id, which is the key the tracker dedups on.
@@ -1547,9 +1647,12 @@ pub struct CrawlSummary {
     pub units_errored: usize,
     pub units_interrupted: usize,
     pub units_budget_exhausted: usize,
-    /// The scheduler runs every grown unit; there is no between-units skip
-    /// loop to stop early any more, so this is always 0. Kept, present, for
-    /// readers keyed on the retired launcher's shape.
+    /// (#2454) Every grown unit is still SCHEDULED — the scheduler has no
+    /// between-units skip loop of its own — but a unit's own `run` can
+    /// decline to dispatch when the thermal breaker's `STOP` file is
+    /// present, and this counts exactly those. Before #2454 this was
+    /// always 0 (kept, present, for readers keyed on the retired launcher's
+    /// shape); it is no longer a dead field.
     pub units_skipped: usize,
     pub findings: u64,
     pub prompt_tokens: u64,
@@ -1690,7 +1793,12 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
     let units_completed = count("stop");
     let units_budget_exhausted = count(UNIT_BUDGET_EXHAUSTED);
     let units_interrupted = count("interrupted");
-    let units_errored = rows.len() - units_completed - units_budget_exhausted - units_interrupted;
+    // (#2454) Counted in its OWN bucket, subtracted out of `units_errored`
+    // below — a unit the thermal breaker skipped before it ever dispatched
+    // did not "genuinely break" and must not read as one.
+    let units_skipped = count(THERMAL_STOP);
+    let units_errored =
+        rows.len() - units_completed - units_budget_exhausted - units_interrupted - units_skipped;
 
     Ok(CrawlSummary {
         schema_version: CRAWL_SUMMARY_SCHEMA_VERSION.to_string(),
@@ -1703,13 +1811,29 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         units_errored,
         units_interrupted,
         units_budget_exhausted,
-        units_skipped: 0,
+        units_skipped,
         findings,
         prompt_tokens,
         completion_tokens,
         wall_ms,
         tokens_per_hour,
-        stopped_by: if units_errored > 0 { "error".into() } else { "done".into() },
+        // (#2454) Named FIRST, and deliberately so: `stopped_by` answers
+        // one question — "why is this run shorter than its plan" — and the
+        // breaker is the answer whenever it fired, because it is the thing
+        // that ENDED the run. This does shadow `"error"`: a unit that
+        // errored BEFORE the breaker tripped is perfectly possible, and
+        // then `units_errored > 0` while `stopped_by == "thermal"`. That is
+        // the right precedence (the errors did not stop the run; the
+        // breaker did) but it does mean a reader must not treat
+        // `stopped_by != "error"` as "nothing errored" — `units_errored` is
+        // the field that answers THAT, and it stays exact.
+        stopped_by: if units_skipped > 0 {
+            "thermal".into()
+        } else if units_errored > 0 {
+            "error".into()
+        } else {
+            "done".into()
+        },
         est_tokens,
         model: rows.iter().find_map(|r| r.model.clone()),
         // (#2310 P4c) `crawl.summary` is not reused by review (its own

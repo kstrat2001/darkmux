@@ -421,6 +421,15 @@ struct StepScan {
     unreadable: Vec<String>,
 }
 
+/// (#2454) `darkmux_lab::crawl::unit_step::THERMAL_STOP` — a local literal
+/// duplicate for the same crate-boundary reason as the `SCANNED_*` kind ids
+/// above (`darkmux-crew` cannot depend on `darkmux-lab`), and pinned against
+/// the real constant by the same conformance test in `src/mission_launch.rs`.
+/// Drift here is silent and expensive in one direction: if this string stops
+/// matching, every thermally-skipped unit goes back to counting as reviewed
+/// coverage.
+pub const UNIT_RESULT_THERMAL_STOP: &str = "thermal_stop";
+
 /// (#2310 P4c-2b PR #2357 review MUST FIX C/D, CONSIDER F) Scan every
 /// `Task`/`Step` this mission recorded (across every phase — the same
 /// per-phase `lifecycle::load_steps_for_phase` walk `crawl::unit_step::
@@ -517,31 +526,69 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                         scan.errored.push(format!("unit `{}` ({:?})", step.id, step.status));
                         continue;
                     }
-                    // (#2361 item 2) This unit COMPLETED, so the windows
-                    // its plan named were actually reviewed.
-                    if let (Some(rule), Some(unit)) = (
-                        step.config.get("rule").and_then(|v| v.as_str()),
-                        step.config.get("unit").and_then(|v| v.as_str()),
-                    ) {
-                        scan.completed_units.insert((rule.to_string(), unit.to_string()));
-                    }
-                    let Some(raw) = step.output.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
-                        continue;
+                    // (#2454) Read the outcome BEFORE the coverage decision
+                    // below, but WITHOUT letting a missing or unparseable one
+                    // change that decision: this used to be an unconditional
+                    // insert ahead of the read, and moving the read in front
+                    // of it silently un-covered every unit whose output was
+                    // absent or malformed. `None` here keeps the old benefit
+                    // of the doubt; only an outcome that positively SAYS it
+                    // never dispatched is treated as having reviewed nothing.
+                    let doc = match step.output.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        None => None,
+                        Some(raw) => match crate::step_output::resolve_output_doc(raw) {
+                            Ok((doc, _)) => Some(doc),
+                            Err(e) => {
+                                // (silent-miss audit, 2026-09-06) Previously
+                                // swallowed here, which read as
+                                // `findings_rejected == 0` —
+                                // indistinguishable from a genuinely clean
+                                // unit. Named instead.
+                                scan.unreadable.push(format!("unit `{}` output: {e:#}", step.id));
+                                None
+                            }
+                        },
                     };
-                    let doc = match crate::step_output::resolve_output_doc(raw) {
-                        Ok((doc, _)) => doc,
-                        Err(e) => {
-                            // (silent-miss audit, 2026-09-06) Previously
-                            // swallowed here, which read as `findings_rejected
-                            // == 0` — indistinguishable from a genuinely
-                            // clean unit. Named instead.
-                            scan.unreadable.push(format!("unit `{}` output: {e:#}", step.id));
-                            continue;
+                    // (#2361 item 2) This unit COMPLETED, so the windows its
+                    // plan named were actually reviewed —
+                    // (#2454) UNLESS it completed without ever dispatching.
+                    // A `Complete` status stopped being sufficient evidence
+                    // the moment `crawl.unit` gained a path that returns
+                    // `Ok` having done NO work: the thermal breaker's
+                    // between-units gate. Such a unit read nothing, so
+                    // counting its planned windows as covered would make the
+                    // posted review claim coverage of hunks a thermally
+                    // shortened run never looked at — the exact false claim
+                    // #2361 item 2 exists to prevent, arriving through a new
+                    // door. Read off the outcome's own `result` (loose JSON,
+                    // never the typed `UnitOutcome` — this crate cannot
+                    // depend on `darkmux-lab`); an outcome with no `result`
+                    // at all keeps the old benefit of the doubt.
+                    let never_dispatched = doc
+                        .as_ref()
+                        .and_then(|d| d.pointer("/body/result").or_else(|| d.get("result")))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|r| r == UNIT_RESULT_THERMAL_STOP);
+                    // NOT pushed to `errored` either: nothing failed. The
+                    // run's own `crawl.summary` is where a thermally
+                    // shortened run is NAMED (`stopped_by: "thermal"`, the
+                    // unit's own `thermal_stop` result); giving the posted
+                    // review its own "skipped" line means a new
+                    // `DeliverScope` field, its render and its goldens —
+                    // worth doing, deliberately not folded into this fix.
+                    if !never_dispatched {
+                        if let (Some(rule), Some(unit)) = (
+                            step.config.get("rule").and_then(|v| v.as_str()),
+                            step.config.get("unit").and_then(|v| v.as_str()),
+                        ) {
+                            scan.completed_units.insert((rule.to_string(), unit.to_string()));
                         }
-                    };
+                    }
                     let rejected = doc
-                        .pointer("/body/findings_rejected")
-                        .or_else(|| doc.get("findings_rejected"))
+                        .as_ref()
+                        .and_then(|d| {
+                            d.pointer("/body/findings_rejected").or_else(|| d.get("findings_rejected"))
+                        })
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
                     scan.findings_rejected += rejected as usize;
@@ -1008,10 +1055,17 @@ mod tests {
 
     /// Save one `crawl.unit` step for `rule`/`unit` at `status`.
     fn save_unit_step(id: &str, rule: &str, unit: &str, status: NodeStatus) {
+        save_unit_step_with_result(id, rule, unit, status, "stop");
+    }
+
+    /// (#2454) Same, with the outcome's `result` under the caller's control
+    /// — a `Complete` step is no longer sufficient evidence a unit reviewed
+    /// anything, so the tests need to say which kind of completion it was.
+    fn save_unit_step_with_result(id: &str, rule: &str, unit: &str, status: NodeStatus, result: &str) {
         let output = (status == NodeStatus::Complete).then(|| {
             crate::step_output::Output::wrap(
                 "crawl.unit-outcome",
-                json!({ "schema_version": "1.1", "unit": unit, "result": "stop", "findings": 1, "findings_rejected": 0 }),
+                json!({ "schema_version": "1.1", "unit": unit, "result": result, "findings": 1, "findings_rejected": 0 }),
                 crate::step_output::Producer::of(MISSION, "unit-task", id),
             )
             .to_output_string()
@@ -1109,6 +1163,52 @@ mod tests {
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(wrapped.body.scope.hunks_covered, 2, "{:?}", wrapped.body.scope);
         assert_eq!(wrapped.body.scope.rules_run.len(), 2, "{:?}", wrapped.body.scope);
+    }
+
+    /// (#2454) A unit the thermal breaker skipped returns `Ok` with
+    /// `result: "thermal_stop"` and NEVER dispatches, so its step reaches
+    /// `Complete` having read nothing. Before this fix, `Complete` alone put
+    /// its planned windows into `completed_units` — the posted review would
+    /// then claim coverage of hunks a thermally shortened run never looked
+    /// at, which is the exact false claim #2361 item 2 exists to prevent,
+    /// arriving through a new door.
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn a_thermally_skipped_unit_does_not_count_as_reviewed_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+        let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        write_plan_sites(&plan_dir, "swallowed-error", &[("src/a.ts", 1)]);
+        write_plan_sites(&plan_dir, "union-vs-enum", &[("src/b.ts", 1)]);
+        let diff_path = tmp.path().join("pr.diff");
+        diff_with_n_hunks(&diff_path, &["src/a.ts", "src/b.ts"]);
+
+        // One unit genuinely reviewed its window; the breaker tripped, so
+        // the next one completed WITHOUT dispatching.
+        save_unit_step("unit-step-1", "swallowed-error", "u-0001", NodeStatus::Complete);
+        save_unit_step_with_result("unit-step-2", "union-vs-enum", "u-0001", NodeStatus::Complete, "thermal_stop");
+
+        let out = RecordsGatherStepKind
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        let scope = &wrapped.body.scope;
+        assert_eq!(scope.hunks_total, 2, "{scope:?}");
+        assert_eq!(
+            scope.hunks_covered, 1,
+            "the thermally-skipped unit dispatched nothing, so its window is NOT covered: {scope:?}"
+        );
+        assert_eq!(
+            scope.rules_run,
+            vec!["swallowed-error".to_string()],
+            "a rule whose only unit was skipped did not run: {scope:?}"
+        );
+        assert!(
+            scope.errored.is_empty(),
+            "and it is not an ERROR either — nothing failed, the machine got hot: {scope:?}"
+        );
     }
 
     /// Write a `plan/<rule>.json` whose `units[].sites` list is exactly

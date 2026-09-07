@@ -312,11 +312,92 @@ pub fn stop_file_unresolved_reason(record_context: Option<&serde_json::Value>) -
 /// name-validation fix — closing it needs a pre-write check (e.g.
 /// `symlink_metadata` on `stop_file` and its parent, refusing a symlink)
 /// that this function doesn't have today.
-fn write_stop_file(stop_file: &Path) {
+fn write_stop_file(stop_file: &Path, owner: Option<&str>) {
     if let Some(parent) = stop_file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(stop_file, b"thermal-critical\n");
+    let _ = std::fs::write(stop_file, stop_file_body(owner));
+}
+
+/// (#2454) The STOP file's one line: the reason, plus — when the breaker
+/// knows it — the mission whose run it fired in.
+///
+/// **Why the owner is in the file at all.** Nothing has EVER removed this
+/// file: the retired launcher (`src/crawl_launch.rs`, gone in #2301) only
+/// read it, and no code path in this repo has ever deleted one. That was
+/// coherent while the only writer was a human `touch`ing it as a manual
+/// kill switch — a hand-written sentinel is a hand-removed sentinel. It
+/// stopped being coherent the moment #2109 made the BREAKER a writer: the
+/// path is `<root>/crawl/<manifest>/STOP`, scoped to the WORKSPACE and not
+/// to any run, so one thermal event would otherwise refuse every unit of
+/// every future crawl on that workspace, forever, with no automatic way
+/// back. Stamping the owner scopes the machine-written file to the run
+/// that wrote it — which is exactly what the breaker means ("no FURTHER
+/// unit gets dispatched") — while leaving an unattributed file (a human's
+/// `touch`, or one from a pre-#2454 binary) honored by everyone, since
+/// only a human can know what that one meant. See [`stop_hold_for_mission`]
+/// for the read side.
+fn stop_file_body(owner: Option<&str>) -> String {
+    match owner.map(str::trim).filter(|m| !m.is_empty()) {
+        // Deliberately one greppable line rather than JSON: an operator
+        // finding this file wants `cat` to answer "what is this and who
+        // left it", and the reader below only needs the one field.
+        Some(mission) => format!("{STOP_FILE_REASON} mission={mission}\n"),
+        None => format!("{STOP_FILE_REASON}\n"),
+    }
+}
+
+/// The STOP file's reason word — the same string the pace file carries as
+/// `reason` on a breaker trip, so the two artifacts of one event read alike.
+pub const STOP_FILE_REASON: &str = "thermal-critical";
+
+/// (#2454) Why a reader is honoring a STOP file it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopHold {
+    /// This mission's own breaker wrote it, this run. The remaining units
+    /// of THIS run must not dispatch.
+    ThisMission,
+    /// The file names no mission — a human's `touch`, or a breaker from a
+    /// binary older than #2454. Honored by every mission, because nothing
+    /// here can know what it meant; only a human removes it.
+    Unattributed,
+}
+
+/// (#2454) Should the mission `mission_id` honor the STOP file at
+/// `stop_file`? `None` — dispatch — when there is no such file, when it is
+/// unreadable, or when it names a DIFFERENT mission.
+///
+/// A file naming another mission is a PREVIOUS run's thermal event. A new
+/// mission only exists because the operator launched it, and that launch is
+/// their own "go" — the breaker's job was to stop the run it fired in, and
+/// that run is over. If the machine is still hot, the new run's own
+/// governor trips again within a few samples and re-stamps this file under
+/// the new mission's name, so nothing is lost by not inheriting the old
+/// one. This is what keeps a transient thermal event from becoming a
+/// permanent, workspace-wide refusal (see [`stop_file_body`]).
+///
+/// An unreadable file is treated as ABSENT rather than as a stop, matching
+/// every other best-effort read in this module: a stop that cannot be
+/// attributed to anything is not evidence of a thermal condition, and
+/// failing closed here would brick the workspace on a truncated write,
+/// which is the exact failure this function exists to prevent.
+pub fn stop_hold_for_mission(stop_file: &Path, mission_id: &str) -> Option<StopHold> {
+    let body = std::fs::read_to_string(stop_file).ok()?;
+    match stop_file_owner(&body) {
+        None => Some(StopHold::Unattributed),
+        Some(owner) if owner == mission_id.trim() => Some(StopHold::ThisMission),
+        Some(_) => None,
+    }
+}
+
+/// The `mission=<id>` field of a STOP file's body, when it has one.
+/// Tolerant on read: any line may carry it, and a body without one is a
+/// legitimate (unattributed) shape, not a parse error.
+fn stop_file_owner(body: &str) -> Option<&str> {
+    body.split_whitespace()
+        .find_map(|tok| tok.strip_prefix("mission="))
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
 }
 
 /// One state change the governor made this tick — the caller (the sampler
@@ -424,6 +505,15 @@ pub struct ThermalGovernor {
     /// every `ms_since_stamp` reset.
     last_stamp_instant: Instant,
     last_stamp_wall: SystemTime,
+    /// (#2454) The mission this governor is pacing, stamped into any STOP
+    /// file the breaker writes so a LATER mission can tell "my own run's
+    /// breaker tripped" from "some previous run's did" — see
+    /// [`stop_file_body`] for why an unowned STOP file is a permanent,
+    /// workspace-wide refusal. `None` for a dispatch with no mission (a
+    /// bare `darkmux dispatch`), which writes the unattributed shape; that
+    /// path never derives a STOP path today anyway, since the derivation
+    /// requires the crawl `record_context` a mission-run unit stamps.
+    stop_owner: Option<String>,
 }
 
 impl ThermalGovernor {
@@ -438,7 +528,18 @@ impl ThermalGovernor {
             speed_limit_low_streak: 0,
             last_stamp_instant: Instant::now(),
             last_stamp_wall: SystemTime::now(),
+            stop_owner: None,
         }
+    }
+
+    /// (#2454) Name the mission whose run this governor is pacing. Builder
+    /// form because [`ThermalGovernor::new`] is called from ~50 tests that
+    /// have no mission and want the unattributed default; only the live
+    /// dispatch path (`dispatch_internal.rs`) has an id to give.
+    #[must_use]
+    pub fn owned_by(mut self, mission_id: Option<&str>) -> Self {
+        self.stop_owner = mission_id.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
+        self
     }
 
     /// (N1) True once REAL time since the last pace-file write has
@@ -547,7 +648,7 @@ impl ThermalGovernor {
                         self.mark_stamped();
                         write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
                         if let Some(stop) = stop_file {
-                            write_stop_file(stop);
+                            write_stop_file(stop, self.stop_owner.as_deref());
                         }
                         return Some(ThermalEvent::Breaker {
                             state: self.last_known_state.clone(),
@@ -580,7 +681,7 @@ impl ThermalGovernor {
             self.mark_stamped();
             write_pace_file(host_out, true, "thermal-critical", &thermal.state);
             if let Some(stop) = stop_file {
-                write_stop_file(stop);
+                write_stop_file(stop, self.stop_owner.as_deref());
             }
             return Some(ThermalEvent::Breaker { state: thermal.state.clone() });
         }
@@ -629,7 +730,7 @@ impl ThermalGovernor {
                     self.mark_stamped();
                     write_pace_file(host_out, true, "thermal-critical", &thermal.state);
                     if let Some(stop) = stop_file {
-                        write_stop_file(stop);
+                        write_stop_file(stop, self.stop_owner.as_deref());
                     }
                     return Some(ThermalEvent::Breaker { state: thermal.state.clone() });
                 }
@@ -755,6 +856,75 @@ mod tests {
             Some(ThermalEvent::Resumed { state: "fair".to_string() }),
             "resume only after a FRESH continuous 60s hold"
         );
+    }
+
+    // ── #2454: the STOP file is scoped to the run that wrote it ──
+
+    /// (#2454) The breaker stamps its own mission into the STOP file, and
+    /// the read side hands that run — and only that run — a stop.
+    ///
+    /// Load-bearing because NOTHING removes this file: not the retired
+    /// launcher (`src/crawl_launch.rs`, which only ever read it), not this
+    /// module, not any other code path in the repo. The path is
+    /// `<root>/crawl/<manifest>/STOP`, scoped to the WORKSPACE rather than
+    /// to a run, so an unattributed machine-written stop would refuse every
+    /// unit of every future crawl on that workspace, permanently, from one
+    /// transient thermal event.
+    #[test]
+    fn the_breaker_stamps_its_mission_and_only_that_mission_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("crawl-root").join("STOP");
+        let mut gov = ThermalGovernor::new(cfg()).owned_by(Some("crawl-m-1"));
+
+        let ev = gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, Some(ThermalEvent::Breaker { state: "critical".to_string() }));
+        assert!(stop.exists());
+
+        assert_eq!(
+            stop_hold_for_mission(&stop, "crawl-m-1"),
+            Some(StopHold::ThisMission),
+            "the run whose breaker tripped must be stopped"
+        );
+        assert_eq!(
+            stop_hold_for_mission(&stop, "crawl-m-2"),
+            None,
+            "a LATER mission must not inherit an older run's thermal stop — nothing deletes this \
+             file, so inheriting it bricks the workspace forever"
+        );
+    }
+
+    /// (#2454) A governor with no mission (a bare `darkmux dispatch`, or a
+    /// build older than #2454) writes the unattributed shape, which every
+    /// mission honors — a hand-`touch`ed STOP is a hand-removed STOP, and
+    /// this module cannot know what a human meant by it.
+    #[test]
+    fn an_unowned_breaker_writes_a_stop_every_mission_honors() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("crawl-root").join("STOP");
+        let mut gov = ThermalGovernor::new(cfg());
+
+        gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(std::fs::read_to_string(&stop).unwrap(), "thermal-critical\n");
+        assert_eq!(stop_hold_for_mission(&stop, "anything"), Some(StopHold::Unattributed));
+    }
+
+    #[test]
+    fn an_absent_or_unreadable_stop_file_is_not_a_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(stop_hold_for_mission(&dir.path().join("nope"), "m"), None);
+        // A DIRECTORY where the file should be: `read_to_string` fails, and
+        // failing closed here would brick the workspace on a bad write —
+        // exactly the outcome this scoping exists to prevent.
+        let as_dir = dir.path().join("STOP");
+        std::fs::create_dir_all(&as_dir).unwrap();
+        assert_eq!(stop_hold_for_mission(&as_dir, "m"), None);
+    }
+
+    #[test]
+    fn a_blank_owner_is_the_unattributed_shape_not_a_mission_named_empty() {
+        assert_eq!(stop_file_body(Some("   ")), "thermal-critical\n");
+        assert_eq!(stop_file_owner("thermal-critical mission=\n"), None);
+        assert_eq!(stop_file_owner("thermal-critical mission=m-9\n"), Some("m-9"));
     }
 
     #[test]

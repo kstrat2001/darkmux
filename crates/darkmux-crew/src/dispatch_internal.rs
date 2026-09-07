@@ -6011,8 +6011,14 @@ fn run_telemetry_sampler(
     // (#2110/#2109) The thermal governor/breaker — see its module doc.
     // `stop_file` resolves once, up front: the crawl `STOP` path (if this
     // dispatch is a crawl unit) never changes mid-dispatch.
+    // (#2454) `.owned_by` stamps this mission into any STOP file the
+    // breaker drops, so the NEXT mission on the same workspace can tell a
+    // previous run's thermal event from its own and is not refused by it
+    // forever — nothing removes that file. See `thermal_governor::
+    // stop_file_body`.
     let mut thermal_governor =
-        crate::thermal_governor::ThermalGovernor::new(crate::thermal_governor::ThermalGovernorConfig::from_env());
+        crate::thermal_governor::ThermalGovernor::new(crate::thermal_governor::ThermalGovernorConfig::from_env())
+            .owned_by(mission_id.as_deref());
     let thermal_stop_file =
         crate::thermal_governor::stop_file_path_from_record_context(record_context.as_ref());
     // (#2110/#2109 review finding 5) `Some(reason)` only when this dispatch

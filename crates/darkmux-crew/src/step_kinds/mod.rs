@@ -84,7 +84,7 @@ pub use mods_gate::{register_mods_gate_kind, ModsGateStepKind, MODS_GATE_KIND};
 pub use records_gather::{
     register_records_gather_kind, GatherOutput, RecordsGatherStepKind, RECORDS_GATHER_KIND,
     RECORDS_GATHER_OUTPUT_KIND, SCANNED_CRAWL_PLAN_KIND, SCANNED_CRAWL_UNIT_KIND,
-    SCANNED_PLAN_SITES_KIND,
+    SCANNED_PLAN_SITES_KIND, UNIT_RESULT_THERMAL_STOP,
 };
 pub use registry::StepKindRegistry;
 pub use types::{
