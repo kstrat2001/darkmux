@@ -12,7 +12,7 @@
 //! (2.0: the `openclaw` shell-out runtime and `darkmux crew sync` were
 //! removed — see #1405. The in-house runtime is the only dispatch path.)
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -32,16 +32,50 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const LICENSED_ADJACENT_ROLES: &[&str] = &["health-research", "legal-research", "fitness-coach"];
 
 /// Resolve the directory where licensed-adjacent acknowledgment files
-/// live. Defaults to `~/.darkmux/acks/`. The `DARKMUX_ACK_DIR` env var
+/// live. Defaults to `<darkmux root>/acks/`. The `DARKMUX_ACK_DIR` env var
 /// overrides — used by tests, also available for operators who want to
 /// keep the acks in a different location.
+///
+/// (#2450) The fallback default is derived from the SAME root resolution
+/// every other darkmux directory resolves through —
+/// `darkmux_types::paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a
+/// project-local `./.darkmux` before `~/.darkmux` — mirroring
+/// `config_access::fleet_file_default`/`flows_dir_default`. Before this fix,
+/// this went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped
+/// install with no `DARKMUX_ACK_DIR` override still wrote licensed-adjacent
+/// acknowledgment files into the operator's REAL `~/.darkmux/acks`, the same
+/// bug class fixed elsewhere for #1585, #2093, #2363, and `fleet_file`
+/// (#2450) itself. Probed and confirmed broken (not assumed from shape)
+/// before this fix.
 fn ack_dir() -> Result<PathBuf> {
-    // env(DARKMUX_ACK_DIR) > config.dirs.ack > ~/.darkmux/acks (#661 Slice 3).
+    // env(DARKMUX_ACK_DIR) > config.dirs.ack > <darkmux root>/acks (#661 Slice 3).
     if let Some(p) = darkmux_types::config_access::ack_dir_override() {
         return Ok(p);
     }
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory found"))?;
-    Ok(home.join(".darkmux").join("acks"))
+    Ok(ack_dir_default())
+}
+
+/// Test builds must never default onto the operator's real
+/// `~/.darkmux/acks` — same isolation discipline as
+/// `config_access::lab_dir_default`'s own test-build variant (#994). This
+/// accessor genuinely WRITES operator-visible files (the ack marker), unlike
+/// `cache_dir`/`runtime_cache_dir` (read-mostly internal caches deliberately
+/// left without this guard, see their doc). A test that DID isolate itself
+/// (a `DARKMUX_HOME` tempdir, or a project-local `./.darkmux`) is honored
+/// verbatim, because a test that isolated itself means it.
+#[cfg(any(test, feature = "test-support"))]
+fn ack_dir_default() -> PathBuf {
+    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return PathBuf::from("/tmp/darkmux-test-isolated/acks");
+    }
+    resolved.root.join("acks")
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn ack_dir_default() -> PathBuf {
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("acks")
 }
 
 fn ack_file_for(role_id: &str) -> Result<PathBuf> {
@@ -547,14 +581,35 @@ pub fn fresh_session_id(role_id: &str) -> String {
 }
 
 /// Resolve the path to the optional operator-identity file (#147).
-/// Defaults to `~/.darkmux/identity.md`. The `DARKMUX_IDENTITY_PATH`
+/// Defaults to `<darkmux root>/identity.md`. The `DARKMUX_IDENTITY_PATH`
 /// env var overrides — used by tests, also available for operators
 /// with multi-user / multi-identity setups.
+///
+/// (#2450) The fallback routes through `paths::resolve` rather than straight
+/// at `dirs::home_dir()`. This one is a READ, not a write, which makes it the
+/// most privacy-bearing member of the class rather than the least: the file's
+/// CONTENT is injected into the dispatch's system prompt, so before this fix a
+/// `DARKMUX_HOME`-scoped install (a sandbox, a CI run, a second persona) read
+/// the operator's REAL `~/.darkmux/identity.md` and sent it to the model.
+/// Probed and confirmed broken before this fix.
+///
+/// `ForceUser`, deliberately — the operator's identity is user-global, and
+/// `Auto` would silently switch personas based on which directory the process
+/// happened to be standing in. `ForceUser` still honors `DARKMUX_HOME` (that
+/// branch short-circuits ahead of the scope match), which is the bug fixed.
 fn identity_path() -> Option<PathBuf> {
-    // env(DARKMUX_IDENTITY_PATH) > config.dirs.identity > ~/.darkmux/identity.md
-    // (None if no HOME and no override) (#661 Slice 3).
-    darkmux_types::config_access::identity_path_override()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".darkmux").join("identity.md")))
+    // env(DARKMUX_IDENTITY_PATH) > config.dirs.identity > <darkmux root>/identity.md
+    // (#661 Slice 3). Always `Some` since #2450 — `paths::resolve` has its own
+    // no-HOME fallback, so the old "no HOME and no override" None arm is gone.
+    // The Option is kept because callers already treat a missing path and a
+    // missing FILE identically (the identity file is optional by design).
+    darkmux_types::config_access::identity_path_override().or_else(|| {
+        Some(
+            darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
+                .root
+                .join("identity.md"),
+        )
+    })
 }
 
 /// Load the operator-identity content from `~/.darkmux/identity.md` if
@@ -1322,6 +1377,77 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_ACK_DIR"),
             }
         }
+    }
+
+    /// (#2450) `ack_dir()`'s built-in default must scope under `DARKMUX_HOME`,
+    /// the same bug class already fixed for `fleet_file`/`flows_dir`/
+    /// `hooks_outbox_dir`/`lab_dir` in `darkmux-types::config_access`. Probed
+    /// directly (not assumed from shape) before this fix: with no
+    /// `DARKMUX_ACK_DIR` set and `DARKMUX_HOME` pointed at a throwaway root,
+    /// `ack_dir()` still resolved to the operator's REAL
+    /// `~/.darkmux/acks` — confirmed via a temporary probe test, since
+    /// `ack_dir()` writes real acknowledgment files on the operator's behalf.
+    #[test]
+    #[serial_test::serial]
+    fn ack_dir_honors_darkmux_home() {
+        let tmp = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_ack = std::env::var("DARKMUX_ACK_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_ACK_DIR");
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let dir = ack_dir().unwrap();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_ack {
+                Some(v) => std::env::set_var("DARKMUX_ACK_DIR", v),
+                None => std::env::remove_var("DARKMUX_ACK_DIR"),
+            }
+        }
+        assert_eq!(
+            dir,
+            tmp.path().join("acks"),
+            "must scope under DARKMUX_HOME, not the real user home"
+        );
+    }
+
+    /// (#2450) `identity_path()`'s built-in default must scope under
+    /// `DARKMUX_HOME`. Probed before the fix and confirmed broken: with
+    /// `DARKMUX_HOME` pointed at a throwaway root and no
+    /// `DARKMUX_IDENTITY_PATH` override, it still resolved to the operator's
+    /// REAL `~/.darkmux/identity.md` — whose CONTENT this module injects into
+    /// the dispatch system prompt, so the leak was of the operator's own
+    /// identity text into a scoped install's model calls.
+    #[test]
+    #[serial_test::serial]
+    fn identity_path_honors_darkmux_home() {
+        let tmp = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_id = std::env::var("DARKMUX_IDENTITY_PATH").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_IDENTITY_PATH");
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let got = identity_path();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_id {
+                Some(v) => std::env::set_var("DARKMUX_IDENTITY_PATH", v),
+                None => std::env::remove_var("DARKMUX_IDENTITY_PATH"),
+            }
+        }
+        assert_eq!(
+            got,
+            Some(tmp.path().join("identity.md")),
+            "must scope under DARKMUX_HOME, not the real user home"
+        );
     }
 
     // ─── #88: fresh session id per dispatch ────────────────────────────────

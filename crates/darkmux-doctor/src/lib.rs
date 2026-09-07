@@ -1414,15 +1414,12 @@ fn check_gh_allowlist() -> Check {
 /// provenance) — previously any non-`env` case was reported as
 /// `config.json` even when NEITHER tier actually set it.
 fn check_hooks() -> Vec<Check> {
-    let env_set = std::env::var("DARKMUX_HOOKS_ENABLED").ok().filter(|s| !s.trim().is_empty()).is_some();
-    let config_set = darkmux_types::config::DarkmuxConfig::load_resolved().hooks.as_ref().and_then(|h| h.enabled).is_some();
-    let provenance = if env_set {
-        "env"
-    } else if config_set {
-        "config.json"
-    } else {
-        "default"
-    };
+    // (#2450 review) Provenance comes from `config_access`, which owns the
+    // `env > config.json > default` ladder for every setting. The local copy
+    // this replaces asked the config tier via `DarkmuxConfig::load_resolved()`,
+    // which has no #811 test seam and so read the operator's REAL config.json
+    // from inside the unit tests — see `hooks_enabled_provenance`'s own doc.
+    let provenance = darkmux_types::config_access::hooks_enabled_provenance();
     let enabled = darkmux_types::config_access::hooks_enabled();
     let rules = darkmux_types::config_access::hooks_rules();
     let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
