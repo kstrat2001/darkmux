@@ -1377,7 +1377,17 @@ body {
      its own line instead, and the title keeps ONE line either way. */
   flex-wrap: wrap;
   row-gap: 5px;
-  justify-content: space-between;
+  /* `flex-start` + `margin-left: auto` on the button group, NOT
+     `space-between`. With the pill outside `.eventlog__headbtns` this row
+     has THREE children, and `space-between` pins the first and last and
+     CENTERS the middle one — so whenever the pill is short enough to sit
+     on line 1 ("0 events", "3 matches"), the follow and filters buttons
+     detached from the header's right edge and floated mid-row with ~158px
+     of dead space beside them (measured, review of this commit). The auto
+     margin puts the buttons hard right on line 1 in both cases: with the
+     pill beside them when it fits, alone when the pill wraps to its own
+     line below. */
+  justify-content: flex-start;
   align-items: center;
 }
 .eventlog__head h3 > span:first-child {
@@ -1388,6 +1398,11 @@ body {
   align-items: center;
   gap: 6px;
   flex: none;
+  /* Holds the group against the header's right edge now that the h3 is
+     `justify-content: flex-start` (see its own rule for why). Inert on the
+     phone, where this group is `width: 100%` and there is no free space
+     for an auto margin to absorb. */
+  margin-left: auto;
 }
 /* (#2029) `.eventlog__follow` belongs HERE, grouped with `.eventlog__fbtn`
    for the shared button base. A #2018 edit anchored on the first occurrence

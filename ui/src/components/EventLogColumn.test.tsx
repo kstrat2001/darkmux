@@ -765,16 +765,31 @@ describe("compactCountLabel", () => {
 // The phone needs the opposite (#2108): in the group, so follow + filters
 // + count share ONE row and the header stays two rows.
 describe("count pill placement (#2447)", () => {
-  function setInnerWidth(width: number) {
+  // Both axes, and the ORIGINAL DESCRIPTORS restored — not just the values.
+  // `useIsMobile()` has a landscape branch (a phone rotated wide is still
+  // phone chrome), so a test that sets only `innerWidth` lands on "desktop"
+  // by way of jsdom's 768px `innerHeight` plus the absence of `matchMedia`,
+  // not because it asked for a desktop viewport. Setting the pair says what
+  // it means. And `defineProperty` replaces jsdom's own accessor with a data
+  // property: writing the value back in `afterEach` would leave every later
+  // test in this file with an `innerWidth` that no longer tracks the window.
+  const ORIGINAL = {
+    width: Object.getOwnPropertyDescriptor(window, "innerWidth"),
+    height: Object.getOwnPropertyDescriptor(window, "innerHeight"),
+  };
+  function setViewport(width: number, height: number) {
     Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: height });
   }
-  const ORIGINAL_WIDTH = window.innerWidth;
-  afterEach(() => setInnerWidth(ORIGINAL_WIDTH));
+  afterEach(() => {
+    if (ORIGINAL.width) Object.defineProperty(window, "innerWidth", ORIGINAL.width);
+    if (ORIGINAL.height) Object.defineProperty(window, "innerHeight", ORIGINAL.height);
+  });
 
   const records = [rec({ action: "dispatch.reasoning" }), rec({ action: "tool.completed" })];
 
   it("desktop: the pill is a child of the header's h3, NOT of the button group", () => {
-    setInnerWidth(1440);
+    setViewport(1440, 900);
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     const qc = document.getElementById("qcount");
     expect(qc).toBeTruthy();
@@ -783,7 +798,7 @@ describe("count pill placement (#2447)", () => {
   });
 
   it("phone: the pill sits inside the button group, on the follow/filters row", () => {
-    setInnerWidth(390);
+    setViewport(390, 844);
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     const qc = document.getElementById("qcount");
     expect(qc).toBeTruthy();
@@ -791,11 +806,11 @@ describe("count pill placement (#2447)", () => {
   });
 
   it("renders exactly one pill in either skin — the two placements are exclusive", () => {
-    setInnerWidth(1440);
+    setViewport(1440, 900);
     const desktop = render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     expect(desktop.container.querySelectorAll(".eventlog__qcount").length).toBe(1);
     desktop.unmount();
-    setInnerWidth(390);
+    setViewport(390, 844);
     const phone = render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     expect(phone.container.querySelectorAll(".eventlog__qcount").length).toBe(1);
   });
