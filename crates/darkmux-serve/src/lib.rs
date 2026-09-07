@@ -743,19 +743,26 @@ async fn fleet_sessions_live_handler() -> impl IntoResponse {
 }
 
 /// CORS layer for the daemon's browser-facing endpoints. **Default**:
-/// `null` only (i.e. `file://` pages — the bundled topology + flow
-/// viewers run from disk). **Operator override**: set
-/// `DARKMUX_DAEMON_CORS_ORIGINS=<comma-list>` to extend the allowlist
-/// with specific origins (e.g. `http://localhost:5173` for a Vite dev
-/// server). Each entry is matched **exactly** — no prefix wildcard.
+/// nothing — every origin, `null` included, is denied. **Operator
+/// override**: set `DARKMUX_DAEMON_CORS_ORIGINS=<comma-list>` to name the
+/// origins that may read the daemon (e.g. `http://localhost:5173` for a
+/// Vite dev server, or `null` to restore the old file:// behavior for a
+/// bundled viewer opened directly from disk). Each entry is matched
+/// **exactly** — no prefix wildcard.
 ///
 /// The tightening from "any localhost origin" (#225) to "null only by
-/// default" (#273) follows from #270 elevating the daemon's data
-/// surface to fleet-wide. A compromised tab at any localhost origin
-/// would otherwise be able to exfiltrate fleet activity via CORS;
-/// requiring an explicit opt-in matches operator-sovereignty (default
-/// is the safer choice; operator names the dev-server origins they
-/// actually run).
+/// default" (#273) followed from #270 elevating the daemon's data
+/// surface to fleet-wide. **#2155 tightened it again: `null` is no
+/// longer allowed unconditionally.** `null` is the origin a `file://`
+/// page sends, but it is ALSO the origin of a sandboxed iframe
+/// (`<iframe sandbox="allow-scripts">`) — so any site the operator
+/// visits in a normal tab could embed one, issue a same-simple-request
+/// GET against the loopback or tailnet daemon, and read it back via
+/// `postMessage` once the response carried
+/// `Access-Control-Allow-Origin: null`. Requiring an explicit opt-in
+/// matches operator-sovereignty (default is the safer choice; the
+/// operator names the dev-server origins — and, if they genuinely run a
+/// `file://` viewer, `null` itself — that they actually use).
 ///
 /// Non-browser clients (curl, darkmux CLI, probe) are unaffected —
 /// CORS is browser-enforced; the header simply isn't set for unmatched
@@ -774,9 +781,6 @@ fn local_only_cors() -> tower_http::cors::CorsLayer {
         .allow_origin(AllowOrigin::predicate(
             move |origin: &HeaderValue, _parts: &axum::http::request::Parts| {
                 let s = origin.to_str().unwrap_or("");
-                if s == "null" {
-                    return true;
-                }
                 // Normalize the incoming Origin so trailing-slash /
                 // uppercase mismatches between what the browser sends
                 // and what the operator typed in their env var don't
@@ -802,10 +806,11 @@ fn local_only_cors() -> tower_http::cors::CorsLayer {
 /// (`**`, `https://*.example.com`) and oddities (`null`) are kept
 /// as-is + normalized; they pass through as exact-match strings.
 /// Subdomain-wildcard patterns silently never match anything (no
-/// browser sends `*.example.com` as Origin). `null` is the one
-/// special case the predicate ALREADY allows unconditionally (it's
-/// the file:// origin); adding it to the env list is harmless-but-
-/// redundant.
+/// browser sends `*.example.com` as Origin). **`null` is no longer a
+/// special case (#2155)** — the predicate denies it like any other
+/// origin unless the operator lists it here explicitly, so
+/// `DARKMUX_DAEMON_CORS_ORIGINS=null` is the real, load-bearing way to
+/// restore the old file://-viewer behavior, not a redundant no-op.
 ///
 /// Shared by `local_only_cors` (predicate construction) and
 /// `build_startup_banner` (operator-visible allowlist report).
@@ -930,9 +935,11 @@ fn build_startup_banner(
         darkmux_types::style::dim(&phase_count.to_string())
     ));
 
-    // CORS allowlist surface (#273) — operators with a localhost dev
-    // server origin need to opt in via DARKMUX_DAEMON_CORS_ORIGINS;
-    // surface the resolved state so failure-to-connect is debuggable.
+    // CORS allowlist surface (#273; tightened again by #2155 — `null` no
+    // longer allowed unconditionally) — operators with a localhost dev
+    // server origin, or a genuine file:// viewer, need to opt in via
+    // DARKMUX_DAEMON_CORS_ORIGINS; surface the resolved state so
+    // failure-to-connect is debuggable.
     // Routed through `parse_cors_origins` (#288) so the banner shows
     // the same normalized form the predicate uses — operators who type
     // `http://Foo:5173/` see `http://foo:5173` in the banner and can
@@ -945,7 +952,7 @@ fn build_startup_banner(
     );
     if extra_list.is_empty() {
         lines.push(
-            "  cors allowlist: null (file://) only — set DARKMUX_DAEMON_CORS_ORIGINS to opt in"
+            "  cors allowlist: (empty) — every origin denied; set DARKMUX_DAEMON_CORS_ORIGINS to opt in (e.g. null for a file:// viewer)"
                 .to_string(),
         );
     } else {
@@ -953,7 +960,7 @@ fn build_startup_banner(
         // matters — operators who SEE entries are the ones who might
         // wonder why their typed env value looks different here.
         lines.push(format!(
-            "  cors allowlist: null (file://) + {} (exact-match, normalized lowercase + no trailing slash)",
+            "  cors allowlist: {} (exact-match, normalized lowercase + no trailing slash)",
             darkmux_types::style::dim(&extra_list.join(", "))
         ));
     }

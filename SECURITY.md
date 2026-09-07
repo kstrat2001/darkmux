@@ -63,9 +63,12 @@ frame:
   non-macOS, the full URL is supplied via `DARKMUX_REDIS_URL` (your
   responsibility to keep out of shell history / logs).
 - **Daemon binds to loopback by default.** `darkmux serve` binds `127.0.0.1`
-  unless you explicitly bind elsewhere. CORS is deny-by-default (only
-  `null`/`file://` origins); extra origins are opt-in via
-  `DARKMUX_DAEMON_CORS_ORIGINS`.
+  unless you explicitly bind elsewhere. CORS is deny-by-default — no origin,
+  `null` included, is allowed until you name it; every origin (dev-server
+  origins, or `null` for a genuine `file://` viewer) is opt-in via
+  `DARKMUX_DAEMON_CORS_ORIGINS` ([#2155](https://github.com/kstrat2001/darkmux/issues/2155)
+  — `null` was previously allowed unconditionally, which let a sandboxed
+  iframe on any site read the daemon's read routes; it no longer is).
 - **No shell interpolation of untrusted strings.** Dispatch invokes Docker and
   subprocesses through argument vectors (`Command::arg`), not a shell string, so
   record/identifier values cannot inject shell commands. Operator-supplied
