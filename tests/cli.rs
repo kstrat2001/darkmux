@@ -2468,10 +2468,25 @@ fn dispatch_licensed_adjacent_role_bails_at_ack_gate_before_docker() {
 /// makes a review probe's remote `curl` call (`darkmux-crew`'s
 /// `remote_chat_attempt`) hang exactly the way a live LLM endpoint that
 /// stopped answering would. Each accepted connection gets its own thread
-/// doing a blocking read with no timeout; that read returns (`Ok(0)`/`Err`)
-/// the instant the PEER's socket closes — i.e. the instant `curl` itself
-/// dies — which is what [`ReapProbe::wait_for_close`] below waits on. This
-/// is a more precise proof of reaping than polling `ps`/`pgrep` for a
+/// that DRAINS whatever the peer sends (curl's request line, headers, and
+/// body all arrive before curl blocks waiting for a response) and keeps
+/// the socket open across every `Ok(n > 0)` read — the connection is only
+/// released, and the stream only dropped, once a read returns `Ok(0)`
+/// (peer sent FIN) or `Err` (peer reset). That is the instant `curl`
+/// itself actually dies, which is what [`Self::wait_for_a_connection_to_close`]
+/// below waits on.
+///
+/// (#2461) An earlier version of this handler read exactly ONE byte and
+/// then let `stream` fall out of scope — which itself closed the
+/// server's end of the socket right after curl's very first byte
+/// (`'P'` of `POST`) landed. Two bugs from that one line: the stub never
+/// actually held a connection open (curl got an immediate empty reply and
+/// exited in milliseconds, so there was never a long-lived process for
+/// `assert_no_surviving_remote_curl` to find), and the "closed" signal
+/// fired on the request ARRIVING rather than on a real peer close. The
+/// loop below fixes both: nothing closes this end until the peer does.
+///
+/// This is a more precise proof of reaping than polling `ps`/`pgrep` for a
 /// process that might not exist yet: it observes the OS actually tearing
 /// the connection down, not just a name disappearing from a process list.
 struct HangingStubServer {
@@ -2491,16 +2506,46 @@ impl HangingStubServer {
                 let Ok(mut stream) = stream else { continue };
                 let _ = accepted_tx.send(());
                 let closed_tx = closed_tx.clone();
+                // (#2461) This reader thread's own lifetime is bounded by
+                // the PEER, never by this process: it only returns once
+                // curl's socket actually closes (curl exits, whether from
+                // the production SIGKILL reap, its own `-m` bound, or the
+                // whole test binary exiting and tearing down every fd on
+                // the way out). Every caller that blocks on
+                // `closed_rx`/`accepted_rx` already bounds ITS OWN wait
+                // with `recv_timeout`, so a peer that never closes fails
+                // that caller's assertion instead of hanging the suite.
                 std::thread::spawn(move || {
                     use std::io::Read;
-                    let mut buf = [0u8; 1];
-                    // Blocks until the peer closes (curl dies) or sends a
-                    // byte (never happens — this server never writes a
-                    // response, so curl never gets anything back that
-                    // would make it close on its own before its `-m`
-                    // bound, which this test's SIGTERM preempts).
-                    let _ = stream.read(&mut buf);
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut buf) {
+                            // The peer is still sending (or handed back a
+                            // short read) — keep draining without closing
+                            // our end. This server never writes a
+                            // response, so curl blocks waiting for one
+                            // until it is killed or its own `-m` bound
+                            // fires.
+                            Ok(n) if n > 0 => continue,
+                            // (#2461 review) EINTR is NOT a peer close --
+                            // it is a signal landing on THIS process while
+                            // the read was parked. `std`'s bare
+                            // `Read::read` does not retry it (only
+                            // `read_exact`/`read_to_end` do), so without
+                            // this arm a stray signal would fire the
+                            // "closed" signal while curl is still very much
+                            // alive -- re-opening exactly the false-`closed`
+                            // hole this loop exists to close.
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            // Ok(0): peer sent FIN. Err: peer reset.
+                            // Either way this is a REAL close, not the
+                            // request merely arriving.
+                            _ => break,
+                        }
+                    }
                     let _ = closed_tx.send(());
+                    // `stream` drops here, AFTER the real peer close —
+                    // never before it.
                 });
             }
         });

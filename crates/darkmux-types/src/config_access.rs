@@ -1039,12 +1039,19 @@ fn flows_dir_default() -> std::path::PathBuf {
 /// that isolated itself means it. Only a test that isolated NOTHING (so
 /// `paths::resolve` would otherwise land on the real user root) falls back to
 /// the throwaway path. This was previously unconditional, which is exactly
-/// why `mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl`'s
-/// own comment (tests/cli.rs, deleted along with the dedicated review
-/// launcher — #2310 P4d-1) noted "flow records do NOT follow DARKMUX_HOME
-/// at all" and set `DARKMUX_FLOWS_DIR` explicitly as a workaround — it no
-/// longer needs to, though existing explicit overrides remain harmless (env
-/// still wins).
+/// why a now-deleted test's own comment noted "flow records do NOT follow
+/// DARKMUX_HOME at all" and set `DARKMUX_FLOWS_DIR` explicitly as a
+/// workaround — it no longer needs to, though existing explicit overrides
+/// remain harmless (env still wins).
+///
+/// That test was `mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl`,
+/// deleted with the dedicated review launcher in #2310 P4d-1. Named here as
+/// history rather than as a pointer, because it no longer exists to be read:
+/// the live descendants are `mission_launch_generic_…`, `dispatch_…` and
+/// `lab_run_sigterm_…_reaps_curl` in `tests/cli.rs`. (A #2461 review flagged
+/// the original as a dangling reference; it is, but repointing it at a live
+/// test made the sentence claim a test that still exists had been deleted, so
+/// the two facts are separated instead.)
 #[cfg(any(test, feature = "test-support"))]
 fn flows_dir_default() -> std::path::PathBuf {
     let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
