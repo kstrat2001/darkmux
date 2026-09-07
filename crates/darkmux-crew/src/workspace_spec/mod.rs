@@ -124,7 +124,25 @@ pub struct WorkspaceSpec {
     pub name: Option<String>,
     /// Root directory this workspace's mirrors/worktrees live under.
     /// `~`-expanded; defaults to `<darkmux root>/workspaces/<name>` via
-    /// [`WorkspaceSpec::resolved_root`] when absent.
+    /// [`WorkspaceSpec::resolved_root`] when absent. **An explicit `root:`
+    /// here is an unvalidated operator override** — expanded verbatim,
+    /// with no containment check — while the DEFAULT arm's `<name>` is
+    /// guarded twice: by the character class in
+    /// [`WorkspaceSpec::validate`] at load time, and structurally at the
+    /// join itself in [`WorkspaceSpec::resolved_root`] (#2455). The
+    /// asymmetry is deliberate: `name` is a spec-internal identifier the
+    /// operator rarely thinks about as a path at all, so it gets the same
+    /// structural guard as a source `id`; `root:` is the operator
+    /// explicitly naming a filesystem location, and second-guessing an
+    /// explicit path an operator wrote on purpose is not this type's job.
+    ///
+    /// The bound on that override, stated so it is not mistaken for an
+    /// oversight: `root:` is only ever read from a spec FILE the operator
+    /// wrote (or from a caller in this repo that passes a path it chose
+    /// itself). It is not derived from any remote-controlled value — the
+    /// one production caller that builds a spec from external input,
+    /// `darkmux_lab::crawl::plan_sites_step::derive_workspace_spec`,
+    /// leaves it `None` and always takes the guarded default arm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     pub sources: Vec<SourceSpec>,
@@ -210,6 +228,46 @@ impl WorkspaceSpec {
         let mut warnings = Vec::new();
         let name = self.effective_name().to_string();
 
+        // (#2455) `resolved_root()` joins `effective_name()` onto
+        // `<darkmux root>/workspaces/` — the identical shape as a source
+        // `id` joined onto that source's own materialized root just below,
+        // and just as unsafe to leave unvalidated: `Path::join` REPLACES
+        // the accumulated path outright when the joined component is
+        // absolute, and never strips a `..` segment. Reuses
+        // `valid_source_id` rather than a second predicate (see that
+        // function's own doc) — checked here, at the one place an
+        // OPERATOR-AUTHORED spec is read, so an invalid name is refused
+        // with an error naming their config rather than a structural
+        // refusal from three layers down.
+        //
+        // This check is the ERGONOMIC half of the pair, not the load-
+        // bearing one. `validate()` runs only from `load()`, and a
+        // `WorkspaceSpec` built as a struct literal never reaches it
+        // (`darkmux_lab::crawl::plan_sites_step::derive_workspace_spec`
+        // does exactly that, then materializes). The containment that
+        // cannot be skipped lives at the join, in `resolved_root()` —
+        // see its doc for why the two guards use different classes.
+        // Neither covers `root:`: an explicit override takes a different,
+        // unvalidated arm of `resolved_root()` entirely.
+        if !valid_source_id(&name) {
+            // The remedy names BOTH origins on purpose (#2455 review).
+            // `load()` substitutes the spec FILE's stem when the spec sets
+            // no `name` of its own, so the offending value is very often
+            // one the operator never typed into the file at all — a spec
+            // at `q1 corpus.json` produces exactly this error, and
+            // "rename it in the spec" alone would send them looking for a
+            // `name` key that isn't there.
+            bail!(
+                "workspace spec '{name}': the workspace name is invalid — it becomes a single \
+                 path component under `<darkmux root>/workspaces/`, so it must match \
+                 ^[A-Za-z0-9][A-Za-z0-9._-]*$ (start with a letter or digit; then letters, \
+                 digits, `.`, `_` or `-` only — no `/`, no spaces, no leading dot). Fix it in \
+                 one of three ways: set a valid `\"name\"` in the spec; or, if the spec sets no \
+                 `name` at all, rename the spec FILE (the name defaults to its stem); or set an \
+                 explicit `root:` to place this workspace at a path of your choosing"
+            );
+        }
+
         if let Some(sv) = &self.schema_version {
             if let (Some(got), Some(want)) =
                 (schema_major(sv), schema_major(WORKSPACE_SPEC_SCHEMA_VERSION))
@@ -276,15 +334,82 @@ impl WorkspaceSpec {
 
     /// Resolve `root`, `~`-expanding an explicit value or defaulting to
     /// `<darkmux root>/workspaces/<name>`.
-    pub fn resolved_root(&self) -> PathBuf {
-        match &self.root {
-            Some(r) if !r.trim().is_empty() => expand_tilde(r),
-            _ => darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
-                .root
-                .join("workspaces")
-                .join(self.effective_name()),
+    ///
+    /// **The default arm CONTAINS `<name>` here, at the join itself
+    /// (#2455 review)** — not only in [`WorkspaceSpec::validate`]. The
+    /// two guards are deliberate defense in depth, and this is the one
+    /// that cannot be skipped:
+    ///
+    /// - `validate()`'s check is the operator-facing one. It runs inside
+    ///   [`WorkspaceSpec::load`], applies the full [`valid_source_id`]
+    ///   character class, and refuses a bad spec at the moment the
+    ///   operator's file is read, naming the config.
+    /// - This check is STRUCTURAL. `WorkspaceSpec` is a plain `pub` struct
+    ///   with `pub` fields, and real production code builds one as a
+    ///   literal without ever calling `load()` (see
+    ///   `darkmux_lab::crawl::plan_sites_step::derive_workspace_spec`,
+    ///   which hands its spec straight to
+    ///   [`materialize`](super::materialize)). A guard that only lives in
+    ///   `validate()` is therefore worth exactly as much as every caller
+    ///   remembering to call it — the arrangement `darkmux_types::paths`
+    ///   already rejected in writing when it made the lab-root bypass
+    ///   unrepresentable rather than merely discouraged (#1882). So the
+    ///   containment lives where the dangerous `join` lives, and every
+    ///   caller of this function gets it whether it went through `load()`
+    ///   or not.
+    ///
+    /// The two checks are deliberately DIFFERENT classes, and the
+    /// difference is load-bearing. This one asks only "is it a single,
+    /// non-escaping path component" — the exact question `Path::join`
+    /// makes dangerous, and the same predicate
+    /// `materialize`'s own `contained_child` already applies to a source
+    /// `id`. It does NOT apply the stricter charset, because a
+    /// STRUCTURALLY safe name that the charset would reject is genuinely
+    /// reachable: `derive_workspace_spec` names the workspace after the
+    /// GitHub repo, and `owner/.github` is a real and common repository —
+    /// `.github` is a perfectly safe single component that
+    /// [`valid_source_id`] rejects for its leading dot. Applying the
+    /// charset here would refuse to review that repo at all. The charset
+    /// stays where it belongs: on operator-authored specs, at load time.
+    ///
+    /// The explicit-`root:` arm is an unvalidated operator override and is
+    /// NOT contained — see that field's own doc for why.
+    pub fn resolved_root(&self) -> Result<PathBuf> {
+        if let Some(r) = &self.root {
+            if !r.trim().is_empty() {
+                return Ok(expand_tilde(r));
+            }
         }
+        let name = self.effective_name();
+        if !single_path_component(name) {
+            bail!(
+                "workspace '{name}': the workspace name must be a single non-escaping path \
+                 component — it is joined onto `<darkmux root>/workspaces/`, and `Path::join` \
+                 REPLACES the whole accumulated path when the joined value is absolute (and \
+                 never strips a `..` segment) — rename the workspace, or set an explicit \
+                 `root:` if you meant to place it somewhere specific"
+            );
+        }
+        Ok(darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+            .root
+            .join("workspaces")
+            .join(name))
     }
+}
+
+/// Is `name` a single path component that cannot escape the root it is
+/// joined onto? The same predicate `materialize`'s `contained_child`
+/// applies to a source `id` (minus the `canonicalize`, which needs the
+/// root to already exist on disk — `<darkmux root>/workspaces/` may not).
+///
+/// Rejects, by construction rather than by blacklist: an absolute path
+/// (leading `Component::RootDir`), any `..` (`Component::ParentDir`), a
+/// bare or embedded `.` (`Component::CurDir`), an embedded or trailing
+/// separator (more than one component), and the empty string (no
+/// components at all).
+fn single_path_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_))) && components.next().is_none()
 }
 
 /// A source id is safe to join onto a filesystem root only if it can't
@@ -440,7 +565,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write(&dir, "workspace.json", &json.to_string());
         let (s, _) = WorkspaceSpec::load(&path).unwrap();
-        let root = s.resolved_root();
+        let root = s.resolved_root().unwrap();
         assert!(!root.to_string_lossy().starts_with('~'), "{root:?}");
         assert!(root.ends_with("somewhere/workspace-x"), "{root:?}");
     }
@@ -457,7 +582,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write(&dir, "workspace.json", &json.to_string());
         let (s, _) = WorkspaceSpec::load(&path).unwrap();
-        let root = s.resolved_root();
+        let root = s.resolved_root().unwrap();
         unsafe {
             match &prev {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -524,4 +649,315 @@ mod tests {
         let spec: WorkspaceSpec = serde_json::from_value(json).unwrap();
         assert!(spec.effective_exclude().is_empty());
     }
+
+    // ── name validation (#2455) ──
+    //
+    // `effective_name()` used to be free-form: `validate()` never checked
+    // `name`, so `resolved_root()`'s `<darkmux root>/workspaces/<name>`
+    // join could be handed an absolute path (which REPLACES the
+    // accumulated path per `Path::join`'s documented behavior) or a `..`
+    // segment (which is never rejected by `join`). Confirmed end-to-end
+    // with a scratch probe before this fix landed: a spec named an
+    // absolute path under a second tempdir caused `materialize()` to
+    // `git clone --bare` and check out a worktree there, while the
+    // intended `<DARKMUX_HOME>/workspaces/` directory was never created
+    // at all. These tests pin the fix at its source, `validate()`.
+
+    #[test]
+    fn absolute_name_is_rejected() {
+        let mut json = minimal_spec_json();
+        json["name"] = serde_json::json!("/tmp/anywhere");
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "workspace.json", &json.to_string());
+        let err = WorkspaceSpec::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/anywhere"), "{msg}");
+        assert!(msg.contains("name"), "{msg}");
+    }
+
+    #[test]
+    fn dotdot_name_is_rejected() {
+        let mut json = minimal_spec_json();
+        json["name"] = serde_json::json!("..");
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "workspace.json", &json.to_string());
+        let err = WorkspaceSpec::load(&path).unwrap_err();
+        assert!(err.to_string().contains("name"), "{err}");
+    }
+
+    #[test]
+    fn nested_dotdot_name_that_only_escapes_after_joining_is_rejected() {
+        let mut json = minimal_spec_json();
+        json["name"] = serde_json::json!("../../../../etc/passwd");
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "workspace.json", &json.to_string());
+        let err = WorkspaceSpec::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("../../../../etc/passwd"), "{msg}");
+        assert!(msg.contains("name"), "{msg}");
+    }
+
+    #[test]
+    fn bare_separator_name_is_rejected() {
+        let mut json = minimal_spec_json();
+        json["name"] = serde_json::json!("a/b");
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "workspace.json", &json.to_string());
+        let err = WorkspaceSpec::load(&path).unwrap_err();
+        assert!(err.to_string().contains("name"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ordinary_name_still_resolves_exactly_where_it_did_before() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let mut json = minimal_spec_json();
+        json["name"] = serde_json::json!("perfectly-ordinary_name.v2");
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "workspace.json", &json.to_string());
+        let loaded = WorkspaceSpec::load(&path);
+        let root = loaded.as_ref().ok().map(|(s, _)| s.resolved_root().unwrap());
+        unsafe {
+            match &prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        loaded.unwrap();
+        assert_eq!(
+            root.unwrap(),
+            tmp.path().join("workspaces").join("perfectly-ordinary_name.v2")
+        );
+    }
+    // ── #2455 review: the two guards, each pinned as its own class ──
+    //
+    // The load-time check (`validate`) and the join-time check
+    // (`resolved_root`) are DIFFERENT predicates on purpose, so each gets
+    // its own table. Pinning only the four cases the fix was written for
+    // would leave the class itself free to drift — the exact gap #2157's
+    // review found on this codebase's other copy of this guard (there,
+    // since closed: see `thermal_governor`'s own corpus).
+
+    /// The CHARSET class. Driven through `validate()` DIRECTLY rather
+    /// than through `load()`, because `load()` substitutes the spec
+    /// file's stem for an absent/blank `name` — so `""` and `"   "` can
+    /// never reach `validate` via that path, and testing the class
+    /// through `load` would silently drop them (see
+    /// `a_blank_name_becomes_the_file_stem_before_validate_sees_it`).
+    #[test]
+    fn validate_refuses_the_whole_bad_name_charset() {
+        let cases: &[(&str, &str)] = &[
+            ("", "empty"),
+            ("   ", "whitespace only"),
+            (".", "bare current-dir"),
+            ("..", "bare parent-dir"),
+            ("...", "leading dot"),
+            (".hidden", "leading dot (hidden file)"),
+            ("-flag", "leading hyphen (reads as a CLI flag downstream)"),
+            ("_scratch", "leading underscore"),
+            ("a/b", "embedded separator"),
+            ("a\\b", "embedded backslash"),
+            ("/abs", "absolute"),
+            ("../escape", "traversal"),
+            ("a/../../b", "traversal that only escapes after joining"),
+            ("q1 corpus", "embedded space"),
+            ("caf\u{e9}", "non-ASCII"),
+            ("nam\u{435}", "Cyrillic homoglyph that renders as ASCII"),
+            ("a\u{2044}b", "FRACTION SLASH — renders like a separator"),
+            ("a\nb", "embedded newline"),
+            ("a\0b", "embedded NUL"),
+        ];
+        for (name, why) in cases {
+            let mut json = minimal_spec_json();
+            json["name"] = serde_json::json!(name);
+            let spec: WorkspaceSpec = serde_json::from_value(json).unwrap();
+            let err = spec
+                .validate()
+                .err()
+                .unwrap_or_else(|| panic!("name {name:?} ({why}) must be refused"));
+            assert!(
+                err.to_string().contains("the workspace name is invalid"),
+                "name {name:?} ({why}) was refused for the WRONG reason: {err}"
+            );
+        }
+    }
+
+    /// The substitution the table above works around, pinned in its own
+    /// right: a spec with no usable `name` takes the FILE's stem, and
+    /// that stem is then subject to the same charset. A spec at
+    /// `q1 corpus.json` is refused even though its author never typed a
+    /// `name` — which is exactly why the error text names the file as one
+    /// of the three remedies.
+    #[test]
+    fn a_blank_name_becomes_the_file_stem_before_validate_sees_it() {
+        let mut json = minimal_spec_json();
+        json["name"] = serde_json::json!("   ");
+        let dir = TempDir::new().unwrap();
+
+        let ok = write(&dir, "perfectly-fine.json", &json.to_string());
+        let (spec, _) = WorkspaceSpec::load(&ok).unwrap();
+        assert_eq!(spec.effective_name(), "perfectly-fine");
+
+        let bad = write(&dir, "q1 corpus.json", &json.to_string());
+        let err = WorkspaceSpec::load(&bad).unwrap_err().to_string();
+        assert!(err.contains("q1 corpus"), "{err}");
+        assert!(
+            err.contains("rename the spec FILE"),
+            "the remedy must cover the file-stem origin, since no `name` was written: {err}"
+        );
+    }
+
+    /// The direction an over-eager charset would break: names an operator
+    /// realistically writes must still load.
+    #[test]
+    fn validate_still_accepts_realistic_names() {
+        for name in ["a", "9", "acme", "q1-corpus", "crawl_v2.1-final", "darkmux-self", "Repo.Name"] {
+            let mut json = minimal_spec_json();
+            json["name"] = serde_json::json!(name);
+            let dir = TempDir::new().unwrap();
+            let path = write(&dir, "workspace.json", &json.to_string());
+            WorkspaceSpec::load(&path).unwrap_or_else(|e| panic!("name {name:?} must load: {e}"));
+        }
+    }
+
+    /// The CONTAINMENT class, at the join — reached WITHOUT `load()`, the
+    /// way `crawl::plan_sites_step::derive_workspace_spec` reaches it.
+    /// Every value here must make `resolved_root()` refuse rather than
+    /// return a path outside `<darkmux root>/workspaces/`.
+    #[test]
+    fn resolved_root_refuses_every_name_that_could_escape_the_join() {
+        for name in [
+            "",
+            "   /..",
+            ".",
+            "..",
+            "a/b",
+            "a//b",
+            "/abs",
+            "/",
+            "../escape",
+            "a/../../b",
+            "./a",
+        ] {
+            let spec = WorkspaceSpec {
+                schema_version: None,
+                name: Some(name.to_string()),
+                root: None,
+                sources: Vec::new(),
+                include: None,
+                exclude: None,
+                edges: Vec::new(),
+                rules: Vec::new(),
+                extras: BTreeMap::new(),
+            };
+            let err = spec
+                .resolved_root()
+                .err()
+                .unwrap_or_else(|| panic!("name {name:?} must be refused at the join"));
+            assert!(
+                err.to_string().contains("single non-escaping path component"),
+                "name {name:?} refused for the wrong reason: {err}"
+            );
+        }
+    }
+
+    /// The near-miss worth stating so nobody "fixes" it: a TRAILING
+    /// separator is not an escape. `Path::components()` normalizes it
+    /// away, so `"a/"` is still exactly one component and still lands
+    /// inside `workspaces/`. The load-time charset rejects it anyway (it
+    /// contains a `/`), which is the right place for a tidiness rule —
+    /// the join-time guard only owns containment.
+    #[test]
+    #[serial_test::serial]
+    fn a_trailing_separator_is_normalized_away_not_an_escape() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let spec = WorkspaceSpec {
+            schema_version: None,
+            name: Some("a/".to_string()),
+            root: None,
+            sources: Vec::new(),
+            include: None,
+            exclude: None,
+            edges: Vec::new(),
+            rules: Vec::new(),
+            extras: BTreeMap::new(),
+        };
+        let root = spec.resolved_root();
+        unsafe {
+            match &prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(root.unwrap(), tmp.path().join("workspaces").join("a"));
+        assert!(!valid_source_id("a/"), "the load-time charset still refuses it");
+    }
+
+    /// The join-time guard is deliberately the CONTAINMENT class, not the
+    /// charset — and this is the case that proves the difference matters
+    /// rather than being an accident of implementation.
+    /// `derive_workspace_spec` names a workspace after the GitHub repo it
+    /// is reviewing, and `owner/.github` is a real, common repository. A
+    /// leading dot is structurally harmless (still one component, still
+    /// contained); tightening this guard to the charset would refuse to
+    /// review that repo at all.
+    #[test]
+    #[serial_test::serial]
+    fn resolved_root_accepts_a_structurally_safe_name_the_charset_would_reject() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let spec = WorkspaceSpec {
+            schema_version: None,
+            name: Some(".github".to_string()),
+            root: None,
+            sources: Vec::new(),
+            include: None,
+            exclude: None,
+            edges: Vec::new(),
+            rules: Vec::new(),
+            extras: BTreeMap::new(),
+        };
+        let root = spec.resolved_root();
+        unsafe {
+            match &prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(root.unwrap(), tmp.path().join("workspaces").join(".github"));
+        // ...and the charset guard genuinely WOULD have rejected it, so
+        // this test fails loudly if someone later "unifies" the two.
+        assert!(!valid_source_id(".github"));
+    }
+
+    /// An explicit `root:` stays the unvalidated operator override the
+    /// field's doc promises — the join-time guard must not silently start
+    /// policing a path the operator wrote on purpose.
+    #[test]
+    fn resolved_root_leaves_an_explicit_root_override_alone() {
+        let spec = WorkspaceSpec {
+            schema_version: None,
+            name: Some("..".to_string()),
+            root: Some("/some/operator/chosen/place".to_string()),
+            sources: Vec::new(),
+            include: None,
+            exclude: None,
+            edges: Vec::new(),
+            rules: Vec::new(),
+            extras: BTreeMap::new(),
+        };
+        assert_eq!(spec.resolved_root().unwrap(), PathBuf::from("/some/operator/chosen/place"));
+    }
+
 }
