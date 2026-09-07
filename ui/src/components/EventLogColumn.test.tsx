@@ -754,3 +754,49 @@ describe("compactCountLabel", () => {
     expect(compactCountLabel("12 matches · 4952 hidden")).toBe("12 matches · 5.0k hidden");
   });
 });
+
+// (operator, 2026-09-06 — desktop screenshot) The count pill's DOM group
+// is layout-load-bearing, and the two skins need it in DIFFERENT groups.
+// On desktop the events column is ~380px and the pill reaches ~250px with
+// `white-space: nowrap`; inside `.eventlog__headbtns` (`flex: none`) it
+// could neither shrink nor wrap, so it squeezed the title into three
+// stacked lines and still ran past the header's right edge. Outside that
+// group it is a wrappable child of the `<h3>` and drops onto its own line.
+// The phone needs the opposite (#2108): in the group, so follow + filters
+// + count share ONE row and the header stays two rows.
+describe("count pill placement (#2447)", () => {
+  function setInnerWidth(width: number) {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+  }
+  const ORIGINAL_WIDTH = window.innerWidth;
+  afterEach(() => setInnerWidth(ORIGINAL_WIDTH));
+
+  const records = [rec({ action: "dispatch.reasoning" }), rec({ action: "tool.completed" })];
+
+  it("desktop: the pill is a child of the header's h3, NOT of the button group", () => {
+    setInnerWidth(1440);
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    const qc = document.getElementById("qcount");
+    expect(qc).toBeTruthy();
+    expect(qc!.closest(".eventlog__headbtns")).toBeNull();
+    expect(qc!.parentElement?.tagName).toBe("H3");
+  });
+
+  it("phone: the pill sits inside the button group, on the follow/filters row", () => {
+    setInnerWidth(390);
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    const qc = document.getElementById("qcount");
+    expect(qc).toBeTruthy();
+    expect(qc!.closest(".eventlog__headbtns")).not.toBeNull();
+  });
+
+  it("renders exactly one pill in either skin — the two placements are exclusive", () => {
+    setInnerWidth(1440);
+    const desktop = render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    expect(desktop.container.querySelectorAll(".eventlog__qcount").length).toBe(1);
+    desktop.unmount();
+    setInnerWidth(390);
+    const phone = render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    expect(phone.container.querySelectorAll(".eventlog__qcount").length).toBe(1);
+  });
+});
