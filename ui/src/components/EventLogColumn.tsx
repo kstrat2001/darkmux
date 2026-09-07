@@ -652,6 +652,34 @@ export function EventLogColumn({
       ? `${LOG_CAP} of ${filtered.length}${serverTruncated ? "+" : ""} events${hiddenSuffix}`
       : `${filtered.length}${serverTruncated ? "+" : ""} events${hiddenSuffix}`;
 
+  /* (operator, 2026-09-06, desktop) The count pill is rendered here and
+     placed by viewport, because the two layouts need it in different FLEX
+     GROUPS and neither placement works for the other:
+
+       phone   — inside `.eventlog__headbtns`, so follow + filters + the
+                 count share one row and the header stays two rows (#2108).
+       desktop — a direct child of the `<h3>`, so it wraps onto its own line
+                 when the events column is too narrow to hold it beside the
+                 title.
+
+     Desktop with the phone's placement is what the operator caught: the
+     column is ~380px, the pill is ~250px and `white-space: nowrap`, and
+     `.eventlog__headbtns` is `flex: none` — so the pill could neither
+     shrink nor wrap, it squeezed "events last 24h" into three stacked
+     lines and still overflowed the header's right edge by a few pixels.
+     The node itself is identical in both placements (`id="qcount"` and its
+     text), so anything reading it by id is unaffected. */
+  const qcountNode = (
+    <span
+      className={`eventlog__qcount${qcountText ? " show" : ""}${q && filtered.length === 0 ? " zero" : ""}`}
+      id="qcount"
+      aria-live="polite"
+      title={isMobile && qcountText ? qcountText : undefined}
+    >
+      {isMobile ? compactCountLabel(qcountText) : qcountText}
+    </span>
+  );
+
   return (
     <div
       className={`eventlog${visible ? "" : " eventlog--hidden"}${collapsed ? " eventlog--collapsed" : ""}`}
@@ -872,25 +900,14 @@ export function EventLogColumn({
                 ) : null}
               </button>
               {/* (#2108, operator finding — real device, oversized Events
-                  header) Moved here from `.eventlog__search` below — on a
-                  phone this groups ALL three "controls" (follow, filters,
-                  the matches count) into one row alongside the search box's
-                  own row, matching the operator's ask for a compact
-                  two-row header instead of two half-empty ones. Desktop's
-                  own layout is unaffected: `.eventlog__headbtns` and
-                  `.eventlog__search` render exactly where they always
-                  did, this is purely which FLEX GROUP the pill's DOM node
-                  sits in — `id="qcount"` and its content are unchanged, so
-                  nothing that reads it by id cares that it moved. */}
-              <span
-                className={`eventlog__qcount${qcountText ? " show" : ""}${q && filtered.length === 0 ? " zero" : ""}`}
-                id="qcount"
-                aria-live="polite"
-                title={isMobile && qcountText ? qcountText : undefined}
-              >
-                {isMobile ? compactCountLabel(qcountText) : qcountText}
-              </span>
+                  header) On a PHONE the count belongs in this group — it
+                  puts all three "controls" (follow, filters, the matches
+                  count) on one row beside the search box's own row, the
+                  compact two-row header the operator asked for. On desktop
+                  it sits outside this group instead; see `qcountNode`. */}
+              {isMobile ? qcountNode : null}
             </span>
+            {isMobile ? null : qcountNode}
           </h3>
           <div className="eventlog__search">
             <div className="eventlog__searchbox">

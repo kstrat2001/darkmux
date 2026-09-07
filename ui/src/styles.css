@@ -1368,14 +1368,41 @@ body {
   text-transform: uppercase;
   color: var(--dim);
   display: flex;
-  justify-content: space-between;
+  /* (operator, 2026-09-06, desktop) The count pill (`.eventlog__qcount`,
+     a direct child here on desktop — see `qcountNode` in
+     `EventLogColumn.tsx`) is `white-space: nowrap` and can reach ~250px on
+     a busy stream, while the events column itself is ~380px. Without a
+     wrap the pill wins the row: the title collapses to three stacked
+     lines and the pill still overflows the header. Wrapping drops it onto
+     its own line instead, and the title keeps ONE line either way. */
+  flex-wrap: wrap;
+  row-gap: 5px;
+  /* `flex-start` + `margin-left: auto` on the button group, NOT
+     `space-between`. With the pill outside `.eventlog__headbtns` this row
+     has THREE children, and `space-between` pins the first and last and
+     CENTERS the middle one — so whenever the pill is short enough to sit
+     on line 1 ("0 events", "3 matches"), the follow and filters buttons
+     detached from the header's right edge and floated mid-row with ~158px
+     of dead space beside them (measured, review of this commit). The auto
+     margin puts the buttons hard right on line 1 in both cases: with the
+     pill beside them when it fits, alone when the pill wraps to its own
+     line below. */
+  justify-content: flex-start;
   align-items: center;
+}
+.eventlog__head h3 > span:first-child {
+  white-space: nowrap;
 }
 .eventlog__headbtns {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   flex: none;
+  /* Holds the group against the header's right edge now that the h3 is
+     `justify-content: flex-start` (see its own rule for why). Inert on the
+     phone, where this group is `width: 100%` and there is no free space
+     for an auto margin to absorb. */
+  margin-left: auto;
 }
 /* (#2029) `.eventlog__follow` belongs HERE, grouped with `.eventlog__fbtn`
    for the shared button base. A #2018 edit anchored on the first occurrence
@@ -1548,6 +1575,12 @@ body {
 }
 .eventlog__qcount {
   flex: none;
+  /* Last-resort guard for a column narrower than the pill itself: elide
+     rather than run past the header's edge. The wrap above is what keeps
+     this from firing at ordinary widths. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
   letter-spacing: 0.04em;
   color: var(--dim);

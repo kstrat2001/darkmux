@@ -754,3 +754,64 @@ describe("compactCountLabel", () => {
     expect(compactCountLabel("12 matches · 4952 hidden")).toBe("12 matches · 5.0k hidden");
   });
 });
+
+// (operator, 2026-09-06 — desktop screenshot) The count pill's DOM group
+// is layout-load-bearing, and the two skins need it in DIFFERENT groups.
+// On desktop the events column is ~380px and the pill reaches ~250px with
+// `white-space: nowrap`; inside `.eventlog__headbtns` (`flex: none`) it
+// could neither shrink nor wrap, so it squeezed the title into three
+// stacked lines and still ran past the header's right edge. Outside that
+// group it is a wrappable child of the `<h3>` and drops onto its own line.
+// The phone needs the opposite (#2108): in the group, so follow + filters
+// + count share ONE row and the header stays two rows.
+describe("count pill placement (#2447)", () => {
+  // Both axes, and the ORIGINAL DESCRIPTORS restored — not just the values.
+  // `useIsMobile()` has a landscape branch (a phone rotated wide is still
+  // phone chrome), so a test that sets only `innerWidth` lands on "desktop"
+  // by way of jsdom's 768px `innerHeight` plus the absence of `matchMedia`,
+  // not because it asked for a desktop viewport. Setting the pair says what
+  // it means. And `defineProperty` replaces jsdom's own accessor with a data
+  // property: writing the value back in `afterEach` would leave every later
+  // test in this file with an `innerWidth` that no longer tracks the window.
+  const ORIGINAL = {
+    width: Object.getOwnPropertyDescriptor(window, "innerWidth"),
+    height: Object.getOwnPropertyDescriptor(window, "innerHeight"),
+  };
+  function setViewport(width: number, height: number) {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: height });
+  }
+  afterEach(() => {
+    if (ORIGINAL.width) Object.defineProperty(window, "innerWidth", ORIGINAL.width);
+    if (ORIGINAL.height) Object.defineProperty(window, "innerHeight", ORIGINAL.height);
+  });
+
+  const records = [rec({ action: "dispatch.reasoning" }), rec({ action: "tool.completed" })];
+
+  it("desktop: the pill is a child of the header's h3, NOT of the button group", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    const qc = document.getElementById("qcount");
+    expect(qc).toBeTruthy();
+    expect(qc!.closest(".eventlog__headbtns")).toBeNull();
+    expect(qc!.parentElement?.tagName).toBe("H3");
+  });
+
+  it("phone: the pill sits inside the button group, on the follow/filters row", () => {
+    setViewport(390, 844);
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    const qc = document.getElementById("qcount");
+    expect(qc).toBeTruthy();
+    expect(qc!.closest(".eventlog__headbtns")).not.toBeNull();
+  });
+
+  it("renders exactly one pill in either skin — the two placements are exclusive", () => {
+    setViewport(1440, 900);
+    const desktop = render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    expect(desktop.container.querySelectorAll(".eventlog__qcount").length).toBe(1);
+    desktop.unmount();
+    setViewport(390, 844);
+    const phone = render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    expect(phone.container.querySelectorAll(".eventlog__qcount").length).toBe(1);
+  });
+});
