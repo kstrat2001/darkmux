@@ -109,6 +109,24 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             k,
             bundler,
         } => {
+            // (#2463) `lab eval` dispatches one internal-runtime call per
+            // case (`darkmux_crew::dispatch`, the same `dispatch()`
+            // primitive `darkmux dispatch` uses) in a plain loop with no
+            // signal handling at all — the #2262 gap, unfixed here. Each
+            // dispatch already gets its own `dispatch.error` bookend from
+            // `DispatchBookendGuard`, and the docker path already
+            // self-kills on a caught signal via the trajectory tailer's
+            // `interrupt::is_set()` poll — so, same as `dispatch`/`lab
+            // run`, the only two things missing are (1) installing the
+            // handlers so SIGTERM/SIGINT/SIGHUP become a flag instead of
+            // an outright kill, and (2) the watchdog that kills a
+            // registered child for a role that resolves to the tool-less
+            // remote `curl` path (no poll seam of its own). No new
+            // finalize/envelope guard — a run killed mid-corpus loses only
+            // the cases not yet scored, same as `Ctrl-C`-before-#2463 did;
+            // `scores.json` still isn't written until the loop completes.
+            crate::launch_guard::arm();
+            let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
             lab::review_bench::run_review_bench(lab::review_bench::ReviewBenchOpts {
                 role,
                 cases_dir: std::path::PathBuf::from(cases_dir),
@@ -172,6 +190,14 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             profile,
             profiles: crate::cli::ProfilesFileArg { profiles },
         } => {
+            // (#2463) `characterize()` is a thin wrapper over `lab_run`
+            // (single run) — the exact `lab_run` gap `LabCmd::Run` above
+            // was already fixed for in #2262. Same fix, same reasoning:
+            // `lab_run` already writes a terminal `lifecycle.json` on any
+            // dispatch `Err`, so only the handlers + curl-path watchdog
+            // are missing.
+            crate::launch_guard::arm();
+            let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
             let report = lab::characterize::characterize(&lab::characterize::CharacterizeOpts {
                 workload,
                 profile,
@@ -190,6 +216,13 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             runs,
             profiles: crate::cli::ProfilesFileArg { profiles },
         } => {
+            // (#2463) `tune()` is `lab_run` with `--runs N` — same gap,
+            // same fix as `LabCmd::Run`/`LabCmd::Characterize` above.
+            // Armed ONCE ahead of the whole multi-run loop (`lab_run`
+            // itself loops over `runs`), matching `LabCmd::Run`'s own
+            // placement.
+            crate::launch_guard::arm();
+            let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
             let report = lab::tune::tune(&lab::tune::TuneOpts {
                 workload,
                 profile,
@@ -391,6 +424,17 @@ fn parse_compact_strategy(raw: &str) -> Result<darkmux_types::CompactionStrategy
 ///     `CompactionDispatchArgs` via the provider (`loop_override`).
 fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
     use darkmux_lab::lab::loop_report::{analyze_run, LoopCompactionOverride};
+
+    // (#2463) `lab loop` calls `lab_run` (via `run_arm` below) either once
+    // or twice (the `--ab` baseline/treatment pair) — same underlying gap
+    // #2262 fixed for `LabCmd::Run`, unfixed here. Armed ONCE, ahead of
+    // both the single-run and `--ab` two-run shapes, matching `LabCmd::
+    // Run`'s own placement ahead of ITS (possibly `--runs N`) loop —
+    // `lab_run` already writes a terminal `lifecycle.json` on any dispatch
+    // `Err`, so the handlers + curl-path watchdog are the only things
+    // missing.
+    crate::launch_guard::arm();
+    let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
 
     // ── build the compaction overlay (axis 2) ───────────────────────
     let strategy = match args.compact_strategy.as_deref() {

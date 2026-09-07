@@ -111,6 +111,19 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
             opts.role
         )
     } else {
+        // (#2463) `notebook draft`'s dispatch (`dispatch_draft_via_internal`
+        // below, via `crate::fleet::dispatch_routed` -> the plain
+        // `dispatch()` primitive `darkmux dispatch` itself uses) installs
+        // no signal handling at all — the #2262 gap, unfixed here. The
+        // call already gets its own `dispatch.error` bookend from
+        // `DispatchBookendGuard`, and the docker path already self-kills
+        // on a caught signal via the trajectory tailer's
+        // `interrupt::is_set()` poll — so, same as `dispatch`, only the
+        // handlers + the curl-path watchdog (for a role/profile that
+        // resolves remote) are missing. No new finalize guard — there is
+        // no mission/envelope here to finalize, just this one dispatch.
+        crate::launch_guard::arm();
+        let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
         dispatch_draft_via_internal(&opts.role, &prompt, &session_id)?
     };
 

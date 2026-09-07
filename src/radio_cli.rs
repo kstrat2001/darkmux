@@ -30,6 +30,23 @@ use std::io::IsTerminal;
 
 /// Top-level entry called from `main.rs`'s dispatch table for `Cmd::Radio`.
 pub fn run(text: &str, dry_run: bool) -> Result<i32> {
+    // (#2463) `darkmux radio` dispatches the routing seat
+    // (`radio::dispatch_router_call`, below) and, on a `Refuse` decision,
+    // the answering seat too (`radio_answer::answer_live` ->
+    // `dispatch_answerer_call_with`) — both go through the container-free
+    // `dispatch_local_single_shot` curl path with no signal handling at
+    // all, the #2262 gap unfixed here. Each call already gets its own
+    // `dispatch.error` bookend from the inline `BookendGuard`
+    // `dispatch_local_single_shot` builds — so, same as `dispatch`/`lab
+    // run`, the only things missing are (1) the handlers so SIGTERM/
+    // SIGINT/SIGHUP become a flag instead of an outright kill, and (2)
+    // the watchdog that kills the registered `curl` child (this path has
+    // no self-polling seam of its own the way the docker container path
+    // does). Armed ONCE, ahead of BOTH possible dispatches in this
+    // single-exchange invocation, so a signal during either one is
+    // caught.
+    crate::launch_guard::arm();
+    let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
     let catalog = radio::compile_catalog();
     if catalog.is_empty() {
         println!(
@@ -206,10 +223,36 @@ fn spawn_mission_launch(config_id: &str, args: &str) -> Result<i32> {
         }
     };
     println!("radio: launching `{config_id}` …");
-    let status = cmd
-        .status()
+    // (#2463 review) POLL, do not `status()`. This child is deliberately NOT
+    // in `child_registry` — the reap watchdog would SIGKILL it ~100ms after a
+    // Ctrl-C, racing its own `LaunchFinalizeGuard` and leaving the mission
+    // Active — so nothing else can end the wait on our behalf.
+    //
+    // `cmd.status()` blocks in `Child::wait`, which retries `EINTR`. With
+    // `arm()` now installed above, a TARGETED `kill -TERM <radio pid>` sets
+    // the interrupt flag and returns to that wait, so radio hung for the
+    // launch's entire duration where before this change one signal ended it.
+    // Ctrl-C hid the regression: a terminal signal goes to the whole
+    // foreground group and reaches the child too. A supervisor's targeted
+    // kill does not — and that is the form every signal test here uses.
+    //
+    // Polling restores the pre-guard outcome for a targeted kill: we stop
+    // waiting and exit 130. The child is left to its OWN signal handling,
+    // which it installs itself (`mission_launch.rs`) and which a group
+    // signal still reaches. FORWARDING the signal to it would be better
+    // still — it would finalize on a targeted kill too — but that is a
+    // behavior improvement with its own test, tracked separately, not
+    // something to smuggle into a guard fix.
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("spawning `darkmux mission launch {config_id}`"))?;
-    Ok(status.code().unwrap_or(1))
+    loop {
+        if let Some(status) = child.try_wait().context("waiting on `darkmux mission launch`")? {
+            return Ok(status.code().unwrap_or(1));
+        }
+        crate::launch_guard::reap_and_exit_on_signal();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Mirrors `mission_launch.rs`'s private `cli_gate_handler` SELECTION
