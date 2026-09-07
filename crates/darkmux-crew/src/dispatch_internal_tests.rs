@@ -1752,6 +1752,148 @@
         assert!(named.join("sentinel.txt").exists(), "the pre-existing dir must be left untouched");
     }
 
+    // ─── #2158: create_dir_exclusive_0700 (symlink-proof dir creation) ─
+
+    #[test]
+    fn create_dir_exclusive_0700_refuses_a_preplanted_symlink_rather_than_following_it() {
+        // (#2158) `resolve_host_out`'s `None` branch (and the workspace
+        // auto-tempdir site) name their dir from `role_id` + `unix_micros`
+        // BEFORE creating it, so an attacker who predicts (or races) that
+        // name can plant a symlink at the path first. The fix is
+        // `create_dir` (not `_all`): one atomic mkdir(2) syscall with no
+        // separate exists-check window, so a symlink already sitting at
+        // the path makes the call fail with AlreadyExists rather than
+        // being silently followed. Exercised against the extracted helper
+        // directly, inside a `TempDir`, because the real dispatch path's
+        // name is unpredictable-by-design outside a controlled test.
+        let tmp = TempDir::new().unwrap();
+        let evil_target = tmp.path().join("evil-target");
+        std::fs::create_dir_all(&evil_target).unwrap();
+        let planted = tmp.path().join("out");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&evil_target, &planted).unwrap();
+
+        let err = create_dir_exclusive_0700(&planted).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("exist"),
+            "expected a named refusal citing the pre-existing entry, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&evil_target).unwrap().count(),
+            0,
+            "the symlink's redirect target must be untouched — nothing was ever written through it"
+        );
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(&planted).unwrap().file_type().is_symlink(),
+            "the planted symlink itself must be left exactly as it was, never replaced or followed"
+        );
+    }
+
+    #[test]
+    fn create_dir_exclusive_0700_refuses_a_preexisting_plain_directory_too() {
+        // Not just symlinks — a leftover dir from a prior run (or anything
+        // else already sitting at the path) is refused the same way, never
+        // silently reused.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("out");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("sentinel.txt"), b"pre-existing").unwrap();
+
+        let err = create_dir_exclusive_0700(&target).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("exist"));
+        assert!(target.join("sentinel.txt").exists(), "pre-existing dir must be left untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_exclusive_0700_creates_a_fresh_dir_locked_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("fresh-out");
+        create_dir_exclusive_0700(&target).unwrap();
+        assert!(target.is_dir(), "the ordinary path: a fresh dir must actually get created");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "freshly-created dir must be locked to 0700");
+    }
+
+    #[test]
+    fn create_dir_exclusive_unique_0700_steps_to_the_next_name_instead_of_reusing_a_leftover() {
+        // (#2158 review) The auto-named sites derive their dir from a WALL
+        // CLOCK (`<role>-<unix_micros>`), and a dispatch's out-dir is never
+        // cleaned — so a leftover at that exact name is reachable (a clock
+        // that steps back, or two same-microsecond siblings). A hard
+        // `AlreadyExists` there would refuse that name forever. It must pick
+        // the next name instead, and must NOT reuse or write into the
+        // leftover.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("darkmux-out-coder-424242");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("sentinel.txt"), b"prior run").unwrap();
+
+        let created = create_dir_exclusive_unique_0700(&base).unwrap();
+        assert_ne!(created, base, "must not hand back the occupied path");
+        assert_eq!(created.file_name().unwrap(), "darkmux-out-coder-424242-1");
+        assert!(created.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&created).unwrap().count(),
+            0,
+            "the new dir is genuinely fresh, not the leftover"
+        );
+        assert!(
+            base.join("sentinel.txt").exists(),
+            "the leftover must be left exactly as it was — never reused, never written into"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_exclusive_unique_0700_never_follows_a_planted_symlink_while_stepping() {
+        // The security property #2158 exists for must survive the retry: a
+        // symlink planted at the derived name is stepped OVER, never
+        // followed, and its target is never written through.
+        let tmp = TempDir::new().unwrap();
+        let evil_target = tmp.path().join("evil-target");
+        std::fs::create_dir(&evil_target).unwrap();
+        let base = tmp.path().join("darkmux-out-coder-9");
+        std::os::unix::fs::symlink(&evil_target, &base).unwrap();
+
+        let created = create_dir_exclusive_unique_0700(&base).unwrap();
+        assert_ne!(created, base);
+        assert_eq!(
+            std::fs::read_dir(&evil_target).unwrap().count(),
+            0,
+            "nothing was ever written through the planted symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(&base).unwrap().file_type().is_symlink(),
+            "the planted symlink is left untouched"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the stepped-to dir is still locked to 0700"
+        );
+    }
+
+    #[test]
+    fn create_dir_exclusive_unique_0700_refuses_loudly_when_every_candidate_is_taken() {
+        // Exhaustion is a LOUD refusal, never a silent fallback to an
+        // unguarded path.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("darkmux-out-coder-1");
+        std::fs::create_dir(&base).unwrap();
+        for n in 1..EXCLUSIVE_DIR_ATTEMPTS {
+            std::fs::create_dir(tmp.path().join(format!("darkmux-out-coder-1-{n}"))).unwrap();
+        }
+        let err = create_dir_exclusive_unique_0700(&base).unwrap_err();
+        assert!(
+            err.to_string().contains("already taken"),
+            "expected a named exhaustion refusal, got: {err:#}"
+        );
+    }
+
     #[test]
     fn apply_runtime_injection_mounts_binary_and_overrides_entrypoint() {
         // (#703) Injecting into a non-default image: bind the static binary
