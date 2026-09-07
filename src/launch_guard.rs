@@ -60,6 +60,78 @@ pub(crate) fn arm() {
     darkmux_types::interrupt::install_hup();
 }
 
+/// (#2262) Reap-on-signal watchdog for a caller whose own dispatch has no
+/// polling seam of its own to notice a caught signal mid-blocking-wait —
+/// the shape `mission_launch.rs::launch` has always spawned inline for
+/// itself (see its own comment at the spawn site), now shared so `darkmux
+/// dispatch` and `darkmux lab run` — both single/looped dispatch callers
+/// with no Task/Step graph of their own to poll from — get the same
+/// coverage without re-deriving it.
+///
+/// **Why this is needed even though `arm()` alone looks sufficient.** The
+/// docker/coder container dispatch path already self-kills on a caught
+/// signal: `dispatch_internal.rs`'s trajectory tailer thread polls
+/// `interrupt::is_set()` on its own ~250ms cadence and kills its
+/// registered child pid once `arm()` has made that flag meaningful. But
+/// the tool-less remote/hosted path (`remote_chat_attempt`'s `curl`) has
+/// NO poll seam at all — it registers its child pid then blocks in a
+/// single `child.wait_with_output()` with nothing watching it. Without a
+/// watchdog like this one, `arm()` alone converts "SIGTERM kills the
+/// process outright" into "SIGTERM sets a flag nothing ever reads for
+/// that path" — the dispatch would hang until curl's own `-m
+/// <timeout_seconds>` bound expired (up to `--timeout`'s default 600s),
+/// not "responds within a poll tick" the way every other signal-aware
+/// path in this codebase does.
+///
+/// Returns a guard whose `Drop` stops the thread once the caller's own
+/// dispatch is over — hold it for exactly the scope that needs
+/// interruptibility, same as `mission_launch.rs`'s own
+/// `WatchdogStopGuard`. Skipped entirely under `cfg(test)` (no unit test
+/// needs a real background thread); a live signal-delivery proof spawns
+/// the compiled binary as a subprocess instead, where `cfg!(test)` is
+/// false regardless of how it was built.
+pub(crate) fn spawn_reap_watchdog() -> WatchdogStopGuard {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = WatchdogStopGuard(std::sync::Arc::clone(&stop));
+    if !cfg!(test) {
+        std::thread::spawn(move || {
+            while !darkmux_types::interrupt::is_set() {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            loop {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+    guard
+}
+
+/// RAII stop-flag for [`spawn_reap_watchdog`]'s background thread.
+///
+/// **NOT shared with `mission_launch.rs` — it still has its own inline
+/// `WatchdogStopGuard` and its own inline spawn.** An earlier version of this
+/// comment claimed the migration had happened; it has not, and saying so was
+/// worse than the duplication, because it invited a reader to assume one
+/// definition governs both. The two bodies were diffed and are semantically
+/// identical, so migrating `mission_launch` onto this one is safe — but it is
+/// its own change, kept out of #2262's diff so a working launcher was not
+/// touched by a signal-handling fix. Until then these two must stay in sync by
+/// discipline, which is exactly the reason to do the migration.
+pub(crate) struct WatchdogStopGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WatchdogStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A launcher that ran its dispatch on a worker thread it deliberately
 /// abandoned (a caught signal, and joining would block on the same
 /// blocking call the signal is trying to escape) calls this ONCE its own

@@ -1575,6 +1575,30 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         host_out: None,
         max_turns_override: None,
     };
+    // (#2262) A bare `dispatch` installed no signal handling at all — the
+    // same gap #2131 closed for every `mission launch` launcher, never
+    // closed here. Without `arm()`, a caught SIGTERM/SIGINT/SIGHUP kills
+    // this process via the OS default disposition: no unwind, no `Drop`,
+    // the docker container (or curl child, for a tool-less hosted role)
+    // orphaned. `dispatch_as_crew_of_one` below already mints a real
+    // (cardinality-one) mission and reconciles it to a terminal status on
+    // ANY `Err`/`NodeStatus::Error` outcome (see its own `finalize`/
+    // `reconcile_on_error`) — the SAME `finalize_mission` a `mission
+    // launch` run reaches — and `dispatch_internal.rs`'s own
+    // `DispatchBookendGuard` already guarantees a `dispatch.error`
+    // liveness bookend on every exit from the dispatch call itself. So
+    // the only two things actually missing here are: (1) install the
+    // handlers so a signal becomes a flag instead of an outright kill,
+    // and (2) something to notice that flag and kill the blocked child —
+    // the docker path already self-kills via its own trajectory-tailer
+    // poll of `interrupt::is_set()` once the flag is live, but the
+    // tool-less remote/hosted `curl` path has no poll seam of its own
+    // (see `spawn_reap_watchdog`'s own doc). No new finalize/envelope
+    // guard is added here — one would be redundant with the crew-of-one
+    // machinery this call already goes through.
+    crate::launch_guard::arm();
+    let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
+
     // (#1509) Route the LOCAL half of `dispatch_routed`'s routing decision
     // through the engine as a crew of one (a full Mission -> Phase ->
     // Task(role) -> Step graph at cardinality one, run through the SAME
