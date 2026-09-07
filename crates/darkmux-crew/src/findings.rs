@@ -279,7 +279,26 @@ pub fn materialize(root: &Path, record: &FindingRecord) -> Result<Materialized> 
     // `create_new` closes the last of the race: two producers that both saw an
     // absent file still cannot double-write, and the loser reports the same
     // already-present outcome the `exists()` fast path does.
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+    //
+    // (#2451) Owner-only on POSIX — `emitted` (and, for a crawl finding,
+    // `context`) can carry a source line copied verbatim out of the
+    // operator's repository, and this writer landed at the umask default
+    // (typically 0o644, world-readable) with no mode of its own. Fixed at
+    // the creator, same shape as the #2259 hook-outbox fix: `.mode()`
+    // applies only when this call WINS the create race (the write-once
+    // contract above means it never runs again for this path), so an
+    // already-present finding from a pre-#2451 binary keeps whatever mode
+    // it already has — this does not retroactively `chmod` it, the same
+    // call #2259 makes (a migration that walks the store and re-modes it is
+    // a separate, operator-visible decision, not a side effect of a write).
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
+    match opened {
         Ok(mut f) => {
             use std::io::Write;
             f.write_all(body.as_bytes())

@@ -655,7 +655,31 @@ pub fn materialize(root: &Path, record: &ModRecord) -> Result<Materialized> {
     let dir = path.parent().expect("record path always has a parent");
     std::fs::create_dir_all(dir).with_context(|| format!("creating mod dir {}", dir.display()))?;
     let body = serde_json::to_string_pretty(record)? + "\n";
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+    // (#2451) Owner-only on POSIX — a mod's `kit` is a patch against the
+    // operator's code, and this writer landed at the umask default
+    // (typically 0o644, world-readable) with no mode of its own. Fixed at
+    // the creator, same shape as `findings::materialize` and the #2259
+    // hook-outbox fix: `.mode()` applies only when this call WINS the
+    // create race (the write-once contract above means it never runs again
+    // for this path), so an already-present mod from a pre-#2451 binary
+    // keeps whatever mode it already has — this does not retroactively
+    // `chmod` it, the same call #2259 makes.
+    //
+    // The mode set here is the mode the record has for its whole life on
+    // two counts a future change could break: `stage_and_commit` finishes
+    // with a `std::fs::rename`, which moves this inode rather than copying
+    // it; and `record_gate_with_source` — the one writer that legitimately
+    // rewrites this path — uses `std::fs::write`, which truncates an
+    // existing file WITHOUT touching its mode. Switching that rewrite to a
+    // temp-then-rename for atomicity would silently drop back to 0o644.
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
+    match opened {
         Ok(mut f) => {
             use std::io::Write;
             f.write_all(body.as_bytes())
@@ -826,12 +850,60 @@ pub fn create(
 
     stage_and_commit(root, &record, &|dest| {
         for (path, name) in attachments.iter().zip(&names) {
-            std::fs::copy(path, dest.join(name))
+            // (#2451) NOT `std::fs::copy`: on Unix it carries the SOURCE
+            // file's permission bits onto the copy, so an ordinary 0o644
+            // file in the operator's repo landed 0o644 inside the store no
+            // matter what the umask was. The destination is created
+            // owner-only FIRST and the bytes streamed in, so the copy never
+            // exists on disk at a wider mode — not even for the window a
+            // copy-then-`chmod` would leave open.
+            let mut src = std::fs::File::open(path)
+                .with_context(|| format!("opening attachment {}", path.display()))?;
+            let mut out = create_attachment_file(&dest.join(name))?;
+            std::io::copy(&mut src, &mut out)
                 .with_context(|| format!("copying attachment {}", path.display()))?;
         }
         Ok(())
     })?;
     Ok(record)
+}
+
+/// Create one attachment file inside a mod's staging directory, owner-only
+/// on POSIX.
+///
+/// (#2451) An attachment is the same operator content the kit is — a diff,
+/// a screenshot, a captured log — and both producers wrote it world-readable:
+/// `create` through `std::fs::copy` (which carries the source file's mode)
+/// and `create_from_emission` through a bare `std::fs::write` (which lands
+/// at the umask default). The mode has to be set HERE, at creation, because
+/// `stage_and_commit` finishes with a `std::fs::rename` and a rename moves
+/// the inode — whatever mode the file was created with is the mode it has
+/// after it lands in the store.
+///
+/// `create_new` rather than `create`+`truncate`: a `.mode()` is ignored when
+/// the open does not create, so reusing a stale file left behind by a
+/// crashed stage would silently keep its old, wider mode. A minted key never
+/// collides, so the refusal is unreachable in practice and loud if it isn't.
+/// Non-POSIX gets no mode — the same carve-out `materialize` takes.
+fn create_attachment_file(path: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating attachment {}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("creating attachment {}", path.display()))
+    }
 }
 
 /// Assemble one mod under `.staging`, then rename it into place.
@@ -1206,7 +1278,12 @@ pub fn create_from_emission(
 
     stage_and_commit(root, &record, &|dest| {
         for a in attachments {
-            std::fs::write(dest.join(&a.name), &a.bytes)
+            use std::io::Write as _;
+            // (#2451) Owner-only at creation, same reason as `create`'s
+            // copy above — a bare `std::fs::write` landed these bytes at
+            // the umask default (typically 0o644, world-readable).
+            let mut out = create_attachment_file(&dest.join(&a.name))?;
+            out.write_all(&a.bytes)
                 .with_context(|| format!("writing attachment {:?}", a.name))?;
         }
         Ok(())
