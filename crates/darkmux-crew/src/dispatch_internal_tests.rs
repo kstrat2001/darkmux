@@ -1884,7 +1884,7 @@
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("darkmux-out-coder-1");
         std::fs::create_dir(&base).unwrap();
-        for n in 1..EXCLUSIVE_DIR_ATTEMPTS {
+        for n in 1..crate::exclusive_fs::EXCLUSIVE_DIR_ATTEMPTS {
             std::fs::create_dir(tmp.path().join(format!("darkmux-out-coder-1-{n}"))).unwrap();
         }
         let err = create_dir_exclusive_unique_0700(&base).unwrap_err();

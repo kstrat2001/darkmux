@@ -476,145 +476,14 @@ pub(crate) fn write_resume_origin_meta(host_out: &Path, workspace: &Path, worksp
     }
 }
 
-/// (#2158) Create `path` in a way immune to a pre-planted symlink OR a
-/// leftover directory sitting at the same name: `create_dir` (never
-/// `create_dir_all`) is ONE atomic `mkdir(2)` syscall with no
-/// separate exists-check-then-create window, so anything already at
-/// `path` — a directory, a file, or a symlink, dangling or not — makes the
-/// call fail with `AlreadyExists` rather than being silently reused or
-/// followed. This is the strong form: it closes the TOCTOU race
-/// structurally, not just narrows it by making the name harder to guess
-/// (a random suffix reduces the odds an attacker wins the race; it does
-/// not remove the race).
-///
-/// The `symlink_metadata` call below is a POSTCONDITION ASSERTION, not a
-/// defense — stated plainly so it is not mistaken for one. Once
-/// `create_dir` has returned `Ok`, `mkdir(2)` has created a real directory
-/// at `path`, so the assertion cannot fire: reaching it would require
-/// another process to `rmdir` our directory and plant a symlink in the
-/// window between the two calls, which the sticky bit on `/tmp` already
-/// forbids to anything but the owner. It is kept because it is free and
-/// documents the invariant this function promises its callers, and it is
-/// deliberately NOT load-bearing: a weaker `mkdir` would not be rescued by
-/// a later `stat` either (that is the same TOCTOU window, just moved).
-///
-/// Locks the result to `0o700` on unix — callers mount this at a
-/// container path or write secrets/trajectories into it; no other local
-/// user should be able to read or traverse it.
-///
-/// Used directly by `resolve_host_out`'s CALLER-NAMED branch, where an
-/// existing path is a caller-contract violation and must stay a hard
-/// refusal (the crawl's per-unit collision check depends on exactly that).
-/// The AUTO-NAMED sites go through `create_dir_exclusive_unique_0700`
-/// below instead. `crates/darkmux-crew/src/thermal_governor.rs`'s
-/// `write_stop_file` carries the same class of gap one directory over —
-/// tracked as #2456, filed out of the #2157 audit — and is a candidate to
-/// move onto this same helper, not fixed here to keep this diff scoped to
-/// #2158. (A review pass removed this issue reference after grepping the
-/// repo for `2456` and finding only this comment; an issue number lives on
-/// GitHub, not in the tree, so absence from the source proves nothing about
-/// whether the issue exists. It does: `gh issue view 2456`.)
-fn create_dir_exclusive_0700(path: &Path) -> Result<()> {
-    if !try_create_dir_exclusive_0700(path)? {
-        bail!(
-            "darkmux: refusing to create {} — something already exists at that path (a \
-             leftover from a prior run, or a planted symlink); never reused or followed",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-/// (#2158) The fallible-but-not-fatal core of `create_dir_exclusive_0700`.
-/// `Ok(true)` — we created `path`. `Ok(false)` — something was already
-/// there, so NOTHING was created, reused or followed; the caller decides
-/// whether that is fatal (a caller-named dir) or merely means "pick another
-/// name" (an auto-generated one). `Err` is a real I/O failure.
-///
-/// Separated out precisely so the auto-named callers can tell
-/// `AlreadyExists` apart from a genuine error without string-matching an
-/// `anyhow` message.
-fn try_create_dir_exclusive_0700(path: &Path) -> Result<bool> {
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(e) => {
-            return Err(e).with_context(|| format!("creating directory: {}", path.display()));
-        }
-    }
-    let meta = fs::symlink_metadata(path)
-        .with_context(|| format!("stat'ing freshly-created directory: {}", path.display()))?;
-    if meta.file_type().is_symlink() {
-        bail!(
-            "darkmux: refusing to use {} — it resolved as a symlink immediately after creation; \
-             not proceeding",
-            path.display()
-        );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("setting permissions on directory: {}", path.display()))?;
-    }
-    Ok(true)
-}
-
-/// How many names `create_dir_exclusive_unique_0700` will try before giving
-/// up. Generous: every attempt past the first means a real collision, and
-/// an attacker who pre-plants all of them earns a LOUD refusal, never a
-/// redirect.
-const EXCLUSIVE_DIR_ATTEMPTS: u32 = 16;
-
-/// (#2158) The AUTO-NAMED counterpart to `create_dir_exclusive_0700`, for
-/// the two sites whose directory name darkmux derives itself rather than
-/// receiving from a caller: `resolve_host_out`'s `None` branch and the
-/// dispatch's auto-workspace tempdir.
-///
-/// Both derive their name from `<role_id>-<unix_micros>`, which is NOT a
-/// uniqueness guarantee — it is a wall clock. Two same-role dispatches that
-/// reach `SystemTime::now()` in the same microsecond derive the same name,
-/// and because a dispatch's out-dir is deliberately never cleaned, a clock
-/// that steps backwards can re-derive the name of a dir still sitting in
-/// `temp_dir()`. Making a bare `AlreadyExists` fatal at these two sites
-/// would turn the #2158 hardening into an availability cliff: a single
-/// leftover directory would refuse that name FOREVER, and concurrent
-/// sibling `dispatch.internal` steps (which carry step-derived session ids,
-/// so the duplicate-container-name check does NOT cover them) would take
-/// each other down.
-///
-/// So: keep the exclusive create — every attempt is still one atomic
-/// `mkdir(2)` that never reuses or follows what is already there — and on a
-/// collision try the NEXT name rather than reusing the occupied one. The
-/// security property is identical (darkmux only ever writes into a
-/// directory it just created itself); only the availability cliff is gone.
-/// Returns the path actually created, which the caller must use in place of
-/// `base`.
-fn create_dir_exclusive_unique_0700(base: &Path) -> Result<PathBuf> {
-    let stem = base
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("cannot derive a unique directory name from {}", base.display()))?
-        .to_os_string();
-    for attempt in 0..EXCLUSIVE_DIR_ATTEMPTS {
-        let candidate = if attempt == 0 {
-            base.to_path_buf()
-        } else {
-            let mut name = stem.clone();
-            name.push(format!("-{attempt}"));
-            base.with_file_name(name)
-        };
-        if try_create_dir_exclusive_0700(&candidate)? {
-            return Ok(candidate);
-        }
-    }
-    bail!(
-        "darkmux: refusing to create a dispatch directory — {} and its next {} candidate names \
-         are all already taken (stale leftovers under the temp dir, or something planting them); \
-         nothing was reused or followed",
-        base.display(),
-        EXCLUSIVE_DIR_ATTEMPTS - 1
-    );
-}
+// (#2158 / #2456) `create_dir_exclusive_0700` and
+// `create_dir_exclusive_unique_0700` moved to `crate::exclusive_fs` so
+// `thermal_governor.rs`'s STOP-file write (#2456 — filed out of this
+// module's own #2158 review as the same class of gap one directory over)
+// can share the convention instead of hand-rolling a second one. See that
+// module's own doc for the full reasoning; both functions' behavior here
+// is unchanged, only their address.
+use crate::exclusive_fs::{create_dir_exclusive_0700, create_dir_exclusive_unique_0700};
 
 /// (#2153) Resolve this dispatch's host out dir. See
 /// `DispatchOpts::host_out`'s own doc for the crawl-launcher motivation.
@@ -631,8 +500,9 @@ fn create_dir_exclusive_unique_0700(base: &Path) -> Result<PathBuf> {
 ///   `/darkmux-out` bind mount.
 ///
 /// Both branches create through the same exclusive-`mkdir(2)` core
-/// (`try_create_dir_exclusive_0700`), so there is exactly one place that
-/// decides what "safe to create a dispatch-owned directory" means (#2158).
+/// (`crate::exclusive_fs`'s private `try_create_dir_exclusive_0700`), so
+/// there is exactly one place that decides what "safe to create a
+/// dispatch-owned directory" means (#2158).
 /// They differ only in what a COLLISION means: a caller-named dir is a
 /// caller-contract violation and stays a hard refusal (the crawl's per-unit
 /// collision check depends on that); an auto-derived name is darkmux's own
@@ -6165,38 +6035,63 @@ fn run_telemetry_sampler(
                 }
                 crate::thermal_governor::ThermalEvent::Breaker { state } => {
                     emit_rest("thermal-critical", &state, true);
-                    // (#2110/#2109 review finding 5) The breaker tripped on
-                    // what looked like a crawl unit, but there was no
-                    // trustworthy STOP path to write — never write one at
-                    // a guessed path (thermal_governor.rs never did); make
-                    // the gap LOUD instead of a silent no-op that lets the
-                    // crawl keep dispatching units past a tripped breaker.
-                    if thermal_stop_file.is_none() {
-                        if let Some(reason) = thermal_stop_unresolved_reason {
-                            // (N3, final re-check) Warn — this is an
-                            // operator-actionable gap, not routine
-                            // telemetry — through merge_record_context so
-                            // the crawl's own identifying fields (unit,
-                            // source, sha, rule) ride along, same as
-                            // `emit_rest` above.
-                            let mut payload = serde_json::json!({
-                                "stop_written": false,
-                                "reason": reason,
-                                "state": state,
-                            });
-                            merge_record_context(&mut payload, &record_context);
-                            let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-                                darkmux_flow::Level::Warn,
-                                "thermal.stop_unresolved",
-                                "thermal",
-                                &role_id,
-                                &session_id,
-                                Some(&model),
-                                mission_id.as_deref(),
-                                phase_id.as_deref(),
-                                payload,
-                            ));
-                        }
+                    // (#2110/#2109 review finding 5, widened by #2456) Two
+                    // DISTINCT ways the breaker can fail to stop a crawl,
+                    // both surfaced through the same warning shape because
+                    // from the operator's point of view they mean the
+                    // same thing — "the breaker tried and could not write
+                    // a STOP" — and both must be LOUD, never a silent
+                    // no-op that lets the crawl keep dispatching units
+                    // past a tripped breaker with no trace of why:
+                    //
+                    // - No trustworthy STOP path could even be DERIVED
+                    //   (finding 5's original case — never write one at a
+                    //   guessed path).
+                    // - A path WAS derived, but the write itself was
+                    //   REFUSED (#2456 — a symlink was sitting at the path
+                    //   or its parent).
+                    //
+                    // The two are DISTINGUISHABLE in the record — `cause`
+                    // is `"path_underivable"` vs `"write_refused"` — because
+                    // the remedies differ sharply: the first is a crawl
+                    // `record_context` bug, the second means something is
+                    // sitting at the STOP path as a symlink and wants an
+                    // operator to go LOOK. The selection lives in
+                    // `thermal_governor::stop_unresolved_cause` (a pure,
+                    // unit-tested function) rather than inline here: this
+                    // sampler runs on its own thread inside a live dispatch
+                    // and no test reaches it, so an inline version was
+                    // pinned by nothing.
+                    let unresolved = crate::thermal_governor::stop_unresolved_cause(
+                        thermal_stop_file.as_deref(),
+                        thermal_stop_unresolved_reason,
+                        thermal_governor.last_stop_write_error(),
+                    );
+                    if let Some((cause, reason)) = unresolved {
+                        // (N3, final re-check) Warn — this is an
+                        // operator-actionable gap, not routine
+                        // telemetry — through merge_record_context so
+                        // the crawl's own identifying fields (unit,
+                        // source, sha, rule) ride along, same as
+                        // `emit_rest` above.
+                        let mut payload = serde_json::json!({
+                            "stop_written": false,
+                            "cause": cause.as_str(),
+                            "reason": reason,
+                            "state": state,
+                        });
+                        merge_record_context(&mut payload, &record_context);
+                        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+                            darkmux_flow::Level::Warn,
+                            "thermal.stop_unresolved",
+                            "thermal",
+                            &role_id,
+                            &session_id,
+                            Some(&model),
+                            mission_id.as_deref(),
+                            phase_id.as_deref(),
+                            payload,
+                        ));
                     }
                 }
             }
