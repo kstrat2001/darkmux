@@ -149,6 +149,25 @@ fn run_cargo_build_release() -> Result<(), String> {
 pub struct FleetNode {
     pub machine_id: String,
     pub daemon_port: u16,
+    /// (#2184) This node's own scoped darkmux config root, set as
+    /// `DARKMUX_HOME` on every command `cmd()` builds and on the daemon
+    /// itself (`spawn_daemon`) — see `cmd()`'s doc for why this can never
+    /// be left unset.
+    pub home_dir: PathBuf,
+    /// (#2184) This node's own scoped `HOME`, a SIBLING of `home_dir`.
+    /// `DARKMUX_HOME` is not on its own sufficient: several paths resolve
+    /// through `dirs::home_dir()` and never consult it —
+    /// `config_access::fleet_file`, `config_access::cache_dir`,
+    /// `crew::dispatch::ack_dir` (`~/.darkmux/acks`, WRITTEN on every
+    /// dispatch ack) and `crew::dispatch`'s `identity.md`, plus the
+    /// profile/mission-config/workload/skill search paths that include
+    /// `~/.darkmux/...` as a candidate. Measured 2026-09-07 against a
+    /// plain `cargo build` binary: with `DARKMUX_HOME` set to a tempdir,
+    /// `darkmux machine add` still wrote `$HOME/.darkmux/fleet.json`.
+    /// This node overrides two of those by name (`DARKMUX_FLEET_FILE`,
+    /// `DARKMUX_CREW_DIR`); `HOME` closes the rest at once, and keeps
+    /// closing the ones nobody has written yet.
+    pub process_home: PathBuf,
     pub flows_dir: PathBuf,
     pub fleet_file: PathBuf,
     pub crew_root: PathBuf,
@@ -161,10 +180,23 @@ pub struct FleetNode {
 impl FleetNode {
     /// Build a CLI command pre-configured with this node's env vars.
     /// Caller adds `.args([...])` and `.output()`/`.spawn()`.
+    ///
+    /// (#2184) `DARKMUX_HOME` is load-bearing, not cosmetic: the binary
+    /// this spawns (`darkmux_release_binary()`) is a real `cargo build
+    /// --release` artifact with no `test`/`test-support` cfg (see the
+    /// module doc), so absent `DARKMUX_HOME` it resolves the operator's
+    /// actual `~/.darkmux/config.json` — and a real `hooks` rule there
+    /// gets a real POST for every flow record this command writes.
+    /// Reproduced live 2026-08-31 (five records reaching a real
+    /// crawl-tracker during an ordinary `cargo test` sweep). Every env var
+    /// this method sets lives HERE, in the one place every caller goes
+    /// through, so a future one can't forget it.
     pub fn cmd(&self) -> Command {
         let binary = darkmux_release_binary();
         let mut cmd = Command::new(binary);
-        cmd.env("DARKMUX_MACHINE_ID", &self.machine_id)
+        cmd.env("HOME", &self.process_home)
+            .env("DARKMUX_HOME", &self.home_dir)
+            .env("DARKMUX_MACHINE_ID", &self.machine_id)
             .env("DARKMUX_REDIS_URL", &self.redis_url)
             .env("DARKMUX_FLOWS_DIR", &self.flows_dir)
             .env("DARKMUX_FLEET_FILE", &self.fleet_file)
@@ -184,6 +216,88 @@ impl Drop for FleetNode {
     fn drop(&mut self) {
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
+    }
+}
+
+#[cfg(test)]
+mod darkmux_home_isolation_tests {
+    use super::*;
+
+    /// (#2184) Every process this harness spawns runs the real RELEASE
+    /// binary (`run_cargo_build_release` — a plain `cargo build --release`,
+    /// deliberately outside any `cargo test` session, so it carries none of
+    /// the `test`/`test-support` cfg that empties the config tier
+    /// elsewhere in this workspace — see `darkmux_types::config_access`'s
+    /// module doc). Nothing about being spawned FROM a test makes that
+    /// binary read a test config: absent `DARKMUX_HOME`, it resolves
+    /// `~/.darkmux/config.json` exactly like an operator's own shell
+    /// would. Reproduced live 2026-08-31: with a real `hooks` rule
+    /// configured there (a loopback crawl-tracker), five flow records
+    /// this harness's daemon and `FleetNode::cmd()` wrote were POSTed to
+    /// it during an ordinary `cargo test` sweep.
+    ///
+    /// The fix is `DARKMUX_HOME`, scoped under the node's own tempdir, on
+    /// every spawned command. This asserts the invariant directly against
+    /// `FleetNode::cmd()`'s actual env — not the incident, the guarantee:
+    /// no command this harness builds may omit it.
+    #[test]
+    fn cmd_always_sets_darkmux_home_scoped_under_the_node_dir() {
+        // A cheap real `Child` — `FleetNode` owns one for real, so this
+        // exercises the actual struct rather than a stand-in.
+        let daemon = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning throwaway child for the test node");
+
+        let node_dir = std::env::temp_dir().join("darkmux-2184-cmd-home-test");
+        let home_dir = node_dir.join("home");
+        let process_home = node_dir.join("process-home");
+        let node = FleetNode {
+            machine_id: "node-a".to_string(),
+            daemon_port: 0,
+            home_dir: home_dir.clone(),
+            process_home: process_home.clone(),
+            flows_dir: node_dir.join("flows"),
+            fleet_file: node_dir.join("fleet.json"),
+            crew_root: node_dir.join("crew"),
+            redis_url: "redis://127.0.0.1:0".to_string(),
+            lmstudio_base_url: "http://127.0.0.1:0".to_string(),
+            daemon,
+        };
+
+        let cmd = node.cmd();
+        let env_var = |name: &str| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(name))
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_owned())
+        };
+        let darkmux_home = env_var("DARKMUX_HOME");
+
+        // (#2184) The other half. `DARKMUX_HOME` is not sufficient on its
+        // own: `config_access::fleet_file`, `config_access::cache_dir` and
+        // `crew::dispatch::ack_dir` all resolve through `dirs::home_dir()`
+        // and never read it. Measured 2026-09-07 against a plain `cargo
+        // build` binary: with `DARKMUX_HOME` set to a tempdir, `darkmux
+        // machine add` still wrote `$HOME/.darkmux/fleet.json`.
+        assert_eq!(
+            env_var("HOME"),
+            Some(process_home.into_os_string()),
+            "FleetNode::cmd() must also scope HOME to this node (#2184) — the paths that \
+             resolve through `dirs::home_dir()` rather than `DARKMUX_HOME` otherwise land in \
+             the operator's real ~/.darkmux, and the binary this harness spawns is a plain \
+             release build with none of the workspace's cfg(test) isolation guards"
+        );
+
+        assert_eq!(
+            darkmux_home,
+            Some(home_dir.into_os_string()),
+            "FleetNode::cmd() must set DARKMUX_HOME to THIS node's own scoped dir \
+             (#2184) — without it, the real release binary this harness spawns falls \
+             through to the operator's actual ~/.darkmux/config.json, and a real \
+             `hooks` rule there gets a real POST from every flow record the command \
+             writes"
+        );
     }
 }
 
@@ -357,6 +471,20 @@ fn spawn_daemon(
         .map_err(|e| format!("crew/roles dir: {e}"))?;
     let fleet_file = node_dir.join("fleet.json");
 
+    // (#2184) This node's own darkmux config root — `DARKMUX_HOME` below
+    // scopes the release binary to it instead of the operator's real
+    // `~/.darkmux`. See `FleetNode::cmd()`'s doc for why this is not
+    // optional.
+    let home_dir = node_dir.join("home");
+    std::fs::create_dir_all(&home_dir).map_err(|e| format!("home dir: {e}"))?;
+    // (#2184) A SIBLING of the darkmux root, not its parent: see
+    // `FleetNode::process_home`. `<process_home>/.darkmux` is deliberately
+    // a different directory from `home_dir`, so a path resolved by the
+    // `dirs::home_dir()` route is distinguishable from one resolved by the
+    // `DARKMUX_HOME` route when a test needs to tell them apart.
+    let process_home = node_dir.join("process-home");
+    std::fs::create_dir_all(&process_home).map_err(|e| format!("process home dir: {e}"))?;
+
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("binding daemon port: {e}"))?;
     let port = listener
@@ -368,6 +496,8 @@ fn spawn_daemon(
     let binary = darkmux_release_binary();
     let daemon = Command::new(&binary)
         .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
+        .env("HOME", &process_home)
+        .env("DARKMUX_HOME", &home_dir)
         .env("DARKMUX_MACHINE_ID", &spec.machine_id)
         .env("DARKMUX_REDIS_URL", redis_url)
         .env("DARKMUX_FLOWS_DIR", &flows_dir)
@@ -384,6 +514,8 @@ fn spawn_daemon(
     Ok(FleetNode {
         machine_id: spec.machine_id.clone(),
         daemon_port: port,
+        home_dir,
+        process_home,
         flows_dir,
         fleet_file,
         crew_root,

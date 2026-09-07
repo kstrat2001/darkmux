@@ -11,6 +11,306 @@ use std::collections::BTreeMap;
 use std::fs;
 use tempfile::TempDir;
 
+// ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2184) ==========================
+//
+// The only place this file names the darkmux binary. Every child process
+// this file starts goes through `darkmux_cmd()` or `darkmux_std_cmd()`,
+// and both scope the child to a FRESH, empty pair of roots by setting
+// `DARKMUX_HOME` AND `HOME` (see `isolated_roots` for why one is not
+// enough, and why they are siblings rather than nested).
+//
+// Why that is load-bearing and not hygiene: these spawn a real
+// subprocess, so nothing about being launched FROM a test makes the
+// child read a test-shaped configuration. `DARKMUX_HOME` is the FIRST
+// tier of `paths::resolve` (`crates/darkmux-types/src/paths.rs`);
+// without it the child resolves `./.darkmux` and then the developer's
+// actual `~/.darkmux`, and every accessor that has no test-build guard
+// of its own (`crew_dir_override`, `fleet_file`, `notebook_dir`,
+// `identity_path_override`, `ack_dir_override`) then reads and WRITES
+// the operator's real state. Measured 2026-09-07 against this file's own
+// binary: with `DARKMUX_HOME` unset, `darkmux machine add` created
+// `$HOME/.darkmux/fleet.json`.
+//
+// The incident that named this (#2184) is the same failure one crate
+// over: during an ordinary `cargo test` sweep on 2026-08-31, five flow
+// records were POSTed to a live crawl-tracker on 127.0.0.1:8790, because
+// `hooks.enabled` and its rules were read out of the operator's real
+// `~/.darkmux/config.json`. That particular vector happens to be closed
+// for THIS file by an unrelated mechanism: `cargo test` feature-unifies
+// `darkmux-types/test-support` (root `[dev-dependencies]`) into the bin
+// target, so `config_access::config()` is empty by construction in the
+// spawned child. Measured 2026-09-07, same `config.json` both ways:
+// `flow status --json` reports `hooks.enabled: false` from the `cargo
+// test` binary and `true` from a plain `cargo build` one. That is a
+// side effect of a feature-resolution rule nobody stated as a guarantee,
+// and it does nothing for the path tiers above. Isolate at the spawn.
+//
+// `every_darkmux_spawn_in_this_file_goes_through_the_isolating_helpers`
+// (below) is the structural half: it fails if a raw spawn is ever
+// reintroduced anywhere outside this block.
+
+/// The darkmux binary under test. `CARGO_BIN_EXE_darkmux` is cargo's own
+/// compile-time path to the bin target built for this integration test:
+/// exact, and one source for both helpers below.
+fn darkmux_bin_path() -> &'static str {
+    env!("CARGO_BIN_EXE_darkmux")
+}
+
+/// A fresh `(HOME, DARKMUX_HOME)` pair for ONE spawned command.
+///
+/// Per-call rather than per-file so two tests running concurrently in
+/// this process can never collide on `fleet.json` / `missions/`; plain
+/// `PathBuf`s rather than a `TempDir` because a `TempDir` returned from
+/// here would be dropped (and its directory deleted) at the end of the
+/// caller's expression, typically before the child has even run. Both
+/// live under one pid-named parent so a leftover tree is obviously this
+/// test binary's.
+///
+/// They are SIBLINGS, not `<home>/.darkmux`, and that is load-bearing.
+/// Six accessors in `config_access` (`lab_dir_default`,
+/// `flows_dir_default`, `hooks_outbox_dir_default`,
+/// `findings_dir_default`, `mods_dir_default`, `liveness_dir_default`)
+/// carry a test-build guard that reads "if the resolved root IS
+/// `dirs::home_dir()/.darkmux`, this test forgot to isolate itself" and
+/// redirects to `/tmp/darkmux-test-isolated/...`. Nesting `DARKMUX_HOME`
+/// under `HOME` makes a properly isolated child look exactly like an
+/// un-isolated one to that check, and it fires: measured 2026-09-07,
+/// `lab notebook draft` then resolved its run dir to
+/// `/tmp/darkmux-test-isolated/runs` and could not see the fixture the
+/// test had just written. Sibling roots keep the two distinguishable.
+fn isolated_roots() -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir()
+        .join(format!("darkmux-cli-tests-{}", std::process::id()))
+        .join(format!("spawn-{n:04}"));
+    let home = base.join("home");
+    let darkmux_home = base.join("darkmux");
+    for d in [&home, &darkmux_home] {
+        fs::create_dir_all(d)
+            .unwrap_or_else(|e| panic!("creating isolated root {}: {e}", d.display()));
+    }
+    (home, darkmux_home)
+}
+
+/// A `std::process::Command` for the darkmux binary, isolated. Use when
+/// the test needs `.spawn()` / `Stdio` plumbing that
+/// `assert_cmd::Command` does not offer.
+///
+/// TWO env vars, because `DARKMUX_HOME` alone does not actually contain
+/// the child. It is the first tier of `paths::resolve`, and most darkmux
+/// directories route through that — but several accessors reach for
+/// `dirs::home_dir()` directly and never consult it:
+/// `config_access::fleet_file`, `config_access::cache_dir`,
+/// `residency_lease`'s root, `dispatch_liveness`'s root, and
+/// `crew::dispatch`'s `identity.md`. Measured 2026-09-07: with
+/// `DARKMUX_HOME` pointed at a tempdir, `darkmux machine add` still wrote
+/// `$HOME/.darkmux/fleet.json`. `dirs::home_dir()` honors `$HOME` on
+/// unix, so setting BOTH closes the whole family at once instead of
+/// enumerating the leaks (and re-enumerating them every time a new one is
+/// written). They point at the same tree, so a child sees one coherent
+/// root either way it resolves.
+fn darkmux_std_cmd() -> std::process::Command {
+    let (home, darkmux_home) = isolated_roots();
+    let mut cmd = std::process::Command::new(darkmux_bin_path());
+    cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home);
+    cmd
+}
+
+/// The default: an `assert_cmd::Command` for the darkmux binary,
+/// isolated. Same idiom as the e2e harness's `FleetNode::cmd()`
+/// (`tests/e2e/harness.rs`): one constructor owns the isolation env, so
+/// no call site can forget it.
+///
+/// A test that needs a SPECIFIC root (one it seeds, or one it later
+/// asserts against) still comes through here and overrides with its own
+/// `.env("DARKMUX_HOME", ...)`. A later `.env` wins, so the override is
+/// explicit and the default is never a raw inherit.
+fn darkmux_cmd() -> Command {
+    Command::from_std(darkmux_std_cmd())
+}
+
+/// The one named override: a spawn scoped to a PROJECT-LOCAL darkmux
+/// root at `<dir>/.darkmux`, with `<dir>` as the child's cwd.
+///
+/// The `lab fixture` / `lab doctor` / `lab notebook` / `lab run` tests
+/// below seed a tempdir, create `<tempdir>/.darkmux`, and then assert
+/// against that root (or run a SECOND command that has to see what the
+/// first one wrote). They cannot take `darkmux_cmd()`'s per-call root:
+/// each spawn would get a fresh one, so a `fixture register` in spawn 1
+/// is invisible to a `fixture list` in spawn 2.
+///
+/// This is the override shape `darkmux_cmd()`'s doc describes — the root
+/// is NAMED, not inherited — and the `HOME` half of the isolation from
+/// `darkmux_std_cmd()` is untouched, so the `dirs::home_dir()` accessors
+/// (`fleet_file` and friends) still cannot reach the operator.
+///
+/// Setting `DARKMUX_HOME` rather than relying on `paths::resolve`'s
+/// project tier finding `./.darkmux` on its own is deliberate: the two
+/// resolve to the identical set of paths (only `DarkmuxPaths::scope`
+/// differs, which no production code reads), and an explicit value can't
+/// be defeated by an inherited one.
+fn darkmux_cmd_in_project(dir: &std::path::Path) -> Command {
+    let mut cmd = darkmux_cmd();
+    cmd.current_dir(dir).env("DARKMUX_HOME", dir.join(".darkmux"));
+    cmd
+}
+
+/// (#2184) The BEHAVIORAL half. The structural guard below proves every
+/// spawn is ROUTED through the helper; it cannot tell whether the helper
+/// still isolates anything.
+///
+/// So: read the root the helper picked straight off the command it built,
+/// then RUN that command and prove the operator state landed THERE and
+/// nowhere near this process's own home. `machine add` is the probe on
+/// purpose. Its roster path (`config_access::fleet_file`) is one of the
+/// accessors that reaches `dirs::home_dir()` WITHOUT consulting
+/// `DARKMUX_HOME`, so a helper that kept only the `DARKMUX_HOME` half
+/// fails here rather than passing.
+///
+/// The child's cwd is a fresh tempdir so the `./.darkmux` tier of
+/// `paths::resolve` cannot quietly absorb the write and turn a real
+/// regression into a green run.
+#[test]
+fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
+    let mut cmd = darkmux_std_cmd();
+    let env: BTreeMap<std::ffi::OsString, Option<std::ffi::OsString>> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+        .collect();
+    let child_home = env
+        .get(std::ffi::OsStr::new("HOME"))
+        .cloned()
+        .flatten()
+        .map(std::path::PathBuf::from)
+        .expect("(#2184) the spawn helper must set HOME on every child; several darkmux paths \
+                 (fleet_file, cache_dir, residency_lease, dispatch_liveness, identity.md) \
+                 resolve through dirs::home_dir() and never look at DARKMUX_HOME");
+    let child_darkmux_home = env
+        .get(std::ffi::OsStr::new("DARKMUX_HOME"))
+        .cloned()
+        .flatten()
+        .map(std::path::PathBuf::from)
+        .expect("(#2184) the spawn helper must set DARKMUX_HOME on every child");
+
+    assert_ne!(
+        child_darkmux_home,
+        child_home.join(".darkmux"),
+        "(#2184) DARKMUX_HOME must NOT be nested at `<HOME>/.darkmux` — see `isolated_roots`: \
+         six config_access test-build guards read that exact equality as `this test forgot to \
+         isolate itself` and silently redirect to /tmp/darkmux-test-isolated"
+    );
+    assert_ne!(
+        Some(child_home.clone()),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        "(#2184) the helper handed the child THIS process's own home — in a real `cargo test` \
+         run that is the operator's, and every roster/mission/notebook write is theirs"
+    );
+
+    let empty_cwd = TempDir::new().unwrap();
+    let out = cmd
+        .current_dir(empty_cwd.path())
+        .args(["machine", "add", "spawn-isolation-probe", "--address", "127.0.0.1:1"])
+        .output()
+        .expect("running `darkmux machine add`");
+    assert!(
+        out.status.success(),
+        "machine add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Anti-vacuity: the negative assertions below mean nothing unless this
+    // command really does write a roster somewhere.
+    assert!(
+        child_home.join(".darkmux").join("fleet.json").is_file(),
+        "(#2184) `machine add` wrote no roster under the helper's own root ({}) — either the \
+         isolation is pointing somewhere unexpected, or this probe no longer writes state and \
+         the assertions below are vacuous",
+        child_home.display()
+    );
+    assert!(
+        !empty_cwd.path().join(".darkmux").exists(),
+        "(#2184) the child fell through to the project-local `./.darkmux` tier of \
+         paths::resolve instead of the helper's root"
+    );
+}
+
+/// (#2184) The structural half of the fix: a source-scanning conformance
+/// test, in the shape this repo already uses elsewhere.
+///
+/// Before this pass, `tests/cli.rs` named the binary at 135 sites and set
+/// `DARKMUX_HOME` at 55 of them. Nothing made the other 80 visible, and
+/// nothing stops site 136 from being written the same way tomorrow. So
+/// the invariant is asserted against this file's own source: the binary
+/// may be named ONLY inside the helper block above.
+///
+/// The block itself is the trusted region, deliberately. It is ~90 lines
+/// long, fenced by two markers, and it is where a reviewer looking for
+/// "how do these tests isolate themselves" already has to look.
+#[test]
+fn every_darkmux_spawn_in_this_file_goes_through_the_isolating_helpers() {
+    // Split with `concat!` on purpose: written as one literal, these two
+    // lines would themselves contain the markers, and the scan below would
+    // find the END marker HERE instead of at the real end of the block,
+    // silently shrinking the trusted region to nothing.
+    const BEGIN: &str = concat!("DARKMUX-SPAWN-", "HELPERS: BEGIN");
+    const END: &str = concat!("DARKMUX-SPAWN-", "HELPERS: END");
+    // The tokens that can only mean "this line resolves or spawns the
+    // darkmux binary": `assert_cmd`'s `Command::cargo_bin` /
+    // `assert_cmd::cargo::cargo_bin`, and cargo's own
+    // `CARGO_BIN_EXE_darkmux` env.
+    const SPAWN_TOKENS: [&str; 2] = ["cargo_bin", "CARGO_BIN_EXE_darkmux"];
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cli.rs");
+    let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+    let lines: Vec<&str> = src.lines().collect();
+
+    let begin = lines
+        .iter()
+        .position(|l| l.contains(BEGIN))
+        .unwrap_or_else(|| panic!("the `{BEGIN}` marker is gone from tests/cli.rs; this guard \
+             cannot tell helper code from a raw spawn without it"));
+    let end = lines
+        .iter()
+        .position(|l| l.contains(END))
+        .unwrap_or_else(|| panic!("the `{END}` marker is gone from tests/cli.rs; this guard \
+             cannot tell helper code from a raw spawn without it"));
+    assert!(
+        begin < end,
+        "the spawn-helper markers are out of order (BEGIN at line {}, END at line {})",
+        begin + 1,
+        end + 1
+    );
+
+    let offenders: Vec<String> = lines
+        .iter()
+        .enumerate()
+        // Inside the helper block is the one place the binary may be named.
+        .filter(|(i, _)| *i < begin || *i > end)
+        // A whole-line comment cannot spawn anything (this guard's own
+        // prose above says `cargo_bin` several times).
+        .filter(|(_, l)| !l.trim_start().starts_with("//"))
+        .filter(|(_, l)| SPAWN_TOKENS.iter().any(|t| l.contains(t)))
+        .map(|(i, l)| format!("  tests/cli.rs:{}: {}", i + 1, l.trim()))
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "(#2184) {} spawn site(s) in tests/cli.rs name the darkmux binary directly instead of \
+         going through `darkmux_cmd()` / `darkmux_std_cmd()`. A raw spawn inherits the \
+         developer's environment, so with no `DARKMUX_HOME` the child resolves the operator's \
+         REAL `~/.darkmux` and reads and writes their actual roster, missions and notebook \
+         (and, in a non-`test-support` build, POSTs their real hook rules). Route it through \
+         the helper; override `DARKMUX_HOME` after the call if this test needs a specific \
+         root:\n{}",
+        offenders.len(),
+        offenders.join("\n")
+    );
+}
+
+// ===== DARKMUX-SPAWN-HELPERS: END (#2184) ============================
+
 fn fixture_json() -> &'static str {
     r#"{
         "profiles": {
@@ -34,7 +334,7 @@ fn fixture_json() -> &'static str {
 
 #[test]
 fn version_outputs_semver() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("--version")
         .assert()
         .success()
@@ -43,7 +343,7 @@ fn version_outputs_semver() {
 
 #[test]
 fn help_lists_subcommands() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("--help")
         .assert()
         .success()
@@ -58,7 +358,7 @@ fn profile_list_lists_from_explicit_config() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("profiles.json");
     fs::write(&p, fixture_json()).unwrap();
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.args(["profile", "list", "--profiles-file", p.to_str().unwrap()])
         .assert()
         .success()
@@ -69,7 +369,7 @@ fn profile_list_lists_from_explicit_config() {
 
 #[test]
 fn profile_list_errors_when_config_missing() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.args(["profile", "list", "--profiles-file", "/no/such/path.json"])
         .assert()
         .failure()
@@ -83,7 +383,7 @@ fn profile_list_errors_when_config_missing() {
 // error (no compat alias — pre-2.0 clean removal).
 #[test]
 fn retired_top_level_profiles_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("profiles")
         .assert()
         .failure()
@@ -94,7 +394,7 @@ fn retired_top_level_profiles_verb_is_unknown() {
 
 #[test]
 fn retired_top_level_scan_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("scan")
         .assert()
         .failure()
@@ -105,7 +405,7 @@ fn retired_top_level_scan_verb_is_unknown() {
 
 #[test]
 fn retired_top_level_pr_review_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("pr-review")
         .assert()
         .failure()
@@ -116,7 +416,7 @@ fn retired_top_level_pr_review_verb_is_unknown() {
 
 #[test]
 fn retired_top_level_notebook_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("notebook")
         .assert()
         .failure()
@@ -131,7 +431,7 @@ fn retired_top_level_notebook_verb_is_unknown() {
 /// so clap rejects it as an unknown subcommand.
 #[test]
 fn retired_top_level_skills_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("skills")
         .assert()
         .failure()
@@ -155,7 +455,7 @@ fn retired_crew_family_is_unknown_entirely() {
         vec!["crew", "show", "review-deep"],
         vec!["crew", "index", "status"],
     ] {
-        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        let mut cmd = darkmux_cmd();
         cmd.args(&args)
             .assert()
             .failure()
@@ -178,7 +478,7 @@ fn retired_lessons_family_is_unknown_entirely() {
         vec!["lessons", "recall", "--term", "x"],
         vec!["lessons", "export"],
     ] {
-        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        let mut cmd = darkmux_cmd();
         cmd.args(&args)
             .assert()
             .failure()
@@ -198,8 +498,7 @@ fn retired_lessons_family_is_unknown_entirely() {
 #[test]
 fn memory_family_carries_both_kinds() {
     let help = |args: &[&str]| -> String {
-        let out = Command::cargo_bin("darkmux")
-            .unwrap()
+        let out = darkmux_cmd()
             .args(args)
             .arg("--help")
             .output()
@@ -253,7 +552,7 @@ fn retired_lab_flat_subverbs_are_unknown() {
         vec!["lab", "unregister", "some-name"],
         vec!["lab", "review-bench"],
     ] {
-        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        let mut cmd = darkmux_cmd();
         cmd.args(&args)
             .assert()
             .failure()
@@ -268,7 +567,7 @@ fn retired_lab_flat_subverbs_are_unknown() {
 /// an unexpected argument (no compat alias).
 #[test]
 fn retired_crew_flag_on_lab_eval_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.args(["lab", "eval", "--funnel", "--crew", "review-funnel"])
         .assert()
         .failure()
@@ -282,8 +581,7 @@ fn retired_crew_flag_on_lab_eval_is_unknown() {
 #[test]
 fn lab_kind_families_carry_their_members() {
     let help = |args: &[&str]| -> String {
-        let out = Command::cargo_bin("darkmux")
-            .unwrap()
+        let out = darkmux_cmd()
             .args(args)
             .arg("--help")
             .output()
@@ -331,7 +629,7 @@ fn lab_kind_families_carry_their_members() {
 /// alias (pre-2.0 clean removal).
 #[test]
 fn retired_mission_run_subverb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.args(["mission", "run", "some-mission"])
         .assert()
         .failure()
@@ -355,7 +653,7 @@ fn retired_phase_family_is_unknown_entirely() {
         vec!["phase", "complete", "s1"],
         vec!["phase", "abandon", "s1"],
     ] {
-        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        let mut cmd = darkmux_cmd();
         cmd.args(&args)
             .assert()
             .failure()
@@ -375,7 +673,7 @@ fn retired_mission_ship_and_close_subverbs_are_unknown() {
         vec!["mission", "ship", "some-mission"],
         vec!["mission", "close", "some-mission"],
     ] {
-        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        let mut cmd = darkmux_cmd();
         cmd.args(&args)
             .assert()
             .failure()
@@ -392,8 +690,7 @@ fn retired_mission_ship_and_close_subverbs_are_unknown() {
 /// retirement test above.
 #[test]
 fn mission_family_has_finalize_abort_addphase_but_not_ship_close() {
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .args(["mission", "--help"])
         .output()
         .expect("mission --help runs");
@@ -442,8 +739,7 @@ fn mission_family_has_finalize_abort_addphase_but_not_ship_close() {
 /// `MissionCmd::Run` would list `run` in the help and fail this.
 #[test]
 fn mission_run_verb_absent_from_help_but_launch_present() {
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .args(["mission", "--help"])
         .output()
         .expect("mission --help runs");
@@ -492,8 +788,7 @@ fn mission_run_verb_absent_from_help_but_launch_present() {
 
 #[test]
 fn mission_help_lists_config() {
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .args(["mission", "--help"])
         .output()
         .expect("mission --help runs");
@@ -506,8 +801,7 @@ fn mission_help_lists_config() {
 
 #[test]
 fn mission_config_help_lists_list_and_show() {
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .args(["mission", "config", "--help"])
         .output()
         .expect("mission config --help runs");
@@ -519,8 +813,7 @@ fn mission_config_help_lists_list_and_show() {
 #[test]
 fn mission_config_list_json_includes_the_two_embedded_builtins() {
     let tmp = TempDir::new().unwrap();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         // (merge-gate CONSIDER 5) `DARKMUX_HOME` isolates config.json +
         // profiles.json + mission-configs all at once (never the
         // operator's real `~/.darkmux`); `DARKMUX_LMS_BIN=/usr/bin/true`
@@ -545,8 +838,7 @@ fn mission_config_list_json_includes_the_two_embedded_builtins() {
 #[test]
 fn mission_config_show_review_names_every_phase_and_flags_unconstructible_kinds() {
     let tmp = TempDir::new().unwrap();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", tmp.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["mission", "config", "show", "review", "--json"])
@@ -618,8 +910,7 @@ fn mission_config_show_renders_an_ignored_input() {
     }"#;
     fs::write(config_dir.join("ignored-input-test.json"), config_json).unwrap();
 
-    let json_out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let json_out = darkmux_cmd()
         .env("DARKMUX_HOME", tmp.path())
         .args(["mission", "config", "show", "ignored-input-test", "--json"])
         .output()
@@ -636,8 +927,7 @@ fn mission_config_show_renders_an_ignored_input() {
     let reason = legacy["ignored_reason"].as_str().expect("a reason string");
     assert!(!reason.is_empty(), "{legacy}");
 
-    let text_out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let text_out = darkmux_cmd()
         .env("DARKMUX_HOME", tmp.path())
         .args(["mission", "config", "show", "ignored-input-test"])
         .output()
@@ -664,8 +954,7 @@ fn mission_config_show_renders_an_ignored_input() {
 #[test]
 fn mission_config_show_unknown_id_exits_nonzero_with_hint() {
     let tmp = TempDir::new().unwrap();
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_HOME", tmp.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["mission", "config", "show", "totally-not-a-real-config"])
@@ -688,8 +977,7 @@ fn mission_config_show_review_param_override_is_reported_ignored_with_a_warning(
         r#"{"profiles":{"deep":{"models":[{"id":"m-deep","n_ctx":8000}]}},"default_profile":"deep"}"#,
     )
     .unwrap();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", tmp.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args([
@@ -735,8 +1023,7 @@ fn mission_config_show_review_param_override_is_reported_ignored_with_a_warning(
 #[test]
 fn mission_config_show_coder_phase_param_is_neutered_with_warning() {
     let tmp = TempDir::new().unwrap();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", tmp.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args([
@@ -779,8 +1066,7 @@ fn mission_config_show_coder_phase_param_is_neutered_with_warning() {
 #[test]
 fn mission_config_show_explicit_bad_profiles_file_errors_loudly() {
     let tmp = TempDir::new().unwrap();
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_HOME", tmp.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args([
@@ -806,7 +1092,7 @@ fn mission_config_show_explicit_bad_profiles_file_errors_loudly() {
 // `fleet` folded into the `machine` family.
 #[test]
 fn retired_top_level_swap_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("swap").assert().failure().stderr(
         predicate::str::contains("unrecognized subcommand")
             .or(predicate::str::contains("unexpected argument")),
@@ -815,7 +1101,7 @@ fn retired_top_level_swap_verb_is_unknown() {
 
 #[test]
 fn retired_top_level_status_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("status").assert().failure().stderr(
         predicate::str::contains("unrecognized subcommand")
             .or(predicate::str::contains("unexpected argument")),
@@ -824,7 +1110,7 @@ fn retired_top_level_status_verb_is_unknown() {
 
 #[test]
 fn retired_top_level_model_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("model").assert().failure().stderr(
         predicate::str::contains("unrecognized subcommand")
             .or(predicate::str::contains("unexpected argument")),
@@ -833,7 +1119,7 @@ fn retired_top_level_model_verb_is_unknown() {
 
 #[test]
 fn retired_top_level_fleet_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("fleet").assert().failure().stderr(
         predicate::str::contains("unrecognized subcommand")
             .or(predicate::str::contains("unexpected argument")),
@@ -842,7 +1128,7 @@ fn retired_top_level_fleet_verb_is_unknown() {
 
 #[test]
 fn retired_top_level_recommendations_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("recommendations").assert().failure().stderr(
         predicate::str::contains("unrecognized subcommand")
             .or(predicate::str::contains("unexpected argument")),
@@ -857,7 +1143,7 @@ fn machine_status_runs_with_explicit_profiles() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("profiles.json");
     fs::write(&p, fixture_json()).unwrap();
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
     cmd.args(["machine", "status", "--profiles-file", p.to_str().unwrap()])
         .assert()
@@ -868,7 +1154,7 @@ fn machine_status_runs_with_explicit_profiles() {
 
 #[test]
 fn bare_machine_routes_to_status() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
     cmd.arg("machine")
         .assert()
@@ -884,8 +1170,7 @@ fn machine_status_json_carries_matching_profiles_and_registry_keys() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("profiles.json");
     fs::write(&p, fixture_json()).unwrap();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args([
             "machine",
@@ -909,7 +1194,7 @@ fn machine_status_json_carries_matching_profiles_and_registry_keys() {
 /// degrades to residents-without-match.
 #[test]
 fn machine_status_explicit_bad_profiles_file_errors_loudly() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
     cmd.args(["machine", "status", "--profiles-file", "/no/such/path.json"])
         .assert()
@@ -946,8 +1231,7 @@ fn canned_http_peer(status_line: &'static str, body: &'static str, count: usize)
 /// via the real `machine add` verb. Returns the roster file path.
 fn roster_with_peer(tmp: &TempDir, id: &str, addr: &str) -> std::path::PathBuf {
     let fleet_file = tmp.path().join("fleet.json");
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_FLEET_FILE", &fleet_file)
         .args(["machine", "add", id, "--address", addr])
         .assert()
@@ -963,8 +1247,7 @@ fn machine_status_remote_degraded_peer_is_not_healthy_empty() {
     let addr = canned_http_peer("200 OK", r#"{"models":[],"lms_unreachable":true,"generated_at_ms":1}"#, 1);
     let tmp = TempDir::new().unwrap();
     let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_FLEET_FILE", &fleet_file)
         .args(["machine", "status", "peer1"])
         .output()
@@ -987,8 +1270,7 @@ fn machine_status_remote_happy_path_json_carries_machine_id() {
     let addr = canned_http_peer("200 OK", body, 1);
     let tmp = TempDir::new().unwrap();
     let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_FLEET_FILE", &fleet_file)
         .args(["machine", "status", "peer1", "--json"])
         .output()
@@ -1006,8 +1288,7 @@ fn machine_status_remote_shape_mismatch_prints_raw_json() {
     let addr = canned_http_peer("200 OK", r#"{"future_shape":{"models_v2":[]}}"#, 1);
     let tmp = TempDir::new().unwrap();
     let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_FLEET_FILE", &fleet_file)
         .args(["machine", "status", "peer1"])
         .output()
@@ -1020,13 +1301,13 @@ fn machine_status_remote_shape_mismatch_prints_raw_json() {
 
 #[test]
 fn unknown_command_exits_nonzero() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("nonexistent-command").assert().failure();
 }
 
 #[test]
 fn lab_with_no_subcommand_reports() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.args(["lab"])
         .assert()
         .stderr(predicate::str::contains("not yet wired").or(predicate::str::contains("lab")));
@@ -1076,14 +1357,13 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     // the test writes to the tempdir, not the user's home.
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd_in_project(tmp.path());
     // Force an empty templates dir so on-disk lookup doesn't accidentally
     // resolve before the embedded fallback. This proves the embedded path.
     cmd.env(
         "DARKMUX_TEMPLATES_DIR",
         tmp.path().join("nope").to_str().unwrap(),
     );
-    cmd.current_dir(tmp.path());
     cmd.args([
         "lab",
         "run",
@@ -1171,7 +1451,7 @@ fn notebook_list_shows_entries() {
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     // Set notebook dir via env var.
     cmd.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
         .arg("lab")
@@ -1205,7 +1485,7 @@ fn notebook_list_machine_filter() {
     .unwrap();
 
     // Filter to m5-home.
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
         .arg("lab")
         .arg("notebook")
@@ -1222,7 +1502,7 @@ fn notebook_list_machine_filter() {
         .stdout(predicate::str::contains("m3-laptop").not());
 
     // Filter to nonexistent machine → no output.
-    let mut cmd2 = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd2 = darkmux_cmd();
     cmd2.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
         .arg("lab")
         .arg("notebook")
@@ -1239,7 +1519,7 @@ fn notebook_list_machine_filter() {
 /// notebook family folded into `lab`.)
 #[test]
 fn notebook_list_no_dir() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("lab")
         .arg("notebook")
         .arg("list")
@@ -1254,7 +1534,7 @@ fn notebook_list_no_dir() {
 /// unknown-subcommand error (no compat alias — pre-2.0 clean removal).
 #[test]
 fn retired_top_level_external_verb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    let mut cmd = darkmux_cmd();
     cmd.arg("external")
         .arg("pull")
         .arg("--stdin")
@@ -1307,8 +1587,7 @@ fn mission_migrate_dry_run_shows_moves_without_moving() {
     write_flat_mission_file(tmp.path(), "alpha");
     write_flat_phase_file(tmp.path(), "s1", "alpha");
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_CREW_DIR", tmp.path())
         .args(["mission", "migrate"])
         .assert()
@@ -1335,8 +1614,7 @@ fn mission_migrate_apply_moves_files() {
     write_flat_mission_file(tmp.path(), "alpha");
     write_flat_phase_file(tmp.path(), "s1", "alpha");
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_CREW_DIR", tmp.path())
         .args(["mission", "migrate", "--apply"])
         .assert()
@@ -1371,16 +1649,14 @@ fn mission_migrate_apply_is_idempotent() {
     write_flat_phase_file(tmp.path(), "s1", "alpha");
 
     // First apply.
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_CREW_DIR", tmp.path())
         .args(["mission", "migrate", "--apply"])
         .assert()
         .success();
 
     // Second apply: must succeed and report nothing to do.
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_CREW_DIR", tmp.path())
         .args(["mission", "migrate", "--apply"])
         .assert()
@@ -1396,8 +1672,7 @@ fn mission_migrate_apply_is_idempotent() {
 #[test]
 fn notebook_draft_rejects_old_agent_flag() {
     let tmp = TempDir::new().unwrap();
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.current_dir(tmp.path());
+    let mut cmd = darkmux_cmd_in_project(tmp.path());
     let output = cmd
         .args([
             "lab",
@@ -1440,8 +1715,7 @@ fn notebook_draft_accepts_role_flag_under_dry_run() {
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.current_dir(tmp.path());
+    let mut cmd = darkmux_cmd_in_project(tmp.path());
     cmd.env("DARKMUX_NOTEBOOK_DIR", darkmux.join("notebook").to_str().unwrap());
     cmd.args([
         "lab",
@@ -1480,8 +1754,7 @@ fn lab_register_creates_registry_entry() {
     // Force project-scope so registry lands in tmp.
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.current_dir(tmp.path());
+    let mut cmd = darkmux_cmd_in_project(tmp.path());
     cmd.args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success()
@@ -1506,17 +1779,13 @@ fn lab_fixtures_shows_registered_entries() {
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
     // Register first.
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success();
 
     // Now list.
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "fixture", "list"])
         .assert()
         .success()
@@ -1534,16 +1803,12 @@ fn lab_unregister_removes_entry_but_not_dir() {
     fs::write(fixture_dir.join("a.txt"), "x").unwrap();
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success();
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "fixture", "unregister", "demo"])
         .assert()
         .success()
@@ -1563,9 +1828,7 @@ fn lab_doctor_warns_when_no_registry() {
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    let output = darkmux_cmd_in_project(tmp.path())
         .args(["lab", "doctor"])
         .output()
         .unwrap();
@@ -1585,16 +1848,12 @@ fn lab_doctor_passes_for_clean_fixture() {
     fs::write(fixture_dir.join("source.txt"), "baseline").unwrap();
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success();
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "doctor"])
         .assert()
         .success()
@@ -1613,9 +1872,7 @@ fn lab_doctor_warns_on_hash_drift() {
     fs::write(fixture_dir.join("source.txt"), "baseline").unwrap();
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success();
@@ -1623,9 +1880,7 @@ fn lab_doctor_warns_on_hash_drift() {
     // Mutate the fixture → drift.
     fs::write(fixture_dir.join("source.txt"), "MUTATED").unwrap();
 
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    let output = darkmux_cmd_in_project(tmp.path())
         .args(["lab", "doctor"])
         .output()
         .unwrap();
@@ -1654,9 +1909,7 @@ fn lab_register_builtin_demo_tiny_py_succeeds() {
         repo_root
     );
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "fixture", "register", &fixture_path])
         .assert()
         .success()
@@ -1715,16 +1968,12 @@ fn lab_doctor_passes_for_builtin_demo_tiny_py() {
     let fixture_dir = tmp.path().join("demo-tiny-py");
     copy_pruned(std::path::Path::new(&fixture_src), &fixture_dir);
     let fixture_path = fixture_dir.to_string_lossy().to_string();
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "fixture", "register", &fixture_path])
         .assert()
         .success();
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .current_dir(tmp.path())
+    darkmux_cmd_in_project(tmp.path())
         .args(["lab", "doctor"])
         .assert()
         .success()
@@ -1741,8 +1990,7 @@ fn lab_doctor_passes_for_builtin_demo_tiny_py() {
 fn dispatch_message_source_contract() {
     // Mutual exclusion: positional MESSAGE AND --message-from-file → clap
     // rejects. (Proves the positional exists and conflicts with the file flag.)
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .args([
             "dispatch",
             "code-reviewer",
@@ -1757,8 +2005,7 @@ fn dispatch_message_source_contract() {
     // Missing --message-from-file → resolved early, fails loud BEFORE any
     // dispatch setup (the message is resolved at the top of the handler, ahead
     // of out-dir creation / container spawn).
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .args([
             "dispatch",
             "code-reviewer",
@@ -1781,8 +2028,7 @@ fn dispatch_message_source_contract() {
 #[test]
 fn dispatch_finding_refuses_a_key_with_no_stored_record() {
     let store = TempDir::new().unwrap(); // empty store
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_FINDINGS_DIR", store.path())
         .args(["dispatch", "health-research", "--finding", "sess-x/9", "smoke"])
         .assert()
@@ -1797,8 +2043,7 @@ fn dispatch_finding_refuses_a_key_with_no_stored_record() {
         );
 
     // A key of the wrong SHAPE is refused with the form it should have.
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_FINDINGS_DIR", store.path())
         .args(["dispatch", "health-research", "--finding", "not-a-key", "smoke"])
         .assert()
@@ -1813,8 +2058,7 @@ fn dispatch_finding_refuses_a_key_with_no_stored_record() {
 #[test]
 fn dispatch_mod_refuses_a_key_with_no_stored_record() {
     let store = TempDir::new().unwrap(); // empty store
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_MODS_DIR", store.path())
         .args(["dispatch", "health-research", "--mod", "mod-1-nope", "smoke"])
         .assert()
@@ -1827,8 +2071,7 @@ fn dispatch_mod_refuses_a_key_with_no_stored_record() {
         );
 
     // A key that could escape the store is refused as a key, never read.
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_MODS_DIR", store.path())
         .args(["dispatch", "health-research", "--mod", "../etc", "smoke"])
         .assert()
@@ -1863,8 +2106,7 @@ fn dispatch_finding_loads_a_stored_record_and_proceeds() {
         .unwrap();
     }
     let ack_dir = TempDir::new().unwrap();
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_FINDINGS_DIR", store.path())
         .env("DARKMUX_ACK_DIR", ack_dir.path())
         .args([
@@ -1948,8 +2190,7 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
     // `dialectic-judge` is TOOL-LESS, so this takes the light single-shot
     // hosted path (a host `curl` to the stub) rather than a
     // `darkmux-runtime` container — no Docker, no image, no model.
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_PROFILES", &profiles_path)
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_FINDINGS_DIR", findings.path())
@@ -2053,8 +2294,7 @@ fn dispatch_refuses_a_record_ref_routed_to_another_machine() {
     )
     .unwrap();
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_FINDINGS_DIR", store.path())
         .env("DARKMUX_MACHINE_ID", "this-one")
         .args([
@@ -2076,8 +2316,7 @@ fn dispatch_refuses_a_record_ref_routed_to_another_machine() {
 #[test]
 fn dispatch_positional_message_reaches_ack_gate() {
     let ack_dir = TempDir::new().unwrap(); // empty — no prior ack on file
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_ACK_DIR", ack_dir.path())
         .args(["dispatch", "health-research", "smoke"])
         .assert()
@@ -2101,8 +2340,7 @@ fn dispatch_positional_message_reaches_ack_gate() {
 #[test]
 fn dispatch_stdin_message_reaches_ack_gate() {
     let ack_dir = TempDir::new().unwrap();
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_ACK_DIR", ack_dir.path())
         .args(["dispatch", "health-research"])
         .write_stdin("smoke from stdin")
@@ -2125,8 +2363,7 @@ fn dispatch_stdin_message_reaches_ack_gate() {
 #[test]
 fn dispatch_empty_stdin_bails_loudly() {
     let ack_dir = TempDir::new().unwrap();
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_ACK_DIR", ack_dir.path())
         .args(["dispatch", "health-research"])
         .write_stdin("") // empty pipe → loud bail, not a blank dispatch
@@ -2149,8 +2386,7 @@ fn dispatch_empty_stdin_bails_loudly() {
 #[test]
 fn dispatch_whitespace_only_stdin_bails_loudly() {
     let ack_dir = TempDir::new().unwrap();
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_ACK_DIR", ack_dir.path())
         .args(["dispatch", "health-research"])
         .write_stdin("\n")
@@ -2170,8 +2406,7 @@ fn dispatch_empty_message_file_bails_loudly() {
     let tmp = TempDir::new().unwrap();
     let brief = tmp.path().join("blank-brief.md");
     fs::write(&brief, "  \n\n").unwrap();
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .args([
             "dispatch",
             "code-reviewer",
@@ -2196,8 +2431,7 @@ fn dispatch_empty_message_file_bails_loudly() {
 #[test]
 fn dispatch_licensed_adjacent_role_bails_at_ack_gate_before_docker() {
     let ack_dir = TempDir::new().unwrap(); // empty — no prior ack on file
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_ACK_DIR", ack_dir.path())
         .args(["dispatch", "health-research", "smoke"])
         // assert_cmd pipes stdin (not a TTY), so the gate's non-interactive
@@ -2461,7 +2695,7 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     }"#;
     fs::write(config_dir.join("sigterm-generic-test.json"), config_json).unwrap();
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_darkmux"))
+    let mut child = darkmux_std_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_PROFILES", &profiles_path)
@@ -2566,8 +2800,7 @@ fn mission_launch_outcome_from_unknown_task_refused_before_minting() {
     }"#;
     fs::write(config_dir.join("outcome-from-typo-test.json"), config_json).unwrap();
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .args(["mission", "launch", "outcome-from-typo-test"])
         .assert()
@@ -2656,8 +2889,7 @@ fn mission_launch_flows_never_leak_into_process_home() {
 
         write_flows_root_test_config(darkmux_home.path());
 
-        Command::cargo_bin("darkmux")
-            .unwrap()
+        darkmux_cmd()
             .env("DARKMUX_HOME", darkmux_home.path())
             .env("HOME", fake_home.path())
             .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -2682,8 +2914,7 @@ fn mission_launch_flows_never_leak_into_process_home() {
 
         write_flows_root_test_config(darkmux_home.path());
 
-        Command::cargo_bin("darkmux")
-            .unwrap()
+        darkmux_cmd()
             .env("DARKMUX_HOME", darkmux_home.path())
             .env("HOME", fake_home.path())
             .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -2730,8 +2961,7 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
     }"#;
     fs::write(config_dir.join("run-on-typo-test.json"), config_json).unwrap();
 
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .args(["mission", "launch", "run-on-typo-test"])
         .assert()
@@ -2816,8 +3046,7 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
     for (day, text) in [("2026-01-01", "alpha"), ("2026-01-02", "bravo")] {
         let staging = tmp.path().join(format!("stage-{day}"));
         std::fs::create_dir_all(&staging).unwrap();
-        Command::cargo_bin("darkmux")
-            .unwrap()
+        darkmux_cmd()
             .env("DARKMUX_AUDIT_DIR", &staging)
             .args(["flow", "note", "--text", text, "--source", "orchestrator"])
             .assert()
@@ -2846,8 +3075,7 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
         std::fs::write(audit.join(format!("{day}.jsonl")), lines.join("\n") + "\n").unwrap();
     }
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_AUDIT_DIR", &audit)
         .args(["flow", "integrity-check"])
         .output()
@@ -2873,8 +3101,7 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
     // `strict` flag rather than on the computed code, so it printed the
     // wrong status beside the tamper signal while the process exited 2.
     // Non-strict coverage alone does not reach it.
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_AUDIT_DIR", &audit)
         .args(["flow", "integrity-check", "--strict"])
         .output()
@@ -2904,8 +3131,7 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
 #[test]
 fn flow_status_json_reports_hooks_disabled_by_default() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", tmp.path())
         .args(["flow", "status", "--json"])
         .output()
@@ -2921,8 +3147,7 @@ fn flow_status_json_reports_hooks_disabled_by_default() {
 #[test]
 fn flow_status_human_reports_hooks_disabled_by_default() {
     let tmp = tempfile::tempdir().unwrap();
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_HOME", tmp.path())
         .args(["flow", "status"])
         .assert()
@@ -3019,8 +3244,7 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     )
     .unwrap();
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .args(["run", "list", "--json", "--all"])
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
@@ -3052,13 +3276,20 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     // developer's REAL `~/.darkmux` missions and this comparison would be
     // an accident.
     //
-    // The restore is not hygiene theater. `assert_cmd::Command` inherits
-    // the parent env, only 15 of this file's ~100 `cargo_bin` call sites
-    // set `DARKMUX_HOME` themselves, and `#[serial]` orders this test
-    // against the file's other `#[serial]` tests only — the rest run
-    // concurrently in this same process. A leaked var pointing at a
-    // `TempDir` that has since been deleted turns green tests red
-    // depending on declaration order.
+    // The restore is not hygiene theater. This process's env is shared by
+    // every test in this binary, and `#[serial]` orders this test against
+    // the file's other `#[serial]` tests only — the rest run concurrently
+    // in this same process. A leaked var pointing at a `TempDir` that has
+    // since been deleted turns green tests red depending on declaration
+    // order.
+    //
+    // (#2184) The CHILD side of that same problem is now handled one layer
+    // down instead of per-site: every spawn in this file goes through
+    // `darkmux_cmd()`, which stamps a fresh `DARKMUX_HOME` on the child.
+    // Before that, this file named the binary at 135 sites and set
+    // `DARKMUX_HOME` at 55 of them, so the rest inherited whatever the
+    // developer's shell had (usually nothing, which resolves their real
+    // `~/.darkmux`).
     let _crew_guard = EnvVarGuard::set("DARKMUX_CREW_DIR", crew.path());
     let direct = darkmux_serve::build_runs(flows.path(), Some(lab.path()), &[]);
     let mut direct_ids: Vec<String> = direct
@@ -3223,8 +3454,7 @@ fn crawl_dry_run(home: &TempDir, spec_path: &std::path::Path, extra: &[&str]) ->
         format!("workspace={}", spec_path.display()),
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .args(&args)
         .env("DARKMUX_HOME", home.path())
         .output()
@@ -3358,8 +3588,7 @@ fn an_ignored_input_flag_warns_on_any_config_never_by_id() {
     )
     .unwrap();
 
-    let with_ignored = Command::cargo_bin("darkmux")
-        .unwrap()
+    let with_ignored = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .args([
             "mission",
@@ -3378,8 +3607,7 @@ fn an_ignored_input_flag_warns_on_any_config_never_by_id() {
         "an ignored input supplied must warn, naming the input and its reason: {stderr}"
     );
 
-    let with_live = Command::cargo_bin("darkmux")
-        .unwrap()
+    let with_live = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .args([
             "mission",
@@ -3468,8 +3696,7 @@ fn write_synthetic_grow_typo_config(home: &TempDir) {
 fn a_static_placeholder_typo_is_refused_on_dry_run() {
     let home = TempDir::new().unwrap();
     write_synthetic_static_typo_config(&home);
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .args([
             "mission",
@@ -3495,8 +3722,7 @@ fn a_static_placeholder_typo_is_refused_on_dry_run() {
 fn a_static_placeholder_typo_is_refused_before_any_mint_on_a_real_launch() {
     let home = TempDir::new().unwrap();
     write_synthetic_static_typo_config(&home);
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["mission", "launch", "synthetic-static-typo", "--param", "workspace=/tmp/ws.json"])
@@ -3513,8 +3739,7 @@ fn a_static_placeholder_typo_is_refused_before_any_mint_on_a_real_launch() {
 fn a_grow_config_placeholder_typo_is_refused_on_dry_run() {
     let home = TempDir::new().unwrap();
     write_synthetic_grow_typo_config(&home);
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .args([
             "mission",
@@ -3540,8 +3765,7 @@ fn a_grow_config_placeholder_typo_is_refused_on_dry_run() {
 fn a_grow_config_placeholder_typo_is_refused_before_any_mint_on_a_real_launch() {
     let home = TempDir::new().unwrap();
     write_synthetic_grow_typo_config(&home);
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["mission", "launch", "synthetic-grow-typo", "--param", "workspace=/tmp/ws.json"])
@@ -3592,8 +3816,7 @@ fn write_synthetic_embedded_optional_config(home: &TempDir) {
 fn an_embedded_placeholder_naming_an_unset_optional_input_is_refused_on_dry_run() {
     let home = TempDir::new().unwrap();
     write_synthetic_embedded_optional_config(&home);
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .args([
             "mission",
@@ -3619,8 +3842,7 @@ fn an_embedded_placeholder_naming_an_unset_optional_input_is_refused_on_dry_run(
 fn an_embedded_placeholder_naming_an_unset_optional_input_is_refused_before_any_mint_on_a_real_launch() {
     let home = TempDir::new().unwrap();
     write_synthetic_embedded_optional_config(&home);
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["mission", "launch", "synthetic-embedded-optional", "--param", "workspace=/tmp/ws.json"])
@@ -3687,8 +3909,7 @@ fn review_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
     let intent_path = workdir.path().join("intent.md");
     fs::write(&intent_path, "Fix the swallowed catch in src/x.ts.").unwrap();
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args([
@@ -3818,8 +4039,7 @@ fn review_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     fs::write(&diff_path, &diff_text).unwrap();
     let emit_path = workdir.path().join("review-payload.json");
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -3978,8 +4198,7 @@ fn review_real_launch_exits_non_zero_when_the_deliver_step_errors() {
     // Under a directory that was never created — `fs::write` fails.
     let emit_path = workdir.path().join("no-such-dir").join("review-payload.json");
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -4066,8 +4285,7 @@ fn review_real_launch_survives_a_plan_phase_error_and_still_delivers() {
     .unwrap();
     let emit_path = workdir.path().join("review-payload.json");
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -4207,8 +4425,7 @@ fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {
     )
     .unwrap();
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -4277,8 +4494,7 @@ fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {
 #[test]
 fn mission_config_show_names_the_create_mod_task_as_disabled() {
     let home = TempDir::new().unwrap();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["mission", "config", "show", "crawl", "--json"])
@@ -4395,8 +4611,7 @@ fn a_template_grows_one_dispatch_per_finding_carrying_its_key_in_brief_refs() {
     )
     .unwrap();
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_FINDINGS_DIR", findings.path())
@@ -4521,8 +4736,7 @@ fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
     write_finding_day_file(&flows);
 
     let dm = |args: &[&str]| {
-        Command::cargo_bin("darkmux")
-            .unwrap()
+        darkmux_cmd()
             .env("DARKMUX_HOME", home.path())
             .env("DARKMUX_FLOWS_DIR", &flows)
             .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -4729,8 +4943,7 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
     write_finding_day_file(&flows);
 
     let dm = |args: &[&str]| {
-        Command::cargo_bin("darkmux")
-            .unwrap()
+        darkmux_cmd()
             .env("DARKMUX_HOME", home.path())
             .env("DARKMUX_FLOWS_DIR", &flows)
             .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -4740,8 +4953,7 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
     };
     // Same invocation, with a kit piped on stdin.
     let dm_stdin = |args: &[&str], stdin: &str| {
-        Command::cargo_bin("darkmux")
-            .unwrap()
+        darkmux_cmd()
             .env("DARKMUX_HOME", home.path())
             .env("DARKMUX_FLOWS_DIR", &flows)
             .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5065,8 +5277,7 @@ fn mod_show_prints_the_warnings_of_a_partial_mod() {
             "warnings":["dropped attachment \"mod.diff\": no path/bytes pair"]}"#,
     )
     .unwrap();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["mod", "show", "mod-1788430000-abc123"])
@@ -5111,8 +5322,7 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
     }"#;
     fs::write(config_dir.join("enabled-test.json"), config_json).unwrap();
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5180,8 +5390,7 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
     assert_eq!(start["payload"]["graph"]["steps_in_config"], 4);
 
     // `mission status` counts it, human and JSON.
-    let status = Command::cargo_bin("darkmux")
-        .unwrap()
+    let status = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5191,8 +5400,7 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&status.stdout)).unwrap();
     assert_eq!(v["missions"][0]["graph"]["steps_in_config"], 4, "{v}");
     assert_eq!(v["missions"][0]["graph"]["steps_minted"], 1);
-    let human = Command::cargo_bin("darkmux")
-        .unwrap()
+    let human = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5267,8 +5475,7 @@ fn grow_fixture(units_json: &str, config_extra: &str) -> (TempDir, TempDir, std:
 }
 
 fn launch_grow(home: &TempDir, flows: &TempDir) -> std::process::Output {
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5411,8 +5618,7 @@ fn mission_launch_grows_one_task_per_plan_unit_with_provenance() {
     );
 
     // `mission status` names the growth.
-    let status = Command::cargo_bin("darkmux")
-        .unwrap()
+    let status = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .args(["mission", "status"])
@@ -5587,8 +5793,7 @@ fn fail_probe_fixture_with(deliver_command: &str, deliver_extra: &str) -> (TempD
 }
 
 fn launch_fail_probe(home: &TempDir, flows: &TempDir) -> std::process::Output {
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5687,8 +5892,7 @@ fn forward_edge_fixture() -> (TempDir, TempDir) {
 #[test]
 fn an_abandoned_declared_step_makes_the_run_degraded_never_clean() {
     let (home, flows) = forward_edge_fixture();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5871,8 +6075,7 @@ fn fail_probe_terminal_mission_has_no_non_terminal_step_and_envelope_matches_dis
     // stopped at the phase; now that the step-level rules exist (#2310
     // fix-loop C4), a clean board is evidence rather than a blind spot —
     // this assertion is red the moment either half regresses.
-    let board = Command::cargo_bin("darkmux")
-        .unwrap()
+    let board = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5907,8 +6110,7 @@ fn fail_probe_terminal_mission_has_no_non_terminal_step_and_envelope_matches_dis
 #[test]
 fn finalize_reconciles_a_planned_step_under_an_already_terminal_phase() {
     let (home, flows) = forward_dep_fixture();
-    let launched = Command::cargo_bin("darkmux")
-        .unwrap()
+    let launched = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5938,8 +6140,7 @@ fn finalize_reconciles_a_planned_step_under_an_already_terminal_phase() {
     fs::write(p1_dir.join("s-orphan.json"), serde_json::to_string(&seeded).unwrap()).unwrap();
 
     let board = |label: &str| -> serde_json::Value {
-        let out = Command::cargo_bin("darkmux")
-            .unwrap()
+        let out = darkmux_cmd()
             .env("DARKMUX_HOME", home.path())
             .env("DARKMUX_FLOWS_DIR", flows.path())
             .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -5968,8 +6169,7 @@ fn finalize_reconciles_a_planned_step_under_an_already_terminal_phase() {
     assert!(suggest.contains("mission finalize"), "got {suggest:?}");
 
     // Run the command the board itself suggested.
-    let fixed = Command::cargo_bin("darkmux")
-        .unwrap()
+    let fixed = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -6028,8 +6228,7 @@ fn finalize_reconciles_a_planned_step_under_an_already_terminal_phase() {
 #[ignore = "needs fix-loop packet D: procedural.shell bounded deadline + child registration (S4-4)"]
 fn hung_shell_step_is_bounded_and_the_board_names_what_the_kill_left() {
     let (home, flows) = fail_probe_fixture("sleep 600");
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -6053,8 +6252,7 @@ fn hung_shell_step_is_bounded_and_the_board_names_what_the_kill_left() {
         .iter()
         .filter(|(_, (status, _))| status == "planned" || status == "running")
         .collect();
-    let board = Command::cargo_bin("darkmux")
-        .unwrap()
+    let board = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -6193,8 +6391,7 @@ fn forward_dep_fixture() -> (TempDir, TempDir) {
 #[test]
 fn forward_dep_task_runs_in_the_later_phases_pass() {
     let (home, flows) = forward_dep_fixture();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -6538,8 +6735,7 @@ fn endpoint_seat_fixture() -> EndpointSeatFixture {
 }
 
 fn endpoint_seat_dry_run(fx: &EndpointSeatFixture, seat: &str) -> std::process::Output {
-    Command::cargo_bin("darkmux")
-        .unwrap()
+    darkmux_cmd()
         .args([
             "mission",
             "launch",
@@ -6680,8 +6876,7 @@ fn create_mod_wait_command(finding_key: &str, bound: &str) -> String {
 fn record_mod_for(home: &std::path::Path, workdir: &std::path::Path, finding_key: &str) {
     let kit = workdir.join(format!("kit-{}.diff", finding_key.replace('/', "-")));
     fs::write(&kit, "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n").unwrap();
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home)
         .args([
             "mod",
@@ -6710,11 +6905,20 @@ fn record_mod_for(home: &std::path::Path, workdir: &std::path::Path, finding_key
 
 /// Run the shipped wait command with a real store behind it.
 fn run_wait_command(home: &std::path::Path, command: &str) -> std::process::Output {
+    // (#2184) The child here is `sh`, not darkmux — but the shell script it
+    // runs invokes `$DARKMUX_BIN`, so the isolation still has to be applied,
+    // and the structural guard cannot see it (nothing on this line names the
+    // binary except through the helper). `DARKMUX_HOME` is the caller's on
+    // purpose: these tests seed a mod store there and the command must read
+    // the same one. `HOME` is a throwaway so the accessors that resolve
+    // through `dirs::home_dir()` instead (see `darkmux_std_cmd`'s doc) can't
+    // reach the operator either.
     std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
+        .env("HOME", isolated_roots().0)
         .env("DARKMUX_HOME", home)
-        .env("DARKMUX_BIN", assert_cmd::cargo::cargo_bin("darkmux"))
+        .env("DARKMUX_BIN", darkmux_bin_path())
         .output()
         .expect("the wait command runs")
 }
@@ -6925,8 +7129,7 @@ fn review_dry_run_resolves_mod_wait_seconds_to_the_documents_default() {
     let diff_path = workdir.path().join("d.diff");
     fs::write(&diff_path, "").unwrap();
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
@@ -6971,8 +7174,7 @@ fn a_supplied_mod_wait_seconds_beats_the_documents_default() {
     let diff_path = workdir.path().join("d.diff");
     fs::write(&diff_path, "").unwrap();
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
+    let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
