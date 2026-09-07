@@ -1334,7 +1334,6 @@ pub fn fleet_file() -> std::path::PathBuf {
 /// escape this issue is about while dropping the cwd sensitivity.
 /// `workdir::worktrees_base_dir` and `dispatch::identity_path` took exactly
 /// that `ForceUser` route in this same change, for that same reason.
-#[cfg(not(any(test, feature = "test-support")))]
 fn fleet_file_default() -> std::path::PathBuf {
     // `ForceUser`, NOT `Auto` (#2450 review decision). Closing the
     // `DARKMUX_HOME` escape must not smuggle in a NEW cwd sensitivity: before
@@ -1352,20 +1351,28 @@ fn fleet_file_default() -> std::path::PathBuf {
     crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("fleet.json")
 }
 
-/// Test builds must never default onto the operator's real
-/// `~/.darkmux/fleet.json` — same isolation discipline as `lab_dir_default`'s
-/// own test-build variant (#994). A test that DID isolate itself (a
-/// `DARKMUX_HOME` tempdir, or a project-local `./.darkmux`) is honored
-/// verbatim, because a test that isolated itself means it.
-#[cfg(any(test, feature = "test-support"))]
-fn fleet_file_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
-    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
-    if real_user_root.as_ref() == Some(&resolved.root) {
-        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/fleet.json");
-    }
-    resolved.root.join("fleet.json")
-}
+// NO test-build guard here, deliberately — see #2450's CI failure.
+//
+// The sibling accessors guard by comparing the resolved root against
+// `dirs::home_dir()/.darkmux` and redirecting to `/tmp/darkmux-test-isolated`
+// when they match, on the premise that "resolved to the home root" means "this
+// test forgot to isolate itself". That premise is FALSE for any test that
+// isolates by moving `HOME` rather than by setting `DARKMUX_HOME`: the guard's
+// own yardstick moves with it, the two roots match, and a correctly-isolated
+// test is hijacked into the shared `/tmp` root.
+//
+// Not hypothetical. `tests/fleet_concurrent_add_no_lost_writes.rs` isolates
+// exactly that way (`.env("HOME", …).env_remove("DARKMUX_HOME")`) and asserts
+// the roster lands under its own temp home; the guard turned it red, in CI and
+// locally, with the roster written to `/tmp/darkmux-test-isolated/fleet.json`.
+// `worktrees_base_dir` is left unguarded for the same reason and about the
+// same kind of test.
+//
+// Dropping it does not weaken #2450: `DARKMUX_HOME` is honored by
+// `paths::resolve`'s own early return, which is the escape this issue was
+// about. The residual exposure — an in-process test isolating NEITHER var —
+// is exactly what `main` has today, and #2184's spawn helper narrows it
+// further.
 
 // The next two are **override-only** (`env > config.dirs.X`, else `None`):
 // each caller keeps its own no-HOME default/error handling, so the accessor
