@@ -12,6 +12,27 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.7.1] - 2026-09-07
+
+### Fixed
+
+- **The desktop events header stops fighting the count pill** ([#2447](https://github.com/kstrat2001/darkmux/issues/2447)) —
+  on every desktop screen by default, the "50 of 1100 events · 6033 hidden"
+  chip overflowed the events header's right edge and squeezed "events last
+  24h" into three stacked lines. #2108 had moved the chip inside the
+  follow/filters button group so the phone could have a one-row toolbar;
+  that group is `flex: none` and the chip is `white-space: nowrap` at
+  ~250px inside a ~380px column, so it could neither shrink nor wrap. The
+  chip is now placed by viewport — inside the group on a phone, a wrappable
+  child of the header on desktop, where it shares line 1 with the buttons
+  when it fits and drops to its own line when it doesn't. The phone layout
+  is unchanged, measured identical at 390 and 320. Both failures are pinned
+  in a real browser now (`tests/e2e/event-log-desktop-header.spec.js`), the
+  desktop twin of the phone's existing chip-wrap spec, since a CSS-only
+  layout regression is invisible to every unit test.
+
+[3.7.1]: https://github.com/kstrat2001/darkmux/releases/tag/v3.7.1
+
 ## [3.7.0] - 2026-09-06
 
 A review that lands as conversations, and a run that says what it cost.
