@@ -2769,6 +2769,229 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     assert!(saw_a_phase, "the mint must have produced at least one phase to check");
 }
 
+/// (#2262) `kill <pid>` (SIGTERM) on a plain `darkmux dispatch <role>`
+/// blocked mid-dispatch (a real `curl` call to an endpoint that never
+/// answers) must: exit within 5s, leave a terminal `dispatch.error`
+/// bookend behind (surfaced here via the crew-of-one mission this dispatch
+/// mints — `dispatch_as_crew_of_one.rs`'s `finalize`/`reconcile_on_error`
+/// reach the SAME `finalize_mission` a `mission launch` run does), and
+/// leave no `curl` process still holding the stub connection open. Before
+/// #2262's fix, `dispatch` installed no signal handling at all — the
+/// same gap `mission launch` had before #2131, just never closed here —
+/// so a SIGTERM killed the process outright (default disposition), no
+/// `Drop` ran, and the container/curl child was orphaned.
+#[test]
+fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
+    let stub = HangingStubServer::start();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    // (#2262 review) The spawned binary gets an isolated OS `HOME` as well as
+    // an isolated `DARKMUX_HOME` — a SIBLING temp root, never a parent of it.
+    // `DARKMUX_HOME` only covers darkmux's OWN root (`paths::resolve` returns
+    // early on it); anything the dispatch shells out to still resolves the
+    // real `$HOME`. Measured on the `lab run` twin below, which writes
+    // `$HOME/.lmstudio-home-pointer` on every run; done here too so the two
+    // proofs isolate identically rather than one of them relying on the
+    // dispatch path happening not to reach an `lms` shell-out today.
+    let os_home = TempDir::new().unwrap();
+
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+
+    // (#2262, matching #2131's own test) `dialectic-judge` is a built-in,
+    // deliberately TOOL-LESS role (`tool_palette.allow: []`) — so
+    // `dispatch_internal.rs` routes its remote dispatch through the light
+    // single-shot HOSTED path (a plain host-side `curl`, already
+    // `child_registry`-wired) rather than a `darkmux-runtime` container,
+    // which this test environment has neither Docker nor the image for.
+    // (#2184) Through the isolating helper, not a raw spawn — the structural
+    // guard in this file refuses the latter. Both overrides below are the
+    // helper's own documented escape: a later `.env` wins, so this test still
+    // gets the specific roots it seeds and asserts against, while the DEFAULT
+    // is isolation rather than a raw inherit.
+    let mut child = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .args(["dispatch", "dialectic-judge", "hang please", "--timeout", "60"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux dispatch dialectic-judge");
+    let pid = child.id();
+
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "the dispatch never reached a dispatch call to the stub server within 20s"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the dispatch must still be running (blocked on the hanging dispatch) before SIGTERM"
+    );
+
+    let kill_status =
+        std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("running kill -TERM");
+    assert!(kill_status.success(), "kill -TERM itself must succeed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "darkmux dispatch did not exit within 5s of SIGTERM (#2262 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a signal-interrupted dispatch must not exit 0");
+
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "no `curl` connection to the stub server was ever torn down — a child process survived \
+         the parent (#2262 regression)"
+    );
+
+    assert_no_surviving_remote_curl(child.id(), "dispatch");
+
+    // `darkmux dispatch` routes through `dispatch_as_crew_of_one`, which
+    // mints a real (cardinality-one) mission for every dispatch — its
+    // `finalize`/`reconcile_on_error` reach the same `finalize_mission`
+    // a `mission launch` run does, so the terminal-record shape is
+    // directly comparable to the #2131 test above.
+    let missions_dir = home.path().join("missions");
+    let mission_id = fs::read_dir(&missions_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", missions_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .next()
+        .expect("exactly one mission must have been minted");
+
+    let mission_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(missions_dir.join(&mission_id).join("mission.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        mission_json["status"], "finalized",
+        "an interrupted dispatch must reach a terminal mission status, never stay active: {mission_json}"
+    );
+}
+
+/// (#2262) `kill <pid>` (SIGTERM) on `darkmux lab run <workload>` blocked
+/// mid-dispatch (a real `curl` call to an endpoint that never answers)
+/// must: exit within 5s, leave the run's `lifecycle.json` in a TERMINAL
+/// status (never stuck `running`), and leave no `curl` process still
+/// holding the stub connection open. Mirrors the `dispatch` proof above —
+/// `lab run`'s dispatch goes through the same `crew::dispatch::dispatch`
+/// primitive, one layer further from the mission machinery (no mission is
+/// minted for a lab run at all — see `crates/darkmux-lab/src/lab/
+/// lifecycle.rs`'s own `RunLifecycle`), so the terminal record this test
+/// checks is the lab run's own lifecycle bookend, not a mission envelope.
+#[test]
+fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
+    let stub = HangingStubServer::start();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    // (#2262 review) See the `dispatch` twin above. Load-bearing HERE
+    // specifically: measured, this run reaches an `lms` shell-out, which
+    // writes `$HOME/.lmstudio-home-pointer` — so without this the test wrote
+    // into the developer's (and CI's) REAL home directory on every run.
+    let os_home = TempDir::new().unwrap();
+
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+
+    // A user-tier workload (the `prompt` provider — no sandbox, no Docker
+    // seed) bound to the same tool-less `dialectic-judge` role the
+    // `dispatch` proof above uses, so this run ALSO takes the light
+    // single-shot HOSTED `curl` path rather than a container.
+    let workloads_dir = home.path().join("workloads");
+    fs::create_dir_all(&workloads_dir).unwrap();
+    let workload_json = r#"{
+        "workload": {
+            "id": "sigterm-lab-hang-test",
+            "provider": "prompt",
+            "description": "SIGTERM lab-run regression fixture (#2262)",
+            "role": "dialectic-judge",
+            "prompt": "hang please"
+        }
+    }"#;
+    fs::write(workloads_dir.join("sigterm-lab-hang-test.json"), workload_json).unwrap();
+
+    // (#2184) Through the isolating helper, not a raw spawn — the structural
+    // guard in this file refuses the latter. Both overrides below are the
+    // helper's own documented escape: a later `.env` wins, so this test still
+    // gets the specific roots it seeds and asserts against, while the DEFAULT
+    // is isolation rather than a raw inherit.
+    let mut child = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .args(["lab", "run", "sigterm-lab-hang-test", "--profile", "hang", "--profiles-file"])
+        .arg(&profiles_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux lab run sigterm-lab-hang-test");
+    let pid = child.id();
+
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "the lab run never reached a dispatch call to the stub server within 20s"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the lab run must still be running (blocked on the hanging dispatch) before SIGTERM"
+    );
+
+    let kill_status =
+        std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("running kill -TERM");
+    assert!(kill_status.success(), "kill -TERM itself must succeed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "darkmux lab run did not exit within 5s of SIGTERM (#2262 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a signal-interrupted lab run must not exit 0");
+
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "no `curl` connection to the stub server was ever torn down — a child process survived \
+         the parent (#2262 regression)"
+    );
+
+    assert_no_surviving_remote_curl(child.id(), "lab-run");
+
+    let runs_dir = home.path().join("runs");
+    let run_id = fs::read_dir(&runs_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", runs_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .next()
+        .expect("exactly one lab run dir must have been minted");
+
+    let lifecycle_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(runs_dir.join(&run_id).join("lifecycle.json"))
+            .unwrap_or_else(|e| panic!("reading lifecycle.json for run {run_id}: {e}")),
+    )
+    .unwrap();
+    assert_ne!(
+        lifecycle_json["status"], "running",
+        "an interrupted lab run must reach a terminal lifecycle status, never stay `running`: \
+         {lifecycle_json}"
+    );
+}
+
 /// (#2345 C2) `outcome_from` names the task whose last step's output the
 /// launcher promotes as the `mission close` record's payload. Before this
 /// fix, a typo'd `outcome_from` was refused only AFTER the whole run — the

@@ -49,6 +49,29 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
                          `lab run compare <a> <b>`)"
                     )
                 })?;
+                // (#2262) `lab run` installed no signal handling at all — the
+                // same gap #2131 closed for every `mission launch` launcher.
+                // Without `arm()`, a caught SIGTERM/SIGINT/SIGHUP kills this
+                // process via the OS default disposition: no unwind, no
+                // `Drop`, the docker container (or curl child, for a
+                // tool-less hosted role/profile) orphaned. `lab::run::
+                // lab_run` already writes an explicit terminal
+                // `lifecycle.json` on ANY dispatch `Err` (see
+                // `RunLifecycle`'s own doc + the `lifecycle.finish_error`
+                // call in `run.rs`), and `dispatch_internal.rs`'s own
+                // `DispatchBookendGuard` already guarantees a
+                // `dispatch.error` liveness bookend — so the only two things
+                // actually missing are: (1) install the handlers so a
+                // signal becomes a flag instead of an outright kill, and (2)
+                // something to notice that flag and kill the blocked child.
+                // Armed ONCE, ahead of the whole (possibly `--runs N`)
+                // dispatch loop below — `is_set()` never resets, so one
+                // signal ends the whole invocation, matching every other
+                // launcher's shape. See `spawn_reap_watchdog`'s own doc for
+                // why the docker path is already self-killing and this
+                // watchdog exists for the curl-only remote path.
+                crate::launch_guard::arm();
+                let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
                 let outcomes = lab::run::lab_run(lab::run::RunOpts {
                     workload_id,
                     profile_name: profile,
