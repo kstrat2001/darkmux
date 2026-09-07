@@ -1429,9 +1429,10 @@
         );
     }
 
-    /// Operator-opt-in: `DARKMUX_DAEMON_CORS_ORIGINS` extends the
-    /// default null-only allowlist. Comma-separated. Origins in the
-    /// list receive CORS headers. (#273)
+    /// Operator-opt-in: `DARKMUX_DAEMON_CORS_ORIGINS` IS the allowlist —
+    /// since #2155 the default is EMPTY (it used to be "null only", which
+    /// this comment described until `null` stopped being unconditional).
+    /// Comma-separated. Origins in the list receive CORS headers. (#273)
     #[tokio::test]
     #[serial_test::serial]
     async fn cors_allows_origin_in_env_override() {
@@ -1942,9 +1943,24 @@
         );
     }
 
-    /// `null` origin = topology viewer opened directly from disk (file://).
+    /// (#2155) `null` is the origin a `file://` page sends, but it is ALSO
+    /// the origin of a sandboxed iframe (`<iframe sandbox="allow-scripts">`)
+    /// that any site the operator visits can embed. Unconditionally
+    /// allowing `null` therefore let an arbitrary web page read the
+    /// daemon's read routes (flow records, machine specs, mission/run
+    /// state, worktree summaries) via CORS, against both loopback and the
+    /// tailnet URL. `null` must now be denied by default, same as any
+    /// other origin not on the allowlist — the operator opts a genuine
+    /// `file://` viewer back in via `DARKMUX_DAEMON_CORS_ORIGINS=null`
+    /// (see `cors_allows_null_origin_when_allowlisted` below).
+    ///
+    /// `#[serial]` for the same reason as the other default-deny
+    /// assertions: a sibling test sets `DARKMUX_DAEMON_CORS_ORIGINS` and
+    /// would race the default-deny read under cargo's parallel runner.
     #[tokio::test]
-    async fn cors_allows_file_protocol_origin() {
+    #[serial_test::serial]
+    async fn cors_denies_null_origin_by_default() {
+        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
         let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
@@ -1958,8 +1974,39 @@
             .unwrap();
 
         assert!(
+            !response.headers().contains_key("access-control-allow-origin"),
+            "null origin (e.g. a sandboxed iframe) must NOT receive CORS headers by default (#2155)"
+        );
+    }
+
+    /// The escape hatch for `cors_denies_null_origin_by_default`: an
+    /// operator who genuinely runs a `file://` viewer restores the old
+    /// behavior by naming `null` explicitly in
+    /// `DARKMUX_DAEMON_CORS_ORIGINS`. `parse_cors_origins` already passes
+    /// `null` through as an exact-match string (it's not the literal `*`
+    /// wildcard it special-cases), so this is a plain allowlist entry —
+    /// without this test, a future "simplification" could quietly remove
+    /// the opt-in path entirely and this would read as a pure deletion.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cors_allows_null_origin_when_allowlisted() {
+        unsafe { std::env::set_var("DARKMUX_DAEMON_CORS_ORIGINS", "null"); }
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "null")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
+
+        assert!(
             response.headers().contains_key("access-control-allow-origin"),
-            "file:// (null) origin must receive CORS headers for the topology viewer"
+            "null origin must receive CORS headers once the operator names it in DARKMUX_DAEMON_CORS_ORIGINS (#2155)"
         );
     }
 
