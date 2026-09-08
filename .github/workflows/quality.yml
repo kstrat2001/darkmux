@@ -108,7 +108,7 @@ jobs:
           # assertion is only sound if the count and the mutation scope agree.
           # They currently DON'T for the whole tree: this job mutates the root
           # `darkmux` package only (see the Mutate step, and the follow-up
-          # issue: workspace scope), so a PR touching only `crates/**` yields
+          # issue #2499), so a PR touching only `crates/**` yields
           # zero mutants LEGITIMATELY at this scope — counting those lines
           # would fail a large share of honest PRs for a defect that is already
           # documented and deferred.
@@ -154,8 +154,7 @@ jobs:
           # PR) by running those two tests against a copy with and without
           # `.git` — fails both ways without it, passes both ways with it.
           #
-          # KNOWN UNDER-SCOPING, deliberately NOT fixed here (see follow-up
-          # issue: workspace scope). This repo's root `Cargo.toml` carries BOTH
+          # KNOWN UNDER-SCOPING, deliberately NOT fixed here (see #2499). This repo's root `Cargo.toml` carries BOTH
           # a `[workspace]` table AND a `[package]` (the `darkmux` bin), so
           # cargo-mutants' auto package-filter — the same convention cargo
           # itself uses — resolves to the ROOT package only when no
@@ -286,7 +285,7 @@ jobs:
   mutants-full:
     # NOTE the name overstates the scope: despite "full workspace", this job
     # sweeps the ROOT `darkmux` package only — see the Sweep step's comment and
-    # the follow-up issue (workspace scope). The name is left alone so the
+    # the follow-up issue #2499. The name is left alone so the
     # check's identity doesn't churn; renaming it belongs with the fix.
     name: mutation — full workspace sweep (nightly)
     runs-on: macos-latest
@@ -335,8 +334,7 @@ jobs:
           # build tree is a real git repo (this repo has tests that shell out
           # to git and panic without one).
           #
-          # KNOWN UNDER-SCOPING, deliberately NOT fixed here (see follow-up
-          # issue: workspace scope). This job's name says "full workspace
+          # KNOWN UNDER-SCOPING, deliberately NOT fixed here (see #2499). This job's name says "full workspace
           # sweep" and it has never been one. Without `-p`/`--workspace`,
           # cargo-mutants (like plain `cargo test`) auto-scopes to the ROOT
           # package when the workspace root also carries a `[package]` table,
