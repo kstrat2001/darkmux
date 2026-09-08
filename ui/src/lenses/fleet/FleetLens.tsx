@@ -250,6 +250,40 @@ function FleetCoverageNotice({ historical = false }: { historical?: boolean }) {
   );
 }
 
+/**
+ * (#1923 review) The `/runs` read failed — say so, rather than letting the
+ * cards below silently assert "no lab runs".
+ *
+ * The cards' lab-run count comes from `GET /runs`; a failed read yields the
+ * same empty list a healthy idle machine does, so the card falls back to
+ * exactly the "idle while a lab run is live" reading #1923 removed. It is
+ * the sibling of `FleetCoverageNotice` above (presence unreadable) applied
+ * to the other source this lens depends on, and follows `RunsBoard`'s own
+ * habit of naming what it could not read instead of rendering the absence
+ * as data.
+ *
+ * Deliberately does NOT say the machine IS running lab work — the whole
+ * point is that this page no longer knows. `role="status"`, same as the
+ * coverage notice: informational, never an interruption.
+ *
+ * Worded to share NO phrase with `FleetCoverageNotice`'s "could not be
+ * read": the two can legitimately fire together (a machine that can reach
+ * neither Redis nor its own `/runs`), and a reader — or a test's
+ * `getByText` — has to be able to tell which source is missing.
+ */
+function RunsUnreadableNotice({ unreadable, message }: { unreadable: boolean; message?: string | null }) {
+  if (!unreadable) return null;
+  return (
+    <div className="fleetcov" data-state="runs-unreadable" role="status">
+      <span className="fleetcov__icon">⚠</span>
+      <span>
+        Run records are unavailable{message ? ` (${message})` : ""} — lab runs are missing from the counts below, so a
+        machine working through one may read idle.
+      </span>
+    </div>
+  );
+}
+
 /** (#1800 P2) `records`/`tMax`/`tMin` OPTIONAL so playback can render this
  * same hero over a historical day. Omitted = the live rolling window, exactly
  * as before, so every existing caller is unchanged.
@@ -413,6 +447,23 @@ export function FleetLens({
   // already optional-safe — `fetchJson`'s `ok: true` only proves the body
   // parsed as JSON, not that it matches `RunsResponse`.
   const runs = (runsQuery.data?.ok ? runsQuery.data.data.runs : []) ?? [];
+  // (#1923 review) …but an empty list from a FAILED read is not the same
+  // claim as an empty list from a healthy daemon, and the cards cannot tell
+  // them apart: both render "idle" / "0 running". That is the exact lie
+  // #1923 exists to remove, restored by a `/runs` that 500s or times out.
+  // So the failure is named, the way `RunsBoard` names its own
+  // (`labSourceNotice`) and `specOf` distinguishes "no specs" from
+  // "hardware not reported" — the `?? []` fallback keeps the lens rendering,
+  // this says what it is missing. `enabled: false` (a static build with no
+  // committed fixture) is NOT a failure: nothing was asked, so `isError` is
+  // false and `data` is undefined, and both arms below stay quiet.
+  //
+  // LIVE MODE ONLY, for the same reason `FleetCoverageNotice` is historical-
+  // gated: replay never reads `machineRuns` at all (`buildFleetCard` gates
+  // the lab count on `liveMode`), so a failed `/runs` costs a replayed day
+  // nothing, and warning about it there would be the bug.
+  const runsUnreadable = liveMode && (runsQuery.isError || runsQuery.data?.ok === false);
+  const runsErrorMessage = runsQuery.data && !runsQuery.data.ok ? runsQuery.data.message : null;
 
 
   // (#1869) The token hero + hybrid note are "as of the playhead" — legacy's
@@ -500,6 +551,7 @@ export function FleetLens({
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
       <SavingsHero tokens={tokens} note={note} liveMode={liveMode} data={scopedData} nowMs={nowMs} />
       <FleetCoverageNotice historical={historical} />
+      <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <div className="fleet">
         {cards.map((card) => (
           // `<div class="mach ..." data-act="machine" data-arg="${uid}">`

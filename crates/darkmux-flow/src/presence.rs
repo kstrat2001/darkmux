@@ -58,7 +58,13 @@ pub struct PresenceBeat {
     /// liveness is governed by Redis key existence (TTL), NOT by comparing
     /// this against the reader's clock.
     pub beat_ts_ms: u64,
-    /// One-line machine summary (chip · ram · cores), best-effort.
+    /// One-line machine summary, best-effort. The producer
+    /// (`darkmux_hardware::format_spec_summary`) emits `"<chip> · <N> GB"`,
+    /// dropping the RAM half when the reading is unknown — so `"Apple M5
+    /// Max · 128 GB"`, or just `"Apple M5 Max"` when it is not. Core count
+    /// is NOT in it; an earlier version of this line said `chip · ram ·
+    /// cores` and no producer ever emitted the third field. Display-only:
+    /// never parsed, never keyed on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub specs: Option<String>,
     /// LMStudio loaded-model ids, best-effort (may be empty / omitted).

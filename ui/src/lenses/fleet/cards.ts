@@ -142,12 +142,39 @@ export function topLevelRunSessionIds(data: FlowRecord[], sessionIds: string[]):
   return [...standalone, ...repForMission.values()];
 }
 
-/** (#1923) Lab runs deliberately do NOT ride the flow stream — CLAUDE.md's
- * cross-system contract 3, the lab/fleet sink boundary: "lab runs write
- * per-run-local artifacts; the fleet flow stream carries engagement work
- * only. No crossings in either direction." So `machActive`/`sessionsOn`
- * (both flow-derived) structurally cannot see a lab run — a machine running
- * only lab work reads "idle" / "0 running" no matter how long it runs.
+/** (#1923) How many of this machine's `/runs` rows are lab runs that are
+ * running right now.
+ *
+ * ## What flow presence DOES see (correcting this comment's own first draft)
+ *
+ * A lab run's DISPATCH phase rides the flow stream like any other dispatch.
+ * The providers (`crates/darkmux-lab/src/providers/{prompt,coding_task,
+ * tool_bench}.rs`) call `darkmux_crew::dispatch::dispatch`, whose internal
+ * path emits the contract-2 liveness bookends through
+ * `DispatchBookendGuard` and then spawns the
+ * `darkmux:session-presence:<sid>` emitter — which is exactly what
+ * `useLiveSessionIds` → `liveSet` reads. `lib/flow.ts`'s bookend-matcher
+ * doc names `darkmux-lab` as one of the two producer lineages, and
+ * `crates/darkmux-lab/src/lab/lifecycle.rs`'s module doc says the same
+ * thing from the producer side: the lab lifecycle record is "the missing
+ * half of contract 2 (dispatch liveness) applied to the lab path."
+ *
+ * The first version of this comment claimed the opposite — that CLAUDE.md's
+ * contract 3 (the lab/fleet sink boundary) kept lab work off the flow
+ * stream entirely. It does not. Contract 3 governs where a lab run's
+ * ARTIFACTS are written (per-run-local, never the fleet stream); it grants
+ * no exemption from contract 2. Built on that false premise, the count
+ * SUMMED the two sources and reported a single live lab run as two.
+ *
+ * ## The gap that is real, and all this exists to close
+ *
+ * A lab run's NON-dispatch phases: the COW sandbox clone, the baseline
+ * hash, the verify command, scoring. On a long-agentic run those are
+ * minutes with no dispatch in flight — no bookends, no presence key, so
+ * flow sees nothing and the card reads "idle" while a run is live. Same for
+ * the Redis-off case, where presence cannot be read at all. The lab
+ * `lifecycle.json` row is the only source that stays "running" across the
+ * whole span (written at start, RAII-guarded — see that module's doc).
  *
  * This does NOT cross the sink boundary: it changes what the card reads for
  * DISPLAY, never what gets WRITTEN. `machineRuns` comes from `GET /runs`,
@@ -176,10 +203,20 @@ export interface FleetCard {
    * viewer.html:1713. The whole label, not just the noun, so the pluralization
    * rule lives beside the count it describes. */
   runsLabel: string;
-  /** (#1903) The session ids counted into `runsCount`, LIVE MODE ONLY —
-   * always empty in replay, where `runsCount` counts the day's whole
-   * session set rather than currently-running work (see `runsCount`'s own
-   * comment above). Lets `FleetLens.tsx` build the running-count's own tap
+  /** (#1903) The machine's currently-running FLOW sessions, collapsed to
+   * top-level runs — LIVE MODE ONLY, always empty in replay, where
+   * `runsCount` counts the day's whole session set rather than
+   * currently-running work (see `runsCount`'s own comment above).
+   *
+   * (#1923 review) This is the flow HALF of `runsCount`, no longer
+   * necessarily its whole basis: `runsCount` merges this with the lab-row
+   * count via `Math.max`, so a machine whose only activity is a lab run
+   * between dispatches reads `runsCount: 1` with this list empty. The tap
+   * target below degrades correctly on its own in that case — an empty
+   * list is not "exactly one", so the card drills to the runs lens pinned
+   * to the machine, which is where a lab run is listed anyway.
+   *
+   * Lets `FleetLens.tsx` build the running-count's own tap
    * target — the session drill directly when there's exactly one, the runs
    * lens pinned to this machine otherwise — without re-deriving the
    * running session set from raw flow data a second time. */
@@ -231,10 +268,37 @@ export function buildFleetCard(
   // specialist roster (`runsCount`'s own module doc), which is a different
   // question from "how many things are running right now."
   const runningSessionIds = liveMode ? topLevelRunSessionIds(data, all.filter((sid) => liveSet.has(sid))) : [];
-  // (#1923) `+ labRunning`: lab runs are additive, never a replacement for
-  // the flow-derived count — see `runningLabRunCount`'s own doc for why a
-  // mission/dispatch row from the same `/runs` payload is excluded here.
-  const runsCount = liveMode ? runningSessionIds.length + labRunning : all.length;
+  // (#1923) The two sources OVERLAP — they are not disjoint, and summing
+  // them double-counts. A lab run in its dispatch phase appears on BOTH:
+  // once as its `/runs` lab row, once as the flow session its provider's
+  // `dispatch` call emits presence for (see `runningLabRunCount`'s doc).
+  // Nothing joins the two ids — the lab run id carries epoch SECONDS from
+  // `lab/run.rs`, the dispatch session id epoch MILLIS minted later inside
+  // the provider, and the lab dispatch carries no `mission_id` for
+  // `topLevelRunSessionIds` to collapse on — so the merge here is
+  // `Math.max`, the cheapest rule that is never wrong in the direction that
+  // matters:
+  //
+  // - lab run mid-dispatch, alone   → max(1, 1) = 1  (was 2: the defect)
+  // - lab run between dispatches    → max(0, 1) = 1  (the gap #1923 closes)
+  // - two lab runs, both quiescent  → max(0, 2) = 2
+  // - lab run + a standalone crew dispatch → max(2, 1) = 2
+  //
+  // What it gives up: a lab run in a NON-dispatch phase running alongside
+  // unrelated flow work undercounts — one lab run scoring while one mission
+  // dispatches reads "1 running", not 2. That is a strictly smaller lie
+  // than the systematic double-count it replaces, and `active` below is
+  // unaffected either way (a live lab run always lights the card).
+  //
+  // The durable fix is a real join key, and it is NOT available today: the
+  // lab dispatch's session id is recorded only in the run manifest, which
+  // `providers/coding_task.rs` writes AFTER the dispatch returns — absent
+  // for exactly the live window this count serves. Carrying it on the
+  // start-time `lifecycle.json` (and out through `Run.session_id`, whose
+  // own doc currently asserts a lab row has no flow session at all) would
+  // let this collapse exactly, the way `topLevelRunSessionIds` collapses a
+  // mission's seats. That is a producer-side change, tracked separately.
+  const runsCount = liveMode ? Math.max(runningSessionIds.length, labRunning) : all.length;
   return {
     uid: m,
     name: nameOf(data, liveMachines, m),
