@@ -180,9 +180,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // closes the file-based exposure entirely, but is not a complete
     // isolation boundary: the secret still lives in this process's memory
     // for the dispatch's duration, and a same-uid `bash` process could in
-    // principle attempt `/proc/1/mem` inspection depending on the host's
-    // `kernel.yama.ptrace_scope` — a residual risk `--cap-drop=ALL` doesn't
-    // close (it blocks `ptrace()`, not a same-uid `/proc/<pid>/mem` read).
+    // principle attempt `/proc/<this-process's-pid>/mem` inspection
+    // depending on the host's `kernel.yama.ptrace_scope` — a residual risk
+    // `--cap-drop=ALL` doesn't close (it blocks `ptrace()`, not a same-uid
+    // `/proc/<pid>/mem` read). (#2481) Since `docker run --init` gave the
+    // container a real PID 1 (docker's tini, which reaps the orphans #2215's
+    // bash-tool fix can leave behind), this process is PID 2, not PID 1 —
+    // the attack this note describes is unaffected (same-uid `/proc/<pid>/mem`
+    // access doesn't care which pid), but a reader shouldn't infer this
+    // process is still the container's init.
     // False when the remote endpoint declares no auth (or no remote brain).
     let mut auth_header_stdin: bool = false;
     // Streaming is on by default (#205). Operators / tests pass
