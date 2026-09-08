@@ -530,30 +530,74 @@ fn check_beat33_legacy_crew_dir() -> Check {
         };
     }
 
-    // Build the mv-script. One line per existing promoted subdir + the
-    // pins file. `mv -n` (no-clobber) is deliberate: if the operator has
-    // partial state at both locations, we never overwrite the canonical
-    // side; they merge manually.
+    // Build the mv-script. `mv -n` (no-clobber) protects a FILE
+    // destination from being overwritten — it does NOT protect a
+    // DIRECTORY destination from being NESTED into: `mv -n src dst` where
+    // `dst` already exists as a directory moves `src` INSIDE `dst`
+    // (`dst/src/`), silently producing an unreadable layout instead of a
+    // safe no-op (#1715, found live: a partially-migrated `<root>/missions`
+    // already existed and non-empty, so the naive line here would have
+    // nested the legacy entries where the loader never scans). So each
+    // subdir gets its OWN destination check: absent → the plain move
+    // below; already a directory → a per-entry merge loop, so nothing
+    // ever lands inside a same-named directory.
+    //
+    // Three things the emitted lines have to get right, each of which was a
+    // SILENT no-op-and-exit-0 before (#1715 review):
+    //
+    // - Every path is DOUBLE-QUOTED. `DARKMUX_CREW_DIR` is an operator-set
+    //   path and can hold a space (`~/Library/Application Support/...`, a
+    //   folder named by hand); unquoted, the `for` header word-splits into
+    //   two non-matching literals, the loop body never runs, and the block
+    //   still exits 0 having moved nothing.
+    // - The merge glob includes DOTFILES. `*` matches none, and a
+    //   `.DS_Store` is near-certain on any macOS directory that has been
+    //   opened in Finder. `.[!.]*` + `..?*` are the standard pair covering
+    //   dot-entries without ever matching `.` or `..` (non-matching globs
+    //   stay literal, which the `[ -e "$e" ]` guard already discards).
+    // - `rmdir` failures are SURFACED. `mv -n` skips a name that already
+    //   exists at the destination and exits 0, so the only evidence a
+    //   collision was left behind is the source directory still being
+    //   non-empty — `2>/dev/null || true` swallowed exactly that.
     let mut script_lines: Vec<String> = Vec::new();
     for subdir in &present_subdirs {
-        script_lines.push(format!(
-            "mv -n {legacy}/{subdir} {root}/{subdir}",
-            legacy = legacy_dir.display(),
-            root = root.display(),
-            subdir = subdir
-        ));
+        let dest = root.join(subdir);
+        let legacy = legacy_dir.display();
+        let root_disp = root.display();
+        if dest.is_dir() {
+            script_lines.push(format!(
+                "# {subdir}: destination directory already exists — merging entries, not \
+                 moving the directory (a plain `mv` would nest it)"
+            ));
+            script_lines.push(format!(
+                "for e in \"{legacy}/{subdir}\"/* \"{legacy}/{subdir}\"/.[!.]* \
+                 \"{legacy}/{subdir}\"/..?*; do [ -e \"$e\" ] || continue; mv -n \"$e\" \
+                 \"{root_disp}/{subdir}/\"; done"
+            ));
+            script_lines.push(format!(
+                "rmdir \"{legacy}/{subdir}\" || echo \"LEFTOVERS in {legacy}/{subdir} — those \
+                 names already exist under {root_disp}/{subdir} and were NOT overwritten; \
+                 compare and merge them by hand\""
+            ));
+        } else {
+            script_lines.push(format!("# {subdir}: destination absent — plain move"));
+            script_lines.push(format!(
+                "mv -n \"{legacy}/{subdir}\" \"{root_disp}/{subdir}\""
+            ));
+        }
     }
     if pins_present {
         script_lines.push(format!(
-            "mv -n {legacy}/{file} {root}/{file}",
+            "mv -n \"{legacy}/{file}\" \"{root}/{file}\"",
             legacy = legacy_dir.display(),
             root = root.display(),
             file = promoted_file
         ));
     }
     script_lines.push(format!(
-        "rmdir {} 2>/dev/null || true",
-        legacy_dir.display()
+        "rmdir \"{legacy}\" || echo \"note: {legacy} is not empty — whatever remains is either \
+         operator-authored (darkmux never proposes moving that) or a LEFTOVERS line above\"",
+        legacy = legacy_dir.display()
     ));
 
     let mut listed = present_subdirs
@@ -574,8 +618,14 @@ fn check_beat33_legacy_crew_dir() -> Check {
         ),
         hint: Some(format!(
             "darkmux still reads the legacy layout via the loader's dual-read fallback — no \
-             rush. When you're ready to flatten, copy-paste this (uses `mv -n` so existing \
-             canonical files are never overwritten):\n\n{script}\n\n\
+             rush. When you're ready to flatten, copy-paste this — each line is state-checked \
+             against your actual destination (a plain `mv -n` for an absent destination, a \
+             per-entry merge for one that already exists, never a directory nested into \
+             another):\n\n{script}\n\n\
+             Nothing is overwritten: every move is `mv -n`, so a file whose name ALREADY \
+             exists at the flattened destination is left where it is and the script prints a \
+             `LEFTOVERS in ...` line naming the directory it stayed in — compare those two \
+             copies yourself and delete the stale one. A clean run prints nothing.\n\n\
              Note: if you set DARKMUX_CREW_DIR explicitly, this check assumes the env var \
              points at the post-flatten root (e.g. `~/.darkmux/`). If you instead set it \
              at the legacy `crew/` dir (`~/.darkmux/crew/`), the dual-read keeps working \
@@ -4623,6 +4673,10 @@ fn check_mission_config_registry() -> Check {
     // grouped at render time instead of repeated once per document.
     let mut blocking: Vec<(String, String)> = Vec::new();
     let mut kind_warning_ids: Vec<String> = Vec::new();
+    // (#2428) (id, note) pairs for a same-major minor/patch schema_version
+    // drift — informational only, never blocking. See the loop body below
+    // for why this is no longer in `blocking`.
+    let mut minor_drift: Vec<(String, String)> = Vec::new();
 
     for id in &ids {
         match mission_config::load(id) {
@@ -4651,40 +4705,43 @@ fn check_mission_config_registry() -> Check {
                         version_drift.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
                     blocking.push((id.clone(), joined));
                 }
-                // (#1284 review round 2, consider 7; fixed for #1917) A
-                // USER-tier copy whose schema MINOR trails the binary's MAY
-                // be silently missing an additive field newer launchers rely
-                // on. Two things this finding must get right, both broken
-                // before #1917:
+                // (#2428) A USER-tier copy whose schema MINOR differs from
+                // the binary's still LOADS and VALIDATES cleanly — the
+                // mission-config schema is deliberately lenient-on-read
+                // (all-`Option` fields + `#[serde(flatten)] extras`). The
+                // two DIRECTIONS of that gap are NOT the same finding,
+                // though, and collapsing them is what #2428's first pass got
+                // wrong:
                 //
-                // 1. **The remedy must not assume a fallback exists.** The
-                //    ORIGINAL text unconditionally said "delete it to fall
-                //    back to the embedded tier" — true only when `id` HAS an
-                //    embedded/on-disk counterpart. Every `pr-*` GitHub-verb
-                //    config (and thirteen others, on the reporting
-                //    operator's machine) is user-only: `templates/builtin/
-                //    mission-configs/` holds exactly `coder-phase` and
-                //    `review`. Following the old advice on a user-only
-                //    document deletes it with nothing to fall back to.
-                //    `has_non_user_fallback` is the same user → on-disk →
-                //    embedded resolution `mission launch` uses, so the check
-                //    already KNOWS the answer before it speaks.
-                // 2. **The severity wording must scale with the actual gap.**
-                //    The ORIGINAL text quoted a fixed illustration — a
-                //    pre-1.4 "review" copy losing `reads` (#1619) — on EVERY
-                //    minor-trailing hit, regardless of how far the document
-                //    actually trails. A one-minor additive gap (2.2 → 2.3
-                //    just added the optional `cmd`) then reads exactly
-                //    like a data-loss hazard it is not.
+                // TRAILING (`doc_minor < bin_minor`) — the document is OLDER
+                // than the binary. Every field it names is one this build
+                // already understands; the version number is just stale.
+                // #1917/#1648 treated this as blocking and it produced 13
+                // FALSE "issues" on a real machine (#2428): operator-authored
+                // configs with no built-in counterpart and no retired
+                // vocabulary, every one launching clean under `mission launch
+                // <id> --dry-run`, read as doctor failures purely because
+                // their declared number was old. A doctor line the operator
+                // cannot act on is noise (#2425/#2411's same lesson), so this
+                // direction is INFORMATIONAL only.
                 //
-                // (#1550 cluster item 2: an earlier illustration named the
-                // `expand` primitive, but `expand` was retired in schema
-                // 2.0 — a MAJOR bump, see `MISSION_CONFIG_SCHEMA`'s doc — so
-                // pointing at it here would itself be a stale reference to a
-                // field that no longer exists.) Major drift is `validate()`'s
-                // job (either direction); this minor-trailing check is
-                // user-tier-only because the embedded/on-disk built-ins ship
-                // with the binary and can't trail it.
+                // LEADING (`doc_minor > bin_minor`) — the document is NEWER
+                // than the binary, so it may name fields this build has never
+                // heard of, and lenient-on-read means those fields are
+                // SILENTLY DISCARDED: the run completes green with zero
+                // findings and no surface says a thing. Nothing else in the
+                // stack catches it — `MissionConfig::validate()` flags
+                // exactly two SPECIFIC retired keys (`gh_verb`, `expand`);
+                // any unknown or future key is inert by construction, which
+                // is precisely the hazard. And the schema's own changelog
+                // refutes "additive means safely ignorable": `grow` (3.2)
+                // silently mints nothing for a template task, `outcome_from`
+                // (3.3) promotes the wrong payload, `reads` (1.4) is #1619's
+                // dropped cross-phase data. The live topology this protects
+                // is current: the laptop on `main` authors a user-tier config
+                // using a field a newer schema added; the Studio on
+                // brew-stable runs it with an older binary. So this direction
+                // stays a WARN.
                 if loaded.source == mission_config::MissionConfigSource::User {
                     if let Some((doc_major, doc_minor)) = loaded
                         .config
@@ -4695,97 +4752,25 @@ fn check_mission_config_registry() -> Check {
                         let (bin_major, bin_minor) =
                             parse_major_minor(mission_config::MISSION_CONFIG_SCHEMA)
                                 .expect("MISSION_CONFIG_SCHEMA is a valid MAJOR.MINOR constant");
-                        if doc_major == bin_major && doc_minor < bin_minor {
-                            let gap = bin_minor - doc_minor;
-                            // Scoped to the actual gap: a one-minor trail is
-                            // advisory by the schema's own versioning rule
-                            // ("a future consumer can safely ignore what it
-                            // can't yet evaluate" — MISSION_CONFIG_SCHEMA's
-                            // doc); a wider trail is where the concrete
-                            // reads/#1619 hazard actually applies.
-                            let severity = if gap <= 1 {
-                                // (#1919 review) Deliberately does NOT say "likely a
-                                // no-op". `gap <= 1` measures DISTANCE, not harm, and
-                                // this schema's history refutes the equivalence twice:
-                                // 1.3 -> 1.4 added `reads` (cross-phase delivery
-                                // silently stops) and 2.2 -> 2.3 added `cmd` (the
-                                // allowlist gate stops applying). The only reachable
-                                // gap-1 case on a 2.3 binary today is a 2.2 document,
-                                // which is exactly the `pr-*` configs that mutate
-                                // GitHub state and are currently ungated because of it.
-                                // Telling the operator that is harmless would be
-                                // backwards for the one case that prompted the check.
-                                "trailing by one minor is additive by this schema's own \
-                                 versioning rule, so the document still LOADS — but its \
-                                 fields predate additive fields this binary now reads, and \
-                                 absent is not the same as harmless. Confirm none of the \
-                                 fields this binary's schema added since your document's \
-                                 version apply to it: 1.3 -> 1.4 added `reads` (cross-phase \
-                                 data delivery silently stops), 2.2 -> 2.3 added `cmd` (a \
-                                 config that mutates GitHub state runs ungated), 3.0 -> 3.1 \
-                                 added `enabled` (a step you meant to leave out still runs)"
-                                    .to_string()
-                            } else {
-                                format!(
-                                    "trailing by {gap} minors is far enough that the user copy \
-                                     may predate additive fields newer launchers rely on (e.g. a \
-                                     pre-1.4 \"review\" copy has no `reads` field on any task, so \
-                                     cross-phase data delivery that relies on it — see schema \
-                                     1.4's #1619 — silently doesn't happen)"
-                                )
-                            };
-                            let remedy = if mission_config::has_non_user_fallback(id) {
-                                "re-derive it from the current built-in, or delete it to fall \
-                                 back to the on-disk/embedded built-in tier"
-                                    .to_string()
-                            } else {
-                                "this document has no on-disk or embedded counterpart to fall \
-                                 back to — deleting it loses it; update it in place against the \
-                                 current schema instead"
-                                    .to_string()
-                            };
-                            blocking.push((
-                                id.clone(),
-                                format!(
-                                    "user-tier copy declares schema {doc_major}.{doc_minor}, \
-                                     but this binary's mission-config schema is \
-                                     {bin_major}.{bin_minor} — {severity}; {remedy}"
-                                ),
-                            ));
-                        }
-                        // (#1648) The MIRROR direction, and the more dangerous
-                        // one. A doc on a NEWER minor parses cleanly here —
-                        // `TaskConfig`'s `#[serde(flatten)] extras` swallows
-                        // every field this binary doesn't know — so an
-                        // additive field silently stops existing. The schema's
-                        // minor-bump rule assumes a consumer "can SAFELY
-                        // IGNORE what it can't yet evaluate", but #1619's
-                        // `reads` breaks that assumption: ignoring it drops
-                        // both the data delivery AND the execution ordering,
-                        // and since the scheduler is not phase-gated, a review
-                        // variant's judge task then has no remaining
-                        // dependency, dispatches at launch against an empty
-                        // docket, and the run completes GREEN WITH ZERO
-                        // FINDINGS. A false-green review is the worst failure
-                        // this project has; better to refuse to guess.
-                        //
-                        // Honest about reach: this only helps binaries that
-                        // HAVE the check, so it cannot retroactively protect
-                        // an already-shipped older binary. It closes the
-                        // window from here forward, which is the only window
-                        // a code change can close.
                         if doc_major == bin_major && doc_minor > bin_minor {
                             blocking.push((
                                 id.clone(),
                                 format!(
-                                    "user-tier copy declares schema {doc_major}.{doc_minor}, \
-                                     NEWER than this binary's {bin_major}.{bin_minor} — it may \
-                                     declare additive fields this binary silently ignores rather \
-                                     than rejects (a `reads` relation, for one, carries both data \
-                                     and ordering: dropping it can let a stage run early against \
-                                     empty input and finish green with no findings). Upgrade \
-                                     darkmux, or re-author this copy against \
-                                     {bin_major}.{bin_minor}"
+                                    "declares schema {doc_major}.{doc_minor}, NEWER than this \
+                                     binary's {bin_major}.{bin_minor} — any field minted after \
+                                     {bin_major}.{bin_minor} is swallowed by the lenient-on-read \
+                                     `extras` and silently does nothing here (a run would still \
+                                     complete green)"
+                                ),
+                            ));
+                        } else if doc_major == bin_major && doc_minor < bin_minor {
+                            minor_drift.push((
+                                id.clone(),
+                                format!(
+                                    "declares schema {doc_major}.{doc_minor}, older than this \
+                                     binary's {bin_major}.{bin_minor} — every field it names is \
+                                     one this build understands, so the number alone is stale, \
+                                     not broken"
                                 ),
                             ));
                         }
@@ -4799,17 +4784,39 @@ fn check_mission_config_registry() -> Check {
         }
     }
 
+    // The informational notes belong to BOTH outcomes. They used to be
+    // rendered only inside the `blocking.is_empty()` arm, which dropped them
+    // exactly when an operator is most likely reading this check — one
+    // unrelated config with an empty `name` erased every other config's note,
+    // including the drift note whose stated justification is "so an operator
+    // chasing a specific field can still find it".
+    let mut notes = String::new();
+    if !kind_warning_ids.is_empty() {
+        notes.push_str(&format!(
+            "; {} reference step kinds outside this process's Tier 1 registry (expected — \
+             Tier 3 kinds register at composition time, so this check can't see them): {}",
+            kind_warning_ids.len(),
+            kind_warning_ids.join(", ")
+        ));
+    }
+    if !minor_drift.is_empty() {
+        notes.push_str(&format!(
+            "; {} declare a same-major schema_version OLDER than this binary's, naming only \
+             fields this build understands (informational — the number is stale, and this \
+             check has not inspected the documents' contents beyond validation): {}",
+            minor_drift.len(),
+            minor_drift
+                .iter()
+                .map(|(id, note)| format!("\"{id}\": {note}"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+
     if blocking.is_empty() {
         let mut message =
             format!("{} mission config(s) registered: {}", ids.len(), summary_lines.join(", "));
-        if !kind_warning_ids.is_empty() {
-            message.push_str(&format!(
-                "; {} reference step kinds outside this process's Tier 1 registry (expected — \
-                 Tier 3 kinds register at composition time, so this check can't see them): {}",
-                kind_warning_ids.len(),
-                kind_warning_ids.join(", ")
-            ));
-        }
+        message.push_str(&notes);
         Check {
             name: "mission config registry".into(),
             status: Status::Pass,
@@ -4817,6 +4824,8 @@ fn check_mission_config_registry() -> Check {
             hint: None,
         }
     } else {
+        let mut message = summarize_findings(ids.len(), &blocking);
+        message.push_str(&notes);
         Check {
             name: "mission config registry".into(),
             status: Status::Warn,
@@ -4824,16 +4833,19 @@ fn check_mission_config_registry() -> Check {
             // (one document can contribute a structural-error entry AND a
             // schema-drift entry), so the count is worded as issues, never
             // as a config count (#1284 review round 1).
-            message: summarize_findings(ids.len(), &blocking),
+            message,
             hint: Some(
                 "fix the named document(s) under `~/.darkmux/mission-configs/<id>.json` (or the \
                  checked-out `templates/builtin/mission-configs/<id>.json` for a built-in) — a \
                  dangling depends_on, an empty id, or a schema_version your darkmux build \
-                 doesn't recognize. These documents DO execute — `darkmux mission launch <id>` \
-                 runs any config whose graph names step kinds this build can construct, so a \
-                 finding here is a config that MAY fail at launch, not a dormant one — an \
-                 Error-tier finding bails the launch, a Warning-tier one (a schema_version \
-                 drift, say) only prints."
+                 doesn't recognize. A document declaring a schema_version NEWER than this \
+                 binary's is the one to look at hardest: it parses cleanly, so any field minted \
+                 after this build's schema lands in `extras` and does nothing — either upgrade \
+                 darkmux on this machine or drop the newer fields from the document. These \
+                 documents DO execute — `darkmux mission launch <id>` runs any config whose \
+                 graph names step kinds this build can construct, so a finding here is a config \
+                 that MAY fail at launch, not a dormant one — an Error-tier finding bails the \
+                 launch, a Warning-tier one (a schema_version drift, say) only prints."
                     .into(),
             ),
         }
@@ -4841,22 +4853,44 @@ fn check_mission_config_registry() -> Check {
 }
 
 fn check_lms_binary() -> Check {
-    let bin = env::var("DARKMUX_LMS_BIN").unwrap_or_else(|_| "lms".to_string());
-    if which(&bin).is_some() {
+    // (#2149) Resolved through `config_access::lms_bin()` — the ONE place
+    // `env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"` precedence lives.
+    // This check previously read `DARKMUX_LMS_BIN` directly and never saw
+    // `config.lms_bin` at all, so an operator whose config named an
+    // out-of-PATH `lms` (e.g. `~/.lmstudio/bin/lms`) got a false FAIL here
+    // even though the daemon itself reached LMStudio fine.
+    let (bin, source) = darkmux_types::config_access::lms_bin_with_source();
+    let via = match source {
+        darkmux_types::config_access::Source::Env => " (via DARKMUX_LMS_BIN)",
+        darkmux_types::config_access::Source::Config => " (via config.lms_bin)",
+        darkmux_types::config_access::Source::BuiltIn => "",
+    };
+    // A value containing a path separator is a path, not a PATH-searchable
+    // command name — `which()` searches PATH entries; checking a path
+    // directly against the filesystem is the correct lookup, and doesn't
+    // depend on `PATH` being set at all in the calling process.
+    let (found, how) = if bin.contains('/') {
+        let p = std::path::Path::new(&bin);
+        (p.is_file() && is_executable(p), "at that path")
+    } else {
+        (which(&bin).is_some(), "on PATH")
+    };
+    if found {
         Check {
             name: "lms binary".into(),
             status: Status::Pass,
-            message: format!("found `{bin}` on PATH"),
+            message: format!("found `{bin}` {how}{via}"),
             hint: None,
         }
     } else {
         Check {
             name: "lms binary".into(),
             status: Status::Fail,
-            message: format!("`{bin}` not found on PATH"),
+            message: format!("`{bin}`{via} not found {how}"),
             hint: Some(
-                "install LMStudio (https://lmstudio.ai/) and ensure `lms` is on PATH, \
-                 or set DARKMUX_LMS_BIN to override"
+                "install LMStudio (https://lmstudio.ai/), then run `darkmux config set \
+                 lms_bin <path>` — the durable mechanism, visible in `~/.darkmux/config.json`; \
+                 DARKMUX_LMS_BIN overrides it for one shell"
                     .into(),
             ),
         }
@@ -9881,21 +9915,38 @@ mod tests {
     /// RAII: redirect DARKMUX_CREW_DIR to a TempDir for the test's duration.
     struct CrewRootGuard {
         prev: Option<String>,
-        tmp: tempfile::TempDir,
+        _tmp: tempfile::TempDir,
+        root: std::path::PathBuf,
     }
 
     impl CrewRootGuard {
         fn new() -> Self {
+            Self::at(|tmp| tmp.to_path_buf())
+        }
+
+        /// Point the crew root at a NAMED SUBDIRECTORY of the tempdir. The
+        /// only caller passes a name containing a space — every path the
+        /// beat-33 remedy emits has to survive one, and a bare tempdir path
+        /// never has one, so the no-op-on-word-split failure mode is
+        /// invisible without this.
+        fn new_at_subdir(name: &str) -> Self {
+            Self::at(|tmp| tmp.join(name))
+        }
+
+        fn at(pick: impl FnOnce(&std::path::Path) -> std::path::PathBuf) -> Self {
             let tmp = tempfile::TempDir::new().expect("tempdir");
+            let root = pick(tmp.path());
+            std::fs::create_dir_all(&root).expect("crew root");
             let prev = std::env::var("DARKMUX_CREW_DIR").ok();
             // SAFETY: tests using this guard MUST be #[serial].
             unsafe {
-                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+                std::env::set_var("DARKMUX_CREW_DIR", &root);
             }
-            Self { prev, tmp }
+            Self { prev, _tmp: tmp, root }
         }
+
         fn path(&self) -> &std::path::Path {
-            self.tmp.path()
+            &self.root
         }
     }
 
@@ -9988,6 +10039,213 @@ mod tests {
         assert!(
             !hint.contains("operator-private-stuff"),
             "mv script must not propose moving operator-authored subdirs"
+        );
+    }
+
+    /// (#1715) The exact reported corruption: a PARTIALLY-migrated operator
+    /// has content at BOTH `<root>/crew/missions` (legacy, still holding
+    /// entries) AND `<root>/missions` (already flattened, non-empty). The
+    /// naive `mv -n <legacy>/missions <root>/missions` line this check used
+    /// to emit unconditionally does not no-op here — `mv` moving a
+    /// directory onto an EXISTING directory nests the source inside it
+    /// (`<root>/missions/missions/`), which the loader never scans, so the
+    /// legacy entries become unreadable. `-n` only protects against
+    /// overwriting a FILE; it does nothing for this case. The remedy must
+    /// detect the existing destination directory and merge entries instead
+    /// of moving the directory wholesale.
+    #[serial_test::serial]
+    #[test]
+    fn beat33_legacy_crew_dir_merges_instead_of_nesting_when_destination_dir_already_exists() {
+        let guard = CrewRootGuard::new();
+        // Legacy side still has content.
+        std::fs::create_dir_all(guard.path().join("crew").join("missions")).unwrap();
+        std::fs::write(guard.path().join("crew").join("missions").join("m1.json"), "{}").unwrap();
+        // Destination ALREADY exists and is non-empty — the partially-
+        // migrated state the check exists for.
+        std::fs::create_dir_all(guard.path().join("missions")).unwrap();
+        std::fs::write(guard.path().join("missions").join("m2.json"), "{}").unwrap();
+
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        let hint = check.hint.expect("warn must carry an mv-script hint");
+        let flat = hint.replace('\n', " ");
+
+        // The corrupting line must NEVER appear when the destination
+        // directory already exists.
+        assert!(
+            !flat.contains(&format!(
+                "mv -n {}/missions {}/missions",
+                guard.path().join("crew").display(),
+                guard.path().display()
+            )),
+            "must not propose moving the whole directory onto an existing one (nests instead of \
+             merging): {flat}"
+        );
+        // Must propose a per-entry merge instead, scoped to the missions
+        // source glob. Every emitted path is QUOTED (a root containing a
+        // space otherwise word-splits the loop into a silent no-op — see
+        // `beat33_flatten_script_...` below), so the glob reads
+        // `"<legacy>/missions"/*`, not `<legacy>/missions/*`.
+        assert!(
+            flat.contains(&format!("\"{}/missions\"/*", guard.path().join("crew").display())),
+            "must propose a QUOTED per-entry merge loop for the colliding destination: {flat}"
+        );
+    }
+
+    /// Pull the runnable lines back out of the remedy hint, which wraps the
+    /// script in prose. Keyed on the shell verbs the builder emits, so a
+    /// prose edit can't silently make this extract nothing (the caller
+    /// asserts the extraction is non-empty and that the script actually
+    /// does work).
+    fn beat33_script_from_hint(hint: &str) -> String {
+        hint.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with('#')
+                    || t.starts_with("for ")
+                    || t.starts_with("mv ")
+                    || t.starts_with("rmdir ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// (#1715 review) The remedy is copy-pasted and RUN, so it is tested by
+    /// running it. Three silences compounded in the emitted script and each
+    /// one alone left the operator with data still in the legacy layout and
+    /// a script that exited 0 saying nothing:
+    ///
+    /// 1. unquoted paths — a crew root containing a space word-split the
+    ///    `for` loop into two non-matching literals, so the whole block was
+    ///    a no-op that still exited 0;
+    /// 2. `*` never matches dotfiles, and a `.DS_Store` is near-certain on
+    ///    any macOS directory that has been opened in Finder, so the
+    ///    per-entry merge left one behind;
+    /// 3. `mv -n` SKIPS a name that already exists at the destination and
+    ///    exits 0, and the following `rmdir … 2>/dev/null || true` then
+    ///    swallowed the non-empty failure that was the only evidence of
+    ///    both (1)'s leftover dotfile and (3)'s skipped collision.
+    ///
+    /// The fixture reproduces all three at once: a root named with a space,
+    /// a legacy dir holding an ordinary entry + a dotfile + a name that
+    /// COLLIDES with one already at the flattened destination.
+    #[serial_test::serial]
+    #[test]
+    fn beat33_flatten_script_moves_dotfiles_survives_spaces_and_names_what_it_left_behind() {
+        let guard = CrewRootGuard::new_at_subdir("my darkmux");
+        let root = guard.path().to_path_buf();
+        let legacy = root.join("crew").join("missions");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("m1.json"), r#"{"from":"legacy"}"#).unwrap();
+        std::fs::write(legacy.join("collide.json"), r#"{"from":"legacy"}"#).unwrap();
+        std::fs::write(legacy.join(".DS_Store"), "finder").unwrap();
+        // The flattened destination already exists and already holds a file
+        // by the same name — the partially-migrated state this remedy is for.
+        let dest = root.join("missions");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("collide.json"), r#"{"from":"already-flattened"}"#).unwrap();
+
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        let hint = check.hint.expect("warn must carry an mv-script hint");
+        let script = beat33_script_from_hint(&hint);
+        assert!(
+            script.contains("mv -n"),
+            "extraction found no runnable lines in the hint: {hint}"
+        );
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("bash");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ctx = format!("--- script ---\n{script}\n--- output ---\n{combined}");
+
+        // (1) The loop actually ran despite the space in the root.
+        assert!(dest.join("m1.json").is_file(), "ordinary entry never moved\n{ctx}");
+        // (2) The dotfile came with it.
+        assert!(
+            dest.join(".DS_Store").is_file(),
+            "a dotfile was left behind — `*` alone does not match one\n{ctx}"
+        );
+        // (3a) `mv -n` correctly refused to clobber the destination's copy.
+        assert_eq!(
+            std::fs::read_to_string(dest.join("collide.json")).unwrap(),
+            r#"{"from":"already-flattened"}"#,
+            "the already-flattened copy must never be overwritten\n{ctx}"
+        );
+        // (3b) ...and the collision it therefore skipped is NAMED, not
+        // silently swallowed. This is the whole point: the operator has to
+        // learn that something is still in the legacy layout.
+        assert!(
+            combined.contains(&legacy.display().to_string()),
+            "the skipped collision left a non-empty legacy dir and the script said nothing about \
+             it\n{ctx}"
+        );
+        assert!(
+            legacy.join("collide.json").is_file(),
+            "the skipped entry is still where it was — that is why it must be named\n{ctx}"
+        );
+        // Nothing nested (the original #1715 corruption).
+        assert!(
+            !dest.join("missions").exists(),
+            "the legacy directory was nested inside the destination\n{ctx}"
+        );
+    }
+
+    /// The inverted case for the test above, and the reason the `LEFTOVERS`
+    /// echo can be trusted: with no collision, the same script must move
+    /// EVERYTHING, remove both legacy directories, and print NOTHING. A
+    /// remedy that narrates on a clean run is the noise this whole beat is
+    /// about (#2425/#2411), and an echo that always fires proves nothing
+    /// when it fires on the colliding fixture.
+    #[serial_test::serial]
+    #[test]
+    fn beat33_flatten_script_is_silent_and_complete_on_a_clean_run() {
+        let guard = CrewRootGuard::new_at_subdir("my darkmux");
+        let root = guard.path().to_path_buf();
+        let legacy = root.join("crew").join("missions");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("m1.json"), r#"{"from":"legacy"}"#).unwrap();
+        std::fs::write(legacy.join(".DS_Store"), "finder").unwrap();
+        // Destination exists (so the per-entry merge branch is the one under
+        // test) but holds nothing that collides.
+        let dest = root.join("missions");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("already-here.json"), "{}").unwrap();
+
+        let check = check_beat33_legacy_crew_dir();
+        let hint = check.hint.expect("warn must carry an mv-script hint");
+        let script = beat33_script_from_hint(&hint);
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("bash");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ctx = format!("--- script ---\n{script}\n--- output ---\n{combined}");
+
+        assert!(dest.join("m1.json").is_file(), "{ctx}");
+        assert!(dest.join(".DS_Store").is_file(), "{ctx}");
+        assert!(dest.join("already-here.json").is_file(), "pre-existing entry disturbed\n{ctx}");
+        assert!(!legacy.exists(), "the emptied legacy subdir should be gone\n{ctx}");
+        assert!(
+            !root.join("crew").exists(),
+            "the emptied legacy parent should be gone too\n{ctx}"
+        );
+        assert!(
+            combined.trim().is_empty(),
+            "a clean run must print nothing — every line here is noise the operator learns to \
+             ignore\n{ctx}"
         );
     }
 
@@ -10344,6 +10602,58 @@ mod tests {
         assert!(check.message.contains("major-version mismatch"), "{}", check.message);
     }
 
+    /// (#2428) The direct reproduction of the reported bug: a user-tier
+    /// config trailing the binary's schema by one minor validates cleanly
+    /// (it's the same "review" fixture the neighboring — now historical —
+    /// `_blocks_a_user_tier_copy_trailing_the_current_minor` test builds)
+    /// and yet, before this fix, reads as a blocking doctor "issue" purely
+    /// because its declared `schema_version` number is old. On the
+    /// reporting operator's real machine this hit 13 live, working configs
+    /// at once. A minor/patch difference is not a validation failure —
+    /// darkmux's mission-config schema is explicitly lenient-on-read — so
+    /// this must PASS, and must not count toward "N issue(s)".
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_passes_when_user_tier_trails_by_a_minor() {
+        let (bin_major, bin_minor) = {
+            let mut it = darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA.split('.');
+            (
+                it.next().unwrap().parse::<u32>().unwrap(),
+                it.next().unwrap_or("0").parse::<u32>().unwrap(),
+            )
+        };
+        if bin_minor == 0 {
+            // No same-major lower minor exists at a `.0` schema — nothing
+            // to fixture yet (mirrors the neighboring historical test's
+            // own early-return for the same reason).
+            return;
+        }
+        let doc_version = format!("{bin_major}.{}", bin_minor - 1);
+
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("review.json"),
+            format!(
+                r#"{{"id":"review","name":"PR Review (one minor behind)","schema_version":"{doc_version}"}}"#
+            ),
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "a same-major minor trail validates cleanly and must not block: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("issue("),
+            "must not be counted as an 'N issue(s)' finding: {}",
+            check.message
+        );
+    }
+
     /// (#1684) The same-major-lower-minor trail this file's own
     /// `check_mission_config_registry_warns_when_user_tier_copy_is_on_an_older_major`
     /// doc comment named as "worth re-testing directly again once a real
@@ -10357,9 +10667,17 @@ mod tests {
     /// minor-trail finding is a loud `Status::Warn`, same tier as every
     /// other entry `check_mission_config_registry`'s `blocking` vec
     /// collects — see that function's own `if blocking.is_empty()` branch).
+    ///
+    /// (#2428 UPDATE, 2026-09) This hazard turned out to over-fire in
+    /// practice — 13 live, working operator configs on a real machine, none
+    /// of which use anything the trailing minors added — so the finding was
+    /// downgraded from blocking to informational; see
+    /// `check_mission_config_registry_passes_when_user_tier_trails_by_a_minor`
+    /// above, which is now the test pinning this path's real behavior. This
+    /// test is kept (updated) to confirm the SAME fixture no longer blocks.
     #[serial_test::serial]
     #[test]
-    fn check_mission_config_registry_blocks_a_user_tier_copy_trailing_the_current_minor() {
+    fn check_mission_config_registry_is_quiet_for_a_user_tier_copy_trailing_the_current_minor() {
         // (#2004) The fixture is DERIVED from the constant: one minor behind
         // the binary, within the same major. A literal "2.0" here meant this
         // test silently changed which BRANCH it exercised when the schema
@@ -10404,49 +10722,37 @@ mod tests {
             return;
         }
 
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        // (#2428) A same-major minor trail is no longer blocking — see
+        // `check_mission_config_registry_passes_when_user_tier_trails_by_a_minor`,
+        // which now pins this path directly. Still surfaced, just as an
+        // informational note on the Pass message rather than an "issue".
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             check.message.contains(&format!("declares schema {doc_version}")),
             "{}",
             check.message
         );
         assert!(
-            // #1917 rescoped this to name the actual gap ("trailing by N
-            // minors") rather than a fixed phrase, since the severity text
-            // now varies with how far the document trails.
-            check.message.contains("predate additive fields"),
-            "must name the hazard, not just the version delta: {}",
+            !check.message.contains("issue("),
+            "a minor trail must not be counted as an 'N issue(s)' finding: {}",
             check.message
         );
     }
 
-    /// Pull just one id's finding out of `check_mission_config_registry`'s
-    /// combined message — findings are joined with `" | "` and each starts
-    /// with `"<id>": ...` (see `blocking.join(" | ")`). Lets a test assert
-    /// on ONE finding's text without the other finding's text being able to
-    /// satisfy the assertion by accident.
-    fn finding_for<'a>(message: &'a str, id: &str) -> &'a str {
-        let needle = format!("\"{id}\":");
-        let start = message
-            .find(&needle)
-            .unwrap_or_else(|| panic!("no finding for \"{id}\" in: {message}"));
-        let rest = &message[start..];
-        match rest.find(" | ") {
-            Some(end) => &rest[..end],
-            None => rest,
-        }
-    }
 
-    /// #1917 — the remedy text must differ depending on whether `id` HAS a
-    /// fallback tier. Same one-minor gap on two ids in the SAME check run:
-    /// "review" is embedded (deleting the user copy truly falls back to
-    /// something), "totally-custom-1917" is user-only (deleting it loses
-    /// the document outright — the exact hazard #1917 reported live, on 15
-    /// real configs including every `pr-*` GitHub verb, none of which have
-    /// a built-in counterpart).
+    /// #1917 originally differentiated the remedy text by whether `id` had a
+    /// fallback tier — meaningful when a minor trail was a blocking finding
+    /// asking the operator to act. #2428 downgraded a same-major minor trail
+    /// to informational (see
+    /// `check_mission_config_registry_passes_when_user_tier_trails_by_a_minor`),
+    /// so there is no remedy left to differentiate; this test is kept
+    /// (updated) to confirm both an embedded-fallback id ("review") and a
+    /// user-only id ("totally-custom-1917") trailing by the SAME one minor
+    /// both simply Pass — neither is treated as an issue anymore, and
+    /// neither is told to delete anything.
     #[serial_test::serial]
     #[test]
-    fn check_mission_config_registry_remedy_differs_between_a_fallback_and_a_user_only_config() {
+    fn check_mission_config_registry_is_quiet_for_a_minor_trail_regardless_of_fallback() {
         let guard = CrewRootGuard::new();
         std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
         let (major, minor) =
@@ -10473,48 +10779,30 @@ mod tests {
         .unwrap();
 
         let check = check_mission_config_registry();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-
-        let review_finding = finding_for(&check.message, "review");
-        let custom_finding = finding_for(&check.message, "totally-custom-1917");
-
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
-            review_finding.contains("delete it"),
-            "review has an embedded fallback — deleting it is a real, safe option: {review_finding}"
+            !check.message.contains("delete it"),
+            "an informational note has nothing to remedy — must never suggest deleting: {}",
+            check.message
         );
-        assert!(
-            !custom_finding.contains("delete it"),
-            "a user-only config has nothing to fall back to — must never suggest deleting it: {custom_finding}"
-        );
-        assert!(
-            custom_finding.contains("no on-disk or embedded counterpart"),
-            "must say what is actually true for a user-only document: {custom_finding}"
-        );
-
-        // Both fixtures trail by exactly one minor (2.2 vs the binary's
-        // 2.3) — additive, per the schema's own versioning rule. Neither
-        // finding should quote the fixed pre-1.4 "review"/`reads` example;
-        // that hazard belongs to a document trailing far enough for it to
-        // plausibly apply, not to a one-minor additive gap (#1917's second
-        // half — a small gap must not read as data loss).
-        for finding in [review_finding, custom_finding] {
-            assert!(
-                !finding.contains("pre-1.4"),
-                "a one-minor gap must not quote the fixed pre-1.4 example: {finding}"
-            );
-            assert!(
-                finding.contains("one minor"),
-                "the severity text must name the actual (small) gap detected: {finding}"
-            );
-        }
     }
 
     /// (#1648) The MIRROR direction — a user-tier copy on a NEWER minor than
     /// the binary. Parses cleanly (the flatten `extras` swallows unknown
-    /// fields), which is exactly the hazard: an additive field silently stops
-    /// existing. For `reads` (#1619) that drops data AND ordering, letting a
-    /// stage run early against empty input and finish GREEN WITH NO FINDINGS.
-    /// A false-green review must never be reachable in silence.
+    /// fields), and THAT is the hazard: a field a newer schema minted is
+    /// silently discarded and the run completes green with zero findings.
+    /// #2428 downgraded the TRAILING direction (all 13 of its false issues
+    /// were trailing) but briefly collapsed both directions into one
+    /// informational note, which deleted this signal entirely. The leading
+    /// direction is a Warn again: nothing else in the stack catches it
+    /// (`MissionConfig::validate()` flags exactly two NAMED retired keys —
+    /// `gh_verb`, `expand`; any unknown or FUTURE key is inert by
+    /// construction), and the schema's own history says a swallowed field
+    /// changes behavior — `grow` (3.2) mints nothing for a template task,
+    /// `outcome_from` (3.3) promotes the wrong payload, `reads` (1.4) is
+    /// #1619 itself. The live topology this protects: the laptop on `main`
+    /// authors a user-tier config; the Studio on brew-stable runs it with an
+    /// older binary.
     #[serial_test::serial]
     #[test]
     fn check_mission_config_registry_warns_when_user_tier_minor_leads_the_binary() {
@@ -10542,8 +10830,65 @@ mod tests {
             check.message
         );
         assert!(
-            check.message.contains("silently ignores"),
-            "the warning must say the fields are IGNORED, not rejected — that is the hazard: {}",
+            check.message.contains("issue("),
+            "a minor LEAD is a real finding and must be counted as one: {}",
+            check.message
+        );
+    }
+
+    /// The informational notes (the trailing-minor drift and the Tier 1
+    /// step-kind note) must survive a run in which SOME OTHER config blocks.
+    /// They were rendered only inside the `blocking.is_empty()` arm, so the
+    /// drift note — whose whole justification is "an operator chasing a
+    /// specific field can still find it" — vanished exactly when an operator
+    /// is most likely reading this check: when doctor is already warning
+    /// about something. One config with an empty `name` is enough to erase
+    /// every other config's note.
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_keeps_informational_notes_when_another_config_blocks() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        let (major, minor) =
+            parse_major_minor(darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA).expect("valid constant");
+        // At x.0 there is no one-minor-trailing document to fixture (see
+        // `..._is_quiet_for_a_minor_trail_...` for the same guard).
+        if minor == 0 {
+            return;
+        }
+        let trailing = format!("{major}.{}", minor - 1);
+        // A config that blocks entirely on its own account — empty `name` is
+        // an Error-tier finding in `MissionConfig::validate()`.
+        std::fs::write(
+            guard.path().join("mission-configs").join("nameless.json"),
+            r#"{"id":"nameless","name":"","schema_version":"3.5"}"#,
+        )
+        .unwrap();
+        // ... and an unrelated one whose only remark is the informational
+        // trailing-minor drift.
+        std::fs::write(
+            guard.path().join("mission-configs").join("trailer.json"),
+            format!(
+                r#"{{"id":"trailer","name":"Operator's own","schema_version":"{trailing}"}}"#
+            ),
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("nameless"),
+            "the blocking config is still named: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains(&format!("declares schema {trailing}")),
+            "the trailing-minor note must survive an unrelated blocking config: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("Tier 1 registry"),
+            "the step-kind note must survive an unrelated blocking config: {}",
             check.message
         );
     }
@@ -10571,6 +10916,96 @@ mod tests {
             !check.message.contains("declares schema"),
             "a current-schema user copy must not trip any drift warning: {}",
             check.message
+        );
+    }
+
+    // ─── (#2149) check_lms_binary ───────────────────────────────────────
+
+    /// (#2149) The direct mechanism behind the reported false FAIL: a
+    /// `lms_bin` value that is a PATH (contains `/`, e.g. the real operator
+    /// value `~/.lmstudio/bin/lms`) must be checked directly against the
+    /// filesystem, not searched for on `PATH` — the OLD code called
+    /// `which(&bin)` unconditionally, which returns `None` immediately
+    /// whenever the `PATH` env var itself is unset in the calling process,
+    /// even for an otherwise-valid absolute path. Clearing `PATH` here
+    /// makes that distinction directly observable: the fix must still find
+    /// the binary; the old code could not have.
+    #[serial_test::serial]
+    #[test]
+    fn check_lms_binary_checks_a_path_bearing_value_directly_without_needing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("lms");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let prev_lms_bin = std::env::var("DARKMUX_LMS_BIN").ok();
+        let prev_path = std::env::var("PATH").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_LMS_BIN", fake.to_str().unwrap());
+            std::env::remove_var("PATH");
+        }
+
+        let check = check_lms_binary();
+
+        unsafe {
+            match prev_lms_bin {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("at that path"),
+            "must resolve via the direct filesystem check, not a PATH search: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("via DARKMUX_LMS_BIN"),
+            "must name the resolving tier: {}",
+            check.message
+        );
+    }
+
+    /// (#2149) The remedy must name the durable, config-file mechanism
+    /// first — `darkmux config set lms_bin <path>` — and the env var
+    /// second, as an override. The ORIGINAL text told the operator to "set
+    /// DARKMUX_LMS_BIN to override", i.e. abandon the config file the rest
+    /// of the docs prefer as the durable mechanism.
+    #[serial_test::serial]
+    #[test]
+    fn check_lms_binary_fail_names_config_set_as_the_durable_remedy() {
+        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+        // No `/` in this name — takes the PATH-search branch, and is
+        // certain not to exist on any real PATH.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "darkmux-doctor-test-nonexistent-lms-2149") };
+
+        let check = check_lms_binary();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        let hint = check.hint.expect("a FAIL always carries a remedy");
+        assert!(
+            hint.contains("darkmux config set lms_bin"),
+            "the durable mechanism must be named first: {hint}"
+        );
+        assert!(
+            hint.contains("DARKMUX_LMS_BIN overrides"),
+            "the env var must be framed as the OVERRIDE, not the primary mechanism: {hint}"
         );
     }
 
