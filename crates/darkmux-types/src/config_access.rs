@@ -110,6 +110,22 @@ impl Source {
     }
 }
 
+/// `pick_string`'s sibling that also reports WHICH tier won. Pure + testable
+/// like `pick_string` — the only difference is the second return value.
+fn pick_string_with_source(
+    env_key: &str,
+    cfg: Option<&str>,
+    default: Option<&str>,
+) -> (Option<String>, Source) {
+    if let Some(v) = env_str(env_key) {
+        return (Some(v), Source::Env);
+    }
+    if let Some(v) = cfg.filter(|s| !s.trim().is_empty()) {
+        return (Some(v.to_string()), Source::Config);
+    }
+    (default.map(str::to_string), Source::BuiltIn)
+}
+
 /// `pick_parsed`'s sibling that also reports WHICH tier won. Pure + testable
 /// like `pick_parsed` — the only difference is the second return value.
 fn pick_parsed_with_source<T: FromStr + Copy>(
@@ -181,7 +197,15 @@ pub fn fleet_mode() -> crate::config::FleetMode {
 
 // ── External tooling ──
 pub fn lms_bin() -> String {
-    pick_string("DARKMUX_LMS_BIN", config().lms_bin.as_deref(), Some("lms")).unwrap()
+    lms_bin_with_source().0
+}
+/// `lms_bin`'s sibling that also reports WHICH tier resolved it (#2149) —
+/// `darkmux doctor`'s "lms binary" row names the tier so an operator whose
+/// `config.lms_bin` is set doesn't have to guess why the row differs from a
+/// bare `lms` lookup.
+pub fn lms_bin_with_source() -> (String, Source) {
+    let (v, s) = pick_string_with_source("DARKMUX_LMS_BIN", config().lms_bin.as_deref(), Some("lms"));
+    (v.unwrap(), s)
 }
 /// The LMStudio **base** URL (`scheme://host:port`), resolving
 /// `env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234`.
@@ -1559,6 +1583,25 @@ mod tests {
         assert_eq!(pick_string(k, Some(""), None), None);
         // nothing set anywhere
         assert_eq!(pick_string(k, None, None), None);
+    }
+
+    // ── pick_string_with_source (#2149): same precedence as pick_string,
+    //    plus WHICH tier won — the piece `check_lms_binary` needed and
+    //    didn't have, so it never saw `config.lms_bin` at all.
+    #[serial_test::serial]
+    #[test]
+    fn pick_string_with_source_names_the_winning_tier() {
+        let k = "DARKMUX_TEST_PICK_STRING_SOURCE";
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(pick_string_with_source(k, None, Some("d")), (Some("d".to_string()), Source::BuiltIn));
+        assert_eq!(pick_string_with_source(k, Some("c"), Some("d")), (Some("c".to_string()), Source::Config));
+        unsafe { std::env::set_var(k, "e"); }
+        assert_eq!(pick_string_with_source(k, Some("c"), Some("d")), (Some("e".to_string()), Source::Env));
+        // empty/whitespace env falls through to cfg, same as pick_string.
+        unsafe { std::env::set_var(k, "   "); }
+        assert_eq!(pick_string_with_source(k, Some("c"), Some("d")), (Some("c".to_string()), Source::Config));
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(pick_string_with_source(k, None, None), (None, Source::BuiltIn));
     }
 
     // ── pick_parsed: env > cfg > default, unparseable env falls through ──

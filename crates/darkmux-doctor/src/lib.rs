@@ -4766,22 +4766,44 @@ fn check_mission_config_registry() -> Check {
 }
 
 fn check_lms_binary() -> Check {
-    let bin = env::var("DARKMUX_LMS_BIN").unwrap_or_else(|_| "lms".to_string());
-    if which(&bin).is_some() {
+    // (#2149) Resolved through `config_access::lms_bin()` — the ONE place
+    // `env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"` precedence lives.
+    // This check previously read `DARKMUX_LMS_BIN` directly and never saw
+    // `config.lms_bin` at all, so an operator whose config named an
+    // out-of-PATH `lms` (e.g. `~/.lmstudio/bin/lms`) got a false FAIL here
+    // even though the daemon itself reached LMStudio fine.
+    let (bin, source) = darkmux_types::config_access::lms_bin_with_source();
+    let via = match source {
+        darkmux_types::config_access::Source::Env => " (via DARKMUX_LMS_BIN)",
+        darkmux_types::config_access::Source::Config => " (via config.lms_bin)",
+        darkmux_types::config_access::Source::BuiltIn => "",
+    };
+    // A value containing a path separator is a path, not a PATH-searchable
+    // command name — `which()` searches PATH entries; checking a path
+    // directly against the filesystem is the correct lookup, and doesn't
+    // depend on `PATH` being set at all in the calling process.
+    let (found, how) = if bin.contains('/') {
+        let p = std::path::Path::new(&bin);
+        (p.is_file() && is_executable(p), "at that path")
+    } else {
+        (which(&bin).is_some(), "on PATH")
+    };
+    if found {
         Check {
             name: "lms binary".into(),
             status: Status::Pass,
-            message: format!("found `{bin}` on PATH"),
+            message: format!("found `{bin}` {how}{via}"),
             hint: None,
         }
     } else {
         Check {
             name: "lms binary".into(),
             status: Status::Fail,
-            message: format!("`{bin}` not found on PATH"),
+            message: format!("`{bin}`{via} not found {how}"),
             hint: Some(
-                "install LMStudio (https://lmstudio.ai/) and ensure `lms` is on PATH, \
-                 or set DARKMUX_LMS_BIN to override"
+                "install LMStudio (https://lmstudio.ai/), then run `darkmux config set \
+                 lms_bin <path>` — the durable mechanism, visible in `~/.darkmux/config.json`; \
+                 DARKMUX_LMS_BIN overrides it for one shell"
                     .into(),
             ),
         }
@@ -10520,6 +10542,96 @@ mod tests {
             !check.message.contains("declares schema"),
             "a current-schema user copy must not trip any drift warning: {}",
             check.message
+        );
+    }
+
+    // ─── (#2149) check_lms_binary ───────────────────────────────────────
+
+    /// (#2149) The direct mechanism behind the reported false FAIL: a
+    /// `lms_bin` value that is a PATH (contains `/`, e.g. the real operator
+    /// value `~/.lmstudio/bin/lms`) must be checked directly against the
+    /// filesystem, not searched for on `PATH` — the OLD code called
+    /// `which(&bin)` unconditionally, which returns `None` immediately
+    /// whenever the `PATH` env var itself is unset in the calling process,
+    /// even for an otherwise-valid absolute path. Clearing `PATH` here
+    /// makes that distinction directly observable: the fix must still find
+    /// the binary; the old code could not have.
+    #[serial_test::serial]
+    #[test]
+    fn check_lms_binary_checks_a_path_bearing_value_directly_without_needing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("lms");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let prev_lms_bin = std::env::var("DARKMUX_LMS_BIN").ok();
+        let prev_path = std::env::var("PATH").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_LMS_BIN", fake.to_str().unwrap());
+            std::env::remove_var("PATH");
+        }
+
+        let check = check_lms_binary();
+
+        unsafe {
+            match prev_lms_bin {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("at that path"),
+            "must resolve via the direct filesystem check, not a PATH search: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("via DARKMUX_LMS_BIN"),
+            "must name the resolving tier: {}",
+            check.message
+        );
+    }
+
+    /// (#2149) The remedy must name the durable, config-file mechanism
+    /// first — `darkmux config set lms_bin <path>` — and the env var
+    /// second, as an override. The ORIGINAL text told the operator to "set
+    /// DARKMUX_LMS_BIN to override", i.e. abandon the config file the rest
+    /// of the docs prefer as the durable mechanism.
+    #[serial_test::serial]
+    #[test]
+    fn check_lms_binary_fail_names_config_set_as_the_durable_remedy() {
+        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+        // No `/` in this name — takes the PATH-search branch, and is
+        // certain not to exist on any real PATH.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "darkmux-doctor-test-nonexistent-lms-2149") };
+
+        let check = check_lms_binary();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        let hint = check.hint.expect("a FAIL always carries a remedy");
+        assert!(
+            hint.contains("darkmux config set lms_bin"),
+            "the durable mechanism must be named first: {hint}"
+        );
+        assert!(
+            hint.contains("DARKMUX_LMS_BIN overrides"),
+            "the env var must be framed as the OVERRIDE, not the primary mechanism: {hint}"
         );
     }
 
