@@ -1504,7 +1504,7 @@ mod tests {
             }),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
-        assert!(out.get("s1").is_none(), "no foreign totals may reach s1, got {out:#?}");
+        assert!(!out.contains_key("s1"), "no foreign totals may reach s1, got {out:#?}");
     }
 
     #[test]
