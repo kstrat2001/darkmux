@@ -1046,7 +1046,7 @@ mod tests {
             // tick; this test doesn't, so it needs a generous declared
             // interval instead to stay "fresh" without one.
             let other_pid = 1u32;
-            let _guard = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 60_000)
+            let guard = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 60_000)
                 .expect("the lock is free at test start");
 
             let ring = HostSamplerRing::new();
@@ -1061,7 +1061,32 @@ mod tests {
             // nominal 10 ticks land in a short sleep). 3s is comfortably
             // past the threshold either way, and still fast enough not to
             // slow the suite.
-            std::thread::sleep(Duration::from_millis(3000));
+            //
+            // (#2475) A real dispatch holder keeps this lock fresh by
+            // heartbeating every tick; this fixture must too, or the
+            // assertion below is really pinning "sleep(3s) never overruns
+            // 3x the declared interval on whatever machine runs this,"
+            // not the invariant it names. Refresh throughout the window —
+            // far more often than any plausible gap between refreshes —
+            // so the held lock is PROVABLY fresh for the whole 3s, not
+            // merely fresh-if-nothing-stalls-the-thread. This is what
+            // failed under `cargo llvm-cov --workspace`'s coverage-job
+            // load: a single unrefreshed write followed by a plain
+            // `sleep(3000)` lets the real elapsed time (stretched by
+            // instrumentation + a loaded runner) cross the lock's own
+            // staleness threshold mid-window, at which point the daemon
+            // CORRECTLY takes over and emits — and the old assertion
+            // failed on behavior that was right.
+            let window = Duration::from_millis(3000);
+            let refresh_every = Duration::from_millis(50);
+            let window_deadline = Instant::now() + window;
+            while Instant::now() < window_deadline {
+                assert!(
+                    guard.heartbeat(60_000),
+                    "must still own the lock — nothing else in this test should be racing to steal it"
+                );
+                std::thread::sleep(refresh_every.min(window_deadline.saturating_duration_since(Instant::now())));
+            }
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
 
