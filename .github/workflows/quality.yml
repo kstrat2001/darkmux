@@ -15,9 +15,18 @@ name: quality
 #              (#1618, #1631, and the ghost-runs half of #1621) lived in regions
 #              with literally zero test execution.
 #
-# Both are ADVISORY on PRs and neither blocks a merge. They surface a number
-# and a diff; the operator decides. Making them gates before anyone has seen
-# their baseline would fail honest PRs for pre-existing debt.
+# Both are ADVISORY ABOUT THEIR FINDINGS: a surviving mutant or an uncovered
+# region surfaces a number and a diff and never blocks a merge. Making those a
+# gate before anyone has seen their baseline would fail honest PRs for
+# pre-existing debt.
+#
+# (#1716) Both are GATING ON THEIR OWN INTEGRITY, and that is a different
+# claim. If the tool did not actually run — or ran and reported numbers that
+# contradict its own exit code — the job FAILS. It had been doing the
+# opposite: `cargo mutants ... || true` swallowed every exit code, so a run
+# where the baseline suite failed and zero mutants were ever generated
+# rendered "No surviving mutants" and went green. An advisory check is still
+# allowed to say nothing; it is not allowed to say "clean" when it never ran.
 
 on:
   pull_request:
@@ -28,8 +37,12 @@ on:
   push:
     branches: [main]
   schedule:
-    # Nightly full sweep. The PR job only mutates the diff (seconds); the whole
-    # workspace is ~1410 mutants and does not belong in anyone's review loop.
+    # Nightly sweep. Measured locally on 2026-09-08 with cargo-mutants 27.1.0:
+    # `cargo mutants --list` (the scope this job actually runs at — the root
+    # `darkmux` package only, see mutants-full's comment) finds 2,136 mutants,
+    # and `cargo mutants --workspace --list` finds 12,619. Either number is a
+    # build+test per mutant and does not belong in anyone's review loop; the PR
+    # job mutates only the diff, which is far smaller.
     - cron: "23 7 * * *"
   workflow_dispatch:
 
@@ -57,45 +70,124 @@ jobs:
           key: mutants
 
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked
+        # (#1716) PINNED. Unpinned, CI installs whatever is current, and this
+        # job's entire pass/fail decision is read out of cargo-mutants' exit
+        # codes and its `outcomes.json` field names. A rename in either turns
+        # the gate back into a false green — which is not hypothetical: an
+        # `outcomes.json` carrying none of the keys we read was the exact
+        # fixture that made the summary print "nothing to mutate" at exit 2
+        # over three real survivors. The summary script now falls back to the
+        # `.txt` files and cross-checks the exit code, so a rename degrades
+        # loudly rather than silently; the pin is what keeps the upgrade a
+        # deliberate, reviewed act. Bump both install sites together.
+        run: cargo install cargo-mutants --locked --version 27.1.0
+
+      - name: Summary script self-test
+        # The whole pass/fail decision for this job lives in a Python file the
+        # repo's own mutation gate structurally cannot cover. Same wiring as
+        # `engagement-sentinel-guard.py --self-test` in ci.yml: the self-test
+        # runs FIRST, so a broken summarizer fails here instead of quietly
+        # mis-reporting a real sweep.
+        run: python3 scripts/ci-mutants-summary.py --self-test
 
       - name: Diff against the merge base
+        id: diff
         run: |
+          # What cargo-mutants gets. Unchanged: every Rust file in the diff.
           git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr.diff
-          echo "changed Rust lines: $(grep -c '^+' /tmp/pr.diff || echo 0)"
+          echo "changed Rust lines (all): $(grep -cE '^\+([^+]|$)' /tmp/pr.diff || true)"
+
+          # (#1716) What the summary step asserts on, and it is deliberately a
+          # NARROWER number: the added Rust lines that are actually IN SCOPE for
+          # this job's mutation run.
+          #
+          # The summary fails the job when cargo-mutants mutated nothing while
+          # the diff added Rust code — the PROVEN-green shape behind an
+          # `--in-diff` whose paths don't resolve ("No mutants to filter", exit
+          # 0) and an unparseable diff ("Diff file is empty", exit 0). That
+          # assertion is only sound if the count and the mutation scope agree.
+          # They currently DON'T for the whole tree: this job mutates the root
+          # `darkmux` package only (see the Mutate step, and the follow-up
+          # issue #2499), so a PR touching only `crates/**` yields
+          # zero mutants LEGITIMATELY at this scope — counting those lines
+          # would fail a large share of honest PRs for a defect that is already
+          # documented and deferred.
+          #
+          # `src/` is exactly the root package's mutable surface: measured
+          # 2026-09-08, all 2,136 of `cargo mutants --list`'s entries at this
+          # scope are under `src/`, and zero are under `crates/`. A git
+          # pathspec's `*` crosses `/`, so this covers any nesting.
+          #
+          # WHEN THE WORKSPACE-SCOPE FOLLOW-UP LANDS, widen this back to
+          # '*.rs' in the same change — the two are one setting in two places.
+          #
+          # ADDED lines only, and not the `+++ b/path` file headers: a
+          # deletion-only diff legitimately yields zero mutants, and counting
+          # its header line would turn that into a failure.
+          #
+          # Written to a file first, deliberately: in a `git ... | grep -c`
+          # pipeline (no pipefail under GitHub's `bash -e`) a FAILING git diff
+          # feeds grep nothing, grep prints 0, and the guard silently switches
+          # itself off. As a plain command, a git failure fails the step.
+          git diff "origin/${{ github.base_ref }}"...HEAD -- 'src/*.rs' > /tmp/pr-scope.diff
+          CHANGED=$(grep -cE '^\+([^+]|$)' /tmp/pr-scope.diff || true)
+          CHANGED=${CHANGED:-0}
+          echo "changed Rust lines (in mutation scope): $CHANGED"
+          echo "changed_lines=$CHANGED" >> "$GITHUB_OUTPUT"
 
       - name: Mutate only what this PR touched
         id: mutants
-        continue-on-error: true
         run: |
+          # (#1716) No more `|| true`. That swallowed EVERY exit code,
+          # including 4 (BaselineFailed — the unmutated tree's own tests
+          # failed, so zero mutants were ever tested) indistinguishably from
+          # 0 (clean) or 2 (survivors found, this job's entire point). Capture
+          # the real code and hand the decision to the "Report survivors"
+          # step, which is the one place that now owns pass/fail.
+          #
+          # `--copy-vcs true` is the actual fix for the baseline failure this
+          # issue documents: cargo-mutants tests a COPY of the tree, and
+          # without the VCS dirs that copy isn't a git repository, so any
+          # test that shells out to git (this repo has two, both gated on
+          # `darkmux mission launch coder-phase` needing a real repo) panics
+          # before a single mutant is generated. Confirmed locally (see the
+          # PR) by running those two tests against a copy with and without
+          # `.git` — fails both ways without it, passes both ways with it.
+          #
+          # KNOWN UNDER-SCOPING, deliberately NOT fixed here (see #2499). This repo's root `Cargo.toml` carries BOTH
+          # a `[workspace]` table AND a `[package]` (the `darkmux` bin), so
+          # cargo-mutants' auto package-filter — the same convention cargo
+          # itself uses — resolves to the ROOT package only when no
+          # `-p`/`--workspace` is given. Measured locally on 2026-09-08: a diff
+          # touching only `crates/darkmux-eureka/src/lib.rs` produces "No
+          # mutants to filter" at this scope and 5 real mutants with
+          # `--workspace`; `--list` finds 2,136 mutants at this scope against
+          # 12,619 with it. So every one of the ~12 library crates under
+          # `crates/` gets ZERO mutation-in-diff coverage today, and has for as
+          # long as this job has existed.
+          #
+          # Adding `--workspace` here was tried and REVERTED, for the sizing
+          # reasons spelled out on the `mutants-full` Sweep step below (the two
+          # jobs share a scope, so they share the fix). Widening it is a real
+          # change with its own sizing work — sharding, timeout re-budgeting —
+          # and it does not ride along with the exit-code honesty fix; coupling
+          # them lands neither.
+          set +e
           cargo mutants --in-diff /tmp/pr.diff -j 4 --timeout 120 \
-            --output mutants-out || true
+            --copy-vcs true --output mutants-out
+          STATUS=$?
+          set -e
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Report survivors
         if: always()
         run: |
-          OUT=mutants-out/mutants.out
-          if [ ! -d "$OUT" ] && [ ! -f "$OUT/caught.txt" ]; then OUT=mutants.out; fi
-          MISSED="$OUT/missed.txt"
-          {
-            echo "## Mutation testing — this PR's changed lines"
-            echo
-            if [ -s "$MISSED" ]; then
-              N=$(wc -l < "$MISSED" | tr -d ' ')
-              echo "**$N surviving mutant(s).** Each is a change to your code that NO test noticed."
-              echo
-              echo 'Advisory, not a gate — some survivors are genuinely untestable (a log line, a'
-              echo 'display string). But a survivor on a branch that decides a STATUS or a NUMBER is'
-              echo 'the "test that cannot fail" shape, and worth one minute before merging.'
-              echo
-              echo '```'
-              cat "$MISSED"
-              echo '```'
-            else
-              echo 'No surviving mutants on the changed lines. Every mutation this PR made testable'
-              echo 'was caught by a test.'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/ci-mutants-summary.py \
+            "${{ steps.mutants.outputs.exit_code }}" diff \
+            "Mutation testing — this PR's changed lines" \
+            --changed-lines "${{ steps.diff.outputs.changed_lines }}" \
+            mutants-out/mutants.out mutants.out >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -191,12 +283,24 @@ jobs:
           if-no-files-found: ignore
 
   mutants-full:
+    # NOTE the name overstates the scope: despite "full workspace", this job
+    # sweeps the ROOT `darkmux` package only — see the Sweep step's comment and
+    # the follow-up issue #2499. The name is left alone so the
+    # check's identity doesn't churn; renaming it belongs with the fix.
     name: mutation — full workspace sweep (nightly)
     runs-on: macos-latest
     # (#1792) Was `!= 'pull_request'`, which meant ANY non-PR event. Adding a
-    # push:main trigger for the coverage badge would have made this ~1410-mutant
+    # push:main trigger for the coverage badge would have made this large
     # sweep run on EVERY MERGE. Pinned to the nightly it was written for.
-    if: github.event_name == 'schedule'
+    # (The mutant count in the ORIGINAL version of this comment, ~1410, was
+    # itself wrong even at the time: `--list` at this job's actual scope
+    # measures 2,136 — see the Sweep step.)
+    #
+    # (#1716) `workflow_dispatch` added. Before it, `schedule` was the ONLY
+    # channel: this job could not be triggered to verify anything, so a defect
+    # in it — including the `|| true` false green this issue is about — could
+    # only ever be observed by waiting for cron.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -210,27 +314,59 @@ jobs:
           key: mutants-full
 
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked
+        # Pinned for the reason spelled out in mutants-in-diff's install step:
+        # this job's pass/fail is read out of cargo-mutants' exit codes and
+        # `outcomes.json` field names. Bump both sites together.
+        run: cargo install cargo-mutants --locked --version 27.1.0
+
+      - name: Summary script self-test
+        run: python3 scripts/ci-mutants-summary.py --self-test
 
       - name: Sweep
-        continue-on-error: true
-        run: cargo mutants -j 4 --timeout 120 --output mutants-out || true
+        id: mutants
+        run: |
+          # (#1716) Same defect, same fix, as `mutants-in-diff` above: no
+          # more `|| true` swallowing cargo-mutants' exit code (a
+          # BaselineFailed here was SUSPECTED but unconfirmed — this job only
+          # runs on `schedule`, so it couldn't be triggered directly to
+          # observe; the exit-code capture makes it observable on the next
+          # scheduled run either way), and `--copy-vcs true` so the copied
+          # build tree is a real git repo (this repo has tests that shell out
+          # to git and panic without one).
+          #
+          # KNOWN UNDER-SCOPING, deliberately NOT fixed here (see #2499). This job's name says "full workspace
+          # sweep" and it has never been one. Without `-p`/`--workspace`,
+          # cargo-mutants (like plain `cargo test`) auto-scopes to the ROOT
+          # package when the workspace root also carries a `[package]` table,
+          # which this repo's does (the `darkmux` bin). Measured locally on
+          # 2026-09-08 with cargo-mutants 27.1.0: `cargo mutants --list` finds
+          # 2,136 mutants at this scope; `--workspace --list` finds 12,619. The
+          # ~12 library crates under `crates/` — most of this codebase — have
+          # never been swept.
+          #
+          # `--workspace` was tried here and REVERTED, on two sizing findings
+          # from the review of that attempt (their numbers, not re-measured
+          # here): projected ~33h of sweep against this job's 350-minute
+          # (5.83h) cap, and `--timeout 120` bounding the whole-workspace
+          # BASELINE too, which was measured at 154s — so the sweep would fail
+          # its own baseline before testing a single mutant. Widening the scope
+          # needs sharding and a timeout re-budget; that is the follow-up's
+          # work, not this fix's. Deliberately left under-scoped and
+          # DOCUMENTED rather than silently under-scoped.
+          set +e
+          cargo mutants -j 4 --timeout 120 --copy-vcs true --output mutants-out
+          STATUS=$?
+          set -e
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Summarize
         if: always()
         run: |
-          OUT=$(ls -d mutants-out/mutants.out mutants.out 2>/dev/null | head -1)
-          {
-            echo "## Nightly mutation sweep"
-            echo
-            for f in caught missed timeout unviable; do
-              [ -f "$OUT/$f.txt" ] && echo "- **$f**: $(wc -l < "$OUT/$f.txt" | tr -d ' ')"
-            done
-            echo
-            echo 'A surviving ("missed") mutant is a line no test constrains. This is the'
-            echo 'backlog number — not something to fix in one pass, but the direction of travel'
-            echo 'should be down.'
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/ci-mutants-summary.py \
+            "${{ steps.mutants.outputs.exit_code }}" full \
+            "Nightly mutation sweep (root \`darkmux\` package — see #1716)" \
+            mutants-out/mutants.out mutants.out >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
