@@ -1,9 +1,10 @@
 # darkmux self-review runner
 
 `.github/workflows/darkmux-review.yml` lets darkmux review its own PRs on a
-**local review pipeline** — a crew of local models, not a single reviewer — in
-public, darkmux dogfooding itself (#1222 Phase B). This doc is the one-time
-setup for the self-hosted runner that powers it.
+**local review pipeline** — the same `reviewer` seat dispatched once per
+planned finding-site across the diff (#2310 P4d) — in public, darkmux
+dogfooding itself. This doc is the one-time setup for the self-hosted runner
+that powers it.
 
 ## How it runs (and why it's safe on a public repo)
 
@@ -31,7 +32,7 @@ mission launch review`, which plans each enabled rule against the diff
 (`plan.sites`) and dispatches one `crawl.unit` reviewer task per planned site,
 then gates and delivers any findings (`create-mods`/`deliver`) in the
 sandboxed, network-isolated internal runtime. The pipeline's
-own GitHub file source (used when a probe or the judge wants to see more of a
+own GitHub file source (used when a `reviewer` dispatch wants to see more of a
 changed file than the diff shows) also reads file contents via the API as
 data, never executed — same trust class as the diff. (The title + description
 give the review its stated intent, so it assesses the diff against
@@ -69,19 +70,29 @@ comment launches it — still maintainer-only.
      workflow dispatches.
    - The `darkmux-runtime` Docker image present (Docker running; `darkmux` pulls/uses
      `darkmux-runtime:latest`).
-   - A **`review-deep` crew** in the runner's `~/.darkmux/profiles.json`, naming
-     the profiles (never a raw model id) that staff its `review-probe` and
-     `review-judge` seats (#1054, #1222 Phase B packet 1). See the **Studio
-     migration checklist** below for a copy-pasteable example.
+   - A profile in the runner's `~/.darkmux/profiles.json` bound to the
+     `reviewer` role via `role_profiles.reviewer` (#1475) — every review rule
+     dispatches through this one seat. See **Staffing the runner's reviewer
+     seat** below for a copy-pasteable example; for guidance on which model
+     shape to pick, see [the missions guide's "Staffing the `reviewer`
+     seat"](https://darkmux.com/guide/missions.html).
    - `jq` + `gh` on PATH (GitHub's runner image bundles both). The review
      payload is rendered as part of `darkmux mission launch review`
      (`--param emit=...`) — no `python3` needed; `jq` just splits the
-     rendered `{mode, review, comment}` for `gh`.
+     rendered payload's `mode`/`review`/`fallback_comment` fields for `gh`.
 
-## Studio migration checklist (moving from the single-reviewer setup)
+## Staffing the runner's reviewer seat
 
-If your runner is still on the pre-crew `diff-review` profile + `pr-reviewer`
-role setup, here's the path to the crew-based review pipeline:
+If your runner still has a `crews` map or a `review-probe`/`review-judge`
+staffing left over from before #2310 P4d, here's the current setup. Reviewer
+staffing is DERIVED, never declared: a plain `profiles` entry plus one
+`role_profiles.reviewer` binding — no `crews` map, no probe/judge seats, no
+`k`, no `bundle_selector`. Every review rule dispatches through that same
+`reviewer` seat once per planned site. For guidance on which model shape to
+pick (dense wide-instruct vs MoE reasoner vs hosted endpoint, and the data
+boundary on the last one), see [the missions guide's "Staffing the `reviewer`
+seat"](https://darkmux.com/guide/missions.html) — this checklist only covers
+the runner-specific steps.
 
 **(a) Update darkmux.**
 
@@ -89,79 +100,41 @@ role setup, here's the path to the crew-based review pipeline:
 brew upgrade darkmux
 ```
 
-**(b) Add a `crews` section to `~/.darkmux/profiles.json`.** Crews are a
-top-level sibling of `profiles`, keyed by crew name; each crew's `seats` map
-names which profiles (and optionally which explicit model within a profile)
-staff each seat, with a draws-per-item `k` and an optional `bundle_selector`
-to scope which fact families a staffing draws from. **Profile names are
-machine-specific** — the example below assumes profiles named `devstral` and
-`qwen3.6-27b-review` pointing at models you've actually downloaded; substitute
-your own. This is a fragment to merge into your existing `profiles.json`, not
-a whole file:
+**(b) Add a profile to `~/.darkmux/profiles.json` and bind it to the
+`reviewer` role.** **Profile names are machine-specific** — the example below
+assumes a profile named `review-mid` pointing at a model you've actually
+downloaded; substitute your own. This is a fragment to merge into your
+existing `profiles.json`, not a whole file:
 
 ```json
 {
   "profiles": {
-    "devstral": {
-      "description": "Probe seat, plain draws — devstral at 32K.",
+    "review-mid": {
+      "description": "Reviewer seat — a dense wide-instruct model reading diffs in one pass.",
       "models": [{ "id": "mistralai/devstral-small-2507", "n_ctx": 32000 }]
-    },
-    "qwen4b": {
-      "description": "Probe seat, second voice — a fast 4B instruct at 32K.",
-      "models": [{ "id": "qwen3-4b-instruct-2507", "n_ctx": 32000 }]
-    },
-    "judge-35b-moe": {
-      "description": "Judge seat — the 35B MoE weighing the probes' findings.",
-      "models": [{ "id": "qwen/qwen3.6-35b-a3b", "n_ctx": 32000 }]
-    }
-  },
-
-  "crews": {
-    "review-deep": {
-      "description": "32GB-tier review pipeline: a wide instruct pair on the probe seat plus a fast MoE judge — the measured reference configuration.",
-      "seats": {
-        "review-probe": [
-          { "profile": "devstral", "k": 3, "max_tokens": 3000 },
-          { "profile": "qwen4b", "k": 2, "max_tokens": 4000 }
-        ],
-        "review-judge": [
-          { "profile": "judge-35b-moe", "max_tokens": 20000 }
-        ]
-      }
     }
   }
 }
 ```
 
-**(c) Make sure the models are downloaded.**
+```bash
+darkmux config set role_profiles.reviewer review-mid
+```
+
+**(c) Make sure the model is downloaded.**
 
 ```bash
 lms get mistralai/devstral-small-2507
-lms get qwen3-4b-instruct-2507
-# skip if the judge model is already on the box (it likely is — same family
-# darkmux's other roles use)
-lms get qwen/qwen3.6-35b-a3b
 ```
 
-**(d) Dispatch mode — retired (post-#2431 fix loop).** The `sequential` /
-`parallel` / `auto` residency split described here belonged to the funnel-era
-pipeline's probe/judge staffing, which #2310 P4d deleted along with its
-bespoke launcher. The shipped `review.json` pipeline runs each planned unit
-as a `crawl.unit` dispatch under the generic scheduler, which owns dispatch
-ordering directly — there is no residency knob to set. Staffing (which
-model each role resolves to) still lives on the runner's own
-`~/.darkmux/config.json` `role_profiles` map, per (c) above.
-
-**A note on deep-reasoner probe seats (do NOT add one on a 32GB M1-class box).**
-High-memory machines (64GB+, current-generation Max/Ultra bandwidth) can add a
-third probe staffing — a dense ~27B reasoner with a `bundle_selector` scoping it
-to a few high-value bundles — which measurably reaches a bug class the wide
-pair cannot (deep relational/temporal mechanisms). The cost is real: one deep
-draw is a 20-30K-token reasoning pass, roughly 7-9 minutes on an M5-class Max
-and 30-60+ minutes per draw on an M1 Max — hours per PR. On bandwidth-limited
-32GB machines, skip the deep seat (the wide-pair crew above is the validated
-reference configuration) and treat deep prosecution as a higher-tier machine's
-job or, in a future release, a remote-staffed seat.
+**(d) Dispatch ordering — no residency knob.** An earlier funnel-era pipeline
+had a `sequential` / `parallel` / `auto` residency split across its
+probe/judge staffing; #2310 P4d deleted that pipeline and its bespoke
+launcher. The shipped `review.json` pipeline runs each planned unit as a
+`crawl.unit` dispatch under the generic scheduler, which owns dispatch
+ordering directly — there is nothing to set here. Staffing (which model the
+`reviewer` role resolves to) lives entirely on the runner's own
+`~/.darkmux/config.json` `role_profiles` map, per (b) above.
 
 **(e) Verify.**
 
@@ -172,40 +145,34 @@ darkmux mission launch review \
 ```
 
 `review.json` has no `crew`/`worktree`/dispatch-`mode` inputs — role staffing
-comes from `~/.darkmux/profiles.json`'s `role_profiles.reviewer` binding on
+comes from `~/.darkmux/config.json`'s `role_profiles.reviewer` binding on
 this machine, not a launch param.
 
 No `--timeout` needed: when it is omitted, the review launcher defaults each
 single-shot call to 3600 seconds — the same per-call ceiling the retired
 `pr-review run` used — not `mission launch`'s generic 600-second default.
 
-A clean run prints (or writes, if you pass `--param emit=<path>`) a `{mode,
-review, comment}` payload with `mode: "review"` and at least the judge seat's
-findings. If it comes back `degraded`, re-check step (b)/(c) before dispatching
-against a real PR.
-
-**Changing the workflow's default crew without editing YAML.** Set the repo
-(or environment) variable `DARKMUX_REVIEW_CREW` — Settings → Secrets and
-variables → Actions → Variables — to the crew name you want as the default
-when `-f crew=` is left blank. The workflow reads it via `${{ vars.DARKMUX_REVIEW_CREW
-|| 'review-deep' }}`, so setting/clearing the variable changes the default on
-every future dispatch with no PR against this repo.
+A clean run prints (or writes, if you pass `--param emit=<path>`) a rendered
+payload with `mode: "review"` and at least one finding from the `reviewer`
+seat's dispatches. If it comes back `degraded`, re-check step (b)/(c) before
+dispatching against a real PR.
 
 ## Notes
 
-- The review is **advisory** (no merge gate). Review quality depends on the
-  crew you staff: a probe seat surfaces candidates, the judge seat weighs
-  them — pair it with a human/frontier pass on substantive PRs regardless of
-  crew composition.
-- The model choice is operator-tunable **on the runner**: edit the
-  `review-deep` crew (or whichever crew you dispatch) in
-  `~/.darkmux/profiles.json`. The workflow never pins a model id in the repo
-  — it only ever names a crew (#1054).
-- **Data boundary — REMOTE (hosted-endpoint) seats send code off-box (#1260).**
-  A remote-staffed seat (probe / judge / verify pointed at a hosted endpoint
-  profile) transmits the diff, the surrounding code, and the extracted facts to
-  that endpoint. Only staff a remote seat whose endpoint is **cleared for the
-  code it will see** — an org-approved deployment (e.g. private/proprietary code
-  → the org's own Azure tenant only, never a personal-key third-party vendor).
-  This is operator-explicit by construction: profiles name their own endpoint
-  and nothing auto-routes; darkmux never picks a remote endpoint for you.
+- The review is **advisory** (no merge gate). Review quality depends on
+  which model you bind to the `reviewer` seat — pair it with a human/frontier
+  pass on substantive PRs regardless of which model you choose.
+- The model choice is operator-tunable **on the runner**: change the
+  `role_profiles.reviewer` binding via `darkmux config set` (or hand-edit
+  `~/.darkmux/config.json`). The workflow never pins a model id or profile
+  in the repo — staffing lives entirely on the runner (#1475).
+- **Data boundary — a REMOTE (hosted-endpoint) `reviewer` seat sends code
+  off-box (#1260).** A remote-staffed `reviewer` seat transmits the diff and
+  any additional file contents it requests to that endpoint (the optional
+  `mod_seat_profile` coder seat behind `create-mods` carries the same
+  boundary for the finding + source it fixes). Only staff a remote seat
+  whose endpoint is **cleared for the code it will see** — an org-approved
+  deployment (e.g. private/proprietary code → the org's own Azure tenant
+  only, never a personal-key third-party vendor). This is operator-explicit
+  by construction: profiles name their own endpoint and nothing auto-routes;
+  darkmux never picks a remote endpoint for you.
