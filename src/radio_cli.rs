@@ -237,12 +237,25 @@ fn spawn_mission_launch(config_id: &str, args: &str) -> Result<i32> {
     // kill does not — and that is the form every signal test here uses.
     //
     // Polling restores the pre-guard outcome for a targeted kill: we stop
-    // waiting and exit 130. The child is left to its OWN signal handling,
-    // which it installs itself (`mission_launch.rs`) and which a group
-    // signal still reaches. FORWARDING the signal to it would be better
-    // still — it would finalize on a targeted kill too — but that is a
-    // behavior improvement with its own test, tracked separately, not
-    // something to smuggle into a guard fix.
+    // waiting and exit 130. (#2477) The child is no longer left ENTIRELY to
+    // its own signal handling: once WE notice our own caught signal, we
+    // forward it to the child (`forward_signal_and_wait`) before exiting, so
+    // a targeted kill on radio's pid now finalizes the launch too, matching
+    // the outcome a real Ctrl-C (which the whole foreground group already
+    // reaches) has always produced.
+    //
+    // Note what this loop deliberately does NOT do any more: the branch
+    // below used to call `launch_guard::reap_and_exit_on_signal()`, which
+    // `SIGKILL`s every `child_registry` pid and then `std::process::exit
+    // (130)`s. Neither half is load-bearing here. The reap is redundant:
+    // `run` above holds a `spawn_reap_watchdog` for this whole invocation,
+    // and that watchdog already calls the SAME `kill_all(SIGKILL)` on a
+    // ~100ms cadence from the moment the interrupt flag is set — so every
+    // registered pid gets reaped whether or not this line runs. And the
+    // hard `exit` skipped every destructor on the way out, including
+    // `_synth`'s tempdir cleanup above; returning runs them. (This child is
+    // not in that registry at all — see the comment above — so neither call
+    // ever reached it.)
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning `darkmux mission launch {config_id}`"))?;
@@ -250,9 +263,115 @@ fn spawn_mission_launch(config_id: &str, args: &str) -> Result<i32> {
         if let Some(status) = child.try_wait().context("waiting on `darkmux mission launch`")? {
             return Ok(status.code().unwrap_or(1));
         }
-        crate::launch_guard::reap_and_exit_on_signal();
+        if darkmux_types::interrupt::is_set() {
+            return forward_signal_and_wait(&mut child);
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// (#2477) How long radio waits, after forwarding OUR OWN caught signal to
+/// the launched `mission launch` child, before it stops waiting and reports
+/// that the child is still finishing.
+///
+/// **This is an ANNOUNCE point, not a kill budget** — see
+/// [`forward_signal_and_wait`] for why nothing is forced down when it
+/// expires. It bounds only how long RADIO stays alive holding the
+/// operator's terminal, which is radio's own promise (a targeted kill
+/// returns control promptly) and the only thing radio actually controls.
+///
+/// **Why a fixed number cannot bound the child's finalize.** An earlier
+/// version of this constant justified 5 seconds as "the guard's finalize
+/// write is a local JSON write + rename, a few milliseconds", reusing the
+/// bound the direct-SIGTERM launcher tests assert. Measured, that
+/// reasoning does not hold: `crew::lifecycle::save_json` is `write` +
+/// **`fsync`** + `rename` + **`fsync` of the parent directory**, once per
+/// mission/phase/task/step record, and `fsync` latency is bounded by the
+/// machine's I/O queue, not by the size of the write. On this repo's own
+/// dev machine under an ordinary multi-agent load (load average 21), the
+/// child needed longer than 5s to finalize and the escalation this
+/// constant used to gate fired on a launcher that was seconds from
+/// succeeding — reproduced deterministically by setting this to zero, which
+/// leaves the mission `active`, the exact outcome #2477 exists to prevent.
+const FORWARD_SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// (#2477) Forward the signal that just interrupted THIS process to the
+/// launched `mission launch` child, then wait — bounded — for it to exit on
+/// its own before this process does too.
+///
+/// **Ordering is the whole point.** Signal, THEN wait, THEN exit — never
+/// exit right after signalling. `kill(2)` returning only means the kernel
+/// queued the signal, not that the child's `LaunchFinalizeGuard`
+/// (`launch_guard.rs`) has run; exiting immediately would race the very
+/// finalize this function exists to enable, reproducing the bug from the
+/// child's side instead of radio's.
+///
+/// **Signalling by pid is safe here, and would not be anywhere else.**
+/// `child` is a live [`std::process::Child`] this process spawned and has
+/// NOT reaped: the only `try_wait` calls anywhere in this file return
+/// before reaching a signal send, and nothing in this binary reaps
+/// children process-wide (no `wait(-1)`, no `SIGCHLD` handler — the only
+/// signals installed are `darkmux_types::interrupt`'s INT/TERM/HUP). So if
+/// the child has already exited it is a ZOMBIE, which still holds its pid,
+/// and the send is a harmless no-op. There is no window in which this pid
+/// can have been recycled onto an unrelated process — measured directly on
+/// this platform, including from a parent that had set `SIGCHLD` to
+/// `SIG_IGN`. `child_registry::kill_pid`'s own doc carries the same
+/// contract for every future caller.
+///
+/// **What happens if the child outlives the grace window: radio says so and
+/// leaves.** It does NOT force the child down. A `SIGKILL` here can only
+/// ever make the outcome worse — the child has already been asked to stop
+/// and is either converging on its own terminal record or genuinely stuck,
+/// and killing it converts the first case (a finalized mission, the whole
+/// point of #2477) into the second (a mission left `active`). The window is
+/// gated on `fsync` latency, so no fixed number makes that safe; an earlier
+/// cut escalated to `SIGKILL` here and was measured destroying a real
+/// finalize under ordinary machine load. The mission record is atomic
+/// either way (`save_json` is tmp + fsync + rename), so nothing here can
+/// leave a torn `mission.json` — the only difference the escalation made
+/// was whether the good record ever got written.
+///
+/// The cost of not killing is a launcher that may linger unsupervised, so
+/// that is exactly what the operator is TOLD, by pid, with the verb that
+/// resolves it — never left to be inferred from a bare exit code.
+fn forward_signal_and_wait(child: &mut std::process::Child) -> Result<i32> {
+    let pid = child.id();
+    // The child may already be exiting on its own (a real Ctrl-C reaches
+    // it too, via the foreground process group, so this can race a signal
+    // it already received) — `ESRCH` on an already-reaped pid is not
+    // reportable news. Anything else is: a signal that silently failed to
+    // send is the difference between "your mission finalized" and "your
+    // mission is still running", and the operator must not have to guess
+    // which happened.
+    if let Err(e) = darkmux_types::child_registry::kill_pid(pid, darkmux_types::child_registry::SIGTERM) {
+        if e.raw_os_error() != Some(darkmux_types::child_registry::ESRCH) {
+            eprintln!("radio: could not forward the interrupt to `mission launch` (pid {pid}): {e}");
+        }
+    }
+
+    let deadline = std::time::Instant::now() + FORWARD_SIGNAL_GRACE;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("waiting on `darkmux mission launch` after forwarding its signal")?
+        {
+            return Ok(status.code().unwrap_or(130));
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    eprintln!(
+        "radio: the launched `mission launch` (pid {pid}) was asked to stop but is still \
+         finishing after {}s — radio is exiting now and will stop watching it. It should \
+         finalize on its own shortly; if it does not, `darkmux mission status` shows whether \
+         the mission is still `active` and `darkmux mission abort <id>` closes it.",
+        FORWARD_SIGNAL_GRACE.as_secs()
+    );
+    Ok(130)
 }
 
 /// Mirrors `mission_launch.rs`'s private `cli_gate_handler` SELECTION
