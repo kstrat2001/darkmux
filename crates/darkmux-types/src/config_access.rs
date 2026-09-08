@@ -28,6 +28,21 @@ static CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 #[cfg(any(test, feature = "test-support"))]
 static EMPTY_CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 
+// (#2498) The test seam: when set (via `set_config_for_test`), `config()`
+// returns THIS instead of `EMPTY_CONFIG`. A raw pointer rather than a
+// `Mutex<DarkmuxConfig>` because `config()` must hand back `&'static
+// DarkmuxConfig` (every accessor above borrows straight off it) — an
+// `AtomicPtr` swap is the cheapest way to get a `'static` reference that a
+// test can also RESET, which `OnceLock` (write-once) structurally can't do.
+// Each `set_config_for_test` call `Box::leak`s a fresh config; the leak is
+// deliberate and test-only (bounded by the number of tests that call it, not
+// by anything a real workload does). Null = "no override" = fall through to
+// `EMPTY_CONFIG`, so a test that never calls `set_config_for_test` sees
+// exactly the same empty config #811 always gave it.
+#[cfg(any(test, feature = "test-support"))]
+static CONFIG_OVERRIDE: std::sync::atomic::AtomicPtr<DarkmuxConfig> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
 /// The config tier of `env > config.json > default`.
 ///
 /// **Production** (`cfg(not(test, test-support))`): the operator's real
@@ -44,11 +59,66 @@ static EMPTY_CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 /// — `pick_*()` take explicit cfg args, and accessor tests assert the env tier
 /// or the built-in default. A crate's whole test build opts in by enabling the
 /// `darkmux-types/test-support` feature (a dev-dependency); no per-test call.
+///
+/// (#2498) The ONE exception: a `test-support` test that has explicitly opted
+/// in via [`set_config_for_test`] sees that config instead, for as long as its
+/// returned guard is alive. Isolation is unchanged for every test that does
+/// NOT opt in — the override defaults to unset (null), so `config()` falls
+/// straight back through to `EMPTY_CONFIG` exactly as before this existed.
 fn config() -> &'static DarkmuxConfig {
     #[cfg(any(test, feature = "test-support"))]
-    return EMPTY_CONFIG.get_or_init(DarkmuxConfig::default);
+    {
+        let ptr = CONFIG_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(cfg) = unsafe { ptr.as_ref() } {
+            return cfg;
+        }
+        EMPTY_CONFIG.get_or_init(DarkmuxConfig::default)
+    }
     #[cfg(not(any(test, feature = "test-support")))]
     CONFIG.get_or_init(DarkmuxConfig::load_resolved)
+}
+
+/// (#2498) RAII guard returned by [`set_config_for_test`]. Restores the
+/// config tier to `EMPTY_CONFIG` (the #811 isolation default) when dropped —
+/// including on an unwinding panic, so a test that fails mid-assertion still
+/// can't leak its override into the next test in the process. **Bind it to a
+/// named variable** (`let _guard = set_config_for_test(cfg);`) — binding to
+/// `_` drops it immediately at the end of that statement, which restores the
+/// empty config before the rest of the test body runs.
+///
+/// This is process-global state (one `AtomicPtr`, same as every env-var
+/// mutation test in this module already touches process-global
+/// `std::env`), so a test using this seam MUST carry `#[serial_test::serial]`
+/// — nothing here enforces that at compile time, matching the existing
+/// convention in this file where the serial-ness of env-mutating tests is
+/// also a documented discipline, not a type-level guarantee.
+#[cfg(feature = "test-support")]
+pub struct ConfigOverrideGuard {
+    _private: (),
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for ConfigOverrideGuard {
+    fn drop(&mut self) {
+        CONFIG_OVERRIDE.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// (#2498) Test seam: redirect the config tier to `cfg` for the lifetime of
+/// the returned guard. `#[cfg(feature = "test-support")]` only (NOT plain
+/// `cfg(test)`) — matching the issue's own proposed shape, and keeping this
+/// callable from a DEPENDENT crate's tests (e.g. `darkmux-doctor`'s), which
+/// opt in via the `test-support` feature on their `darkmux-types` dev-dep
+/// the same way they already opt into the empty-config default.
+///
+/// Defaults to unset: a test that never calls this still sees the #811 empty
+/// config, unchanged. See [`ConfigOverrideGuard`] for the leak/panic/binding
+/// discipline this requires from the caller.
+#[cfg(feature = "test-support")]
+pub fn set_config_for_test(cfg: DarkmuxConfig) -> ConfigOverrideGuard {
+    let leaked: &'static DarkmuxConfig = Box::leak(Box::new(cfg));
+    CONFIG_OVERRIDE.store(leaked as *const DarkmuxConfig as *mut DarkmuxConfig, std::sync::atomic::Ordering::SeqCst);
+    ConfigOverrideGuard { _private: () }
 }
 
 /// Read an env var, **trimmed**, returning `None` when unset or
@@ -1608,6 +1678,28 @@ mod tests {
         assert_eq!(pick_string_with_source(k, None, None), (None, Source::BuiltIn));
     }
 
+    // (#2498) `pick_string` and `pick_string_with_source` are two
+    // independently-written implementations of the same ladder (an
+    // `or_else` chain vs an if-let chain — same pre-existing pattern as
+    // `pick_parsed`/`pick_parsed_with_source` below). They agree today; this
+    // keeps them agreeing — the value each returns must match across every
+    // tier combination, or the two ladders have silently diverged.
+    #[serial_test::serial]
+    #[test]
+    fn pick_string_and_pick_string_with_source_agree() {
+        let k = "DARKMUX_TEST_PICK_STRING_AGREE";
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(pick_string(k, None, Some("d")), pick_string_with_source(k, None, Some("d")).0);
+        assert_eq!(pick_string(k, Some("c"), Some("d")), pick_string_with_source(k, Some("c"), Some("d")).0);
+        unsafe { std::env::set_var(k, "e"); }
+        assert_eq!(pick_string(k, Some("c"), Some("d")), pick_string_with_source(k, Some("c"), Some("d")).0);
+        unsafe { std::env::set_var(k, "   "); }
+        assert_eq!(pick_string(k, Some("c"), Some("d")), pick_string_with_source(k, Some("c"), Some("d")).0);
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(pick_string(k, Some("   "), Some("d")), pick_string_with_source(k, Some("   "), Some("d")).0);
+        assert_eq!(pick_string(k, None, None), pick_string_with_source(k, None, None).0);
+    }
+
     // ── pick_parsed: env > cfg > default, unparseable env falls through ──
     #[serial_test::serial]
     #[test]
@@ -1646,6 +1738,54 @@ mod tests {
         assert_eq!(Source::BuiltIn.as_str(), "built-in");
         assert_eq!(Source::Config.as_str(), "config");
         assert_eq!(Source::Env.as_str(), "env");
+    }
+
+    // ── (#2498) the test seam itself: `set_config_for_test` must actually
+    //    make an accessor see the CONFIG tier. Gated on `test-support`
+    //    (matching `set_config_for_test`'s own gate) so it only runs under
+    //    `cargo test -p darkmux-types --features test-support` — NOT the
+    //    plain `cargo test -p darkmux-types` this crate's suite normally
+    //    runs under, since the function it exercises doesn't exist in that
+    //    build. The equivalent, always-in-the-normal-run proof lives in
+    //    `darkmux-doctor`'s `check_lms_binary_resolves_from_config_tier_and_
+    //    names_it` (that crate's dev-deps enable `test-support` on this one
+    //    unconditionally), which is also the test that red-proves #2149's
+    //    regression. This one is the seam's own self-test, one layer down.
+    #[cfg(feature = "test-support")]
+    #[serial_test::serial]
+    #[test]
+    fn set_config_for_test_redirects_the_config_tier() {
+        let k = "DARKMUX_LMS_BIN";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+
+        // Before opting in: the #811 empty-config default, same as every
+        // other test in this module gets.
+        assert_eq!(lms_bin_with_source(), ("lms".to_string(), Source::BuiltIn));
+
+        {
+            let cfg = DarkmuxConfig { lms_bin: Some("/opt/custom/lms".to_string()), ..Default::default() };
+            let _guard = set_config_for_test(cfg);
+            assert_eq!(
+                lms_bin_with_source(),
+                ("/opt/custom/lms".to_string(), Source::Config),
+                "an accessor must see the config the guard installed"
+            );
+        }
+        // Guard dropped at scope end: back to the #811 empty default — proves
+        // the seam can't leak into the next test in this process.
+        assert_eq!(
+            lms_bin_with_source(),
+            ("lms".to_string(), Source::BuiltIn),
+            "dropping the guard must restore EMPTY_CONFIG"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     // ── representative `_with_source` accessors honor the env layer live,
