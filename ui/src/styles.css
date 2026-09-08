@@ -5548,6 +5548,42 @@ body {
   color: var(--fg);
   opacity: 0.85;
 }
+/* (#2406, post-review) The phase box's own status LINE. Before this the box
+   carried no status word at all — a degraded phase was conveyed purely by
+   border color, and the counts existed only as a `title=`, which touch
+   devices have no way to show. Both are real text now: the shared
+   `WorkStatus` chip (no snowflake indicator) plus, for running/degraded
+   phases only, the count breakdown beside it.
+   The name, chip and counts share ONE line deliberately — the label block
+   is absolutely positioned at the box's top-left with only `BAND_PAD`
+   (56px, `graph.ts`) of clearance before the first task card, and a third
+   stacked line renders underneath that card. */
+.missionlens .phasegroup .pg-state {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+.missionlens .phasegroup .pg-state .pg-name {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.missionlens .phasegroup .pg-state .pg-tag {
+  flex: 0 0 auto;
+  align-self: center;
+  font-size: calc(9px * var(--fs-scale));
+  padding: 1px 5px;
+}
+.missionlens .phasegroup .pg-note {
+  flex: 0 1 auto;
+  font: calc(10px * var(--fs-scale))/1.1 var(--font-mono);
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .missionlens .phasegroup.s-running {
   border-color: var(--ml-run);
 }
@@ -5892,6 +5928,21 @@ body {
   font: calc(10px * var(--fs-scale))/1 var(--font-mono);
   text-transform: uppercase;
   letter-spacing: 0.06em;
+  color: var(--dim);
+}
+/* (#2406, post-review) The task-count breakdown, as REAL TEXT rather than
+   a `title=` — tooltips do not exist on touch, and this viewer is driven
+   from a phone. It takes a full row of its own inside the (now wrapping)
+   header, so the phone layout never has to squeeze it beside the phase
+   name; on wide screens it reads as a caption under the name. Rendered
+   only for running/degraded phases, so no other status gains a row. */
+.missionlens .tlphase .tlph-hd {
+  flex-wrap: wrap;
+}
+.missionlens .tlphase .tlph-hd .tlph-note {
+  flex: 1 0 100%;
+  margin-top: 4px;
+  font: calc(10px * var(--fs-scale))/1.35 var(--font-mono);
   color: var(--dim);
 }
 .missionlens .tltasks {

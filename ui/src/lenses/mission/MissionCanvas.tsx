@@ -26,6 +26,7 @@ import ReactFlow, {
 } from "reactflow";
 import "reactflow/dist/style.css";
 import { StepRow } from "./StepRow";
+import { WorkStatus } from "../../components/WorkStatus";
 import {
   recordDimensions,
   withMeasuredDimensions,
@@ -93,18 +94,33 @@ function MissionNode({ data }: NodeProps<MissionNodeData>) {
 function PhaseGroup({
   data,
 }: NodeProps<{ label: string; status: string; description?: string; statusNote?: string }>) {
-  // (#2406) The counts breakdown, when present, rides ahead of the
-  // description in the tooltip — it's the more actionable read on a
-  // running/degraded phase; the description (often a long dispatch brief)
-  // stays available right after it rather than being replaced.
-  const title = [data.statusNote, data.description].filter(Boolean).join(" — ");
+  // (#2406, post-review) The phase box used to carry NO status word at
+  // all — a degraded phase was conveyed purely by border color, and the
+  // counts reached the page only as a `title=`. Tooltips do not exist on
+  // touch and this viewer is driven from a phone, so both the word and
+  // the breakdown render as REAL TEXT. The word is the shared
+  // `WorkStatus` chip (no snowflake indicator); the note sits beside it
+  // and is present only for `running`/`degraded` (see
+  // `mission_graph.rs::phase_status_note`). `title` stays the
+  // description, as it was before this packet — the note no longer needs
+  // to hitch a ride on it.
   return (
-    <div className={`phasegroup s-${data.status || "planned"}`} title={title}>
+    <div className={`phasegroup s-${data.status || "planned"}`} title={data.description || ""}>
       <Handle type="target" id="phase-in" position={Position.Top} style={{ opacity: 0 }} />
       <Handle type="source" id="phase-out" position={Position.Bottom} style={{ opacity: 0 }} />
       <div className="pg-label">
         <span className="pg-kind">PHASE</span>
-        <span className="pg-name">{data.label || ""}</span>
+        {/* The name, the chip and the counts share ONE line on purpose: the
+            label block is absolutely positioned at the box's top-left and
+            has only `BAND_PAD` (56px, `graph.ts`) of clearance before the
+            first task card. A third stacked line renders UNDER that card —
+            observed at 1280x900 before this layout, with the counts row
+            half-hidden behind it. */}
+        <span className="pg-state">
+          <span className="pg-name">{data.label || ""}</span>
+          <WorkStatus status={data.status} className="pg-tag" />
+          {data.statusNote ? <span className="pg-note">{data.statusNote}</span> : null}
+        </span>
       </div>
     </div>
   );

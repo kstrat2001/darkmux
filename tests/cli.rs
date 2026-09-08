@@ -8173,3 +8173,70 @@ fn a_supplied_mod_wait_seconds_beats_the_documents_default() {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(stdout.contains("mod_wait_seconds = 45"), "{stdout}");
 }
+
+/// (#2406) END-TO-END: a phase that ships some tasks and cascade-abandons
+/// others reaches the OPERATOR's board as `degraded`, not silently folded
+/// into `complete`.
+///
+/// The fail-probe's p2 is exactly the shape the finding names — `t-dep2`
+/// and `t-chain-err` run and complete (`run_on: ["complete","error"]`),
+/// while `t-dep` and `t-chain` cascade-abandon off the errored `t-fail`.
+/// Two completed tasks, two abandoned ones, all terminal.
+///
+/// This covers the wiring no unit test can: launcher → `envelope.json` →
+/// `mission_status::degraded_phase_ids`'s real disk read → the `--json`
+/// payload. `Degraded` drives `lifecycle::phase_complete` on purpose, so
+/// disk says `complete` for this phase and always will — the board can only
+/// tell the difference by reading the envelope back.
+#[test]
+fn fail_probe_board_reports_the_mixed_phase_as_degraded_not_complete() {
+    let (home, flows) = fail_probe_fixture("true");
+    let _ = launch_fail_probe(&home, &flows);
+
+    let dir = one_mission_dir(&home);
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("envelope.json")).unwrap()).unwrap();
+    let p2_outcome = envelope["phases"]
+        .as_array()
+        .expect("phases")
+        .iter()
+        .find(|p| p["phase_id"].as_str().is_some_and(|id| id.ends_with("-p2")))
+        .expect("p2 in the envelope")
+        .clone();
+    assert_eq!(
+        p2_outcome["outcome"],
+        serde_json::json!("degraded"),
+        "2 completed tasks + 2 cascade-abandoned ones is a MIX: {envelope}"
+    );
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--json", "--all"])
+        .output()
+        .unwrap();
+    let board: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let phases = &board["missions"][0]["phases"];
+    assert_eq!(
+        phases["degraded"], 1,
+        "the mixed phase must land in its OWN bucket, not inside `complete`: {phases}"
+    );
+    assert_eq!(
+        phases["complete"], 1,
+        "three phases: p1 abandoned, p2 degraded, p3 complete — so exactly ONE clean: {phases}"
+    );
+    assert_eq!(phases["abandoned"], 1, "{phases}");
+    assert_eq!(phases["total"], 3, "{phases}");
+
+    // …and the human board says the word, not just the JSON.
+    let human = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--all"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("degraded"), "the board never says `degraded`:\n{text}");
+}

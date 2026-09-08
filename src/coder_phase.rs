@@ -2400,6 +2400,55 @@ fn phase_status_label(s: crew::types::PhaseStatus) -> &'static str {
     }
 }
 
+/// (#2406) The word the debrief prints for one phase, given what DISK says
+/// and what the mission's `envelope.json` recorded for it.
+///
+/// `crew::types::PhaseStatus` has no `Degraded` and is not gaining one: a
+/// degraded phase IS terminal-and-produced-output, so `Degraded`
+/// deliberately drives `lifecycle::phase_complete` and persists as
+/// `Complete`. The distinction survives only in the envelope, so the
+/// debrief — the surface whose whole job is saying how each phase ended —
+/// has to read it from there or it reports a mixed phase as plainly
+/// `complete`.
+///
+/// The overlay is deliberately one-way and narrow: an envelope `Degraded`
+/// refines a persisted `Complete` and NOTHING ELSE. That is the same
+/// monotone-authority shape the graph lens applies
+/// (`mission_graph.rs::phase_display_status`), and it keeps a stale or
+/// hand-edited envelope from contradicting a persisted terminal.
+fn phase_label_with_outcome(
+    s: crew::types::PhaseStatus,
+    outcome: Option<crew::envelope::PhaseOutcomeKind>,
+) -> &'static str {
+    if s == crew::types::PhaseStatus::Complete
+        && outcome == Some(crew::envelope::PhaseOutcomeKind::Degraded)
+    {
+        return "degraded";
+    }
+    phase_status_label(s)
+}
+
+/// (#2406) One phase's debrief row.
+///
+/// `reason` is `PhaseOutcome::reason` — e.g. `"2 of 4 task(s) completed, 0
+/// errored, 2 abandoned"`. The launcher has been WRITING that string for
+/// some time and, until now, nothing ever read it back: a `grep` for
+/// `.reason` across `src` and `crates` returned writers only. So naming the
+/// mix here is mostly wiring up something already recorded, not computing
+/// anything new.
+#[derive(Debug, Clone)]
+struct DebriefPhase {
+    id: String,
+    /// First line of the phase description.
+    description: String,
+    /// `planned` / `running` / `complete` / `degraded` / `abandoned` — see
+    /// [`phase_label_with_outcome`].
+    status: &'static str,
+    /// The envelope's own provenance line for this phase's outcome, when it
+    /// recorded one.
+    reason: Option<String>,
+}
+
 fn mission_status_label(s: crew::types::MissionStatus) -> &'static str {
     use crew::types::MissionStatus::*;
     match s {
@@ -2438,8 +2487,8 @@ struct DebriefReport {
     mission_id: String,
     mission_description: String,
     mission_status: &'static str,
-    /// (phase_id, first-line description, status label) per phase.
-    phases: Vec<(String, String, &'static str)>,
+    /// Per-phase debrief rows. See [`DebriefPhase`].
+    phases: Vec<DebriefPhase>,
     /// Already bullet-formatted by [`mission_cautions`].
     cautions: Vec<String>,
     /// The reviewer's adjudication notes (#849), as recorded.
@@ -2491,10 +2540,17 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
     // (#2421) Best-effort, same discipline as everything else in this
     // gatherer — a missing/unreadable envelope degrades to `None`
     // (rendered as "not available"), never a debrief-wide failure.
-    let records_emitted = crew::lifecycle::load_envelope(mission_id)
-        .ok()
-        .flatten()
-        .and_then(|env| env.records_emitted);
+    //
+    // (#2406) Read ONCE and kept, rather than loaded again below: the same
+    // envelope carries the per-phase outcomes, which is the only place a
+    // `Degraded` phase is distinguishable from a clean one (disk says
+    // `Complete` for both — see `phase_label_with_outcome`).
+    let envelope = crew::lifecycle::load_envelope(mission_id).ok().flatten();
+    let phase_outcomes: std::collections::BTreeMap<&str, &crew::envelope::PhaseOutcome> = envelope
+        .as_ref()
+        .map(|env| env.phases.iter().map(|p| (p.phase_id.as_str(), p)).collect())
+        .unwrap_or_default();
+    let records_emitted = envelope.as_ref().and_then(|env| env.records_emitted.clone());
 
     // The mission's exact dispatch session ids — the coder-phase dispatch id
     // for each phase, so the collectors scope to THIS mission's sessions (no
@@ -2511,11 +2567,13 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
         phases: mission_phases
             .iter()
             .map(|s| {
-                (
-                    s.id.clone(),
-                    s.description.lines().next().unwrap_or("").trim().to_string(),
-                    phase_status_label(s.status),
-                )
+                let outcome = phase_outcomes.get(s.id.as_str());
+                DebriefPhase {
+                    id: s.id.clone(),
+                    description: s.description.lines().next().unwrap_or("").trim().to_string(),
+                    status: phase_label_with_outcome(s.status, outcome.map(|o| o.outcome)),
+                    reason: outcome.and_then(|o| o.reason.clone()),
+                }
             })
             .collect(),
         // (#1002) A debrief is retrospective — no active dispatch, so no
@@ -2559,8 +2617,17 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
         let phases_json: Vec<serde_json::Value> = report
             .phases
             .iter()
-            .map(|(id, desc, status)| {
-                serde_json::json!({ "id": id, "description": desc, "status": status })
+            .map(|p| {
+                // (#2406) `reason` is a NEW SIBLING key, and `status` can now
+                // read `degraded` where it previously read `complete` for a
+                // mixed phase — which is the whole point: the old value was
+                // wrong, not merely coarse.
+                serde_json::json!({
+                    "id": p.id,
+                    "description": p.description,
+                    "status": p.status,
+                    "reason": p.reason,
+                })
             })
             .collect();
         let out = serde_json::json!({
@@ -2592,13 +2659,19 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
     if report.phases.is_empty() {
         println!("  {}", style::dim("(none)"));
     } else {
-        for (id, desc, status) in &report.phases {
+        for p in &report.phases {
             println!(
                 "  {} [{}] {}",
-                style::accent(id),
-                status,
-                style::dim(desc)
+                style::accent(&p.id),
+                p.status,
+                style::dim(&p.description)
             );
+            // (#2406) The mix, named. `[degraded]` alone is the same word
+            // for "11 of 12 shipped" and "1 of 12 shipped"; the envelope
+            // already recorded which, and nothing read it back until now.
+            if let Some(reason) = &p.reason {
+                println!("      {}", style::dim(reason));
+            }
         }
     }
     println!();

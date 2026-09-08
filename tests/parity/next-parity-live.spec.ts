@@ -107,17 +107,32 @@ async function liveRecordCount(page) {
  * consecutive samples before treating it as the real baseline — the same
  * shape as this repo's other `toPass`-based settle-waits (see
  * `next-parity-console.spec.ts`'s `waitLoadedUnderFrozenClock`), just
- * polling a number instead of a locator. */
+ * polling a number instead of a locator.
+ *
+ * ZERO IS NOT SETTLED. "Two equal consecutive samples" is satisfied by
+ * `0 === 0` — the count `#meta` renders during boot, before either day's
+ * fetch resolves. So a slow enough boot let this return a stable `0`,
+ * which the caller then fails on ("must produce a real baseline count")
+ * with a message pointing at the CORPUS, not at the race. It reproduced
+ * 2-in-3 after a change added ~900 bytes to the bundle — i.e. the race was
+ * always here and only ever needed the boot to cross one 200ms sample
+ * boundary. Requiring a POSITIVE stable sample removes it without weakening
+ * anything: the only caller asserts `> 0` on the very next line, so a run
+ * whose count genuinely never leaves zero still fails — now by timing out
+ * here with a message that names the real condition. */
 async function waitForStableRecordCount(page, { attempts = 30, intervalMs = 200 } = {}) {
   let last = null;
   for (let i = 0; i < attempts; i++) {
     const now = await liveRecordCount(page);
-    if (now !== null && now === last) return now;
+    if (now !== null && now > 0 && now === last) return now;
     last = now;
     // eslint-disable-next-line no-await-in-loop -- deliberately sequential: each sample must see the PREVIOUS one's result.
     await page.waitForTimeout(intervalMs);
   }
-  throw new Error(`meta record count never stabilized (last sample: ${last})`);
+  throw new Error(
+    `meta record count never stabilized at a positive value (last sample: ${last}) — ` +
+      `either the corpus's /flow fixtures are empty or the app never finished its day-window fetches`,
+  );
 }
 
 /** Registers a stream-path override that NEVER resolves — see the module

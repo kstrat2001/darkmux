@@ -756,12 +756,12 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(report.mission_status, "finalized");
         assert_eq!(report.phases.len(), 2, "both phases surfaced: {:?}", report.phases);
         assert!(
-            report.phases.iter().any(|(id, _, st)| id == "s1" && *st == "complete"),
+            report.phases.iter().any(|p| p.id == "s1" && p.status == "complete"),
             "{:?}",
             report.phases
         );
         assert!(
-            report.phases.iter().any(|(id, _, st)| id == "s2" && *st == "abandoned"),
+            report.phases.iter().any(|p| p.id == "s2" && p.status == "abandoned"),
             "{:?}",
             report.phases
         );
@@ -769,6 +769,115 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(report.cautions[0].contains("src/index.rs"), "{:?}", report.cautions);
         assert_eq!(report.corrections, vec!["overrode SIGNOFF — verify never ran".to_string()]);
         assert!(missing.is_err(), "an unknown mission errors");
+    }
+
+    /// (#2406) The debrief names a DEGRADED phase, and names the mix.
+    ///
+    /// The defect: `Degraded` drives `lifecycle::phase_complete` on purpose
+    /// (a degraded phase IS terminal-and-produced-output, and `PhaseStatus`
+    /// has no third terminal), so a phase with 2 completed and 2
+    /// cascade-abandoned steps persists as `complete` — and the debrief,
+    /// which reads only disk, called it plainly `complete`. #2406's display
+    /// fix had moved that phase from wrong-and-loud (`abandoned`) to
+    /// wrong-and-quiet.
+    ///
+    /// The `reason` half is pure wiring: the launcher has been WRITING
+    /// `PhaseOutcome::reason` for some time and nothing ever read it back.
+    /// `#[serial]` — mutates DARKMUX_HOME.
+    #[test]
+    #[serial_test::serial]
+    fn gather_debrief_names_a_degraded_phase_and_its_mix() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mid = "m-degraded";
+        let mdir = home.path().join("missions").join(mid);
+        std::fs::create_dir_all(mdir.join("phases")).unwrap();
+        std::fs::write(
+            mdir.join("mission.json"),
+            format!(r#"{{"id":"{mid}","description":"d","status":"finalized","phase_ids":["p1","p2"],"created_ts":1700000000}}"#),
+        )
+        .unwrap();
+        // BOTH phases are `complete` ON DISK — which is exactly the point:
+        // nothing about the persisted record distinguishes them.
+        for pid in ["p1", "p2"] {
+            std::fs::write(
+                mdir.join("phases").join(format!("{pid}.json")),
+                format!(
+                    r#"{{"id":"{pid}","mission_id":"{mid}","description":"{pid} work","status":"complete","depends_on":[],"created_ts":1700000200}}"#
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            mdir.join("envelope.json"),
+            r#"{
+                "mission_id": "m-degraded",
+                "schema_version": "1.3",
+                "status": "degraded",
+                "phases": [
+                    { "phase_id": "p1", "outcome": "complete" },
+                    { "phase_id": "p2", "outcome": "degraded",
+                      "reason": "2 of 4 task(s) completed, 0 errored, 2 abandoned" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let report = gather_debrief(mid);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        let report = report.expect("mission found");
+        let p1 = report.phases.iter().find(|p| p.id == "p1").expect("p1 present");
+        let p2 = report.phases.iter().find(|p| p.id == "p2").expect("p2 present");
+        assert_eq!(p1.status, "complete", "a clean phase still reads complete: {p1:?}");
+        assert_eq!(p1.reason, None, "a clean phase has no mix to name");
+        assert_eq!(
+            p2.status, "degraded",
+            "the SAME on-disk `complete` must read `degraded` when the envelope says so: {p2:?}"
+        );
+        assert_eq!(
+            p2.reason.as_deref(),
+            Some("2 of 4 task(s) completed, 0 errored, 2 abandoned"),
+            "the counts were already recorded — the debrief just has to read them back"
+        );
+    }
+
+    /// (#2406) The overlay is one-way and narrow: an envelope `Degraded`
+    /// refines a persisted `Complete` and NOTHING else. Same
+    /// monotone-authority shape the graph lens applies, so a stale or
+    /// hand-edited envelope can never contradict a persisted terminal.
+    #[test]
+    fn phase_label_with_outcome_only_refines_a_persisted_complete() {
+        use crew::envelope::PhaseOutcomeKind;
+        use crew::types::PhaseStatus;
+        assert_eq!(
+            phase_label_with_outcome(PhaseStatus::Complete, Some(PhaseOutcomeKind::Degraded)),
+            "degraded"
+        );
+        assert_eq!(
+            phase_label_with_outcome(PhaseStatus::Abandoned, Some(PhaseOutcomeKind::Degraded)),
+            "abandoned",
+            "an operator's abort is the authoritative terminal — the envelope never overwrites it"
+        );
+        assert_eq!(
+            phase_label_with_outcome(PhaseStatus::Running, Some(PhaseOutcomeKind::Degraded)),
+            "running",
+            "a live phase is not relabeled by a stale envelope"
+        );
+        // No envelope row at all (never finalized, or an envelope written
+        // before `Degraded` existed) → disk, unchanged.
+        assert_eq!(phase_label_with_outcome(PhaseStatus::Complete, None), "complete");
+        assert_eq!(
+            phase_label_with_outcome(PhaseStatus::Complete, Some(PhaseOutcomeKind::Complete)),
+            "complete"
+        );
     }
 
     /// (#2421) `gather_debrief` reads `records_emitted` off a persisted
