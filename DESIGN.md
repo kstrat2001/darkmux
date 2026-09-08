@@ -454,6 +454,39 @@ Three properties are worth stating, because each was chosen against an alternati
 
 **The caps stay separate.** It is tempting to make the dispatch-free track unbounded — nothing there is rate-limited by anyone. But `mods.gate` runs an operator-supplied test command per mod, and "as many test suites at once as the graph happens to contain" is a real machine load, not a free lunch. It gets a generous default and a visible knob, which is the same shape every other bound in darkmux has.
 
+## Phase status: a set of tasks is not one unit of work
+
+A mission graph has two levels that look alike and are not. A **task** is one unit of work — a chain of steps that either did the thing or did not. A **phase** is a *set of independent tasks* that happen to run together.
+
+For a long time one predicate served both: *any `Error` wins; else any `Running`; else all-`Complete`; else `Abandoned`; else `Planned`*. At the task level that is exactly right — a task whose second step failed is a failed task, and no amount of earlier success changes it. Applied to a phase, the same words say something false. A review mission's Review phase read **ERROR** while one of twelve unit tasks had errored, seven had completed, and four were still running. The phase was not failed. It was not even over.
+
+The envelope collapsed the same way from the other side: `errored > 0` became `Abandoned("N step(s) errored")`, so a debrief called a phase with eleven successes "abandoned".
+
+The fix is not a softer threshold. It is asking a question a set can answer:
+
+| The set | Status |
+|---|---|
+| any task running, or planned alongside terminals | `Running` |
+| all planned, or empty | `Planned` |
+| all complete | `Complete` |
+| terminal, some complete | `Degraded` |
+| terminal, none complete, some errored | `Error` |
+| terminal, none complete, none errored | `Abandoned` |
+
+Task level is untouched. `Degraded` is the word the mission vocabulary already used one level up, and it means there what it means here: **real output was produced, something was lost.**
+
+Five properties are worth stating, because each was chosen against an alternative.
+
+**`Degraded` is terminal, and it closes the phase on disk.** It drives `lifecycle::phase_complete`, exactly as `Complete` does. This looks like the bug returning — the CLI counting a mixed phase as complete — and it is not the same thing. The phase *is* finished and it *did* produce output; a lifecycle that reopened it would be lying in the other direction. What changed is that the reporting surfaces can tell the two apart. Where the lifecycle needs one bit (is this phase still consuming a seat?), the operator needs the distinction, and those are different questions that were being answered by one field.
+
+**The counts travel with the status, as text.** `Degraded` alone cannot separate eleven-of-twelve succeeded from one-of-twelve succeeded, and those deserve different reactions. So the status carries `7 complete · 1 errored · 4 running` wherever it is shown — and *shown* means rendered, not `title=`. A tooltip does not exist on a phone, and this viewer is driven from one.
+
+**Every reporting surface gets the distinction, or the fix is half-done.** The first cut taught the graph lens and the envelope about `Degraded` and left `mission status` and `mission debrief` counting it as plain `complete`. That is not a smaller version of the fix; it is the same defect with the volume turned down — the board moved from wrong-and-loud ("abandoned") to wrong-and-quiet ("complete"), which is worse, because nobody investigates a green board. A status vocabulary is a contract across surfaces or it is decoration on one.
+
+**The envelope counts tasks, not steps — the same rule, one level down.** The first cut had the display roll up *tasks* while the envelope rolled up raw *steps*, and they disagreed on any phase whose mix lived inside a single multi-step task: `[Complete, Abandoned]` steps in one task read `Degraded` in the envelope and `Abandoned` in the lens, with `complete` on disk — three words for one phase. Counting steps is the mirror image of the bug this section exists to fix, applied one level too low: a task's steps are *stages*, not independent deliverables, so a half-finished unit is not "output shipped, something lost", it is a unit that did not finish. The envelope now groups by `task_id` first. One divergence is deliberately left: `[Complete, Error]` inside one task reads `error` on one side and `Abandoned` on the other, because `PhaseOutcomeKind` has no `Error` variant — that predates this change, and it is written into the test rather than papered over by forcing agreement.
+
+**An additive enum variant on a persisted shape needs a catch-all in the same change.** `PhaseOutcomeKind` gained `Degraded` and, in the same commit, `#[serde(other)] Unknown`. Without it an older binary reading a newer envelope does not degrade one phase — `serde` fails the **whole document**, because `#[serde(default)]` on the `phases` vector covers a missing field, not a failing element. The lesson generalizes past this enum: on any shape that outlives the binary that wrote it, the catch-all is part of adding the variant, not a follow-up.
+
 ## The command gate: darkmux runs your shell-outs, not its own
 
 Some mission configs exist to run a command that changes something outside darkmux — approve a pull request, merge it, apply a deployment. They are ordinary `procedural.shell` graphs an operator wrote, shelling out to a tool the operator already has installed and signed in, exactly like the `lms` and `zed` shell-outs elsewhere in the binary.
