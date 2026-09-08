@@ -992,6 +992,29 @@ mod tests {
 
     /// The embedded example registry parses as valid JSON. Caught at build time
     /// via `include_str!`, but verifying serde-shaped is a cheap belt-and-braces.
+    /// (#2055) The shipped example is the FIRST darkmux artifact a new user
+    /// reads — `init` writes it verbatim as their `profiles.json`. It must not
+    /// name a subsystem darkmux no longer has: the pre-2.0 openclaw shell-out
+    /// (removed in #1405) survived here for four releases as a `Requires
+    /// OpenClaw >= ...` note on a profile description, so a fresh install's
+    /// own registry told the operator to go install a dependency that does not
+    /// exist. Text-level and case-insensitive on purpose — the failure mode is
+    /// prose in a `description`, not a structural field any parser would catch.
+    #[test]
+    fn the_shipped_example_names_no_retired_subsystem() {
+        let lowered = EXAMPLE_PROFILES_JSON.to_ascii_lowercase();
+        // drift-guard:allow crew sync — this test ASSERTS the retirement; the
+        // drift-guard:allow darkmux swap — names here are the needles, not prose.
+        for retired in ["openclaw", "crew sync", "darkmux swap"] {
+            assert!(
+                !lowered.contains(retired),
+                "the shipped example registry names the retired `{retired}` — \
+                 a fresh `darkmux init` would hand the operator a file \
+                 referencing a subsystem this binary does not have"
+            );
+        }
+    }
+
     #[test]
     fn embedded_example_profiles_parses_as_json() {
         let parsed: serde_json::Value =
