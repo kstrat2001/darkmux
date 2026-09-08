@@ -530,18 +530,36 @@ fn check_beat33_legacy_crew_dir() -> Check {
         };
     }
 
-    // Build the mv-script. One line per existing promoted subdir + the
-    // pins file. `mv -n` (no-clobber) is deliberate: if the operator has
-    // partial state at both locations, we never overwrite the canonical
-    // side; they merge manually.
+    // Build the mv-script. `mv -n` (no-clobber) protects a FILE
+    // destination from being overwritten — it does NOT protect a
+    // DIRECTORY destination from being NESTED into: `mv -n src dst` where
+    // `dst` already exists as a directory moves `src` INSIDE `dst`
+    // (`dst/src/`), silently producing an unreadable layout instead of a
+    // safe no-op (#1715, found live: a partially-migrated `<root>/missions`
+    // already existed and non-empty, so the naive line here would have
+    // nested the legacy entries where the loader never scans). So each
+    // subdir gets its OWN destination check: absent → the plain move
+    // below; already a directory → a per-entry merge loop, so nothing
+    // ever lands inside a same-named directory.
     let mut script_lines: Vec<String> = Vec::new();
     for subdir in &present_subdirs {
-        script_lines.push(format!(
-            "mv -n {legacy}/{subdir} {root}/{subdir}",
-            legacy = legacy_dir.display(),
-            root = root.display(),
-            subdir = subdir
-        ));
+        let dest = root.join(subdir);
+        let legacy = legacy_dir.display();
+        let root_disp = root.display();
+        if dest.is_dir() {
+            script_lines.push(format!(
+                "# {subdir}: destination directory already exists — merging entries, not \
+                 moving the directory (a plain `mv` would nest it)"
+            ));
+            script_lines.push(format!(
+                "for e in {legacy}/{subdir}/*; do [ -e \"$e\" ] || continue; mv -n \"$e\" \
+                 {root_disp}/{subdir}/; done"
+            ));
+            script_lines.push(format!("rmdir {legacy}/{subdir} 2>/dev/null || true"));
+        } else {
+            script_lines.push(format!("# {subdir}: destination absent — plain move"));
+            script_lines.push(format!("mv -n {legacy}/{subdir} {root_disp}/{subdir}"));
+        }
     }
     if pins_present {
         script_lines.push(format!(
@@ -574,8 +592,10 @@ fn check_beat33_legacy_crew_dir() -> Check {
         ),
         hint: Some(format!(
             "darkmux still reads the legacy layout via the loader's dual-read fallback — no \
-             rush. When you're ready to flatten, copy-paste this (uses `mv -n` so existing \
-             canonical files are never overwritten):\n\n{script}\n\n\
+             rush. When you're ready to flatten, copy-paste this — each line is state-checked \
+             against your actual destination (a plain `mv -n` for an absent destination, a \
+             per-entry merge for one that already exists, never a directory nested into \
+             another):\n\n{script}\n\n\
              Note: if you set DARKMUX_CREW_DIR explicitly, this check assumes the env var \
              points at the post-flatten root (e.g. `~/.darkmux/`). If you instead set it \
              at the legacy `crew/` dir (`~/.darkmux/crew/`), the dual-read keeps working \
@@ -9935,6 +9955,53 @@ mod tests {
         assert!(
             !hint.contains("operator-private-stuff"),
             "mv script must not propose moving operator-authored subdirs"
+        );
+    }
+
+    /// (#1715) The exact reported corruption: a PARTIALLY-migrated operator
+    /// has content at BOTH `<root>/crew/missions` (legacy, still holding
+    /// entries) AND `<root>/missions` (already flattened, non-empty). The
+    /// naive `mv -n <legacy>/missions <root>/missions` line this check used
+    /// to emit unconditionally does not no-op here — `mv` moving a
+    /// directory onto an EXISTING directory nests the source inside it
+    /// (`<root>/missions/missions/`), which the loader never scans, so the
+    /// legacy entries become unreadable. `-n` only protects against
+    /// overwriting a FILE; it does nothing for this case. The remedy must
+    /// detect the existing destination directory and merge entries instead
+    /// of moving the directory wholesale.
+    #[serial_test::serial]
+    #[test]
+    fn beat33_legacy_crew_dir_merges_instead_of_nesting_when_destination_dir_already_exists() {
+        let guard = CrewRootGuard::new();
+        // Legacy side still has content.
+        std::fs::create_dir_all(guard.path().join("crew").join("missions")).unwrap();
+        std::fs::write(guard.path().join("crew").join("missions").join("m1.json"), "{}").unwrap();
+        // Destination ALREADY exists and is non-empty — the partially-
+        // migrated state the check exists for.
+        std::fs::create_dir_all(guard.path().join("missions")).unwrap();
+        std::fs::write(guard.path().join("missions").join("m2.json"), "{}").unwrap();
+
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        let hint = check.hint.expect("warn must carry an mv-script hint");
+        let flat = hint.replace('\n', " ");
+
+        // The corrupting line must NEVER appear when the destination
+        // directory already exists.
+        assert!(
+            !flat.contains(&format!(
+                "mv -n {}/missions {}/missions",
+                guard.path().join("crew").display(),
+                guard.path().display()
+            )),
+            "must not propose moving the whole directory onto an existing one (nests instead of \
+             merging): {flat}"
+        );
+        // Must propose a per-entry merge instead, scoped to the missions
+        // source glob.
+        assert!(
+            flat.contains(&format!("{}/missions/*", guard.path().join("crew").display())),
+            "must propose a per-entry merge loop for the colliding destination: {flat}"
         );
     }
 

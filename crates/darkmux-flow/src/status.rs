@@ -46,6 +46,19 @@ pub struct SinkSummary {
     pub composition: String,
 }
 
+/// (#1715) The retention ceiling every KNOWN reader of the flow stream
+/// enforces independently of `redis.maxlen` — darkmux-serve's
+/// `MAX_FLOW_FILE_RECORDS` (the disk-file read cap) and its `XREVRANGE …
+/// COUNT` literal (the Redis read cap) are both matched to this value BY
+/// DESIGN, not derived from it structurally (they live in a different
+/// crate this one can't depend on without inverting the dependency graph
+/// — darkmux-serve depends on darkmux-flow, not the reverse). A stream
+/// whose `maxlen` sits AT or ABOVE this cap can trim forever without
+/// losing a single record any reader could have retrieved — raising
+/// retention further only stores records nothing can read back. See
+/// `compute_near_max_len`'s doc for how this bounds `near_max_len`.
+pub const FLOW_READ_CAP_RECORDS: usize = 10_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisStatus {
     pub url: String,
@@ -63,8 +76,13 @@ pub struct RedisStatus {
     pub newest_ts: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_probe_ms: Option<u128>,
-    /// True when XLEN is within 5% of MAXLEN — warns the operator the
-    /// stream is about to start trimming old records.
+    /// (#1715) True when XLEN is within 5% of MAXLEN **and** MAXLEN is
+    /// below `FLOW_READ_CAP_RECORDS` — i.e. raising retention would
+    /// genuinely let a reader see more than it does today. A stream at or
+    /// above the read cap is the PERMANENT, EXPECTED steady state of any
+    /// active fleet (it will always be near/at MAXLEN), so that case no
+    /// longer sets this field — it used to, and fired forever, teaching
+    /// the operator that doctor's warnings are weather, not signal.
     pub near_max_len: bool,
 }
 
@@ -297,6 +315,31 @@ pub fn redact_url_creds(url: &str) -> String {
     format!("{scheme}://{masked_userinfo}@{host}{tail}")
 }
 
+/// (#1715) Whether the near-maxlen warning is genuinely actionable. Pure
+/// (no I/O) so the precedence logic is testable without a live Redis —
+/// the same split `pick_string`/`pick_parsed` use for their own
+/// precedence math.
+///
+/// Two conditions, both required:
+/// 1. `cap` is below `read_cap` — raising `cap` would actually let a
+///    reader see MORE records than it does today. At or above `read_cap`,
+///    every KNOWN reader is capped at `read_cap` regardless of retention,
+///    so raising `cap` further stores records nothing can read back.
+/// 2. XLEN is within 5% of `cap` — the stream is genuinely close to
+///    trimming records a reader could still have used.
+///
+/// Before #1715 only condition 2 gated the warning, so the OVERWHELMINGLY
+/// common configuration (`cap == read_cap`, the shipped default) warned
+/// PERMANENTLY: a stream at its cap is the steady state of any active
+/// fleet, and the suggested remedy ("raise DARKMUX_REDIS_MAXLEN") bought
+/// nothing in that configuration — the read cap capped it right back down.
+pub(crate) fn compute_near_max_len(cap: Option<usize>, xlen: Option<u64>, read_cap: usize) -> bool {
+    match (cap, xlen) {
+        (Some(cap), Some(len)) if cap > 0 && cap < read_cap => (len as f64) / (cap as f64) >= 0.95,
+        _ => false,
+    }
+}
+
 /// Probe Redis: open a connection, run XLEN + XREVRANGE for oldest/newest,
 /// time the round-trip. Returns the status + the list of distinct schema
 /// strings observed in the last 100 entries (for skew detection).
@@ -400,10 +443,7 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
 
     let last_probe_ms = start.elapsed().as_millis();
 
-    let near_max_len = match (cfg.max_len, xlen) {
-        (Some(cap), Some(len)) if cap > 0 => (len as f64) / (cap as f64) >= 0.95,
-        _ => false,
-    };
+    let near_max_len = compute_near_max_len(cfg.max_len, xlen, FLOW_READ_CAP_RECORDS);
 
     (
         RedisStatus {
@@ -722,6 +762,48 @@ fn collect_hooks_status() -> HooksStatus {
     let rules = darkmux_types::config_access::hooks_rules();
     let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
     build_hooks_status(enabled, &outbox_dir, &rules)
+}
+
+#[cfg(test)]
+mod near_max_len_tests {
+    use super::*;
+
+    /// (#1715) The exact live scenario reported: `maxlen == read_cap ==
+    /// 10000`, XLEN sitting right at/above it (the permanent steady state
+    /// of an active fleet). Before this fix, `compute_near_max_len`'s
+    /// predecessor warned here forever; raising `maxlen` buys nothing
+    /// because every known reader is independently capped at
+    /// `read_cap` — the warning must NOT fire.
+    #[test]
+    fn is_quiet_when_maxlen_matches_the_read_cap_even_at_full_saturation() {
+        assert!(!compute_near_max_len(Some(10_000), Some(10_002), 10_000));
+        assert!(!compute_near_max_len(Some(10_000), Some(10_000), 10_000));
+    }
+
+    /// A `maxlen` set ABOVE the read cap is even less actionable — the
+    /// operator already over-provisioned retention beyond what any reader
+    /// can use, so nearing that ceiling still isn't a real problem.
+    #[test]
+    fn is_quiet_when_maxlen_exceeds_the_read_cap() {
+        assert!(!compute_near_max_len(Some(20_000), Some(19_500), 10_000));
+    }
+
+    /// The genuine mismatch: `maxlen` BELOW the read cap means a reader
+    /// actually wants more than retention keeps — raising `maxlen` here
+    /// (up to the read cap) truly buys the operator something, so the
+    /// warning is real and must still fire once XLEN nears that lower cap.
+    #[test]
+    fn warns_when_maxlen_trails_the_read_cap_and_xlen_is_near_it() {
+        assert!(compute_near_max_len(Some(1_000), Some(960), 10_000));
+        assert!(!compute_near_max_len(Some(1_000), Some(500), 10_000), "not near yet");
+    }
+
+    #[test]
+    fn is_quiet_when_maxlen_or_xlen_is_unknown() {
+        assert!(!compute_near_max_len(None, Some(9_999), 10_000));
+        assert!(!compute_near_max_len(Some(1_000), None, 10_000));
+        assert!(!compute_near_max_len(Some(0), Some(1), 10_000), "cap=0 (unbounded) never warns");
+    }
 }
 
 #[cfg(test)]

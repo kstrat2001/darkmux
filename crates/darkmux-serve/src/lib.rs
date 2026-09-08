@@ -3925,7 +3925,10 @@ fn read_flow_records_from_redis(
         .arg("+")
         .arg("-")
         .arg("COUNT")
-        .arg(10000)
+        // (#1715) Was a bare `10000` literal, independent of the
+        // `MAX_FLOW_FILE_RECORDS` const defined below in this file —
+        // matched by convention, not enforced. Single-sourced now.
+        .arg(MAX_FLOW_FILE_RECORDS)
         .query(&mut conn)
         .with_context(|| format!("XREVRANGE on {stream}"))?;
     let entries = match raw {
@@ -3984,7 +3987,14 @@ fn read_flow_records_from_redis(
 /// the read stays constant-bounded even when a crash-looping producer emits
 /// a `dispatch error` bookend every second — #900's bound, not a second
 /// unbounded read.
-const MAX_FLOW_FILE_RECORDS: usize = 10_000;
+// (#1715) Single-sourced from darkmux-flow's `FLOW_READ_CAP_RECORDS` — the
+// doctor/`flow status` near-maxlen warning reasons about THIS value (is
+// `redis.maxlen` below the cap every known reader enforces), so a literal
+// here that could silently drift from that reasoning would quietly make
+// the warning's precondition wrong again. darkmux-flow can't depend back
+// on darkmux-serve (this crate depends on darkmux-flow, not the reverse),
+// so the constant lives there and this is a reference, not a duplicate.
+const MAX_FLOW_FILE_RECORDS: usize = darkmux_flow::FLOW_READ_CAP_RECORDS;
 
 /// Parse `<flows_dir>/<date>.jsonl` into a Vec of JSON values, keeping every
 /// dispatch-liveness bookend PLUS the newest `MAX_FLOW_FILE_RECORDS` of
