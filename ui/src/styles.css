@@ -203,7 +203,19 @@ body {
    longer holds. */
 .app-shell__sticky {
   position: sticky;
-  top: 0;
+  /* (#2264) `top: 0` IS the status-bar band under `viewport-fit=cover` +
+     `apple-mobile-web-app-status-bar-style: black-translucent` (index.html).
+     The masthead pads for the inset but SCROLLS AWAY — what replaces it at
+     the top of the viewport is this row, and its tabs are tap targets, so a
+     scrolled page put FLEET/CONSOLE/RUNS/MACHINE under the clock and the
+     Dynamic Island. Measured at 390x844 with a simulated 47px inset before
+     the fix: after `scrollTo(0, 400)` this row's top was 0.
+     Only the STUCK position moves: `top` on a sticky element does nothing
+     until the element would otherwise scroll past that threshold, so at rest
+     the row still sits flush under the masthead with no gap (asserted in
+     catalog.spec.js, both with and without an inset), and the inset is 0 on
+     every non-notched viewport, making this a no-op there. */
+  top: env(safe-area-inset-top, 0px);
   z-index: 30;
   display: flex;
   flex-wrap: wrap;
@@ -2313,13 +2325,22 @@ body {
   margin-top: 10px;
   overflow: hidden;
 }
-/* (#2077) `.panelout`/`.panelerr`/`.panelwarn` already scroll horizontally
-   (`overflow-x: auto` below) — a fixed-width CLI table wider than its box
-   was always reachable by touch-dragging the body. This cue is the missing
-   piece: mobile browsers hide the native scrollbar, so nothing signaled
-   that dragging would do anything. `ConsolePanel.tsx`'s `CliPanelView`
-   mounts it IFF the body's own `scrollWidth` measures past its
-   `clientWidth` — never shown for content that already fits.
+/* (#2077) `.panelout` scrolls horizontally (`overflow-x: auto` below) — a
+   fixed-width CLI table wider than its box was always reachable by
+   touch-dragging the body. This cue is the missing piece: mobile browsers
+   hide the native scrollbar, so nothing signaled that dragging would do
+   anything. `ConsolePanel.tsx`'s `CliPanelView` mounts it IFF the body both
+   SCROLLS (computed `overflow-x` is `auto`/`scroll`) and measures its own
+   `scrollWidth` past its `clientWidth` — never shown for content that
+   already fits.
+
+   Those two tests are not redundant. `.panelerr`/`.panelwarn` below are
+   `pre-wrap` with NO `overflow-x`, and an unbreakable stderr token (a
+   `sha256:…` digest, a long absolute path, a JSON error blob) still
+   overflows them — measured 685-882px of content in a 356px box at a 390px
+   viewport. But `overflow-x` is `visible` there and `.panelwrap` is
+   `overflow: hidden`, so the tail is CLIPPED and `scrollLeft` will not
+   move: cueing on those bodies would point at a gesture that does nothing.
 
    A normal-flow strip between `.panelchrome` and the body, NOT an overlay
    pinned over the content: an absolutely positioned version of this landed
