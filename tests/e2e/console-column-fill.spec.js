@@ -94,6 +94,44 @@ function panelBody(ansi) {
   };
 }
 
+// (#2077 review NIT 4) The cue is PHONE chrome. This is the inverted case,
+// and it is not hypothetical: the first version of this fix rendered the cue
+// at every width, and the parity goldens caught it — `console-mission-status`
+// gained a `scroll for more` line at Desktop Chrome's 1280px, changing this
+// viewer's frozen rendering spec for every desktop user as a side effect of a
+// phone fix. The fixture below is deliberately the SAME overflowing content
+// the phone test uses, at a desktop viewport: if the cue were width-blind it
+// would render here, so this test fails for exactly the reason the goldens
+// did, in a place that names the rule instead of diffing a text file.
+test.describe('(#2077) the scroll cue is phone chrome, not a global affordance', () => {
+  test.use({ viewport: { width: 1456, height: 900 } });
+
+  test('overflowing content on a desktop viewport renders no scroll cue', async ({ page }) => {
+    await page.route('**/panel/**', (route) =>
+      route.fulfill({ contentType: 'application/json', body: JSON.stringify(panelBody(RUN_LIST_ANSI)) }),
+    );
+    await page.goto(`${BASE}#lens=console`);
+    await page.waitForSelector('.panelout');
+    await page.waitForTimeout(300);
+
+    // Force the body to overflow at desktop width regardless of how wide the
+    // fixture happens to render, so this can never pass vacuously by the
+    // content simply fitting — which is the failure mode that would make it
+    // green while the cue was still width-blind.
+    const overflowing = await page.evaluate(() => {
+      const out = document.querySelector('.panelout');
+      out.style.width = '300px';
+      out.getBoundingClientRect();
+      window.dispatchEvent(new Event('resize'));
+      return out.scrollWidth > out.clientWidth + 1;
+    });
+    await page.waitForTimeout(300);
+    expect(overflowing, 'the body must actually overflow for this assertion to mean anything').toBe(true);
+
+    await expect(page.locator('.panelwrap__scrollcue')).toHaveCount(0);
+  });
+});
+
 test.describe('(#2077) console lens on a phone: wide panel output scrolls in its own box, never the page', () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
 

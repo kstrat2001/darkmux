@@ -6,6 +6,7 @@ import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelArgv, panelOpt
 import { fetchPanel } from "./fetchPanel";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { panelAgeLabel } from "./format";
+import { useIsMobile } from "../../hooks/useIsMobile";
 import { AnsiText } from "./ansi";
 import type { PanelResponse } from "../../types/handwritten";
 
@@ -300,13 +301,27 @@ function CliPanelView({
   // starts working for them with no change here. (Their clipped-tail problem
   // is real and pre-existing — it is a separate fix, not this one.)
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  //
+  // SCOPED TO PHONE CHROME (#2077 review NIT 4). The reported bug is a phone
+  // one, and desktop already has a discoverable affordance the phone lacks:
+  // a scrollbar that appears on hover/wheel. Rendering the cue at every width
+  // instead changed the console lens for every desktop user — caught not by
+  // judgment but by the parity goldens, which are this viewer's frozen
+  // rendering spec: `console-mission-status.txt` gained a `scroll for more`
+  // line at Desktop Chrome's 1280px. Widening this to desktop is a product
+  // decision that deserves its own change and its own golden update, not a
+  // side effect of a phone fix. Gated through the SAME `useIsMobile` every
+  // other phone/desktop branch in this app calls, so there is one definition
+  // of "phone chrome" (768px OR a coarse pointer, which keeps a rotated
+  // landscape phone on the phone side) rather than a second breakpoint here.
+  const isMobile = useIsMobile();
   const [scrollCueVisible, setScrollCueVisible] = useState(false);
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap) return undefined;
     const measure = () => {
       const body = wrap.querySelector<HTMLElement>(".panelout, .panelerr, .panelwarn");
-      if (!body) {
+      if (!isMobile || !body) {
         setScrollCueVisible(false);
         return;
       }
@@ -327,7 +342,7 @@ function CliPanelView({
     // introducing a second mechanism (a `ResizeObserver`) for the same job.
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
-  }, [loadedBody, errorMessage, stale]);
+  }, [loadedBody, errorMessage, stale, isMobile]);
 
   return (
     <div className="panelwrap" ref={wrapRef}>
