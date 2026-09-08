@@ -1003,6 +1003,8 @@ mod tests {
     #[test]
     fn the_shipped_example_names_no_retired_subsystem() {
         let lowered = EXAMPLE_PROFILES_JSON.to_ascii_lowercase();
+        // drift-guard:allow crew sync — this test ASSERTS the retirement; the
+        // drift-guard:allow darkmux swap — names here are the needles, not prose.
         for retired in ["openclaw", "crew sync", "darkmux swap"] {
             assert!(
                 !lowered.contains(retired),
