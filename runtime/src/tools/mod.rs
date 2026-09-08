@@ -36,7 +36,8 @@ pub mod workspace;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::lmstudio::{FunctionDef, ToolDef};
 use workspace::{resolve_read, resolve_write, DEFAULT_WORKSPACE};
@@ -592,29 +593,58 @@ fn execute_bash(raw_args: &str, workspace_root: &Path) -> Result<String> {
     // marker below, so a user command that happens to exit 124 isn't
     // mislabeled as a timeout when the wrapper was never used.
     let used_timeout = has_timeout_command();
-    let output = if used_timeout {
-        Command::new("timeout")
-            .arg(format!("{timeout_secs}"))
-            .arg(shell)
-            .arg("-c")
-            .arg(&args.command)
-            .current_dir(workspace_root)
-            .output()
+    let mut cmd = if used_timeout {
+        let mut c = Command::new("timeout");
+        c.arg(format!("{timeout_secs}")).arg(shell).arg("-c").arg(&args.command);
+        c
     } else {
-        Command::new(shell)
-            .arg("-c")
-            .arg(&args.command)
-            .current_dir(workspace_root)
-            .output()
-    }
+        let mut c = Command::new(shell);
+        c.arg("-c").arg(&args.command);
+        c
+    };
+    cmd.current_dir(workspace_root);
+
+    // (#2215) `timeout` (when present) only signals its DIRECT child — the
+    // shell — never anything the command backgrounds (`cmd &`, the shape
+    // `npx vitest` and friends leave behind: a live vite/esbuild dev-server
+    // process). And on a host with no `timeout` binary at all (the else
+    // branch above), NOTHING bounds the command. Either way a grandchild
+    // that inherits stdout/stderr keeps the pipe open long after the
+    // command itself is done, and a plain `.output()` blocks reading to
+    // EOF for as long as that grandchild lives — not the command's own
+    // bound. `run_bash_bounded` closes both gaps: it puts the whole
+    // invocation in its own process group and, once the command has
+    // exited (or our own deadline fires), kills the GROUP if the drains
+    // haven't reached EOF on their own within a short grace window.
+    let bounded = run_bash_bounded(
+        cmd,
+        Duration::from_secs(timeout_secs.saturating_add(BASH_GROUP_KILL_SLACK_SECS)),
+    )
     .with_context(|| format!("spawning {shell} for: {}", args.command))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&bounded.stdout);
+    let stderr = String::from_utf8_lossy(&bounded.stderr);
+    let exit_code = bounded.exit_code.unwrap_or(-1);
 
-    let timed_out_marker = if used_timeout && exit_code == 124 {
+    // Two DIFFERENT outcomes, two different things to tell the model.
+    //
+    // A timeout — the coreutils wrapper's own 124, or this runner's
+    // deadline stepping in where there was no `timeout` binary — means the
+    // command was still running when its time ran out.
+    //
+    // A leftover kill means the opposite: the command FINISHED, on its own,
+    // inside its bound, and something it left running kept the output
+    // stream open afterwards. Reporting that as "TIMED OUT" (which it was,
+    // before #2215's review) tells a model that its successful command
+    // failed, and invites it to retry work that already succeeded — so it
+    // gets its own marker, naming the one thing that avoids the kill.
+    let timed_out_marker = if (used_timeout && exit_code == 124) || bounded.forced_timeout {
         format!(" (TIMED OUT after {timeout_secs}s)")
+    } else if bounded.killed_leftovers {
+        " (this command finished, but a process it left running kept its output stream open \
+         and was killed. To leave a process running past the command, redirect its output: \
+         `mycmd >/dev/null 2>&1 &`)"
+            .to_string()
     } else {
         String::new()
     };
@@ -625,6 +655,286 @@ fn execute_bash(raw_args: &str, workspace_root: &Path) -> Result<String> {
          --- stderr ---\n{stderr}"
     ))
 }
+
+/// (#2215) Extra slack, beyond the tool's own `timeout_secs`, before
+/// [`run_bash_bounded`] forcibly steps in. Gives the coreutils `timeout`
+/// wrapper (when present) room to fire its OWN SIGTERM and report exit 124
+/// first — our own deadline is the backstop for the two cases it can't
+/// cover (no `timeout` binary at all; something the command backgrounded
+/// outliving the direct child `timeout` already killed), not a race against
+/// it.
+const BASH_GROUP_KILL_SLACK_SECS: u64 = 3;
+
+/// (#2215) How long, after the command's own process has exited (or our
+/// deadline in [`run_bash_bounded`] fires), the stdout/stderr drain threads
+/// get to reach EOF on their own before something the command left running
+/// is judged to be holding the pipe open and the whole process GROUP is
+/// killed to force it closed. A normal command's drains are already at (or
+/// a syscall away from) EOF the instant it exits — this is only reachable
+/// when a backgrounded grandchild inherited the pipe.
+const GRANDCHILD_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How often [`run_bash_bounded`]'s deadline loop polls `try_wait`.
+const BASH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// What one bounded bash invocation produced.
+struct BoundedBash {
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// `true` when THIS runner's own deadline (or the post-exit drain
+    /// grace) had to kill the process group directly — as opposed to the
+    /// coreutils `timeout` wrapper reporting its own exit 124. Distinct
+    /// from `used_timeout && exit_code == 124` in `execute_bash`: this
+    /// covers the case that wrapper cannot: no `timeout` binary at all.
+    ///
+    /// Means the command was STILL RUNNING when its time ran out —
+    /// distinct from [`killed_leftovers`](Self::killed_leftovers), which
+    /// is the command finishing on its own and something it left behind
+    /// being killed after it.
+    forced_timeout: bool,
+    /// `true` when the command exited ON ITS OWN, within its bound, but
+    /// something it left running still held the stdout/stderr pipe open
+    /// past [`GRANDCHILD_DRAIN_GRACE`] and had to be killed — the #2215
+    /// mechanism. The command itself did NOT time out; conflating the two
+    /// reports `exit: 0 (TIMED OUT after 1s)` for a command that succeeded
+    /// in milliseconds, which is a false statement to the model reading
+    /// this tool result.
+    killed_leftovers: bool,
+}
+
+/// Which pipe a drain thread is reading — the two have different types and
+/// this keeps the one drain body shared between them. Mirrors
+/// `darkmux-crew`'s `bounded_command::DrainSource` — same shape, same
+/// reasoning, duplicated rather than shared because `runtime/` is a
+/// separate, non-workspace crate built into the container image and does
+/// not depend on the host-side crew crates.
+enum BashDrainSource {
+    Out(std::process::ChildStdout),
+    Err(std::process::ChildStderr),
+}
+
+/// (#2215) Run `cmd` with a hard deadline, in its OWN process group, so a
+/// backgrounded grandchild that inherits its stdout/stderr can never hold
+/// `execute_bash` hostage past the tool's own timeout.
+///
+/// Mechanism (same shape as `darkmux-crew`'s `bounded_command::run_bounded`,
+/// the sibling fix for the identical class of bug at the step-command
+/// layer, #2310/#2361): `spawn` + `try_wait` polling, stdout/stderr drained
+/// on background threads into shared buffers (never `read_to_end`/`.output()`
+/// directly — that call reads to EOF, which is exactly the hang this exists
+/// to close), and a hard kill of the whole process GROUP — not just the
+/// spawned pid.
+///
+/// The kill fires on either of two conditions, which the returned
+/// [`BoundedBash`] keeps DISTINCT because they mean opposite things to the
+/// model reading the tool result:
+///
+/// - `deadline` elapses with the command still running → `forced_timeout`.
+///   Killed immediately, before the drain grace: an EOF cannot arrive while
+///   the command that holds the pipe is still alive, so waiting first would
+///   only let it run further past its bound.
+/// - the command exits ON ITS OWN and the drains still haven't reached EOF
+///   within [`GRANDCHILD_DRAIN_GRACE`] → `killed_leftovers`. The command
+///   succeeded; something it left running is holding the pipe.
+fn run_bash_bounded(mut cmd: Command, deadline: Duration) -> Result<BoundedBash> {
+    use std::io::Read;
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Moves the CHILD into a NEW process group of its own (pgid ==
+        // its own pid) — never darkmux-runtime's own group. Every process
+        // the command forks (the shell, `timeout`, anything backgrounded)
+        // inherits this same group by default, which is what lets a single
+        // `kill -<pgid>` below reach a grandchild the command never told us
+        // about.
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
+    for (pipe, buf) in [
+        (child.stdout.take().map(BashDrainSource::Out), out_buf.clone()),
+        (child.stderr.take().map(BashDrainSource::Err), err_buf.clone()),
+    ] {
+        let tx = eof_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(src) = pipe {
+                let mut reader: Box<dyn Read + Send> = match src {
+                    BashDrainSource::Out(p) => Box::new(p),
+                    BashDrainSource::Err(p) => Box::new(p),
+                };
+                let mut chunk = [0u8; 8192];
+                while let Ok(n) = reader.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut b) = buf.lock() {
+                        b.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+            // The receiver may already be gone (a prior EOF already
+            // satisfied every wait this function does) — never panic here.
+            let _ = tx.send(());
+        });
+    }
+    drop(eof_tx);
+
+    // Poll for the command's OWN exit, up to `deadline`. `Ok(None)` from
+    // `try_wait` just means "still running"; `Err` (rare — e.g. the pid
+    // already reaped from under us) is treated the same as "not exited",
+    // since the deadline/kill path below is safe to run either way.
+    let started = Instant::now();
+    let mut exit_status = None;
+    let mut forced_timeout = false;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            exit_status = Some(status);
+            break;
+        }
+        if started.elapsed() >= deadline {
+            forced_timeout = true;
+            break;
+        }
+        std::thread::sleep(BASH_POLL_INTERVAL);
+    }
+
+    if forced_timeout {
+        // The command is STILL RUNNING and out of time. Kill the group
+        // FIRST — waiting out `GRANDCHILD_DRAIN_GRACE` before killing
+        // would be waiting for an EOF that cannot arrive (the live
+        // command is itself holding the pipe), i.e. paying the grace to
+        // learn something already known, and letting the command run that
+        // much past its own bound. The pid has NOT been reaped here, so
+        // it is safe to signal directly as well as through the group.
+        kill_bash_group(pid, true);
+        reap_bounded(&mut child, &mut exit_status);
+    }
+
+    // Give the drains a short, bounded grace window to reach EOF on their
+    // own — the ordinary case, where nothing else was left running (and,
+    // after the kill above, the timed-out case too).
+    let mut eofs_seen = 0u8;
+    let grace_deadline = Instant::now() + GRANDCHILD_DRAIN_GRACE;
+    while eofs_seen < 2 {
+        let remaining = grace_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match eof_rx.recv_timeout(remaining) {
+            Ok(()) => eofs_seen += 1,
+            Err(_) => break,
+        }
+    }
+
+    // Reaching here with a drain still open means SOMETHING the command
+    // left running is holding the pipe (the #2215 mechanism) — killing
+    // only `pid` would never reach it, because it is a grandchild that
+    // re-parented away the moment the shell exited. The GROUP is ours (the
+    // child was moved into its own above), so this reaches exactly what
+    // the command left behind and nothing else.
+    let killed_leftovers = eofs_seen < 2 && !forced_timeout;
+    if eofs_seen < 2 {
+        // `pid` itself is already reaped by now (`try_wait` above, or
+        // `reap_bounded`), so signal ONLY the group: the pgid stays
+        // reserved while any member lives, and the member holding the pipe
+        // is exactly that. The bare pid, by contrast, is free to be
+        // recycled once reaped — so it is deliberately NOT signalled here,
+        // the one place this runner is stricter than its `darkmux-crew`
+        // sibling.
+        kill_bash_group(pid, false);
+        // The kill releases the pipe; the drains should hit EOF promptly
+        // now. Bounded wait so a kill that somehow reached nothing can't
+        // reintroduce an unbounded hang — whatever was captured before
+        // this point is still returned.
+        let final_deadline = Instant::now() + Duration::from_secs(1);
+        while eofs_seen < 2 {
+            let remaining = final_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match eof_rx.recv_timeout(remaining) {
+                Ok(()) => eofs_seen += 1,
+                Err(_) => break,
+            }
+        }
+    }
+
+    let stdout = out_buf.lock().map(|b| b.clone()).unwrap_or_default();
+    let stderr = err_buf.lock().map(|b| b.clone()).unwrap_or_default();
+    Ok(BoundedBash {
+        exit_code: exit_status.and_then(|s| s.code()),
+        stdout,
+        stderr,
+        forced_timeout,
+        killed_leftovers,
+    })
+}
+
+/// Reap a child we have just killed, bounded — the group is dead or dying,
+/// so this resolves within a poll tick or two. Bounded rather than
+/// `child.wait()` because an unbounded wait here is the same shape of
+/// hazard this whole module exists to remove: a process wedged in
+/// uninterruptible sleep would hold the dispatch open forever.
+fn reap_bounded(child: &mut std::process::Child, exit_status: &mut Option<std::process::ExitStatus>) {
+    let reap_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < reap_deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            *exit_status = Some(status);
+            return;
+        }
+        std::thread::sleep(BASH_POLL_INTERVAL);
+    }
+}
+
+/// SIGKILL the process group `pid` leads (`kill(-pid, SIGKILL)`), and —
+/// only when `also_signal_pid` says the child has NOT yet been reaped —
+/// the pid itself as a backstop for a child whose `process_group(0)` did
+/// not take, which is still in darkmux-runtime's OWN group and therefore
+/// unreachable by the negative-pid signal. (Signalling `-getpgrp()` to
+/// cover that case would take the runtime down with it, so it is never
+/// done.)
+///
+/// The signal goes through `kill(2)` directly rather than shelling out to
+/// a `kill` BINARY, for two reasons. (1) The binary is a dependency on the
+/// IMAGE, not on this crate: the runtime image is alpine, so `kill` is a
+/// busybox applet whose handling of a negative pid is a property of that
+/// applet, not of POSIX — and a BYO `--image` (#703) may ship a different
+/// one, or none. A group kill that silently reaches nothing is exactly the
+/// #2215 bug back again, just quieter. (2) This is the one code path that
+/// has to work when the container is at its `--pids-limit`, where spawning
+/// a helper process is itself what fails. Declaring the symbol keeps the
+/// runtime's deliberately tiny dep set unchanged — `std` links libc on
+/// every unix target, so `kill` is already there.
+#[cfg(unix)]
+fn kill_bash_group(pid: u32, also_signal_pid: bool) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    let pid = pid as i32;
+    // SAFETY: `kill(2)` takes two integers and returns one; there is no
+    // memory involved. A pid that no longer exists simply returns ESRCH,
+    // which is why both calls are unconditional-and-ignored.
+    unsafe {
+        kill(-pid, SIGKILL);
+        if also_signal_pid {
+            kill(pid, SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_bash_group(_pid: u32, _also_signal_pid: bool) {}
 
 /// Probe whether the `timeout` command is available. Alpine has it via
 /// coreutils-default-symlinks; stock macOS doesn't.
@@ -1157,6 +1467,187 @@ mod tests {
             result.contains(&expected_pwd.to_string_lossy().to_string()),
             "expected pwd output to contain {expected_pwd:?}, got: {result}"
         );
+    }
+
+    /// (#2215) A command that backgrounds a detached grandchild (`cmd &`,
+    /// e.g. `npx vitest` leaving a vite/esbuild dev-server process behind)
+    /// hangs `execute_bash` for as long as that grandchild lives, REGARDLESS
+    /// of `timeout_seconds` — not just past it, indefinitely.
+    ///
+    /// Mechanism: the grandchild inherits the shell's stdout/stderr file
+    /// descriptors. `timeout` (the wrapper `execute_bash` shells out to on
+    /// Linux) only signals its DIRECT child — the shell — never the whole
+    /// process group, so killing the shell (or the shell simply finishing,
+    /// as it does here with no `timeout` binary on the macOS test host —
+    /// `has_timeout_command()` is false) leaves the grandchild's copy of the
+    /// write end of the pipe open. `Command::output()` reads stdout/stderr
+    /// to EOF before returning, and EOF never arrives until EVERY process
+    /// holding the write end closes it — so the read blocks for the
+    /// grandchild's full lifetime, not the command's.
+    ///
+    /// This is the runtime-side mechanism behind #2215's field report: a
+    /// dispatch wedged with `darkmux-runtime` (PID 1) blocked and six zombie
+    /// `timeout` children (already exited, unreaped because the parent never
+    /// returned from this exact read), on tool-heavy dispatches running
+    /// `npx vitest`. Bounded to 3s here with `sleep 5` as the stand-in
+    /// grandchild — proportionally identical to the field case's minutes-long
+    /// dev-server holds, just fast enough to run in CI.
+    ///
+    /// Run on a background thread with a bounded `recv_timeout` so a
+    /// reproduction of the bug fails LOUDLY (the assertion below) instead of
+    /// hanging the test binary forever.
+    #[test]
+    fn bash_does_not_hang_past_a_backgrounded_grandchild_holding_the_pipe() {
+        let ws = fresh_workspace();
+        let raw = serde_json::json!({
+            "command": "( sleep 5 & ) ; echo parent-done",
+            "timeout_seconds": 1,
+        })
+        .to_string();
+
+        let ws_path = ws.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = execute_bash(&raw, &ws_path);
+            // The receiver may already have given up (test failed and
+            // moved on) — a dropped receiver must not panic this thread.
+            let _ = tx.send(result);
+        });
+
+        let result = rx.recv_timeout(std::time::Duration::from_secs(3));
+        assert!(
+            result.is_ok(),
+            "execute_bash did not return within 3s for a 1s bash timeout — it is blocked \
+             reading stdout to EOF past a backgrounded grandchild's lifetime, exactly the \
+             #2215 field mechanism (a `cmd &` inside the tool call outlives the killed \
+             direct child and keeps the pipe open)"
+        );
+    }
+    // ─── (#2215 review) executed bound-and-kill verification ──────────────
+
+    /// A sleep duration no other process on this machine is using — the
+    /// test binary's own pid as a fractional part, so a leftover from an
+    /// EARLIER run (or another worktree's suite) can never satisfy the
+    /// `pgrep` these tests do. Mirrors `darkmux-crew`'s `bounded_command`
+    /// tests, which prove the same property for the step-command layer.
+    #[cfg(unix)]
+    fn sleep_marker(tag: u32) -> String {
+        format!("221{tag}.{}", std::process::id())
+    }
+
+    /// Surviving pids for `sleep <marker>`, retried for up to ~3s — the
+    /// group kill is delivered synchronously but the kernel reaps
+    /// asynchronously. Empty string = nothing left.
+    #[cfg(unix)]
+    fn sleep_survivors(m: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let found = Command::new("pgrep")
+                .args(["-f", &format!("sleep {m}")])
+                .output()
+                .expect("pgrep must be available");
+            let out = String::from_utf8_lossy(&found.stdout).trim().to_string();
+            if out.is_empty() || std::time::Instant::now() >= deadline {
+                return out;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// (#2215) The bound RETURNS, and the process it left behind is GONE.
+    /// Returning promptly alone would still leak the grandchild — and a
+    /// leak inside a `--pids-limit=512` container is the same wedge one
+    /// dispatch later. The marker is a unique sleep duration so `pgrep`
+    /// can only match this test's own descendant.
+    #[test]
+    #[cfg(unix)]
+    fn the_group_kill_reaches_the_grandchild_that_held_the_pipe() {
+        let ws = fresh_workspace();
+        let m = sleep_marker(1);
+        let raw = serde_json::json!({
+            "command": format!("sleep {m} & echo parent-done"),
+            "timeout_seconds": 1,
+        })
+        .to_string();
+
+        let started = std::time::Instant::now();
+        let out = execute_bash(&raw, ws.path()).expect("execute_bash must return");
+        let elapsed = started.elapsed();
+        eprintln!("--- returned in {elapsed:?} ---\n{out}\n---");
+
+        let left = sleep_survivors(&m);
+        let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
+
+        assert!(elapsed < Duration::from_secs(8), "took {elapsed:?}");
+        assert!(out.contains("parent-done"), "the command's own output is still captured: {out}");
+        assert!(left.is_empty(), "the pipe-holding grandchild survived the group kill: {left}");
+        // The command SUCCEEDED — it must not be reported to the model as
+        // a timeout, which is what conflating the two outcomes did before
+        // this review: `exit: 0 (TIMED OUT after 1s)` for a command that
+        // finished in milliseconds, inviting a retry of work that worked.
+        assert!(out.starts_with("exit: 0"), "the command's own exit is reported: {out}");
+        assert!(
+            !out.contains("TIMED OUT"),
+            "a command that finished inside its bound must not be labelled a timeout: {out}"
+        );
+        assert!(
+            out.contains("left running kept its output stream open"),
+            "and the model is told what actually happened, and how to avoid it: {out}"
+        );
+    }
+
+    /// The bound must not be trigger-happy: a command that legitimately
+    /// runs for a while, emits output the whole time, and finishes INSIDE
+    /// its own `timeout_seconds` is never killed and never marked timed
+    /// out. Without this, making the runner kill unconditionally would
+    /// leave the test above green.
+    #[test]
+    #[cfg(unix)]
+    fn a_productive_command_inside_its_own_timeout_is_neither_killed_nor_marked() {
+        let ws = fresh_workspace();
+        let raw = serde_json::json!({
+            "command": "for i in 1 2 3 4 5 6; do echo tick-$i; sleep 0.3; done",
+            "timeout_seconds": 20,
+        })
+        .to_string();
+        let started = std::time::Instant::now();
+        let out = execute_bash(&raw, ws.path()).expect("execute_bash must return");
+        let elapsed = started.elapsed();
+        assert!(out.starts_with("exit: 0"), "a productive command exits cleanly: {out}");
+        assert!(!out.contains("TIMED OUT"), "and is never marked timed out: {out}");
+        assert!(out.contains("tick-6"), "with its full output captured: {out}");
+        assert!(elapsed >= Duration::from_millis(1500), "it really did run for a while: {elapsed:?}");
+    }
+
+    /// (#2215) The runner's OWN deadline is a real bound even with no
+    /// `timeout` binary in PATH (stock macOS; any image whose busybox was
+    /// built without the applet) — the case where, before this fix,
+    /// NOTHING bounded the command at all. The group kill must reach the
+    /// direct child too, not only what it forked.
+    #[test]
+    #[cfg(unix)]
+    fn with_no_timeout_binary_the_runners_own_deadline_still_kills_the_command() {
+        if has_timeout_command() {
+            // On a host that HAS `timeout`, the coreutils wrapper fires
+            // first and this test would be measuring that instead.
+            return;
+        }
+        let ws = fresh_workspace();
+        let m = sleep_marker(2);
+        let raw = serde_json::json!({
+            "command": format!("sleep {m}"),
+            "timeout_seconds": 1,
+        })
+        .to_string();
+        let started = std::time::Instant::now();
+        let out = execute_bash(&raw, ws.path()).expect("execute_bash must return");
+        let elapsed = started.elapsed();
+        let left = sleep_survivors(&m);
+        let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
+        eprintln!("--- returned in {elapsed:?} ---\n{out}\n---");
+        assert!(elapsed < Duration::from_secs(10), "the deadline must bound it, took {elapsed:?}");
+        assert!(out.contains("TIMED OUT"), "and say so: {out}");
+        assert!(left.is_empty(), "the command survived its own deadline: {left}");
     }
 
     // ─── create_finding: harness-captured context (#1959) ─────────────────

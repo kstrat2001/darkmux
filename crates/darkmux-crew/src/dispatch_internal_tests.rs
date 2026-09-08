@@ -4132,6 +4132,151 @@
         );
     }
 
+    /// (#2215 diagnosis) Every reset test above drives `TailerState`
+    /// synchronously, in the test's own thread, with a hand-set deadline —
+    /// none of them exercise the REAL production shape: `run_tailer` on its
+    /// own background thread, polling a file on its own cadence, racing
+    /// real wall-clock time against the shared mutex the watchdog thread
+    /// reads independently. This is the piece #2215's field report could
+    /// not directly inspect (the watchdog thread's own liveness), so it is
+    /// worth proving in isolation even though it cannot reproduce a
+    /// multi-machine, multi-hour field incident.
+    ///
+    /// Drives the real `run_tailer` loop for ~1.2s against a real file with
+    /// a 400ms inactivity budget: an initial `tool.completed` primes the
+    /// deadline, then the file goes silent. Asserts (a) once the budget
+    /// elapses with nothing new written, the shared deadline is genuinely in
+    /// the past — the exact condition the watchdog's `now >= deadline` check
+    /// polls for — and stays there (nothing resets it out from under a
+    /// silent dispatch), and (b) a live append afterward still reaches the
+    /// running tailer thread and pushes the deadline forward again, proving
+    /// the mutex handoff works under real concurrency, not just in a
+    /// single-threaded synchronous call.
+    ///
+    /// This test passing does not explain #2215's field occurrence — it
+    /// rules out "the mutex-based reset/expiry mechanism itself is racy or
+    /// wrong," narrowing the search toward the runtime-side stall (a tool
+    /// call blocked past its own bound, `runtime/src/tools/mod.rs`) and/or
+    /// something specific to the live host's environment that a synthetic
+    /// single-process test cannot observe (thread scheduling, App Nap-style
+    /// throttling of a backgrounded process, or a defect in the docker-kill
+    /// leg — already covered separately by the `kill_container_persistently`
+    /// / `watchdog_finalize_kill` fake-docker tests).
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn run_tailer_real_thread_deadline_expires_on_silence_and_still_resets_on_live_activity() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        std::fs::create_dir_all(traj_path.parent().unwrap()).unwrap();
+
+        let inactivity_secs_equiv = Duration::from_millis(400);
+        // `run_tailer` takes whole seconds; round up so the real deadline
+        // is at least the sub-second budget this test actually waits on.
+        let inactivity_secs = 1u64;
+        let deadline = Arc::new(Mutex::new(Instant::now() + inactivity_secs_equiv));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let tailer_deadline = Arc::clone(&deadline);
+        let tailer_stop = Arc::clone(&stop_flag);
+        let out_dir = tmp.path().to_path_buf();
+        let handle = thread::spawn(move || {
+            run_tailer(
+                out_dir,
+                "sess-real-watchdog".into(),
+                "coder".into(),
+                "darkmux:qwen3.6".into(),
+                None,
+                None,
+                None,
+                tailer_stop,
+                tailer_deadline,
+                inactivity_secs,
+                None,
+                None,
+            )
+        });
+
+        // Prime the deadline with a REAL proof-of-work event, through the
+        // REAL running tailer thread (not a synchronous handle_event call).
+        {
+            let mut f = std::fs::File::create(&traj_path).unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"bash","args_chars":10,"result_chars":10,"ok":true}}"#
+            )
+            .unwrap();
+        }
+        // Give the tailer's own poll cadence room to pick the line up
+        // before we start timing the silence window. TAILER_POLL_INTERVAL
+        // is 250ms and the write can land just after a poll began, so the
+        // worst case is ~250ms plus the read+parse — 300ms left a ~50ms
+        // margin on a loaded machine, which is a flake, not a bound.
+        thread::sleep(Duration::from_millis(600));
+        let primed_deadline = *lock_deadline(&deadline);
+        assert!(
+            primed_deadline > Instant::now(),
+            "the real tailer thread must have picked up the tool.completed and pushed the \
+             deadline into the future before the silence window starts"
+        );
+
+        // Now go silent for longer than the inactivity budget, with NO
+        // further trajectory writes — exactly the field report's "13+
+        // minutes of nothing" shape, compressed to test scale.
+        thread::sleep(Duration::from_millis(1200));
+
+        let expired_deadline = *lock_deadline(&deadline);
+        assert!(
+            Instant::now() >= expired_deadline,
+            "after real silence past the inactivity budget, the shared deadline must be in \
+             the past — this is the exact condition the production watchdog thread polls \
+             for (`now >= deadline`) to decide whether to kill; if this is still in the \
+             future, something reset it with no corresponding proof-of-work write, which \
+             would explain #2215's watchdog never firing"
+        );
+
+        // A live append AFTER the silence window must still reach the
+        // running thread and push the deadline forward again — proves the
+        // mutex handoff isn't a one-shot fluke of the priming write above.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&traj_path).unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"tool.completed","seq":2,"tool_seq":1,"tool_name":"bash","args_chars":10,"result_chars":10,"ok":true}}"#
+            )
+            .unwrap();
+        }
+        thread::sleep(Duration::from_millis(600));
+        let revived_deadline = *lock_deadline(&deadline);
+        assert!(
+            revived_deadline > Instant::now(),
+            "a live tool.completed written after the silence window must still reach the \
+             running tailer thread and push the deadline back into the future"
+        );
+
+        stop_flag.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+    }
+
     /// (#469) Backward-compat: a `tool.completed` event with no `ok`
     /// field (pre-#469 trajectory) is treated as success and resets the
     /// deadline, so old data behaves as it did before the field landed.
