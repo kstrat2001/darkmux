@@ -3236,6 +3236,491 @@ fn radio_sigterm_mid_dispatch_reaps_curl() {
     assert_no_surviving_remote_curl(child.id(), "radio");
 }
 
+/// (#2477) A best-effort SIGKILL, at drop time, on a `mission launch`
+/// child this test spawned only INDIRECTLY (`darkmux radio` spawns it,
+/// never this test) and drives against a stub server that never answers —
+/// so if the forwarding under proof here regresses, the child keeps
+/// running against that hang for its own default (3600s) step timeout. A
+/// live pid at drop time, whether from a genuine regression or a panicked
+/// assertion mid-test, must not sit in the background for an hour.
+/// Cleanup only, never part of the proof (the proof is the mission's own
+/// terminal record, read before this guard ever drops).
+///
+/// **Why it re-checks the command line before signalling.** This test does
+/// not own the pid the way `Child::id()` owns one: by drop time `darkmux
+/// radio` has exited, so the launcher is an orphan reparented to `launchd`
+/// — which reaps it the moment it exits, freeing the pid for reuse. A bare
+/// `kill -KILL <remembered pid>` here could therefore land on an unrelated
+/// process on the developer's own machine, with their privileges. Killing
+/// only a pid whose CURRENT command line still names this test's unique
+/// config id closes that to a window in which a recycled pid would have to
+/// be running a command containing `radio-forward-signal-test`.
+struct KillOnDrop {
+    pid: Option<u32>,
+    marker: &'static str,
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid else { return };
+        if !cmdline_of(pid).is_some_and(|c| c.contains(self.marker)) {
+            return;
+        }
+        let _ = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+    }
+}
+
+/// The current command line of `pid`, or `None` if it is gone. `ps` prints
+/// nothing (and a non-zero status) for a pid that does not exist, which is
+/// the "already gone" answer every caller here wants.
+fn cmdline_of(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps").args(["-o", "command=", "-p", &pid.to_string()]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Poll for the direct child of `parent_pid` whose command line contains
+/// `marker` — the `mission launch` process `darkmux radio` spawns, which
+/// this test never gets a `Child` handle to directly (only `radio_cli.rs`'s
+/// own `spawn_mission_launch` does).
+///
+/// **Parentage first, marker second, and the order matters.** An earlier
+/// cut searched by `pgrep -f <marker>` alone. That finds a matching process
+/// anywhere on the machine — including one belonging to a SIBLING checkout
+/// of this repo running this same test concurrently, which is an ordinary
+/// state on this developer's machine. It would then have been that other
+/// run's launcher this test measured and (via [`KillOnDrop`]) killed.
+/// `pgrep -P` restricts the search to processes this test's own `darkmux
+/// radio` actually forked, so the answer can only ever be ours.
+fn find_child_pid_of(parent_pid: u32, marker: &str, timeout: std::time::Duration) -> Option<u32> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(out) = std::process::Command::new("pgrep").args(["-P", &parent_pid.to_string()]).output() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            let found = s
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .find(|pid| cmdline_of(*pid).is_some_and(|c| c.contains(marker)));
+            if found.is_some() {
+                return found;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Poll `mission.json` until its `status` reaches `want`, or `timeout`
+/// elapses; returns the LAST value read either way, so a failing assertion
+/// can print what was actually on disk.
+///
+/// **Why a poll and not a single read.** The child's finalize is
+/// deliberately asynchronous to radio's own exit (`radio_cli.rs`'s
+/// `forward_signal_and_wait` bounds only how long RADIO waits, and never
+/// forces the child down when that bound expires — a `SIGKILL` there would
+/// destroy the very finalize this test asserts). On a loaded machine the
+/// child's `save_json` fsyncs can outlast radio's grace window, so reading
+/// once at the instant radio exits races a finalize that is still in
+/// flight. Polling asserts the CONTRACT (the child was told to stop and
+/// therefore finalizes) rather than an incidental ordering between two
+/// processes.
+fn wait_for_mission_status(mission_json_path: &std::path::Path, want: &str, timeout: std::time::Duration) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = serde_json::Value::Null;
+    loop {
+        if let Ok(text) = fs::read_to_string(mission_json_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if v["status"] == want {
+                    return v;
+                }
+                last = v;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// (#2477) The routing seat's own stub — distinct from `RespondingStubServer`
+/// (a fixed "ack") because the shape it must produce is dictated by
+/// `radio.rs`'s own parser (`validate_router_output`): a fenced ```json
+/// block naming a `command` the catalog advertises. Always answers the SAME
+/// canned decision, regardless of what's asked — this test only ever routes
+/// one message to one command.
+fn start_route_decision_stub(command: &str) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the route-decision stub");
+    let port = listener.local_addr().unwrap().port();
+    let content = format!("```json\n{{\"command\": \"{command}\", \"args\": \"\"}}\n```");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let content = content.clone();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": content } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })
+                .to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    port
+}
+
+/// (#2477) `kill <pid>` (SIGTERM), TARGETED at `darkmux radio`'s OWN pid —
+/// never the foreground process group — while it has already routed and
+/// spawned `darkmux mission launch <config>` as a child, and that child is
+/// itself blocked mid-dispatch (a real `curl` call to a stub endpoint that
+/// never answers).
+///
+/// This is the exact gap #2463 named and left for its own test: #2463 made
+/// radio itself honor a targeted kill (exit within 5s instead of hanging
+/// for the launch's whole duration), but the LAUNCHED CHILD was left to its
+/// own signal handling — a targeted kill on radio's pid never reaches it
+/// (unlike a real Ctrl-C, which hits the whole foreground group), so the
+/// mission kept running and finalized on its own schedule, long after radio
+/// itself had already exited.
+///
+/// The behavior this proves: radio forwards its own caught signal to the
+/// child BEFORE exiting, so the child's own `LaunchFinalizeGuard`
+/// (`launch_guard.rs`) runs and writes a terminal record — the mission
+/// reaches `finalized` (never left `active`), with its phase `abandoned`
+/// (never left `active` either). Two DIFFERENT profiles keep the routing
+/// call (radio-router, unmapped -> `default_profile`) and the launched
+/// dispatch (`dialectic-judge`, pinned via the step's OWN `profile_name`)
+/// pointed at two DIFFERENT stub servers, so the router call can answer
+/// immediately (routing this test's message to the launch target) while the
+/// LAUNCHED dispatch hangs (giving this test a real mid-dispatch window to
+/// signal against) — without either dispatch racing the other's server.
+#[test]
+fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
+    let route_port = start_route_decision_stub("radio-forward-signal-test");
+    let hang = HangingStubServer::start();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        format!(
+            r#"{{
+                "profiles": {{
+                    "route-stub": {{
+                        "models": [
+                            {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{route_port}"}}}}
+                        ]
+                    }},
+                    "hang-stub": {{
+                        "models": [
+                            {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{}"}}}}
+                        ]
+                    }}
+                }},
+                "default_profile": "route-stub"
+            }}"#,
+            hang.port
+        ),
+    )
+    .unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    // Advertised via `panel` (so radio's catalog names it) and classified
+    // `Launch` (so it spawns a `mission launch` subprocess, not an
+    // in-process ephemeral run) by having a `dispatch.internal` step — the
+    // SAME shape `mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl`
+    // above proves finalizes correctly on a direct SIGTERM. `dialectic-judge`
+    // is tool-less, so it takes the light single-shot hosted `curl` path
+    // (no Docker, no image). Its OWN `profile_name` pins it to the "hang"
+    // stub, independent of `default_profile` (which the routing call uses).
+    let config_json = r#"{
+        "id": "radio-forward-signal-test",
+        "name": "Radio Forward Signal Test",
+        "schema_version": "3.4",
+        "panel": { "description": "test-only launch target for #2477's forwarding proof" },
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{
+                    "id": "s1",
+                    "kind": "dispatch.internal",
+                    "config": { "role_id": "dialectic-judge", "message": "hang please", "profile_name": "hang-stub" }
+                }]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("radio-forward-signal-test.json"), config_json).unwrap();
+
+    let mut radio_child = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .args(["radio", "please help me with something"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux radio");
+    let radio_pid = radio_child.id();
+
+    assert!(
+        hang.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "the launched mission's dispatch never reached the hang stub within 20s — either \
+         routing never resolved to a Launch, or the launched child never dispatched"
+    );
+
+    // Belt-and-suspenders cleanup from here on, regardless of how the rest
+    // of this test ends (a passing assertion, a panicking one, or a
+    // deliberate RED run with the forwarding fix reverted).
+    let launched_pid =
+        find_child_pid_of(radio_pid, "radio-forward-signal-test", std::time::Duration::from_secs(5));
+    let _cleanup = KillOnDrop { pid: launched_pid, marker: "radio-forward-signal-test" };
+    assert!(
+        launched_pid.is_some(),
+        "no `mission launch radio-forward-signal-test` child of radio (pid {radio_pid}) was found \
+         \u{2014} the rest of this test would be measuring nothing"
+    );
+
+    assert!(
+        radio_child.try_wait().unwrap().is_none(),
+        "darkmux radio must still be running (waiting on the launched child) before SIGTERM"
+    );
+
+    let kill_status =
+        std::process::Command::new("kill").args(["-TERM", &radio_pid.to_string()]).status().expect("running kill -TERM");
+    assert!(kill_status.success(), "kill -TERM itself must succeed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let exit_status = loop {
+        if let Some(status) = radio_child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "darkmux radio did not exit within 10s of a TARGETED SIGTERM on its own pid \
+             (#2477 regression — it must forward the signal and wait a bounded grace \
+             window, not hang indefinitely)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a signal-interrupted radio invocation must not exit 0");
+
+    // The core assertion: the LAUNCHED CHILD's own terminal record exists —
+    // never provable by radio's own exit code, which #2463 already made
+    // well-behaved without any forwarding at all.
+    let missions_dir = home.path().join("missions");
+    let mission_id = fs::read_dir(&missions_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", missions_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .next()
+        .expect("exactly one mission must have been minted by the launched child");
+
+    let mission_json = wait_for_mission_status(
+        &missions_dir.join(&mission_id).join("mission.json"),
+        "finalized",
+        std::time::Duration::from_secs(30),
+    );
+    assert_eq!(
+        mission_json["status"], "finalized",
+        "a targeted SIGTERM on radio's own pid must be FORWARDED to the launched child so \
+         its own LaunchFinalizeGuard runs — the mission must never be left `active` just \
+         because radio itself already exited (#2477): {mission_json}"
+    );
+
+    let phases_dir = missions_dir.join(&mission_id).join("phases");
+    let mut saw_a_phase = false;
+    for entry in fs::read_dir(&phases_dir).unwrap().filter_map(|e| e.ok()) {
+        // The same filter every production reader applies (`crew::loader`):
+        // an interrupted `save_json` can leave a `<id>.json.tmp` behind,
+        // which is not a phase record and must not be parsed as one.
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let phase_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap();
+        assert_eq!(
+            phase_json["status"], "abandoned",
+            "the launched child's phase must be abandoned, never left active or completed: {phase_json}"
+        );
+        saw_a_phase = true;
+    }
+    assert!(saw_a_phase, "the mint must have produced at least one phase to check");
+}
+
+/// (#2477 review) A stub endpoint that ANSWERS with an error-shaped body —
+/// `dispatch_internal.rs::parse_hosted_response`'s documented contract:
+/// curl exits 0 on an HTTP body carrying `{"error": {...}}` (no `-f` flag),
+/// so the endpoint's own JSON is what turns this into a failed dispatch,
+/// never the HTTP status line. Used below to give the launched mission's
+/// step a genuine non-zero outcome without Docker or a real model.
+fn start_hosted_error_stub() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the error stub");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = serde_json::json!({ "error": { "message": "boom (test, #2477)" } }).to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    port
+}
+
+/// One `darkmux radio "<text>"` invocation that routes to `mission launch
+/// <config_id>`, is NEVER signaled, and runs to natural completion against
+/// `dispatch_port` (dialectic-judge's own `profile_name` pin, same shape as
+/// the SIGTERM test above). Returns radio's own exit status.
+fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::process::ExitStatus, TempDir) {
+    let route_port = start_route_decision_stub(config_id);
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        format!(
+            r#"{{
+                "profiles": {{
+                    "route-stub": {{
+                        "models": [{{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{route_port}"}}}}]
+                    }},
+                    "dispatch-stub": {{
+                        "models": [{{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{dispatch_port}"}}}}]
+                    }}
+                }},
+                "default_profile": "route-stub"
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = format!(
+        r#"{{
+            "id": "{config_id}",
+            "name": "Radio Forward Signal Completion Test",
+            "schema_version": "3.4",
+            "panel": {{ "description": "test-only launch target for #2477's inverted-direction proof" }},
+            "phases": [{{
+                "id": "p1",
+                "tasks": [{{
+                    "id": "t1",
+                    "steps": [{{
+                        "id": "s1",
+                        "kind": "dispatch.internal",
+                        "config": {{ "role_id": "dialectic-judge", "message": "hi", "profile_name": "dispatch-stub" }}
+                    }}]
+                }}]
+            }}]
+        }}"#
+    );
+    fs::write(config_dir.join(format!("{config_id}.json")), config_json).unwrap();
+
+    let output = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .args(["radio", "please help me with something unrelated"])
+        .output()
+        .expect("running darkmux radio to completion");
+    (output.status, home)
+}
+
+/// (#2477 review) Inverted-direction proof for the fix above: an
+/// UNSIGNALLED `darkmux radio` invocation whose launched child completes on
+/// its own must still return exactly the CHILD's exit code, unchanged by
+/// the new forwarding branch — which must fire ONLY when `darkmux radio`
+/// itself catches a signal (`darkmux_types::interrupt::is_set()`), never on
+/// the ordinary `try_wait` = `Some(status)` path a clean exit already takes.
+/// Two shapes, both against the SAME light single-shot hosted `curl` path
+/// the SIGTERM test above uses (no Docker, no model): a dispatch that
+/// SUCCEEDS (the launched mission finalizes clean, `mission launch` itself
+/// exits 0) and one that FAILS (`start_hosted_error_stub`'s error-shaped
+/// body, `mission launch` itself exits 1) — proving the pass-through
+/// carries the real code both ways, not just a hardcoded "0 unless
+/// signaled."
+#[test]
+fn radio_normal_run_returns_the_launched_childs_exit_code_unchanged() {
+    let respond = RespondingStubServer::start();
+    let (status, home) = run_radio_launch_to_completion("radio-forward-signal-completion-ok", respond.port);
+    // The headline assertion FIRST. It used to sit below the mission-record
+    // reads, so a mutation that made the forwarding branch fire
+    // unconditionally reddened this test by panicking on a missing
+    // `missions/` directory (the child was signalled before it minted
+    // anything) instead of printing the exit-code message written to
+    // explain exactly that failure. A red that does not say what broke is
+    // most of a test's value thrown away.
+    assert!(
+        status.success(),
+        "an unsignalled `darkmux radio` whose launched child dispatched successfully must \
+         exit 0 (#2477 — the forwarding branch must never fire on a clean try_wait): {status:?}"
+    );
+    let missions_dir = home.path().join("missions");
+    let mission_id = fs::read_dir(&missions_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", missions_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .next()
+        .expect("exactly one mission must have been minted");
+    let mission_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(missions_dir.join(&mission_id).join("mission.json")).unwrap())
+            .unwrap();
+    assert_eq!(mission_json["status"], "finalized", "a normal run must finalize cleanly: {mission_json}");
+
+    let error_port = start_hosted_error_stub();
+    let (status, _home) = run_radio_launch_to_completion("radio-forward-signal-completion-err", error_port);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "an unsignalled `darkmux radio` whose launched child's dispatch FAILED must exit \
+         with that SAME non-zero code (`mission launch` itself exits 1 on an errored step), \
+         not the signal-path's 130 and not a swallowed 0 (#2477): {status:?}"
+    );
+}
+
 /// (#2345 C2) `outcome_from` names the task whose last step's output the
 /// launcher promotes as the `mission close` record's payload. Before this
 /// fix, a typo'd `outcome_from` was refused only AFTER the whole run — the

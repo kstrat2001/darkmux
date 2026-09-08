@@ -49,6 +49,57 @@ static CHILDREN: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 /// own direct `libc` dependency just for one constant.
 pub const SIGKILL: i32 = libc::SIGKILL;
 
+/// Companion to [`SIGKILL`], re-exported for the same reason: a caller
+/// that wants to ask a process to stop CLEANLY (so its own RAII finalize
+/// guard runs) rather than force it down should not have to take its own
+/// `libc` dependency for one constant.
+pub const SIGTERM: i32 = libc::SIGTERM;
+
+/// `kill(2)`'s "no such process" errno, re-exported for the same reason
+/// the signal numbers above are: it is the ONE [`kill_pid`] failure a
+/// caller routinely wants to treat as "already gone, nothing to report"
+/// rather than as news, and reaching for it should not cost that caller a
+/// `libc` dependency (or a hardcoded `3`).
+pub const ESRCH: i32 = libc::ESRCH;
+
+/// Send `sig` to ONE pid the caller owns. Returns `Ok(())` if the kernel
+/// accepted the request, `Err(std::io::Error)` otherwise (`ESRCH` when the
+/// pid is gone, `EPERM` when it is not ours to signal) — unlike
+/// [`kill_all`], the caller here has somewhere to report a failure to, and
+/// a signal that silently failed to send is exactly the kind of thing an
+/// operator must not have to guess at.
+///
+/// **Caller contract — pid ownership.** `pid` must be a process the caller
+/// SPAWNED and has not yet reaped (`Child::try_wait`/`wait` returning
+/// `Some` is the reap). An unreaped child that has already exited is a
+/// zombie: it still holds its pid, so this call is a harmless no-op and
+/// CANNOT reach an unrelated process. Pass a pid scavenged from `ps`/
+/// `pgrep`, or one already reaped, and that guarantee is gone — the pid
+/// may have been recycled by then, and this will signal a stranger.
+///
+/// Refuses every pid that `kill(2)` would read as something OTHER than one
+/// process: `0` means "every process in my own process group", and any
+/// NEGATIVE value means a process GROUP. A `u32` cannot be negative on its
+/// own, but the `as libc::pid_t` cast every caller of `kill(2)` needs turns
+/// anything above `i32::MAX` into one, so the range check is part of the
+/// same guarantee rather than a separate paranoia. `Child::id()` never
+/// produces either shape, so this only ever catches a caller that computed
+/// the pid some other way.
+pub fn kill_pid(pid: u32, sig: i32) -> std::io::Result<()> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to signal pid {pid}: kill(2) would read that as a process GROUP, not one child"),
+        ));
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Register a just-spawned child pid. Call BEFORE blocking on it (a
 /// `Command::spawn()` + later `.wait()`/`.wait_with_output()`, never a
 /// plain `.output()`, which offers no window to register the pid before
@@ -109,6 +160,50 @@ mod tests {
         assert!(CHILDREN.lock().unwrap().contains(&999_999));
         deregister(999_999);
         assert!(!CHILDREN.lock().unwrap().contains(&999_999));
+    }
+
+    /// [`kill_pid`] must refuse pid 0 rather than pass it through to
+    /// `kill(2)`, where it would mean "signal my ENTIRE process group" —
+    /// i.e. this process and every sibling the shell put in the same job.
+    /// Nothing else in this module can catch that: `libc::kill(0, SIGKILL)`
+    /// is a perfectly valid call that returns success.
+    #[test]
+    fn kill_pid_refuses_pid_zero() {
+        let err = kill_pid(0, SIGTERM).expect_err("pid 0 must be refused, never forwarded to kill(2)");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The other end of the same guarantee: a `u32` above `i32::MAX` casts
+    /// to a NEGATIVE `pid_t`, which `kill(2)` reads as a process group.
+    /// Unreachable from `Child::id()`, which is exactly why nothing would
+    /// notice if the check were dropped.
+    #[test]
+    fn kill_pid_refuses_a_pid_that_would_cast_negative() {
+        let err = kill_pid(u32::MAX, SIGTERM).expect_err("a pid that casts negative must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// A pid that does not exist reports `ESRCH` as an `Err`, rather than
+    /// being silently swallowed the way [`kill_all`] deliberately does —
+    /// the whole reason this function returns a `Result` at all.
+    #[test]
+    fn kill_pid_reports_a_missing_process_instead_of_swallowing_it() {
+        let err = kill_pid(999_999, SIGTERM).expect_err("a nonexistent pid must report an error");
+        assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
+    }
+
+    /// The live proof: a real child, signaled by pid through this function,
+    /// actually dies. Without this, both tests above would stay green even
+    /// if `kill_pid` never called `kill(2)` at all.
+    #[test]
+    fn kill_pid_actually_signals_a_real_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning a sleep child");
+        kill_pid(child.id(), SIGKILL).expect("signaling our own live child must succeed");
+        let status = child.wait().expect("reaping the signaled child");
+        assert!(!status.success(), "a SIGKILLed child must not report success: {status:?}");
     }
 
     #[test]
