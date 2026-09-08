@@ -2017,6 +2017,12 @@
             argv.contains(&format!("--memory={}", DOCKER_MEMORY)),
             "must include --memory 4g"
         );
+        assert!(
+            argv.contains(&"--init".to_string()),
+            "must include --init (#2481) — without it, PID 1 in the container is \
+             darkmux-runtime itself, which never reaps orphans #2215's bash-tool fix \
+             can leave behind, and they zombie for the container's whole lifetime"
+        );
 
         // 2. Verify the full argv structure
         assert_eq!(argv[0], "docker");
@@ -2031,34 +2037,39 @@
         assert_eq!(argv[7], format!("--pids-limit={}", DOCKER_PIDS_LIMIT));
         assert_eq!(argv[8], format!("--memory={}", DOCKER_MEMORY));
 
+        // 3b. (#2481) --init follows the other hardening flags, before any
+        // mount — gives the container a real init (docker's tini) that reaps
+        // orphaned grandchildren instead of leaving them zombied on PID 1.
+        assert_eq!(argv[9], "--init");
+
         // 4. Verify volume mounts (workspace + out-dir)
-        assert_eq!(argv[9], "-v");
-        assert_eq!(argv[10], "/host/workspace:/workspace");
-        assert_eq!(argv[11], "-v");
-        assert_eq!(argv[12], "/host/out:/darkmux-out");
+        assert_eq!(argv[10], "-v");
+        assert_eq!(argv[11], "/host/workspace:/workspace");
+        assert_eq!(argv[12], "-v");
+        assert_eq!(argv[13], "/host/out:/darkmux-out");
 
         // 5. Verify cache mount + env vars (real host:container bind, not a
         // bare anonymous volume).
-        assert_eq!(argv[13], "-v");
-        assert_eq!(argv[14], "/home/op/.darkmux/cache:/darkmux-cache");
-        assert_eq!(argv[15], "-e");
-        assert_eq!(argv[16], "CARGO_HOME=/darkmux-cache/cargo");
-        assert_eq!(argv[17], "-e");
-        assert_eq!(argv[18], "npm_config_cache=/darkmux-cache/npm");
-        assert_eq!(argv[19], "-e");
-        assert_eq!(argv[20], "PIP_CACHE_DIR=/darkmux-cache/pip");
+        assert_eq!(argv[14], "-v");
+        assert_eq!(argv[15], "/home/op/.darkmux/cache:/darkmux-cache");
+        assert_eq!(argv[16], "-e");
+        assert_eq!(argv[17], "CARGO_HOME=/darkmux-cache/cargo");
+        assert_eq!(argv[18], "-e");
+        assert_eq!(argv[19], "npm_config_cache=/darkmux-cache/npm");
+        assert_eq!(argv[20], "-e");
+        assert_eq!(argv[21], "PIP_CACHE_DIR=/darkmux-cache/pip");
 
         // 5b. (#1548) Verify the feedback-injection env var is forwarded —
         // the fix for the #1548 dead surface (`config.feedback_injection: true`
         // in this test's config → `DARKMUX_FEEDBACK_INJECTION=true` on argv).
-        assert_eq!(argv[21], "-e");
-        assert_eq!(argv[22], "DARKMUX_FEEDBACK_INJECTION=true");
+        assert_eq!(argv[22], "-e");
+        assert_eq!(argv[23], "DARKMUX_FEEDBACK_INJECTION=true");
 
         // 5c. (#2094) Verify the turn-delay env var is forwarded — ALWAYS,
         // including at nonzero values (`config.turn_delay_ms: 3000` in this
         // test's config → `DARKMUX_TURN_DELAY_MS=3000` on argv).
-        assert_eq!(argv[23], "-e");
-        assert_eq!(argv[24], "DARKMUX_TURN_DELAY_MS=3000");
+        assert_eq!(argv[24], "-e");
+        assert_eq!(argv[25], "DARKMUX_TURN_DELAY_MS=3000");
 
         // 5d. (#2094 finding 1) Verify the inactivity-timeout env var is
         // forwarded too (`config.inactivity_timeout_seconds: 900` in this
@@ -2066,88 +2077,88 @@
         // — the piece #2094's original cut left unforwarded, so the
         // runtime's soft-warning detector silently used its own 600s
         // literal default instead of the operator's configured budget.
-        assert_eq!(argv[25], "-e");
-        assert_eq!(argv[26], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900");
+        assert_eq!(argv[26], "-e");
+        assert_eq!(argv[27], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900");
 
         // 5e. (#2165) Verify the inactivity-timeout SOURCE env var is
         // forwarded alongside the value — a distinct, non-default source
         // (`Config`, not the built-in default) so this assertion actually
         // pins forwarding rather than coincidentally matching a default.
-        assert_eq!(argv[27], "-e");
-        assert_eq!(argv[28], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config");
+        assert_eq!(argv[28], "-e");
+        assert_eq!(argv[29], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config");
 
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[29], "-v");
+        assert_eq!(argv[30], "-v");
         assert_eq!(
-            argv[30],
+            argv[31],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[31], "--entrypoint");
-        assert_eq!(argv[32], "/darkmux-runtime");
+        assert_eq!(argv[32], "--entrypoint");
+        assert_eq!(argv[33], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[33], "--");
-        assert_eq!(argv[34], "rust:slim"); // image
-        assert_eq!(argv[35], "run"); // runtime subcommand
-        assert_eq!(argv[36], "--model");
-        assert_eq!(argv[37], "llama3-8b");
+        assert_eq!(argv[34], "--");
+        assert_eq!(argv[35], "rust:slim"); // image
+        assert_eq!(argv[36], "run"); // runtime subcommand
+        assert_eq!(argv[37], "--model");
+        assert_eq!(argv[38], "llama3-8b");
         // (Security audit, #2114 resume follow-up) Unconditional, every
         // dispatch — see `DockerRunConfig::role_id`'s own doc.
-        assert_eq!(argv[38], "--role-id");
-        assert_eq!(argv[39], "test-role");
+        assert_eq!(argv[39], "--role-id");
+        assert_eq!(argv[40], "test-role");
         // (#2386) Unconditional too — the runtime needs its finding-key
         // namespace on every dispatch. See `DockerRunConfig::session_id`.
-        assert_eq!(argv[40], "--session-id");
-        assert_eq!(argv[41], "sess-test");
-        assert_eq!(argv[42], "--system");
-        assert_eq!(argv[43], "You are a coding assistant.");
+        assert_eq!(argv[41], "--session-id");
+        assert_eq!(argv[42], "sess-test");
+        assert_eq!(argv[43], "--system");
+        assert_eq!(argv[44], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[44], "--prompt-file");
-        assert_eq!(argv[45], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[45], "--prompt-file");
+        assert_eq!(argv[46], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[46], "--json");
+        assert_eq!(argv[47], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[47], "--allowed-tools");
-        assert_eq!(argv[48], "exec,edit");
+        assert_eq!(argv[48], "--allowed-tools");
+        assert_eq!(argv[49], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[49], "--compact-threshold-tokens");
-        assert_eq!(argv[50], "4096");
-        assert_eq!(argv[51], "--compactor-model");
-        assert_eq!(argv[52], "util-model");
-        assert_eq!(argv[53], "--compact-threshold-ratio");
-        assert_eq!(argv[54], "0.75");
-        assert_eq!(argv[55], "--context-window");
-        assert_eq!(argv[56], "32000");
-        assert_eq!(argv[57], "--compact-strategy");
-        assert_eq!(argv[58], "structured-slot");
-        assert_eq!(argv[59], "--bail-after-compactions");
-        assert_eq!(argv[60], "10");
-        assert_eq!(argv[61], "--compactor-custom-instructions");
-        assert_eq!(argv[62], "Be terse.");
+        assert_eq!(argv[50], "--compact-threshold-tokens");
+        assert_eq!(argv[51], "4096");
+        assert_eq!(argv[52], "--compactor-model");
+        assert_eq!(argv[53], "util-model");
+        assert_eq!(argv[54], "--compact-threshold-ratio");
+        assert_eq!(argv[55], "0.75");
+        assert_eq!(argv[56], "--context-window");
+        assert_eq!(argv[57], "32000");
+        assert_eq!(argv[58], "--compact-strategy");
+        assert_eq!(argv[59], "structured-slot");
+        assert_eq!(argv[60], "--bail-after-compactions");
+        assert_eq!(argv[61], "10");
+        assert_eq!(argv[62], "--compactor-custom-instructions");
+        assert_eq!(argv[63], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[63], "--feedback-templates-json");
+        assert_eq!(argv[64], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[64].contains("error"));
-        assert!(argv[64].contains("An error occurred"));
+        assert!(argv[65].contains("error"));
+        assert!(argv[65].contains("An error occurred"));
 
-        // Total arg count: 61 (0..=60) — 53 pre-#1548, +2 for
+        // Total arg count: 66 (0..=65) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
         // `-e DARKMUX_TURN_DELAY_MS=<ms>` (#2094), +2 for
         // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` (#2094 finding 1),
         // +2 for `--role-id <id>` (security audit, #2114 resume follow-up), +2 for
         // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=<tier>` (#2165).
-        // +2 for `--session-id <id>` (#2386).
-        assert_eq!(argv.len(), 65);
+        // +2 for `--session-id <id>` (#2386). +1 for `--init` (#2481).
+        assert_eq!(argv.len(), 66);
     }
 
     #[test]
@@ -2257,6 +2268,9 @@
         assert!(argv.contains(&format!("--security-opt={}", DOCKER_SECURITY_OPT)));
         assert!(argv.contains(&format!("--pids-limit={}", DOCKER_PIDS_LIMIT)));
         assert!(argv.contains(&format!("--memory={}", DOCKER_MEMORY)));
+        // (#2481) --init is unconditional — a minimal dispatch still needs
+        // its orphaned grandchildren reaped.
+        assert!(argv.contains(&"--init".to_string()));
 
         // Should NOT contain injection args (no binary mount/entrypoint)
         assert!(
@@ -2388,6 +2402,44 @@
         assert!(
             argv.windows(2).any(|w| w[0] == "-v" && w[1] == "/tmp/ws:/workspace:ro"),
             "expected -v /tmp/ws:/workspace:ro in argv: {argv:?}"
+        );
+    }
+
+    /// (#2481) `--init` must land in the docker-run OPTIONS section — BEFORE
+    /// the `--` separator — not after it.
+    ///
+    /// Deliberately `position()`-based rather than another link in
+    /// `build_docker_run_argv_asserts_complete_vector`'s index chain. That
+    /// chain pins `--init` at `argv[9]`, but every index after an inserted
+    /// flag shifts by one, so the chain is renumbered whenever the argv
+    /// grows — and a renumber is exactly what would ALSO make the chain
+    /// green if `--init` were pushed in the wrong SECTION: move the push
+    /// below `args.push("--")` and the whole tail slides by one, the
+    /// renumbered chain matches again, and the golden echoes the mistake
+    /// instead of catching it. Anchoring on the separator's own position
+    /// can't be satisfied that way.
+    ///
+    /// The production failure it guards: everything after `--` is the
+    /// CONTAINER's argv, so a misplaced `--init` reaches the runtime's clap
+    /// parser as an unknown flag and every dispatch exits 2 — the same class
+    /// as #975's `docker docker run`, where the vector assertions were all
+    /// individually satisfiable by the broken output.
+    #[test]
+    fn build_docker_run_argv_puts_init_before_the_separator_not_after() {
+        let argv = build_docker_run_argv(&base_argv_config());
+        let sep = argv
+            .iter()
+            .position(|a| a == "--")
+            .unwrap_or_else(|| panic!("argv must carry the `--` image separator: {argv:?}"));
+        let init = argv
+            .iter()
+            .position(|a| a == "--init")
+            .unwrap_or_else(|| panic!("argv must carry --init (#2481): {argv:?}"));
+        assert!(
+            init < sep,
+            "--init must be a docker-run OPTION (index {init}) before the `--` separator \
+             (index {sep}); after it, docker hands the flag to the container and the \
+             runtime exits 2 on an unknown flag: {argv:?}"
         );
     }
 

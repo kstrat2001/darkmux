@@ -1234,6 +1234,34 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push(format!("--pids-limit={}", DOCKER_PIDS_LIMIT));
     args.push(format!("--memory={}", DOCKER_MEMORY));
 
+    // (#2481) Docker's tini as PID 1 instead of the runtime binary. #2215's
+    // bash-tool fix kills a process GROUP that can still hold a backgrounded
+    // grandchild's pipe open; that grandchild is orphaned to the container's
+    // PID 1 the instant its parent shell exits. Without `--init`, PID 1 IS
+    // `darkmux-runtime` (`runtime/Dockerfile`'s `ENTRYPOINT`), and nothing in
+    // `runtime/src/` calls `waitpid`/installs a SIGCHLD handler — so every
+    // such orphan becomes a permanent zombie for the container's remaining
+    // lifetime, counting against `--pids-limit` above. `--init` makes
+    // docker's own tini PID 1 instead; tini reaps ANY child reparented to
+    // it (that's its whole job), which only ever includes these orphans —
+    // the runtime's own tracked children (spawned via `std::process::Command`
+    // for tool calls) stay parented to the runtime process itself and are
+    // never touched by tini's reap loop, so this can't steal an exit status
+    // `runtime/src/tools/mod.rs` is waiting on.
+    //
+    // Verified NOT to depend on the runtime being literally PID 1:
+    // `docker kill` (the host's `docker_kill_by_name`, this crate's only
+    // container-teardown path) sends SIGKILL by default, which cannot be
+    // caught, blocked, or ignored by ANY process regardless of PID — the
+    // PID-1-only immunity that applies to SIGTERM/SIGINT never applied here.
+    // Docker's own exit-code propagation for `docker run` in attached mode
+    // is guaranteed by docker/tini's design (tini forwards its reaped
+    // tracked child's exit status as its own) — unaffected either way. The
+    // one place PID 1 was invoked as such is a residual-risk doc comment in
+    // `runtime/src/main.rs` about `/proc/1/mem`; see that comment's own note
+    // for the now-off-by-one PID under `--init`.
+    args.push("--init".to_string());
+
     // (#1187) Keep stdin open ONLY when the container needs its remote auth
     // secret piped in — every other dispatch (local, or a remote endpoint
     // with no auth) has no stdin use and omits this flag.
