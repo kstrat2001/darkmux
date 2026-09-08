@@ -164,3 +164,64 @@ test('a long mission id truncates on the phone instead of wrapping the masthead 
   await expect(page.locator('.masthead__pilldot--replay')).toBeVisible();
   await expect(page.locator('.masthead__pilldot--replay')).toHaveText('▣');
 });
+
+// (#2264) `viewport-fit=cover` (index.html) extends the standalone/PWA page
+// under the iOS status bar, so `.masthead` must pad for
+// `env(safe-area-inset-top)` — otherwise the wordmark/pill render UNDER the
+// clock/battery. There is no notched device in CI, so this proves it the
+// only way headless Chromium allows: `Emulation.setSafeAreaInsetsOverride`
+// (verified against this harness's own Chromium build before writing the
+// fix — it makes `env(safe-area-inset-top)` resolve to a real value) makes
+// the inset real for the page, and the assertion reads the MASTHEAD's own
+// computed padding + its brand's real screen position, not a CSS string.
+test('the masthead pads for the iOS safe-area-inset-top on a phone', async ({ page, context }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const cdp = await context.newCDPSession(page);
+  await cdp.send('Emulation.setSafeAreaInsetsOverride', {
+    insets: { top: 47, right: 0, bottom: 34, left: 0 },
+  });
+
+  await page.route('**/fleet/machines/live', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ machines: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
+  );
+  await page.route('**/fleet/sessions/live', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
+  );
+
+  await page.goto('/index-live.html');
+  await page.waitForSelector('.masthead__brand', { timeout: 15_000 });
+
+  const geo = await page.evaluate(() => {
+    const m = document.querySelector('.masthead');
+    const brand = document.querySelector('.masthead__brand');
+    return {
+      paddingTop: parseFloat(getComputedStyle(m).paddingTop),
+      brandTop: Math.round(brand.getBoundingClientRect().top),
+    };
+  });
+  // `styles.css`'s <=768px rule: `padding-top: calc(8px + env(safe-area-inset-top, 0px))`.
+  expect(Math.round(geo.paddingTop), `masthead padding-top ${geo.paddingTop}px — want 8 + the 47px inset`).toBe(8 + 47);
+  // The wordmark itself must clear the simulated status bar band, not just
+  // the box around it.
+  expect(geo.brandTop, `brand top ${geo.brandTop}px — must clear the 47px inset`).toBeGreaterThanOrEqual(47);
+});
+
+// The SAME masthead, on desktop, with NO inset simulated at all (the real
+// shape of every non-notched device: `env(safe-area-inset-top)` resolves to
+// 0 with nothing to override) — the fix must not add phantom padding where
+// there is no inset to clear.
+test('the masthead is unaffected by the safe-area fix on desktop', async ({ page }) => {
+  await page.setViewportSize({ width: 1456, height: 900 });
+  await page.route('**/fleet/machines/live', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ machines: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
+  );
+  await page.route('**/fleet/sessions/live', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
+  );
+
+  await page.goto('/index-live.html');
+  await page.waitForSelector('.masthead__brand', { timeout: 15_000 });
+  const paddingTop = await page.evaluate(() => parseFloat(getComputedStyle(document.querySelector('.masthead')).paddingTop));
+  // `styles.css`'s base rule: `padding-top: calc(10px + env(safe-area-inset-top, 0px))`, and no inset is simulated here.
+  expect(Math.round(paddingTop), `masthead padding-top ${paddingTop}px on desktop — want the plain 10px, no inset`).toBe(10);
+});
