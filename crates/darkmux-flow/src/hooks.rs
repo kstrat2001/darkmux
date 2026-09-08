@@ -593,6 +593,51 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// (#2453) Truncate-and-replace the `.last` sidecar's ENTIRE content
+/// under an exclusive `flock(2)` on the sidecar's OWN path — same "lock
+/// the file itself, do the I/O through the locked handle" shape
+/// `append_outbox_line`/`ensure_trailing_newline` already use for the
+/// outbox, just an overwrite instead of an append. Used by
+/// `write_last_status`, which always derives a complete fresh document
+/// from `RuleRuntime`'s own atomics rather than reading the file first —
+/// there's nothing for IT to read here, only something to serialize
+/// against: a concurrent `write_cursor_write_status` sharing this same
+/// path takes the SAME lock (`flock` contends on the open file
+/// description / inode, not on which function opened it), so the two can
+/// never interleave.
+///
+/// Locking the sidecar's own path (rather than a new `.last.lock`
+/// sibling) keeps the per-rule file set exactly as it was — nothing new
+/// to collide with `quarantine_path`/`drain_lock_path`/
+/// `dropped_appends_path` — and a BRAND-NEW sidecar gets the same
+/// `0o600` creation mode (#2259) every other locked file already gets,
+/// for free. An EXISTING sidecar (pre-#2453, created at the process
+/// umask's mode — typically `0o644`, world-readable) keeps that mode:
+/// `lock_exclusive`'s `.mode()` only applies at creation, and this
+/// function never `chmod`s it retroactively (see `lock_exclusive`'s own
+/// doc for why that's deliberate).
+fn write_status_sidecar_locked(path: &Path, json: &[u8]) -> Result<()> {
+    darkmux_types::flock::with_locked_file(path, |file| {
+        file.set_len(0).with_context(|| format!("truncating {}", path.display()))?;
+        file.seek(SeekFrom::Start(0)).with_context(|| format!("seeking {}", path.display()))?;
+        // (#2453 review red-prove seam) Widens the TRUNCATE-to-WRITE
+        // window on demand — the window a concurrent READER tears in.
+        // A SEPARATE map from `LAST_STATUS_RACE_HOOKS`, deliberately:
+        // these two seams fire from different writers, and a test that
+        // arms one must not be woken by the other. Sharing one map
+        // deadlocks `concurrent_writers_do_not_lose_last_status_update`
+        // outright — that test arms the rendezvous channel for the
+        // READ seam and receives from it exactly once, so a second
+        // firing point blocks forever on `send` with no receiver left,
+        // while holding this file's exclusive lock. Compiled out of
+        // every non-test build.
+        #[cfg(test)]
+        fire_last_status_truncate_hook(path);
+        file.write_all(json).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    })
+}
+
 /// Write the TERMINAL delivery outcome (success or give-up) for a rule's
 /// current line — `ok`/`error` describe that outcome. The cursor-write
 /// bookkeeping fields (`cursor_write_failures`/`stalled`) are read from
@@ -610,10 +655,12 @@ fn write_last_status(rt: &RuleRuntime, ok: bool, error: Option<&str>) {
         stalled: rt.stalled.load(Ordering::Acquire),
     };
     if let Ok(json) = serde_json::to_string(&status) {
-        // (#2259) Owner-only on POSIX — this sidecar carries the last
-        // delivery's error detail, which can echo record content back
-        // (e.g. an HTTP error body).
-        if let Err(e) = write_owner_only_file(&rt.rule.last_status_path, json.as_bytes()) {
+        // (#2453) Locked on the sidecar's own path — see
+        // `write_status_sidecar_locked`'s doc — so this can never
+        // interleave with a concurrent `write_cursor_write_status`
+        // sharing the same file, whether that's a second thread or a
+        // second darkmux process sharing this outbox directory.
+        if let Err(e) = write_status_sidecar_locked(&rt.rule.last_status_path, json.as_bytes()) {
             eprintln!("flow::HookSink: failed to write last-status {}: {e:#}", rt.rule.last_status_path.display());
         }
     }
@@ -625,29 +672,103 @@ fn write_last_status(rt: &RuleRuntime, ok: bool, error: Option<&str>) {
 /// (`ok`/`error`/`ts`) is preserved rather than reset. No prior sidecar
 /// (a fresh rule that hasn't had a terminal outcome yet) seeds one with
 /// `ok: true`/no error, since "no delivery outcome yet" is not a failure.
+///
+/// (#2453) The read and the write now happen inside ONE critical section
+/// — a single exclusive `flock` on `path` held across both, acquired
+/// through the SAME `with_locked_file` primitive `append_outbox_line`
+/// uses for the outbox (`darkmux_types::flock`). Before this fix, the
+/// read (`read_last_status`) and the write (`write_owner_only_file`)
+/// were two independent, unlocked opens with an unguarded window between
+/// them — a concurrent `write_last_status` landing in that window was
+/// silently reverted the instant this function's stale read got written
+/// back over it (a lost update, not merely a torn file). Locking on
+/// `path` itself, rather than a separate sidecar lock file, means this
+/// contends with `write_last_status`'s lock on the exact same path —
+/// there is no third file to keep in sync and no risk of the two
+/// functions locking two DIFFERENT files while believing they've
+/// serialized against each other.
 fn write_cursor_write_status(path: &Path, cursor_write_failures: u64, stalled: bool) {
-    let mut status = read_last_status(path).unwrap_or_else(|| LastStatus {
-        ts: schema::ts_utc_now(),
-        ok: true,
-        error: None,
-        cursor_write_failures: 0,
-        stalled: false,
+    let result = darkmux_types::flock::with_locked_file(path, |file| {
+        // (#2453 review) Read RAW BYTES, not a `String`. `read_to_string`
+        // hard-errors on invalid UTF-8, which aborts this closure and
+        // SKIPS the write — permanently, since this function is the only
+        // thing that ever rewrites the file on the cursor-failure path.
+        // The pre-fix code reached the same state through
+        // `read_last_status(..).unwrap_or_else(default)`, which treated
+        // any unreadable sidecar as absent and healed it on the next
+        // write; parsing from bytes preserves exactly that. Reachable:
+        // `error` echoes a delivery failure's body back (see
+        // `write_last_status`), so a torn write can land mid-multi-byte
+        // character and leave bytes that are not valid UTF-8.
+        let mut content = Vec::new();
+        file.seek(SeekFrom::Start(0)).with_context(|| format!("seeking {}", path.display()))?;
+        file.read_to_end(&mut content).with_context(|| format!("reading {}", path.display()))?;
+        let mut status = serde_json::from_slice::<LastStatus>(&content).unwrap_or_else(|_| LastStatus {
+            ts: schema::ts_utc_now(),
+            ok: true,
+            error: None,
+            cursor_write_failures: 0,
+            stalled: false,
+        });
+        // (#2453 red-prove seam) Widens the read-to-write window on
+        // demand for the concurrency test — see
+        // `fire_last_status_race_hook`'s doc. Deliberately
+        // INSIDE the locked closure (unlike the pre-fix placement): the
+        // whole point of the fix is that widening this window no longer
+        // matters, because nothing else can observe or mutate `path`
+        // until this closure returns and the lock releases.
+        #[cfg(test)]
+        fire_last_status_race_hook(path);
+        status.cursor_write_failures = cursor_write_failures;
+        status.stalled = stalled;
+        let json = serde_json::to_string(&status).context("serializing cursor-write status")?;
+        file.set_len(0).with_context(|| format!("truncating {}", path.display()))?;
+        file.seek(SeekFrom::Start(0)).with_context(|| format!("seeking {}", path.display()))?;
+        file.write_all(json.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
     });
-    status.cursor_write_failures = cursor_write_failures;
-    status.stalled = stalled;
-    if let Ok(json) = serde_json::to_string(&status) {
-        // (#2259) Same owner-only writer as `write_last_status` — this
-        // is the SAME `.last` sidecar file, just a read-modify-write of
-        // a subset of its fields.
-        if let Err(e) = write_owner_only_file(path, json.as_bytes()) {
-            eprintln!("flow::HookSink: failed to write cursor-write status {}: {e:#}", path.display());
-        }
+    if let Err(e) = result {
+        eprintln!("flow::HookSink: failed to write cursor-write status {}: {e:#}", path.display());
     }
 }
 
+/// (#2453) Read the `.last` sidecar under a SHARED `flock(2)` on the
+/// same path the two writers take exclusively, so a reader can never
+/// observe the file during a writer's truncate-then-write.
+///
+/// Not a theoretical window. Both writers replace the sidecar's contents
+/// IN PLACE (`set_len(0)` -> `seek(0)` -> `write_all`) rather than by
+/// atomic rename — which they must, because the writers' mutual
+/// exclusion is a lock on this file's own inode, and a rename would swap
+/// that inode out from under a concurrent writer's lock, silently
+/// reopening the lost update this change exists to close. The sibling
+/// sidecars (`.cursor` via `write_cursor`, `.dropped` via
+/// `write_dropped_appends_atomic`) can and do use temp+rename precisely
+/// because neither has a read-modify-write to serialize; this one pays
+/// for its writer safety with a truncate window, and closes that window
+/// on the READ side instead.
+///
+/// What the window costs if left open, measured rather than assumed: an
+/// unlocked reader racing a writing rule observed an unparseable
+/// (truncated) sidecar on ~37% of reads. Every one of those becomes
+/// `None` here, and `summarize_configured_rules` renders `None` as
+/// `stalled: false`, `last_error: None`, `last_delivery_ts: None` — a
+/// failing, stalled rule reported to `doctor` (and republished by the
+/// viewer's console lens) as healthy. The failure direction is the bad
+/// one, and it is adversely correlated: the sicker a rule is, the more
+/// often it writes status, the likelier an operator's `doctor` run reads
+/// a tear.
+///
+/// Absent file -> `None`, exactly as before (`lock_shared_existing`
+/// never creates, so reporting on a rule never materializes its state).
+/// Unparseable bytes -> `None`, exactly as before: parsed from the raw
+/// bytes rather than through a `String`, so a sidecar that isn't valid
+/// UTF-8 is a parse miss and not a hard read error.
 fn read_last_status(path: &Path) -> Option<LastStatus> {
-    let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    let mut guard = darkmux_types::flock::lock_shared_existing(path).ok()??;
+    let mut buf = Vec::new();
+    guard.file().read_to_end(&mut buf).ok()?;
+    serde_json::from_slice(&buf).ok()
 }
 
 // ─── Resolved rules ─────────────────────────────────────────────────────
@@ -1135,6 +1256,76 @@ fn read_cursor(cursor_path: &Path) -> u64 {
 #[cfg(test)]
 static FORCE_CURSOR_WRITE_FAILURE_PATHS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
     std::sync::OnceLock::new();
+
+/// (#2453) Test-only seam that widens the `.last` sidecar's
+/// read-modify-write race window on demand, keyed by path (never a
+/// single global switch, same parallel-test-safety reason as
+/// `FORCE_CURSOR_WRITE_FAILURE_PATHS` above) so unrelated tests running
+/// concurrently in the same test binary never see each other's hook. A
+/// test registers a `SyncSender<()>` for the sidecar path it's about to
+/// race; `write_cursor_write_status`'s read-modify-write fires it (once,
+/// right after capturing its read) then sleeps, giving a concurrent
+/// `write_last_status` on the SAME path a wide, deterministic window to
+/// land its own write mid-critical-section — reproducing #2453's
+/// interleaving on every run rather than "one in fifty." Never compiled
+/// into a release binary.
+#[cfg(test)]
+static LAST_STATUS_RACE_HOOKS: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, std::sync::mpsc::SyncSender<()>>>> =
+    std::sync::OnceLock::new();
+
+/// (#2453 review) Sibling of `LAST_STATUS_RACE_HOOKS` for the
+/// TRUNCATE-to-write window in `write_status_sidecar_locked` — the
+/// window a concurrent READER tears in, as opposed to the read-to-write
+/// window a concurrent WRITER loses an update in. Kept as its own map so
+/// arming one seam never fires the other; see the firing site for the
+/// deadlock that sharing them causes.
+#[cfg(test)]
+static LAST_STATUS_TRUNCATE_HOOKS: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, std::sync::mpsc::SyncSender<()>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn set_last_status_truncate_hook(path: &Path, tx: std::sync::mpsc::SyncSender<()>) {
+    let map = LAST_STATUS_TRUNCATE_HOOKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    map.lock().unwrap().insert(path.to_path_buf(), tx);
+}
+
+#[cfg(test)]
+fn clear_last_status_truncate_hook(path: &Path) {
+    if let Some(map) = LAST_STATUS_TRUNCATE_HOOKS.get() {
+        map.lock().unwrap().remove(path);
+    }
+}
+
+#[cfg(test)]
+fn fire_last_status_truncate_hook(path: &Path) {
+    let tx = LAST_STATUS_TRUNCATE_HOOKS.get().and_then(|map| map.lock().unwrap().get(path).cloned());
+    if let Some(tx) = tx {
+        let _ = tx.send(());
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+#[cfg(test)]
+fn set_last_status_race_hook(path: &Path, tx: std::sync::mpsc::SyncSender<()>) {
+    let map = LAST_STATUS_RACE_HOOKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    map.lock().unwrap().insert(path.to_path_buf(), tx);
+}
+
+#[cfg(test)]
+fn clear_last_status_race_hook(path: &Path) {
+    if let Some(map) = LAST_STATUS_RACE_HOOKS.get() {
+        map.lock().unwrap().remove(path);
+    }
+}
+
+#[cfg(test)]
+fn fire_last_status_race_hook(path: &Path) {
+    let tx = LAST_STATUS_RACE_HOOKS.get().and_then(|map| map.lock().unwrap().get(path).cloned());
+    if let Some(tx) = tx {
+        let _ = tx.send(());
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
 
 #[cfg(test)]
 fn set_force_cursor_write_failure(path: &Path, fail: bool) {
@@ -4103,6 +4294,303 @@ mod tests {
         );
 
         set_force_cursor_write_failure(&rt.rule.cursor_path, false);
+    }
+
+    // ─── (#2453) `.last` sidecar cross-process race ────────────────────
+
+    /// (#2453 review) The READ side of the same race. `write_last_status`
+    /// replaces the sidecar in place — `set_len(0)` then `write_all` —
+    /// so between those two syscalls the file on disk is EMPTY. An
+    /// unlocked reader landing there parses nothing, returns `None`, and
+    /// `summarize_configured_rules` renders `None` as `stalled: false` /
+    /// `last_error: None`: a failing rule reported to `doctor` as
+    /// healthy.
+    ///
+    /// Made deterministic with the same seam the writer-race test uses,
+    /// fired here from inside `write_status_sidecar_locked` between the
+    /// truncate and the write. The reader thread is released exactly
+    /// then, so on unlocked-reader code it reads the empty file every
+    /// time; with the shared lock it blocks for the rest of the writer's
+    /// critical section and reads the COMPLETE new document.
+    #[test]
+    fn a_reader_never_observes_the_sidecar_mid_rewrite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:1/unused".to_string()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let rule = resolve_rules(&rules, tmp.path()).unwrap().into_iter().next().unwrap();
+        let last_status_path = rule.last_status_path.clone();
+        let rt = rule_runtime_for(rule);
+
+        // Seed a complete document so "the reader saw nothing" can only
+        // mean it observed the rewrite, never "the file didn't exist".
+        write_last_status(&rt, true, None);
+        assert!(read_last_status(&last_status_path).is_some(), "seed write must have landed");
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+        set_last_status_truncate_hook(&last_status_path, tx);
+
+        let path_for_reader = last_status_path.clone();
+        let reader = std::thread::spawn(move || {
+            // Released the instant the writer has truncated and not yet
+            // written — no timing guess.
+            rx.recv().expect("the writer must fire the seam mid-rewrite");
+            read_last_status(&path_for_reader)
+        });
+
+        write_last_status(&rt, false, Some("boom"));
+        let observed = reader.join().unwrap();
+        clear_last_status_truncate_hook(&last_status_path);
+
+        let observed = observed.expect(
+            "a reader that lands inside the writer's truncate-to-write window must never see a torn \
+             sidecar — `None` here is what `doctor` renders as `stalled: false` / no last error, i.e. \
+             a failing rule reported as healthy",
+        );
+        assert_eq!(
+            observed.error.as_deref(),
+            Some("boom"),
+            "having waited out the writer, the reader must see the COMPLETE new document — got {observed:?}"
+        );
+    }
+
+    /// (#2453 review) `write_cursor_write_status` must still SELF-HEAL a
+    /// sidecar it cannot parse, exactly as the pre-#2453 code did via
+    /// `read_last_status(..).unwrap_or_else(default)`.
+    ///
+    /// Routing the read through the locked handle made it a
+    /// `read_to_string`, which hard-errors on invalid UTF-8 — aborting
+    /// the closure and skipping the write, permanently: nothing else on
+    /// the cursor-failure path ever rewrites this file, so a stalled rule
+    /// could never persist its `stalled` flag again and `doctor` would
+    /// keep reporting it healthy. Reachable because `error` echoes a
+    /// delivery failure's body back, so a torn write can land mid-
+    /// multi-byte character.
+    #[test]
+    fn an_unparseable_sidecar_still_self_heals() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // (a) valid UTF-8, invalid JSON — healed before this fix too.
+        let truncated_json = tmp.path().join("truncated.last");
+        std::fs::write(&truncated_json, br#"{"ts":"2020-01-01T00:00:00Z","ok":tr"#).unwrap();
+        write_cursor_write_status(&truncated_json, 3, true);
+        let healed = read_last_status(&truncated_json).expect("invalid JSON must heal into a fresh document");
+        assert_eq!(healed.cursor_write_failures, 3);
+        assert!(healed.stalled);
+
+        // (b) not valid UTF-8 at all — a torn write that landed mid
+        // multi-byte character.
+        let torn_utf8 = tmp.path().join("torn.last");
+        std::fs::write(&torn_utf8, b"{\"ts\":\"2020-01-01T00:00:00Z\",\"ok\":false,\"error\":\"caf\xc3").unwrap();
+        assert!(std::fs::read_to_string(&torn_utf8).is_err(), "precondition: those bytes are not valid UTF-8");
+        write_cursor_write_status(&torn_utf8, 9, true);
+        let healed = read_last_status(&torn_utf8)
+            .expect("a non-UTF-8 sidecar must heal too — otherwise this rule's status is wedged forever");
+        assert_eq!(healed.cursor_write_failures, 9);
+        assert!(healed.stalled);
+    }
+
+    /// Builds a `RuleRuntime` around `rule` with the same "quiet, unused
+    /// http target" shape `advance_cursor_backs_off_never_resets_on_write_failure`
+    /// uses — none of these tests ever let a real delivery attempt run.
+    fn rule_runtime_for(rule: ResolvedRule) -> RuleRuntime {
+        RuleRuntime {
+            rule,
+            backoff: Mutex::new(INITIAL_BACKOFF),
+            next_attempt: Mutex::new(Instant::now()),
+            attempt_count: Mutex::new(0),
+            client_error_count: Mutex::new(0),
+            dropped_appends: AtomicU64::new(0),
+            last_drop_warning: Mutex::new(None),
+            cursor_write_failures: AtomicU64::new(0),
+            stalled: AtomicBool::new(false),
+            last_cursor_write_warning: Mutex::new(None),
+            non_record_lines: AtomicU64::new(0),
+            orphaned_transforms: Arc::new(AtomicU32::new(0)),
+            consecutive_busy: AtomicU32::new(0),
+            last_busy_warning: Mutex::new(None),
+        }
+    }
+
+    /// (#2453) Real concurrency proof, not a shape assertion: two
+    /// `RuleRuntime`s resolved against the SAME outbox dir/rule (so they
+    /// share one `last_status_path` but have their own, independent
+    /// atomics) model the module doc's "two darkmux processes share this
+    /// outbox directory" scenario — `flock` contends identically across
+    /// threads and processes, since it's keyed on the open file
+    /// description / inode, never the PID, so a thread-based race here
+    /// exercises the exact same kernel primitive a real second process
+    /// would.
+    ///
+    /// The race: seed the sidecar via `write_last_status(rt_a, ok: true,
+    /// ..)`. Arm the `#2453` red-prove seam so `write_cursor_write_status`
+    /// (running on a second thread, standing in for a second process
+    /// advancing ITS OWN cursor) fires the moment it has read that seed,
+    /// then sleeps 150ms before writing its merged result back. While it
+    /// sleeps, THIS thread — synchronized on the same channel, so there
+    /// is no timing guess involved — calls `write_last_status(rt_a, ok:
+    /// false, error: "boom", ..)`, a genuinely new terminal delivery
+    /// outcome. That write is a single fast syscall pair and completes
+    /// well inside the 150ms window.
+    ///
+    /// Any CORRECT serialization of the two calls (A-then-B or B-then-A)
+    /// produces one of exactly two states: pure A (if A runs last) or a
+    /// merge that still carries A's `ok: false` / `error: "boom"` forward
+    /// (if B runs last, per `write_cursor_write_status`'s own "preserve
+    /// the last known delivery outcome" contract). The unlocked bug
+    /// produces a THIRD state that neither ordering can produce: B's
+    /// stale read (captured before A's write) silently overwrites A's
+    /// already-completed write with the pre-A snapshot, discarding "ok:
+    /// false / error: boom" outright — the lost update #2453 describes.
+    #[test]
+    fn concurrent_writers_do_not_lose_last_status_update() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:1/unused".to_string()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let rule_a = resolve_rules(&rules, tmp.path()).unwrap().into_iter().next().unwrap();
+        let rule_b = resolve_rules(&rules, tmp.path()).unwrap().into_iter().next().unwrap();
+        let last_status_path = rule_a.last_status_path.clone();
+        assert_eq!(
+            last_status_path, rule_b.last_status_path,
+            "both runtimes must resolve to the SAME sidecar file for this to model two processes sharing it"
+        );
+
+        let rt_a = rule_runtime_for(rule_a);
+        let rt_b = rule_runtime_for(rule_b);
+
+        // Seed a known baseline delivery outcome.
+        write_last_status(&rt_a, true, None);
+        assert_eq!(read_last_status(&last_status_path).map(|s| s.ok), Some(true), "seed write must have landed");
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+        set_last_status_race_hook(&last_status_path, tx);
+
+        let path_for_b = last_status_path.clone();
+        let b = std::thread::spawn(move || {
+            write_cursor_write_status(&path_for_b, 42, true);
+        });
+
+        // Block until B's read has genuinely fired the hook (no sleep
+        // guessing) — THEN, while B is still asleep inside its widened
+        // window, land A's fresh terminal outcome.
+        rx.recv().expect("B's read must fire the race hook before A writes");
+        write_last_status(&rt_a, false, Some("boom"));
+
+        b.join().unwrap();
+        clear_last_status_race_hook(&last_status_path);
+
+        let rt_b_unused = &rt_b; // keep B's runtime alive through the join for clarity; never touched otherwise
+        let _ = rt_b_unused;
+
+        let final_status = read_last_status(&last_status_path)
+            .expect("sidecar must contain valid, parseable JSON after the race — a torn write is also a bug this test catches");
+
+        assert_eq!(
+            final_status.error.as_deref(),
+            Some("boom"),
+            "A's delivery-failure outcome must survive B's concurrent cursor-write-status update — got {final_status:?}, \
+             which means B's stale read clobbered A's already-completed write (the lost-update race #2453 describes)"
+        );
+        assert!(
+            !final_status.ok,
+            "the surviving status must reflect A's terminal outcome (ok: false), not the stale pre-A seed — got {final_status:?}"
+        );
+    }
+
+    /// (#2453) A brand-new `.last` sidecar now goes through
+    /// `lock_exclusive`'s creator (same as the outbox, the fleet roster,
+    /// etc.), so it lands at `0o600` — the SAME mode `write_owner_only_file`
+    /// already gave it pre-fix, just via a different creator. Routing
+    /// through the lock must not have quietly widened it.
+    #[cfg(unix)]
+    #[test]
+    fn write_last_status_creates_a_fresh_sidecar_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:1/unused".to_string()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let rule = resolve_rules(&rules, tmp.path()).unwrap().into_iter().next().unwrap();
+        let last_status_path = rule.last_status_path.clone();
+        assert!(!last_status_path.exists(), "precondition: no sidecar yet");
+        let rt = rule_runtime_for(rule);
+
+        write_last_status(&rt, true, None);
+
+        let mode = std::fs::metadata(&last_status_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a freshly created `.last` sidecar must land owner-only; got {mode:o}");
+    }
+
+    /// (#2453) The other half: a sidecar ALREADY on disk at the pre-#2259
+    /// world-readable default (`0o644` — as a pre-#2259 binary, or a
+    /// hand-edited file, would leave it) must keep working through BOTH
+    /// locked write paths, and its mode must NOT be silently tightened —
+    /// `lock_exclusive`'s `.mode()` only applies at creation, and neither
+    /// `write_status_sidecar_locked` nor `write_cursor_write_status`
+    /// calls `set_permissions`. Silently tightening permissions on a file
+    /// an operator may have intentionally widened is a separate, louder
+    /// decision than "make new files safe by default" (see
+    /// `lock_exclusive`'s own doc).
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_world_readable_sidecar_keeps_its_mode_and_keeps_working() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:1/unused".to_string()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let rule = resolve_rules(&rules, tmp.path()).unwrap().into_iter().next().unwrap();
+        let last_status_path = rule.last_status_path.clone();
+
+        // Simulate a sidecar left behind by a pre-#2259 binary: created
+        // at the umask default rather than owner-only.
+        std::fs::write(&last_status_path, br#"{"ts":"2020-01-01T00:00:00Z","ok":true}"#).unwrap();
+        std::fs::set_permissions(&last_status_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let rt = rule_runtime_for(rule);
+
+        // Both writer paths must still work against it.
+        write_last_status(&rt, false, Some("boom"));
+        assert_eq!(read_last_status(&last_status_path).and_then(|s| s.error), Some("boom".to_string()));
+        let mode_after_write_last_status = std::fs::metadata(&last_status_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_after_write_last_status, 0o644, "write_last_status must not tighten a pre-existing sidecar's mode");
+
+        write_cursor_write_status(&last_status_path, 7, true);
+        let status = read_last_status(&last_status_path).expect("cursor-write-status write must have produced valid JSON");
+        assert_eq!(status.cursor_write_failures, 7);
+        assert!(status.stalled);
+        assert_eq!(status.error.as_deref(), Some("boom"), "cursor-write-status must have preserved the prior delivery outcome");
+        let mode_after_cursor_status = std::fs::metadata(&last_status_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_after_cursor_status, 0o644, "write_cursor_write_status must not tighten a pre-existing sidecar's mode either");
     }
 
     /// Integration-level companion to the narrow test above: end-to-end

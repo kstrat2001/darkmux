@@ -132,6 +132,45 @@ where
     f(guard.file())
 }
 
+/// (#2453) Read-side sibling of `lock_exclusive` — opens `path`
+/// READ-ONLY and takes a blocking SHARED `flock(2)` (`LOCK_SH`), so any
+/// number of readers proceed together but none can observe the file
+/// while an exclusive writer holds it mid-rewrite.
+///
+/// Two deliberate differences from `lock_exclusive`, both of which exist
+/// so this stays usable from a read-only introspection path (`darkmux
+/// doctor`, `flow status`) without that path acquiring any authority it
+/// doesn't need:
+///
+/// - **Never creates.** A missing file returns `Ok(None)`, not a
+///   freshly-created empty one. A `doctor` run must not bring per-rule
+///   state files into existence as a side effect of reporting on them.
+/// - **Opens `O_RDONLY`.** `flock(2)` locks the open file DESCRIPTION and
+///   imposes no access-mode requirement of its own (unlike `fcntl(2)`
+///   record locks), so a shared lock on a read-only handle is legal —
+///   which means this works against a file the caller has no write
+///   permission for.
+///
+/// Callers that need the whole load-modify-save transaction still want
+/// `with_locked_file`'s exclusive lock; this is only for readers.
+pub fn lock_shared_existing(path: &Path) -> Result<Option<FlockGuard>> {
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow!("opening {} for shared-locked read: {}", path.display(), e));
+        }
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(anyhow!(
+            "flock(LOCK_SH) failed on {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(Some(FlockGuard(file)))
+}
+
 /// (#2093 merge-gate finding 3) Non-blocking sibling of `lock_exclusive` —
 /// `flock(LOCK_EX | LOCK_NB)`. Returns `Ok(Some(guard))` when the lock was
 /// acquired, `Ok(None)` when another holder already has it (never blocks
@@ -229,6 +268,63 @@ mod tests {
     /// while another holder has the lock, it returns `Ok(None)` instead of
     /// waiting, so a drainer can skip this cycle rather than stall behind
     /// a slow (up to `POST_TIMEOUT`) holder.
+    /// (#2453) `flock(2)` imposes no access-mode requirement, so a
+    /// SHARED lock on an `O_RDONLY` handle is legal — the property the
+    /// read-only `doctor` path depends on. This is a claim about the
+    /// kernel, not about our code, so it is executed rather than assumed.
+    #[test]
+    fn lock_shared_existing_locks_a_read_only_handle() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("status.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let guard = lock_shared_existing(&path).unwrap();
+        assert!(guard.is_some(), "a shared lock on a read-only handle must succeed");
+    }
+
+    /// (#2453) Two readers hold the shared lock at the same time — it is
+    /// genuinely `LOCK_SH`, not an exclusive lock in disguise (which
+    /// would serialize every `doctor` invocation against every other).
+    #[test]
+    fn lock_shared_existing_admits_concurrent_readers() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("status.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let _a = lock_shared_existing(&path).unwrap().expect("first reader");
+        let b = lock_shared_existing(&path).unwrap();
+        assert!(b.is_some(), "a second shared reader must not block behind the first");
+    }
+
+    /// (#2453) The whole point: while an exclusive writer holds the file
+    /// mid-rewrite, a shared reader cannot get in.
+    #[test]
+    fn lock_shared_existing_is_excluded_by_an_exclusive_holder() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("status.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let _held = lock_exclusive(&path).unwrap();
+        // Non-blocking probe stands in for "would block" — a blocking
+        // `lock_shared_existing` here would hang the test rather than
+        // fail it, which is exactly the shape the review brief warns
+        // against.
+        let rc = unsafe {
+            let f = OpenOptions::new().read(true).open(&path).unwrap();
+            libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB)
+        };
+        assert_eq!(rc, -1, "a shared lock must be refused while an exclusive holder has the file");
+    }
+
+    /// (#2453) A missing file reports absence rather than creating one —
+    /// `doctor` must not materialize per-rule state as a side effect of
+    /// reporting on it.
+    #[test]
+    fn lock_shared_existing_never_creates_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("absent.json");
+        let guard = lock_shared_existing(&path).unwrap();
+        assert!(guard.is_none(), "a missing file must report absence");
+        assert!(!path.exists(), "and must NOT have been created");
+    }
+
     #[test]
     fn try_lock_exclusive_returns_none_when_already_held() {
         let tmp = TempDir::new().unwrap();
