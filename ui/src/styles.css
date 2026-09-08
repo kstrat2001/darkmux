@@ -2313,6 +2313,30 @@ body {
   margin-top: 10px;
   overflow: hidden;
 }
+/* (#2077) `.panelout`/`.panelerr`/`.panelwarn` already scroll horizontally
+   (`overflow-x: auto` below) — a fixed-width CLI table wider than its box
+   was always reachable by touch-dragging the body. This cue is the missing
+   piece: mobile browsers hide the native scrollbar, so nothing signaled
+   that dragging would do anything. `ConsolePanel.tsx`'s `CliPanelView`
+   mounts it IFF the body's own `scrollWidth` measures past its
+   `clientWidth` — never shown for content that already fits.
+
+   A normal-flow strip between `.panelchrome` and the body, NOT an overlay
+   pinned over the content: an absolutely positioned version of this landed
+   directly on top of real table/footer text (measured against the demo's
+   own `run-list` fixture — it sat right on the `showing 10 of 11 runs…`
+   footer line), obscuring exactly the text a wide panel most needs read.
+   Its own strip above the scrollable body never competes with content for
+   the same pixels. */
+.panelwrap__scrollcue {
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-3);
+  color: var(--dim);
+  font: 600 calc(10px * var(--fs-scale)) var(--font-mono);
+  letter-spacing: 0.04em;
+  text-align: right;
+}
 .panelchrome {
   display: flex;
   flex-wrap: wrap;

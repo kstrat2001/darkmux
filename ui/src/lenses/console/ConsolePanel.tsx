@@ -267,8 +267,48 @@ function CliPanelView({
   // the full "why this and not a comparison" reasoning.
   const stale = query.isPlaceholderData;
 
+  // (#2077) `.panelout`/`.panelerr`/`.panelwarn` already scroll horizontally
+  // on their own (`styles.css`'s `.panelout { overflow-x: auto }`) — a real
+  // daemon's `run-list` (KIND/STATUS/STARTED/DURATION/ID/MACHINE) or any
+  // other wide fixed-width CLI table DOES reach its off-screen columns by
+  // touch-dragging the body. Measured against the demo's own captured
+  // `run-list` fixture at a 390px phone viewport: `.panelout` renders 919px
+  // of content in a 356px box, `scrollWidth`/`clientWidth` confirm it, and a
+  // simulated touch swipe moves `scrollLeft` — so the content is reachable.
+  // What is missing is any VISIBLE sign that it's reachable at all: mobile
+  // browsers hide the native scrollbar by default, and nothing else in this
+  // box hints "there's more to the right" — which is exactly why the report
+  // read as "off-screen with no scroll affordance" even though the escape
+  // hatch already existed. This is a real DOM element (not a background
+  // gradient trick) specifically so it has a measurable box: it renders IFF
+  // the body actually overflows, so a geometry-based e2e assertion can prove
+  // it appears when content is wide and stays absent when it isn't.
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [scrollCueVisible, setScrollCueVisible] = useState(false);
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return undefined;
+    const measure = () => {
+      const body = wrap.querySelector<HTMLElement>(".panelout, .panelerr, .panelwarn");
+      // +1: sub-pixel layout rounding must never flip this on for content
+      // that fits exactly — same tolerance `panels.test.ts`'s own geometry
+      // assertions use elsewhere in this lens.
+      setScrollCueVisible(!!body && body.scrollWidth > body.clientWidth + 1);
+    };
+    measure();
+    // Content-driven overflow changes (a new panel/opt selection loading
+    // wider or narrower output) are covered by this effect re-running on
+    // `[loadedBody, errorMessage, stale]` below. `resize` covers the OTHER
+    // axis — the viewport (or a phone rotation) changing while the SAME
+    // content is on screen — matching `useIsMobile.ts`'s own
+    // `window.addEventListener("resize", …)` convention rather than
+    // introducing a second mechanism (a `ResizeObserver`) for the same job.
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [loadedBody, errorMessage, stale]);
+
   return (
-    <div className="panelwrap">
+    <div className="panelwrap" ref={wrapRef}>
       <div className="panelchrome">
         <ChromeCommandLine id={id} opts={opts} onOptChange={onOptChange} loadedBody={loadedBody} stale={stale} manual={manual} fetchedAt={query.dataUpdatedAt} />
         <span className="pc-spacer"></span>
@@ -289,6 +329,20 @@ function CliPanelView({
           {loadedBody ? "re-run" : "run"}
         </button>
       </div>
+      {/* (#2077) A normal-flow row, not an overlay — an absolutely
+          positioned cue pinned over the body sat directly on top of real
+          table/footer text (measured: it landed on the `showing 10 of 11
+          runs…` footer line, obscuring exactly the text a wide panel most
+          needs read). Its own strip above the scrollable body never
+          competes with content for the same pixels. `aria-hidden`: purely a
+          visual hint for a sighted touch user that the box scrolls — a
+          screen reader already reaches every column linearly regardless of
+          scroll position, so there is nothing here worth announcing. */}
+      {scrollCueVisible && (
+        <div className="panelwrap__scrollcue" aria-hidden="true">
+          ⇠ scroll for more ⇢
+        </div>
+      )}
       <PanelBody
         loading={query.isFetching && !stale}
         stale={stale}
