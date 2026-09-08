@@ -651,6 +651,18 @@ pub fn run_ephemeral(
         &crate::crew::concurrent_dispatch::lms_host_factory,
         &mut |mut record| {
             record.mission_id.get_or_insert_with(|| correlation_id.clone());
+            // (#1918) Same fix, same reasoning, as `mission_launch.rs`'s
+            // identical `emit`-wrap: `session_id::task`/`session_id::step`
+            // carry no per-run identity of their own, so every ephemeral
+            // panel dispatch of the SAME document (e.g. every `pr-view`
+            // invocation sharing the reserved task id `__panel_args__`)
+            // collided on one `session_id` — the dominant collision case
+            // named in #1918's own report (49 missions, one session).
+            // Compose this run's own `mission_id` in, the same as `launch`
+            // does — see `darkmux_types::session_id::scope_to_run`.
+            if let Some(mid) = record.mission_id.clone() {
+                record.session_id = record.session_id.map(|sid| darkmux_types::session_id::scope_to_run(&sid, &mid));
+            }
             // (#1877) Drain before emit — same interleaving discipline
             // `launch`'s own emit closure uses, so telemetry streams
             // alongside this run's other records rather than batching at
@@ -1361,6 +1373,107 @@ mod tests {
         assert_eq!(starts[0]["session_id"], serde_json::json!(mission_id));
         assert_eq!(completes[0]["mission_id"], serde_json::json!(mission_id));
         assert_eq!(completes[0]["payload"]["gate"], serde_json::Value::Null, "no coder-phase gate on this path");
+
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    /// (#1918) Two ephemeral panel dispatches of the SAME document (e.g.
+    /// every `pr-view` invocation, which reuses the reserved task id
+    /// `__panel_args__`) must NOT share a scheduler-emitted step-lifecycle
+    /// `session_id` — the dominant real-world collision case named in
+    /// #1918's own report (49 missions folded into one `session_id`
+    /// bucket on the reporting machine). Sibling of
+    /// `mission_launch.rs`'s `two_launches_of_the_same_config_produce_
+    /// distinct_step_lifecycle_session_ids` — same fix, same assertions,
+    /// proving the SAME `scope_to_run` composition applies at this
+    /// SEPARATE `run_step_graph` choke point (`run_ephemeral`'s own
+    /// `emit`-wrap), not just the generic `mission launch` path.
+    #[test]
+    #[serial_test::serial]
+    fn two_ephemeral_runs_of_the_same_document_produce_distinct_step_lifecycle_session_ids() {
+        let tmp_flows = tempfile::TempDir::new().unwrap();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path()) };
+
+        let cfg = config(
+            "panel-args-test",
+            None,
+            vec![phase(
+                "p1",
+                vec![task(
+                    "__panel_args__",
+                    &[],
+                    &[],
+                    vec![step("s1", "procedural.noop", serde_json::Value::Null)],
+                )],
+            )],
+        );
+        let cwd = std::env::temp_dir();
+
+        let out1 = run_ephemeral(&cfg, "", &cwd, None).expect("first ephemeral run succeeds");
+        assert!(out1.success);
+        let out2 = run_ephemeral(&cfg, "", &cwd, None).expect("second ephemeral run succeeds");
+        assert!(out2.success);
+
+        let records = read_all_flow_records();
+        let step_records: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| {
+                let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let source = r.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                source == "scheduler" && (action == "step start" || action == "step complete")
+            })
+            .collect();
+        assert!(
+            step_records.len() >= 4,
+            "expected `step start`+`step complete` for `s1` from BOTH runs, got {}: {step_records:#?}",
+            step_records.len()
+        );
+
+        let mission_ids: std::collections::BTreeSet<&str> = step_records
+            .iter()
+            .filter_map(|r| r.get("mission_id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            mission_ids.len(),
+            2,
+            "both ephemeral runs must be represented by distinct mission ids, got {mission_ids:?}"
+        );
+
+        // Within each run, the step-lifecycle records still share ONE
+        // session_id (grouping intact); across the two runs, that id must
+        // now differ — the #1918 collision surface closed.
+        let sessions_for = |mid: &str| -> std::collections::BTreeSet<&str> {
+            step_records
+                .iter()
+                .filter(|r| r.get("mission_id").and_then(|v| v.as_str()) == Some(mid))
+                .filter_map(|r| r.get("session_id").and_then(|v| v.as_str()))
+                .collect()
+        };
+        let mut all_sessions: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for mid in &mission_ids {
+            let sessions = sessions_for(mid);
+            assert_eq!(
+                sessions.len(),
+                1,
+                "one run's own step-lifecycle records must share exactly ONE session_id, got {sessions:?}"
+            );
+            for sid in &sessions {
+                assert!(sid.contains(mid), "session id `{sid}` must carry its own run's mission id `{mid}`");
+            }
+            all_sessions.extend(sessions);
+        }
+        assert_eq!(
+            all_sessions.len(),
+            2,
+            "the two ephemeral runs of the SAME document must mint DIFFERENT session ids \
+             for the same reused task id `__panel_args__` — this is the #1918 collision surface"
+        );
 
         unsafe {
             match prev_flows {

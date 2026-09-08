@@ -636,7 +636,9 @@ pub(crate) struct StepFinals {
 /// Which step id (if any) a flow record attributes to, using the SAME three
 /// correlation keys, in the SAME order, the page's `stepForRecord` uses:
 /// (1) `payload.step_id`; (2) a `session_id` of the `step-<id>` shape a
-/// `dispatch.internal` step defaults to; (3) `handle == <step id>`. Returns
+/// `dispatch.internal` step defaults to — in EITHER its bare pre-1.43.0
+/// spelling or the `step-<id>-<mission id>` run-scoped spelling #1918
+/// introduced; (3) `handle == <step id>`. Returns
 /// the id only when it is one of THIS mission's steps (`step_ids`), so a
 /// scan over a shared per-day flow file attributes nothing foreign.
 ///
@@ -670,6 +672,28 @@ fn step_for_record<'a>(
         if let Some(rest) = session.strip_prefix("step-") {
             if let Some(found) = step_ids.get(rest) {
                 return Some(found.as_str());
+            }
+            // (#1918) The SAME key, in its run-scoped spelling. Since
+            // 1.43.0 `dispatch_internal::dispatch` composes the emitting
+            // run's own mission id onto this default
+            // (`darkmux_types::session_id::scope_to_run`), so the live
+            // shape is `step-<step id>-<mission id>`. `mission_id` does
+            // NOT substitute for this key: it only gates ADMISSION above
+            // (which mission owns the record) and says nothing about
+            // WHICH STEP it belongs to — and the `dispatch complete`
+            // record this fold reads its `total_tokens`/`total_turns`
+            // from carries neither `payload.step_id` (only the tailer's
+            // per-event records are step-stamped, #1483) nor a step id in
+            // `handle` (that is the ROLE id), so this key is the only one
+            // that can attribute it. Peeled here rather than at the
+            // producer so a mixed day file — pre-1.43.0 unscoped records
+            // beside post-1.43.0 scoped ones, the state every operator
+            // upgrading actually has — folds identically under both
+            // spellings.
+            if let Some(unscoped) = rest.strip_suffix(mission_id).and_then(|r| r.strip_suffix('-')) {
+                if let Some(found) = step_ids.get(unscoped) {
+                    return Some(found.as_str());
+                }
             }
         }
     }
@@ -1418,6 +1442,69 @@ mod tests {
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(15200));
         assert_eq!(out["s1"].turns, Some(9));
+    }
+
+    /// (#1918 QA) The run-SCOPED spelling of correlation key 2. Since
+    /// FLOW 1.43.0 a generic `mission launch <config>` step's own
+    /// `dispatch complete` carries `session_id: "step-<id>-<mission id>"`
+    /// (`session_id::scope_to_run`, applied in
+    /// `dispatch_internal::dispatch` whenever the step's phase resolves —
+    /// which it does for every config-launched mission, since
+    /// `DispatchInternalStepKind::run` falls back to the owning Task's
+    /// `phase_id`). That record carries NO `payload.step_id` (only the
+    /// tailer's per-event records are step-stamped) and its `handle` is
+    /// the ROLE id, so this key is the ONLY one that can attribute it —
+    /// and `mission_id`, which the scoped record does carry, cannot
+    /// substitute: it identifies the MISSION, not the step. Without the
+    /// scoped-form peel every completed step on the mission-graph page
+    /// reads 0 tokens / 0 turns after a reload.
+    #[test]
+    fn fold_finals_dispatch_complete_folds_via_the_run_scoped_session_id() {
+        let step_ids = ids(&["s1"]);
+        let scoped = darkmux_types::session_id::scope_to_run(
+            &darkmux_types::session_id::step("s1"),
+            "twin-mission-1757-abc123",
+        );
+        assert_eq!(scoped, "step-s1-twin-mission-1757-abc123");
+        let rec = serde_json::json!({
+            "action": "dispatch.complete",
+            "session_id": scoped,
+            "mission_id": "twin-mission-1757-abc123",
+            "payload": { "total_tokens": 15200, "total_turns": 9 }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids, "twin-mission-1757-abc123");
+        assert_eq!(out["s1"].tokens, Some(15200));
+        assert_eq!(out["s1"].turns, Some(9));
+    }
+
+    /// (#1918 QA) The peel must not become a NEW cross-mission leak: a
+    /// scoped session belonging to a DIFFERENT mission is already rejected
+    /// by the `mission_id` admission gate, and a session whose suffix
+    /// merely resembles this mission's id must not resolve to a step this
+    /// mission doesn't own.
+    #[test]
+    fn fold_finals_scoped_peel_never_invents_a_foreign_step() {
+        let step_ids = ids(&["s1"]);
+        let recs = vec![
+            // Another mission's scoped session for the SAME step id — the
+            // #1918 collision itself. Rejected on `mission_id` before any
+            // key matching.
+            serde_json::json!({
+                "action": "dispatch.complete",
+                "session_id": "step-s1-mission-other",
+                "mission_id": "mission-other",
+                "payload": { "total_tokens": 99999, "total_turns": 42 }
+            }),
+            // A scoped session for a step this mission does not own.
+            serde_json::json!({
+                "action": "dispatch.complete",
+                "session_id": "step-s-nope-m-this",
+                "mission_id": "m-this",
+                "payload": { "total_tokens": 5, "total_turns": 1 }
+            }),
+        ];
+        let out = fold_step_finals(recs, &step_ids, "m-this");
+        assert!(out.get("s1").is_none(), "no foreign totals may reach s1, got {out:#?}");
     }
 
     #[test]

@@ -77,8 +77,40 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.42.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.43.0";
 // Version history:
+//   1.43.0 — `session_id::task`/`session_id::step` (the scheduler's own
+//           step-lifecycle default and `dispatch.internal`'s unconfigured
+//           default) now compose the emitting run's own mission id into
+//           the string wherever that mission id resolves (#1918). Root
+//           cause: both defaults derive purely from a task/step id
+//           straight out of the mission config document — byte-identical
+//           across every launch of the SAME config — so `darkmux-serve`'s
+//           flow index, keyed by `session_id` alone, folded every mission
+//           that ever ran a shared config into one bucket (98 records /
+//           49 distinct `mission_id` / 1 `session_id`, measured live).
+//           `FlowRecord.session_id` stays a plain `Option<String>` — no
+//           field added, removed, or retyped — this bump documents a
+//           VALUE-convention change for the same reason 1.24.0's
+//           `crawl.unit.*` session-id convention change did (the
+//           `crawl.unit.started`/`completed` pair moving onto the UNIT's
+//           own session id — that entry's "finding 5"; 1.17.0, which an
+//           earlier draft of this line cited, is the review-funnel
+//           ACTION-VALUE entry and changed no session id): an older
+//           reader that predicts this string from a task/step id alone
+//           (rather than treating it as opaque) now predicts wrong for
+//           new records — darkmux's own mission-graph step correlator
+//           (`darkmux-serve::mission_graph::step_for_record` and its
+//           page-side twin) was one of them, and accepts BOTH spellings
+//           as of this version. Old records on disk are UNAFFECTED and keep
+//           resolving under their pre-1.43.0 (unscoped) session_id
+//           forever — this only changes what NEW records carry, and only
+//           when the emitting mission's id actually resolves (a session
+//           whose phase→mission lookup fails, the pre-existing #1523
+//           "Gap 2", still emits the unscoped form; `darkmux-serve`'s own
+//           predictor claims BOTH forms for exactly that reason). See
+//           `darkmux_types::session_id::scope_to_run`'s doc for the full
+//           producer/consumer inventory.
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
 //   1.4.0 — added optional `machine_id` + `orchestrator` (#167; substrate for #162 fleet UI)

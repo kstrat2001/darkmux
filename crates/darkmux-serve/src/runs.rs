@@ -668,6 +668,33 @@ fn collect_mission_step_sessions(mission: &Mission) -> HashSet<String> {
             continue;
         };
         for step in steps {
+            // (#1918 — considered, not applied) `step_session_id`
+            // reconstructs the per-KIND default (`session_id::task`/
+            // `session_id::step`) exactly as the producer computes it
+            // BEFORE composing this run's own identity in via
+            // `scope_to_run`. This predictor does NOT also predict the
+            // scoped form: every producer that applies `scope_to_run`
+            // (the launcher's `emit`-wrap, and `dispatch_internal::
+            // dispatch`'s own resolved-mission composition) does so in
+            // lock-step with populating `FlowRecord.mission_id` — the
+            // SAME resolved value drives both, unconditionally in the
+            // launcher's case and gated on the SAME `resolve_mission_
+            // for_phase` call in `dispatch_internal`'s. So a record's
+            // `session_id` is the SCOPED form if and only if that record
+            // ALSO carries `mission_id` — and a session with `mission_id`
+            // present is already correctly attributed and ghost-
+            // suppressed via `build_mission_id_index`/`known_mission_ids`,
+            // with no need for this predictor to also guess the scoped
+            // string. Only the UNSCOPED default below is ever needed here
+            // (the pre-existing #1523 "Gap 2": a step whose phase→mission
+            // resolution fails keeps the raw form on both mission_id AND
+            // session_id, together).
+            //
+            // (#1918 QA) This reasoning is specific to a MISSION-
+            // attribution join. It does NOT generalize: `mission_graph::
+            // step_for_record` asks WHICH STEP a record belongs to, which
+            // `mission_id` cannot answer, so that consumer does have to
+            // accept the scoped spelling and peels the suffix itself.
             if let Some(sid) = step_session_id(&step, &registry) {
                 out.insert(sid);
             }
@@ -832,8 +859,25 @@ fn mission_to_run(
     // that start-less session first and let its `handle`/`model` win both
     // attributes over every real dispatch session, exactly the corruption
     // `earliest_by_start` itself is already immune to.
+    //
+    // (#1918 QA) ALSO filtered by `!is_ambiguous()`, for the SAME reason
+    // and by the SAME detector `sessions_bare` (status, #1979) already
+    // uses. Role and model are exactly the two attributes #1918 reports
+    // as cross-contaminated, and the write-side scoping alone does not
+    // close them for a MIXED day file — the state every operator has for
+    // `RUNS_FLOW_SCAN_WINDOW_DAYS` after upgrading. A pre-1.43.0 record
+    // set still carries the bare `task-<id>`/`step-<id>` bucket that N
+    // missions shared; a NEW mission's structural prediction
+    // (`collect_mission_step_sessions`, which by design still predicts the
+    // unscoped form) claims that bucket, and because the legacy records
+    // are OLDER they sort FIRST here and win both attributes over the new
+    // mission's own correctly-scoped session. Proved: a new mission
+    // rendered `model: legacy-model-a` / `role: legacy-role` beside its
+    // own `correct-model` records. Membership deliberately still keeps
+    // these aggs (claiming the session suppresses a ghost row); only
+    // ATTRIBUTION is narrowed, mirroring `sessions_bare` exactly.
     let mut sessions_by_start: Vec<&SessionAgg> =
-        sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some()).collect();
+        sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some() && !s.is_ambiguous()).collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
 
     // Model is simple: the bookend's own record NEVER carries one
@@ -3902,6 +3946,165 @@ mod tests {
         assert_eq!(runs[0].kind, RunKind::Mission);
         assert!(runs[0].tracked);
         assert_eq!(runs[0].model.as_deref(), Some("qwen3.6-35b-a3b"));
+    }
+
+    /// (#1918) The actual reported harm, reproduced end to end: TWO
+    /// missions launched from the SAME config run the SAME task/step id
+    /// (`s-shared`) with DIFFERENT roles/models. Before the fix, both
+    /// missions' step records landed under the identical config-derived
+    /// `session_id` (`step-s-shared`), so `SessionAgg` folded them into
+    /// ONE bucket and `mission_to_run`'s role/model attribution for
+    /// EITHER mission could read the OTHER's. This test writes the
+    /// POST-FIX (scoped) session ids each mission's own step-lifecycle
+    /// records now carry and asserts `build_runs` attributes role/model
+    /// to the mission that actually ran it — never the sibling's.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_two_missions_from_the_same_config_never_cross_attribute_role_or_model() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let raw_session = darkmux_types::session_id::step("s-shared");
+        let session_x = darkmux_types::session_id::scope_to_run(&raw_session, "mission-x");
+        let session_y = darkmux_types::session_id::scope_to_run(&raw_session, "mission-y");
+        assert_ne!(session_x, session_y, "the two missions' scoped session ids must differ");
+
+        // `write_day_file` truncates the day file on every call — collect
+        // BOTH missions' records and write the file exactly once, the way
+        // a real day's flow stream actually accumulates.
+        let mut all_records: Vec<serde_json::Value> = Vec::new();
+        for (mission_id, phase_id, task_id, role, model, session_id) in [
+            ("mission-x", "px", "tx", "coder", "model-x", &session_x),
+            ("mission-y", "py", "ty", "reviewer", "model-y", &session_y),
+        ] {
+            let mission = minimal_mission(
+                mission_id,
+                vec![phase_id.to_string()],
+                Some(MissionSpec {
+                    config_id: "shared-config".to_string(),
+                    inputs_fingerprint: format!("fp-{mission_id}"),
+                    origin: None,
+                }),
+            );
+            darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+            let phase = minimal_phase(phase_id, mission_id, vec![task_id.to_string()]);
+            darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+            let task = minimal_task(task_id, phase_id, vec!["s-shared".to_string()], Some(role));
+            darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
+            // Same step id, same kind default, no explicit session_id —
+            // the exact config-derived collision shape.
+            let step = minimal_step("s-shared", task_id, None);
+            darkmux_crew::lifecycle::save_step(mission_id, phase_id, &step).unwrap();
+
+            all_records.push(serde_json::json!({
+                "ts": "2026-07-24T09:00:00Z",
+                "action": "dispatch start",
+                "session_id": session_id,
+                "handle": role,
+                "mission_id": mission_id,
+            }));
+            all_records.push(serde_json::json!({
+                "ts": "2026-07-24T09:10:00Z",
+                "action": "dispatch complete",
+                "session_id": session_id,
+                "handle": role,
+                "mission_id": mission_id,
+                "model": model,
+            }));
+        }
+        write_day_file(flows.path(), &today(), &all_records);
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let run_x = runs.iter().find(|r| r.id == "mission-x").expect("mission-x must produce a Run");
+        let run_y = runs.iter().find(|r| r.id == "mission-y").expect("mission-y must produce a Run");
+
+        assert_eq!(run_x.model.as_deref(), Some("model-x"), "mission-x must never read mission-y's model");
+        assert_eq!(run_y.model.as_deref(), Some("model-y"), "mission-y must never read mission-x's model");
+        assert_ne!(
+            run_x.model, run_y.model,
+            "two missions running the SAME shared task/step id must attribute DISTINCT models — \
+             the #1918 cross-mission contamination this fix closes"
+        );
+    }
+
+    /// (#1918 QA) The MIXED day file — the state every operator has for
+    /// `RUNS_FLOW_SCAN_WINDOW_DAYS` after upgrading past FLOW 1.43.0:
+    /// pre-1.43.0 records still carry the bare `step-<id>` bucket that N
+    /// missions shared, beside a new mission's correctly-scoped ones. A
+    /// new mission's structural prediction (`collect_mission_step_
+    /// sessions`, which by design still predicts the UNSCOPED form)
+    /// claims that legacy bucket, and its records are OLDER — so before
+    /// the `is_ambiguous` filter on `sessions_by_start` they sorted FIRST
+    /// and won BOTH `role` and `model`, which are precisely the two
+    /// attributes #1918 exists to stop cross-contaminating. Measured
+    /// before the fix: `model: legacy-model-a`, `role: legacy-role` on a
+    /// mission whose own records say `correct-model`/`coder`.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_mixed_day_never_attributes_the_legacy_shared_bucket_to_a_new_mission() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let raw = darkmux_types::session_id::step("s-shared");
+        let scoped_new = darkmux_types::session_id::scope_to_run(&raw, "mission-new");
+        assert_ne!(raw, scoped_new);
+
+        let mission = minimal_mission(
+            "mission-new",
+            vec!["pn".to_string()],
+            Some(MissionSpec {
+                config_id: "shared-config".to_string(),
+                inputs_fingerprint: "fp-new".to_string(),
+                origin: None,
+            }),
+        );
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        darkmux_crew::lifecycle::save_phase(&minimal_phase("pn", "mission-new", vec!["tn".to_string()])).unwrap();
+        darkmux_crew::lifecycle::save_task(
+            "mission-new",
+            &minimal_task("tn", "pn", vec!["s-shared".to_string()], Some("coder")),
+        )
+        .unwrap();
+        darkmux_crew::lifecycle::save_step("mission-new", "pn", &minimal_step("s-shared", "tn", None)).unwrap();
+
+        let mut recs: Vec<serde_json::Value> = Vec::new();
+        // LEGACY: two OLD missions folded into the ONE bare session id —
+        // the 49-missions/1-session bucket #1918 measured live.
+        for (mid, model) in [("mission-old-a", "legacy-model-a"), ("mission-old-b", "legacy-model-b")] {
+            recs.push(serde_json::json!({
+                "ts": "2026-07-20T09:00:00Z", "action": "dispatch start",
+                "session_id": raw, "handle": "legacy-role", "mission_id": mid,
+            }));
+            recs.push(serde_json::json!({
+                "ts": "2026-07-20T09:10:00Z", "action": "dispatch complete",
+                "session_id": raw, "handle": "legacy-role", "mission_id": mid, "model": model,
+            }));
+        }
+        // The new mission's OWN, correctly scoped records — LATER, so
+        // only the ambiguity filter (not ordering) can save them.
+        recs.push(serde_json::json!({
+            "ts": "2026-07-24T09:00:00Z", "action": "dispatch start",
+            "session_id": scoped_new, "handle": "coder", "mission_id": "mission-new",
+        }));
+        recs.push(serde_json::json!({
+            "ts": "2026-07-24T09:10:00Z", "action": "dispatch complete",
+            "session_id": scoped_new, "handle": "coder", "mission_id": "mission-new",
+            "model": "correct-model",
+        }));
+        write_day_file(flows.path(), &today(), &recs);
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let run = runs.iter().find(|r| r.id == "mission-new").expect("mission-new must produce a Run");
+        assert_eq!(
+            run.model.as_deref(),
+            Some("correct-model"),
+            "a new mission must never read a legacy shared bucket's model"
+        );
+        assert_eq!(
+            run.role.as_deref(),
+            Some("coder"),
+            "a new mission must never read a legacy shared bucket's role"
+        );
     }
 
     /// (#1877 regression, fixed here) The whole-run `dispatch start`

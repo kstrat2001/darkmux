@@ -345,16 +345,44 @@ export function tsToMs(ts: string | number | null | undefined): number {
 }
 
 /** `stepForRecord` — mission-graph.html. Three correlation keys, in order:
- * `payload.step_id`, `session_id` (the `step-<id>` default), `handle`.
- * `mission_id`, when present, is authoritative and never falls through. */
+ * `payload.step_id`, `session_id` (the `step-<id>` default, in either its
+ * bare pre-FLOW-1.43.0 spelling or the `step-<id>-<missionId>` run-scoped
+ * spelling #1918 introduced), `handle`.
+ * `mission_id`, when present, is authoritative and never falls through.
+ *
+ * (#1918) `mission_id` does NOT make the session key redundant: it gates
+ * ADMISSION (which mission owns the record) and says nothing about WHICH
+ * STEP the record belongs to. The `dispatch complete` record the token/turn
+ * meters read carries no `payload.step_id` (only the tailer's per-event
+ * records are step-stamped) and its `handle` is the ROLE id, so the session
+ * key is the only one that can attribute it. Mirrors
+ * `crates/darkmux-serve/src/mission_graph.rs`'s `step_for_record` exactly —
+ * the two must stay in lock-step. */
 export function stepForRecord(rec: FlowRecord, idx: GraphIndex, missionId: string): string | null {
   if (rec.mission_id && rec.mission_id !== missionId) return null;
   const p = rec.payload || {};
   const stepId = typeof p.step_id === "string" ? p.step_id : undefined;
   if (stepId && idx.stepIds.has(stepId)) return stepId;
-  if (rec.session_id && idx.sessionToStep[rec.session_id]) return idx.sessionToStep[rec.session_id];
+  if (rec.session_id) {
+    if (idx.sessionToStep[rec.session_id]) return idx.sessionToStep[rec.session_id];
+    const unscoped = unscopeSession(rec.session_id, missionId);
+    if (unscoped && idx.sessionToStep[unscoped]) return idx.sessionToStep[unscoped];
+  }
   if (rec.handle && idx.stepIds.has(rec.handle)) return rec.handle;
   return null;
+}
+
+/** (#1918) Peel the run-scope `-<missionId>` suffix
+ * `darkmux_types::session_id::scope_to_run` appends to the config-derived
+ * `task-`/`step-` session defaults, so a mixed day file — pre-1.43.0
+ * unscoped records beside post-1.43.0 scoped ones, the state every
+ * upgrading operator actually has — resolves identically under both
+ * spellings. Returns "" when the id carries no such suffix. */
+export function unscopeSession(sessionId: string, missionId: string): string {
+  if (!missionId) return "";
+  const suffix = "-" + missionId;
+  if (!sessionId.endsWith(suffix)) return "";
+  return sessionId.slice(0, sessionId.length - suffix.length);
 }
 
 /** (#2223) Does this flow-record action attest MODEL-DISPATCH work?
@@ -421,7 +449,14 @@ export function stepDispatchSessions(records: FlowRecord[], missionId: string): 
   }
   const out: Record<string, string> = {};
   for (const [stepId, seen] of Object.entries(tally)) {
+    // (#1918) The emitter default now carries the run scope
+    // (`step-<id>-<missionId>`) whenever the step's phase resolves, so
+    // this deterministic tiebreak accepts BOTH spellings — otherwise the
+    // rule silently stopped applying on exactly the flagship generic
+    // `mission launch <config>` path it was written for.
     const emitterDefault = "step-" + stepId;
+    const emitterDefaultScoped = emitterDefault + "-" + missionId;
+    const isEmitterDefault = (sid: string) => sid === emitterDefault || sid === emitterDefaultScoped;
     let best = "";
     let bestT: Tally | null = null;
     for (const [sid, t] of Object.entries(seen)) {
@@ -434,8 +469,8 @@ export function stepDispatchSessions(records: FlowRecord[], missionId: string): 
         if (t.ours) { best = sid; bestT = t; }
         continue;
       }
-      const aDefault = sid === emitterDefault;
-      const bDefault = best === emitterDefault;
+      const aDefault = isEmitterDefault(sid);
+      const bDefault = isEmitterDefault(best);
       if (aDefault !== bDefault) {
         if (aDefault) { best = sid; bestT = t; }
         continue;

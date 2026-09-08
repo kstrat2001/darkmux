@@ -68,6 +68,18 @@ pub fn mission_phase_dispatch(
 /// Task-scoped step-lifecycle record id (#1399). Was `task:{id}` pre-#1436;
 /// the mission-graph page's events-panel scoping matches on this exact form,
 /// updated in lockstep in the same change.
+///
+/// **Carries no per-RUN identity (#1918).** `task_id` comes straight out of
+/// the mission config document — byte-identical across every launch of the
+/// same config — so this alone is NOT a valid flow-index key across
+/// missions. Every production caller that stamps this onto a real
+/// `FlowRecord` composes it with [`scope_to_run`] using the launcher's own
+/// per-run `mission_id`, at the same choke point that already backfills
+/// `FlowRecord.mission_id` (#1641). This constructor's raw output is still
+/// correct and unchanged for callers that only need the per-CONFIG grouping
+/// key it always meant (e.g. `dispatch_session_id`'s trait-level contract) —
+/// #1918's fix is additive at the emission boundary, not a change to what
+/// this function returns.
 pub fn task(task_id: &str) -> String {
     session_id("task", task_id, "")
 }
@@ -75,8 +87,82 @@ pub fn task(task_id: &str) -> String {
 /// Step-scoped default dispatch session id (a `dispatch.internal` step with
 /// no caller-supplied session id). Was `step:{id}` pre-#1436; the
 /// mission-graph page indexes this form to map a record back to its step.
+///
+/// **Carries no per-RUN identity (#1918)** for the same reason [`task`]
+/// doesn't — `step_id` is a literal out of the mission config document. See
+/// [`task`]'s doc for the full explanation and [`scope_to_run`] for the fix
+/// applied at emission time.
 pub fn step(step_id: &str) -> String {
     session_id("step", step_id, "")
+}
+
+/// (#1918) Disambiguates a config-derived session id by composing the
+/// caller's own per-run identity into it.
+///
+/// [`task`] and [`step`] are the only two mints in this module that carry
+/// NO per-run identity of their own: both derive purely from a task or step
+/// id straight out of a mission config, so the SAME config launched twice
+/// produces the byte-identical string both times. Every other mint here
+/// already composes a mission id or a time-based disambiguator
+/// ([`mission`], [`mission_run`], [`mission_phase_dispatch`],
+/// [`phase_estimate_narrate`], [`phase_review`]) and passes through this
+/// function unchanged.
+///
+/// Applied at the launcher's `emit`-wrap choke point (`src/mission_launch.rs`,
+/// `src/acp_panel.rs`) — the same place that already backfills
+/// `FlowRecord.mission_id` (#1641) — rather than inside `darkmux-crew`
+/// itself, because the scheduler and the built-in `StepKind`s structurally
+/// have no `Mission` concept of their own (see `scheduler::step_lifecycle_
+/// record`'s doc).
+///
+/// **Read-side inventory (#1918 QA).** Two consumers reconstruct these
+/// strings independently, and they need DIFFERENT things — because the
+/// session id answers two different questions:
+///
+/// - `darkmux-serve::runs::collect_mission_step_sessions` predicts the
+///   UNSCOPED form ONLY, on purpose. It is a MISSION-attribution join, and
+///   a scoped record always also carries `FlowRecord.mission_id` (every
+///   site that applies this function does so in lock-step with populating
+///   that field — unconditionally in the launcher's `emit`-wrap, and gated
+///   on the SAME `resolve_mission_for_phase` result in
+///   `dispatch_internal::dispatch`), so `mission_id` already answers it.
+///   The unscoped prediction is still needed for the case where the
+///   mission does NOT resolve, which leaves BOTH fields in their raw form
+///   together.
+/// - `darkmux-serve::mission_graph::step_for_record` (and its page-side
+///   twin `ui/src/lenses/mission/graph.ts::stepForRecord`) DOES have to
+///   accept both spellings. It asks WHICH STEP a record belongs to, and
+///   `mission_id` cannot answer that — it only gates admission. The
+///   `dispatch complete` record those meters read carries no
+///   `payload.step_id` and its `handle` is the ROLE id, so the session id
+///   is its only step key. Both peel a trailing `-{mission_id}` before the
+///   lookup.
+///
+/// The general rule for a new consumer: "scoped implies `mission_id`
+/// present" is true, but it only lets you SKIP this function when the
+/// thing you are identifying is the MISSION.
+///
+/// Idempotent by substring, not by exact suffix: `run_id` may already
+/// appear anywhere in `session_id` (a crew-of-one dispatch's `task_id` is
+/// itself minted as `{mission_id}-task`, so `task(&task_id)` already
+/// contains the mission id it would otherwise be scoped to) — in that case
+/// this is a no-op, not a second stamp.
+///
+/// A narrow, accepted gap: an OPERATOR-AUTHORED `step.config["session_id"]`
+/// that happens to literally start with `task-`/`step-` also gets scoped by
+/// this function, since the emission choke point cannot tell "the
+/// convention default" apart from "an explicit override that happens to
+/// share the prefix" once it's already a plain string on the `FlowRecord`.
+/// No built-in role/mission-config template does this; the cost of the
+/// false-positive case is a harmless extra suffix on a self-chosen name,
+/// never a correctness break.
+pub fn scope_to_run(session_id: &str, run_id: &str) -> String {
+    let collision_prone = session_id.starts_with("task-") || session_id.starts_with("step-");
+    if collision_prone && !session_id.contains(run_id) {
+        format!("{session_id}-{run_id}")
+    } else {
+        session_id.to_string()
+    }
 }
 
 /// Phase-estimate narration flow id (the utility-agent narrate pass).
@@ -153,5 +239,64 @@ mod tests {
         assert!(step("s").starts_with("step-"));
         assert_eq!(phase_review(42), "phase-review-42");
         assert_eq!(phase_estimate_narrate(7), "phase-estimate-narrate-7");
+    }
+
+    // ── scope_to_run (#1918) ─────────────────────────────────────────────
+
+    #[test]
+    fn scope_to_run_disambiguates_task_and_step_forms() {
+        assert_eq!(scope_to_run(&task("t1"), "m1"), "task-t1-m1");
+        assert_eq!(scope_to_run(&step("s1"), "m1"), "step-s1-m1");
+    }
+
+    #[test]
+    fn scope_to_run_disambiguates_the_same_task_across_two_missions_differently() {
+        // The actual #1918 collision: two missions launched from the SAME
+        // config mint the SAME `task(&task_id)`. Scoping to each mission's
+        // own id must diverge them.
+        let a = scope_to_run(&task("t1"), "mission-a");
+        let b = scope_to_run(&task("t1"), "mission-b");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn scope_to_run_leaves_already_run_scoped_forms_untouched() {
+        // Every OTHER mint already carries a mission id or a time-based
+        // disambiguator — scoping must be a no-op for these, never a
+        // second stamp.
+        assert_eq!(scope_to_run(&mission("m1"), "m1"), mission("m1"));
+        assert_eq!(scope_to_run(&mission_run("m1", "p1"), "m1"), mission_run("m1", "p1"));
+        assert_eq!(
+            scope_to_run(&mission_phase_dispatch("m1", "p1", 100, 0), "m1"),
+            mission_phase_dispatch("m1", "p1", 100, 0)
+        );
+        assert_eq!(scope_to_run(&phase_review(42), "m1"), phase_review(42));
+    }
+
+    #[test]
+    fn scope_to_run_is_idempotent_by_substring_not_only_exact_suffix() {
+        // A crew-of-one dispatch mints `task_id` as `{mission_id}-task`, so
+        // `task(&task_id)` already contains the mission id in the MIDDLE of
+        // the string, not at the end. Scoping must recognize that as
+        // already-disambiguated rather than appending a second, redundant
+        // stamp — the read-side predictor (`collect_mission_step_sessions`)
+        // calls this unconditionally for every mission shape and must
+        // reconstruct the EXACT same string the write side left unscoped.
+        let crew_of_one_task_id = "mission-xyz-task";
+        let sid = task(crew_of_one_task_id);
+        assert_eq!(sid, "task-mission-xyz-task");
+        assert_eq!(scope_to_run(&sid, "mission-xyz"), sid, "already contains the run id — must not double-stamp");
+
+        // Calling it twice with the genuinely new-collision shape must also
+        // never double-stamp.
+        let once = scope_to_run(&task("t1"), "m1");
+        assert_eq!(scope_to_run(&once, "m1"), once);
+    }
+
+    #[test]
+    fn scope_to_run_never_touches_a_non_collision_prone_explicit_session_id() {
+        // An operator-authored `step.config["session_id"]` with no
+        // `task-`/`step-` prefix at all is untouched.
+        assert_eq!(scope_to_run("crew-dispatch-coder-123", "m1"), "crew-dispatch-coder-123");
     }
 }
