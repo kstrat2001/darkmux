@@ -3653,6 +3653,27 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // dispatch. The router (dispatch.rs) returns here before its own phase
     // wiring, so the internal path resolves it directly from `opts`.
     let mission_id = crate::dispatch::resolve_mission_for_phase(opts.phase_id.as_deref());
+    // (#1918) `DispatchInternalStepKind::run` defaults an unconfigured
+    // step's `session_id` to `session_id::step(&step.id)` — a literal out
+    // of the mission config document, byte-identical across every launch
+    // of the same config, so a GENERIC config-launched mission's own
+    // agentic dispatch bookends (`dispatch start`/`dispatch.turn`/
+    // `dispatch.tool`/`dispatch complete`/telemetry — everything this
+    // function emits below, live) collided exactly like the scheduler's
+    // step-lifecycle bookends did. This is the SAME resolved `mission_id`
+    // this function already uses for those records' `mission_id` field
+    // (the comment above) — composing it into `session_id` too closes the
+    // collision for the ONE producer that streams its own records
+    // directly (bypassing `StepOutcome.flow_records`/`StepRunCtx::emit`,
+    // both of which the launcher's `emit`-wrap already scopes — see
+    // `darkmux_types::session_id::scope_to_run`'s doc for the full
+    // producer inventory). A no-op for crew-of-one's `{mission_id}-task`-
+    // embedded ids and coder-phase/review's explicit `mission-run-<…>`
+    // session — both already carry their own run identity.
+    let session_id = match &mission_id {
+        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
+        None => session_id,
+    };
     let phase_id = opts.phase_id.clone();
     // (#1483) The mission-graph step this dispatch runs as (when it's a
     // graph step). Stamped onto every live per-event flow record's payload

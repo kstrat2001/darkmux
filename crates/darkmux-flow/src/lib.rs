@@ -3061,7 +3061,13 @@ mod tests {
         //           becomes machine-scoped (session/model/mission/phase
         //           fields absent, `payload.interval_ms` added) — one
         //           emitter per machine instead of one per dispatch (#2413).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.42.0");
+        //   1.43.0: `session_id::task`/`session_id::step` compose the
+        //           emitting run's own mission id into the string wherever
+        //           it resolves — closes the collision where every mission
+        //           launched from the same config shared one session_id
+        //           (#1918). See `schema.rs`'s own history entry for the
+        //           full explanation.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.43.0");
     }
 
     #[test]

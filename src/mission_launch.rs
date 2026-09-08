@@ -1528,6 +1528,25 @@ pub fn launch(
         // "running" by the other mission's heartbeat.
         &mut |mut record| {
             record.mission_id.get_or_insert_with(|| mission_id.clone());
+            // (#1918) `session_id::task`/`session_id::step` carry no
+            // per-run identity of their own — see their own doc and
+            // `darkmux_types::session_id::scope_to_run`'s. Compose this
+            // run's own (now-resolved) `mission_id` into the session id
+            // right here, the SAME choke point that already backfills
+            // `mission_id` above, so every record this run's
+            // `run_step_graph` call produces — the scheduler's own
+            // step-lifecycle bookends AND any `StepKind`'s task-scoped
+            // dispatch session — stops colliding with every OTHER mission
+            // ever launched from this same config.
+            // Read-side: `darkmux-serve::runs`'s join needs no change (a
+            // scoped record always also carries `mission_id`, backfilled
+            // one line above), but `mission_graph::step_for_record` and
+            // its page-side twin DO peel this suffix — see
+            // `scope_to_run`'s own read-side inventory for why the two
+            // differ.
+            if let Some(mid) = record.mission_id.clone() {
+                record.session_id = record.session_id.map(|sid| darkmux_types::session_id::scope_to_run(&sid, &mid));
+            }
             // (#1877, corrected #2413 round 3 MF3) Calls `flow::record`
             // directly here (not `bookend.emit_now`) because `bookend`
             // isn't reachable from inside this closure (it's constructed
@@ -4819,18 +4838,36 @@ mod tests {
         );
     }
 
-    /// (#1641) Two missions launched from the SAME config share every
-    /// CONFIG-scoped identity a step-lifecycle record carries —
-    /// `session_id::task(&step.task_id)` and `handle: step.id` are literal
-    /// strings straight out of the document, byte-identical across both
-    /// runs (`crates/darkmux-crew/src/scheduler.rs`'s `step_lifecycle_record`
-    /// doc names this exact collision — real flow data measured only 0.2%
-    /// of dispatch/token records carrying `mission_id` before this fix).
-    /// This proves the launcher's `emit`-wrap closes it: same session_id and
-    /// handle across both runs, but `mission_id` disambiguates them.
+    /// (#1918) Two missions launched from the SAME config must NOT share a
+    /// step-lifecycle `session_id`. Before this fix,
+    /// `session_id::task(&step.task_id)` was a literal string straight out
+    /// of the mission config document — byte-identical across every launch
+    /// of the same config (`crates/darkmux-crew/src/scheduler.rs`'s
+    /// `step_lifecycle_record` doc names this exact collision) — so
+    /// `darkmux-serve`'s flow index, keyed by `session_id` ALONE, folded
+    /// every mission that ever ran this config into ONE bucket (98 records
+    /// / 49 distinct `mission_id` / 1 `session_id`, measured live on the
+    /// reporting machine). The pre-#1918 `mission_id` backfill (#1641,
+    /// this test's own former name) stamped the RIGHT mission id onto each
+    /// record, but that alone did not help: the flow index's KEY is
+    /// `session_id`, so the AGGREGATE itself — role, model, timestamps,
+    /// liveness — stayed cross-contaminated across every mission sharing
+    /// the bucket even though each record still carried its own correct
+    /// `mission_id`.
+    ///
+    /// The fix composes the launcher's own per-run `mission_id` into the
+    /// scheduler's config-derived `session_id::task`/`session_id::step`
+    /// forms, at the SAME `emit`-wrap choke point that already backfills
+    /// `mission_id` (#1641) — see
+    /// `darkmux_types::session_id::scope_to_run`. This test proves BOTH
+    /// directions: two runs of the same config now mint DIFFERENT session
+    /// ids for the same task (the actual fix), and one run's OWN
+    /// step-lifecycle records still share exactly ONE session id so a
+    /// step's start/complete/timing records keep grouping (the direction
+    /// an over-eager fix could break).
     #[test]
     #[serial_test::serial]
-    fn two_launches_of_the_same_config_produce_step_lifecycle_records_distinguishable_by_mission_id() {
+    fn two_launches_of_the_same_config_produce_distinct_step_lifecycle_session_ids() {
         const STEPPED_CONFIG: &str = r#"{
             "id": "twin-mission-test",
             "name": "Twin Mission Test",
@@ -4877,44 +4914,71 @@ mod tests {
             step_records.len()
         );
 
-        // The config-scoped collision that made the bug possible: BOTH runs'
-        // step-lifecycle records share the exact same `session_id`/`handle`.
-        let session_ids: std::collections::BTreeSet<&str> = step_records
-            .iter()
-            .filter_map(|r| r.get("session_id").and_then(|v| v.as_str()))
-            .collect();
-        assert_eq!(
-            session_ids,
-            std::collections::BTreeSet::from(["task-t1"]),
-            "both runs' step-lifecycle records must share the SAME config-scoped session_id \
-             (session_id::task(\"t1\") = \"task-t1\") — this is the collision surface, got {session_ids:?}"
-        );
-        let handles: std::collections::BTreeSet<&str> =
-            step_records.iter().filter_map(|r| r.get("handle").and_then(|v| v.as_str())).collect();
-        assert_eq!(
-            handles,
-            std::collections::BTreeSet::from(["s1"]),
-            "both runs' step-lifecycle records must share the SAME handle, got {handles:?}"
-        );
-
-        // ...but `mission_id` DOES distinguish them now — the actual fix
-        // under test. Assert on `mission_id` itself, not any downstream or
-        // coincidental value.
+        // mission_id continues to disambiguate every record (#1641,
+        // unchanged by this fix).
         for r in &step_records {
             assert!(
                 r.get("mission_id").and_then(|v| v.as_str()).is_some(),
                 "every step-lifecycle record must carry a non-null mission_id, got {r:#?}"
             );
         }
-        let mission_ids_seen: std::collections::BTreeSet<&str> = step_records
-            .iter()
-            .filter_map(|r| r.get("mission_id").and_then(|v| v.as_str()))
-            .collect();
+
+        let recs_for = |mid: &str| -> Vec<&&serde_json::Value> {
+            step_records.iter().filter(|r| r.get("mission_id").and_then(|v| v.as_str()) == Some(mid)).collect()
+        };
+        let first_recs = recs_for(&first_id);
+        let second_recs = recs_for(&second_id);
+        assert!(
+            !first_recs.is_empty() && !second_recs.is_empty(),
+            "both missions must be represented among the step-lifecycle records, got {step_records:#?}"
+        );
+
+        // The direction an over-eager fix could break: ONE mission's own
+        // step-lifecycle records (its `s1` start + complete) must still
+        // share exactly ONE session_id, so they keep grouping.
+        let first_sessions: std::collections::BTreeSet<&str> =
+            first_recs.iter().filter_map(|r| r.get("session_id").and_then(|v| v.as_str())).collect();
         assert_eq!(
-            mission_ids_seen,
-            std::collections::BTreeSet::from([first_id.as_str(), second_id.as_str()]),
-            "step-lifecycle records must carry BOTH real, distinct mission ids — same \
-             session_id/handle, but mission_id tells the two runs apart"
+            first_sessions.len(),
+            1,
+            "one mission's own step-lifecycle records must share exactly ONE session_id, got {first_sessions:?}"
+        );
+        let second_sessions: std::collections::BTreeSet<&str> =
+            second_recs.iter().filter_map(|r| r.get("session_id").and_then(|v| v.as_str())).collect();
+        assert_eq!(
+            second_sessions.len(),
+            1,
+            "one mission's own step-lifecycle records must share exactly ONE session_id, got {second_sessions:?}"
+        );
+
+        // The actual fix under test: the SAME task, run in TWO different
+        // missions, must mint DIFFERENT session ids — the #1918 collision
+        // surface closed.
+        assert_ne!(
+            first_sessions, second_sessions,
+            "two missions launched from the SAME config must mint DIFFERENT session ids \
+             for the same task — this is the #1918 collision surface"
+        );
+
+        // Each session id must carry its OWN mission's identity as the
+        // disambiguator (tying the fix to `mission_id`, not an unrelated
+        // opaque value) — matches `darkmux_types::session_id::scope_to_run`'s
+        // contract.
+        for sid in &first_sessions {
+            assert!(sid.contains(&first_id), "session id `{sid}` must carry mission `{first_id}`'s own identity");
+        }
+        for sid in &second_sessions {
+            assert!(sid.contains(&second_id), "session id `{sid}` must carry mission `{second_id}`'s own identity");
+        }
+
+        // `handle` (the plain step id) is unaffected by this fix — still
+        // just `s1` for both missions.
+        let handles: std::collections::BTreeSet<&str> =
+            step_records.iter().filter_map(|r| r.get("handle").and_then(|v| v.as_str())).collect();
+        assert_eq!(
+            handles,
+            std::collections::BTreeSet::from(["s1"]),
+            "both runs' step-lifecycle records must share the SAME handle, got {handles:?}"
         );
     }
 

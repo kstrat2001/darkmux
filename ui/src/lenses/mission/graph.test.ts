@@ -279,6 +279,27 @@ describe("indexGraph / recordInMission / stepForRecord", () => {
     expect(stepForRecord(rec({ handle: "not-a-step" }), idx, "m1")).toBeNull();
   });
 
+  // (#1918 QA) The run-SCOPED spelling of correlation key 2. Since FLOW
+  // 1.43.0 a generic `mission launch <config>` step's own
+  // `dispatch complete` carries `session_id: "step-<id>-<missionId>"`
+  // (`session_id::scope_to_run`). That record has no `payload.step_id`
+  // (only the tailer's per-event records are step-stamped) and its
+  // `handle` is the ROLE id, so this key is the only one that can
+  // attribute it -- and `mission_id`, which the scoped record does carry,
+  // gates admission only, never step identity. Without the peel every
+  // completed step's token/turn meter reads 0 after a reload.
+  it("stepForRecord resolves the run-scoped session_id spelling too", () => {
+    const idx = indexGraph(baseGraph());
+    expect(stepForRecord(rec({ session_id: "step-a-step-m1", mission_id: "m1" }), idx, "m1")).toBe("a-step");
+    // Both spellings coexist in one day file across an upgrade.
+    expect(stepForRecord(rec({ session_id: "step-a-step" }), idx, "m1")).toBe("a-step");
+    // The peel must not invent a step this mission does not own.
+    expect(stepForRecord(rec({ session_id: "step-nope-m1", mission_id: "m1" }), idx, "m1")).toBeNull();
+    // Another mission's scoped session for the SAME step id -- the #1918
+    // collision itself -- stays rejected on `mission_id`.
+    expect(stepForRecord(rec({ session_id: "step-a-step-other", mission_id: "other" }), idx, "m1")).toBeNull();
+  });
+
   it("stepForRecord returns null for a different mission's record", () => {
     const idx = indexGraph(baseGraph());
     expect(stepForRecord(rec({ mission_id: "other", handle: "a-step" }), idx, "m1")).toBeNull();

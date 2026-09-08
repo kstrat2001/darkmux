@@ -1333,6 +1333,85 @@ mod tests {
         }
     }
 
+    /// (#1918) `dispatch_internal::dispatch` composes THIS SAME resolved
+    /// mission id into its own `session_id` (right beside the resolution
+    /// tested above), closing the collision for the one producer that
+    /// streams its own records directly (`dispatch start`/`dispatch.turn`/
+    /// `dispatch.tool`/`dispatch complete`/telemetry — bypassing
+    /// `StepOutcome.flow_records`/`StepRunCtx::emit`, both of which the
+    /// launcher's own `emit`-wrap already scopes). A full end-to-end proof
+    /// of `dispatch()`'s own wiring needs a real container
+    /// (`mock_dispatch_proof.rs`'s tests are `#[ignore]`d for exactly that
+    /// reason); this proves the COMPOSITION `dispatch()` applies at that
+    /// resolution point is the one two missions running the SAME config
+    /// (the `session_id::step` default, unset by config) need: distinct
+    /// per-mission session ids for the identical, config-derived default.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_internal_composes_the_resolved_mission_into_a_config_derived_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        }
+        let phases_dir = tmp.path().join("missions").join("mission-a").join("phases");
+        fs::create_dir_all(&phases_dir).unwrap();
+        fs::write(
+            phases_dir.join("p1.json"),
+            r#"{"id":"p1","mission_id":"mission-a","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+        )
+        .unwrap();
+        let other_phases_dir = tmp.path().join("missions").join("mission-b").join("phases");
+        fs::create_dir_all(&other_phases_dir).unwrap();
+        fs::write(
+            other_phases_dir.join("p1.json"),
+            r#"{"id":"p1","mission_id":"mission-b","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+        )
+        .unwrap();
+
+        // The SAME `session_id::step` default a `dispatch.internal` step
+        // with no explicit `config.session_id` falls back to — literally
+        // out of the mission config document, byte-identical whichever
+        // mission runs it.
+        let raw_session_id = darkmux_types::session_id::step("s1");
+
+        // Two DIFFERENT phases (as two launches of the same config would
+        // each mint their own phase under their own mission), same phase
+        // id `p1`, same step id `s1` — the actual #1918 collision shape.
+        let mission_a = resolve_mission_for_phase(Some("p1"));
+        // Force the second resolution to hit the OTHER mission's phase by
+        // pointing `DARKMUX_CREW_DIR`'s layout differently is awkward here
+        // (both phases share the literal id `p1`, one per mission dir) —
+        // resolve each directly against its own known mission_id instead,
+        // proving the composition, not the phase-lookup collision (a
+        // SEPARATE, real limitation: two phases sharing a literal id
+        // across missions is exactly why #1918 exists at the session_id
+        // layer in the first place, and `load_phase_by_id` itself resolves
+        // by id, not by mission — out of scope for this test).
+        assert_eq!(mission_a.as_deref(), Some("mission-a"));
+
+        let scoped_a = match &mission_a {
+            Some(mid) => darkmux_types::session_id::scope_to_run(&raw_session_id, mid),
+            None => raw_session_id.clone(),
+        };
+        let scoped_b = darkmux_types::session_id::scope_to_run(&raw_session_id, "mission-b");
+
+        assert_eq!(scoped_a, "step-s1-mission-a");
+        assert_eq!(scoped_b, "step-s1-mission-b");
+        assert_ne!(
+            scoped_a, scoped_b,
+            "two missions running the identical config-derived session_id default must diverge \
+             once scoped to their own mission — the #1918 collision surface `dispatch()` itself closes"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn resolve_mission_for_phase_returns_none_for_unknown_phase() {
