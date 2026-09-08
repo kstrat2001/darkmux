@@ -233,9 +233,13 @@ pub fn redis_stream() -> String {
 /// Redis stream retention for `XADD MAXLEN ~ N`. `0` carries the operator's
 /// "unbounded" intent — the `0 → None` translation the XADD path needs stays
 /// at the flow call site (Slice 5); this is a plain value provider.
+///
+/// (#1715) The built-in tier is [`crate::config::DEFAULT_REDIS_MAXLEN`], the
+/// same constant `with_defaults()` writes — so the two paths an untouched
+/// machine can reach this number by cannot drift apart.
 pub fn redis_maxlen() -> usize {
     let cfg = config().redis.as_ref().and_then(|r| r.maxlen);
-    pick_parsed("DARKMUX_REDIS_MAXLEN", cfg, Some(10_000)).unwrap()
+    pick_parsed("DARKMUX_REDIS_MAXLEN", cfg, Some(crate::config::DEFAULT_REDIS_MAXLEN)).unwrap()
 }
 
 // The non-secret connection bits for the config-assembled Redis URL (#661

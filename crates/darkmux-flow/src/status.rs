@@ -57,7 +57,31 @@ pub struct SinkSummary {
 /// losing a single record any reader could have retrieved — raising
 /// retention further only stores records nothing can read back. See
 /// `compute_near_max_len`'s doc for how this bounds `near_max_len`.
+///
+/// **Do not raise this alone.** The near-maxlen warning's silence on an
+/// untouched machine depends on `darkmux_types::config::DEFAULT_REDIS_MAXLEN`
+/// staying `>=` this value; raising the cap past the shipped default revives
+/// the permanent warning #1715 removed, for every operator who never touched
+/// retention. The const assertion immediately below refuses to COMPILE instead
+/// of letting that happen silently — a live hazard, because
+/// `read_flow_records_from_redis`'s own #2409 note already names a follow-up
+/// that would want a bigger read.
 pub const FLOW_READ_CAP_RECORDS: usize = 10_000;
+
+/// (#1715 review) The near-maxlen warning's precondition, pinned at COMPILE
+/// time rather than left as a convention between two crates: an operator on
+/// the shipped `redis.maxlen` default must never be able to reach the
+/// warning, and that holds only while the default sits at or above this read
+/// cap. Raising `FLOW_READ_CAP_RECORDS` alone now fails the build here rather
+/// than quietly reviving a permanent warning on every default machine.
+/// `shipped_default_maxlen_never_warns` (in `near_max_len_tests`) covers the
+/// BEHAVIOR that relationship buys; this covers the relationship itself.
+const _: () = assert!(
+    darkmux_types::config::DEFAULT_REDIS_MAXLEN >= FLOW_READ_CAP_RECORDS,
+    "the shipped redis.maxlen default dropped below FLOW_READ_CAP_RECORDS — an operator on the \
+     untouched default would get back the permanent near-maxlen warning #1715 removed. Raise \
+     DEFAULT_REDIS_MAXLEN alongside the cap, or re-derive compute_near_max_len's precondition."
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisStatus {
@@ -768,16 +792,45 @@ fn collect_hooks_status() -> HooksStatus {
 mod near_max_len_tests {
     use super::*;
 
-    /// (#1715) The exact live scenario reported: `maxlen == read_cap ==
-    /// 10000`, XLEN sitting right at/above it (the permanent steady state
-    /// of an active fleet). Before this fix, `compute_near_max_len`'s
-    /// predecessor warned here forever; raising `maxlen` buys nothing
-    /// because every known reader is independently capped at
-    /// `read_cap` — the warning must NOT fire.
+    use darkmux_types::config::DEFAULT_REDIS_MAXLEN;
+
+    /// (#1715) The exact live scenario reported: `maxlen == read_cap`, XLEN
+    /// sitting right at/above it (the permanent steady state of an active
+    /// fleet). Before this fix, `compute_near_max_len`'s predecessor warned
+    /// here forever; raising `maxlen` buys nothing because every known
+    /// reader is independently capped at `read_cap` — the warning must NOT
+    /// fire. Written against `FLOW_READ_CAP_RECORDS` rather than a bare
+    /// `10_000` so the scenario keeps meaning "at the cap" if the cap moves.
     #[test]
     fn is_quiet_when_maxlen_matches_the_read_cap_even_at_full_saturation() {
-        assert!(!compute_near_max_len(Some(10_000), Some(10_002), 10_000));
-        assert!(!compute_near_max_len(Some(10_000), Some(10_000), 10_000));
+        let cap = FLOW_READ_CAP_RECORDS;
+        assert!(!compute_near_max_len(Some(cap), Some(cap as u64 + 2), cap));
+        assert!(!compute_near_max_len(Some(cap), Some(cap as u64), cap));
+    }
+
+    /// (#1715, review) The BEHAVIOR the `DEFAULT_REDIS_MAXLEN >=
+    /// FLOW_READ_CAP_RECORDS` const assertion (beside the cap itself) exists
+    /// to guarantee: a machine on the shipped `redis.maxlen` default, its
+    /// stream fully saturated, stays quiet. The two numbers live in
+    /// different crates and were related only by convention — raise
+    /// `FLOW_READ_CAP_RECORDS` alone (as #2409's documented follow-up would
+    /// want to, to stop a busy stream pushing a `dispatch.start` bookend
+    /// below the read cap) and the permanent warning #1715 removed comes
+    /// straight back for every operator who never touched retention. The
+    /// const assertion catches the relationship at compile time; this
+    /// catches a change to `compute_near_max_len` that breaks the same
+    /// promise while leaving both numbers alone.
+    #[test]
+    fn shipped_default_maxlen_never_warns() {
+        assert!(
+            !compute_near_max_len(
+                Some(DEFAULT_REDIS_MAXLEN),
+                Some(DEFAULT_REDIS_MAXLEN as u64),
+                FLOW_READ_CAP_RECORDS
+            ),
+            "an operator on the shipped default ({DEFAULT_REDIS_MAXLEN}), at full saturation, \
+             must never see the near-maxlen warning"
+        );
     }
 
     /// A `maxlen` set ABOVE the read cap is even less actionable — the
@@ -785,7 +838,8 @@ mod near_max_len_tests {
     /// can use, so nearing that ceiling still isn't a real problem.
     #[test]
     fn is_quiet_when_maxlen_exceeds_the_read_cap() {
-        assert!(!compute_near_max_len(Some(20_000), Some(19_500), 10_000));
+        let cap = FLOW_READ_CAP_RECORDS;
+        assert!(!compute_near_max_len(Some(cap * 2), Some(cap as u64 * 2 - 500), cap));
     }
 
     /// The genuine mismatch: `maxlen` BELOW the read cap means a reader
@@ -794,15 +848,24 @@ mod near_max_len_tests {
     /// warning is real and must still fire once XLEN nears that lower cap.
     #[test]
     fn warns_when_maxlen_trails_the_read_cap_and_xlen_is_near_it() {
-        assert!(compute_near_max_len(Some(1_000), Some(960), 10_000));
-        assert!(!compute_near_max_len(Some(1_000), Some(500), 10_000), "not near yet");
+        let cap = FLOW_READ_CAP_RECORDS;
+        let under = cap / 10;
+        assert!(compute_near_max_len(Some(under), Some(under as u64 * 96 / 100), cap));
+        assert!(
+            !compute_near_max_len(Some(under), Some(under as u64 / 2), cap),
+            "not near yet"
+        );
     }
 
     #[test]
     fn is_quiet_when_maxlen_or_xlen_is_unknown() {
-        assert!(!compute_near_max_len(None, Some(9_999), 10_000));
-        assert!(!compute_near_max_len(Some(1_000), None, 10_000));
-        assert!(!compute_near_max_len(Some(0), Some(1), 10_000), "cap=0 (unbounded) never warns");
+        let cap = FLOW_READ_CAP_RECORDS;
+        assert!(!compute_near_max_len(None, Some(cap as u64 - 1), cap));
+        assert!(!compute_near_max_len(Some(cap / 10), None, cap));
+        assert!(
+            !compute_near_max_len(Some(0), Some(1), cap),
+            "cap=0 (unbounded) never warns"
+        );
     }
 }
 

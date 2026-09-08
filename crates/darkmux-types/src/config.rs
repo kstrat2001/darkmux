@@ -290,6 +290,23 @@ pub struct DirsConfig {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// The shipped default for `redis.maxlen` (`XADD MAXLEN ~ N` retention) — the
+/// value BOTH `Config::with_defaults()` (what `darkmux init` writes into
+/// `config.json`) and `config_access::redis_maxlen()`'s built-in tier resolve
+/// to, so an operator who has never touched retention gets exactly this number
+/// through either path.
+///
+/// (#1715) Named rather than repeated as a literal because a DOWNSTREAM
+/// invariant now rests on it: `darkmux-flow`'s near-maxlen warning is silent
+/// only while this default is `>= FLOW_READ_CAP_RECORDS` (at or above the read
+/// cap, raising retention buys a reader nothing, so the warning would be
+/// unactionable — the permanent-warning bug #1715 removed). That relationship
+/// is pinned by a `const _: () = assert!(...)` sitting beside
+/// `FLOW_READ_CAP_RECORDS` in `darkmux_flow::status`, which reads this
+/// constant: moving either number without the other FAILS THE BUILD instead of
+/// silently reviving the warning for every operator on the shipped default.
+pub const DEFAULT_REDIS_MAXLEN: usize = 10_000;
+
 /// The Redis flow-coordination sink — a **feature block gated by `enabled`**,
 /// not by field-presence. `darkmux init` writes the whole block with
 /// `enabled: false` and every connection knob populated to its sensible
@@ -1038,7 +1055,7 @@ impl DarkmuxConfig {
                 port: Some(6379),
                 db: None,
                 stream: Some("darkmux:flow".to_string()),
-                maxlen: Some(10_000),
+                maxlen: Some(DEFAULT_REDIS_MAXLEN),
                 extras: Default::default(),
             }),
             audit: Some(AuditConfig {

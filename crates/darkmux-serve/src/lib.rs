@@ -3939,7 +3939,10 @@ fn read_flow_records_from_redis(
             ));
         }
     };
-    let mut records = Vec::with_capacity(entries.len().min(10000));
+    // (#1715 review) The last bare `10000` on this path — the same cap the
+    // XREVRANGE above already single-sources, so it follows that constant
+    // rather than sitting beside it as a third copy.
+    let mut records = Vec::with_capacity(entries.len().min(MAX_FLOW_FILE_RECORDS));
     for entry in entries {
         // Each entry is [id, [k, v, k, v, ...]]. Find the `record` field.
         let pairs = match entry {
