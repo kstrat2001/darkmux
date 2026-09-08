@@ -1122,7 +1122,20 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(branch_name("s1"), "darkmux/s1");
     }
 
+    /// `worktree_path` joins `worktrees_base_dir()` — which reads the shared
+    /// `DARKMUX_HOME` env var live, uncached, on every call. This test
+    /// never sets `DARKMUX_HOME` itself, but the two `worktree_path` calls
+    /// below straddle a window in which *another* test can: without
+    /// `#[serial]` this test can interleave with any of the many
+    /// `#[serial]`-marked tests elsewhere in this binary that
+    /// `set_var("DARKMUX_HOME", ...)` then restore it, so the first call can
+    /// observe the operator's real `~/.darkmux` and the second call can
+    /// observe a concurrent test's tempdir — same repo-relative path, two
+    /// different bases, spurious inequality. `#[serial]` closes the window by
+    /// excluding this test from running while any other `#[serial]` test
+    /// (the full set of `DARKMUX_HOME` mutators in this binary) is active.
     #[test]
+    #[serial_test::serial]
     fn worktree_path_is_deterministic_under_repo_name() {
         let p = worktree_path(Path::new("/home/k/proj/darkmux-public"), "s1");
         assert!(p.ends_with("darkmux-public/s1"), "{}", p.display());
