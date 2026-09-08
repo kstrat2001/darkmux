@@ -4,7 +4,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useFleetCoverage, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
-import { getSource, runsSrc } from "../../lib/source";
+import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, liveSessionSet, machineNames, LIVE_WINDOW_MS, T } from "../../lib/flow";
 import type { FlowRecord, RunsResponse } from "../../types/handwritten";
@@ -398,9 +398,14 @@ export function FleetLens({
   // still gets a value here (there is no reason to withhold it), but
   // `buildFleetCard` only ever reads it in `liveMode` — see that
   // parameter's own doc.
+  // `enabled` on `runsReachable()`: a daemon-less static build that ships no
+  // committed runs fixture has nothing to answer this, and `runsSrc()`'s
+  // daemon fallback would fetch `/runs` off a page with no daemon (see that
+  // predicate's own doc — the 404 the static-build gate catches).
   const runsQuery = useQuery({
     queryKey: queryKeys.runs(),
     queryFn: () => fetchJson<RunsResponse>(runsSrc()),
+    enabled: runsReachable(),
     refetchInterval: livePolling ? PRESENCE_POLL_MS : false,
   });
   // `?? []` guards a malformed/shape-mismatched 200 (a test double, or a
