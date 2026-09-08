@@ -246,6 +246,68 @@ fn probe_machine_uid() -> Option<String> {
     parse_io_platform_uuid(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// One-line `"<cpu brand> · <N> GB"` hardware summary for THIS machine —
+/// the same shape `darkmux-serve`'s `/machine/specs` endpoint hands the
+/// viewer (`cpu_brand` + `ram_total_bytes`, formatted client-side in
+/// `specOf()`). Lets a presence beat (`darkmux-flow::presence::PresenceBeat`)
+/// carry the identical string so a REMOTE fleet card can show hardware
+/// without a second per-peer HTTP fetch (#2083, #1855).
+///
+/// Best-effort: `None` when the brand-string probe fails (macOS-only probe;
+/// same leniency every other probe in this crate has) — callers must treat
+/// `None` as "not reported", never synthesize a placeholder.
+///
+/// Cached: hardware doesn't change for the process lifetime, same rationale
+/// as [`machine_uid`]'s `OnceLock`.
+pub fn spec_summary() -> Option<String> {
+    static SUMMARY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SUMMARY
+        .get_or_init(|| {
+            let brand = probe_cpu_brand()?;
+            let total_ram_gb = detect().total_ram_gb;
+            Some(format_spec_summary(&brand, total_ram_gb))
+        })
+        .clone()
+}
+
+/// Pure formatting half of [`spec_summary`] — testable without shelling out.
+/// Omits the `· N GB` suffix when RAM is unknown (`0`) rather than printing
+/// a misleading `· 0 GB`.
+fn format_spec_summary(cpu_brand: &str, total_ram_gb: u32) -> String {
+    if total_ram_gb > 0 {
+        format!("{cpu_brand} · {total_ram_gb} GB")
+    } else {
+        cpu_brand.to_string()
+    }
+}
+
+/// CPU brand string (`sysctl machdep.cpu.brand_string`, e.g. `"Apple M5
+/// Max"`). macOS only; `None` elsewhere or on any probe failure — mirrors
+/// `darkmux-serve::read_cpu_brand`'s shape (that copy stays local to the
+/// `/machine/specs` handler; this one is the presence-beat's source).
+fn probe_cpu_brand() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// Pull the `IOPlatformUUID` value out of `ioreg -rd1 -c
 /// IOPlatformExpertDevice` output (a line shaped like
 /// `    "IOPlatformUUID" = "XXXXXXXX-...."`). Pure — testable without
@@ -357,5 +419,26 @@ mod tests {
     fn platform_label_human_readable() {
         assert_eq!(Platform::AppleSilicon.label(), "Apple Silicon");
         assert_eq!(Platform::Linux.label(), "Linux");
+    }
+
+    #[test]
+    fn format_spec_summary_includes_brand_and_rounded_gb() {
+        assert_eq!(format_spec_summary("Apple M5 Max", 128), "Apple M5 Max · 128 GB");
+    }
+
+    #[test]
+    fn format_spec_summary_omits_gb_suffix_when_ram_unknown() {
+        // A `0` RAM reading is "unknown", not "zero" — must not print a
+        // misleading "· 0 GB".
+        assert_eq!(format_spec_summary("Apple M5 Max", 0), "Apple M5 Max");
+    }
+
+    #[test]
+    #[ignore]
+    fn spec_summary_present_on_this_mac() {
+        // Run with `--ignored` on a real Mac to exercise the live sysctl
+        // path end to end (same shape as `machine_uid_present_on_this_mac`).
+        let s = spec_summary().expect("expected a spec summary on macOS");
+        assert!(s.contains("GB"), "expected a `· N GB` suffix: {s}");
     }
 }

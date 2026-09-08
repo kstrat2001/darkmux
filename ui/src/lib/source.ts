@@ -62,6 +62,27 @@ export function labRunsSrc(): string {
   return getSource().labRuns;
 }
 
+/** Whether `/runs` (and `/lab/runs`) can actually be answered on THIS page.
+ *
+ * (#1923) `Source.runs` falls back to the daemon route `/runs` when no
+ * `darkmux-runs-src` meta is injected — unlike every other field, which is
+ * `null` when absent. That fallback is right for a daemon page and wrong for
+ * a static one: a daemon-less build that ships no committed runs fixture
+ * would fetch a daemon route that cannot exist and 404. Nothing noticed
+ * until the fleet lens started reading `/runs`, because it was the first
+ * lens to do so on a page the static e2e harness serves (that harness
+ * injects `darkmux-flow-src` but no runs fixture, so `kind` is `"static"`
+ * while `runs` still read `/runs`).
+ *
+ * So this is the gate, mirroring `missionGraphReachable()` below rather
+ * than inventing a second shape: a static build can answer only if it
+ * shipped the fixture; a daemon page always can. */
+export function runsReachable(): boolean {
+  const s = getSource();
+  if (s.kind === "daemon") return true;
+  return injectedMeta("darkmux-runs-src") !== null;
+}
+
 /** `missionGraphReachable()` — viewer.html:2732. The predicate outlived its
  * original reason and keeps a NEW one (#1868 third packet): it used to mean
  * "is there a separate mission-graph document to navigate to", back when

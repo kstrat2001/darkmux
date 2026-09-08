@@ -36,11 +36,16 @@ afterEach(() => {
   closeOpenModal({ restore: false });
 });
 
-function renderFleetLens() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderFleetLens(
+  props: Parameters<typeof FleetLens>[0] = {},
+  /** Share one client across two renders when a test needs the SECOND
+   * render to start from an already-settled query cache — see the replay
+   * gate's test for why a fresh client makes that assertion vacuous. */
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
   return render(
     <QueryClientProvider client={queryClient}>
-      <FleetLens />
+      <FleetLens {...props} />
     </QueryClientProvider>,
   );
 }
@@ -59,6 +64,10 @@ function mockFleetFetch(opts: {
    * addition. Set it to make ONE uid resolve as local — see the two
    * locality-split tests below for why that distinction now matters. */
   specs?: unknown;
+  /** (#1923) `GET /runs` rows — omitted (the default) keeps the pre-existing
+   * 404 (every pre-#1923 test in this file is unaffected), same pattern as
+   * `specs` above. */
+  runs?: unknown[];
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -87,6 +96,10 @@ function mockFleetFetch(opts: {
       if (path === "/machine/specs") {
         if (opts.specs === undefined) return Promise.resolve(new Response("{}", { status: 404 }));
         return Promise.resolve(new Response(JSON.stringify(opts.specs), { status: 200 }));
+      }
+      if (path === "/runs") {
+        if (opts.runs === undefined) return Promise.resolve(new Response("not recorded\n", { status: 404 }));
+        return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs, generated_at_ms: 1 }), { status: 200 }));
       }
       return Promise.resolve(new Response("not recorded\n", { status: 404 }));
     }),
@@ -126,6 +139,147 @@ describe("FleetLens", () => {
     // Renders twice: the machine card AND the activity-timeline lane label.
     expect(screen.getAllByText("MacBook-Pro").length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("idle")).toBeInTheDocument(); // no live session -> idle, not "dispatch in flight"
+  });
+
+  // (#2060) The rendered-DOM twin of `cards.test.ts`'s pure-function coverage
+  // — a mission's own top-level session (`session_id === mission_id`) and
+  // its one live seat dispatch (same `mission_id`, its own `session_id`)
+  // must read as ONE running run on the actual card, not two.
+  it("(#2060) a running mission with one live seat renders '1 running', not '2 running'", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" },
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" },
+      ],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("1 running");
+    expect(card.textContent).not.toContain("2 running");
+  });
+
+  // (#1923) A machine whose lab run is BETWEEN dispatches — the COW clone,
+  // the baseline hash, the verify command, scoring — has no dispatch in
+  // flight, so no contract-2 bookends and no presence key: flow sees nothing
+  // and `machActive`/`sessionsOn` have nothing to read. The `/runs` lab row
+  // (written at start, RAII-guarded) is the only source that stays "running"
+  // across that whole span, and without it the card reads "idle" /
+  // "0 running" while the run is very much live.
+  it("(#1923) a running lab run with zero flow activity still renders 'dispatch in flight'", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+      runs: [{ id: "lab-1", kind: "lab", status: "running", machine: "MacBook-Pro", tracked: true }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("dispatch in flight");
+    expect(card.textContent).toContain("1 running");
+    expect(card.textContent).not.toContain("idle");
+  });
+
+  // (#1923 review) The rendered-DOM twin of `cards.test.ts`'s double-count
+  // case. A lab run's DISPATCH phase DOES ride the flow stream — the
+  // provider calls `darkmux_crew::dispatch::dispatch`, which emits the
+  // contract-2 bookends and spawns the session-presence emitter — so both
+  // sources see the same one run. The card must say "1 running".
+  it("(#1923) a lab run whose dispatch is live reads '1 running', not '2 running'", async () => {
+    const today = todayUTC();
+    const labSession = "darkmux-coding-long-agentic-1756000000000";
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+      flowToday: [
+        {
+          ts: `${today}T10:00:00.000Z`,
+          machine_uid: "u1",
+          machine_id: "MacBook-Pro",
+          session_id: labSession,
+          action: "dispatch.start",
+          handle: "coder",
+        },
+      ],
+      runs: [{ id: "long-agentic-balanced-1756000000-1", kind: "lab", status: "running", machine: "MacBook-Pro", tracked: true }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    await waitFor(() => expect(card.textContent).toContain("running"));
+    expect(card.textContent).toContain("1 running");
+    expect(card.textContent).not.toContain("2 running");
+  });
+
+  // (#1923 review) A `/runs` that cannot be read yields the SAME empty list
+  // a healthy idle machine does, so the cards silently return to the exact
+  // "idle while a lab run is live" reading #1923 removed. The lens has to
+  // name the failure rather than render the absence as data.
+  it("(#1923) says so when the /runs read fails, instead of asserting 'no lab runs'", async () => {
+    // `runs` omitted -> the mock's 404, which is what a daemon whose `/runs`
+    // 500s or times out looks like to `fetchJson` (`ok: false`).
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+    });
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(container.querySelector('.fleetcov[data-state="runs-unreadable"]')).toBeTruthy());
+    expect(screen.getByText(/Run records are unavailable/i)).toBeInTheDocument();
+    // The count still renders (the `?? []` fallback keeps the lens alive) —
+    // the notice is what stops it being read as a confident zero.
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(document.querySelector(".mach")!.textContent).toContain("0 running");
+  });
+
+  // The INVERTED case, and the one that proves the notice is conditional: a
+  // `/runs` that answers cleanly must stay silent. Without it, a notice
+  // hardwired on would pass the test above.
+  it("(#1923) stays silent when /runs answers cleanly, even with no runs at all", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+      runs: [],
+    });
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(container.querySelector('.fleetcov[data-state="runs-unreadable"]')).toBeNull();
+  });
+
+  // The second inverted case: a REPLAY never reads `machineRuns` at all
+  // (`buildFleetCard` gates the lab count on `liveMode`), so a failed
+  // `/runs` costs a replayed day nothing and warning about it would be the
+  // bug — the same historical gate `FleetCoverageNotice` already carries.
+  //
+  // Both halves render against ONE `QueryClient` on purpose. A fresh client
+  // makes the replay assertion vacuous: the absence is satisfied by the
+  // `/runs` query simply not having settled yet, so the test passes with
+  // the gate deleted. Rendering the LIVE lens first and waiting for its
+  // notice proves the failed read is already in the cache; the replay
+  // render then starts from that settled failure, and its silence is the
+  // gate's doing rather than a race.
+  it("(#1923) stays silent on a replay, where the lab count is never read", async () => {
+    const today = todayUTC();
+    // `runs` omitted -> the same 404 the live case above warns about.
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const live = renderFleetLens({}, qc);
+    await waitFor(() => expect(live.container.querySelector('.fleetcov[data-state="runs-unreadable"]')).toBeTruthy());
+    live.unmount();
+
+    const records: FlowRecord[] = [
+      { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: `${today}T10:01:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete" },
+    ];
+    const { container } = renderFleetLens(
+      {
+        records,
+        tMax: Date.parse(`${today}T10:01:00.000Z`),
+        tMin: Date.parse(`${today}T10:00:00.000Z`),
+        historical: true,
+      },
+      qc,
+    );
+    await waitFor(() => expect(container.querySelector(".mach")).not.toBeNull());
+    expect(container.querySelector('.fleetcov[data-state="runs-unreadable"]')).toBeNull();
   });
 
   it("renders a real 'history →' link (#1640) when notes history exists, and it opens the notes dialog", async () => {
