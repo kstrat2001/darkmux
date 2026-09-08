@@ -3869,9 +3869,20 @@ fn task_status_from_steps(step_statuses: &[NodeStatus]) -> NodeStatus {
 ///   Step-grain counting called that phase `Degraded` while the graph
 ///   lens called it `Abandoned` and disk said `complete` — three words
 ///   for one phase, and that particular disagreement was NEW in #2406
-///   (pre-fix both sides said `Abandoned`). The repo's own `fail-probe`
-///   fixture has exactly this shape: `t-fail` holding `s-fail` +
-///   `s-after`.
+///   (pre-fix both sides said `Abandoned`).
+/// - That shape arises wherever a MULTI-STEP task is terminalized
+///   BETWEEN its steps. `cascade_abandon` skips a dependent only when
+///   `task_status(dep) != Planned` (`scheduler.rs`), and a half-run task
+///   derives exactly `Planned` — `task_status` returns `Complete` only
+///   when EVERY step is complete, so `[Complete, Planned]` falls through
+///   to `Planned` — so the cascade abandons its leftover steps and leaves
+///   `[Complete, Abandoned]` behind rather than stepping over it.
+///   (An earlier version of this comment cited the repo's `fail-probe`
+///   fixture as an example of the shape. It is NOT one: `s-fail` runs
+///   `exit 3`, so `t-fail` is `[Error, Abandoned]`, which collapses to
+///   `Abandoned` under the old step-grain rule and the new task-grain one
+///   alike. The fail probe's envelope is byte-identical either side of
+///   this fix — see `tests/cli.rs`'s `s-after` assertion.)
 /// - Grouping costs nothing: every `Step` already carries its
 ///   `task_id`, so both call sites keep their existing step-slice
 ///   signature and need no extra loading.
@@ -7157,9 +7168,18 @@ mod tests {
         }
         use crew::envelope::PhaseOutcomeKind;
 
-        // ONE task, steps [Complete, Abandoned] — the repo's own
-        // `fail-probe` shape (`t-fail` holding `s-fail` + `s-after`). A
-        // half-finished UNIT, not "real output shipped, some of it did
+        // ONE task, steps [Complete, Abandoned] — what a multi-step task
+        // terminalized BETWEEN its steps leaves behind (`cascade_abandon`
+        // skips a dependent only when `task_status(dep) != Planned`, and
+        // `[Complete, Planned]` derives `Planned`, so the leftover step is
+        // abandoned rather than stepped over — `scheduler.rs`). NOT the
+        // `fail-probe` fixture, which an earlier version of this comment
+        // wrongly cited: `s-fail` runs `exit 3`, so `t-fail` is
+        // `[Error, Abandoned]` and collapses to `Abandoned` under the old
+        // rule and the new one alike.
+        //
+        // The shape asserted here is a half-finished UNIT, not "real output
+        // shipped, some of it did
         // not": the completed step was a STAGE of the one unit that did
         // not land. The lens says `abandoned`; so must the envelope. Before
         // this fix the envelope said `Degraded` (→ `phase_complete`, so

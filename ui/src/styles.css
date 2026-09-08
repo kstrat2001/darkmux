@@ -5528,10 +5528,26 @@ body {
   pointer-events: none;
   position: relative;
 }
+/* (#2406, post-review round 2) The label block is ABSOLUTELY positioned, so
+   by default nothing about the band bounds its width — it is shrink-to-fit
+   against an infinite available width. Harmless while it read `PHASE` + a
+   short name; not harmless once the status chip and the counts joined the
+   line. Measured before this bound: a three-part note ran 85px past the
+   band's right edge and a five-part one 309px, clipped mid-word by the events
+   pane, so the counts this line exists to expose were unreadable.
+   The items inside already shrink into this bound on their own: `.pg-name` and
+   `.pg-note` both set `overflow: hidden`, which is exactly the condition under
+   which a flex item's automatic minimum size resolves to zero, so their
+   `text-overflow: ellipsis` fires as soon as anything actually constrains the
+   line. Bounding the block is what was missing — but it needs the companion
+   below (`.pg-note`'s shrink factor) to decide WHICH item gives.
+   Guard: `tests/e2e/mission-lens-layout-geometry.spec.js`'s "the phase label
+   never escapes its own band". */
 .missionlens .phasegroup .pg-label {
   position: absolute;
   top: 10px;
   left: 14px;
+  max-width: calc(100% - 28px);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -5576,8 +5592,16 @@ body {
   font-size: calc(9px * var(--fs-scale));
   padding: 1px 5px;
 }
+/* The counts absorb the shrink, not the name. Both items carry
+   `overflow: hidden`, so both already have an automatic minimum size of zero
+   and both CAN ellipsize — and with equal shrink factors they ellipsized
+   TOGETHER, so bounding the label (above) turned `investigate` into `invest…`
+   to make room for counts nobody can read anyway. Shrink is distributed
+   proportionally to factor x base size, so a large factor here makes the note
+   give up nearly all of it first; the name still shrinks rather than
+   overflowing once even a zero-width note is not enough. */
 .missionlens .phasegroup .pg-note {
-  flex: 0 1 auto;
+  flex: 0 999 auto;
   font: calc(10px * var(--fs-scale))/1.1 var(--font-mono);
   color: var(--dim);
   white-space: nowrap;

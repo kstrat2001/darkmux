@@ -2303,9 +2303,16 @@ mod tests {
         // Same fixture shape, asserted on the DISPLAY side, so the two
         // cannot drift apart again without one of them going red.
         //
-        // A phase holding ONE task whose steps are [Complete, Abandoned]
-        // (the repo's own `fail-probe` shape: `t-fail` with `s-fail` +
-        // `s-after`). `derive_task_status` collapses it to `Abandoned` —
+        // A phase holding ONE task whose steps are [Complete, Abandoned] —
+        // what a multi-step task terminalized BETWEEN its steps leaves
+        // behind (`darkmux-crew`'s `cascade_abandon` skips a dependent only
+        // when `task_status(dep) != Planned`, and `[Complete, Planned]`
+        // derives `Planned`, so the leftover step is abandoned rather than
+        // stepped over). NOT the `fail-probe` fixture, which an earlier
+        // version of this comment wrongly cited: `s-fail` runs `exit 3`, so
+        // `t-fail` is `[Error, Abandoned]` and collapses to `Abandoned`
+        // under the old step-grain rule and the new task-grain one alike.
+        // `derive_task_status` collapses it to `Abandoned` —
         // the completed step was a STAGE of the one unit that did not
         // land, not an independent deliverable — and the phase rollup then
         // sees a single abandoned task, NOT a mix. The envelope now says
