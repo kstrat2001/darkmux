@@ -1,5 +1,5 @@
 {
-  "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-pipeline-oriented reference profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_review_staffing_comment` below), each a candidate for the review mission's single `reviewer` seat, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
+  "_comment": "darkmux profile registry — example. Three worker profiles in increasing capacity order (fast → balanced → deep), plus one hosted-endpoint example. A profile's `models[]` are WORKER models; the machine's standing utility/compactor model lives once in the top-level `internal.utility`. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models. `darkmux init` fills the `<your-worker-model-id>` slots from a model you have downloaded; run `lms ls` to see them, and `darkmux config set role_profiles.<role> <profile>` to staff a mission seat. Profiles for the review mission's `reviewer` seat are in the guide, not here.",
 
   "schema_version": "1.5",
 
@@ -25,36 +25,8 @@
       ]
     },
 
-    "gpt-oss": {
-      "description": "OpenAI gpt-oss-120b (MXFP4 quantization) for Apple Silicon — worker at 100K. Requires OpenClaw >= v2026.5.9-beta.1 (harmony format / tool-payload fix).",
-      "models": [
-        { "id": "mlx-community/gpt-oss-120b-MXFP4-Q8", "n_ctx": 100000 }
-      ]
-    },
-
-    "devstral": {
-      "description": "Review pipeline — a `reviewer`-role candidate (`darkmux config set role_profiles.reviewer devstral`). Dense wide-instruct model, no reasoning trace. (#2169) The observed case this issue was filed for was `mistralai/devstral-small-2-2512` — a DIFFERENT id from the `devstral-small-2507` pinned below; whether 2507 shares the same LM Studio Mistral-parser interaction (structured tool_calls whose `name` is model content sliced around its own [TOOL_CALLS] marker) is unconfirmed. Either way darkmux never executes a call like that regardless of which Devstral id produced it — partitioned + coalesced via the `malformed_tool_names` detector rather than dispatched. Not a reason to avoid this profile; worth knowing if that detector fires in a run's telemetry.",
-      "models": [
-        { "id": "mistralai/devstral-small-2507", "n_ctx": 32000 }
-      ]
-    },
-
-    "qwen3.6-27b-review": {
-      "description": "Review pipeline — a second `reviewer`-role candidate, a distinct dense wide-instruct model, useful for A/B-ing the seat against `devstral` (the shipped `review` mission has one `reviewer` seat, reused across every rule — not parallel probes).",
-      "models": [
-        { "id": "qwen/qwen3.6-27b", "n_ctx": 32000 }
-      ]
-    },
-
-    "judge-35b-moe": {
-      "description": "Review pipeline — a third `reviewer`-role candidate: an MoE reasoner, for when the review unit benefits from a reasoning trace rather than the dense wide-instruct models above. (#2310 P4d retired the dedicated judge stage this profile originally staffed; it's now just another candidate for the single `reviewer` seat, same as the two above.)",
-      "models": [
-        { "id": "qwen/qwen3.6-35b-a3b", "n_ctx": 32000 }
-      ]
-    },
-
     "hosted-frontier": {
-      "description": "Hosted (endpoint-bearing) model — declares NO n_ctx: the provider owns the context window, so there is no local load parameter to invent (#1282). No `auth` block here either: a placeholder credential source would make a fresh `darkmux init` fail doctor's credentials check spuriously. When your endpoint needs credentials, add an `auth` block naming a credential SOURCE — either `\"auth\": { \"type\": \"api-key\", \"keychain\": \"<item-name>\" }` (a macOS Keychain ITEM name, never the secret itself) or `\"auth\": { \"type\": \"api-key\", \"key_env\": \"AZURE_OPENAI_KEY\" }` (#1312 — the NAME of an env var holding the key, for ANY provider: `OPENAI_API_KEY`, `AZURE_OPENAI_KEY`, anything). You can declare BOTH — `\"auth\": { \"type\": \"api-key\", \"keychain\": \"darkmux-azure-example\", \"key_env\": \"AZURE_OPENAI_KEY\" }` — and the env var WINS when it is present in the environment: `security` is never read, so a headless CI runner (export the var from its secret store) never touches a lockable login keychain. Neither `keychain` nor `key_env` ever holds the secret VALUE; only names. Replace the URL/deployment with your own, or delete this profile if you only run local models.",
+      "description": "A hosted model instead of a local one — no n_ctx (the provider owns the context window). Add an `auth` block when your endpoint needs credentials; see the guide. Delete this profile if you only run local models.",
       "models": [
         {
           "id": "gpt-5.1",
@@ -71,7 +43,5 @@
 
   "internal": {
     "utility": "qwen/qwen3-4b-instruct-2507"
-  },
-
-  "_review_staffing_comment": "Review staffing is DERIVED via the role->profile flip (#1475), not declared. The shipped `review` mission config (#2310 P4d) has two dispatching roles, not five: `reviewer` (the per-unit `crawl.unit` dispatch that scans the diff for one rule — the same seat runs every rule, one dispatch per planned unit) and `coder` (the OPTIONAL `create-mod-dispatch` template, off by default, for an unattended runner writing a fix). Each resolves INDEPENDENTLY: a per-run launch override (`--param <role>=<profile>`) wins, else the machine-local `role_profiles` map in config.json (`darkmux config set role_profiles.<role> <profile>`), else `default_profile` (the fresh-user floor -- a bare machine runs every seat on one model). The three review-pipeline profiles above (devstral, qwen3.6-27b-review, judge-35b-moe) are reference candidates for the single `reviewer` seat, not roles darkmux resolves automatically — bind one: `darkmux config set role_profiles.reviewer devstral`. `coder` is shared with every other mission's coder seat (e.g. coder-phase); pin it globally, or scope the pin to just this mission's optional unattended path via `--param mod_seat_profile=<profile>` (`create-mod-dispatch`'s own override, read ahead of `role_profiles.coder`). A leftover `crews` key from a pre-2.0 file is harmless residue (`darkmux doctor` notes it)."
+  }
 }
