@@ -1,13 +1,13 @@
 import { useMemo, useState, type CSSProperties } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
-import { queryKeys } from "../../lib/queryKeys";
+import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useFleetCoverage, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
-import { getSource } from "../../lib/source";
+import { getSource, runsSrc } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS, T } from "../../lib/flow";
-import type { FlowRecord } from "../../types/handwritten";
+import { machineUids, machPresent, liveSessionSet, machineNames, LIVE_WINDOW_MS, T } from "../../lib/flow";
+import type { FlowRecord, RunsResponse } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { tokensOffMeter } from "./savings";
@@ -17,6 +17,7 @@ import { openModalEl } from "../../lib/dialogManager";
 import { buildFleetCard } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
+import { runsForMachine } from "../runs/format";
 
 /** `ICON.machine` (viewer.html:935) — the generic processor/chip glyph
  * every fleet card renders, since `MACH_ICON` (the per-machine form-factor
@@ -382,6 +383,32 @@ export function FleetLens({
   });
   const specs = livePolling && specsQuery.data?.ok ? specsQuery.data.data : null;
 
+  // (#1923) `GET /runs` — already fleet-aware, already unions lab + flow
+  // sources server-side (`build_runs`) — read here ONLY to fill the gap
+  // flow presence structurally cannot: a lab run in flight, which
+  // deliberately never rides the flow stream (the lab/fleet sink boundary,
+  // CLAUDE.md contract 3). This is a display-layer read, not a new writer
+  // into that stream — see `cards.ts::runningLabRunCount`'s own doc.
+  //
+  // Fetched on BOTH build kinds (unlike `specsQuery` above, which is
+  // genuinely live-only) — `runsSrc()` resolves to a committed fixture on a
+  // static build, same as `RunsBoard.tsx`'s own `runsQuery`, whose
+  // `queryKey` this intentionally reuses so the two lenses share one cache
+  // entry instead of two independent polls of the same data. Replay mode
+  // still gets a value here (there is no reason to withhold it), but
+  // `buildFleetCard` only ever reads it in `liveMode` — see that
+  // parameter's own doc.
+  const runsQuery = useQuery({
+    queryKey: queryKeys.runs(),
+    queryFn: () => fetchJson<RunsResponse>(runsSrc()),
+    refetchInterval: livePolling ? PRESENCE_POLL_MS : false,
+  });
+  // `?? []` guards a malformed/shape-mismatched 200 (a test double, or a
+  // future API drift) the same way every OTHER field on this response is
+  // already optional-safe — `fetchJson`'s `ok: true` only proves the body
+  // parsed as JSON, not that it matches `RunsResponse`.
+  const runs = (runsQuery.data?.ok ? runsQuery.data.data.runs : []) ?? [];
+
 
   // (#1869) The token hero + hybrid note are "as of the playhead" — legacy's
   // own `visible()` gate (`DATA.filter(r=>T(r.ts)<=state.t)`), restored at
@@ -435,9 +462,13 @@ export function FleetLens({
           liveMode,
           playheadT,
           specBeats,
+          // (#1923) `machineNames`, not a bare uid match — `Run.machine`
+          // carries only a display NAME (`runsForMachine`'s own doc), same
+          // alias-set lookup `specOf`/`nameOf` already use for this uid.
+          runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
         ),
       ),
-    [uids, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats],
+    [uids, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs],
   );
 
   const timeline = useMemo(

@@ -59,6 +59,10 @@ function mockFleetFetch(opts: {
    * addition. Set it to make ONE uid resolve as local — see the two
    * locality-split tests below for why that distinction now matters. */
   specs?: unknown;
+  /** (#1923) `GET /runs` rows — omitted (the default) keeps the pre-existing
+   * 404 (every pre-#1923 test in this file is unaffected), same pattern as
+   * `specs` above. */
+  runs?: unknown[];
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -87,6 +91,10 @@ function mockFleetFetch(opts: {
       if (path === "/machine/specs") {
         if (opts.specs === undefined) return Promise.resolve(new Response("{}", { status: 404 }));
         return Promise.resolve(new Response(JSON.stringify(opts.specs), { status: 200 }));
+      }
+      if (path === "/runs") {
+        if (opts.runs === undefined) return Promise.resolve(new Response("not recorded\n", { status: 404 }));
+        return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs, generated_at_ms: 1 }), { status: 200 }));
       }
       return Promise.resolve(new Response("not recorded\n", { status: 404 }));
     }),
@@ -126,6 +134,43 @@ describe("FleetLens", () => {
     // Renders twice: the machine card AND the activity-timeline lane label.
     expect(screen.getAllByText("MacBook-Pro").length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("idle")).toBeInTheDocument(); // no live session -> idle, not "dispatch in flight"
+  });
+
+  // (#2060) The rendered-DOM twin of `cards.test.ts`'s pure-function coverage
+  // — a mission's own top-level session (`session_id === mission_id`) and
+  // its one live seat dispatch (same `mission_id`, its own `session_id`)
+  // must read as ONE running run on the actual card, not two.
+  it("(#2060) a running mission with one live seat renders '1 running', not '2 running'", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" },
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" },
+      ],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("1 running");
+    expect(card.textContent).not.toContain("2 running");
+  });
+
+  // (#1923) A machine with NO flow activity at all — the sole signal that
+  // it's alive is the presence beat and a RUNNING lab run in `/runs` — must
+  // still read as active, not "idle" / "0 running". Lab runs deliberately
+  // never ride the flow stream (the lab/fleet sink boundary), so without
+  // this fix `machActive`/`sessionsOn` have nothing to see here at all.
+  it("(#1923) a running lab run with zero flow activity still renders 'dispatch in flight'", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+      runs: [{ id: "lab-1", kind: "lab", status: "running", machine: "MacBook-Pro", tracked: true }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("dispatch in flight");
+    expect(card.textContent).toContain("1 running");
+    expect(card.textContent).not.toContain("idle");
   });
 
   it("renders a real 'history →' link (#1640) when notes history exists, and it opens the notes dialog", async () => {

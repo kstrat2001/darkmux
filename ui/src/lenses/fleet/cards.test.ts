@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { machActive, specOf, buildFleetCard } from "./cards";
 import type { FlowRecord, MachineSpecs, PresenceBeat } from "../../types/handwritten";
+import type { Run } from "../../types/generated/Run";
+
+function run(overrides: Partial<Run> & Pick<Run, "id" | "kind" | "status">): Run {
+  return { tracked: true, ...overrides };
+}
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
   return { ts: "2026-08-08T00:00:00.000Z", ...overrides };
@@ -206,5 +211,88 @@ describe("buildFleetCard", () => {
     ];
     expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX).runsCount).toBe(0);
     expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX).runsCount).toBe(1);
+  });
+
+  // (#2060) A mission's own top-level session (`session_id === mission_id`,
+  // see `mission_bookend_record`) and a seat step's session it launched
+  // (`mission_id` set, `session_id` its own) are the SAME run at the fleet
+  // card's grain — one mission dispatching one seat must read "1 running",
+  // not "2 running".
+  it("(#2060) a mission's own session collapses with its seat/step session into ONE running run", () => {
+    const data: FlowRecord[] = [
+      rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
+      rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
+    ];
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1", "seat-1"]), false, "u1", true, T_MAX);
+    expect(card.runsCount).toBe(1);
+    expect(card.runsLabel).toBe("running");
+    // The single "in flight" tap target must land on the MISSION's own
+    // session, not whichever seat happened to be encountered first.
+    expect(card.runningSessionIds).toEqual(["mission-1"]);
+  });
+
+  // (#2060) A concurrent STANDALONE dispatch (no `mission_id`) is genuinely
+  // separate activity and must still count on its own alongside the mission.
+  it("(#2060) a standalone dispatch beside a running mission still counts as a second run", () => {
+    const data: FlowRecord[] = [
+      rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
+      rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
+      rec({ machine_uid: "u1", session_id: "solo-1", action: "dispatch.start" }),
+    ];
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1", "seat-1", "solo-1"]), false, "u1", true, T_MAX);
+    expect(card.runsCount).toBe(2);
+  });
+
+  // (#2060) Two DIFFERENT missions each with their own live seat must still
+  // count as two runs — the collapse is per-mission, not "any mission_id
+  // present collapses everything".
+  it("(#2060) two different missions' seats never collapse into each other", () => {
+    const data: FlowRecord[] = [
+      rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
+      rec({ machine_uid: "u1", session_id: "mission-2", mission_id: "mission-2", action: "dispatch.start" }),
+    ];
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1", "mission-2"]), false, "u1", true, T_MAX);
+    expect(card.runsCount).toBe(2);
+  });
+
+  // (#1923) Lab runs never ride the flow stream (the lab/fleet sink
+  // boundary) — flow presence alone structurally cannot see them, so a
+  // machine running only lab work must not read "idle" / "0 running". This
+  // is a DISPLAY-layer read of `/runs` (already fleet-aware, already
+  // unions lab + flow sources server-side); nothing here writes a lab run
+  // into the flow stream.
+  it("(#1923) a running lab run makes the card active even with zero flow presence", () => {
+    const data: FlowRecord[] = [];
+    const machineRuns: Run[] = [run({ id: "lab-1", kind: "lab", status: "running", machine: "u1" })];
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, new Map(), machineRuns);
+    expect(card.stat).toBe("dispatch in flight");
+    expect(card.runsCount).toBe(1);
+  });
+
+  it("(#1923) a lab run's count adds to, never replaces, the flow-presence count", () => {
+    const data: FlowRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
+    const machineRuns: Run[] = [run({ id: "lab-1", kind: "lab", status: "running", machine: "u1" })];
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, new Map(), machineRuns);
+    expect(card.runsCount).toBe(2);
+  });
+
+  // Only a RUNNING lab run counts — a completed or errored one is history,
+  // not current activity, same rule flow presence already applies.
+  it("(#1923) a completed lab run does not count as active", () => {
+    const data: FlowRecord[] = [];
+    const machineRuns: Run[] = [run({ id: "lab-1", kind: "lab", status: "complete", machine: "u1" })];
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, new Map(), machineRuns);
+    expect(card.stat).toBe("idle");
+    expect(card.runsCount).toBe(0);
+  });
+
+  // A running MISSION/DISPATCH row in `/runs` must NOT be double-counted —
+  // that machine's activity is already fully accounted for by flow
+  // presence (post-#2060). Only `kind === "lab"` rows are net-new signal.
+  it("(#1923) a running mission row in /runs is not double-counted against flow presence", () => {
+    const data: FlowRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
+    const machineRuns: Run[] = [run({ id: "s1", kind: "dispatch", status: "running", machine: "u1" })];
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, new Map(), machineRuns);
+    expect(card.runsCount).toBe(1);
   });
 });

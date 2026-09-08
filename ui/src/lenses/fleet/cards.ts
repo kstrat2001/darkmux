@@ -28,6 +28,7 @@
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
 import type { FlowRecord, MachineSpecs, PresenceBeat } from "../../types/handwritten";
 import { nameOf, machineNames } from "../../lib/flow";
+import type { Run } from "../../types/generated/Run";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
  * of its started sessions is still running — routed through the shared
@@ -104,6 +105,64 @@ export function specOf(
   return beat?.specs || "";
 }
 
+/** (#2060) Collapse a machine's set of currently-running session ids down to
+ * TOP-LEVEL runs: a mission's own whole-run session and its seat/step
+ * dispatches are one mission, not one-run-per-seat.
+ *
+ * The distinguishing shape (`src/mission_launch.rs::mission_bookend_record`):
+ * a mission's OWN bookend stamps `session_id === mission_id` (the mission id
+ * doubles as its own top-level session). A seat/step dispatch the mission
+ * launches carries the SAME `mission_id` but its OWN, different
+ * `session_id` (`launch_session_id`/`scope_to_run`/`dispatch.map`'s per-item
+ * scoping). So: group by `mission_id` when present, one run per group,
+ * preferring the mission's own top-level session as the group's
+ * representative id (so a single-running-item drill-in lands on the
+ * mission, not on whichever seat happened to be seen first). A session with
+ * no `mission_id` at all (a standalone dispatch, a lab run) always counts on
+ * its own — nothing to collapse into.
+ */
+export function topLevelRunSessionIds(data: FlowRecord[], sessionIds: string[]): string[] {
+  const missionIdOf = new Map<string, string | undefined>();
+  for (const r of data) {
+    if (!r.session_id || missionIdOf.has(r.session_id)) continue;
+    if (r.mission_id) missionIdOf.set(r.session_id, r.mission_id);
+  }
+  const standalone: string[] = [];
+  const repForMission = new Map<string, string>();
+  for (const sid of sessionIds) {
+    const missionId = missionIdOf.get(sid);
+    if (!missionId) {
+      standalone.push(sid);
+      continue;
+    }
+    const isTopLevel = missionId === sid;
+    const existing = repForMission.get(missionId);
+    if (!existing || isTopLevel) repForMission.set(missionId, sid);
+  }
+  return [...standalone, ...repForMission.values()];
+}
+
+/** (#1923) Lab runs deliberately do NOT ride the flow stream — CLAUDE.md's
+ * cross-system contract 3, the lab/fleet sink boundary: "lab runs write
+ * per-run-local artifacts; the fleet flow stream carries engagement work
+ * only. No crossings in either direction." So `machActive`/`sessionsOn`
+ * (both flow-derived) structurally cannot see a lab run — a machine running
+ * only lab work reads "idle" / "0 running" no matter how long it runs.
+ *
+ * This does NOT cross the sink boundary: it changes what the card reads for
+ * DISPLAY, never what gets WRITTEN. `machineRuns` comes from `GET /runs`,
+ * which already unions lab + flow sources server-side
+ * (`crates/darkmux-serve/src/runs.rs::build_runs`) — reading that union here
+ * is a display-layer join, not a new writer into the flow stream.
+ *
+ * Counts `kind === "lab"` rows only. A running mission/dispatch row in
+ * `/runs` is deliberately NOT counted here — that activity is already
+ * accounted for by flow presence (via `topLevelRunSessionIds` above,
+ * post-#2060), and counting it again here would double-count it. */
+export function runningLabRunCount(machineRuns: Run[]): number {
+  return machineRuns.filter((r) => r.kind === "lab" && r.status === "running").length;
+}
+
 export interface FleetCard {
   uid: string;
   name: string;
@@ -147,15 +206,35 @@ export function buildFleetCard(
   /** (#2067) See `specOf`'s own doc — the spec source, when it is not the
    * presence beats (a static build). */
   specBeats: Map<string, PresenceBeat> = liveMachines,
+  /** (#1923) This machine's rows from `GET /runs` — see `runningLabRunCount`'s
+   * own doc for why reading this here is a display-layer join, not a sink
+   * crossing. Defaults to `[]` so every pre-#1923 call site (none of which
+   * has `/runs` data to hand) keeps behaving exactly as before. LIVE MODE
+   * ONLY, same as `runningSessionIds` — replay's "specialists" tally is a
+   * different, already-flow-complete question (see that field's own
+   * comment). */
+  machineRuns: Run[] = [],
 ): FleetCard {
-  const active = machActive(data, liveSet, m, liveMode, t);
+  const flowActive = machActive(data, liveSet, m, liveMode, t);
+  const labRunning = liveMode ? runningLabRunCount(machineRuns) : 0;
+  const active = flowActive || labRunning > 0;
   const stat = machAbsent ? "offline" : active ? "dispatch in flight" : "idle";
   const all = sessionsOn(data, m);
   // (#691 Slice 2 / viewer.html:1704) Live counts only RUNNING sessions —
   // completed dispatches from earlier today must not read as current crew.
   // A replay counts the whole window: that IS the day's work.
-  const runningSessionIds = liveMode ? all.filter((sid) => liveSet.has(sid)) : [];
-  const runsCount = liveMode ? runningSessionIds.length : all.length;
+  //
+  // (#2060) `topLevelRunSessionIds` then collapses a mission's own session
+  // together with any of its seat/step dispatches into ONE entry — a
+  // mission with one seat running must read "1 running", not "2 running".
+  // Replay's `all` stays UNCOLLAPSED on purpose: it tallies the day's whole
+  // specialist roster (`runsCount`'s own module doc), which is a different
+  // question from "how many things are running right now."
+  const runningSessionIds = liveMode ? topLevelRunSessionIds(data, all.filter((sid) => liveSet.has(sid))) : [];
+  // (#1923) `+ labRunning`: lab runs are additive, never a replacement for
+  // the flow-derived count — see `runningLabRunCount`'s own doc for why a
+  // mission/dispatch row from the same `/runs` payload is excluded here.
+  const runsCount = liveMode ? runningSessionIds.length + labRunning : all.length;
   return {
     uid: m,
     name: nameOf(data, liveMachines, m),
