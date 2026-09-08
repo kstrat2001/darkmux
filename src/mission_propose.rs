@@ -98,6 +98,42 @@ pub fn propose(
         return Err(anyhow!("mission propose: empty input — nothing to compile"));
     }
 
+    // (#2463) `mission propose` dispatches `mission-compiler` (in the loop
+    // below, possibly more than once across `Decision::Regenerate` passes)
+    // through `dispatch_compiler` -> `crate::fleet::dispatch_routed` — the
+    // plain `dispatch()` primitive, no signal handling at all. Note this
+    // one specifically per the issue: `--start` only calls
+    // `mission_launch::launch` (which arms for ITSELF) from
+    // `persist_and_maybe_start`, well AFTER this compiler dispatch has
+    // already run — so arming there would leave the compiler dispatch,
+    // the render/prompt step, and every regenerate pass unguarded. Armed
+    // HERE instead, before the first dispatch, so the whole invocation —
+    // compiler dispatch(es), the interactive approve/reject/regenerate
+    // prompt, and the eventual `--start` launch — is covered from the
+    // start. `arm()` is idempotent, so `launch()`'s own later call is
+    // harmless. `dispatch_compiler` already wraps its own dispatch in a
+    // `mission.compile.start`/`.error`/`.complete` `BookendGuard` (on top
+    // of the inner `dispatch.error` bookend `DispatchBookendGuard`
+    // provides) — no new finalize guard needed, only the handlers + the
+    // curl-path watchdog.
+    //
+    // (#2463 review) **What "covered" does and does NOT mean for the PROMPT
+    // window** — stated plainly so a later reader doesn't take a cost for a
+    // benefit. The reap coverage is real for the DISPATCH windows: a child
+    // exists, the watchdog kills it, the blocking wait unblocks. During the
+    // interactive approve/reject/regenerate prompt no darkmux child is
+    // alive, so arming buys no reaping there — and it is not free. This
+    // process is then blocked in a `read_line` that retries on `EINTR`, so a
+    // signal only sets a flag nothing in this window polls: before this
+    // change ONE Ctrl-C / `kill <pid>` at the prompt ended the process; now
+    // it takes three (the second delivery restores `SIG_DFL` via
+    // `interrupt::deliver`'s escape hatch, the third kills). That is the
+    // accepted trade for closing the dispatch window — but if the prompt's
+    // signal responsiveness is wanted back, the fix is a poll seam in
+    // `prompt_decision`, NOT moving this `arm()` later.
+    crate::launch_guard::arm();
+    let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
+
     let mut hint: Option<String> = None;
     loop {
         // 2. Dispatch

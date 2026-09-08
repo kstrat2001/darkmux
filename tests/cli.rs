@@ -3050,6 +3050,192 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
     );
 }
 
+/// (#2463) `kill <pid>` (SIGTERM) on `darkmux mission propose` blocked
+/// mid-dispatch, BEFORE the operator ever sees a proposal to
+/// approve/reject/regenerate, must exit within 5s and leave no `curl`
+/// process still holding the stub connection open. This is the exact
+/// window #2463 named: `--start` only reaches `mission_launch::launch`
+/// (which arms ITS OWN guard) from `persist_and_maybe_start`, well AFTER
+/// this compiler dispatch has already run — so before this fix, a signal
+/// here (the dispatch itself, the interactive approve/reject/regenerate
+/// prompt, or any regenerate pass) killed the process outright with no
+/// guard installed at all, even on an invocation that would look fully
+/// guarded once `--start` eventually reached `launch()`.
+///
+/// `mission-compiler`'s real role manifest grants `tool_palette.allow:
+/// ["read"]`, which routes a remote-resolving dispatch through the
+/// agentic-remote CONTAINER path (#1187) rather than the light
+/// single-shot hosted `curl` path the other SIGTERM tests use — Docker +
+/// the runtime image are out of scope for a `cargo test` proof (the same
+/// reasoning the crawl-launcher note above gives for skipping ITS live
+/// test). So this test overrides the operator-role tier
+/// (`<DARKMUX_HOME>/roles/mission-compiler.json`) with a tool-LESS
+/// manifest — same id, same `role_family`/`escalation_contract`, empty
+/// `tool_palette.allow` — which `load_roles()`'s user-fills-first merge
+/// picks up ahead of the builtin, landing `dispatch_compiler`'s
+/// hardcoded `"mission-compiler"` dispatch on the SAME light single-shot
+/// hosted path `dialectic-judge` exercises above. No sibling `.md` file
+/// is written, so `load_role_prompt_for` falls back to the embedded
+/// `mission-compiler.md` prompt unchanged.
+///
+/// (#2463 review) **Name the divergence honestly: the tool grant is not an
+/// incidental field, it IS the path selector.** `role_wants_agentic_remote`
+/// (`dispatch_internal.rs`) forks on exactly `!tool_palette.allow.
+/// is_empty()`, so with the REAL manifest every production `mission
+/// propose` — local model or remote endpoint — takes the CONTAINER path,
+/// and this test takes the `curl` one. What this test therefore proves is
+/// that `arm()` + the reap watchdog are installed and load-bearing at this
+/// call site (both mutation-proven). The container half of the same call
+/// site is not proven HERE; it reduces to the trajectory tailer's
+/// `interrupt::is_set()` poll + `kill_all` (`dispatch_internal.rs`'s
+/// tailer loop), which #2131 pins for the launcher paths. A change to that
+/// tailer will not turn this test red.
+#[test]
+fn mission_propose_sigterm_before_the_operator_decision_reaps_curl() {
+    let stub = HangingStubServer::start();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+
+    let roles_dir = home.path().join("roles");
+    fs::create_dir_all(&roles_dir).unwrap();
+    let role_json = r#"{
+        "id": "mission-compiler",
+        "description": "test override (#2463): tool-less mission-compiler for the SIGTERM proof",
+        "tool_palette": { "allow": [], "deny": ["edit", "write", "exec", "process"] },
+        "escalation_contract": "bail-with-explanation",
+        "role_family": "utility"
+    }"#;
+    fs::write(roles_dir.join("mission-compiler.json"), role_json).unwrap();
+
+    let input_path = home.path().join("intent.txt");
+    fs::write(&input_path, "build a thing").unwrap();
+
+    let mut child = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .args(["mission", "propose", "--from-file"])
+        .arg(&input_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux mission propose");
+    let pid = child.id();
+
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "mission propose never reached a dispatch call to the stub server within 20s"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "mission propose must still be running (blocked on the hanging compiler dispatch) before SIGTERM"
+    );
+
+    let kill_status =
+        std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("running kill -TERM");
+    assert!(kill_status.success(), "kill -TERM itself must succeed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "darkmux mission propose did not exit within 5s of SIGTERM (#2463 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a signal-interrupted mission propose must not exit 0");
+
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "no `curl` connection to the stub server was ever torn down — a child process survived \
+         the parent (#2463 regression)"
+    );
+
+    assert_no_surviving_remote_curl(child.id(), "mission-propose");
+}
+
+/// (#2463) `kill <pid>` (SIGTERM) on `darkmux radio "<text>"` blocked
+/// mid-dispatch (a real `curl` call to an endpoint that never answers)
+/// must: exit within 5s and leave no `curl` process still holding the
+/// stub connection open. `darkmux radio` is a genuinely different
+/// dispatch shape from `dispatch`/`lab run`/`mission propose` above: its
+/// routing seat (`radio::dispatch_router_call`) goes through
+/// `dispatch_local_single_shot` — the container-free direct-HTTP primitive
+/// (#1698 Packet B), not `crew::dispatch::dispatch`'s container-or-remote
+/// fork — which still falls through to the SAME `dispatch_remote` light
+/// single-shot hosted `curl` call when the resolved profile targets a
+/// remote endpoint (`radio-router`'s own role manifest is already
+/// tool-less, `tool_palette.allow: []`, so no role override is needed the
+/// way `mission_propose`'s test above needed one). Before #2463, this path
+/// had no signal handling at all — a caught SIGTERM here just killed the
+/// process outright (default disposition) and orphaned the `curl` child.
+#[test]
+fn radio_sigterm_mid_dispatch_reaps_curl() {
+    let stub = HangingStubServer::start();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+
+    let mut child = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .args(["radio", "reboot the router please"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux radio");
+    let pid = child.id();
+
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "darkmux radio never reached a dispatch call to the stub server within 20s"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "darkmux radio must still be running (blocked on the hanging router dispatch) before SIGTERM"
+    );
+
+    let kill_status =
+        std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("running kill -TERM");
+    assert!(kill_status.success(), "kill -TERM itself must succeed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "darkmux radio did not exit within 5s of SIGTERM (#2463 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a signal-interrupted radio dispatch must not exit 0");
+
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "no `curl` connection to the stub server was ever torn down — a child process survived \
+         the parent (#2463 regression)"
+    );
+
+    assert_no_surviving_remote_curl(child.id(), "radio");
+}
+
 /// (#2345 C2) `outcome_from` names the task whose last step's output the
 /// launcher promotes as the `mission close` record's payload. Before this
 /// fix, a typo'd `outcome_from` was refused only AFTER the whole run — the
