@@ -1922,6 +1922,17 @@ pub(crate) struct LabRunSummary {
     pub(crate) lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
     pub(crate) has_funnels: bool,
     pub(crate) has_events: bool,
+    /// (#1982) The session_id the run's OWN inner dispatch used, read back
+    /// from `manifest.json` (`coding-task`/`prompt` providers write it
+    /// verbatim — the exact string passed to `crew::dispatch::dispatch`).
+    /// `None` for a run whose provider never recorded one (a pre-#1982
+    /// artifact, a provider that doesn't dispatch a single session, or a
+    /// manifest that hasn't been written yet). Exists so `runs::build_runs`
+    /// can claim this session the same way `collect_mission_step_sessions`
+    /// claims a mission's own step sessions — an absent value claims
+    /// nothing and the ghost persists, which is the honest degradation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
 }
 
 /// GET /lab/runs — every run cluster under the lab observer's scan root,
@@ -2136,6 +2147,18 @@ fn build_lab_run_summary(
 
     case_ids.sort();
 
+    // (#1982) `manifest.json` is written by every provider that dispatches a
+    // single inner session (`coding-task`, `prompt`) with the EXACT
+    // session_id string passed to `crew::dispatch::dispatch` — see
+    // `runs::build_runs`'s doc for why claiming it matters. Best-effort:
+    // a missing/malformed manifest (a provider that writes no manifest at
+    // all, or one mid-write) simply leaves this `None`, same lenient-on-read
+    // posture as every other optional field above.
+    let session_id = std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string));
+
     Some(LabRunSummary {
         dir: rel,
         mtime_ms,
@@ -2158,6 +2181,7 @@ fn build_lab_run_summary(
         lifecycle_status: darkmux_lab::lab::lifecycle::read(dir).map(|r| r.status),
         has_funnels,
         has_events,
+        session_id,
     })
 }
 

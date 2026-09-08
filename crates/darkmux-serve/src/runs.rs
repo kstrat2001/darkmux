@@ -364,6 +364,17 @@ pub fn build_runs(
     let lab_machine = darkmux_types::config_access::machine_id();
     if let Some(dir) = lab_dir {
         for summary in crate::scan_lab_runs(dir) {
+            // (#1982) Claim the lab run's OWN inner-dispatch session — read
+            // back from its `manifest.json` — the same way the mission loop
+            // above claims its step sessions. Without this, a lab run's
+            // dispatch bookends have no claimant and `ghost_runs` (below)
+            // synthesizes a SECOND, untracked row for the exact same work.
+            // An absent session_id (a provider that never recorded one)
+            // claims nothing — the ghost persists, which is the honest
+            // degradation named in the issue's acceptance criteria.
+            if let Some(sid) = &summary.session_id {
+                known_session_ids.insert(sid.clone());
+            }
             runs.push(lab_summary_to_run(&summary, lab_machine.clone(), now_ms));
         }
     }
@@ -3066,6 +3077,7 @@ mod tests {
             finished,
             has_funnels: true,
             has_events: true,
+            session_id: None,
         }
     }
 
@@ -3889,6 +3901,163 @@ mod tests {
         assert!(runs[0].tracked);
         assert_eq!(runs[0].role.as_deref(), Some("coder"));
         assert_eq!(runs[0].model.as_deref(), Some("qwen3.6-35b-a3b"));
+    }
+
+    /// (#1982) A lab run dispatches its inner work through the ordinary
+    /// `crew::dispatch::dispatch` primitive, so it emits real `dispatch
+    /// start`/`dispatch complete` flow bookends under the session_id the
+    /// provider minted and recorded into the run's own `manifest.json`.
+    /// Nothing claimed that session on the lab row's behalf, so it ALSO
+    /// surfaced as an untracked ghost — the same underlying work counted
+    /// twice. This is the acceptance case from the issue: one lab summary
+    /// plus the flow records of the dispatch it made must fold into exactly
+    /// one row.
+    fn write_lab_run_with_dispatch_session(lab_dir: &StdPath, dir: &str, session_id: &str) {
+        let run_dir = lab_dir.join(dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("lifecycle.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": "1.0",
+                "run_id": dir,
+                "kind": "lab",
+                "workload": "crawl-error-discard",
+                "profile": "default",
+                "started_at_ms": 1_700_000_000_000u64,
+                "status": "complete",
+                "ended_at_ms": 1_700_000_010_000u64,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": 3,
+                "run_id": dir,
+                "workload": "crawl-error-discard",
+                "provider": "coding-task",
+                "profile": "default",
+                "duration_ms": 10_000,
+                "ok": true,
+                "session_id": session_id,
+                "sandbox": "/tmp/sandbox",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_lab_run_dispatch_session_is_not_also_listed_as_a_ghost() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+
+        write_lab_run_with_dispatch_session(
+            lab.path(),
+            "crawl-error-discard-deep-1",
+            "darkmux-coding-crawl-error-discard-1787676109556",
+        );
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-07-24T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
+                    "handle": "crawler",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T09:10:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
+                    "handle": "crawler",
+                    "model": "qwen3.6-35b-a3b",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one Run — the lab run, no untracked dispatch ghost of its own inner dispatch: {runs:?}"
+        );
+        assert_eq!(runs[0].id, "crawl-error-discard-deep-1");
+        assert_eq!(runs[0].kind, RunKind::Lab);
+        assert!(runs[0].tracked);
+    }
+
+    /// The inverted case (issue's own instruction): de-duplication must
+    /// never swallow a genuinely DIFFERENT dispatch that merely happens to
+    /// be live alongside a lab run. A real, unrelated standalone dispatch
+    /// session (never claimed by any lab summary) must still surface as its
+    /// own ghost row.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_lab_claim_does_not_swallow_an_unrelated_dispatch_session() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+
+        write_lab_run_with_dispatch_session(
+            lab.path(),
+            "crawl-error-discard-deep-1",
+            "darkmux-coding-crawl-error-discard-1787676109556",
+        );
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-07-24T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
+                    "handle": "crawler",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T09:10:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
+                    "handle": "crawler",
+                    "model": "qwen3.6-35b-a3b",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T09:05:00Z",
+                    "action": "dispatch start",
+                    "session_id": "an-entirely-unrelated-standalone-session",
+                    "handle": "coder",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T09:06:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "an-entirely-unrelated-standalone-session",
+                    "handle": "coder",
+                    "model": "qwen3.6-35b-a3b",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        assert_eq!(
+            runs.len(),
+            2,
+            "the lab run's own claimed session must not swallow a distinct, unrelated dispatch: {runs:?}"
+        );
+        let ids: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"crawl-error-discard-deep-1"));
+        assert!(ids.contains(&"an-entirely-unrelated-standalone-session"));
+        let ghost = runs
+            .iter()
+            .find(|r| r.id == "an-entirely-unrelated-standalone-session")
+            .unwrap();
+        assert_eq!(ghost.kind, RunKind::Dispatch);
+        assert!(!ghost.tracked);
     }
 
     /// Launch path 2/4: a GENERIC `mission launch <config>` mission whose
