@@ -155,6 +155,23 @@ pub fn read_live(client: &redis::Client) -> Result<Vec<PresenceBeat>> {
     Ok(out)
 }
 
+/// Build one heartbeat payload. Pure (no I/O) — split out from the emitter
+/// loop's Redis write and thread-timing so the beat's SHAPE is testable
+/// independent of both. `spec_summary` is the caller's already-computed
+/// enrichment value (see `spawn_emitter_thread`'s own comment on why it's
+/// computed once, outside the loop, rather than re-probed every beat).
+fn build_beat(machine_uid: &str, display_name: &str, schema_version: &str, spec_summary: Option<String>) -> PresenceBeat {
+    PresenceBeat {
+        machine_uid: machine_uid.to_string(),
+        display_name: display_name.to_string(),
+        schema_version: schema_version.to_string(),
+        beat_ts_ms: now_ms(),
+        specs: spec_summary,
+        loaded_models: Vec::new(),
+        darkmux_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+    }
+}
+
 /// Unix-ms wall-clock helper for stamping a beat. Saturates to 0 before the
 /// epoch (never in practice).
 pub fn now_ms() -> u64 {
@@ -197,6 +214,12 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
     // when DARKMUX_MACHINE_ID is unset.
     let display_name = crate::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
     let schema_version = crate::FLOW_SCHEMA_VERSION.to_string();
+    // (#2083, #1855) Computed ONCE, outside the loop — hardware doesn't
+    // change for the process lifetime, same rationale as `machine_uid`
+    // above. This is the enrichment field's actual source: before this fix
+    // every beat hardcoded `specs: None`, so a peer's fleet card could never
+    // show its hardware no matter how long the daemon ran.
+    let spec_summary = darkmux_hardware::spec_summary();
 
     let spawned = std::thread::Builder::new()
         .name("darkmux-presence".to_string())
@@ -218,15 +241,7 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
             // daemon log every cadence tick.
             let mut healthy: Option<bool> = None;
             loop {
-                let beat = PresenceBeat {
-                    machine_uid: machine_uid.clone(),
-                    display_name: display_name.clone(),
-                    schema_version: schema_version.clone(),
-                    beat_ts_ms: now_ms(),
-                    specs: None,
-                    loaded_models: Vec::new(),
-                    darkmux_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                };
+                let beat = build_beat(&machine_uid, &display_name, &schema_version, spec_summary.clone());
                 match write_beat(&client, &beat, DEFAULT_TTL_SECS) {
                     Ok(()) => {
                         if healthy != Some(true) {
@@ -353,6 +368,28 @@ mod tests {
         b.darkmux_version = None;
         let json = serde_json::to_string(&b).unwrap();
         assert!(!json.contains("darkmux_version"), "must be omitted, not null: {json}");
+    }
+
+    /// (#2083, #1855) The regression: every emitted beat used to hardcode
+    /// `specs: None` regardless of what the local hardware probe found, so a
+    /// remote fleet card could never show hardware no matter how long the
+    /// daemon ran. `build_beat` is the beat's actual construction site now —
+    /// this proves the field genuinely flows through rather than being
+    /// silently dropped again.
+    #[test]
+    fn build_beat_carries_the_computed_spec_summary() {
+        let beat = build_beat("UID-1", "laptop", "1.10.0", Some("Apple M5 Max · 128 GB".into()));
+        assert_eq!(beat.specs.as_deref(), Some("Apple M5 Max · 128 GB"));
+        assert_eq!(beat.machine_uid, "UID-1");
+        assert_eq!(beat.display_name, "laptop");
+    }
+
+    /// The inverted case: a failed local probe (`None`) must still produce a
+    /// valid beat with `specs` genuinely absent, not a fabricated fallback.
+    #[test]
+    fn build_beat_omits_specs_when_the_probe_failed() {
+        let beat = build_beat("UID-2", "studio", "1.10.0", None);
+        assert_eq!(beat.specs, None);
     }
 
     #[test]
