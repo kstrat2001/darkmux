@@ -21,6 +21,24 @@ import { test, expect } from "@playwright/test";
 //
 // Run with: `bun run dev` (in `ui/`, separate shell), then from `ui/`:
 //   DARKMUX_VERIFY_PORT=5273 npx playwright test verify/brief-pairing.spec.ts --config verify/playwright.config.ts
+//
+// LOCAL-ONLY, deliberately, and worth knowing before trusting a green CI run:
+// NOTHING in CI executes this file. `vitest.config.ts` includes only
+// `src/**/*.test.{ts,tsx}`, and the Playwright jobs run `tests/e2e` and
+// `tests/parity` — so this is a hand-run proof, the same standing as its
+// neighbors here (`live-render.spec.ts`, `machine-render.spec.ts`,
+// `task-row-name.spec.ts`). The CI-able half of #2000's guard therefore
+// lives in `src/lenses/catalog/SessionReplay.test.tsx` ("wraps every brief
+// label with its OWN value in one `.brief-pair` grid item"): jsdom cannot
+// see the layout defect, but it CAN see the wrapper being deleted, which is
+// the likelier regression by far. Neither file replaces the other.
+//
+// A vite caching trap, hit twice while red-proving this spec: vite serves
+// CACHED transforms, so a before/after run against a reverted component can
+// pass while still serving the NEW module. Kill vite and
+// `rm -rf node_modules/.vite` between arms, then confirm what is actually
+// being served (`curl <dev>/src/lenses/catalog/SessionReplay.tsx | grep -c
+// groupBriefEntries`) before believing either result.
 
 const SESSION_ID = "brief-pairing-2000";
 
@@ -66,10 +84,13 @@ async function mockSessionAndGoto(page: import("@playwright/test").Page, width: 
 // The exact field → value mapping the mocked dispatch-start/complete records
 // above produce (matches `sessionRun.ts`'s `pushKv` order: route, runtime,
 // image, model, workspace, timing, then the fallback prompt-length line).
-// This is the CONTENT half of the invariant — the issue's own title is "pairs
-// label with the WRONG value", so the strongest possible proof is reading
-// back what value each label is ACTUALLY next to on screen and comparing it
-// against what it must be, not just "some value follows some label".
+//
+// These are INCIDENTAL FACTS, not the contract: they are today's fixture
+// crossed with today's UI copy (`RUNTIME_LABEL`'s "internal container", the
+// `route` string's "LMStudio", `fmtElapsed`'s "→"). Any of them can change
+// for a reason that has nothing to do with #2000, and when one does the fix
+// is to update this map — a failure here is a copy/fixture drift report, not
+// a pairing regression. The contract itself is the two assertions below.
 const EXPECTED_VALUE_SUBSTRING: Record<string, string> = {
   route: "LMStudio",
   runtime: "internal container",
@@ -84,19 +105,36 @@ const EXPECTED_VALUE_SUBSTRING: Record<string, string> = {
  *  CSS-string or class-name assertion — see the module doc above for why
  *  jsdom cannot see this class of defect at all):
  *
- *  1. CONTENT — for every `.brief-label` actually on screen, read the value
- *     rendered immediately after it (`.nextElementSibling`) and assert it is
- *     the value that field is SUPPOSED to carry (`EXPECTED_VALUE_SUBSTRING`).
- *     This is a direct read of the exact defect the issue reports: "`model`
- *     appears to name a filesystem path" is precisely
- *     `nextElementSibling.textContent` disagreeing with the expected
- *     mapping.
- *  2. GEOMETRY — every label/value pair that CONTENT found correct must also
- *     never straddle a column: the label and its value must share the same
- *     left edge (same column) and the value must sit directly below the
- *     label (small vertical gap), proving the pair renders as one visually
- *     contiguous unit rather than the two being correct in the DOM but torn
- *     apart on screen by the grid. */
+ *  1. CONTENT — for every `.brief-label` on screen, read the element right
+ *     after it (`.nextElementSibling`) and assert it is a `.brief-value`
+ *     carrying the value that field is supposed to carry.
+ *
+ *     STATED HONESTLY, because an earlier version of this comment claimed
+ *     otherwise: this does NOT read the defect the issue reports, and it
+ *     CANNOT go red on it. `pushKv` (`sessionRun.ts`) emits a label and its
+ *     value as ADJACENT siblings, so `nextElementSibling` is the correct
+ *     value however the grid lays the items out. The DOM was never wrong —
+ *     only the painted PLACEMENT was, which makes GEOMETRY the assertion
+ *     that carries the issue. (A run of this spec against `origin/main`'s
+ *     component reported exactly that: red 5/5 on geometry, this half never
+ *     firing.)
+ *
+ *     It stays because it guards a DIFFERENT regression cheaply: a future
+ *     grouping/ordering change that pairs a label with somebody else's
+ *     value, or drops the value element entirely, in the DOM itself.
+ *  2. GEOMETRY — the assertion that carries #2000. The label and its value
+ *     must share a left edge (same column) and the value must sit directly
+ *     below the label, so the pair renders as one visually contiguous unit
+ *     rather than two DOM-correct elements torn apart on screen.
+ *
+ *     Note what this is, exactly: a NEW invariant at EVERY width above one
+ *     column, not a probe isolating the odd-column case. Against
+ *     `origin/main`, where each entry is its own grid item, a label in
+ *     column N always has its value in column N+1 — different left edges —
+ *     so it fails at 768/1024/1680 as surely as at 1280/1440. The odd/even
+ *     distinction only ever governed whether the CONTENT-visible symptom
+ *     (a label reading against the wrong neighbor's value) appeared; the
+ *     geometry was wrong at all of them. */
 async function assertBriefLabelsPairWithTheirRealValue(grid: import("@playwright/test").Locator) {
   const rows = await grid.evaluate((el) =>
     Array.from(el.querySelectorAll(".brief-label")).map((label) => {
@@ -161,11 +199,19 @@ test.describe("#2000 — run-detail brief pairs label with the right value at 3-
     });
   }
 
-  // Control widths (from the issue's own measured table) — must stay clean
-  // both before and after the fix, so this proof doesn't accidentally
-  // depend on the specific width chosen.
+  // Additional widths, so this proof doesn't depend on the specific ones
+  // chosen above. NOT controls, despite what an earlier version of this
+  // comment said: "must stay clean both before and after the fix" does not
+  // hold. Against `origin/main` each entry is its own grid item, so at ANY
+  // column count above 1 a label sits in column N and its value in column
+  // N+1 — different left edges — and the GEOMETRY assertion fails here
+  // exactly as it does at 1280/1440 (a run against main reported all five
+  // widths red). What the issue's own table calls "already correct" at these
+  // widths is the CONTENT symptom, which an even column count does dodge —
+  // and content is the half that cannot go red here at all. So these widths
+  // widen the same new invariant; they isolate nothing.
   for (const width of [768, 1024, 1680]) {
-    test(`${width}px (control, already correct per the issue's own table): still pairs correctly`, async ({ page }) => {
+    test(`${width}px (even/other column counts — no CONTENT symptom here, same pairing invariant): still pairs correctly`, async ({ page }) => {
       const grid = await mockSessionAndGoto(page, width, 900);
       await assertBriefLabelsPairWithTheirRealValue(grid);
     });

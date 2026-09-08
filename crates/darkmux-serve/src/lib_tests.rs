@@ -3782,6 +3782,103 @@
         assert_eq!(runs[1].dir, "older/run1");
     }
 
+    /// (#1982) A minimal live-shaped run dir: `lifecycle.json` (written at
+    /// run START, the only marker a running lab run has) plus whatever
+    /// `manifest.json` bytes the caller wants — `None` writes no manifest at
+    /// all, which is the real shape of a run that is still executing.
+    fn write_lab_run_with_manifest_bytes(dir: &StdPath, run_id: &str, manifest: Option<&str>) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": "1.0",
+                "run_id": run_id,
+                "kind": "lab",
+                "workload": "demo-workload",
+                "profile": "default",
+                "started_at_ms": 1_700_000_000_000u64,
+                "status": "running",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        if let Some(bytes) = manifest {
+            fs::write(dir.join("manifest.json"), bytes).unwrap();
+        }
+    }
+
+    /// (#1982) The POSITIVE control for the three degradation tests below —
+    /// without it, "resolves to `None`" proves nothing, because an
+    /// extraction that ALWAYS returned `None` would satisfy all three.
+    #[test]
+    fn scan_lab_runs_session_id_is_read_from_a_well_formed_manifest() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_manifest_bytes(
+            &tmp.path().join("run1"),
+            "run1",
+            Some(r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-demo-1787676109556"}"#),
+        );
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(
+            runs[0].session_id.as_deref(),
+            Some("darkmux-coding-demo-1787676109556"),
+            "a well-formed manifest's session_id must be read back verbatim"
+        );
+    }
+
+    /// (#1982) The honest-degradation case that actually happens in
+    /// production: `manifest.json` is written at run END, so for a run's
+    /// whole DURATION the dir holds a `lifecycle.json` and no manifest.
+    /// Nothing may be claimed from that — in particular the extraction must
+    /// never fall back to the run id (or any other guessable string), which
+    /// would claim a session this run never dispatched under and could
+    /// swallow an unrelated row.
+    #[test]
+    fn scan_lab_runs_session_id_is_none_when_the_manifest_has_not_been_written_yet() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_manifest_bytes(&tmp.path().join("run1"), "run1", None);
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "the run is still DISCOVERED via lifecycle.json: {runs:?}");
+        assert_eq!(
+            runs[0].session_id, None,
+            "no manifest means nothing to claim — never a fallback to the run id: {runs:?}"
+        );
+    }
+
+    /// (#1982) A manifest caught mid-write (truncated JSON) is unparseable.
+    /// Lenient-on-read: the run still surfaces, it just claims no session.
+    #[test]
+    fn scan_lab_runs_session_id_is_none_for_a_malformed_manifest() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_manifest_bytes(
+            &tmp.path().join("run1"),
+            "run1",
+            Some(r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-de"#),
+        );
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "a malformed manifest must not hide the run: {runs:?}");
+        assert_eq!(runs[0].session_id, None, "{runs:?}");
+    }
+
+    /// (#1982) A `session_id` of the wrong TYPE claims nothing either — the
+    /// claim key is a string and a number/object/null is not one. Guards a
+    /// future "be helpful" coercion (`Value::to_string()`, which would
+    /// produce the literal `123` and claim a session nothing ever
+    /// dispatched under).
+    #[test]
+    fn scan_lab_runs_session_id_is_none_when_the_manifest_value_is_not_a_string() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_manifest_bytes(
+            &tmp.path().join("run1"),
+            "run1",
+            Some(r#"{"schema_version":3,"run_id":"run1","session_id":123}"#),
+        );
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].session_id, None, "{runs:?}");
+    }
+
     #[test]
     fn tail_lab_events_backfills_from_zero_then_returns_only_new_lines() {
         let tmp = TempDir::new().unwrap();

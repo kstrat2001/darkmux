@@ -1204,10 +1204,27 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
         // that never happened; as `updated_ts` it's simply true.
         updated_ts: Some(summary.mtime_ms / 1000),
         tracked: true,
-        // (#1915) A lab run has no flow session backing it — nothing to
-        // drill into via `#dispatch=<id>` — and it already opens its own
-        // in-page detail pane regardless (`RunsBoard.tsx::activateRun`'s
-        // `"lab"` branch), so there's no destination this field could add.
+        // (#1915, corrected #1982) NOT because a lab run has no flow session
+        // — the original comment here claimed exactly that, and #1982
+        // disproves it: a completed `coding-task`/`prompt` run DOES have one
+        // (`summary.session_id`), and `build_runs` above now reads it to
+        // claim the run's own dispatch bookends.
+        //
+        // It stays `None` because populating it would change NOTHING that is
+        // rendered. `runDestination` (`ui/src/lenses/runs/format.ts`)
+        // short-circuits every `kind === "lab"` row to the in-page
+        // `LabRunDetail` on its FIRST line, before it ever looks at
+        // `session_id`; and `LabRunDetail` takes only a `dir`, renders no
+        // `#dispatch=` link, and has no other route to a session replay.
+        //
+        // The honest consequence, recorded rather than papered over: the
+        // runs lens currently offers NO door to a lab run's session replay.
+        // Those records are still reachable — the fleet lens's activity
+        // timeline (`FleetLens.tsx`) navigates to `#dispatch=<sid>` — but
+        // restoring the drill-in from HERE is a `LabRunDetail` change
+        // (carry the session in, render a link) plus a `runDestination`
+        // decision about which of the two destinations wins, not a one-line
+        // field assignment.
         session_id: None,
         abandoned_reason,
     }
@@ -4058,6 +4075,79 @@ mod tests {
             .unwrap();
         assert_eq!(ghost.kind, RunKind::Dispatch);
         assert!(!ghost.tracked);
+    }
+
+    /// (#1982) The DEGRADATION this fix promises, asserted end-to-end rather
+    /// than only described in a comment: a lab run that recorded no
+    /// `session_id` claims nothing, so its dispatch bookends still surface
+    /// as their own untracked ghost. Both rows are expected here — the
+    /// duplicate is the honest outcome of having no claim to make, NOT a
+    /// display filter hiding a still-double-counted total.
+    ///
+    /// This is also the live-run window, which is the case that actually
+    /// occurs: `lifecycle.json` lands at run start and `manifest.json` at
+    /// run end, so a RUNNING lab run has exactly this shape for its whole
+    /// duration (producer-side gap #2511). The guard that matters: nothing
+    /// here may invent a claim from the run id or any other guessable
+    /// string, which would swallow whichever session happened to match.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_lab_run_with_no_recorded_session_claims_nothing_and_the_ghost_persists() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+
+        // Same fixture as the two tests above, minus `manifest.json` — the
+        // shape of a run that has started and not yet finished.
+        let run_dir = lab.path().join("crawl-error-discard-deep-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("lifecycle.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": "1.0",
+                "run_id": "crawl-error-discard-deep-1",
+                "kind": "lab",
+                "workload": "crawl-error-discard",
+                "profile": "default",
+                "started_at_ms": 1_700_000_000_000u64,
+                "status": "running",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-07-24T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
+                    "handle": "crawler",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T09:10:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
+                    "handle": "crawler",
+                    "model": "qwen3.6-35b-a3b",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let ids: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"crawl-error-discard-deep-1"),
+            "the lab row itself is unaffected by having no session to claim: {runs:?}"
+        );
+        assert!(
+            ids.contains(&"darkmux-coding-crawl-error-discard-1787676109556"),
+            "with nothing claimed, the dispatch ghost MUST persist — a silent claim \
+             synthesized from the run id would be worse than the duplicate: {runs:?}"
+        );
+        assert_eq!(runs.len(), 2, "{runs:?}");
     }
 
     /// Launch path 2/4: a GENERIC `mission launch <config>` mission whose

@@ -118,6 +118,77 @@ describe("SessionReplay", () => {
     expect(document.querySelector('[data-act="disclose-prompt"]')).not.toBeInTheDocument();
   });
 
+  it("(#2000) wraps every brief label with its OWN value in one `.brief-pair` grid item", async () => {
+    // The CI-able half of #2000's proof, and its LIMIT stated up front: jsdom
+    // computes no layout, so this cannot see the defect the issue reports (a
+    // pair torn across a grid column). `verify/brief-pairing.spec.ts` is the
+    // only thing that can, and it is a local-only Playwright proof that no CI
+    // job runs.
+    //
+    // What this DOES catch is the likelier regression by far: someone
+    // deleting the `.brief-pair` wrapper — flattening the grouping back to
+    // one grid item per entry — while every other assertion in this suite,
+    // `sessionRun.test.ts`'s pure-logic ones, and the `innerText` goldens all
+    // stay green, because none of them can see a wrapper `<div>` at all. The
+    // wrapper IS the fix; without it the column arithmetic returns.
+    const records = [
+      {
+        ts: "2026-08-26T07:36:48Z",
+        action: "dispatch.start",
+        session_id: "s-pair",
+        machine_id: "MacBook-Pro",
+        category: "work",
+        source: "crew",
+        // `mission_id` is here deliberately: that pair is pushed by hand
+        // (not `pushKv`) and its value carries an `href`, so it is the one
+        // pair that renders an <a> inside `.brief-value`. If grouping ever
+        // special-cases linked entries, this is what notices.
+        mission_id: "m-pair-1",
+        // `model` is a top-level record field, not a payload one
+        // (`sessionRun.ts` reads `d.model`).
+        model: "qwen3.6-35b-a3b-turboquant-mlx",
+        payload: {
+          role: "crawler",
+          runtime: "internal",
+          image: "darkmux-runtime:latest",
+          workspace: "/home/demo/.darkmux/runs/crawl-discarded-locks/sandbox",
+        },
+      },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-pair");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    const grid = document.querySelector(".session-run .track.brief-grid");
+    expect(grid, "the brief grid must render").toBeTruthy();
+
+    const labels = [...grid!.querySelectorAll(".brief-label")];
+    // Guard the guard: a fixture producing no labels would satisfy every
+    // assertion below vacuously.
+    expect(labels.map((l) => l.textContent)).toEqual([
+      "route",
+      "runtime",
+      "image",
+      "model",
+      "workspace",
+      "mission",
+      "timing",
+    ]);
+
+    for (const label of labels) {
+      const pair = label.parentElement;
+      expect(pair?.className, `"${label.textContent}" is not inside a .brief-pair`).toBe("brief-pair");
+      // Exactly the pair, nothing else sharing the grid item — a third child
+      // would be a second entry riding along and re-opening the straddle.
+      expect([...pair!.children].map((c) => c.className)).toEqual(["brief-label", "brief-value"]);
+      expect(pair!.parentElement).toBe(grid);
+    }
+
+    // And no entry escaped the grouping: a bare `.brief-label` sitting
+    // directly in the grid is the exact shape the fix replaced.
+    expect([...grid!.children].filter((c) => c.classList.contains("brief-label"))).toHaveLength(0);
+  });
+
   it("(U3-6) names WALL CLOCK as MODEL time, so it cannot be read as the mission step's span", async () => {
     // The mission graph's per-step badge is the STEP SPAN (setup + the
     // model's work + the gate); this tile is the dispatch's own `wall_ms`.
