@@ -9,12 +9,21 @@
  * the timeline's phase tag. Every scope of the work-unit ladder (mission ›
  * phase › task › step › run) now renders this chip. The raw status word is
  * the label (CSS uppercases it, so every golden that pins the TEXT is
- * unchanged); the look comes from a five-word internal vocabulary:
+ * unchanged); the look comes from a six-word internal vocabulary:
  *
  *   running  — in progress: accent, and the pulse (`data-live` modulates it
  *              exactly as the run detail's liveness state always did)
  *   done     — a good terminal: complete / finished / finalized / closed
  *   error    — a bad terminal: error / errored / killed
+ *   degraded — a MIXED terminal (#2406): real output was produced, some of
+ *              it was not — a phase with some tasks complete and some
+ *              errored/abandoned. Warn color, same as `stopped` (a caution,
+ *              not a failure — see `.fleet-strip--degraded`'s own comment
+ *              in `styles.css` for the same color choice at a different
+ *              scope), but its OWN kind: `degraded` and `stopped` are
+ *              different facts (a mix that shipped real output vs. an
+ *              operator/budget kill) and must stay distinguishable by the
+ *              raw status word even though they share a color family.
  *   stopped  — an operator or budget terminal: aborted / abandoned /
  *              canceled / interrupted / paused
  *   idle     — not started, or a word this map does not know: planned /
@@ -42,7 +51,7 @@ import type { LivenessState } from "./LivenessPulse";
  * (operator, 2026-09-04: "live is a separate idea from a running job.")
  */
 export const RUNNING_WORD = "running";
-export type WorkStatusKind = "running" | "done" | "error" | "stopped" | "idle";
+export type WorkStatusKind = "running" | "done" | "error" | "degraded" | "stopped" | "idle";
 
 const KIND: Record<string, WorkStatusKind> = {
   running: "running",
@@ -55,6 +64,11 @@ const KIND: Record<string, WorkStatusKind> = {
   error: "error",
   errored: "error",
   killed: "error",
+  // (#2406) Mixed terminal — real output was produced, some of it was not.
+  // Its own kind, not folded into `stopped`: see this file's own doc for
+  // why the two must stay distinguishable by word even though they share
+  // a color.
+  degraded: "degraded",
   aborted: "stopped",
   abandoned: "stopped",
   canceled: "stopped",

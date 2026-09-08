@@ -3735,9 +3735,19 @@ pub(crate) fn lazy_close_prior_phases(
         }
         let refs: Vec<&crew::types::Step> = steps.iter().collect();
         let (outcome, _reason) = phase_finalization(&refs);
+        // (#2406) Explicit, not a `_` wildcard: a wildcard here would have
+        // silently routed the new `Degraded` outcome to `phase_abandon`,
+        // the exact "any Error wins" over-collapse this packet fixes —
+        // `Degraded` drives the SAME lifecycle terminal `Complete` does
+        // (see `PhaseOutcomeKind`'s own doc), same as the whole-mission
+        // finalize path (`finalize_mission_with_payload`) below now does.
         let result = match outcome {
-            crew::envelope::PhaseOutcomeKind::Complete => crew::lifecycle::phase_complete(prior),
-            _ => crew::lifecycle::phase_abandon(prior),
+            crew::envelope::PhaseOutcomeKind::Complete | crew::envelope::PhaseOutcomeKind::Degraded => {
+                crew::lifecycle::phase_complete(prior)
+            }
+            crew::envelope::PhaseOutcomeKind::Abandoned | crew::envelope::PhaseOutcomeKind::Unknown => {
+                crew::lifecycle::phase_abandon(prior)
+            }
         };
         if let Err(e) = result {
             closed.remove(prior);
@@ -3752,22 +3762,41 @@ pub(crate) fn lazy_close_prior_phases(
     }
 }
 
-/// (#1406) Derive each executed phase's finalization outcome from THAT
-/// phase's OWN step statuses, rather than stamping every phase with one
-/// uniform run-level outcome. The old uniform mapping marked a never-started
-/// (`Planned`) phase `Complete` on a `Degraded` run; `finalize_mission` then
-/// called `phase_complete` on a `Planned` phase, which the state machine
-/// refuses, leaving a Finalized mission with a permanently `Planned` phase whose
-/// `envelope.json` disagreed with disk. The honest per-phase rules:
+/// (#1406, revised #2406) Derive each executed phase's finalization outcome
+/// from THAT phase's OWN step statuses, rather than stamping every phase
+/// with one uniform run-level outcome. The old uniform mapping marked a
+/// never-started (`Planned`) phase `Complete` on a `Degraded` run;
+/// `finalize_mission` then called `phase_complete` on a `Planned` phase,
+/// which the state machine refuses, leaving a Finalized mission with a
+/// permanently `Planned` phase whose `envelope.json` disagreed with disk.
+/// The honest per-phase rules (all assume every step is TERMINAL — a phase
+/// this launcher's own advance/finalize call sites only ever reach once the
+/// scheduler has stopped touching it):
 ///
 /// - all of the phase's steps `Complete` (and it has at least one) → Complete
-/// - any errored step → Abandoned (errored)
+/// - SOME `Complete` AND some `Error`/`Abandoned` → **Degraded (#2406)** —
+///   real output shipped, some of it did not; NOT the same as Abandoned, and
+///   NOT a lesser Complete either (see [`crew::envelope::PhaseOutcomeKind`]'s
+///   own doc)
+/// - NONE `Complete`, but some errored → Abandoned (errored) — `PhaseOutcomeKind`
+///   still has no `Error` variant (unchanged by #2406), so an all-errored
+///   phase abandons, matching the existing terminal status vocabulary
 /// - a phase the scheduler never reached (no started steps) → Abandoned
-/// - any step left non-terminal (`Running`/`Planned`) → Abandoned
+/// - any step left non-terminal (`Running`/`Planned`) → Abandoned (this
+///   function's own defensive branch, not the live case — callers guard
+///   against invoking it on a phase that still has non-terminal steps;
+///   `phase_finalization_rule4_two_step_phase_mixed_complete_and_planned_abandons`
+///   pins this)
 ///
-/// A phase is `Complete` ONLY when it genuinely finished. Everything else is
-/// honestly Abandoned; `PhaseOutcomeKind` has no `Error` variant, so an
-/// errored phase abandons, matching the existing terminal status vocabulary.
+/// **#2406's fix is narrowly the SOME-complete + SOME-errored/abandoned
+/// branch above.** Before this, `errored > 0` alone routed straight to
+/// Abandoned regardless of how many OTHER steps in the same phase
+/// completed — a phase with 11 completed steps and 1 errored one read
+/// "abandoned", the same over-collapse #2406's issue names for the DISPLAY
+/// side (`crates/darkmux-serve/src/mission_graph.rs::phase_display_status`).
+/// Every other branch (all-complete, all-errored, never-started,
+/// left-non-terminal) is UNCHANGED.
+///
 /// Only phases that actually had tasks in this run are named (a phase with no
 /// tasks is a freeform/manual phase this launcher doesn't drive).
 fn derive_phase_outcomes(
@@ -3799,15 +3828,30 @@ fn derive_phase_outcomes(
         .collect()
 }
 
-/// (#1406) The per-phase outcome + provenance for one phase's step slice.
-/// See [`derive_phase_outcomes`] for the rules.
+/// (#1406, revised #2406) The per-phase outcome + provenance for one
+/// phase's step slice. See [`derive_phase_outcomes`] for the rules.
 fn phase_finalization(phase_steps: &[&crew::types::Step]) -> (crew::envelope::PhaseOutcomeKind, Option<String>) {
     use crew::envelope::PhaseOutcomeKind;
+    let completed = phase_steps.iter().filter(|s| s.status == NodeStatus::Complete).count();
     let errored = phase_steps.iter().filter(|s| s.status == NodeStatus::Error).count();
+    let abandoned = phase_steps.iter().filter(|s| s.status == NodeStatus::Abandoned).count();
     let any_started = phase_steps.iter().any(|s| s.status != NodeStatus::Planned);
-    let all_complete = !phase_steps.is_empty() && phase_steps.iter().all(|s| s.status == NodeStatus::Complete);
+    let all_complete = !phase_steps.is_empty() && completed == phase_steps.len();
     if all_complete {
         (PhaseOutcomeKind::Complete, None)
+    } else if completed > 0 && (errored > 0 || abandoned > 0) {
+        // (#2406) The fix: a mix of Complete and Error/Abandoned among a
+        // TERMINAL phase's own steps is Degraded, not Abandoned — real
+        // output shipped, some of it did not. This is the ONLY branch
+        // #2406 changes; every other arm below is byte-identical to the
+        // pre-#2406 rule.
+        (
+            PhaseOutcomeKind::Degraded,
+            Some(format!(
+                "{completed} of {} step(s) completed, {errored} errored, {abandoned} abandoned",
+                phase_steps.len()
+            )),
+        )
     } else if errored > 0 {
         (PhaseOutcomeKind::Abandoned, Some(format!("{errored} step(s) errored")))
     } else if !any_started {
@@ -6524,6 +6568,68 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn lazy_close_prior_phases_drives_a_degraded_mix_to_complete_not_abandoned() {
+        // (#2406) The mid-run twin of `finalize_mission_drives_a_degraded_
+        // phase_to_complete_on_disk` (envelope.rs) — this is the OTHER
+        // caller of `phase_finalization`, the "advance" partial-close path
+        // that fires the moment a LATER phase starts while an EARLIER one
+        // is still marked Running. Before the `_ => phase_abandon`
+        // wildcard was replaced with an explicit match, a mixed phase
+        // closing here would have silently abandoned instead of
+        // completing — the exact #2406 bug, reachable from a SECOND call
+        // site the envelope-level test above does not exercise.
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let mission_id = "advance-degraded-test";
+        let real = ensure_mission_and_phases_with_provenance(mission_id, &config, None, None).unwrap();
+        let order: Vec<String> = config.phases.iter().filter_map(|p| real.get(&p.id).cloned()).collect();
+        assert!(order.len() >= 2, "the fixture must have enough phases to advance between");
+
+        let mut started = std::collections::HashSet::new();
+        let mut closed = std::collections::HashSet::new();
+        assert!(lazy_start_phase_for_step(mission_id, &order[0], NodeStatus::Running, &mut started));
+
+        // Phase 0 gets TWO steps: one Complete, one Error — the terminal
+        // mix #2406 names.
+        let complete_step = crew::types::Step {
+            id: format!("{}-s1", order[0]),
+            task_id: format!("{}-t1", order[0]),
+            gate: None,
+            kind: "procedural.noop".to_string(),
+            status: NodeStatus::Complete,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let errored_step = crew::types::Step {
+            id: format!("{}-s2", order[0]),
+            task_id: format!("{}-t2", order[0]),
+            gate: None,
+            kind: "procedural.noop".to_string(),
+            status: NodeStatus::Error,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        crew::lifecycle::save_step(mission_id, &order[0], &complete_step).unwrap();
+        crew::lifecycle::save_step(mission_id, &order[0], &errored_step).unwrap();
+
+        assert!(lazy_start_phase_for_step(mission_id, &order[1], NodeStatus::Running, &mut started));
+        lazy_close_prior_phases(mission_id, &order, &order[1], &mut closed);
+
+        assert_eq!(
+            phase_status_on_disk(mission_id, &order[0]),
+            PhaseStatus::Complete,
+            "a phase with SOME complete and SOME errored steps still drives to the Complete \
+             lifecycle terminal on advance — Degraded is an envelope-level distinction, not a \
+             different persisted PhaseStatus"
+        );
+    }
+
     // ── #1400: lazy phase start ("phase 2 stays planned until reached") ──
 
     #[test]
@@ -6810,6 +6916,124 @@ mod tests {
             Some("phase did not complete (steps left non-terminal)"),
             "rule 4 (non-terminal leftover), distinct from the errored / never-started reasons"
         );
+    }
+
+    // ─── phase_finalization (#2406) — table-driven, every combination ───
+
+    #[test]
+    fn phase_finalization_table_every_combination() {
+        use crew::envelope::PhaseOutcomeKind;
+        let s = scripted_step;
+        // (status list, expected outcome, human name) — one row per
+        // reachable combination of terminal/non-terminal step statuses a
+        // phase's own step slice can carry. #2406 changes ONLY the
+        // "mixed Complete + Error/Abandoned, all terminal" rows (marked
+        // below); every other row asserts the PRE-#2406 behavior is
+        // unchanged (the inverted cases the brief asks for).
+        let cases: Vec<(Vec<NodeStatus>, PhaseOutcomeKind, &str)> = vec![
+            // all-complete → Complete (inverted case: unaffected by #2406)
+            (vec![NodeStatus::Complete, NodeStatus::Complete], PhaseOutcomeKind::Complete, "all complete"),
+            (vec![NodeStatus::Complete], PhaseOutcomeKind::Complete, "single complete"),
+            // nothing complete, all errored → Abandoned (inverted case:
+            // "nothing complete" stays Abandoned, unaffected by #2406)
+            (vec![NodeStatus::Error, NodeStatus::Error], PhaseOutcomeKind::Abandoned, "all errored"),
+            (vec![NodeStatus::Error], PhaseOutcomeKind::Abandoned, "single errored"),
+            // nothing complete, all abandoned, no errors → Abandoned
+            (vec![NodeStatus::Abandoned, NodeStatus::Abandoned], PhaseOutcomeKind::Abandoned, "all abandoned"),
+            // nothing complete, a mix of errored + abandoned → Abandoned
+            // (still "nothing complete", so the #2406 Degraded branch does
+            // not apply — errored>0 wins per the unchanged rule)
+            (
+                vec![NodeStatus::Error, NodeStatus::Abandoned],
+                PhaseOutcomeKind::Abandoned,
+                "errored + abandoned, nothing complete",
+            ),
+            // never started → Abandoned (unaffected by #2406)
+            (vec![NodeStatus::Planned, NodeStatus::Planned], PhaseOutcomeKind::Abandoned, "never started"),
+            (vec![], PhaseOutcomeKind::Abandoned, "no steps at all"),
+            // leftover non-terminal, nothing errored → Abandoned (rule 4,
+            // pinned separately above; repeated here for table completeness)
+            (
+                vec![NodeStatus::Complete, NodeStatus::Planned],
+                PhaseOutcomeKind::Abandoned,
+                "complete + leftover planned",
+            ),
+            // ── #2406's fix: terminal, SOME complete + SOME error/abandoned ──
+            (
+                vec![NodeStatus::Complete, NodeStatus::Error],
+                PhaseOutcomeKind::Degraded,
+                "complete + error (THE #2406 bug shape)",
+            ),
+            (
+                vec![NodeStatus::Complete, NodeStatus::Abandoned],
+                PhaseOutcomeKind::Degraded,
+                "complete + abandoned",
+            ),
+            (
+                vec![NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Error, NodeStatus::Abandoned],
+                PhaseOutcomeKind::Degraded,
+                "complete + error + abandoned, all mixed",
+            ),
+        ];
+        for (statuses, expected, name) in cases {
+            let steps: Vec<crew::types::Step> =
+                statuses.iter().enumerate().map(|(i, st)| s(&format!("s{i}"), *st)).collect();
+            let refs: Vec<&crew::types::Step> = steps.iter().collect();
+            let (outcome, _reason) = phase_finalization(&refs);
+            assert_eq!(outcome, expected, "case `{name}`: statuses {statuses:?}");
+        }
+    }
+
+    #[test]
+    fn phase_finalization_the_2406_scenario_1_errored_11_complete_is_degraded_not_abandoned() {
+        // (#2406) The issue's own exact envelope-level slice: 1 of 12 unit
+        // steps errored, 11 completed. The pre-#2406 rule mapped this
+        // straight to Abandoned ("N step(s) errored") regardless of how
+        // many other steps in the phase completed — the debrief then called
+        // a phase that shipped 11 real completions "abandoned". Fixed: the
+        // phase reads Degraded, and the reason names both counts.
+        let mut steps: Vec<crew::types::Step> = Vec::new();
+        for i in 0..11 {
+            steps.push(scripted_step(&format!("unit-{i}"), NodeStatus::Complete));
+        }
+        steps.push(scripted_step("unit-11", NodeStatus::Error));
+        let refs: Vec<&crew::types::Step> = steps.iter().collect();
+        let (outcome, reason) = phase_finalization(&refs);
+        use crew::envelope::PhaseOutcomeKind;
+        assert_eq!(outcome, PhaseOutcomeKind::Degraded, "1 errored of 12, 11 completed → Degraded, never Abandoned");
+        assert_eq!(reason.as_deref(), Some("11 of 12 step(s) completed, 1 errored, 0 abandoned"));
+    }
+
+    #[test]
+    fn derive_phase_outcomes_the_2406_scenario_agrees_at_the_envelope_level() {
+        // (#2406) Same slice as the `phase_finalization` unit test above,
+        // but through the REAL envelope-construction path
+        // (`derive_phase_outcomes`, what `build_envelope` actually calls) —
+        // proves the fix reaches the persisted `envelope.json`, not just
+        // the private helper.
+        let config: MissionConfig =
+            serde_json::from_str(r#"{"id":"r2406","name":"r2406","phases":[{"id":"p1"}]}"#).unwrap();
+        let mid = "r2406";
+        let real = derive_phase_ids(mid, &config);
+        let rp1 = real["p1"].clone();
+        let mut tasks = Vec::new();
+        let mut steps = BTreeMap::new();
+        for i in 0..11 {
+            let step_id = format!("unit-{i}");
+            let mut task = task_with_step(&rp1, &step_id);
+            task.id = format!("{rp1}-task-{i}");
+            tasks.push(task);
+            steps.insert(step_id.clone(), scripted_step(&step_id, NodeStatus::Complete));
+        }
+        let mut errored_task = task_with_step(&rp1, "unit-11");
+        errored_task.id = format!("{rp1}-task-11");
+        tasks.push(errored_task);
+        steps.insert("unit-11".to_string(), scripted_step("unit-11", NodeStatus::Error));
+
+        let outcomes = derive_phase_outcomes(&config, &real, &tasks, &steps);
+        use crew::envelope::PhaseOutcomeKind;
+        let o = outcomes.iter().find(|o| o.phase_id == rp1).expect("phase p1 present");
+        assert_eq!(o.outcome, PhaseOutcomeKind::Degraded, "1-of-12 errored, 11 completed → Degraded at the envelope level");
     }
 
     #[test]

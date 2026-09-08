@@ -7007,8 +7007,17 @@ fn fail_probe_terminal_mission_has_no_non_terminal_step_and_envelope_matches_dis
     for phase in envelope["phases"].as_array().unwrap() {
         let real_id = phase["phase_id"].as_str().unwrap();
         let short = real_id.rsplit('-').next().unwrap().to_string();
+        // (#2406) `Degraded` drives the SAME lifecycle terminal `Complete`
+        // does — `PhaseStatus` has no third terminal to persist it as (see
+        // `crew::envelope::PhaseOutcomeKind`'s own doc). Before #2406 this
+        // match only knew Complete/else-Abandoned, which is exactly the
+        // over-collapse the fixture below caught: p2 has a genuine mix (2
+        // of 4 steps completed, 2 cascade-abandoned) that the pre-#2406
+        // rule read straight to Abandoned on disk — this real end-to-end
+        // fixture is independent proof the bug was reachable outside the
+        // review pipeline too.
         let want = match phase["outcome"].as_str().unwrap() {
-            "Complete" | "complete" => "complete",
+            "Complete" | "complete" | "Degraded" | "degraded" => "complete",
             _ => "abandoned",
         };
         assert_eq!(
@@ -7018,9 +7027,26 @@ fn fail_probe_terminal_mission_has_no_non_terminal_step_and_envelope_matches_dis
             phases.get(&short)
         );
     }
-    // p1 errored and p2's default chain was abandoned: neither is Complete.
+    // p1 errored with nothing else completing in it: Abandoned, unchanged
+    // by #2406 (the "nothing complete" case).
     assert_eq!(phases.get("p1").map(String::as_str), Some("abandoned"), "{phases:#?}");
-    assert_eq!(phases.get("p2").map(String::as_str), Some("abandoned"), "{phases:#?}");
+    // (#2406) p2's default `run_on` chain cascade-abandoned TWO steps, but
+    // TWO OTHER steps in the same phase completed for real
+    // (`s-chain-err`/`s-deliver` — see the envelope's own `payload.
+    // completed_steps`) — a genuine terminal mix. Before #2406 this read
+    // "abandoned" on disk, discarding the fact real work shipped; the
+    // envelope's own per-phase outcome is the more precise assertion (it
+    // must say `degraded`, not merely "not abandoned"), and the disk
+    // status is its lifecycle-terminal consequence.
+    let p2_outcome = envelope["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["phase_id"].as_str().unwrap().ends_with("-p2"))
+        .and_then(|p| p["outcome"].as_str())
+        .unwrap();
+    assert_eq!(p2_outcome, "degraded", "p2 has 2 complete + 2 abandoned steps — a mix, not a clean abandon");
+    assert_eq!(phases.get("p2").map(String::as_str), Some("complete"), "{phases:#?}");
 
     // …and the BOARD agrees. `mission status` reported "board is clean,
     // drift: []" through the whole S4-1/S4-2 class because every rule

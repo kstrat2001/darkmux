@@ -90,9 +90,16 @@ function MissionNode({ data }: NodeProps<MissionNodeData>) {
   );
 }
 
-function PhaseGroup({ data }: NodeProps<{ label: string; status: string; description?: string }>) {
+function PhaseGroup({
+  data,
+}: NodeProps<{ label: string; status: string; description?: string; statusNote?: string }>) {
+  // (#2406) The counts breakdown, when present, rides ahead of the
+  // description in the tooltip — it's the more actionable read on a
+  // running/degraded phase; the description (often a long dispatch brief)
+  // stays available right after it rather than being replaced.
+  const title = [data.statusNote, data.description].filter(Boolean).join(" — ");
   return (
-    <div className={`phasegroup s-${data.status || "planned"}`} title={data.description || ""}>
+    <div className={`phasegroup s-${data.status || "planned"}`} title={title}>
       <Handle type="target" id="phase-in" position={Position.Top} style={{ opacity: 0 }} />
       <Handle type="source" id="phase-out" position={Position.Bottom} style={{ opacity: 0 }} />
       <div className="pg-label">
@@ -122,7 +129,7 @@ function toRfNodes(
         type: "phaseGroup",
         position: { x: box.x, y: box.y },
         style: { width: box.w, height: box.h },
-        data: { label: n.label, status: n.status, description: n.description },
+        data: { label: n.label, status: n.status, description: n.description, statusNote: n.statusNote },
         draggable: false,
         selectable: false,
         zIndex: 0,

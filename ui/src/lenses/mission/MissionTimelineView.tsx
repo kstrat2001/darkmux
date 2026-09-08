@@ -117,7 +117,10 @@ export function MissionTimelineView({
             <span className="tlph-name" title={phase.description || phase.label}>
               {phase.label}
             </span>
-            <WorkStatus status={phase.status} className="tlph-tag" />
+            {/* (#2406) `title` is the counts breakdown ("7 complete · 1
+               errored · 4 running") for a running/degraded phase — absent
+               (undefined) for every other status, same as the field itself. */}
+            <WorkStatus status={phase.status} className="tlph-tag" title={phase.statusNote} />
           </div>
           <div className="tltasks">
             {tasks.length ? (

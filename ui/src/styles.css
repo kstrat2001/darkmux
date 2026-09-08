@@ -2073,6 +2073,13 @@ body {
 .wstatus.is-running { color: var(--accent); border-color: var(--accent); }
 .wstatus.is-done { color: var(--good); border-color: var(--good); }
 .wstatus.is-error { color: var(--bad); border-color: var(--bad); }
+/* (#2406) Same `--warn` token `.is-stopped` and `.fleet-strip--degraded`
+   already use for "a caution, not a failure" — a mixed terminal is a
+   caution, not a failure, same as an operator/budget stop. Reusing the
+   existing warn palette on purpose (no new color for an existing concept);
+   `degraded` stays its own KIND so the raw status word, not the color,
+   tells it apart from `stopped`. */
+.wstatus.is-degraded { color: var(--warn); border-color: var(--warn); }
 .wstatus.is-stopped { color: var(--warn); border-color: var(--warn); }
 .wstatus.is-idle { color: var(--dim); border-color: var(--border); }
 
@@ -5556,6 +5563,18 @@ body {
 .missionlens .phasegroup.s-error .pg-name {
   color: var(--bad);
 }
+/* (#2406) Mixed terminal — real output shipped, some of it did not. Same
+   `--warn` token the timeline/`WorkStatus` chip use for this concept
+   (see `.wstatus.is-degraded`'s own comment); full opacity and a solid
+   border, deliberately NOT the dashed/muted `.s-abandoned` treatment
+   below — a degraded phase produced real work and should not read as
+   de-emphasized the way a fully abandoned one does. */
+.missionlens .phasegroup.s-degraded {
+  border-color: var(--warn);
+}
+.missionlens .phasegroup.s-degraded .pg-name {
+  color: var(--warn);
+}
 .missionlens .phasegroup.s-abandoned {
   border-style: dashed;
   opacity: 0.6;
@@ -5852,6 +5871,11 @@ body {
 }
 .missionlens .tlphase.s-error .tlph-dot {
   background: var(--bad);
+}
+/* (#2406) Same reasoning as `.phasegroup.s-degraded` above: warn color,
+   full opacity — a degraded phase shipped real output. */
+.missionlens .tlphase.s-degraded .tlph-dot {
+  background: var(--warn);
 }
 .missionlens .tlphase.s-abandoned {
   opacity: 0.6;

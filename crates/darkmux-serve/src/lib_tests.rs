@@ -4932,6 +4932,89 @@
         assert_eq!(ids.len(), before, "duplicate edge ids in {edges:?}");
     }
 
+    /// (#2406) The issue's own exact live scenario, through the REAL
+    /// `/mission/:id/graph.json` route: one phase, 12 tasks — 7 complete, 1
+    /// errored, 4 still running. Before this fix, the phase-level rollup
+    /// reused `derive_task_status`'s "any Error wins" one level too high,
+    /// so this exact shape would have rendered the phase `error` while
+    /// eleven other units were doing real work (or `abandoned` once the
+    /// mission finalized). The fix: `running` (the phase is not over) with
+    /// the breakdown named in `statusNote`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_live_mixed_phase_renders_running_with_counts() {
+        let _guard = CrewDirGuard::new();
+        let mission_id = "mixed-2406";
+        let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
+        save_test_mission(&mission);
+        save_test_phase(&minimal_phase("p1", mission_id));
+
+        // 7 complete, 1 errored, 4 running — the issue's own numbers.
+        let mut task_statuses: Vec<(String, darkmux_crew::types::NodeStatus)> = Vec::new();
+        for i in 0..7 {
+            task_statuses.push((format!("unit-{i}"), darkmux_crew::types::NodeStatus::Complete));
+        }
+        task_statuses.push(("unit-7".to_string(), darkmux_crew::types::NodeStatus::Error));
+        for i in 8..12 {
+            task_statuses.push((format!("unit-{i}"), darkmux_crew::types::NodeStatus::Running));
+        }
+        for (task_id, status) in &task_statuses {
+            let step_id = format!("{task_id}-step");
+            let task = darkmux_crew::types::Task {
+                run_on: darkmux_crew::types::default_run_on(),
+                id: task_id.clone(),
+                phase_id: "p1".to_string(),
+                description: task_id.clone(),
+                display_name: None,
+                step_ids: vec![step_id.clone()],
+                depends_on: vec![],
+                reads: Vec::new(),
+                role_id: None,
+                profile_name: None,
+                workdir: None,
+                image: None,
+            };
+            darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
+            let step = darkmux_crew::types::Step {
+                id: step_id,
+                task_id: task_id.clone(),
+                gate: None,
+                kind: "procedural.noop".to_string(),
+                status: *status,
+                config: serde_json::Value::Null,
+                started_ts: Some(1),
+                completed_ts: if *status == darkmux_crew::types::NodeStatus::Complete { Some(2) } else { None },
+                output: None,
+            };
+            darkmux_crew::lifecycle::save_step(mission_id, "p1", &step).unwrap();
+        }
+
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mission/{mission_id}/graph.json"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let nodes = json["nodes"].as_array().unwrap();
+        let phase = nodes.iter().find(|n| n["id"] == "p1").unwrap_or_else(|| panic!("missing phase node p1: {nodes:?}"));
+        assert_eq!(
+            phase["status"], "running",
+            "1 errored + 7 complete + 4 running must NOT read `error` or `abandoned` — the phase isn't over: {phase:?}"
+        );
+        let note = phase["statusNote"].as_str().expect("statusNote present on a live mixed phase");
+        assert!(note.contains("7 complete"), "note: {note}");
+        assert!(note.contains("1 errored"), "note: {note}");
+        assert!(note.contains("4 running"), "note: {note}");
+    }
+
     /// (review-gate MF2a) The three production graph runners persist Step
     /// JSONs only AFTER `run_step_graph` returns — so a page opened DURING
     /// a run sees tasks whose `step_ids` name steps with no file on disk.

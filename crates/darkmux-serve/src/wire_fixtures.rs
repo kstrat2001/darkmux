@@ -139,6 +139,7 @@ mod tests {
                     depth: 0,
                     description: Some("Bundle, probe, dedup".to_string()),
                     steps: vec![],
+                    status_note: None,
                 },
                 GraphNode {
                     // (#1637) The adjudicate phase MUST exist: the contract
@@ -159,6 +160,7 @@ mod tests {
                     depth: 1,
                     description: None,
                     steps: vec![],
+                    status_note: None,
                 },
                 GraphNode {
                     id: "task-judge".to_string(),
@@ -230,6 +232,7 @@ mod tests {
                             model: None,
                         },
                     ],
+                    status_note: None,
                 },
             ],
             edges: vec![GraphEdge {

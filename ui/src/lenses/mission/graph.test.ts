@@ -161,6 +161,19 @@ describe("statusRank / keepPageStatus", () => {
     expect(statusRank("aborted")).toBe(statusRank("complete"));
   });
 
+  it("(#2406) degraded ranks as a real terminal, not unknown", () => {
+    // If this ever regressed to unranked, `isUnknownStatus("degraded")`
+    // would flip true and a live "phase complete" flow record would
+    // silently overwrite an already-rendered `degraded` phase back to
+    // `complete` on the very next SSE tick — see `STATUS_RANK`'s own
+    // comment for the full mechanism.
+    expect(statusRank("degraded")).toBe(statusRank("complete"));
+  });
+
+  it("(#2406) a held degraded status survives an incoming complete record — the live-regression case", () => {
+    expect(keepPageStatus("degraded", "complete")).toBe(true);
+  });
+
   it("normalizes the pre-rename 'closed' spelling to 'finalized'", () => {
     expect(normalizeMissionStatus("closed")).toBe("finalized");
     expect(normalizeMissionStatus("finalized")).toBe("finalized");
