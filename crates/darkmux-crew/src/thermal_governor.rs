@@ -297,26 +297,103 @@ pub fn stop_file_unresolved_reason(record_context: Option<&serde_json::Value>) -
     }
 }
 
-/// **Known, unfixed gap (#2157 audit):** `stop_file`'s NAME is validated
-/// (see [`valid_crawl_manifest_name`]), but this function does not verify
-/// its final PATH component before writing. If `<root>/crawl/<name>`
-/// already exists as a symlink to somewhere else — planted by anything
-/// with write access to `<root>/crawl/` before the breaker ever fires —
-/// `create_dir_all` follows it and the fixed `thermal-critical\n` content
-/// lands wherever the symlink points, not under `<root>/crawl/`.
-/// Reachability requires local write access to `<root>/crawl/` already,
-/// which is a strictly stronger position than the unvalidated-name bug
-/// this module fixes for #2157 (that one is reachable from a plain crawl
-/// manifest name/`record_context` value, no filesystem write access
-/// needed at all). Left unfixed here because it doesn't fall out of the
-/// name-validation fix — closing it needs a pre-write check (e.g.
-/// `symlink_metadata` on `stop_file` and its parent, refusing a symlink)
-/// that this function doesn't have today.
-fn write_stop_file(stop_file: &Path, owner: Option<&str>) {
-    if let Some(parent) = stop_file.parent() {
-        let _ = std::fs::create_dir_all(parent);
+/// (#2456) The two DISTINCT situations that both mean "the breaker tripped
+/// and could not stop the crawl". They reach the operator through the SAME
+/// `thermal.stop_unresolved` warning — the urgency is the same, a crawl may
+/// keep dispatching units past a tripped breaker — but the REMEDIES are
+/// different, so the record names which one it is rather than leaving an
+/// operator to string-match prose out of `reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopUnresolvedCause {
+    /// No trustworthy STOP path could be DERIVED at all — see
+    /// [`stop_file_unresolved_reason`]. The breaker never writes one at a
+    /// guessed path. Operator remedy: fix the crawl's `record_context`
+    /// (`workspace` missing, empty, or not a single valid path segment)
+    /// — a configuration/caller problem.
+    PathUnderivable,
+    /// A path WAS derived, but the write was REFUSED (#2456) — something
+    /// is already sitting at the STOP path or its parent as a symlink, or
+    /// the write failed outright. Operator remedy: go LOOK at
+    /// `<root>/crawl/<name>/` — a symlink there is a filesystem-state
+    /// finding, not a config typo, and is the exact hazard #2456 closed.
+    WriteRefused,
+}
+
+impl StopUnresolvedCause {
+    /// The stable value carried in the record's `cause` field. Stable
+    /// because a downstream reader keys on it — see the
+    /// `thermal.stop_unresolved` entry in `darkmux-flow`'s schema history.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PathUnderivable => "path_underivable",
+            Self::WriteRefused => "write_refused",
+        }
     }
-    let _ = std::fs::write(stop_file, stop_file_body(owner));
+}
+
+/// (#2456) Decide which — if either — of [`StopUnresolvedCause`]'s two
+/// situations a just-tripped breaker is in, and with what reason text.
+///
+/// Extracted as a pure function rather than left inline at the one call
+/// site (`dispatch_internal.rs`'s telemetry sampler) precisely so it is
+/// TESTABLE: the sampler runs on its own thread inside a live dispatch and
+/// is not reachable from a unit test, so an inline version of this
+/// selection was — measurably — pinned by nothing at all.
+///
+/// `None` means the breaker either wrote its STOP successfully or this
+/// dispatch was never crawl-shaped; there is nothing to warn about.
+pub fn stop_unresolved_cause<'a>(
+    stop_path: Option<&Path>,
+    derivation_reason: Option<&'a str>,
+    write_error: Option<&'a str>,
+) -> Option<(StopUnresolvedCause, &'a str)> {
+    match stop_path {
+        // No path was derived — the only thing that can be wrong is the
+        // derivation, and `stop_file_unresolved_reason` already decided
+        // whether that is worth warning about (a non-crawl dispatch is
+        // not).
+        None => derivation_reason.map(|r| (StopUnresolvedCause::PathUnderivable, r)),
+        // A path WAS derived, so derivation is not the story; the only
+        // remaining failure is the write itself.
+        Some(_) => write_error.map(|e| (StopUnresolvedCause::WriteRefused, e)),
+    }
+}
+
+/// **Fixed (#2456, filed out of the #2157 audit):** `stop_file`'s NAME is
+/// validated (see [`valid_crawl_manifest_name`]), but until this fix
+/// nothing verified its final PATH component before writing. If
+/// `<root>/crawl/<name>` already existed as a symlink to somewhere else —
+/// planted by anything with write access to `<root>/crawl/` before the
+/// breaker ever fired — `create_dir_all` followed it and the fixed
+/// `thermal-critical\n` content landed wherever the symlink pointed, not
+/// under `<root>/crawl/`. Reachability requires local write access to
+/// `<root>/crawl/` already, which is a strictly stronger position than the
+/// unvalidated-name bug this module fixes for #2157 (that one is reachable
+/// from a plain crawl manifest name/`record_context` value, no filesystem
+/// write access needed at all). Did not fall out of the name-validation
+/// fix because that one is string validation and this one is a
+/// filesystem-state check.
+///
+/// The remedy is `crate::exclusive_fs::write_file_refusing_symlinks_0600`
+/// — see its own doc for the full reasoning (why this can't just be
+/// `create_new` at the final path: a LATER mission's own breaker trip
+/// legitimately re-stamps an existing STOP file over an older one, per
+/// [`stop_file_body`]'s doc, so "must not already exist" is the wrong
+/// shape here; "must not already be a symlink" is the right one).
+///
+/// Fire-and-forget by necessity — this is the breaker's LAST ACTION under
+/// thermal duress and must never panic or block — but NOT silent on
+/// refusal: the `Err`, when there is one, is captured by every call site
+/// into `self.last_stop_write_error` so the caller
+/// (`dispatch_internal.rs`) can turn a refusal into a loud
+/// `thermal.stop_unresolved` warning rather than let the crawl keep
+/// dispatching units past a tripped breaker with no trace of why the STOP
+/// never landed. See [`ThermalGovernor::last_stop_write_error`]'s own doc.
+fn write_stop_file(stop_file: &Path, owner: Option<&str>) -> Result<(), String> {
+    crate::exclusive_fs::write_file_refusing_symlinks_0600(
+        stop_file,
+        stop_file_body(owner).as_bytes(),
+    )
 }
 
 /// (#2454) The STOP file's one line: the reason, plus — when the breaker
@@ -514,6 +591,20 @@ pub struct ThermalGovernor {
     /// path never derives a STOP path today anyway, since the derivation
     /// requires the crawl `record_context` a mission-run unit stamps.
     stop_owner: Option<String>,
+    /// (#2456) The reason the most recent STOP-file write attempt was
+    /// refused, if it was. `None` after a successful write, or when no
+    /// STOP write has been attempted yet. `write_stop_file`'s call is
+    /// fire-and-forget BY NECESSITY — it is the breaker's LAST ACTION
+    /// under thermal duress and must never panic or block — but a
+    /// refusal must not be SILENT, so this field is how the caller
+    /// (`dispatch_internal.rs`) learns of it: it polls
+    /// [`ThermalGovernor::last_stop_write_error`] right after a `Breaker`
+    /// event and, if `Some`, emits the SAME `thermal.stop_unresolved`
+    /// warning shape `stop_file_unresolved_reason` already produces for
+    /// the "path couldn't even be derived" case — from the operator's
+    /// point of view both are "the breaker tried and could not stop the
+    /// crawl," and deserve the same visibility.
+    last_stop_write_error: Option<String>,
 }
 
 impl ThermalGovernor {
@@ -529,7 +620,13 @@ impl ThermalGovernor {
             last_stamp_instant: Instant::now(),
             last_stamp_wall: SystemTime::now(),
             stop_owner: None,
+            last_stop_write_error: None,
         }
+    }
+
+    /// (#2456) See the field's own doc.
+    pub fn last_stop_write_error(&self) -> Option<&str> {
+        self.last_stop_write_error.as_deref()
     }
 
     /// (#2454) Name the mission whose run this governor is pacing. Builder
@@ -648,7 +745,8 @@ impl ThermalGovernor {
                         self.mark_stamped();
                         write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
                         if let Some(stop) = stop_file {
-                            write_stop_file(stop, self.stop_owner.as_deref());
+                            self.last_stop_write_error =
+                                write_stop_file(stop, self.stop_owner.as_deref()).err();
                         }
                         return Some(ThermalEvent::Breaker {
                             state: self.last_known_state.clone(),
@@ -681,7 +779,7 @@ impl ThermalGovernor {
             self.mark_stamped();
             write_pace_file(host_out, true, "thermal-critical", &thermal.state);
             if let Some(stop) = stop_file {
-                write_stop_file(stop, self.stop_owner.as_deref());
+                self.last_stop_write_error = write_stop_file(stop, self.stop_owner.as_deref()).err();
             }
             return Some(ThermalEvent::Breaker { state: thermal.state.clone() });
         }
@@ -730,7 +828,7 @@ impl ThermalGovernor {
                     self.mark_stamped();
                     write_pace_file(host_out, true, "thermal-critical", &thermal.state);
                     if let Some(stop) = stop_file {
-                        write_stop_file(stop, self.stop_owner.as_deref());
+                        self.last_stop_write_error = write_stop_file(stop, self.stop_owner.as_deref()).err();
                     }
                     return Some(ThermalEvent::Breaker { state: thermal.state.clone() });
                 }
@@ -925,6 +1023,170 @@ mod tests {
         assert_eq!(stop_file_body(Some("   ")), "thermal-critical\n");
         assert_eq!(stop_file_owner("thermal-critical mission=\n"), None);
         assert_eq!(stop_file_owner("thermal-critical mission=m-9\n"), Some("m-9"));
+    }
+
+    // ── #2456: the breaker's STOP write refuses a pre-planted symlink ──
+
+    /// (#2456) The record's `cause` must tell the two situations apart.
+    /// They share one action and one urgency but NOT one remedy: a
+    /// `path_underivable` is a crawl `record_context` bug, a
+    /// `write_refused` means something is sitting at the STOP path on
+    /// disk. An operator filtering the flow stream must not have to
+    /// string-match prose out of `reason` to know which they have.
+    #[test]
+    fn the_two_stop_unresolved_situations_are_distinguishable_in_the_record() {
+        let path = PathBuf::from("/tmp/does-not-matter/STOP");
+
+        // No path derived, derivation had a reason to complain.
+        assert_eq!(
+            stop_unresolved_cause(None, Some("workspace missing"), None),
+            Some((StopUnresolvedCause::PathUnderivable, "workspace missing"))
+        );
+
+        // A path WAS derived and the write was refused — a DIFFERENT
+        // cause, not the derivation one.
+        assert_eq!(
+            stop_unresolved_cause(Some(&path), None, Some("refusing to write ... symlink")),
+            Some((StopUnresolvedCause::WriteRefused, "refusing to write ... symlink"))
+        );
+
+        // The two `cause` strings are distinct and stable — a reader keys
+        // on these, so a rename is a record-contract change.
+        assert_eq!(StopUnresolvedCause::PathUnderivable.as_str(), "path_underivable");
+        assert_eq!(StopUnresolvedCause::WriteRefused.as_str(), "write_refused");
+        assert_ne!(
+            StopUnresolvedCause::PathUnderivable.as_str(),
+            StopUnresolvedCause::WriteRefused.as_str()
+        );
+    }
+
+    /// (#2456) The quiet cases: nothing to warn about. A successful write
+    /// under a derived path, and a non-crawl dispatch (no derived path AND
+    /// no derivation complaint) must BOTH stay silent — a warning on every
+    /// non-crawl breaker trip would bury the real ones.
+    #[test]
+    fn a_successful_or_non_crawl_stop_write_warns_about_nothing() {
+        let path = PathBuf::from("/tmp/does-not-matter/STOP");
+        assert_eq!(stop_unresolved_cause(Some(&path), None, None), None);
+        assert_eq!(stop_unresolved_cause(None, None, None), None);
+        // A stale derivation reason must NOT be reported once a path was
+        // in fact derived, and a stale write error must not be reported
+        // when no path was derived — each cause reads only the input that
+        // belongs to its own branch.
+        assert_eq!(stop_unresolved_cause(Some(&path), Some("stale"), None), None);
+        assert_eq!(stop_unresolved_cause(None, None, Some("stale")), None);
+    }
+
+    /// (#2456) `<root>/crawl/<name>` — the STOP file's PARENT — planted as
+    /// a symlink before the breaker ever trips must not redirect the
+    /// write to wherever it points. This is the exact hazard named in the
+    /// issue title.
+    #[test]
+    fn breaker_does_not_follow_a_symlinked_stop_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_target = dir.path().join("attacker-owned-dir");
+        std::fs::create_dir_all(&real_target).unwrap();
+        let crawl_dir = dir.path().join("crawl-root");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &crawl_dir).unwrap();
+        let stop = crawl_dir.join("STOP");
+
+        let mut gov = ThermalGovernor::new(cfg()).owned_by(Some("crawl-m-1"));
+        let ev = gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, Some(ThermalEvent::Breaker { state: "critical".to_string() }));
+
+        assert!(
+            !real_target.join("STOP").exists(),
+            "must refuse the symlinked parent, never write through it onto the real target"
+        );
+        let err = gov
+            .last_stop_write_error()
+            .expect("a symlinked parent must be a LOUD refusal, not a silent no-op");
+        assert!(err.contains("symlink"), "unexpected error: {err}");
+    }
+
+    /// (#2456) The STOP file's own path planted directly as a symlink
+    /// (parent is a real directory; only the leaf name is hijacked) must
+    /// also refuse rather than write through it.
+    #[test]
+    fn breaker_does_not_follow_a_symlinked_stop_file_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let crawl_dir = dir.path().join("crawl-root");
+        std::fs::create_dir_all(&crawl_dir).unwrap();
+        let attacker_file = dir.path().join("attacker-owned-file");
+        std::fs::write(&attacker_file, b"pre-existing\n").unwrap();
+        let stop = crawl_dir.join("STOP");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&attacker_file, &stop).unwrap();
+
+        let mut gov = ThermalGovernor::new(cfg()).owned_by(Some("crawl-m-1"));
+        let ev = gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, Some(ThermalEvent::Breaker { state: "critical".to_string() }));
+
+        assert_eq!(
+            std::fs::read_to_string(&attacker_file).unwrap(),
+            "pre-existing\n",
+            "must never write through a symlink planted at the STOP path itself"
+        );
+        let err = gov
+            .last_stop_write_error()
+            .expect("a symlinked STOP path must be a LOUD refusal, not a silent replace");
+        assert!(err.contains("symlink"), "unexpected error: {err}");
+    }
+
+    /// (#2456) A refusal must not be silent: the breaker's write is its
+    /// LAST ACTION under thermal duress, so the caller
+    /// (`dispatch_internal.rs`) needs a way to know it tried and could
+    /// not, in order to warn rather than let the crawl keep dispatching
+    /// units past a tripped breaker with no trace of why the STOP never
+    /// landed.
+    #[test]
+    fn a_refused_stop_write_is_surfaced_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_target = dir.path().join("attacker-owned-dir");
+        std::fs::create_dir_all(&real_target).unwrap();
+        let crawl_dir = dir.path().join("crawl-root");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &crawl_dir).unwrap();
+        let stop = crawl_dir.join("STOP");
+
+        let mut gov = ThermalGovernor::new(cfg()).owned_by(Some("crawl-m-1"));
+        assert_eq!(gov.last_stop_write_error(), None, "nothing attempted yet");
+        gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        let err = gov.last_stop_write_error().expect("a refused write must be surfaced, not silent");
+        assert!(err.contains("symlink"), "unexpected error: {err}");
+    }
+
+    /// (#2456) The ordinary, no-symlink path must be unaffected: the
+    /// breaker still writes a real STOP file when nothing is in the way,
+    /// and a later mission's trip on the SAME workspace still overwrites
+    /// it cleanly (the load-bearing re-stamp `stop_file_body` documents —
+    /// nothing ever deletes this file).
+    #[test]
+    fn ordinary_stop_write_still_works_and_a_later_mission_can_overwrite_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("crawl-root").join("STOP");
+
+        let mut gov_a = ThermalGovernor::new(cfg()).owned_by(Some("crawl-m-1"));
+        gov_a.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(gov_a.last_stop_write_error(), None);
+        assert_eq!(stop_hold_for_mission(&stop, "crawl-m-1"), Some(StopHold::ThisMission));
+
+        // #2454's reader still works against the new writer, and a
+        // second mission's own trip re-stamps the SAME file cleanly.
+        let mut gov_b = ThermalGovernor::new(cfg()).owned_by(Some("crawl-m-2"));
+        gov_b.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(gov_b.last_stop_write_error(), None);
+        assert_eq!(
+            stop_hold_for_mission(&stop, "crawl-m-2"),
+            Some(StopHold::ThisMission),
+            "a later mission's own trip must be able to re-stamp the file"
+        );
+        assert_eq!(
+            stop_hold_for_mission(&stop, "crawl-m-1"),
+            None,
+            "the old owner must no longer be held by the re-stamped file"
+        );
     }
 
     #[test]

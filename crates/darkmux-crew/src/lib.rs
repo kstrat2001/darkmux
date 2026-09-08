@@ -36,6 +36,11 @@ pub mod dispatch;
 // uses, so its residency participates in the #1487 lease/reconcile regime.
 pub mod dispatch_as_crew_of_one;
 pub mod dispatch_internal;
+// (#2158 / #2456) Symlink-immune, TOCTOU-immune filesystem primitives
+// shared by `dispatch_internal`'s out-dir creation and
+// `thermal_governor`'s STOP-file write — crate-internal only, not part of
+// this crate's public API.
+mod exclusive_fs;
 // (#1684 Packet 2) The operator sign-off gate — `gate: "operator"` on a
 // mission-config step (schema 2.2), the mechanism behind gated panel verbs
 // like `pr-merge`/`pr-approve`. `GateDecision`/`GateHandler`/`resolve_gate`

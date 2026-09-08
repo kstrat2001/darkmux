@@ -840,6 +840,26 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.42.0";
 //               1.38.0 is days old, unreleased, and had no consumers
 //               outside this repo.
 //
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2456 widens
+//           `thermal.stop_unresolved` (documented under 1.28.x below) to
+//           cover a SECOND situation and adds a key that tells the two
+//           apart. The action previously fired only when the STOP path
+//           could not be DERIVED; it now also fires when a path WAS
+//           derived but the WRITE was refused — the breaker refuses to
+//           write through a symlink planted at the STOP path or its
+//           parent. Both mean "a crawl may keep dispatching units past a
+//           tripped breaker", which is why they share one action and one
+//           `Level::Warn`, but their remedies differ sharply (a
+//           `record_context` bug vs a filesystem-state finding an
+//           operator should go LOOK at), so the payload gains `cause`:
+//           `"path_underivable"` | `"write_refused"`. `reason` keeps its
+//           free-prose role but is no longer only "why derivation failed"
+//           — read `cause` first. Additive key on an existing free-form
+//           payload under the same rule as the 1.28.x entry that
+//           introduced the action; no struct change, no version bump.
+//           Producer: `darkmux_crew::thermal_governor::
+//           stop_unresolved_cause`, consumed at the one emission site in
+//           `dispatch_internal::run_telemetry_sampler`.
 //   1.42.0 (#2413): `telemetry.process` RETIRED, full stop — no producer
 //           writes it at this version. `dispatch_internal::
 //           run_telemetry_sampler` (the per-dispatch, 2s-cadence
