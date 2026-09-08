@@ -19,6 +19,7 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
 export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { runRegions } from "../session/sessionRun";
+import type { BriefEntry } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
 
 /**
@@ -49,6 +50,60 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  * `pillLabel` (pre-uppercased, golden-pinned). */
 function pillStatusWord(cls: "run" | "err" | "done" | "canceled"): string {
   return cls === "run" ? "running" : cls === "err" ? "error" : cls === "done" ? "complete" : "canceled";
+}
+
+/** (#2000) `.brief-grid`'s `repeat(auto-fit, minmax(240px, 1fr))` resolves
+ *  to an odd column count at common desktop widths (measured: 3 at
+ *  1280/1440px — see `styles.css`'s own comment on `.track.brief-grid`).
+ *  With row-major auto-flow and each `BriefEntry` as its OWN grid item, an
+ *  odd column count means every row starts on the opposite parity from the
+ *  last, so a label and its value straddle the column boundary and the
+ *  brief renders wrong facts (`model` reading a filesystem path — see the
+ *  issue's own reproduction).
+ *
+ *  The fix: give `sessionRun.ts`'s `pushKv` label/value pairs a SINGLE grid
+ *  item to sit in, so a pair can never be split across a row boundary no
+ *  matter the column count. Grouped here (view layer) rather than in
+ *  `sessionRun.ts` (pure logic layer) because the grouping is a rendering
+ *  concern, not a data concern — `BriefEntry[]`'s flat shape is what
+ *  `sessionRun.test.ts`'s pure-logic assertions and the golden's `innerText`
+ *  read already pin, and both stay valid unchanged: each entry still renders
+ *  as its own block element, in the same order, just inside one extra
+ *  wrapper per pair. `pushKv` (`sessionRun.ts`) always emits `label` then
+ *  `value` together or neither — so every `"label"` is immediately followed
+ *  by a `"value"` in practice — but a defensive fallback keeps a stray
+ *  unpaired entry (a `"label"` with no following `"value"`, or a `"note"`)
+ *  rendering exactly as before, alone in its own grid item. */
+type BriefGroup =
+  | { kind: "pair"; key: number; label: BriefEntry; value: BriefEntry }
+  | { kind: "single"; key: number; entry: BriefEntry };
+
+function groupBriefEntries(entries: BriefEntry[]): BriefGroup[] {
+  const groups: BriefGroup[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const next = entries[i + 1];
+    if (entry.kind === "label" && next?.kind === "value") {
+      groups.push({ kind: "pair", key: i, label: entry, value: next });
+      i++; // consumed the value too
+    } else {
+      groups.push({ kind: "single", key: i, entry });
+    }
+  }
+  return groups;
+}
+
+function BriefEntryContent({ entry }: { entry: BriefEntry }) {
+  return entry.href ? (
+    // A real anchor, so it is keyboard-reachable and middle-clickable like
+    // any other link. Same text either way — the golden reads `innerText`,
+    // which an <a> does not change.
+    <a className="brief-link" href={entry.href}>
+      {entry.text}
+    </a>
+  ) : (
+    <>{entry.text}</>
+  );
 }
 
 export function SessionReplay({ sessionId, playhead = null }: { sessionId: string; playhead?: number | null }) {
@@ -249,25 +304,29 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
 
       {view.briefLines.length > 0 && (
         <div className="track brief-grid">
-          {/* One block element per entry, same order and same text as before —
-              `goldens/session-task-list.txt` pins label and value as separate
-              lines, so the DOM shape is deliberately unchanged. The class is
-              the only addition, and it is what lets a LABEL stop looking like
-              a VALUE. */}
-          {view.briefLines.map((entry, i) => (
-            <div key={i} className={`brief-${entry.kind}`}>
-              {entry.href ? (
-                // A real anchor, so it is keyboard-reachable and middle-clickable
-                // like any other link. Same text either way — the golden reads
-                // `innerText`, which an <a> does not change.
-                <a className="brief-link" href={entry.href}>
-                  {entry.text}
-                </a>
-              ) : (
-                entry.text
-              )}
-            </div>
-          ))}
+          {/* (#2000) A label+value PAIR is now one grid item (`.brief-pair`),
+              so a pair can never straddle a column boundary regardless of how
+              many columns `.brief-grid` resolves to — see `groupBriefEntries`'s
+              own doc above for the mechanism this fixes. Each entry still
+              renders as its own block element, in the same order and with the
+              same text as before — `goldens/session-task-list.txt` (which
+              reads `innerText`) is unaffected by an extra wrapper `<div>`. */}
+          {groupBriefEntries(view.briefLines).map((group) =>
+            group.kind === "pair" ? (
+              <div key={group.key} className="brief-pair">
+                <div className={`brief-${group.label.kind}`}>
+                  <BriefEntryContent entry={group.label} />
+                </div>
+                <div className={`brief-${group.value.kind}`}>
+                  <BriefEntryContent entry={group.value} />
+                </div>
+              </div>
+            ) : (
+              <div key={group.key} className={`brief-${group.entry.kind}`}>
+                <BriefEntryContent entry={group.entry} />
+              </div>
+            ),
+          )}
         </div>
       )}
 

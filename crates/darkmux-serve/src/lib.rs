@@ -1922,6 +1922,31 @@ pub(crate) struct LabRunSummary {
     pub(crate) lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
     pub(crate) has_funnels: bool,
     pub(crate) has_events: bool,
+    /// (#1982) The session_id the run's OWN inner dispatch used, read back
+    /// from `manifest.json`. Exists so `runs::build_runs` can claim this
+    /// session the same way `collect_mission_step_sessions` claims a
+    /// mission's own step sessions — an absent value claims nothing and the
+    /// ghost persists, which is the honest degradation.
+    ///
+    /// SCOPE, stated exactly, because the field is easy to over-read as "a
+    /// lab run now always folds into one row". It carries a session that
+    /// actually MATCHES the run's own dispatch bookends for a COMPLETED
+    /// `coding-task` / `prompt` run, and only those:
+    ///
+    /// - Those two providers write the verbatim string passed to
+    ///   `crew::dispatch::dispatch`, so the claim matches a real bookend.
+    /// - `manifest.json` is written at run END (`lifecycle.json` at run
+    ///   start), so for a run's whole DURATION there is nothing here to
+    ///   claim and the duplicate row persists — the producer-side gap filed
+    ///   as #2511, not something this reader can fix.
+    /// - `tool-bench` writes a `session_id` it never dispatched under (it
+    ///   mints a fresh one at manifest-write time; its real per-trial
+    ///   sessions carry the task/trial suffixes), so its claim matches no
+    ///   bookend and its ghosts persist too.
+    /// - `None` besides those: a pre-#1982 artifact, a provider that writes
+    ///   no manifest, or a manifest caught mid-write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
 }
 
 /// GET /lab/runs — every run cluster under the lab observer's scan root,
@@ -2136,6 +2161,23 @@ fn build_lab_run_summary(
 
     case_ids.sort();
 
+    // (#1982) `coding-task` and `prompt` write `manifest.json` at run END
+    // carrying the EXACT session_id string they passed to
+    // `crew::dispatch::dispatch` — see the `LabRunSummary::session_id` field
+    // doc for the full scope (which providers, and the two cases where a
+    // duplicate row still persists) and `runs::build_runs` for why claiming
+    // it matters. Best-effort and deliberately silent: a missing/malformed
+    // manifest (a provider that writes no manifest at all, one caught
+    // mid-write, or a `session_id` that is not a string) leaves this `None`,
+    // the same lenient-on-read posture as every other optional field above.
+    // `None` must stay a NON-claim — never a fallback to the run id or to
+    // any other guessable string, or the claim would swallow whichever
+    // unrelated session happened to match it.
+    let session_id = std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string));
+
     Some(LabRunSummary {
         dir: rel,
         mtime_ms,
@@ -2158,6 +2200,7 @@ fn build_lab_run_summary(
         lifecycle_status: darkmux_lab::lab::lifecycle::read(dir).map(|r| r.status),
         has_funnels,
         has_events,
+        session_id,
     })
 }
 
