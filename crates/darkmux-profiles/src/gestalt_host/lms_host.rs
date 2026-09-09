@@ -405,6 +405,25 @@ pub(crate) fn run_bounded(
     deadline: Deadline,
     stdout_mode: StdoutMode,
 ) -> Result<BoundedRun, HostError> {
+    // (#1863) Every caller through this chokepoint inherits the daemon's cwd
+    // by default. This project's own workflow is git worktrees that get
+    // removed — routinely, mid-session — and a daemon started from one keeps
+    // that now-deleted directory as its cwd for the rest of its life.
+    // Live-verified mechanism: `Command::spawn()` itself does NOT fail when
+    // the inherited cwd is gone (fork/exec doesn't need to resolve it) — the
+    // crash is inside the CHILD. `lms` is a Node CLI, and Node crashes hard
+    // reading its own `process.cwd()` at startup (`node -e 'process.cwd()'`
+    // from a deleted cwd exits 1: "ENOENT: process.cwd failed ... the current
+    // working directory was likely removed" — the exact shape the machine
+    // page reported), even though `lms` never reads or writes anything
+    // relative to cwd itself — it only talks to LMStudio's local socket. Pin
+    // to `/`: it needs no resolution (no `dirs::home_dir()` call that could
+    // return `None`, no darkmux-root lookup that could itself be
+    // cwd-sensitive via the project-local `./.darkmux` preference in
+    // `paths::resolve`), and it is guaranteed to exist for the whole life of
+    // the process on every POSIX target this project ships (Windows is not a
+    // build target — see CLAUDE.md).
+    cmd.current_dir("/");
     cmd.stdin(Stdio::null());
     cmd.stdout(match stdout_mode {
         StdoutMode::Null => Stdio::null(),
@@ -1157,6 +1176,48 @@ esac"#,
         let HostError::CommandFailed { detail } = err else { panic!("expected CommandFailed, got {err:?}") };
         assert!(detail.contains("was not found"), "{detail}");
         assert!(!detail.contains("LM Studio"), "{detail}");
+    }
+
+    /// (#1863) The daemon's whole workflow is git worktrees that get
+    /// removed — routinely, mid-session. If the daemon (or a dispatch) was
+    /// started from one, its cwd is now a directory that no longer exists.
+    /// Real `lms` is a Node CLI, and Node crashes hard trying to read its own
+    /// `process.cwd()` at startup when the inherited cwd is gone (live-
+    /// verified: `node -e 'process.cwd()'` from a deleted cwd exits 1 with
+    /// "ENOENT: process.cwd failed ... the current working directory was
+    /// likely removed" — the exact shape the machine page reported). The stub
+    /// below reproduces the same shape with `sh -e` + `pwd` rather than
+    /// requiring Node in the test environment.
+    ///
+    /// Mutates the process-wide cwd — `#[serial_test::serial]` (default
+    /// key, the same one `profiles::darkmux_config_empty_falls_through`
+    /// uses, so the two coordinate rather than race).
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[test]
+    fn run_bounded_survives_a_deleted_cwd() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let stub = write_stub(scratch.path(), "set -e\npwd >/dev/null\necho ok");
+
+        let victim = tempfile::TempDir::new().unwrap();
+        let victim_path = victim.path().to_path_buf();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&victim_path).unwrap();
+        // Delete the directory out from under the process while it's still
+        // the cwd — exactly what `worktree remove` does to a daemon that
+        // was started from inside the worktree.
+        std::fs::remove_dir(&victim_path).unwrap();
+
+        let cmd = Command::new(&stub);
+        let result = run_bounded(cmd, "test-cwd", Deadline(Duration::from_secs(5)), StdoutMode::Capture);
+
+        // Restore before asserting: a failed assertion must not leave the
+        // whole test binary running from a directory that no longer exists.
+        std::env::set_current_dir(&prev_cwd).unwrap();
+
+        let run = result.expect("run_bounded must pin a cwd that survives the caller's deleted one");
+        assert!(run.status.success(), "stub failed: {}", run.stderr);
+        assert!(run.stdout.contains("ok"), "stdout={:?} stderr={:?}", run.stdout, run.stderr);
     }
 }
 

@@ -244,6 +244,12 @@ pub fn load_with_identifier(
         "--identifier",
         identifier,
     ]);
+    // (#1863) This spawn bypasses `run_bounded`'s chokepoint fix (see that
+    // function's comment) by construction — it needs bespoke stdio handling
+    // for the load spinner — so it needs its own cwd pin. Same directory,
+    // same reasoning: `lms` never reads or writes relative to cwd, and `/`
+    // is guaranteed to exist for the process's whole life.
+    cmd.current_dir("/");
     if quiet {
         // (#1135) `quiet` must actually SUPPRESS. `Command` inherits the
         // parent's stdio by default, so merely *not* setting it left the

@@ -118,7 +118,15 @@ impl MachineFingerprint {
     /// fingerprinting.
     pub fn detect(machine_id: &str) -> Self {
         let hw = darkmux_hardware::detect();
+        // (#1863) A lab run is routinely launched from a git worktree that
+        // gets removed later in the same session — if that worktree was the
+        // process's cwd, both spawns below would otherwise inherit a
+        // now-deleted directory and fail outright rather than degrade to
+        // `None`. Neither `sw_vers` nor `lms` reads or writes relative to
+        // cwd, so pin both to `/`: guaranteed to exist for the process's
+        // whole life, no resolution needed.
         let os_version = std::process::Command::new("sw_vers")
+            .current_dir("/")
             .arg("-productVersion")
             .output()
             .ok()
@@ -129,6 +137,7 @@ impl MachineFingerprint {
         // bare `lms version` emits a multi-line ANSI-art banner, which the
         // first tool-bench live run stored verbatim as the fingerprint.
         let engine_version = std::process::Command::new("lms")
+            .current_dir("/")
             .arg("--version")
             .output()
             .ok()
