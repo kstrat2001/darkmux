@@ -1,0 +1,12 @@
+# (#2599) Forbid constructing `httpmock::MockServer` directly anywhere in
+# this crate except `test_support.rs`, where `GuardedMockServer` wraps it.
+#
+# A bare `MockServer` compiles, runs, and passes green even when a mock it
+# registers is silently shadowed (httpmock's first-registered-wins semantics
+# — see `test_support.rs`'s module doc) — nothing about the type signature
+# tells you a guard is missing. `GuardedMockServer` is adopted at all 94
+# call sites today; this lint is what keeps that true after today, since
+# "everyone happens to use the wrapper" is not itself enforceable.
+disallowed-types = [
+    { path = "httpmock::MockServer", reason = "construct crate::test_support::GuardedMockServer::start() instead — a bare MockServer bypasses the #2599 shadowed-mock guard. See test_support.rs's module doc." },
+]

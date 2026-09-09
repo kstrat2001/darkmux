@@ -4972,6 +4972,19 @@ mod tests {
     /// `assistant_messages_in_history_never_carry_reasoning_content` does
     /// (a `read` call on `/workspace/x.txt`), known to round-trip cleanly
     /// with no Docker/real LMStudio involved.
+    ///
+    /// `#[track_caller]` (#2599): this helper has 3 callers, and without
+    /// it every unhit-mock panic from `GuardedMockServer`'s Drop check
+    /// would name the SAME line inside this function for all 3 — the
+    /// `#[track_caller]` on `GuardedMockServer::register` only propagates
+    /// through a chain of `#[track_caller]` functions, so an un-annotated
+    /// intermediate like this one used to stop that propagation cold.
+    /// With it, a shadowed mock this helper registers is attributed to
+    /// whichever TEST called it, not to this function's own body — see
+    /// `test_support::self_tests::
+    /// a_helper_marked_track_caller_reports_the_calling_tests_own_line`
+    /// for the two-callers-report-distinct-lines proof.
+    #[track_caller]
     fn register_three_turn_tool_then_stop_script(server: &crate::test_support::GuardedMockServer) {
         use httpmock::prelude::*;
         let tool_calls = serde_json::json!([{
@@ -5345,25 +5358,29 @@ mod tests {
         // starts directly at the request a fresh dispatch would send as
         // its THIRD call.
         let tc1 = tool_calls.clone();
-        // `mock_expect_zero` (#2599): the whole point of these two mocks is
-        // that a resumed dispatch must NEVER hit them — `assert_hits(0)`
-        // below already pins that explicitly; this declares the zero
-        // legitimate to `GuardedMockServer`'s own drop-time check too.
-        let turn1_mock = server.mock_expect_zero(move |when, then| {
-            when.method(POST).path("/v1/chat/completions").matches(|req| {
-                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
-                b.matches("\"role\":\"tool\"").count() == 0
-            });
-            then.status(200).json_body(chat_response_json(None, Some(tc1.clone()), "tool_calls", 100, 20));
-        });
+        let turn1_mock = server.mock_expect_zero(
+            "a resumed dispatch must NEVER hit turn 1 again — assert_hits(0) below already \
+             pins this; this declares the zero legitimate to GuardedMockServer too",
+            move |when, then| {
+                when.method(POST).path("/v1/chat/completions").matches(|req| {
+                    let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                    b.matches("\"role\":\"tool\"").count() == 0
+                });
+                then.status(200).json_body(chat_response_json(None, Some(tc1.clone()), "tool_calls", 100, 20));
+            },
+        );
         let tc2 = tool_calls.clone();
-        let turn2_mock = server.mock_expect_zero(move |when, then| {
-            when.method(POST).path("/v1/chat/completions").matches(|req| {
-                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
-                b.matches("\"role\":\"tool\"").count() == 1
-            });
-            then.status(200).json_body(chat_response_json(None, Some(tc2.clone()), "tool_calls", 120, 20));
-        });
+        let turn2_mock = server.mock_expect_zero(
+            "a resumed dispatch must NEVER re-request turn 2 either — assert_hits(0) below \
+             already pins this; this declares the zero legitimate to GuardedMockServer too",
+            move |when, then| {
+                when.method(POST).path("/v1/chat/completions").matches(|req| {
+                    let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                    b.matches("\"role\":\"tool\"").count() == 1
+                });
+                then.status(200).json_body(chat_response_json(None, Some(tc2.clone()), "tool_calls", 120, 20));
+            },
+        );
         let turn3_mock = server.mock(move |when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
@@ -5446,16 +5463,17 @@ mod tests {
         // A request shaped like the ORIGINAL turn 1 (no tool results yet)
         // must NEVER land — proves the resume doesn't re-request the
         // model for a turn it already has an assistant message for.
-        // `mock_expect_zero` (#2599): `assert_hits(0)` below already pins
-        // this explicitly; this declares the zero legitimate to
-        // `GuardedMockServer`'s own drop-time check too.
-        let original_turn1_mock = server.mock_expect_zero(|when, then| {
-            when.method(POST).path("/v1/chat/completions").matches(|req| {
-                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
-                b.matches("\"role\":\"tool\"").count() == 0
-            });
-            then.status(200).json_body(chat_response_json(Some("should not be reached"), None, "stop", 100, 5));
-        });
+        let original_turn1_mock = server.mock_expect_zero(
+            "the resume must never re-request turn 1 — assert_hits(0) below already pins \
+             this; this declares the zero legitimate to GuardedMockServer too",
+            |when, then| {
+                when.method(POST).path("/v1/chat/completions").matches(|req| {
+                    let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                    b.matches("\"role\":\"tool\"").count() == 0
+                });
+                then.status(200).json_body(chat_response_json(Some("should not be reached"), None, "stop", 100, 5));
+            },
+        );
         // The next real request comes only once ALL THREE tool results
         // (the checkpoint's one plus the two the resume dispatches) are
         // present.
@@ -9695,46 +9713,18 @@ mod tests {
         assert_eq!(outcome.terminal_reason, TerminalReason::MaxTurns);
     }
 
-    /// (#2541) httpmock's matcher returns the FIRST-REGISTERED mock whose
-    /// predicate matches, not the most specific one. In a scripted
-    /// multi-turn dispatch that means a broad predicate registered ahead
-    /// of a narrower one can silently swallow every later turn's traffic
-    /// — the loop never advances past turn one, and a test whose
-    /// assertions don't happen to depend on reaching later turns stays
-    /// green while covering only turn one.
-    ///
-    /// Call this at the end of a scripted multi-turn dispatch test, naming
-    /// every mock the run is EXPECTED to reach. A shadowed mock then fails
-    /// loudly, right here, instead of the test passing for a reason
-    /// unrelated to what it claims to cover.
-    ///
-    /// This does NOT, on its own, cover a "should not be reached" trap —
-    /// and "it already self-asserts via `Mock::assert_hits(0)`" is not a
-    /// safe reason to omit one. `Mock::assert_hits(0)` only proves the
-    /// trap was never SERVED; it proves nothing about whether the trap's
-    /// matcher was ever even EVALUATED. A trap that does its real work
-    /// inside the matcher closure (a side-channel counter, an
-    /// invariant check) rather than through being served can be silently
-    /// shadowed by an earlier mock whose predicates happen to cover every
-    /// request — the matcher never runs, the counter never moves, and
-    /// `assert_hits(0)` stays trivially true throughout (#2599: exactly
-    /// this shape shadowed `a_salvage_after_a_checkpoint_never_leaves_two_
-    /// assistant_messages_adjacent`'s detector for as long as it was
-    /// registered after the two mocks whose predicates already covered
-    /// every request). Before excluding a trap from this list, confirm
-    /// independently that its matcher is actually reached — e.g. by
-    /// registering it FIRST among the mocks on its server, or by naming it
-    /// here too if the run is expected to reach it at least once.
-    fn assert_every_mock_was_hit(mocks: &[(&str, &httpmock::Mock)]) {
-        for (label, mock) in mocks {
-            assert!(
-                mock.hits() > 0,
-                "mock `{label}` was never hit (0 requests) — #2541: a broader mock \
-                 registered earlier may be shadowing it (httpmock serves the \
-                 first-registered match, not the most specific one)"
-            );
-        }
-    }
+    // The `assert_every_mock_was_hit` per-test opt-in helper that used to
+    // live here (#2541) is retired (#2599): its one remaining caller,
+    // `assistant_messages_in_history_never_carry_reasoning_content` below,
+    // already registers its mocks on a `GuardedMockServer`, whose own
+    // Drop-time check subsumes exactly what this helper asserted — every
+    // registered `.mock(...)` was hit at least once — with no separate
+    // call and no list of labels to keep in sync. The sharper half of its
+    // doc comment (a hits-based check cannot distinguish a legitimately
+    // false predicate from one that was silently shadowed and never even
+    // evaluated) moved to `GuardedMockServer::mock_expect_zero`'s own doc
+    // in `test_support.rs`, where the exemption it warns about is actually
+    // granted.
 
     /// (#406 regression guard, Beat 47) The streaming path used to
     /// strip reasoning_content via `accumulator.take_reasoning_content`
@@ -9772,41 +9762,65 @@ mod tests {
         // yet) so it falls through to `turn1`; from request 2 on, `turn2`
         // matches and wins. Same ordering as
         // `loop_accumulates_reasoning_and_cached_tokens_across_turns_tri_state`.
-        // `assert_eq!(outcome.turns, 2)` and `assert_every_mock_was_hit`
-        // below pin the routing so it cannot silently regress again.
+        // `assert_eq!(outcome.turns, 2)` pins the routing so it cannot
+        // silently regress again — and `GuardedMockServer`'s own Drop-time
+        // check (#2599) now independently requires both `turn1` and
+        // `turn2` below to have been hit at least once.
         //
         // (#2541 full audit, instrumented via `Mock::hits()` across every
-        // runtime test registering 2+ mocks — 43 tests, 105 mocks, run
-        // whole-suite: this was the ONLY test where a registered mock a
-        // run was expected to reach went unserved. (Corrected in #2599's
-        // review from an initial 39 tests / 96 mocks: a direct-registration
-        // scan misses a helper function that registers mocks on the
-        // caller's behalf — `register_three_turn_tool_then_stop_script`
-        // registers 3 mocks and is called by 3 tests with no registration
-        // sites of their own, invisible to a scan that attributes
-        // registrations to the enclosing function — and misses a test
-        // whose two mocks live on two DIFFERENT servers, where shadowing
-        // is structurally impossible but the mocks still belong in the
-        // candidate set.) The other 0-hit mocks found (9 total, across 8
-        // tests — corrected from 8/7; the missed one is a bare
-        // registration with no `let` binding, so its hit count can't be
-        // read without going back and binding it first) are all
-        // deliberate: either an explicit `Mock::assert_hits(0)` proving a
-        // resumed/mid-turn dispatch never re-requests a call it already
-        // has, a "never actually serve — this mock only observes" detector
-        // whose predicate always returns false (but see the #2599 note on
-        // `assert_every_mock_was_hit` above — "the predicate always
-        // returns false" is not the same as "the matcher is actually
-        // reached", and one of exactly this shape was NOT), or one arm of
-        // a pair of genuinely mutually-exclusive predicates whose other
-        // branch this particular scripted run doesn't take. Of those
-        // mutually-exclusive pairs, exactly ONE uses a
+        // runtime test registering 2+ mocks — 44 tests, 105 registrations,
+        // run whole-suite: this was the ONLY test where a registered mock
+        // a run was expected to reach went unserved. (Corrected in #2599's
+        // FIRST review pass from an initial 39 tests / 96 mocks: a
+        // direct-registration scan misses a helper function that
+        // registers mocks on the caller's behalf —
+        // `register_three_turn_tool_then_stop_script` registers 3 mocks
+        // and is called by 3 tests with no registration sites of their
+        // own, invisible to a scan that attributes registrations to the
+        // enclosing function — and misses a test whose two mocks live on
+        // two DIFFERENT servers, where shadowing is structurally
+        // impossible but the mocks still belong in the candidate set.
+        // Corrected AGAIN in #2599's SECOND review pass from 43 tests to
+        // 44: two independent source-level counting methods agree on 44
+        // tests / 105 registrations for this population (a test qualifies
+        // once it registers 2+ mocks, counting a helper's registrations
+        // against every caller). A THIRD, runtime-instrumented count of
+        // every `GuardedMockServer::start()` call in the whole crate (not
+        // just this 2+-mock population) comes out one higher than the
+        // 94 static call sites that make it up, because
+        // `max_stall_recoveries_override_changes_the_escalation_point`
+        // constructs its server inside a 2-iteration `for` loop — one
+        // static site, two servers at run time. That test registers only
+        // ONE mock per iteration, so it is not itself part of the
+        // 44-test/105-registration shadowing-audit population (shadowing
+        // needs 2+ DISTINCT mocks); it is exactly the test responsible for
+        // the crate-wide static-vs-runtime construction-count gap.) The
+        // other 0-hit mocks found (9 total, across 8 tests — corrected
+        // from 8/7; the missed one is a bare registration with no `let`
+        // binding, so its hit count can't be read without going back and
+        // binding it first) are all deliberate, and every one is now
+        // registered through `GuardedMockServer::mock_expect_zero` with a
+        // written reason (#2599) rather than left to a hits-only check:
+        // an explicit `Mock::assert_hits(0)` proving a resumed/mid-turn
+        // dispatch never re-requests a call it already has, a "never
+        // actually serve — this mock only observes" detector whose
+        // predicate always returns false but does its real work as a
+        // side-channel counter (see `GuardedMockServer::mock_expect_zero`'s
+        // own doc in `test_support.rs` for why a hits-only check cannot
+        // safely exempt this shape on its own), or one arm of a pair of
+        // genuinely mutually-exclusive predicates whose other branch this
+        // particular scripted run doesn't take. Of the 9: one uses a
         // `body_contains("\"model\":\"test-primary\"")` /
         // `\"test-compactor\"` discriminator (corrected from "six of
         // seven" — that fraction was inherited from an older comment
-        // describing a different set and never re-checked); two use
-        // tool-role count matchers, four use disjoint content-sentinel
-        // predicates, and one uses a token-limit predicate. None of the 43
+        // describing a different set and never re-checked); three use
+        // tool-role count matchers, three use disjoint content-sentinel
+        // predicates, one uses a token-limit predicate, and one is
+        // `checkpoint_regression_tests::
+        // a_salvage_after_a_checkpoint_never_leaves_two_assistant_messages_
+        // adjacent`'s observe-only `_detector` (corrected from
+        // "two/four/one", which omitted the detector as its own
+        // category). None of the 44
         // are shadowed. Noted, not fixed: at least one of these mutually-
         // exclusive-arm exemptions (`checkpoint_regression_tests::
         // an_answer_after_the_models_own_think_close_is_delivered`'s
@@ -9817,7 +9831,7 @@ mod tests {
         // reach.)
         //
         // Second call (after the tool result): model finishes with stop.
-        let turn2 = server.mock(|when, then| {
+        let _turn2 = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
                 .body_contains("\"role\":\"tool\"");
@@ -9833,7 +9847,7 @@ mod tests {
         // (promotion does NOT fire — tool_calls field is populated).
         // The reasoning is set on the response; without the post-
         // promoter clear, it would leak into the next request.
-        let turn1 = server.mock(|when, then| {
+        let _turn1 = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
                 .body_contains("\"role\":\"user\"");
@@ -9884,15 +9898,14 @@ mod tests {
         );
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
 
-        // (#2541) The structural version of the ordering-comment above:
-        // name every scripted mock and require it was actually served.
-        // Unlike the turns/terminal_reason checks (which only catch
-        // shadowing indirectly, through its downstream symptom), this
-        // fails right at the shadowed mock and names it.
-        assert_every_mock_was_hit(&[
-            ("turn1 (tool_calls response)", &turn1),
-            ("turn2 (stop response)", &turn2),
-        ]);
+        // Both `turn1` and `turn2` are real (`.mock`, not
+        // `.mock_expect_zero`) registrations on a `GuardedMockServer` —
+        // its own Drop-time check already requires every one of them to
+        // have been hit at least once (#2599), so a separate
+        // `assert_every_mock_was_hit(&[...])` call here would be pure
+        // duplication of what teardown already proves; that per-test
+        // opt-in helper was retired once this, its one remaining caller,
+        // no longer needed it.
 
         // The first assistant message in the conversation must have
         // reasoning_content stripped — even though the model emitted
@@ -10772,17 +10785,17 @@ mod tests {
         };
 
         let server = crate::test_support::GuardedMockServer::start();
-        // Must NEVER be hit — escalating means the resume never reaches
-        // the main loop's first post-resume request at all.
-        // `mock_expect_zero` (#2599): `assert_hits(0)` below already pins
-        // this explicitly; this declares the zero legitimate to
-        // `GuardedMockServer`'s own drop-time check too.
-        let primary_mock = server.mock_expect_zero(|when, then| {
-            when.method(POST)
-                .path("/v1/chat/completions")
-                .body_contains("\"model\":\"test-primary\"");
-            then.status(200).json_body(chat_response_json(Some("should not be reached"), None, "stop", 100, 5));
-        });
+        let primary_mock = server.mock_expect_zero(
+            "must NEVER be hit — escalating means the resume never reaches the main loop's \
+             first post-resume request at all; assert_hits(0) below already pins this, this \
+             declares the zero legitimate to GuardedMockServer too",
+            |when, then| {
+                when.method(POST)
+                    .path("/v1/chat/completions")
+                    .body_contains("\"model\":\"test-primary\"");
+                then.status(200).json_body(chat_response_json(Some("should not be reached"), None, "stop", 100, 5));
+            },
+        );
         let compactor_mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")

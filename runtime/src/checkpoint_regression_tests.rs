@@ -106,6 +106,29 @@ fn a_repetitive_but_legitimate_answer_is_never_deleted() {
         "SECTION-ONE the audit of module alpha found the following items.\n{}",
         "- [ ] verify the handler returns the right status code\n".repeat(200)
     );
+    // (#2599: mock_expect_zero must register before any real .mock() on
+    // the same server, so this moved ahead of _m1 below.) Never actually
+    // hit: the current degeneracy verdict escalates on turn 1's
+    // repetitive answer before a second call is ever made, so the "model
+    // converges after a nudge" continuation this mock was written for is
+    // not the path this test exercises today. The test's own assertion
+    // doesn't depend on it — recorded, not fixed. Its predicate
+    // (`contains("repeated itself without converging")`) is the exact
+    // complement of _m1's below, so reordering doesn't change routing.
+    let _m2 = server.mock_expect_zero(
+        "the degeneracy verdict escalates before a second call is ever made on this \
+         script, so the 'model converges after a nudge' continuation this mock scripts \
+         is never reached — recorded, not fixed",
+        move |when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|r: &HttpMockRequest| {
+                    body_of(r).contains("repeated itself without converging")
+                });
+            then.status(200)
+                .json_body(chat_response_json(Some("Done."), None, "stop", 100, 3));
+        },
+    );
     let _m1 = server.mock(move |when, then| {
         when.method(POST)
             .path("/v1/chat/completions")
@@ -114,21 +137,6 @@ fn a_repetitive_but_legitimate_answer_is_never_deleted() {
             });
         then.status(200)
             .json_body(chat_response_json(Some(&part_one), None, "length", 100, 200));
-    });
-    // (#2599, found by GuardedMockServer) Never actually hit: the current
-    // degeneracy verdict escalates on turn 1's repetitive answer before a
-    // second call is ever made, so the "model converges after a nudge"
-    // continuation this mock was written for is not the path this test
-    // exercises today. The test's own assertion doesn't depend on it —
-    // recorded, not fixed.
-    let _m2 = server.mock_expect_zero(move |when, then| {
-        when.method(POST)
-            .path("/v1/chat/completions")
-            .matches(|r: &HttpMockRequest| {
-                body_of(r).contains("repeated itself without converging")
-            });
-        then.status(200)
-            .json_body(chat_response_json(Some("Done."), None, "stop", 100, 3));
     });
 
     let o = go(&server, "degen2", Some(6)).expect("Ok");
@@ -153,6 +161,31 @@ fn an_empty_tool_calls_turn_does_not_delete_the_accumulation() {
         "PART-ONE here are the first results.\n{}",
         (0..200).map(|j| format!("item{j} ")).collect::<String>()
     );
+    // (#2599: mock_expect_zero must register before any real .mock() on
+    // the same server, so this moved ahead of _m1/_m2 below.) Never
+    // actually hit: the empty-tool-calls recovery budget is exhausted
+    // before this turn's nudge ever earns a clean recovery, so the run
+    // escalates instead of reaching the "recovered after the nudge"
+    // continuation this mock was written for. The test's own assertion
+    // doesn't depend on it — recorded, not fixed. Its predicate
+    // (`!contains("PART-ONE") && contains("emitted reasoning tokens")`)
+    // is disjoint from both _m1's and _m2's below, so reordering doesn't
+    // change routing.
+    let _m3 = server.mock_expect_zero(
+        "the empty-tool-calls recovery budget is exhausted before this turn's nudge \
+         earns a clean recovery on this script, so the 'recovered after the nudge' \
+         continuation this mock scripts is never reached — recorded, not fixed",
+        move |when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|r: &HttpMockRequest| {
+                    let b = body_of(r);
+                    !b.contains("PART-ONE") && b.contains("emitted reasoning tokens")
+                });
+            then.status(200)
+                .json_body(chat_response_json(Some("Done."), None, "stop", 100, 3));
+        },
+    );
     let _m1 = server.mock(move |when, then| {
         when.method(POST)
             .path("/v1/chat/completions")
@@ -174,22 +207,6 @@ fn an_empty_tool_calls_turn_does_not_delete_the_accumulation() {
             100,
             5,
         ));
-    });
-    // (#2599, found by GuardedMockServer) Never actually hit: the empty-
-    // tool-calls recovery budget is exhausted before this turn's nudge
-    // ever earns a clean recovery, so the run escalates instead of
-    // reaching the "recovered after the nudge" continuation this mock was
-    // written for. The test's own assertion doesn't depend on it —
-    // recorded, not fixed.
-    let _m3 = server.mock_expect_zero(move |when, then| {
-        when.method(POST)
-            .path("/v1/chat/completions")
-            .matches(|r: &HttpMockRequest| {
-                let b = body_of(r);
-                !b.contains("PART-ONE") && b.contains("emitted reasoning tokens")
-            });
-        then.status(200)
-            .json_body(chat_response_json(Some("Done."), None, "stop", 100, 3));
     });
 
     let o = go(&server, "emptytc2", Some(6)).expect("Ok");
@@ -287,6 +304,33 @@ fn the_models_own_think_close_on_a_terminal_turn_is_not_the_answer() {
 fn an_answer_after_the_models_own_think_close_is_delivered() {
     let server = GuardedMockServer::start();
     let opening = format!("<think>\nSCRATCH-A {}", (0..300).map(|j| format!("distinct reasoning step {j} about module alpha. ")).collect::<String>());
+    // The model closes its own block and starts the answer, but is cut again.
+    let closing_then_answer = format!(
+        "done deliberating.\n</think>\n\nANSWER-PART-ONE the handler is missing a status check. {}",
+        "Detail sentence. ".repeat(40)
+    );
+    // (#2599: mock_expect_zero must register before any real .mock() on
+    // the same server, so this moved ahead of _m1/_m2 below.) Never
+    // actually hit: checkpoint 2 escalates (intra-turn stall exhausted)
+    // before a third call is ever made, so the "delivers a further
+    // ANSWER-PART-TWO" continuation this mock was written for is not the
+    // path this test exercises today. The test's own assertion doesn't
+    // depend on it — recorded, not fixed. Its predicate
+    // (`contains("ANSWER-PART-ONE")`) only becomes true once _m2's OWN
+    // response has already landed in history, which is after both real
+    // requests below are served — reordering doesn't change what they see.
+    let _m3 = server.mock_expect_zero(
+        "checkpoint 2 escalates before a third call is ever made on this script, so the \
+         'delivers a further ANSWER-PART-TWO' continuation this mock scripts is never \
+         reached — recorded, not fixed",
+        move |when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|r: &HttpMockRequest| body_of(r).contains("ANSWER-PART-ONE"));
+            then.status(200)
+                .json_body(chat_response_json(Some(" ANSWER-PART-TWO and that is all."), None, "stop", 100, 10));
+        },
+    );
     let _m1 = server.mock(move |when, then| {
         when.method(POST)
             .path("/v1/chat/completions")
@@ -294,11 +338,6 @@ fn an_answer_after_the_models_own_think_close_is_delivered() {
         then.status(200)
             .json_body(chat_response_json(Some(&opening), None, "length", 100, 200));
     });
-    // The model closes its own block and starts the answer, but is cut again.
-    let closing_then_answer = format!(
-        "done deliberating.\n</think>\n\nANSWER-PART-ONE the handler is missing a status check. {}",
-        "Detail sentence. ".repeat(40)
-    );
     let _m2 = server.mock(move |when, then| {
         when.method(POST)
             .path("/v1/chat/completions")
@@ -308,18 +347,6 @@ fn an_answer_after_the_models_own_think_close_is_delivered() {
             });
         then.status(200)
             .json_body(chat_response_json(Some(&closing_then_answer), None, "length", 100, 200));
-    });
-    // (#2599, found by GuardedMockServer) Never actually hit: checkpoint 2
-    // escalates (intra-turn stall exhausted) before a third call is ever
-    // made, so the "delivers a further ANSWER-PART-TWO" continuation this
-    // mock was written for is not the path this test exercises today. The
-    // test's own assertion doesn't depend on it — recorded, not fixed.
-    let _m3 = server.mock_expect_zero(move |when, then| {
-        when.method(POST)
-            .path("/v1/chat/completions")
-            .matches(|r: &HttpMockRequest| body_of(r).contains("ANSWER-PART-ONE"));
-        then.status(200)
-            .json_body(chat_response_json(Some(" ANSWER-PART-TWO and that is all."), None, "stop", 100, 10));
     });
 
     let o = go(&server, "strand", Some(6)).expect("Ok");
@@ -625,23 +652,26 @@ fn a_non_reasoning_models_first_call_is_not_capped_by_the_reasoning_interval() {
     // Legitimately never hit on current (post-#2164) main, per this test's
     // own doc comment above: the fix means the first call always carries
     // the large answer bound, so only the CLEAN branch mock below is ever
-    // served. `mock_expect_zero` (#2599) declares that instead of leaving
-    // it for `GuardedMockServer`'s drop-time check to flag.
-    server.mock_expect_zero(move |when, then| {
-        when.method(POST).path("/v1/chat/completions").matches(|req| {
-            let b = body_of(req);
-            let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
-            v.get("max_tokens").and_then(|m| m.as_u64()).map(|m| m <= 1000).unwrap_or(false)
-                && !b.contains("\"role\":\"tool\"")
-        });
-        then.status(200).json_body(chat_response_json(
-            None,
-            Some(serde_json::json!(truncated_calls.clone())),
-            "length",
-            100,
-            999,
-        ));
-    });
+    // served.
+    server.mock_expect_zero(
+        "post-#2164, the first call always carries the large answer bound, so this \
+         pre-#2164 (max_tokens<=1000) shape is never sent on current main",
+        move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = body_of(req);
+                let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
+                v.get("max_tokens").and_then(|m| m.as_u64()).map(|m| m <= 1000).unwrap_or(false)
+                    && !b.contains("\"role\":\"tool\"")
+            });
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!(truncated_calls.clone())),
+                "length",
+                100,
+                999,
+            ));
+        },
+    );
     // Whenever it carries the large answer bound — the fixed behavior —
     // serve the FULL clean batch with a `tool_calls` finish.
     server.mock(move |when, then| {
@@ -855,18 +885,16 @@ fn a_salvage_after_a_checkpoint_never_leaves_two_assistant_messages_adjacent() {
     // intercepts (and counts) a request that actually violates the
     // invariant.
     ADJACENT_ASSISTANT_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
-    // `mock_expect_zero`: this mock is deliberately never meant to be
-    // served (see the doc comment above) — its real job is the matcher
-    // closure's side-channel count, not its response. `GuardedMockServer`
-    // (#2599) would otherwise flag it as an unhit mock at teardown, same
-    // as it would any other silently-shadowed mock; this declares the
-    // zero legitimate instead of leaving it invisible to the guard.
-    let _detector = server.mock_expect_zero(|when, then| {
-        when.method(POST)
-            .path("/v1/chat/completions")
-            .matches(body_has_adjacent_assistants);
-        then.status(500).body("never served — this mock only observes");
-    });
+    let _detector = server.mock_expect_zero(
+        "deliberately never meant to be served (see the doc comment above) — its real \
+         job is the matcher closure's side-channel count, not its response",
+        |when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(body_has_adjacent_assistants);
+            then.status(500).body("never served — this mock only observes");
+        },
+    );
 
     let _m1 = server.mock(move |when, then| {
         when.method(POST).path("/v1/chat/completions").matches(|r: &HttpMockRequest| {
