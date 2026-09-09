@@ -578,6 +578,18 @@ impl StepKind for MissionWorktreeStepKind {
         "mission.worktree"
     }
 
+    /// (#1511) `None` — creating a git worktree dispatches no model,
+    /// matching this kind's [`SeatClaim::NoModel`] above.
+    fn dispatch_role(
+        &self,
+        _step: &crew::types::Step,
+        _task: &crew::types::Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
+    }
+
     fn display_name(&self) -> &'static str {
         "Worktree"
     }
@@ -989,6 +1001,33 @@ impl StepKind for MissionCoderStepKind {
         };
         resolve_local_seat(&ctx.role, None, None, &format!("mission-coder:{}", ctx.phase_id))
     }
+
+    /// (#1511) The role this step dispatches — `ctx.role` off the run's
+    /// `ArtifactBus`, the SAME field `run_streaming` puts on `DispatchOpts`
+    /// and `seat` above resolves its placement from. `task.role_id` is
+    /// never read by any of the three.
+    ///
+    /// That is exactly why the consent gate has to ask the kind. When the
+    /// scheduler read `task.role_id` itself, a `coder-phase` task naming a
+    /// benign role while `ctx.role` named a licensed-adjacent one passed the
+    /// gate and loaded the model anyway — proven against the first version
+    /// of this fix.
+    ///
+    /// `None` only when the artifact is missing, which is the same input
+    /// `seat` reports as `LocalModelUnresolved` — a claim the wave loader
+    /// performs no load for, and whose dispatch (if it gets that far) still
+    /// passes `dispatch_internal`'s own in-body consent check first.
+    fn dispatch_role(
+        &self,
+        _step: &crew::types::Step,
+        _task: &crew::types::Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Option<String> {
+        run_ctx
+            .artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)
+            .map(|ctx| ctx.role.clone())
+    }
 }
 
 /// Wraps the mechanical-verify half of the old hand-written sequence
@@ -1134,6 +1173,23 @@ impl StepKind for MissionVerifyStepKind {
             };
         };
         resolve_local_seat("code-reviewer", None, None, &format!("mission-verify:{}", ctx.phase_id))
+    }
+
+    /// (#1511) Always `"code-reviewer"` — hardcoded, exactly as `seat`
+    /// above and `phase_review_output_at` below both are. `task.role_id` on
+    /// the `build-verify` task is DOCUMENTED-DECORATIVE (see
+    /// `run_streaming`'s own note): nothing reads it, so a licensed-adjacent
+    /// value there names a dispatch that never happens. The scheduler's
+    /// former field read would have refused this step for that decorative
+    /// value; asking the kind reports the role that actually dispatches.
+    fn dispatch_role(
+        &self,
+        _step: &crew::types::Step,
+        _task: &crew::types::Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        Some("code-reviewer".to_string())
     }
 }
 

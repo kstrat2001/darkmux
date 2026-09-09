@@ -663,6 +663,97 @@ pub trait StepKind: Send + Sync {
         ctx: &StepRunCtx,
     ) -> SeatClaim;
 
+    /// (#1511) The role id this step will ACTUALLY dispatch under — the
+    /// SAME answer the kind's own dispatch resolves, from the SAME source
+    /// [`StepKind::seat`] resolves its placement from. **Required: there is
+    /// no default body, on purpose**, for exactly the reason `seat` has
+    /// none — the compiler is the completeness check, and a default here
+    /// would be a guess made on behalf of a kind that never thought about
+    /// the question.
+    ///
+    /// The scheduler's licensed-adjacent consent filter
+    /// (`scheduler::run_step_graph`) is the consumer: it asks THIS, then
+    /// refuses the step if that role has no recorded operator ack, strictly
+    /// before the wave loader can make any model resident.
+    ///
+    /// **Why it is a method and not a field read.** #1511's first fix read
+    /// `task.role_id` (falling back to `step.config.role_id`) in the
+    /// scheduler — a PARALLEL GUESS at what the kind would do. Nothing tied
+    /// the two together, and two shipping kinds resolve their dispatch role
+    /// somewhere else entirely: `mission.coder` takes it off the run's
+    /// [`ArtifactBus`] (`task.role_id` is never read), and `crawl.unit`
+    /// defaults to `"crawler"` when the task names nothing. Both therefore
+    /// loaded a licensed-adjacent model with the gate fully in place — the
+    /// guess said `"coder"`, or `None`, while the seat resolved the
+    /// forbidden role. One method, asked of the kind itself, is what
+    /// removes the second source of truth.
+    ///
+    /// **Contract, and what `None` may mean.** Return `Some(role)` for any
+    /// seat that will actually make a model resident or reach an endpoint —
+    /// i.e. whenever [`StepKind::seat`] claims [`SeatClaim::LocalModel`] or
+    /// [`SeatClaim::RemoteEndpoint`]. `None` is legal in exactly two cases,
+    /// and neither of them can load a model behind the gate's back:
+    ///
+    /// - [`SeatClaim::NoModel`] — the kind dispatches nothing at all
+    ///   (`procedural.*`, the render/collect halves). There is no role to
+    ///   consent to. Note this ALSO covers a data-dependent no-op: an EMPTY
+    ///   `dispatch.map` claims `NoModel` and returns `None` here, so it is
+    ///   not refused for a role it was never going to dispatch.
+    /// - [`SeatClaim::LocalModelUnresolved`] — the kind meant to dispatch
+    ///   locally and could not resolve WHAT. The wave loader performs no
+    ///   load for this claim (see that variant's own doc), so nothing
+    ///   reaches RAM here; whatever the step's own body then does still
+    ///   passes through `dispatch_internal`'s in-body consent check before
+    ///   its own load. Returning `None` because the role is genuinely
+    ///   unknown is honest; returning `None` while claiming a real model
+    ///   seat is the fail-open this method exists to make impossible, and
+    ///   the registry conformance tests assert exactly that implication.
+    ///
+    /// A kind that dispatches a bare model rather than a ROLE
+    /// (`dispatch.single_shot`, `dispatch.map` — config `model` + `user`,
+    /// no role prompt anywhere) returns `None`. The consent gate is keyed
+    /// on role ids because it discloses a ROLE'S prompt doctrine; a kind
+    /// with no role has nothing for it to disclose.
+    ///
+    /// Parameters are identical to [`StepKind::seat`]'s, so a kind whose
+    /// role and placement come from one source can read that source once in
+    /// both.
+    ///
+    /// **What the gate's `ctx` and `input` actually carry — read this
+    /// before sourcing a role from anything else.** The scheduler calls
+    /// this from its consent filter, EARLIER in the same wave-loop
+    /// iteration than the job loop that calls `seat`, so the two get the
+    /// same parameter list but not identical contents. Guaranteed here:
+    ///
+    /// - `ctx.artifact::<T>` — the run-scoped [`ArtifactBus`], the same
+    ///   `Arc` the job loop's `ctx` and every `run_streaming` get. That is
+    ///   the source `mission.coder` reads, and a scheduler test
+    ///   (`the_gates_ctx_carries_the_run_scoped_bus_the_kind_reads_its_role_from`)
+    ///   pins it.
+    /// - `ctx`'s `dispatch.map` override — cloned from the same
+    ///   caller-supplied seam the job loop threads through.
+    ///
+    /// NOT populated here, and `None` where the job loop passes a real
+    /// value: the wave-channel record EMITTER (that channel does not exist
+    /// yet — this filter reports through `apply_step_terminal` instead),
+    /// and the shared REMOTE TOKEN BUCKET (a consent check spends
+    /// nothing). And `input` is gathered BEFORE this wave's ready steps
+    /// flip to `Running`, where the job loop's is gathered after — so a
+    /// sibling's status can read differently between the two maps.
+    ///
+    /// So: source a dispatch role from the Step, the Task, or the artifact
+    /// bus. A kind reaching for the emitter or the remote bucket here gets
+    /// `None`; one keying off a sibling's `Running` status in `input` is
+    /// reading something its own `seat` will disagree with — which is the
+    /// second-source-of-truth defect this method exists to remove.
+    fn dispatch_role(
+        &self,
+        step: &Step,
+        task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        ctx: &StepRunCtx,
+    ) -> Option<String>;
+
     /// (#1530 Packet 0) The [`Port`]s this kind PRODUCES — what a future
     /// consumer (a graph validator, the viewer's port-wiring annotation)
     /// can expect available after this step runs. For an

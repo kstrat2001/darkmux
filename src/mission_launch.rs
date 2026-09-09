@@ -4247,6 +4247,354 @@ mod tests {
     use std::io::Write as _;
     use tempfile::{NamedTempFile, TempDir};
 
+    // ─── #1511: the consent gate's role must be the kind's own ──────────
+    //
+    // `scheduler::run_step_graph` refuses a step whose licensed-adjacent
+    // role has no recorded operator ack, and it asks `StepKind::
+    // dispatch_role` which role that is. These two tests are what keep that
+    // question honest across the WHOLE production registry — every Tier 1
+    // builtin plus every Tier 3 kind `all_step_kinds` registers — rather
+    // than only the handful a scheduler fixture happens to exercise.
+    //
+    // The failure they exist to catch is specific and was measured, not
+    // imagined. The first version of the #1511 fix resolved the gate's role
+    // by reading `task.role_id.or(step.config.role_id)` in the scheduler —
+    // a PARALLEL GUESS at what the kind would do. Two shipping kinds resolve
+    // their dispatch role somewhere else entirely (`mission.coder` off the
+    // run's `ArtifactBus`; `crawl.unit` from a hardcoded default when the
+    // task names nothing), so the guess and the loader disagreed and a
+    // licensed-adjacent model loaded with the gate fully in place.
+
+    /// The step every registered kind is asked about below.
+    ///
+    /// `config_role` populates `step.config.role_id` — the SECOND source
+    /// `dispatch.internal` resolves a role from (`task_or_config_str`), and
+    /// one no shape here exercised until the re-review of #1511 pointed at
+    /// it. Step config is free-form JSON carried through verbatim, so an
+    /// operator-authored config naming only `config.role_id` is a supported
+    /// route to a role-bearing dispatch; with `config: {}` on every shape,
+    /// `dispatch.internal::dispatch_role` could have been narrowed to
+    /// `task.role_id.clone()` and the whole suite stayed green while the
+    /// gate read `None` and the seat resolved the role.
+    fn role_conformance_step(kind: &str, config_role: Option<&str>) -> Step {
+        Step {
+            id: "s-role-conf".to_string(),
+            task_id: "t-role-conf".to_string(),
+            gate: None,
+            kind: kind.to_string(),
+            status: crew::types::NodeStatus::Planned,
+            config: match config_role {
+                Some(role) => serde_json::json!({ "role_id": role }),
+                None => serde_json::json!({}),
+            },
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        }
+    }
+
+    /// A Task naming `role_id` — the field the retired guess read.
+    fn role_conformance_task(role_id: Option<&str>) -> crew::types::Task {
+        crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
+            id: "t-role-conf".into(),
+            phase_id: "p-role-conf".into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["s-role-conf".into()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: role_id.map(str::to_string),
+            profile_name: None,
+            workdir: None,
+            image: None,
+        }
+    }
+
+    /// A run-scoped bus carrying a `coder.context` whose role is
+    /// `coder_role` — the source `mission.coder` really reads.
+    fn role_conformance_ctx(coder_role: &str) -> crew::step_kinds::StepRunCtx {
+        let mut bus = crew::step_kinds::ArtifactBus::new();
+        bus.seed(
+            coder_phase::CODER_CONTEXT_ARTIFACT,
+            std::sync::Arc::new(coder_phase::CoderPhaseContext {
+                role: coder_role.to_string(),
+                ..Default::default()
+            }),
+        );
+        crew::step_kinds::StepRunCtx::new(None, None, None, std::sync::Arc::new(bus))
+    }
+
+    /// (#1511) The role each registered kind ACTUALLY dispatches, pinned by
+    /// VALUE, for a step whose Task names `task_role`, whose own
+    /// `config.role_id` is `config_role`, and whose run carries a
+    /// `coder.context` with role `bus_role`.
+    ///
+    /// `None` (the outer one) means "no row" and fails the test — a newly
+    /// registered kind must state its answer here, which forces its author
+    /// to go read what the kind's `run`/`seat` really resolve. `Some(None)`
+    /// is the declared no-dispatch opt-out: a deliberate two-sided edit
+    /// (the override AND this row), so it cannot absorb a mistake.
+    fn expected_dispatch_role(
+        kind_id: &str,
+        task_role: Option<&str>,
+        config_role: Option<&str>,
+        bus_role: &str,
+    ) -> Option<Option<String>> {
+        Some(match kind_id {
+            // Task-sourced, falling back to `config.role_id` — the ONE
+            // shape the retired scheduler-side guess got right, and the
+            // fallback arm is load-bearing: `run` and `seat` BOTH read
+            // `task_or_config_str`, so a `dispatch_role` that read only
+            // `task.role_id` would answer `None` for a config-authored
+            // step whose seat still resolves the role and loads its model.
+            "dispatch.internal" => task_role.or(config_role).map(str::to_string),
+            // Task-sourced with a hardcoded fallback, and `config.role_id`
+            // is NOT a source for it — `run`/`seat` don't read it either.
+            // The fallback is the whole point: with no role on the task the
+            // guess said `None` and this kind still dispatched `crawler`.
+            "crawl.unit" => Some(task_role.unwrap_or("crawler").to_string()),
+            // Bus-sourced. `task.role_id` is never read by this kind's
+            // `run_streaming`, `seat`, or `dispatch_role` — so the value
+            // here must track `bus_role`, never `task_role`.
+            "mission.coder" => Some(bus_role.to_string()),
+            // Hardcoded. `coder-phase.json`'s `build-verify` task declares
+            // a `role_id` that is DOCUMENTED-DECORATIVE — nothing reads it
+            // (see `MissionVerifyStepKind::run_streaming`'s own note), so
+            // the gate must not refuse this step for a value that names no
+            // dispatch.
+            "mission.verify" => Some("code-reviewer".to_string()),
+            // Bare-model kinds: a `model` + `user` chat call, no role
+            // manifest anywhere, so nothing for a role-keyed consent gate
+            // to disclose. This is also what keeps an EMPTY `dispatch.map`
+            // (which claims `NoModel` and loads nothing) from being refused
+            // for a role it never dispatches.
+            "dispatch.single_shot" | "dispatch.map" => None,
+            // Declared no-dispatch: no model work at all.
+            "procedural.shell" | "procedural.noop" | "mission.worktree" | "crawl.plan"
+            | "crawl.summary" | "plan.sites" | "records.gather" | "deliver.github_review"
+            | "mods.gate" => None,
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn every_registered_kind_reports_the_role_it_actually_dispatches() {
+        let registry = all_step_kinds().expect("the production registry always builds");
+        let input = BTreeMap::new();
+        // Four shapes. The second is the one that matters most: the Task
+        // names a BENIGN role while the run's own context names a
+        // licensed-adjacent one, which is exactly the divergence the
+        // retired guess could not see. A kind whose answer tracks the Task
+        // in that shape is reading the wrong source. The FOURTH shape
+        // (re-review of #1511) is the config-only one — no role on the
+        // Task, the role in `step.config` — which pins `dispatch.internal`'s
+        // second source, unexercised while every shape carried `config: {}`.
+        for (task_role, config_role, bus_role) in [
+            (Some("health-research"), None, "health-research"),
+            (Some("coder"), None, "health-research"),
+            (None, None, "health-research"),
+            (None, Some("health-research"), "health-research"),
+        ] {
+            let task = role_conformance_task(task_role);
+            let ctx = role_conformance_ctx(bus_role);
+            for id in registry.ids() {
+                let kind = registry.get(&id).expect("registry.ids() only yields registered kinds");
+                let step = role_conformance_step(&id, config_role);
+                let expected = expected_dispatch_role(&id, task_role, config_role, bus_role).unwrap_or_else(|| {
+                    panic!(
+                        "step kind `{id}` is registered but has no row in \
+                         `expected_dispatch_role`. Add one naming the role this kind ACTUALLY \
+                         dispatches (read its `run`/`run_streaming` and `seat`), or `None` if \
+                         it dispatches no role at all. Do not copy what `task.role_id` happens \
+                         to hold — a gate that reads the Task while the kind reads something \
+                         else is the #1511 defect, and it loads a licensed-adjacent model \
+                         with the gate fully in place.",
+                    )
+                });
+                assert_eq!(
+                    kind.dispatch_role(&step, &task, &input, &ctx),
+                    expected,
+                    "{id} reports a different dispatch role than the one pinned in \
+                     `expected_dispatch_role` (task_role={task_role:?}, \
+                     config_role={config_role:?}, bus_role={bus_role}). \
+                     The licensed-adjacent consent gate checks THIS answer before the wave \
+                     loader runs, so a wrong answer either refuses a step that was never going \
+                     to dispatch that role, or waves through one that was.",
+                );
+            }
+        }
+    }
+
+    /// (#1511) A kind that dispatches a bare MODEL rather than a ROLE.
+    /// Both build their request from `config.model` + `config.user`; neither
+    /// resolves a role manifest or loads a role prompt anywhere, so the
+    /// role-keyed licensed-adjacent gate has nothing to disclose for them —
+    /// and neither was gated before #1511 either. Landing on this list is a
+    /// deliberate edit, which is the point: a NEW kind that claims a real
+    /// model seat and reports no role fails the test below until someone
+    /// either implements `dispatch_role` or states here, in writing, that
+    /// it dispatches no role.
+    const ROLE_FREE_MODEL_KINDS: &[&str] = &["dispatch.single_shot", "dispatch.map"];
+
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_PROFILES, a process-global
+    fn no_registered_kind_claims_a_model_seat_without_naming_a_role() {
+        // The structural backstop for the gate's `None => Ok(())` arm, which
+        // would otherwise be a fail-open on a consent gate. It is safe only
+        // because `None` means "the KIND declared it dispatches no role",
+        // and a kind that will actually make a model resident
+        // (`SeatClaim::LocalModel`) or reach a hosted endpoint
+        // (`SeatClaim::RemoteEndpoint`) cannot say that without being named
+        // on `ROLE_FREE_MODEL_KINDS` above.
+        //
+        // `SeatClaim::NoModel` and `LocalModelUnresolved` are the two claims
+        // `None` is freely legal for, and neither loads anything: `NoModel`
+        // dispatches nothing at all, and the wave loader performs no load
+        // for an unresolved local seat (see that variant's own doc), whose
+        // own dispatch still passes `dispatch_internal`'s in-body consent
+        // check before any load it makes itself.
+        //
+        // A REAL profiles registry is pointed at for the duration. Without
+        // it every role-resolving kind returns `LocalModelUnresolved` in a
+        // test process and this test passes while proving nothing — the
+        // vacuous-probe failure mode. The `claimed_a_model_seat` counter at
+        // the bottom is what makes that impossible to reintroduce silently.
+        let profiles = tempfile::TempDir::new().unwrap();
+        let registry_path = profiles.path().join("profiles.json");
+        std::fs::write(
+            &registry_path,
+            serde_json::json!({
+                "default_profile": "p",
+                "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let prior = std::env::var("DARKMUX_PROFILES").ok();
+        // Safety: serialized.
+        unsafe {
+            std::env::set_var("DARKMUX_PROFILES", &registry_path);
+        }
+
+        let registry = all_step_kinds().expect("the production registry always builds");
+        let input = BTreeMap::new();
+        let task = role_conformance_task(Some("health-research"));
+        let ctx = role_conformance_ctx("health-research");
+        let mut claimed_a_model_seat: Vec<String> = Vec::new();
+        let mut unnamed: Vec<String> = Vec::new();
+        for id in registry.ids() {
+            let kind = registry.get(&id).unwrap();
+            // A `dispatch.single_shot`/`dispatch.map` step needs residency
+            // hints and a collection before it claims a real local seat;
+            // give every kind the same config so this test is not vacuous
+            // for the kinds whose seat resolves without a profile registry.
+            let mut step = role_conformance_step(&id, None);
+            step.config = serde_json::json!({
+                "model": "m-local", "n_ctx": 8000, "user": "hi",
+                "collection": ["one"], "item_var": "it",
+            });
+            let seat = kind.seat(&step, &task, &input, &ctx);
+            if !matches!(
+                seat,
+                crew::step_kinds::SeatClaim::LocalModel(_)
+                    | crew::step_kinds::SeatClaim::RemoteEndpoint
+            ) {
+                continue;
+            }
+            claimed_a_model_seat.push(id.clone());
+            if kind.dispatch_role(&step, &task, &input, &ctx).is_none()
+                && !ROLE_FREE_MODEL_KINDS.contains(&id.as_str())
+            {
+                unnamed.push(id.clone());
+            }
+        }
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+                None => std::env::remove_var("DARKMUX_PROFILES"),
+            }
+        }
+
+        assert!(
+            unnamed.is_empty(),
+            "these kinds claim a seat that makes a model resident (or reaches an endpoint) but \
+             report no dispatch role, so the licensed-adjacent consent gate has nothing to check \
+             and waves them through — the #1511 fail-open: {unnamed:?}. Implement \
+             `StepKind::dispatch_role` to return the role the kind really dispatches, or add the \
+             kind to `ROLE_FREE_MODEL_KINDS` above if it genuinely dispatches a bare model with \
+             no role prompt.",
+        );
+        // Non-vacuity: the role-bearing kinds must actually have resolved a
+        // model seat here. If a future change makes them all
+        // `LocalModelUnresolved` in test builds, this test would otherwise
+        // keep passing while checking nothing.
+        for expected in ["dispatch.internal", "crawl.unit", "mission.coder", "mission.verify"] {
+            assert!(
+                claimed_a_model_seat.iter().any(|id| id == expected),
+                "`{expected}` did not claim a model seat under the fixture profiles registry, so \
+                 this test proved nothing about it. Saw: {claimed_a_model_seat:?}",
+            );
+        }
+    }
+
+    /// (#1511, review item 4) `dispatch.map` never called the consent gate
+    /// before this fix, and must not start now. An EMPTY map claims
+    /// `SeatClaim::NoModel` — it performs ZERO model loads by construction —
+    /// yet the first version of the fix ran its role check ABOVE seat
+    /// classification, off `task.role_id`, so a task naming a
+    /// licensed-adjacent role refused a step that was never going to
+    /// dispatch anything at all. Asking the kind fixes both halves: the map
+    /// dispatches a bare model, not a role, so it reports `None`.
+    #[test]
+    fn an_empty_dispatch_map_names_no_role_so_the_consent_gate_cannot_refuse_it() {
+        let registry = all_step_kinds().unwrap();
+        let kind = registry.get("dispatch.map").unwrap();
+        let mut step = role_conformance_step("dispatch.map", None);
+        step.config = serde_json::json!({
+            "collection": [], "item_var": "it", "model": "m-local", "n_ctx": 8000, "user": "hi",
+        });
+        // The Task names a licensed-adjacent role — what the retired guess
+        // would have read, and refused on.
+        let task = role_conformance_task(Some("health-research"));
+        let input = BTreeMap::new();
+        let ctx = role_conformance_ctx("health-research");
+
+        assert!(
+            matches!(kind.seat(&step, &task, &input, &ctx), crew::step_kinds::SeatClaim::NoModel),
+            "the fixture's premise: an empty map loads nothing",
+        );
+        assert_eq!(
+            kind.dispatch_role(&step, &task, &input, &ctx),
+            None,
+            "an empty `dispatch.map` must not be refused for a role it never dispatches",
+        );
+    }
+
+    /// (#1511, review item 4) `mission.verify`'s `task.role_id` is
+    /// DOCUMENTED-DECORATIVE — `MissionVerifyStepKind` hardcodes
+    /// `code-reviewer` in `run_streaming` (via `phase_review_output_at`) and
+    /// in `seat`, and reads the Task's field nowhere. The first version of
+    /// this fix read that field anyway, so setting it to a licensed-adjacent
+    /// role refused a step whose real dispatch was never that role.
+    #[test]
+    fn mission_verify_reports_its_hardcoded_reviewer_not_its_decorative_task_role() {
+        let registry = all_step_kinds().unwrap();
+        let kind = registry.get("mission.verify").unwrap();
+        let step = role_conformance_step("mission.verify", None);
+        let input = BTreeMap::new();
+        let ctx = role_conformance_ctx("health-research");
+        for decorative in [Some("health-research"), Some("legal-research"), None] {
+            assert_eq!(
+                kind.dispatch_role(&step, &role_conformance_task(decorative), &input, &ctx),
+                Some("code-reviewer".to_string()),
+                "mission.verify dispatches `code-reviewer` whatever the task declares \
+                 (decorative={decorative:?})",
+            );
+        }
+    }
+
     /// (#2302) What the close payload actually does with a LAST step that
     /// is a dispatch. The rule is "promote the last phase's last step
     /// output when it is a JSON OBJECT", and a `dispatch.internal` step's

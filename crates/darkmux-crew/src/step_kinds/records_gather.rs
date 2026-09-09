@@ -125,6 +125,20 @@ impl StepKind for RecordsGatherStepKind {
         SeatClaim::NoModel
     }
 
+    /// (#1511) `None` — the documented no-dispatch opt-out, matching this
+    /// kind's [`SeatClaim::NoModel`] above: it gathers darkmux records off disk
+    /// and speaks to no model, so there is no role for the
+    /// licensed-adjacent consent gate to check.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
+    }
+
     fn id(&self) -> &'static str {
         RECORDS_GATHER_KIND
     }

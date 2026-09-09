@@ -162,6 +162,19 @@ mod tests {
     fn id(&self) -> &'static str {
             self.0
         }
+
+    /// (#1511) A test stub that dispatches nothing — matching its
+    /// [`SeatClaim::NoModel`] above.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
+    }
+
         fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
             Ok(StepOutcome {
                 output: "stub".to_string(),

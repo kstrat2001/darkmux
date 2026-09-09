@@ -146,6 +146,20 @@ impl StepKind for ModsGateStepKind {
         SeatClaim::NoModel
     }
 
+    /// (#1511) `None` — the documented no-dispatch opt-out, matching this
+    /// kind's [`SeatClaim::NoModel`] above: it applies an operator gate to mods
+    /// and speaks to no model, so there is no role for the
+    /// licensed-adjacent consent gate to check.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
+    }
+
     fn id(&self) -> &'static str {
         MODS_GATE_KIND
     }
