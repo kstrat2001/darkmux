@@ -2032,13 +2032,27 @@ y = 2
         out
     }
 
-    /// The repo-root fixture both sides of the runtime->host boundary read.
+    /// The fixture both sides of the runtime->host boundary read — the
+    /// canonical copy lives at repo-root `tests/fixtures/create_mod_wire.json`
+    /// (`crates/darkmux-crew` reads it directly from there). This is a
+    /// VENDORED read-only copy at `runtime/tests/fixtures/` instead of
+    /// `../tests/fixtures/` one directory up (#2544): the runtime crate is
+    /// its own standalone Cargo workspace (see `runtime/Cargo.toml`'s own
+    /// comment), and `cargo mutants --manifest-path runtime/Cargo.toml
+    /// --copy-vcs true` copies ONLY `runtime/` into its scratch build dir —
+    /// confirmed via its own `copy_tree` debug log — so a path reaching one
+    /// directory above `runtime/` doesn't exist there and failed the
+    /// mutation run's BASELINE (exit 4, nothing ever tested) on every
+    /// invocation, mutant or not. `tests/runtime_fixtures_in_sync.rs` (at
+    /// the repo root) is the guard against the vendored copy silently
+    /// drifting from the canonical one — regenerate this file from the
+    /// canonical copy if that guard fails, never hand-edit it out of sync.
     /// Loaded at test RUNTIME (never `include_str!`), so the Docker image
-    /// build — which compiles this crate with no test targets and no repo
-    /// checkout above `runtime/` — is unaffected.
+    /// build — which compiles this crate with no test targets — is
+    /// unaffected either way.
     fn wire_fixture() -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/create_mod_wire.json");
+            .join("tests/fixtures/create_mod_wire.json");
         serde_json::from_str(&std::fs::read_to_string(&path).expect("the wire fixture")).unwrap()
     }
 
@@ -2069,10 +2083,14 @@ y = 2
 
     /// The two `for`-key predicates must agree, or a key the model is allowed
     /// to send is a mod the host silently drops. One table, both crates.
+    ///
+    /// (#2544) Same vendored-copy reasoning as `wire_fixture` above — see
+    /// its doc comment. Canonical copy: repo-root
+    /// `tests/fixtures/finding_key_cases.json`.
     #[test]
     fn the_for_key_predicate_agrees_with_the_hosts_on_the_shared_table() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/finding_key_cases.json");
+            .join("tests/fixtures/finding_key_cases.json");
         let fx: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("the key fixture")).unwrap();
         for case in fx["cases"].as_array().unwrap() {

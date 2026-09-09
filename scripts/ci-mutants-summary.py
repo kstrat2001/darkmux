@@ -444,7 +444,105 @@ def _test_module_ranges(path: Path) -> list[tuple[int, int]] | None:
     return ranges
 
 
-def count_added_lines(diff_text: str) -> tuple[int, int]:
+# ---------------------------------------------------------------------------
+# (#2544) Which paths a given `cargo mutants` invocation can actually reach.
+#
+# The floor above answers "did this diff add lines that could plausibly
+# produce a mutant" — that is only a sound gate when paired with "...and
+# could THIS invocation's scope ever see them". `quality.yml` runs two
+# mutation invocations against two different manifests: the root workspace
+# (`Cargo.toml`, `--workspace`) and `runtime/Cargo.toml` (its own standalone
+# crate, deliberately excluded from the root workspace — see the root
+# manifest's own comment). A line in `runtime/` is invisible to the FIRST
+# invocation no matter how the diff pathspec is widened — the root
+# manifest's `[workspace] exclude` list says so — and a line outside
+# `runtime/` is equally invisible to the SECOND. Counting either against the
+# wrong invocation's floor reproduces #2544: a runtime-only diff failed the
+# PR gate because the workspace-scoped run reported zero mutants against a
+# floor that expected it to reach code it structurally cannot.
+#
+# `--manifest-path <path>` (on `--count-changed-lines`) tells the counter
+# which invocation's floor it is computing. The exclusion list is READ from
+# that manifest's own `[workspace] exclude` array rather than hardcoded, so
+# a future addition to (or removal from) that array changes the floor
+# automatically instead of silently reintroducing this bug the next time
+# someone excludes a fourth project and forgets the gate exists.
+#
+# Fails open in the SAME direction as the rest of this file when the input
+# is diff/manifest CONTENT: if the manifest carries no `[workspace] exclude`
+# list, nothing is excluded — every path under the manifest's own directory
+# counts as reachable, keeping the floor armed (more code counted, never
+# less). But an EXPLICITLY-passed `--manifest-path` that cannot be READ AT
+# ALL is an operator/workflow input, not diff content — same class as the
+# `--count-changed-lines <diff>` path itself, which already exits loudly
+# rather than printing 0 — so `count_changed_lines_main` raises that as a
+# hard failure instead of silently scoping the floor to a directory nothing
+# lives under.
+# ---------------------------------------------------------------------------
+
+_WORKSPACE_TABLE_RE = re.compile(r"^\[workspace\]\s*$", re.MULTILINE)
+_ANY_TABLE_HEADER_RE = re.compile(r"^\[[^\]]*\]\s*$", re.MULTILINE)
+_EXCLUDE_ARRAY_RE = re.compile(r"^\s*exclude\s*=\s*\[(.*?)\]", re.DOTALL | re.MULTILINE)
+_QUOTED_STRING_RE = re.compile(r'"([^"]*)"')
+
+
+def parse_workspace_exclude(manifest_text: str) -> list[str]:
+    """Extract the `[workspace] exclude = [...]` array's string values from a
+    Cargo.toml's raw text. Not a TOML parser — a small, targeted regex, in
+    the same spirit as the rest of this file's diff handling: good enough
+    for this manifest's actual shape (a single- or multi-line quoted-string
+    array), and returns `[]` (fails open) for anything else, including a
+    manifest with no `[workspace]` table, or a `[workspace]` table with no
+    `exclude` key."""
+    m = _WORKSPACE_TABLE_RE.search(manifest_text)
+    if not m:
+        return []
+    next_header = _ANY_TABLE_HEADER_RE.search(manifest_text, m.end())
+    body = manifest_text[m.end() : next_header.start() if next_header else len(manifest_text)]
+    em = _EXCLUDE_ARRAY_RE.search(body)
+    if not em:
+        return []
+    return _QUOTED_STRING_RE.findall(em.group(1))
+
+
+def manifest_scope(manifest_path: Path) -> tuple[str, list[str]]:
+    """Return `(manifest_dir, excluded_prefixes)` for `manifest_path`:
+    `manifest_dir` is that manifest's own directory, POSIX-style and
+    relative to the repo root (`""` for a root `Cargo.toml`);
+    `excluded_prefixes` are the paths its own `[workspace] exclude` array
+    names, relative to `manifest_dir`. Raises `OSError` if the file cannot
+    be read — the caller decides whether that is a hard failure (an
+    explicit `--manifest-path`) or should fail open (no flag given)."""
+    text = manifest_path.read_text()
+    manifest_dir = manifest_path.parent.as_posix()
+    if manifest_dir == ".":
+        manifest_dir = ""
+    return manifest_dir, parse_workspace_exclude(text)
+
+
+def reachable_predicate(manifest_dir: str, excluded_prefixes: list[str]):
+    """Build the `reachable(path) -> bool` predicate `count_added_lines`
+    takes: True iff `path` (repo-root-relative, as it appears in a diff's
+    `+++ b/<path>` header) is under `manifest_dir` and not under any of
+    `excluded_prefixes` (each relative to `manifest_dir`)."""
+
+    def reachable(path: str) -> bool:
+        posix_path = Path(path).as_posix()
+        if manifest_dir:
+            prefix = manifest_dir + "/"
+            if not posix_path.startswith(prefix):
+                return False
+            scoped = posix_path[len(prefix) :]
+        else:
+            scoped = posix_path
+        return not any(
+            scoped == excl or scoped.startswith(excl + "/") for excl in excluded_prefixes
+        )
+
+    return reachable
+
+
+def count_added_lines(diff_text: str, reachable=None) -> tuple[int, int]:
     """Return (added, countable) over a unified diff.
 
     `added` is every added line, the number the workflow's old `grep -cE
@@ -457,7 +555,13 @@ def count_added_lines(diff_text: str) -> tuple[int, int]:
     new-file line number each added line belongs to, so it can also exclude
     a file under a `tests/` directory entirely, or a line inside a
     `#[cfg(test)]` item (see the module comment for the exclusion mechanism
-    and its known gaps)."""
+    and its known gaps).
+
+    `reachable`, if given, is a `Callable[[str], bool]` (see
+    `reachable_predicate` above) — a file for which it returns False is
+    excluded wholesale, the same way a `tests/` file already is (#2544: a
+    path outside this invocation's mutation scope can never produce a
+    mutant regardless of what it contains)."""
     added = 0
     countable = 0
     file_path: str | None = None
@@ -482,6 +586,8 @@ def count_added_lines(diff_text: str) -> tuple[int, int]:
             else:
                 file_path = raw
                 skip_file = "tests" in Path(raw).parent.parts
+                if not skip_file and reachable is not None and not reachable(raw):
+                    skip_file = True  # (#2544) out of this invocation's mutation scope
                 if skip_file:
                     file_ranges = None
                 else:
@@ -520,12 +626,37 @@ def count_added_lines(diff_text: str) -> tuple[int, int]:
 
 
 def count_changed_lines_main(args: list[str]) -> int:
-    """`--count-changed-lines <diff>`: print the countable total on stdout (the
-    workflow captures it) and the breakdown on stderr (the job log reads it).
+    """`--count-changed-lines <diff> [--manifest-path <path>]`: print the
+    countable total on stdout (the workflow captures it) and the breakdown
+    on stderr (the job log reads it).
 
     Anything that goes wrong exits non-zero rather than printing a 0. A guard
     that cannot read its input must fail the step, not silently disarm itself —
-    which is the whole shape of #1716."""
+    which is the whole shape of #1716.
+
+    `--manifest-path`, when given, scopes the count to what THAT manifest's
+    `cargo mutants` invocation can reach (#2544) — see the module comment
+    above `parse_workspace_exclude`. Omitted entirely, behavior is unchanged
+    from before #2544: every added line counts, regardless of path. An
+    UNREADABLE `--manifest-path` is a hard failure (exit 2), the same as an
+    unreadable diff — a typo'd flag must not silently narrow the floor to a
+    directory nothing lives under."""
+    args = list(args)
+    reachable = None
+    if "--manifest-path" in args:
+        mi = args.index("--manifest-path")
+        if mi + 1 >= len(args):
+            print("--manifest-path requires a path to a Cargo.toml", file=sys.stderr)
+            return 2
+        manifest_arg = args[mi + 1]
+        del args[mi : mi + 2]
+        try:
+            manifest_dir, excluded_prefixes = manifest_scope(Path(manifest_arg))
+        except OSError as exc:
+            print(f"--manifest-path could not read {manifest_arg}: {exc}", file=sys.stderr)
+            return 2
+        reachable = reachable_predicate(manifest_dir, excluded_prefixes)
+
     i = args.index("--count-changed-lines")
     if i + 1 >= len(args):
         print("--count-changed-lines requires a path to a unified diff", file=sys.stderr)
@@ -536,12 +667,12 @@ def count_changed_lines_main(args: list[str]) -> int:
     except OSError as exc:
         print(f"--count-changed-lines could not read {path}: {exc}", file=sys.stderr)
         return 2
-    added, countable = count_added_lines(text)
+    added, countable = count_added_lines(text, reachable=reachable)
     print(countable)
     print(
         f"{added} added Rust line(s) in scope; {countable} could plausibly produce a "
         f"mutant ({added - countable} blank / structure-only / comment-only / "
-        "attribute-only)",
+        "attribute-only / outside this invocation's mutation scope)",
         file=sys.stderr,
     )
     return 0
@@ -1186,6 +1317,135 @@ TEST_MODULE_SELF_TEST_CASES = [
 COUNT_SELF_TEST_CASES += TEST_MODULE_SELF_TEST_CASES
 
 
+# ---------------------------------------------------------------------------
+# (#2544) The manifest-scoping half: `--manifest-path` and the exclusion list
+# it derives from a `[workspace] exclude` array, reproducing the exact
+# failure #2544 proved on #2599 (a diff entirely under `runtime/`, floor
+# counted it as reachable by the root `--workspace` invocation, that
+# invocation reported zero mutants — legitimately, since it structurally
+# cannot see `runtime/` — and the gate failed a diff nothing was wrong
+# with).
+# ---------------------------------------------------------------------------
+
+# The real repo's root manifest shape, reproduced (not read from disk — see
+# the "run isolated" comment on `count_self_test`).
+_ROOT_MANIFEST = (
+    "[workspace]\n"
+    'members = [".", "crates/darkmux-types"]\n'
+    "# comment between members and exclude, like the real file\n"
+    'exclude = ["runtime", "plugins/darkmux-bundler-rust", "tools/darkmux-mock-model"]\n'
+    "\n"
+    "[package]\n"
+    'name = "darkmux"\n'
+)
+
+# `runtime/Cargo.toml`'s real shape: its own empty `[workspace]` table (makes
+# it a standalone crate root), no `exclude` — see the file's own comment for
+# why (needs to resolve independently of the parent workspace).
+_RUNTIME_MANIFEST = "[workspace]\n\n[package]\nname = \"darkmux-runtime\"\n"
+
+# A manifest with no `[workspace]` table at all — the fail-open case: nothing
+# can be excluded when there is nothing to read it from.
+_NO_WORKSPACE_MANIFEST = '[package]\nname = "standalone"\n'
+
+_DIFF_RUNTIME_ONLY = (
+    "--- a/runtime/src/loop_runner.rs\n"
+    "+++ b/runtime/src/loop_runner.rs\n"
+    "@@ -10,3 +10,6 @@\n"
+    "+\n"
+    "+pub fn helper() -> usize {\n"
+    "+    1 + 1\n+}\n"
+)
+
+_DIFF_ROOT_SRC_ONLY = (
+    "--- a/src/mission_status.rs\n"
+    "+++ b/src/mission_status.rs\n"
+    "@@ -10,3 +10,6 @@\n"
+    "+\n"
+    "+pub fn helper() -> usize {\n"
+    "+    1 + 1\n+}\n"
+)
+
+MANIFEST_SCOPE_SELF_TEST_CASES = [
+    {
+        # THE #2544 REPRODUCTION. Without the fix, this diff counts 2 (real
+        # code) against the root manifest and fails the gate — exactly the
+        # false failure proven on #2599. With the fix, `runtime/` is outside
+        # the root manifest's own `[workspace] exclude`, so the floor reads
+        # this as legitimately unreachable and the gate PASSES.
+        "name": "#2544: a runtime-only diff is invisible to the root-manifest floor, and the gate passes",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _ROOT_MANIFEST,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # The other half: an ordinary src/ diff is completely unaffected by
+        # the new exclusion mechanism — it is not under any excluded prefix.
+        "name": "#2544: a normal src/ diff still counts fully under the root-manifest floor",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _ROOT_MANIFEST,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        # THE SECOND INVOCATION'S floor: the SAME runtime-only diff, scoped
+        # to `runtime/Cargo.toml` instead. This manifest's own `[workspace]`
+        # is empty (no exclude), and its directory IS `runtime`, so the
+        # lines are now reachable and the floor is armed — proving the
+        # runtime invocation's own floor actually counts what it should,
+        # not just that the root floor correctly ignores it.
+        "name": "#2544: the same runtime-only diff counts fully under runtime/Cargo.toml's own floor",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "runtime/Cargo.toml",
+        "manifest_content": _RUNTIME_MANIFEST,
+        "manifest_arg": "runtime/Cargo.toml",
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        # A file OUTSIDE runtime/ is equally invisible to the runtime
+        # manifest's own invocation — the exclusion is symmetric, not just
+        # "runtime is special".
+        "name": "#2544: a root src/ diff is invisible to the runtime-manifest floor",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "manifest_path": "runtime/Cargo.toml",
+        "manifest_content": _RUNTIME_MANIFEST,
+        "manifest_arg": "runtime/Cargo.toml",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # Fail-open: a manifest with no `[workspace]` table at all excludes
+        # nothing, so the runtime-only diff counts as if unscoped — the
+        # heuristic never invents an exclusion it cannot read.
+        "name": "#2544: a manifest with no [workspace] table excludes nothing (fails open)",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _NO_WORKSPACE_MANIFEST,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        # An explicit `--manifest-path` that cannot be read at all is a hard
+        # failure, not a silent empty-exclude-list — a typo'd flag must not
+        # quietly shrink the floor's reachable scope to a directory nothing
+        # lives under and pass every PR that touches it.
+        "name": "#2544: an unreadable --manifest-path fails loudly, not open",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_arg": "does-not-exist/Cargo.toml",
+        "expect_exit": 2,
+    },
+]
+
+COUNT_SELF_TEST_CASES += MANIFEST_SCOPE_SELF_TEST_CASES
+
+
 def _run_self(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), *argv],
@@ -1219,18 +1479,37 @@ def count_self_test() -> list[str]:
                 dest = tmp_path / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(content)
+            # (#2544) Optional manifest fixture — write it at `manifest_path`
+            # (relative to this same isolated tempdir) when supplied, and
+            # pass `--manifest-path <manifest_arg>` on the counter's argv.
+            # `manifest_arg` may legitimately name a path with NOTHING
+            # written there (the unreadable-manifest case), which is the
+            # point of that case.
+            if "manifest_content" in case:
+                mdest = tmp_path / case["manifest_path"]
+                mdest.parent.mkdir(parents=True, exist_ok=True)
+                mdest.write_text(case["manifest_content"])
+            count_argv = ["--count-changed-lines", str(diff_path)]
+            if "manifest_arg" in case:
+                count_argv += ["--manifest-path", case["manifest_arg"]]
+            expect_exit = case.get("expect_exit", 0)
             problems = []
 
-            proc = _run_self(["--count-changed-lines", str(diff_path)], cwd=tmp_path)
+            proc = _run_self(count_argv, cwd=tmp_path)
             got = proc.stdout.strip()
-            if proc.returncode != 0:
-                problems.append(f"counter exited {proc.returncode}: {proc.stderr.strip()}")
+            if proc.returncode != expect_exit:
+                problems.append(
+                    f"counter exited {proc.returncode}, expected {expect_exit}: "
+                    f"{proc.stderr.strip()}"
+                )
+            elif expect_exit != 0:
+                pass  # a deliberate hard failure — no count/gate to check
             elif got != str(case["expect_count"]):
                 problems.append(f"counted {got!r}, expected {case['expect_count']}")
 
             # Hand the count straight to the floor, the way the workflow does:
             # exit 0, no output directory, i.e. "ran and mutated nothing".
-            if proc.returncode == 0:
+            if expect_exit == 0 and proc.returncode == 0:
                 gate = _run_self(
                     [
                         "0",
