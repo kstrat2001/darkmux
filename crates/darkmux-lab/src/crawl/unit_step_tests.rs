@@ -1327,14 +1327,14 @@ fn every_terminal_state_counter_on_the_summary_is_accounted_for_in_stopped_by() 
         workspace: _,
         units_in_plan: _,
         units_selected: _,
-        // EXCLUDED on purpose, but not for the reason #2274 gave — that
-        // issue blamed this on deselected units (`--param units=`/
-        // `limit=`) getting folded in, and was closed as stale: that
-        // mechanism no longer exists (`select_units`/`crawl_launch.rs`
-        // were deleted in #2301/#2313). With deselection gone,
-        // `units_not_run` today means genuinely unreached. A branch for
-        // it is #2573's job, deliberately not folded into `stopped_by`
-        // here.
+        // Consulted (#2573) — ranked behind `"thermal"`, ahead of
+        // `"interrupted"` and `"error"`. Counts a unit whose row exists but
+        // never settled (still `Planned`/`Running` at summary time) PLUS a
+        // unit that never even got a row grown for it at all — the two
+        // disjoint halves of "never ran". Before #2573 this counter was
+        // never consulted, which is exactly why a still-pending unit's row
+        // (named `"not_run"` by `errored_row`) fell through into the
+        // `units_errored` leftover instead of its own bucket.
         units_not_run: _,
         // The "nothing wrong" bucket — not a stop cause by definition.
         units_completed: _,
@@ -1363,6 +1363,319 @@ fn every_terminal_state_counter_on_the_summary_is_accounted_for_in_stopped_by() 
         finding_refs: _,
         plans_errored: _,
     } = s;
+}
+
+/// (#2573) The bug: a unit whose step never settled — still `Running` at
+/// summary time because the mission died before either the scheduler
+/// finished with it or the abandon-reconciliation that would have marked
+/// it `Abandoned` ever ran — DOES get a row (`errored_row` names its
+/// result `"not_run"`). `units_not_run` was computed by subtracting the
+/// ROW COUNT from the plan total, and this row is IN the row count, so
+/// the subtraction landed on zero and the pending unit fell into the
+/// `units_errored` leftover instead — a unit that never got the chance to
+/// succeed OR fail, reported as a failure.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_still_pending_unit_is_named_not_run_not_folded_into_errored() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let run_dir = darkmux_crew::loader::missions_dir().join(MISSION);
+    fs::create_dir_all(run_dir.join("plan")).unwrap();
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    fs::copy(&plan, run_dir.join("plan").join("unnamed-predicate.json")).unwrap();
+    // The mission died mid-dispatch: the step is still `Running`, with no
+    // output, and no abandon-reconciliation ever touched it.
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Running, None);
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_in_plan, 1);
+    assert_eq!(s.units_not_run, 1, "the pending unit's row is counted by name, not lost to subtraction");
+    assert_eq!(s.units_errored, 0, "a unit that never ran is not folded into the error count");
+    assert_eq!(
+        s.stopped_by, "not_run",
+        "a truncated run must not read as either a clean finish or a genuine failure"
+    );
+}
+
+/// (#2573) The other, disjoint half of "never ran": a unit the plan named
+/// but for which no `crawl.unit` step was ever grown at all — no row, no
+/// `result` to name. This is what the pre-fix subtraction correctly
+/// caught on its own; pinned here so the two halves stay separately
+/// provable and the sum in the class test below is not an accident of one
+/// half papering over a broken other half.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_unit_the_plan_named_with_no_step_ever_grown_also_counts_as_not_run() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let run_dir = darkmux_crew::loader::missions_dir().join(MISSION);
+    fs::create_dir_all(run_dir.join("plan")).unwrap();
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    fs::copy(&plan, run_dir.join("plan").join("unnamed-predicate.json")).unwrap();
+    // No step is ever grown/saved for this unit — the plan names it and
+    // nothing on disk ever mentions it again.
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_in_plan, 1);
+    assert_eq!(s.units.len(), 0, "no row exists for the ungrown unit");
+    assert_eq!(s.units_not_run, 1, "counted via plan-minus-rows, disjoint from a named row");
+    assert_eq!(s.stopped_by, "not_run");
+}
+
+/// (#2603 review, MUST FIX) The bug: a step that reached `Complete` — the
+/// scheduler recorded a terminal, SUCCESSFUL status; nothing was
+/// truncated — but recorded empty/whitespace-only output fell through
+/// `errored_row`'s `_` catch-all the same as a genuinely never-ran
+/// `Planned`/`Running` step, so it was named `"not_run"` too. Once #2573
+/// ranked `"not_run"` ahead of `"interrupted"` in `stopped_by`, that
+/// completed-but-empty row could outrank a GENUINE, attributed operator
+/// interrupt alongside it — the exact inverse of #2573's own
+/// justification (the thing that actually ended the run outranks whatever
+/// merely happened along the way; a step that completed did not end the
+/// run). The fixture is the reviewer's own: one `Complete` step with no
+/// output, alongside one `Abandoned` step. Before this fix:
+/// `not_run=1 interrupted=1 errored=0 stopped_by="not_run"`. After:
+/// `not_run=0 interrupted=1 errored=1 stopped_by="interrupted"` — matching
+/// what a full revert of #2573 produces on this same fixture, because a
+/// `Complete`-with-no-output row belongs in the SAME bucket it was in
+/// before #2573 ever existed.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_completed_steps_empty_row_does_not_outrank_a_genuine_interrupt() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    // Reached `Complete`, but recorded nothing — NOT the same as never
+    // having run at all.
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, None);
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Abandoned, None);
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_not_run, 0, "a completed step's empty row is not a never-ran unit");
+    assert_eq!(s.units_interrupted, 1);
+    assert_eq!(s.units_errored, 1, "the completed-but-empty row lands where it did before #2573");
+    assert_eq!(
+        s.stopped_by, "interrupted",
+        "a step that completed must not hide a genuine, attributed operator abort"
+    );
+    let empty_row = s.units.iter().find(|u| u.unit == "u1").expect("the completed step has a row");
+    assert_eq!(empty_row.result, "empty", "named distinctly from `not_run` — it did run");
+}
+
+/// (#2573) Ranking, half one: a not-run unit alongside an EARLIER error
+/// still names `"not_run"` — the truncation is what makes this run short,
+/// not the earlier per-unit failure that happened along the way. Same
+/// precedence rule #2454/#2569 established for `"thermal"`/`"interrupted"`
+/// vs `"error"`, applied to the new branch.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn not_run_outranks_an_earlier_error() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    // Errored before the mission ever died.
+    save_unit_step(
+        MISSION,
+        PHASE,
+        "u1",
+        NodeStatus::Error,
+        Some("`crawl.unit`: unit `u-0001` ended `timeout` — dispatch ended `timeout`"),
+    );
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Running, None);
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_errored, 1);
+    assert_eq!(s.units_not_run, 1);
+    assert_eq!(
+        s.stopped_by, "not_run",
+        "the never-ran unit is the more honest headline than an earlier error"
+    );
+}
+
+/// (#2573) Ranking, half two: a not-run unit outranks an `"interrupted"`
+/// unit alongside it. The mechanism this covers directly: the mission's
+/// OWN abandon-reconciliation reached one step before losing the race
+/// against the crash that killed it — that step reads `"interrupted"`,
+/// clean and attributed — but never reached this one, which is left
+/// exactly as `errored_row` finds it: not attributed to anything.
+/// `"not_run"` is the more honest headline, because it says the run's own
+/// bookkeeping is incomplete, not just that the operator meant to stop it.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn not_run_outranks_an_interrupt_alongside_it() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Abandoned, None);
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Planned, None);
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_interrupted, 1);
+    assert_eq!(s.units_not_run, 1);
+    assert_eq!(
+        s.stopped_by, "not_run",
+        "reconciliation losing the race is a more honest headline than a partial interrupt"
+    );
+}
+
+/// (#2573) Ranking, half three: the thermal breaker still outranks a
+/// not-run unit alongside it, for the same reason it already outranks an
+/// interrupt (#2569) — when the breaker fired at all, the hardware
+/// constraint is the more useful thing to surface, and a not-run tail
+/// after a thermal stop reads as the breaker's aftermath, not a separate
+/// story.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn thermal_still_outranks_a_not_run_unit_alongside_it() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", THERMAL_STOP, 0, 0, 0)));
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Running, None);
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_skipped, 1);
+    assert_eq!(s.units_not_run, 1);
+    assert_eq!(s.stopped_by, "thermal", "the breaker outranks a not-run unit alongside it");
+}
+
+/// (#2573) The class test: every terminal-state bucket on `CrawlSummary`
+/// reconciles EXACTLY to the plan total across a mixed fixture covering
+/// every outcome a unit can land in — two completions (so "more than one
+/// unit finished" is exercised, not just a single row), one budget
+/// exhaustion, one genuine error, one operator-side interrupt, one
+/// thermal skip, one named-`"not_run"` row (grown, never settled), and one
+/// unit the plan named for which no step was ever grown at all. Eight
+/// units in, eight units accounted for — the reconciliation an adversarial
+/// review of the original fix confirmed, pinned here as a standing
+/// invariant rather than a one-off measurement.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn eight_units_covering_every_outcome_reconcile_exactly_to_the_plan_total() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let run_dir = darkmux_crew::loader::missions_dir().join(MISSION);
+    fs::create_dir_all(run_dir.join("plan")).unwrap();
+    let ws = TempDir::new().unwrap();
+    // Eight planned units, one per rule — the eighth (`r8`) never gets a
+    // step grown for it at all.
+    for (i, rule) in ["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"].iter().enumerate() {
+        let plan = write_plan(ws.path(), rule, &format!("u-000{}", i + 1), &"a".repeat(40));
+        fs::copy(&plan, run_dir.join("plan").join(format!("{rule}.json"))).unwrap();
+    }
+
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", "stop", 1, 10, 10)));
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Complete, Some(&outcome_json("u-0002", "stop", 2, 20, 20)));
+    save_unit_step(
+        MISSION,
+        PHASE,
+        "u3",
+        NodeStatus::Complete,
+        Some(&outcome_json("u-0003", UNIT_BUDGET_EXHAUSTED, 0, 5, 5)),
+    );
+    save_unit_step(
+        MISSION,
+        PHASE,
+        "u4",
+        NodeStatus::Error,
+        Some("`crawl.unit`: unit `u-0004` ended `error` — container refused"),
+    );
+    save_unit_step(MISSION, PHASE, "u5", NodeStatus::Abandoned, None);
+    save_unit_step(MISSION, PHASE, "u6", NodeStatus::Complete, Some(&outcome_json("u-0006", THERMAL_STOP, 0, 0, 0)));
+    save_unit_step(MISSION, PHASE, "u7", NodeStatus::Running, None);
+    // u8: no step grown at all.
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_in_plan, 8);
+    assert_eq!(s.units_completed, 2);
+    assert_eq!(s.units_budget_exhausted, 1);
+    assert_eq!(s.units_errored, 1);
+    assert_eq!(s.units_interrupted, 1);
+    assert_eq!(s.units_skipped, 1);
+    assert_eq!(s.units_not_run, 2, "one named `not_run` row plus one unit never grown at all");
+    let reconciled = s.units_completed
+        + s.units_budget_exhausted
+        + s.units_errored
+        + s.units_interrupted
+        + s.units_skipped
+        + s.units_not_run;
+    assert_eq!(
+        reconciled, s.units_in_plan,
+        "every bucket, summed, must land exactly on the plan total when every planned unit got at \
+         most one row — no unit double-counted or dropped. (This is NOT a general invariant: it \
+         holds only under that one-row-per-planned-unit correspondence. See \
+         `an_unreadable_plan_file_breaks_the_one_row_per_unit_correspondence_and_the_sum_over_counts` \
+         for the case where it doesn't.)"
+    );
+    assert_eq!(s.stopped_by, "thermal", "the breaker still wins the naming even with every other bucket populated");
+
+    // (#2603 review) The sum alone doesn't prove each unit landed in the
+    // RIGHT bucket — four of these six buckets hold exactly one row, so a
+    // mutation that swaps which bucket two of them land in (e.g. swapping
+    // `errored_row`'s `Abandoned`/`Error` arms) leaves every count above
+    // unchanged. Pin membership too: which unit id carries which result.
+    assert_eq!(s.units.len(), 7, "u8 never got a step grown for it at all, so it has no row");
+    let by_unit = |id: &str| s.units.iter().find(|u| u.unit == id).unwrap_or_else(|| panic!("no row for unit {id}"));
+    assert_eq!(by_unit("u-0001").result, "stop");
+    assert_eq!(by_unit("u-0002").result, "stop");
+    assert_eq!(by_unit("u-0003").result, UNIT_BUDGET_EXHAUSTED);
+    // u4/u5/u7 never went through `outcome_json`, so `errored_row`'s
+    // `config.unit` fallback names them by their STEP id instead.
+    assert_eq!(by_unit("u4").result, "error", "the errored step, not swapped with the abandoned one");
+    assert_eq!(by_unit("u5").result, "interrupted", "the abandoned step, not swapped with the errored one");
+    assert_eq!(by_unit("u-0006").result, THERMAL_STOP);
+    assert_eq!(by_unit("u7").result, "not_run");
+}
+
+/// (#2603 review) The partition invariant the class test above pins
+/// ("every bucket, summed, lands exactly on `units_in_plan`") is
+/// CONDITIONAL, not general: it holds only when every row in `s.units`
+/// corresponds to a unit `plan_totals` also counted. That correspondence
+/// breaks when a `plan/<rule>.json` file exists on disk but fails to
+/// parse — `plan_totals` silently skips it (its own doc: "An unreadable/
+/// unparseable plan file is skipped"), undercounting `units_in_plan`,
+/// while the unit STEPS grown from that same rule are read from the
+/// phase's step records, not from the plan file, so they still produce
+/// rows. The gap this leaves (`units_in_plan.saturating_sub(rows.len())`
+/// inside `units_not_run`) SATURATES to zero instead of going negative,
+/// so every bucket's own count stays correct for the rows that exist, but
+/// their sum now EXCEEDS `units_in_plan`. Pre-existing behavior, not
+/// introduced by #2573/#2603 — documented here as a known non-partition
+/// case rather than asserted as a bug.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn an_unreadable_plan_file_breaks_the_one_row_per_unit_correspondence_and_the_sum_over_counts() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let run_dir = darkmux_crew::loader::missions_dir().join(MISSION);
+    fs::create_dir_all(run_dir.join("plan")).unwrap();
+    // The plan file is present but unparseable — `plan_totals` skips it,
+    // so `units_in_plan` is 0 even though a step for it exists below.
+    fs::write(run_dir.join("plan").join("r1.json"), "not valid json").unwrap();
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", "stop", 1, 10, 10)));
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_in_plan, 0, "the unreadable plan file contributed nothing to the plan total");
+    assert_eq!(s.units_completed, 1, "the step's own row still exists and is still counted correctly");
+    assert_eq!(s.units_not_run, 0, "saturating_sub floors at zero rather than going negative");
+    let reconciled = s.units_completed
+        + s.units_budget_exhausted
+        + s.units_errored
+        + s.units_interrupted
+        + s.units_skipped
+        + s.units_not_run;
+    assert!(
+        reconciled > s.units_in_plan,
+        "the sum ({reconciled}) exceeds the plan total ({}) — the partition invariant does not hold \
+         here, by construction, because the row-per-unit correspondence itself is broken",
+        s.units_in_plan
+    );
 }
 
 #[test]

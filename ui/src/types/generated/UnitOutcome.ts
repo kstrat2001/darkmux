@@ -21,7 +21,13 @@ rule: string | null, source: string,
 /**
  * `stop` | `unit_budget_exhausted` | `timeout` | `error` |
  * `thermal_stop` (#2454 — the breaker's STOP file was present before
- * this unit ever dispatched).
+ * this unit ever dispatched) — a `UnitOutcome` a unit's own dispatch
+ * wrote. Plus three the SUMMARY builds itself for a step that
+ * produced no `UnitOutcome` at all (see `errored_row`): `interrupted`
+ * (the step's status was `Abandoned`), `not_run` (still `Planned`/
+ * `Running` at summary time — never settled), and `empty` (#2603 —
+ * `Complete`, but recorded nothing; NOT `not_run`, because it did
+ * run).
  */
 result: string, 
 /**
