@@ -264,6 +264,20 @@ jobs:
 
       - name: Mutate only what this PR touched
         id: mutants
+        # (#2602 round 3) `!cancelled()`, matching "Report survivors" below
+        # (and the runtime/ and plugins/darkmux-bundler-rust/ pairs further
+        # down): this step previously had no condition at all, which is an
+        # IMPLICIT `success()` gate — on any earlier step's failure this step
+        # skips while "Report survivors" (`always()` below, now `!cancelled()`)
+        # still runs and reads an empty `steps.mutants.outputs.exit_code`,
+        # the exact drift the round-2 fix's own comment says must never
+        # happen between a Mutate/Report pair. The round-2 fix put the two
+        # OTHER pairs into lockstep on `!cancelled()` and left this, the
+        # ROOT pair, on the primitive it discarded. An empty exit_code is now
+        # honest (see the summary script's own empty-exit_code message)
+        # rather than a raw integer-parse crash, so this was mitigated, not a
+        # gate hole — but the pair was still out of lockstep.
+        if: ${{ !cancelled() }}
         run: |
           # (#1716) No more `|| true`. That swallowed EVERY exit code,
           # including 4 (BaselineFailed — the unmutated tree's own tests
@@ -339,7 +353,11 @@ jobs:
           exit 0
 
       - name: Report survivors
-        if: always()
+        # (#2602 round 3) `always()` -> `!cancelled()`, matching "Mutate only
+        # what this PR touched" above — see that step's comment. Kept in
+        # lockstep with its own Mutate step, same shape as the runtime/ and
+        # plugins/darkmux-bundler-rust/ pairs below.
+        if: ${{ !cancelled() }}
         run: |
           python3 scripts/ci-mutants-summary.py \
             "${{ steps.mutants.outputs.exit_code }}" diff \

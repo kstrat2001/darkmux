@@ -52,6 +52,16 @@
 //! shape #1716's own summary-script self-test exists to catch elsewhere in
 //! this repo. `check_known_fixtures_present` below asserts the NAMED
 //! fixtures are present, matching what the panic message already claimed.
+//!
+//! (#2602 round 3 — worth recording, not fixing) One shape this guard
+//! still cannot catch: if BOTH named fixtures were truncated to empty on
+//! BOTH sides (canonical and vendored), `assert_eq!` compares two empty
+//! strings and passes, and `check_known_fixtures_present` only checks
+//! presence, not content — so it also passes. Low value to close: the
+//! canonical copy going empty would break `crates/darkmux-crew`'s own tests
+//! loudly (it reads the same file directly), so this guard isn't the only
+//! thing standing between that regression and a green run. Left as a known
+//! gap rather than a third check.
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;

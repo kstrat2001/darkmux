@@ -1100,6 +1100,27 @@ SELF_TEST_CASES = [
         ],
     },
     {
+        # (#2602 round 3) The exact scenario the round-2 fix named but did
+        # not fully cover: the diff step failed upstream, so BOTH GitHub
+        # Actions substitutions arrive empty — exit_code AND changed-lines.
+        # `--changed-lines` is parsed FIRST (before the exit_code check
+        # above), so without this case's fix the reader hit
+        # "--changed-lines must be an integer, got ''" — the identical
+        # confusing integer-parse complaint the exit_code case above exists
+        # to rule out, just moved one argument over.
+        "name": "an empty --changed-lines (the diff step never ran either) fails, honestly",
+        "argv": ["", "diff", "T", "--changed-lines", ""],
+        "files": None,
+        "expect_exit": 2,
+        "must_contain": ["changed-lines is empty", "did not run"],
+        "must_not_contain": [
+            "No surviving mutants",
+            "nothing to mutate",
+            "changed-lines must be an integer",
+            "exit_code must be an integer",
+        ],
+    },
+    {
         "name": "exit 2 with real survivors lists them (advisory pass)",
         "argv": ["2", "diff", "T"],
         "files": {
@@ -1669,16 +1690,35 @@ _MALFORMED_MANIFEST_DUPLICATE_KEY = (
 )
 
 # The reviewer's second reproduction (round 2): a byte-order mark ahead of
-# the SAME comment-bearing array above. `tomllib` cannot parse past a literal
-# BOM character read as plain `utf-8`; `cargo` accepts a BOM-prefixed
-# manifest without complaint. Before the `utf-8-sig` fix, this decode failure
-# would have gone through the now-deleted regex fallback, which would have
-# re-triggered the ORIGINAL #2602 bug (the comment's `"src"` picked up as a
-# third exclusion) on this exact array shape — a BOM defeating the strict
-# parser and quietly resurrecting the bug the strict parser was built to
-# fix. `utf-8-sig` strips the BOM before it ever reaches `tomllib`, so this
-# is a non-event: no decode error, no warning, correct exclusions.
+# the SAME comment-bearing array above, with a leading comment block between
+# the mark and the `[workspace]` header — `runtime/Cargo.toml`'s own real
+# shape (see that file), which is what this fixture models. That leading
+# comment matters to the claim below: a BOM sitting DIRECTLY before
+# `[workspace]` (nothing between them) instead breaks the OLD regex
+# fallback's `^\[workspace\]` anchor outright — no preceding newline for
+# `^` to match after, and the BOM character itself isn't `[` — so the old
+# fallback would have found no `[workspace]` table at all and returned `[]`,
+# FAILING OPEN, not the wrong-three-entry mis-parse this fixture is captioned
+# with. Confirmed by running the old fallback's own regex against both
+# shapes: BOM directly before `[workspace]` returns no match at all; BOM
+# plus a comment line ahead of the table (this fixture's actual shape) finds
+# `[workspace]` fine (the comment line's own trailing newline is what the
+# anchor needs) and mis-parses the exclude array exactly as the caption
+# claims.
+#
+# `tomllib` cannot parse past a literal BOM character read as plain
+# `utf-8`; `cargo` accepts a BOM-prefixed manifest without complaint (with
+# or without a comment ahead of the table). Before the `utf-8-sig` fix, this
+# decode failure would have gone through the now-deleted regex fallback,
+# which would have re-triggered the ORIGINAL #2602 bug (the comment's
+# `"src"` picked up as a third exclusion) on this exact array shape — a BOM
+# defeating the strict parser and quietly resurrecting the bug the strict
+# parser was built to fix. `utf-8-sig` strips the BOM before it ever reaches
+# `tomllib`, so this is a non-event: no decode error, no warning, correct
+# exclusions.
 _BOM_MANIFEST_WITH_ARRAY_COMMENT = "\ufeff" + (
+    "# A leading comment block ahead of the table, like\n"
+    "# runtime/Cargo.toml's own real shape — see that file.\n"
     "[workspace]\n"
     'members = [".", "crates/darkmux-types"]\n'
     "exclude = [\n"
@@ -1833,6 +1873,32 @@ MANIFEST_PARSE_SELF_TEST_CASES = [
         "expect_stderr_not_contains": ["did not parse as TOML", "failing open"],
     },
     {
+        # (#2602 round 3) THE case `expect_stderr_not_contains` actually
+        # needs — the other case above pairs this same manifest with
+        # `_DIFF_RUNTIME_ONLY`, so a regression that makes the BOM manifest
+        # fail to decode again (fail-open, exclude=[]) would ALSO flip that
+        # case's count from 0 to 2 — caught by the count assertion alone,
+        # making its `expect_stderr_not_contains` redundant today. Here the
+        # diff is `_DIFF_ROOT_SRC_ONLY` instead: `src/` is not in this
+        # manifest's exclude list either way, so the count/gate (2/1) is
+        # IDENTICAL whether the BOM manifest parses correctly or regresses
+        # to failing open. Only the stderr assertion can tell the two apart
+        # — this is the case that proves the negative-stderr loop is not a
+        # surviving mutant. Red-proved by reverting `manifest_scope`'s read
+        # from `utf-8-sig` back to plain `utf-8` (round 2's actual fix): the
+        # count/gate still pass unchanged, and only this case's
+        # `expect_stderr_not_contains` fails, catching the regression the
+        # count assertion structurally cannot see here.
+        "name": "#2602 round 3: a byte-order mark still parses quietly even on a diff the exclude list can't affect either way",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _BOM_MANIFEST_WITH_ARRAY_COMMENT,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 2,
+        "expect_gate": 1,
+        "expect_stderr_not_contains": ["did not parse as TOML", "failing open"],
+    },
+    {
         # A `[workspace]` table found with an `exclude` key that parses as
         # TOML but is not a list of strings warns and fails open (nothing
         # excluded), rather than crashing or silently doing nothing.
@@ -1942,10 +2008,21 @@ def count_self_test() -> list[str]:
                     problems.append(f"stderr is missing {needle!r}: {proc.stderr.strip()}")
 
             # (#2602 round 2) The inverse assertion — proving a clean parse
-            # stays QUIET. Without this, a case like the BOM-tolerance one
-            # below could pass on count/gate alone while silently regressing
-            # to "parses, but with a spurious warning" and nobody would
-            # notice.
+            # stays QUIET. Most cases that carry this are also affected by
+            # the manifest's own exclude list, so for them count/gate alone
+            # would already catch a regression to "parses, but with a
+            # spurious warning" (the warning branches all return a changed
+            # exclude set too) — this loop is redundant there today, not
+            # load-bearing. The one case where it genuinely is load-bearing
+            # (#2602 round 3) is "a byte-order mark still parses quietly even
+            # on a diff the exclude list can't affect either way" below: its
+            # diff sits outside the manifest's exclude list either way, so
+            # count/gate are IDENTICAL whether the manifest parses correctly
+            # or regresses to failing open — only this loop can tell them
+            # apart. Confirmed by reverting `manifest_scope` to plain `utf-8`
+            # (undoing round 2's `utf-8-sig` fix): that case's count/gate
+            # still pass unchanged, and only its
+            # `expect_stderr_not_contains` catches the regression.
             for needle in case.get("expect_stderr_not_contains", []):
                 if needle in proc.stderr:
                     problems.append(f"stderr wrongly contains {needle!r}: {proc.stderr.strip()}")
@@ -2045,6 +2122,25 @@ if __name__ == "__main__":
             print("--changed-lines requires a number", file=sys.stderr)
             sys.exit(2)
         raw = args[i + 1]
+        # (#2602 round 3) Same empty-vs-malformed distinction as the
+        # exit_code check below, given the SAME treatment: a diff step that
+        # never ran (skipped by an earlier failure or a cancelled job) leaves
+        # this GitHub Actions output empty, not zero. `--changed-lines` was
+        # parsed BEFORE the exit_code check, so in the exact failure this
+        # script exists to make legible — the diff step failing, both
+        # substitutions arriving empty — the reader hit this branch first and
+        # saw "--changed-lines must be an integer, got ''": the identical
+        # confusing integer-parse complaint the exit_code fix (above) was
+        # written to replace. Checked here too, so neither argument's empty
+        # value reads as a malformed integer from a step that ran.
+        if raw == "":
+            print(
+                "changed-lines is empty — the diff-counting step did not run "
+                "(skipped by an earlier failure or a cancelled job), not that "
+                "it ran and counted zero",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         try:
             changed_lines = int(raw)
         except ValueError:
