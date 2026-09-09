@@ -280,6 +280,66 @@ describe("statusFromRecord / applyFlowRecord", () => {
   });
 });
 
+// (#2518) A historical flow record must never resurrect a status a FRESH,
+// LATER snapshot legitimately regressed — the collision between the page's
+// monotonic `keepPageStatus` ratchet and the server's legitimate
+// `derive_task_status`/`phase_task_rollup` regressions (a task/phase
+// display status genuinely dropping back down between real transitions).
+// See `foldFlowRecords`'s own doc for the fix: gate admission into the
+// fold by the record's `ts` against the snapshot's own `generated_at_ms`,
+// leave `keepPageStatus` itself (the unknown-status asymmetry) untouched.
+describe("foldFlowRecords snapshot-recency gate (#2518)", () => {
+  const SNAPSHOT_MS = tsToMs("2026-08-19T00:00:00Z");
+  function snapshotWithPhase(status: string) {
+    return { ...baseGraph(), nodes: [{ ...PHASE, status }, TASK_A, TASK_B], generated_at_ms: SNAPSHOT_MS };
+  }
+
+  it("a STALE record (older than the snapshot) does not pin a legitimately regressed status", () => {
+    const idx = indexGraph(baseGraph());
+    // The phase was "running" long enough ago to leave a "phase start"
+    // record, but the snapshot handed to this fold is NEWER than that
+    // record and already says "planned" — e.g. #2406's rollup recomputed
+    // after the phase's tasks dropped back between real transitions.
+    const g = foldFlowRecords(
+      snapshotWithPhase("planned"),
+      [rec({ ts: "2026-08-18T00:00:00Z", action: "phase start", handle: "p1" })],
+      idx,
+      "m1",
+    );
+    expect(g.nodes[0].status).toBe("planned");
+  });
+
+  it("a record at the EXACT snapshot instant is treated as already reflected (boundary is <=)", () => {
+    const idx = indexGraph(baseGraph());
+    const g = foldFlowRecords(
+      snapshotWithPhase("planned"),
+      [rec({ ts: "2026-08-19T00:00:00Z", action: "phase start", handle: "p1" })],
+      idx,
+      "m1",
+    );
+    expect(g.nodes[0].status).toBe("planned");
+  });
+
+  it("a LIVE record newer than the snapshot still advances status unconditionally (SSE tail ahead of the poll)", () => {
+    const idx = indexGraph(baseGraph());
+    const g = foldFlowRecords(
+      snapshotWithPhase("planned"),
+      [rec({ ts: "2026-08-19T00:00:10Z", action: "phase start", handle: "p1" })],
+      idx,
+      "m1",
+    );
+    expect(g.nodes[0].status).toBe("running");
+  });
+
+  it("with no generated_at_ms on the snapshot, every record folds unfiltered (lenient default, pre-#2518 behavior)", () => {
+    const idx = indexGraph(baseGraph());
+    const noTimestamp = { ...baseGraph(), nodes: [{ ...PHASE, status: "planned" }, TASK_A, TASK_B] };
+    expect(noTimestamp.generated_at_ms).toBeUndefined();
+    const g = foldFlowRecords(noTimestamp, [rec({ ts: "2020-01-01T00:00:00Z", action: "phase start", handle: "p1" })], idx, "m1");
+    expect(g.nodes[0].status).toBe("running");
+  });
+});
+
 describe("mergeGraphs", () => {
   it("keeps the page's more-advanced status over a lagging disk snapshot", () => {
     const prev: MissionGraph = { ...baseGraph(), nodes: [{ ...PHASE, status: "running" }, TASK_A, TASK_B] };

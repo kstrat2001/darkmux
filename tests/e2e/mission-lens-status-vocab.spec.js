@@ -141,6 +141,73 @@ test('a status this build does not know wins the RECONCILE POLL instead of being
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
+test('a phase that legitimately regresses running->planned in a fresh reconcile snapshot is not pinned back to running by an older matching flow record (#2518)', async ({ page }) => {
+  // The collision #2518 names: `derive_task_status`/`phase_task_rollup`
+  // (crates/darkmux-serve/src/mission_graph.rs) can legitimately regress a
+  // node's DISPLAY status in a fresh, later `graph.json` snapshot (a phase
+  // genuinely between real transitions — #2406 made a phase's own status a
+  // rollup of its tasks'), while `keepPageStatus`'s monotonic ratchet
+  // refuses that regression once ANY matching flow record has ever put the
+  // node at a higher rank. Before the #2518 fix, `foldFlowRecords` replayed
+  // every record it had ever seen for a handle on EVERY fold regardless of
+  // age, so an old "phase start" record from back when the phase first went
+  // running would out-rank the fresh "planned" snapshot and pin the chip at
+  // running forever — proved directly against `foldFlowRecords` in
+  // `graph.test.ts`'s "foldFlowRecords snapshot-recency gate (#2518)". This
+  // is the same collision proved end-to-end through a real render: the
+  // fold now only replays records NEWER than the snapshot's own
+  // `generated_at_ms`, so a record predating both snapshots here must not
+  // resurrect "running" once the second snapshot has legitimately dropped
+  // to "planned".
+  const missionId = 'm-2518';
+  const now = Date.now();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+
+  function snapshot(status, generatedAtMs) {
+    return {
+      mission_id: missionId,
+      mission_status: 'active',
+      nodes: [
+        { id: 'phase-a', kind: 'phase', label: 'Investigate', status, depth: 0, steps: [] },
+        { id: 'task-1', kind: 'task', label: 'Probe', parentId: 'phase-a', status, depth: 0, steps: [] },
+      ],
+      edges: [],
+      generated_at_ms: generatedAtMs,
+    };
+  }
+  const bodies = [snapshot('running', now), snapshot('planned', now + 30_000)];
+  let hit = 0;
+  await page.route(`**/mission/${missionId}/graph.json*`, (r) => {
+    const body = bodies[Math.min(hit, bodies.length - 1)];
+    hit += 1;
+    return r.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
+  });
+  // The historical record that first put the phase at "running", well
+  // BEFORE either snapshot's own `generated_at_ms` — the shape a real
+  // mission produces: the event fires once, long before a later reconcile
+  // poll correctly reads the phase back down to "planned".
+  const historical = [{ ts: new Date(now - 60_000).toISOString(), action: 'phase start', handle: 'phase-a', mission_id: missionId }];
+  await page.route(MISSION_RE, (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify({ records: historical, count: 1, truncated: false, generated_at_ms: 0 }) }));
+  await page.route(BACKFILL_RE, (r) => r.fulfill({ contentType: 'application/json', body: '[]' }));
+  await page.route(STREAM_RE, (r) => r.fulfill({ contentType: 'text/event-stream', body: '' }));
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.clock.install({ time: now });
+  await page.goto(`/index-live.html#mission=${missionId}`);
+  await expect(page.locator('.mnode').first()).toBeVisible();
+
+  await expect(page.locator('.phasegroup.s-running').first()).toBeVisible();
+
+  await page.clock.fastForward(35_000);
+
+  await expect(
+    page.locator('.phasegroup.s-running'),
+    'a legitimate regression in a fresh snapshot must not be pinned back to running by an older flow record for the same handle'
+  ).toHaveCount(0);
+  await expect(page.locator('.phasegroup.s-planned').first()).toBeVisible();
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});
+
 test('every phase container has a visible border, not one that matches the background (#1868 — re-measured against this port\'s own CSS)', async ({ page }) => {
   // Ported from mission-graph-status-vocab.spec.js's identical-named test —
   // same method (a real WCAG contrast ratio, not a luminance delta; see that

@@ -353,12 +353,23 @@ export function MissionGraphLens({
   // disk-level status delta that has NO accompanying flow record (e.g. an
   // out-of-band write to the mission's state file). Folding the known flow
   // record set (`foldFlowRecords`, below) replays every STATUS TRANSITION
-  // this page has ever heard of, which already self-heals a REGRESSED
-  // snapshot value (a lagging disk write reporting a stale status the fold
-  // then re-advances past) — but it cannot invent a transition that arrived
-  // only as a fresh snapshot value, never as a record. Same 20s cadence
-  // mission-graph.html's own `setInterval(reconcile, 20000)` used — see
-  // `RECONCILE_BACKSTOP_MS`'s own doc in `queryKeys.ts`.
+  // this page has heard of that is NEWER than the polled snapshot itself
+  // (`generated_at_ms`, #2518) — a genuinely live record racing ahead of
+  // this poll still wins, unconditionally. It cannot invent a transition
+  // that arrived only as a fresh snapshot value, never as a record. Same
+  // 20s cadence mission-graph.html's own `setInterval(reconcile, 20000)`
+  // used — see `RECONCILE_BACKSTOP_MS`'s own doc in `queryKeys.ts`.
+  //
+  // (#2518, corrected) This used to replay EVERY record this page had ever
+  // seen regardless of age, on the theory that it "self-heals a regressed
+  // snapshot value (a lagging disk write reporting a stale status)". That
+  // reasoning silently assumed every regression was staleness — but
+  // `derive_task_status`/`phase_task_rollup` can legitimately regress a
+  // node's DISPLAY status in a fresh, later snapshot (a task genuinely
+  // between steps; a phase rollup recomputed after #2406), and an old
+  // record for that same handle would out-rank the fresh value and pin the
+  // chip forever. `foldFlowRecords` now only replays records the snapshot
+  // could NOT have already reflected — see its own doc.
   const graphQuery = useQuery({
     queryKey: queryKeys.missionGraph(missionId),
     queryFn: () => fetchJson<MissionGraph>(`/mission/${encodeURIComponent(missionId)}/graph.json`),
