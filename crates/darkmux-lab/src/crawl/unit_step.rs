@@ -178,7 +178,13 @@ pub struct UnitOutcome {
     pub source: String,
     /// `stop` | `unit_budget_exhausted` | `timeout` | `error` |
     /// `thermal_stop` (#2454 — the breaker's STOP file was present before
-    /// this unit ever dispatched).
+    /// this unit ever dispatched) — a `UnitOutcome` a unit's own dispatch
+    /// wrote. Plus three the SUMMARY builds itself for a step that
+    /// produced no `UnitOutcome` at all (see `errored_row`): `interrupted`
+    /// (the step's status was `Abandoned`), `not_run` (still `Planned`/
+    /// `Running` at summary time — never settled), and `empty` (#2603 —
+    /// `Complete`, but recorded nothing; NOT `not_run`, because it did
+    /// run).
     pub result: String,
     /// Accepted `create_finding` calls this unit's dispatch made.
     ///
@@ -1973,7 +1979,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         // whatever merely happened along the way" precedent #2454 set,
         // applied to a second cause.
         //
-        // (#2573) `"not_run"` is named THIRD — ahead of `"error"`, same as
+        // (#2573) `"not_run"` is named SECOND — ahead of `"error"`, same as
         // `"interrupted"`, but now also ahead of `"interrupted"` itself.
         // The mechanism (see `errored_row`) is a unit whose step never
         // settled: still `Planned`/`Running` at summary time, because the
@@ -2034,7 +2040,10 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
 }
 
 /// The honest zero row for a unit step that produced no `UnitOutcome` —
-/// its kind returned `Err`, so its numbers never existed.
+/// its kind returned `Err`, so its numbers never existed. Also the row a
+/// `Complete` step gets when it recorded nothing at all (see the `None`
+/// arm at this function's one call site) — that step's kind DID run to
+/// completion; it just had no numbers to report.
 ///
 /// The unit id comes from the step's own `config.unit` (what the grow seam
 /// stamped there), falling back to the step id: a summary that named the
@@ -2042,6 +2051,20 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
 /// the one thing an operator wants from a failed row. The scheduler's
 /// recorded error text becomes `reason`, so the run says WHY without
 /// anyone opening a second file.
+///
+/// (#2603 review, MUST FIX) `result` matches [`NodeStatus`] exhaustively —
+/// no `_` catch-all — because a catch-all here already hid one real bug:
+/// before this fix, `Complete` fell through the same arm as `Planned`/
+/// `Running` and was named `"not_run"`, so a step that ACTUALLY RAN (the
+/// scheduler recorded a terminal, successful status; nothing was
+/// truncated) could outrank a genuine operator interrupt in `stopped_by`
+/// — the exact inverse of #2573's own justification for that ranking.
+/// `Complete` gets its own name, `"empty"`, distinct from `"not_run"`:
+/// it is not "never ran". `"empty"` is not subtracted out of
+/// `units_errored`'s leftover computation in [`summarize_mission`], so it
+/// folds into that bucket the same way it did before #2573 split
+/// `"not_run"` out — the COUNT for this case is unchanged from
+/// pre-#2573 behavior; only the per-row `result` name is more honest now.
 fn errored_row(step: &Step) -> UnitOutcome {
     let unit = step
         .config
@@ -2060,8 +2083,15 @@ fn errored_row(step: &Step) -> UnitOutcome {
         result: match step.status {
             darkmux_crew::types::NodeStatus::Abandoned => "interrupted".to_string(),
             darkmux_crew::types::NodeStatus::Error => "error".to_string(),
+            // The step's kind ran to completion and recorded nothing — NOT
+            // "never ran" (see this function's own doc). Falls into the
+            // `units_errored` leftover in `summarize_mission`, same as
+            // pre-#2573.
+            darkmux_crew::types::NodeStatus::Complete => "empty".to_string(),
             // Planned/Running at summary time: the step never settled.
-            _ => "not_run".to_string(),
+            darkmux_crew::types::NodeStatus::Planned | darkmux_crew::types::NodeStatus::Running => {
+                "not_run".to_string()
+            }
         },
         findings: 0,
         findings_rejected: 0,

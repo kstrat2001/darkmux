@@ -1426,6 +1426,46 @@ fn a_unit_the_plan_named_with_no_step_ever_grown_also_counts_as_not_run() {
     assert_eq!(s.stopped_by, "not_run");
 }
 
+/// (#2603 review, MUST FIX) The bug: a step that reached `Complete` — the
+/// scheduler recorded a terminal, SUCCESSFUL status; nothing was
+/// truncated — but recorded empty/whitespace-only output fell through
+/// `errored_row`'s `_` catch-all the same as a genuinely never-ran
+/// `Planned`/`Running` step, so it was named `"not_run"` too. Once #2573
+/// ranked `"not_run"` ahead of `"interrupted"` in `stopped_by`, that
+/// completed-but-empty row could outrank a GENUINE, attributed operator
+/// interrupt alongside it — the exact inverse of #2573's own
+/// justification (the thing that actually ended the run outranks whatever
+/// merely happened along the way; a step that completed did not end the
+/// run). The fixture is the reviewer's own: one `Complete` step with no
+/// output, alongside one `Abandoned` step. Before this fix:
+/// `not_run=1 interrupted=1 errored=0 stopped_by="not_run"`. After:
+/// `not_run=0 interrupted=1 errored=1 stopped_by="interrupted"` — matching
+/// what a full revert of #2573 produces on this same fixture, because a
+/// `Complete`-with-no-output row belongs in the SAME bucket it was in
+/// before #2573 ever existed.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_completed_steps_empty_row_does_not_outrank_a_genuine_interrupt() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    // Reached `Complete`, but recorded nothing — NOT the same as never
+    // having run at all.
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, None);
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Abandoned, None);
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_not_run, 0, "a completed step's empty row is not a never-ran unit");
+    assert_eq!(s.units_interrupted, 1);
+    assert_eq!(s.units_errored, 1, "the completed-but-empty row lands where it did before #2573");
+    assert_eq!(
+        s.stopped_by, "interrupted",
+        "a step that completed must not hide a genuine, attributed operator abort"
+    );
+    let empty_row = s.units.iter().find(|u| u.unit == "u1").expect("the completed step has a row");
+    assert_eq!(empty_row.result, "empty", "named distinctly from `not_run` — it did run");
+}
+
 /// (#2573) Ranking, half one: a not-run unit alongside an EARLIER error
 /// still names `"not_run"` — the truncation is what makes this run short,
 /// not the earlier per-unit failure that happened along the way. Same
@@ -1566,9 +1606,76 @@ fn eight_units_covering_every_outcome_reconcile_exactly_to_the_plan_total() {
         + s.units_not_run;
     assert_eq!(
         reconciled, s.units_in_plan,
-        "every bucket, summed, must land exactly on the plan total — no unit double-counted or dropped"
+        "every bucket, summed, must land exactly on the plan total when every planned unit got at \
+         most one row — no unit double-counted or dropped. (This is NOT a general invariant: it \
+         holds only under that one-row-per-planned-unit correspondence. See \
+         `an_unreadable_plan_file_breaks_the_one_row_per_unit_correspondence_and_the_sum_over_counts` \
+         for the case where it doesn't.)"
     );
     assert_eq!(s.stopped_by, "thermal", "the breaker still wins the naming even with every other bucket populated");
+
+    // (#2603 review) The sum alone doesn't prove each unit landed in the
+    // RIGHT bucket — four of these six buckets hold exactly one row, so a
+    // mutation that swaps which bucket two of them land in (e.g. swapping
+    // `errored_row`'s `Abandoned`/`Error` arms) leaves every count above
+    // unchanged. Pin membership too: which unit id carries which result.
+    assert_eq!(s.units.len(), 7, "u8 never got a step grown for it at all, so it has no row");
+    let by_unit = |id: &str| s.units.iter().find(|u| u.unit == id).unwrap_or_else(|| panic!("no row for unit {id}"));
+    assert_eq!(by_unit("u-0001").result, "stop");
+    assert_eq!(by_unit("u-0002").result, "stop");
+    assert_eq!(by_unit("u-0003").result, UNIT_BUDGET_EXHAUSTED);
+    // u4/u5/u7 never went through `outcome_json`, so `errored_row`'s
+    // `config.unit` fallback names them by their STEP id instead.
+    assert_eq!(by_unit("u4").result, "error", "the errored step, not swapped with the abandoned one");
+    assert_eq!(by_unit("u5").result, "interrupted", "the abandoned step, not swapped with the errored one");
+    assert_eq!(by_unit("u-0006").result, THERMAL_STOP);
+    assert_eq!(by_unit("u7").result, "not_run");
+}
+
+/// (#2603 review) The partition invariant the class test above pins
+/// ("every bucket, summed, lands exactly on `units_in_plan`") is
+/// CONDITIONAL, not general: it holds only when every row in `s.units`
+/// corresponds to a unit `plan_totals` also counted. That correspondence
+/// breaks when a `plan/<rule>.json` file exists on disk but fails to
+/// parse — `plan_totals` silently skips it (its own doc: "An unreadable/
+/// unparseable plan file is skipped"), undercounting `units_in_plan`,
+/// while the unit STEPS grown from that same rule are read from the
+/// phase's step records, not from the plan file, so they still produce
+/// rows. The gap this leaves (`units_in_plan.saturating_sub(rows.len())`
+/// inside `units_not_run`) SATURATES to zero instead of going negative,
+/// so every bucket's own count stays correct for the rows that exist, but
+/// their sum now EXCEEDS `units_in_plan`. Pre-existing behavior, not
+/// introduced by #2573/#2603 — documented here as a known non-partition
+/// case rather than asserted as a bug.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn an_unreadable_plan_file_breaks_the_one_row_per_unit_correspondence_and_the_sum_over_counts() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let run_dir = darkmux_crew::loader::missions_dir().join(MISSION);
+    fs::create_dir_all(run_dir.join("plan")).unwrap();
+    // The plan file is present but unparseable — `plan_totals` skips it,
+    // so `units_in_plan` is 0 even though a step for it exists below.
+    fs::write(run_dir.join("plan").join("r1.json"), "not valid json").unwrap();
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", "stop", 1, 10, 10)));
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_in_plan, 0, "the unreadable plan file contributed nothing to the plan total");
+    assert_eq!(s.units_completed, 1, "the step's own row still exists and is still counted correctly");
+    assert_eq!(s.units_not_run, 0, "saturating_sub floors at zero rather than going negative");
+    let reconciled = s.units_completed
+        + s.units_budget_exhausted
+        + s.units_errored
+        + s.units_interrupted
+        + s.units_skipped
+        + s.units_not_run;
+    assert!(
+        reconciled > s.units_in_plan,
+        "the sum ({reconciled}) exceeds the plan total ({}) — the partition invariant does not hold \
+         here, by construction, because the row-per-unit correspondence itself is broken",
+        s.units_in_plan
+    );
 }
 
 #[test]

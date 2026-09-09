@@ -154,10 +154,10 @@ mission close            <span class="comment"># units_completed/errored/skipped
             "total_tokens":669717}}
 
 {"action":"mission close","tier":"operator","mission_id":"crawl-1787979698-b5961a",
- "payload":{"units_in_plan":70,"units_selected":2,"units_not_run":68,
+ "payload":{"units_in_plan":2,"units_selected":2,"units_not_run":0,
             "units_completed":2,"units_errored":0,"findings":2,
             "wall_ms":349707,"tokens_per_hour":7875514,"stopped_by":"done"}}</code></pre>
-    <p><code>wall_ms</code> includes rest time; subtract <code>rest_ms</code> for model-only time. The close payload IS the run's own <code>crawl.summary</code> step output.</p>
+    <p><code>wall_ms</code> includes rest time; subtract <code>rest_ms</code> for model-only time. The close payload IS the run's own <code>crawl.summary</code> step output. <code>--param rules=</code> narrows the PLAN itself, not just which units dispatch, so <code>units_in_plan</code>/<code>units_selected</code> reflect the narrowed scope here rather than the full rule registry's unit count &mdash; and <code>units_not_run</code> is <code>0</code> for a run that reached every unit it planned. (An earlier version of this example carried <code>units_in_plan:70</code>/<code>units_not_run:68</code> alongside <code>stopped_by:"done"</code>, a deselection-era artifact from before <code>--param units=</code>/<code>limit=</code> were removed; that combination is self-contradicting under the current summary, which now names a short run <code>"not_run"</code> rather than <code>"done"</code>.)</p>
   </div>
 </section>
 
