@@ -5318,6 +5318,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let model = model.clone();
         let mission_id = mission_id.clone();
         let phase_id = phase_id.clone();
+        // (#1934) This dispatch's own declared compactor/utility model ids,
+        // resolved earlier in this same function — threaded through so the
+        // sampler can tag each `telemetry.lms` load with the SEAT it
+        // belongs to (`role_for_load`), rather than leaving the viewer to
+        // guess from a bare model id which load was the primary and which
+        // was staffing the compactor/utility exactly as declared.
+        let compactor_model_for_sampler = compaction.compactor_model.clone();
+        let utility_model_for_sampler = utility_model.clone();
         // (#2110/#2109) The thermal governor/breaker rides this same
         // sampler thread — it already reads `probe.sample().thermal` every
         // tick, so no separate poller is needed. `host_out` is where the
@@ -5332,6 +5340,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 role_id,
                 session_id,
                 model,
+                compactor_model_for_sampler,
+                utility_model_for_sampler,
                 mission_id,
                 phase_id,
                 host_out_for_thermal,
@@ -6909,12 +6919,137 @@ fn clear_stale_pace_file(host_out: &Path) {
 /// tolerates on this same loop. Bounded by whatever the active
 /// `FlowSink` bounds its own writes to — this function adds no timeout of
 /// its own.
+///
+/// (#1934) Stamp a `telemetry.lms` `load`/`unload` payload with the SEAT
+/// (`role_for_load`) the model belongs to relative to this dispatch's own
+/// declared staffing — `"primary"` / `"compactor"` / `"utility"` /
+/// `"resident"`. Applied to every payload `lms_diff` emits, load or unload
+/// alike, so an unload's role reads the same as its matching load did.
+///
+/// Payload-additive AND a `FLOW_SCHEMA_VERSION` MINOR bump (1.45.0). An
+/// earlier revision reasoned "payload-additive means no bump" and left the
+/// constant alone; that is not this repo's rule, and it matters concretely:
+/// fleet skew is computed off that constant, so a fleet with one tagged
+/// emitter and one untagged reported NO skew while the viewer was reading
+/// two different shapes. See `schema.rs`'s 1.45.0 entry.
+///
+/// `baseline` marks a `load` from the sampler's FIRST tick — whatever was
+/// already resident before this attempt did anything, diffed against an
+/// empty `prev` (see `run_telemetry_sampler`'s own doc on the seed choice).
+/// Never itself a swap: it is the starting lineup, not an event this
+/// attempt caused. Only set (`true`) when the caller says so; omitted
+/// (never `false`) on every other payload, so its mere PRESENCE already
+/// answers "was this the seed" without a reader having to also check `true`
+/// vs `false` vs absent as three different meanings.
+fn tag_lms_role(
+    mut payload: serde_json::Value,
+    primary: &str,
+    compactor: Option<&str>,
+    utility: Option<&str>,
+    baseline: bool,
+) -> serde_json::Value {
+    if let Some(model_id) = payload.get("model").and_then(|v| v.as_str()) {
+        let role = crate::telemetry_sampler::role_for_load(model_id, primary, compactor, utility);
+        payload["role"] = serde_json::json!(role);
+    }
+    if baseline {
+        payload["baseline"] = serde_json::json!(true);
+    }
+    payload
+}
+
+/// (#1934, review round 2) The `telemetry.lms` half of the sampler loop,
+/// with its two effects INJECTED — the effect seam
+/// [`resolve_dispatch_model_with_hosts`] already established in this module,
+/// applied to the producer this time.
+///
+/// The reason is the same one that seam's own doc gives. Pinning only the
+/// pure helpers ([`tag_lms_role`], `role_for_load`, `lms_diff`) left the
+/// CALL SITE untested, and the call site is where the contract actually
+/// lives. Two mutations proved it: stamping `baseline: true` on EVERY tick
+/// (which silences the detector permanently — no specialist load can ever
+/// fire again) and deleting both `tag_lms_role` calls outright (which
+/// reverts the producer half of #1934 wholesale) each left the entire crate
+/// green. Nothing asserted that the sampler calls the stamper, that
+/// `baseline` is confined to the seed tick, or that the seed branch is
+/// one-shot.
+///
+/// So the per-tick state machine — `prev`, `seeded`, and the tagging — lives
+/// HERE, behind `list_loaded` (which would otherwise shell out to `lms ps`)
+/// and `emit` (which would otherwise write to the live flow sink). The loop
+/// body in [`run_telemetry_sampler`] is left as one delegating call with no
+/// logic of its own, and a unit test can drive a seed tick and a later tick
+/// and assert the emitted payload SEQUENCE without touching the operator's
+/// LMStudio.
+struct LmsTelemetryTracker {
+    /// This dispatch's own wire model id (namespaced since #2240 —
+    /// `role_for_load` normalizes, so it is stored as given).
+    primary: String,
+    compactor: Option<String>,
+    utility: Option<String>,
+    /// The previous SUCCESSFUL `list_loaded` snapshot. A failed probe leaves
+    /// this intact so a transient `lms` hiccup can't emit a flurry of
+    /// spurious unloads.
+    prev: Vec<darkmux_types::LoadedModel>,
+    /// False until the first successful probe. Drives the one-shot seed
+    /// branch below — and therefore `baseline`.
+    seeded: bool,
+}
+
+impl LmsTelemetryTracker {
+    fn new(primary: String, compactor: Option<String>, utility: Option<String>) -> Self {
+        Self { primary, compactor, utility, prev: Vec::new(), seeded: false }
+    }
+
+    /// One sampler tick. Probes via `list_loaded`, emits one tagged
+    /// `telemetry.lms` payload per load/unload delta through `emit`, and
+    /// advances the tracker's own state.
+    ///
+    /// The FIRST successful probe diffs against an EMPTY previous set, so
+    /// every already-resident model is emitted as a `load` and the viewer's
+    /// model section shows what is actually serving this dispatch (darkmux
+    /// loads the model just before this thread starts, so "pre-existing,
+    /// emit nothing" made the dispatch's own model never appear at all).
+    /// Those seed loads — and ONLY those — carry `baseline: true`: they are
+    /// the starting lineup, never an event this attempt caused.
+    fn tick(
+        &mut self,
+        list_loaded: &dyn Fn() -> Result<Vec<darkmux_types::LoadedModel>>,
+        emit: &dyn Fn(serde_json::Value),
+    ) {
+        let Ok(cur) = list_loaded() else { return };
+        let baseline = !self.seeded;
+        let payloads = {
+            let prev: &[darkmux_types::LoadedModel] = if baseline { &[] } else { &self.prev };
+            crate::telemetry_sampler::lms_diff(prev, &cur)
+        };
+        for payload in payloads {
+            emit(tag_lms_role(
+                payload,
+                &self.primary,
+                self.compactor.as_deref(),
+                self.utility.as_deref(),
+                baseline,
+            ));
+        }
+        self.prev = cur;
+        self.seeded = true;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_telemetry_sampler(
     stop_flag: Arc<AtomicBool>,
     role_id: String,
     session_id: String,
     model: String,
+    // (#1934) This dispatch's own declared compactor/utility model ids —
+    // `None` when this dispatch runs no compaction, or utility-model
+    // resolution came back empty. Used only to tag each `telemetry.lms`
+    // load with its SEAT (`role_for_load`); never fed into selection or
+    // loading logic.
+    compactor_model: Option<String>,
+    utility_model: Option<String>,
     mission_id: Option<String>,
     phase_id: Option<String>,
     host_out: PathBuf,
@@ -7019,8 +7154,10 @@ fn run_telemetry_sampler(
     // loop tick. `None` before the first emission.
     let mut last_telemetry_emit_at_ms: Option<u64> = None;
 
-    let mut prev: Vec<darkmux_types::LoadedModel> = Vec::new();
-    let mut seeded = false;
+    // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
+    // all moved into `LmsTelemetryTracker` — see its doc for why the state
+    // machine lives behind an injected-effect seam instead of inline here.
+    let mut lms_tracker = LmsTelemetryTracker::new(model.clone(), compactor_model.clone(), utility_model.clone());
     // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
     // last thermal sample — NOT a hardcoded per-tick constant. A tick can
     // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
@@ -7038,30 +7175,13 @@ fn run_telemetry_sampler(
             break;
         }
 
-        // lms load/unload deltas. Only diff against a SUCCESSFUL probe —
-        // a failed `list_loaded` is skipped (leaves `prev` intact) so a
-        // transient lms hiccup doesn't emit a flurry of spurious unloads.
-        if let Ok(cur) = darkmux_profiles::lms::list_loaded() {
-            if !seeded {
-                // First successful sample: emit a baseline "load" for every
-                // resident model (diff against empty) so the viewer's model
-                // section shows what's actually serving THIS dispatch. darkmux
-                // loads/selects the model just BEFORE the sampler thread starts,
-                // so treating the resident set as "pre-existing, emit nothing"
-                // meant the dispatch's own model never appeared — the panel read
-                // "no telemetry yet" for a run that clearly had a model loaded.
-                for payload in crate::telemetry_sampler::lms_diff(&[], &cur) {
-                    emit("lms", "telemetry.lms", payload);
-                }
-                prev = cur;
-                seeded = true;
-            } else {
-                for payload in crate::telemetry_sampler::lms_diff(&prev, &cur) {
-                    emit("lms", "telemetry.lms", payload);
-                }
-                prev = cur;
-            }
-        }
+        // lms load/unload deltas — the seed/diff rule, the `role`/`baseline`
+        // tagging, and the skip-on-failed-probe behavior all live in
+        // `LmsTelemetryTracker::tick` so they are unit-testable without a
+        // live `lms` or a live flow sink. Nothing but the wiring is here.
+        lms_tracker.tick(&darkmux_profiles::lms::list_loaded, &|payload| {
+            emit("lms", "telemetry.lms", payload)
+        });
 
         // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
         // per-cluster frequency, power and thermal state the same probe

@@ -806,18 +806,137 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
       offsetLabel: "",
     });
   }
-  if (distinct.length > 1) {
-    finds.push({
-      kind: "jit-model-swap",
-      // Synthesized from the load track rather than emitted by a detector, so
-      // it has no record of its own and therefore no timestamp — `null` says
-      // so, instead of borrowing one and implying a moment it did not have.
-      severity: "warn",
-      detail: `${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,
-      fix: "pin one model for the run, or pre-warm the swap target.",
-      atMs: null,
-      offsetLabel: "",
+  // (#1934) `distinct.length > 1` used to fire on ANY two model ids seen
+  // loaded in one run — which a correct `deep`/`balanced` profile trips BY
+  // CONSTRUCTION (primary + compactor, sometimes + the internal utility
+  // model too), and which also counted a merely-resident leftover from an
+  // earlier session that this run never touched at all. Both are staffing
+  // or ambient noise, not a swap.
+  //
+  // The producer now tags each `telemetry.lms` load/unload with `role`
+  // (`"primary"` / `"compactor"` / `"utility"` / `"resident"` — see
+  // `role_for_load` in `telemetry_sampler.rs`) and marks a load `baseline`
+  // when it is the sampler's FIRST tick emitting whatever was already
+  // resident before this attempt did anything (never itself a swap — it is
+  // the starting lineup, not an event). A genuine swap only exists in what
+  // happens to a SPECIALIST seat (never `compactor`/`utility` — those are
+  // declared staffing, doing exactly their job) AFTER that starting point:
+  // a new specialist model going resident mid-run, or any specialist model
+  // being unloaded at all (an eviction the run must reload from, whether or
+  // not a replacement load has landed yet).
+  //
+  // UNTAGGED RECORD SETS ARE NOT JUDGED. Records written before this fix
+  // shipped (and hand-authored fixtures, and the committed demo corpus)
+  // carry neither field. The first revision of this fix claimed those "fall
+  // back to the pre-#1934 reading"; they did not. `isUtilitySeat(undefined)`
+  // is false and `isBaselineLoad` requires a `role`, so on untagged data
+  // EVERY load and unload was admitted and the gate went from a count
+  // (`n > 1`) to a presence (`n > 0`) — measured on this repo's own public
+  // demo corpus, firings went from 8 of 11 sessions to 11 of 11, and three
+  // of the new ones rendered "X was unloaded mid-run" for a record set
+  // containing no unload at all. That is a false factual claim in the
+  // signals pane, not noise.
+  //
+  // So: the seat reading applies only when EVERY lms record in the set
+  // carries a `role`. Otherwise the detector declines, and says so — an
+  // `info` naming what it cannot tell apart, emitted exactly where the old
+  // count-based rule would have raised a `warn`, so a historical run is
+  // neither silently blind nor crying wolf.
+  const lmsFields = lms.map((r) => (r.fields ?? {}) as Record<string, unknown>);
+  const anyUntaggedLms = lmsFields.some((f) => typeof f.role !== "string");
+  const isUtilitySeat = (role: unknown) => role === "compactor" || role === "utility";
+  const isBaselineLoad = (f: Record<string, unknown>) => f.event === "load" && f.role != null && f.baseline === true;
+  if (lms.length > 0 && anyUntaggedLms) {
+    if (distinct.length > 1) {
+      finds.push({
+        kind: "model-track-unclassified",
+        // `info`, not `warn`: nothing here is known to have gone wrong. The
+        // run may have swapped a model mid-flight or may have staffed a
+        // compactor exactly as its profile declares, and these records
+        // cannot tell those apart.
+        severity: "info",
+        detail: `${distinct.length} models loaded in one run (${distinct.join(" → ")}), but these records carry no seat tag — a real mid-run swap and a correct primary+compactor staffing look identical here, so this run is not judged either way.`,
+        fix: "runs recorded at flow schema 1.45.0 or later tag each load with its seat; the swap reading returns for those.",
+        atMs: null,
+        offsetLabel: "",
+      });
+    }
+  } else if (lms.length > 0) {
+    // The seat reading, per the rule stated above. TWO KNOWN NARROWINGS in
+    // it, both deliberate, neither hidden:
+    //
+    // 1. The `isUtilitySeat` exclusion returns before the unload branch, so
+    //    a COMPACTOR OR UTILITY MODEL BEING EVICTED MID-RUN IS INVISIBLE
+    //    HERE. That is right for a utility LOAD (staffing doing its job) and
+    //    wrong for a utility UNLOAD — compactor thrash under memory pressure
+    //    is real, measurable, and exactly the residency churn darkmux exists
+    //    to surface. It is not surfaced anywhere today. Deliberately not
+    //    folded into `jit-model-swap`, which is a claim about the
+    //    SPECIALIST seat and would be mislabeled carrying this; it wants its
+    //    own signal. Tracked as #2565.
+    // 2. A `"resident"` model going resident MID-RUN fires. That includes a
+    //    model the operator loaded from their own unrelated LMStudio use,
+    //    which per #1274 is user state this run never touched. It cannot be
+    //    excluded: a genuine swap-in of a second specialist ALSO tags
+    //    `"resident"` (the dispatch declared no seat for it), so excluding
+    //    the class would blind the detector to the only case it exists for.
+    //    The leftover-resident half of #1934 is fixed at the SEED tick,
+    //    where `baseline` distinguishes them; after it, the record carries
+    //    no information that separates the two.
+    const specialistLoads = loads.filter((r) => !isUtilitySeat((r.fields as Record<string, unknown>).role));
+    const specialistModels = [...new Set(specialistLoads.map((r) => (r.fields as Record<string, unknown>).model as string))];
+    const swapEvents = lms.filter((r) => {
+      const f = r.fields as Record<string, unknown> | undefined;
+      if (!f || isUtilitySeat(f.role)) return false;
+      if (f.event === "unload") return true;
+      return f.event === "load" && !isBaselineLoad(f);
     });
+    // The detail line must describe what the RECORDS say happened. The
+    // first revision had two branches keyed on the model COUNT, so a set
+    // with a single specialist model and no unload at all still rendered
+    // "X was unloaded mid-run" — stating an event that never happened.
+    // Three branches, each keyed on the thing it claims:
+    const unloadedModels = [
+      ...new Set(
+        swapEvents
+          .filter((r) => (r.fields as Record<string, unknown>).event === "unload")
+          .map((r) => (r.fields as Record<string, unknown>).model as string),
+      ),
+    ];
+    const midRunLoadedModels = [
+      ...new Set(
+        swapEvents
+          .filter((r) => (r.fields as Record<string, unknown>).event === "load")
+          .map((r) => (r.fields as Record<string, unknown>).model as string),
+      ),
+    ];
+    // The GATE is still "did anything happen to a specialist seat after the
+    // starting point" — `swapEvents`. `specialistModels` only shapes the
+    // WORDING; on its own it counts the baseline lineup, which is precisely
+    // the staffing this fix exists to stop firing on.
+    let detail: string | null = null;
+    if (swapEvents.length === 0) {
+      detail = null;
+    } else if (specialistModels.length > 1) {
+      detail = `${specialistModels.length} models loaded in one run (${specialistModels.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`;
+    } else if (unloadedModels.length > 0) {
+      detail = `${unloadedModels.join(", ")} was unloaded mid-run — the seat's reload stalls the dispatch while the model loads.`;
+    } else if (midRunLoadedModels.length > 0) {
+      detail = `${midRunLoadedModels.join(", ")} loaded mid-run rather than before it — the dispatch stalls while the model loads.`;
+    }
+    if (detail) {
+      finds.push({
+        kind: "jit-model-swap",
+        // Synthesized from the load track rather than emitted by a detector, so
+        // it has no record of its own and therefore no timestamp — `null` says
+        // so, instead of borrowing one and implying a moment it did not have.
+        severity: "warn",
+        detail,
+        fix: "pin one model for the run, or pre-warm the swap target.",
+        atMs: null,
+        offsetLabel: "",
+      });
+    }
   }
   const runStartMs = d?.ts ? T(d.ts) : null;
   for (const r of dets) {

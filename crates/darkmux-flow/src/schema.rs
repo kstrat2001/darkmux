@@ -77,8 +77,53 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.44.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.45.0";
 // Version history:
+//   1.45.0 (#1934) — additive payload keys `role` and `baseline` on every
+//           `telemetry.lms` load/unload payload (the ones `lms_diff`
+//           produces: `{event:"load", model, gb}` /
+//           `{event:"unload", model}`).
+//
+//           `role` is which SEAT the model serves relative to the emitting
+//           dispatch's own declared staffing — `"primary"` / `"compactor"`
+//           / `"utility"` / `"resident"` (see
+//           `darkmux_crew::telemetry_sampler::role_for_load`). It is
+//           classified from the ids THIS dispatch declared, never from
+//           model size or name shape, and every operand is
+//           namespace-normalized (`darkmux:<key>` and `<key>` name the same
+//           seat). `"resident"` means "this dispatch declared no seat for
+//           this model" — a leftover from an earlier session, the
+//           operator's own unrelated LMStudio use, OR a genuine mid-run
+//           swap-in. The record cannot distinguish those three and the
+//           field does not pretend to.
+//
+//           `baseline` is `true` on the loads of the sampler's FIRST
+//           successful tick — whatever was already resident before this
+//           attempt did anything — and OMITTED everywhere else. Never
+//           written as `false`: presence alone answers "was this the seed",
+//           so a reader never has to treat `true` / `false` / absent as
+//           three states.
+//
+//           MINOR, not "payload-additive so no bump." A consumer that
+//           knows these keys reads a DIFFERENT ANSWER out of the same
+//           record set than one that does not: the viewer's
+//           `jit-model-swap` detector evaluates seat-and-baseline when
+//           every lms record in the set is tagged, and declines to judge
+//           (emitting an `info` saying so) when any is untagged. A fleet
+//           where one machine emits tagged records and another does not is
+//           therefore a genuine divergence in what the viewer will say
+//           about the same run — exactly the condition `flow status` /
+//           `doctor` compute skew for off this constant. Leaving it at
+//           1.44.0 would have reported no skew while two shapes were live.
+//           (Nine prior entries in this history are the same shape — a new
+//           optional payload key — and every one took a minor bump;
+//           `CLAUDE.md`'s versioning rule says additive optional fields are
+//           minor.)
+//
+//           Lenient on read in both directions: a pre-1.45.0 record simply
+//           has neither key, and a 1.45.0 reader must never infer a seat
+//           from their absence.
+//
 //   1.44.0 (#1444) — additive payload keys `reasoning_tokens` /
 //           `cached_tokens` on every token-telemetry payload that already
 //           carries `prompt_tokens`/`completion_tokens`/`total_tokens`:

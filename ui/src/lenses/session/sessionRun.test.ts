@@ -221,10 +221,16 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("a jit-model-swap (more than one local model loaded in one run) surfaces as a warning detection", () => {
+    // (#1934) The fixture carries seat tags because the detector only judges
+    // a fully tagged set — `a` is the run's own primary, resident from the
+    // sampler's first tick; `b` is a second specialist arriving mid-run,
+    // which is what a real swap looks like on the wire. The UNTAGGED version
+    // of this same shape is covered by its own case further down, where the
+    // answer is deliberately different.
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
-      { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "a", gb: 10 } },
-      { ts: "2026-01-01T00:02:00Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "b", gb: 20 } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "a", gb: 10, role: "primary", baseline: true } },
+      { ts: "2026-01-01T00:02:00Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "b", gb: 20, role: "resident" } },
       { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
@@ -239,6 +245,286 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.signalGroups[0].signals[0].atMs).toBeNull();
     expect(view.signalGroups[0].signals[0].offsetLabel).toBe("");
     expect(view.modelTrackLines).toEqual(["a · 10GB", "b · 20GB"]);
+  });
+
+  // (#1934) The detection above used to fire on ANY two distinct model ids
+  // in the load track, which a correct `deep`/`balanced` profile trips by
+  // construction (primary + compactor, sometimes + the internal utility
+  // model) and which also counted a merely-resident leftover from an
+  // earlier session this run never touched. The producer now tags every
+  // `telemetry.lms` load/unload with `role` and marks the sampler's first
+  // ("baseline") tick — these four cases are both directions of the fix:
+  // a correct profile must go silent, and a real swap must still fire.
+
+  it("(#1934) a correct primary+compactor+utility profile does NOT fire — all three are staffing, not a swap", () => {
+    // Mirrors the live #1934 report exactly: 3 models loaded in one run,
+    // none of it a swap — primary, the declared compactor, and the
+    // declared utility model, all resident from the sampler's first tick.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "primary-35b", gb: 20, role: "primary", baseline: true },
+      },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "compactor-4b", gb: 2, role: "compactor", baseline: true },
+      },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "utility-4b", gb: 2, role: "utility", baseline: true },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.find((g) => g.kind === "jit-model-swap")).toBeUndefined();
+    expect(view.signalGroups).toHaveLength(0);
+  });
+
+  it("(#1934) a resident leftover from an earlier session does NOT fire — this run never touched it", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "primary-35b", gb: 20, role: "primary", baseline: true },
+      },
+      // The stray resident: not the primary, not a declared compactor/
+      // utility, but ALSO already loaded before this attempt did anything —
+      // `role: "resident"` and `baseline: true` both apply.
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "leftover-from-earlier-session", gb: 8, role: "resident", baseline: true },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.find((g) => g.kind === "jit-model-swap")).toBeUndefined();
+  });
+
+  it("(#1934) a real mid-run swap to a DIFFERENT specialist model still fires", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "primary-35b", gb: 20, role: "primary", baseline: true },
+      },
+      // A SECOND specialist model goes resident well after the baseline
+      // tick — never staffed as compactor/utility, so it can only be a
+      // genuine swap.
+      {
+        ts: "2026-01-01T00:02:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "other-specialist-14b", gb: 14, role: "resident" },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups).toHaveLength(1);
+    expect(view.signalGroups[0].kind).toBe("jit-model-swap");
+    expect(view.signalGroups[0].signals[0].detail).toMatch(/2 models loaded in one run \(primary-35b → other-specialist-14b\)/);
+  });
+
+  it("(#1934) the SAME primary model unloaded and reloaded mid-run still fires — the reload still stalls the dispatch", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "primary-35b", gb: 20, role: "primary", baseline: true },
+      },
+      {
+        ts: "2026-01-01T00:02:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "unload", model: "primary-35b", role: "primary" },
+      },
+      {
+        ts: "2026-01-01T00:02:30Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "primary-35b", gb: 20, role: "primary" },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups).toHaveLength(1);
+    expect(view.signalGroups[0].kind).toBe("jit-model-swap");
+    expect(view.signalGroups[0].signals[0].detail).toMatch(/primary-35b was unloaded mid-run/);
+  });
+
+  it("(#1934) a compactor that JIT-loads LATER (not resident at the baseline tick) still does NOT fire", () => {
+    // A profile that doesn't pre-warm its compactor: the primary is
+    // resident from the sampler's first tick, but the compactor only goes
+    // resident once compaction actually triggers, well into the run. That
+    // load is non-baseline, so a baseline-only exclusion would miss it and
+    // the `role` check is what keeps it silent. (Honest about what this
+    // pins: neutralizing the BASELINE check also reds this case, because
+    // the primary's own seed load would then be admitted too. It proves the
+    // role check is NECESSARY for a late compactor load, not that it is the
+    // only check involved.)
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "primary-35b", gb: 20, role: "primary", baseline: true },
+      },
+      {
+        ts: "2026-01-01T00:03:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "compactor-4b", gb: 2, role: "compactor" },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.find((g) => g.kind === "jit-model-swap")).toBeUndefined();
+  });
+
+  // (#1934, review round 2) The UNTAGGED path — the half the first revision
+  // of this fix got backwards. It claimed untagged records "fall back to the
+  // pre-#1934 reading"; they did not. `isUtilitySeat(undefined)` is false and
+  // `isBaselineLoad` requires a `role`, so every load and unload was admitted
+  // and the gate silently became `n > 0` instead of `n > 1`. On this repo's
+  // own committed demo corpus that took firings from 8 of 11 sessions to
+  // 11 of 11, three of them stating an unload that never happened.
+
+  it("(#1934) an untagged record set is NOT judged — it gets an info naming why, never a swap warning", () => {
+    // Exactly the staffing #1934 is about, as a PRE-fix recording: primary
+    // plus the declared compactor, no seat tags on either record. The old
+    // count-based rule raised `jit-model-swap` here; the tagged rule cannot
+    // apply at all. So: no warning, and an `info` that says what it could
+    // not tell apart.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "primary-35b", gb: 20 },
+      },
+      {
+        ts: "2026-01-01T00:03:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "compactor-4b", gb: 2 },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.find((g) => g.kind === "jit-model-swap")).toBeUndefined();
+    const unclassified = view.signalGroups.find((g) => g.kind === "model-track-unclassified");
+    expect(unclassified).toBeDefined();
+    expect(unclassified!.signals[0].severity).toBe("info");
+    expect(unclassified!.signals[0].detail).toMatch(/no seat tag/);
+    expect(unclassified!.signals[0].detail).toMatch(/primary-35b → compactor-4b/);
+  });
+
+  it("(#1934) an untagged run with ONE model loaded twice is silent — it must never claim an unload", () => {
+    // The regression that shipped: three demo sessions have two `load`
+    // records for the SAME model and no unload anywhere. Under the count
+    // rule they were correctly silent; the presence gate admitted both loads
+    // and rendered "X was unloaded mid-run" — a false factual claim, not
+    // noise. Silence is the only correct output here.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "scribe", model: "util-4b" },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "util-4b", gb: 18 },
+      },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "util-4b", gb: 2 },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups).toHaveLength(0);
+  });
+
+  it("(#1934) a PARTIALLY tagged set is not judged either — one untagged record makes the seat reading unsound", () => {
+    // A fleet mid-upgrade, or a replayed day file spanning the cutover. The
+    // tagged half would look like "primary staffed, nothing else", and the
+    // untagged record could be anything — including the swap. Judging the
+    // subset would be judging an incomplete track.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
+      {
+        ts: "2026-01-01T00:00:02Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "primary-35b", gb: 20, role: "primary", baseline: true },
+      },
+      {
+        ts: "2026-01-01T00:02:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "other-specialist-14b", gb: 14 },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.find((g) => g.kind === "jit-model-swap")).toBeUndefined();
+    expect(view.signalGroups.find((g) => g.kind === "model-track-unclassified")).toBeDefined();
+  });
+
+  it("(#1934) a tagged set whose only event is a mid-run specialist LOAD says 'loaded', not 'unloaded'", () => {
+    // The detail line must describe what the records say happened. Keying
+    // the two branches on the model COUNT alone made a single-model,
+    // load-only set render "was unloaded mid-run".
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
+      {
+        ts: "2026-01-01T00:02:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "lms",
+        fields: { event: "load", model: "primary-35b", gb: 20, role: "primary" },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const swap = view.signalGroups.find((g) => g.kind === "jit-model-swap");
+    expect(swap).toBeDefined();
+    expect(swap!.signals[0].detail).toMatch(/primary-35b loaded mid-run/);
+    expect(swap!.signals[0].detail).not.toMatch(/unloaded/);
   });
 
   it("(#1973, revised #2107) host CPU/RAM/GPU land in the system pane as avg + high", () => {
