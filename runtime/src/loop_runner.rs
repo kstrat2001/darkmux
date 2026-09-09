@@ -423,6 +423,37 @@ pub struct LoopOutcome {
     /// Total completion tokens summed across all calls.
     pub total_completion_tokens: u32,
 
+    /// (#1444) Sum of every turn's `usage.reasoning_tokens` that actually
+    /// reported one. Whether that sum sits INSIDE `total_completion_tokens`
+    /// above or outside it is PROVIDER-SPECIFIC: OpenAI and Azure document
+    /// the subset relation, other OpenAI-compatible layers do not — see
+    /// `lmstudio::CompletionTokensDetails::reasoning_tokens`'s doc for the
+    /// recorded counter-evidence. Never derive one field from the other.
+    ///
+    /// `None` when NO turn this dispatch ever reported a reasoning-tokens
+    /// figure (a local LMStudio dispatch, or a hosted non-reasoning model)
+    /// — distinct from `Some(0)`, which means at least one turn reported
+    /// the field and its values summed to zero. A turn that omits the
+    /// field doesn't flip an already-`Some` total back to `None`; it just
+    /// doesn't contribute — same "distinguish absent from zero" contract
+    /// as `Usage::reasoning_tokens` itself.
+    pub total_reasoning_tokens: Option<u32>,
+
+    /// (#1444) Sum of every turn's `usage.cached_tokens` that actually
+    /// reported one. Same tri-state contract as `total_reasoning_tokens`
+    /// above — this is prompt-side cache hits, unrelated to
+    /// `total_completion_tokens`.
+    ///
+    /// (#1444 review) On a RESUMED dispatch both totals cover only the turns
+    /// AFTER the resume, while `total_completion_tokens`/
+    /// `total_prompt_tokens` are seeded from the checkpoint and cover the
+    /// whole dispatch (see the accumulator's own comment in
+    /// `run_with_sleeper`). The two are therefore not comparable on a
+    /// resumed run at all — quite apart from the provider question above.
+    /// Nothing pins that today; a consumer must not read a resumed
+    /// dispatch's reasoning total as whole-dispatch.
+    pub total_cached_tokens: Option<u32>,
+
     /// (#1221) The turn's ANSWER text when the loop exits with a checkpoint
     /// prefill still pending.
     ///
@@ -1478,6 +1509,15 @@ fn run_with_sleeper(
     let mut total_prompt_tokens: u32 = resume_seed.as_ref().map(|c| c.total_prompt_tokens).unwrap_or(0);
     let mut total_completion_tokens: u32 =
         resume_seed.as_ref().map(|c| c.total_completion_tokens).unwrap_or(0);
+    // (#1444) NOT carried across a checkpoint resume — `RunCheckpoint`
+    // doesn't persist these (a deliberate scope cut, same shape as the
+    // detector-state/`checkpoints_used` reset `RunCheckpoint::
+    // pending_tool_calls`'s own doc already names: a resumed dispatch gets
+    // a clean slate here too). A resumed dispatch's reasoning/cached totals
+    // therefore cover only the turns AFTER the resume, not the whole
+    // dispatch. Always starts fresh regardless of `resume_seed`.
+    let mut total_reasoning_tokens: Option<u32> = None;
+    let mut total_cached_tokens: Option<u32> = None;
     let mut compactions: u32 = resume_seed.as_ref().map(|c| c.compactions).unwrap_or(0);
     // (#2094) Sum + count of the inter-turn rests taken this dispatch.
     let mut rest_ms: u64 = resume_seed.as_ref().map(|c| c.rest_ms).unwrap_or(0);
@@ -1868,6 +1908,8 @@ fn run_with_sleeper(
                         turns,
                         total_prompt_tokens,
                         total_completion_tokens,
+                        total_reasoning_tokens,
+                        total_cached_tokens,
                         compactions,
                         rest_ms,
                         rests,
@@ -1998,6 +2040,8 @@ fn run_with_sleeper(
                     turns,
                     total_prompt_tokens,
                     total_completion_tokens,
+                    total_reasoning_tokens,
+                    total_cached_tokens,
                     compactions,
                     rest_ms,
                     rests,
@@ -2035,6 +2079,8 @@ fn run_with_sleeper(
                     turns,
                     total_prompt_tokens,
                     total_completion_tokens,
+                    total_reasoning_tokens,
+                    total_cached_tokens,
                     compactions,
                     rest_ms,
                     rests,
@@ -2413,6 +2459,19 @@ fn run_with_sleeper(
             total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
             total_completion_tokens =
                 total_completion_tokens.saturating_add(usage.completion_tokens);
+            // (#1444) Tri-state accumulation: a turn that DOES report the
+            // field promotes the running total from `None` to `Some` (or
+            // adds to an already-`Some` total); a turn that omits it leaves
+            // the running total untouched — it never resets an already-seen
+            // total back to `None`, and it never promotes `None` to
+            // `Some(0)` on its own. So the FINAL total is `None` only if
+            // NO turn in the whole dispatch ever reported the field.
+            if let Some(rt) = usage.reasoning_tokens() {
+                total_reasoning_tokens = Some(total_reasoning_tokens.unwrap_or(0).saturating_add(rt));
+            }
+            if let Some(ct) = usage.cached_tokens() {
+                total_cached_tokens = Some(total_cached_tokens.unwrap_or(0).saturating_add(ct));
+            }
             // (#854) Track endpoint staleness BEFORE overwriting the running
             // value: a count identical to last turn (while the thread grew)
             // means the endpoint froze it. Deliberately inside the `Some(usage)`
@@ -2769,6 +2828,8 @@ fn run_with_sleeper(
                     turns,
                     total_prompt_tokens,
                     total_completion_tokens,
+                    total_reasoning_tokens,
+                    total_cached_tokens,
                     compactions,
                     rest_ms,
                     rests,
@@ -2852,6 +2913,8 @@ fn run_with_sleeper(
                             turns,
                             total_prompt_tokens,
                             total_completion_tokens,
+                            total_reasoning_tokens,
+                            total_cached_tokens,
                             compactions,
                             rest_ms,
                             rests,
@@ -2990,6 +3053,8 @@ fn run_with_sleeper(
                             turns,
                             total_prompt_tokens,
                             total_completion_tokens,
+                            total_reasoning_tokens,
+                            total_cached_tokens,
                             compactions,
                             rest_ms,
                             rests,
@@ -3500,6 +3565,8 @@ fn run_with_sleeper(
                                 turns,
                                 total_prompt_tokens,
                                 total_completion_tokens,
+                                total_reasoning_tokens,
+                                total_cached_tokens,
                                 compactions,
                                 rest_ms,
                                 rests,
@@ -3617,6 +3684,8 @@ fn run_with_sleeper(
                         turns,
                         total_prompt_tokens,
                         total_completion_tokens,
+                        total_reasoning_tokens,
+                        total_cached_tokens,
                         compactions,
                         rest_ms,
                         rests,
@@ -3758,6 +3827,8 @@ fn run_with_sleeper(
                                 turns,
                                 total_prompt_tokens,
                                 total_completion_tokens,
+                                total_reasoning_tokens,
+                                total_cached_tokens,
                                 compactions,
                                 rest_ms,
                                 rests,
@@ -3905,6 +3976,8 @@ fn run_with_sleeper(
                             turns,
                             total_prompt_tokens,
                             total_completion_tokens,
+                            total_reasoning_tokens,
+                            total_cached_tokens,
                             compactions,
                             rest_ms,
                             rests,
@@ -9635,6 +9708,42 @@ mod tests {
     #[serial_test::serial]
     fn assistant_messages_in_history_never_carry_reasoning_content() {
         let server = MockServer::start();
+        // (#1444 review) Registration ORDER is load-bearing, and this test
+        // had it backwards. httpmock returns the FIRST-REGISTERED mock whose
+        // predicate matches, not the most specific one — and `turn1`'s
+        // predicate (`body_contains("\"role\":\"user\"")`) stays true
+        // forever, because the original user message never leaves the
+        // growing conversation. Registered first, `turn1` therefore answered
+        // EVERY request: the loop hammered turn one's tool call 100 times,
+        // tripped the cycle detector, exited on max-turns, and still passed
+        // — under an `.expect("clean two-turn dispatch")` that was false,
+        // for ~2.8s of suite time. The guard itself is load-bearing
+        // (deleting the post-promoter reasoning clear does red this test),
+        // so the fix is to route it correctly, not to delete it.
+        //
+        // Registering the MORE SPECIFIC mock first gives it the lower id:
+        // on request 1 `turn2`'s predicate is false (no tool result exists
+        // yet) so it falls through to `turn1`; from request 2 on, `turn2`
+        // matches and wins. Same ordering as
+        // `loop_accumulates_reasoning_and_cached_tokens_across_turns_tri_state`.
+        // `assert_eq!(outcome.turns, 2)` below pins the routing so it cannot
+        // silently regress again. (Filed as #2541 for the general pattern;
+        // the reviewer established the other six multi-mock tests
+        // discriminate on a genuine model-name predicate and are unaffected.)
+        //
+        // Second call (after the tool result): model finishes with stop.
+        let _turn2 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"tool\"");
+            then.status(200).json_body(chat_response_json(
+                Some("done"),
+                None,
+                "stop",
+                200,
+                10,
+            ));
+        });
         // First call: model emits reasoning + a structured tool call
         // (promotion does NOT fire — tool_calls field is populated).
         // The reasoning is set on the response; without the post-
@@ -9668,19 +9777,6 @@ mod tests {
                 "usage": { "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150 },
             }));
         });
-        // Second call (after tool result): model finishes with stop.
-        let _turn2 = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/chat/completions")
-                .body_contains("\"role\":\"tool\"");
-            then.status(200).json_body(chat_response_json(
-                Some("done"),
-                None,
-                "stop",
-                200,
-                10,
-            ));
-        });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let tmp = tempfile::Builder::new().prefix("reasoning-invariant").tempdir().unwrap();
@@ -9691,6 +9787,17 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("clean two-turn dispatch");
+
+        // (#1444 review) Pins the mock ROUTING the ordering above fixes.
+        // Without it the loop can silently fall back to answering every
+        // request from `turn1`, run to the 100-turn cap, and still satisfy
+        // every assertion below — which is exactly what it did.
+        assert_eq!(
+            outcome.turns, 2,
+            "turn 1 must be answered by the tool_calls mock and turn 2 by the stop mock; \
+             a higher count means turn1's mock is shadowing turn2's again"
+        );
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
 
         // The first assistant message in the conversation must have
         // reasoning_content stripped — even though the model emitted
@@ -9842,8 +9949,115 @@ mod tests {
         assert_eq!(outcome.turns, 1);
         assert_eq!(outcome.compactions, 0);
         assert_eq!(outcome.total_prompt_tokens, 1234);
+        // (#1444) `chat_response_json` never emits `completion_tokens_details`/
+        // `prompt_tokens_details` — the LMStudio-local shape. Absent, not zero.
+        assert_eq!(outcome.total_reasoning_tokens, None);
+        assert_eq!(outcome.total_cached_tokens, None);
         // #325: pin the Stop terminal_reason on this clean-exit path.
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+    }
+
+    /// (#1444) Two turns: turn 1 (tool_calls) reports BOTH reasoning_tokens
+    /// and cached_tokens; turn 2 (stop) reports reasoning_tokens only — its
+    /// `usage` carries no `prompt_tokens_details` at all. The final totals
+    /// must SUM what was reported (500+300=800 reasoning) while
+    /// `total_cached_tokens` reflects ONLY turn 1's report (20), never
+    /// reset to `None` or zeroed by turn 2's silence on the field — the
+    /// tri-state "a turn that omits it doesn't corrupt what's already been
+    /// seen" contract `total_reasoning_tokens`'s own doc names.
+    #[test]
+    fn loop_accumulates_reasoning_and_cached_tokens_across_turns_tri_state() {
+        let server = MockServer::start();
+        // (#1444 test-infra finding) httpmock's `find_mock` returns the
+        // FIRST-registered mock (ascending internal id) whose predicate is
+        // satisfied — NOT the most specific one. `turn1`'s predicate
+        // (`body_contains("\"role\":\"user\"")`) stays true forever (the
+        // original user message never leaves the growing conversation), so
+        // it would shadow `turn2` on every later request if registered
+        // first. Registering the MORE SPECIFIC mock (`turn2`, matched only
+        // once a tool result exists) FIRST — so it gets the lower id and is
+        // checked first — makes routing correct: on request 1 `turn2`'s
+        // predicate is false (no tool result yet) so it falls through to
+        // `turn1`; from request 2 onward `turn2` matches and wins.
+        let turn2 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"tool\"");
+            then.status(200).json_body(serde_json::json!({
+                "id": "chatcmpl-2",
+                "object": "chat.completion",
+                "created": 1700000001,
+                "model": "ignored-by-test",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "done" },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 200,
+                    "completion_tokens": 350,
+                    "total_tokens": 550,
+                    "completion_tokens_details": { "reasoning_tokens": 300 },
+                    // No prompt_tokens_details at all this turn — must NOT
+                    // reset total_cached_tokens back to None.
+                },
+            }));
+        });
+        let turn1 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"user\"");
+            then.status(200).json_body(serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "ignored-by-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "read", "arguments": "{\"path\":\"/workspace/x.txt\"}" },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 600,
+                    "total_tokens": 700,
+                    "completion_tokens_details": { "reasoning_tokens": 500 },
+                    "prompt_tokens_details": { "cached_tokens": 20 },
+                },
+            }));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("reasoning-tokens-accum").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![
+            Message::system("you are a test assistant"),
+            Message::user("read x.txt"),
+        ];
+        let tools = [Tool::Read, Tool::Edit, Tool::Bash];
+
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
+            .expect("two-turn loop should terminate cleanly on turn 2's stop");
+
+        turn1.assert();
+        turn2.assert();
+        assert_eq!(outcome.turns, 2);
+        assert_eq!(outcome.total_completion_tokens, 950, "600 + 350 — reasoning_tokens is INCLUDED, not additional");
+        assert_eq!(outcome.total_reasoning_tokens, Some(800), "500 + 300 summed across both turns");
+        assert_eq!(
+            outcome.total_cached_tokens,
+            Some(20),
+            "only turn 1 reported cached_tokens; turn 2's silence must not reset or corrupt it"
+        );
     }
 
     /// The real signal: drive the loop into a compaction by escalating

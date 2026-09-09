@@ -5551,6 +5551,8 @@ mod tests {
                     total_tokens: Some(7),
                     prompt_tokens: None,
                     completion_tokens: None,
+                    reasoning_tokens: None,
+                    cached_tokens: None,
                     model: Some("served-by-mock".to_string()),
                 })
             });

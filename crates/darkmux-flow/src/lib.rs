@@ -3067,7 +3067,15 @@ mod tests {
         //           launched from the same config shared one session_id
         //           (#1918). See `schema.rs`'s own history entry for the
         //           full explanation.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.43.0");
+        //   1.44.0: additive `reasoning_tokens`/`cached_tokens` payload
+        //           keys on `telemetry.tokens` and `dispatch complete`'s
+        //           token totals (#1444) — billed-but-previously-invisible
+        //           reasoning burn from hosted models. Asserts NO
+        //           arithmetic relation to `completion_tokens`: that
+        //           relation is provider-scoped. See `schema.rs`'s own
+        //           history entry for the full explanation and the
+        //           recorded evidence.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.44.0");
     }
 
     #[test]

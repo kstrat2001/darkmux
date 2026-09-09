@@ -598,6 +598,9 @@
         // metrics.json lives under <out_dir>/.darkmux-runtime/ — the same
         // out-dir the trajectory tailer reads. read_token_totals pulls the
         // runtime's recorded prompt/completion totals; total() is derived.
+        // (#1444) This fixture predates the reasoning/cached fields
+        // (no such keys at all) — `reasoning`/`cached` must read as
+        // `None`, never a fabricated `0`.
         let out = TempDir::new().unwrap();
         let rt = out.path().join(".darkmux-runtime");
         fs::create_dir_all(&rt).unwrap();
@@ -610,6 +613,30 @@
         assert_eq!(t.prompt, 1200);
         assert_eq!(t.completion, 345);
         assert_eq!(t.total(), 1545);
+        assert_eq!(t.reasoning, None, "a pre-#1444 metrics.json has no such key at all");
+        assert_eq!(t.cached, None);
+    }
+
+    /// (#1444) A metrics.json written by a build that DOES track reasoning/
+    /// cached totals (a hosted reasoning-family dispatch) — both fields
+    /// must round-trip as real numbers. `reasoning <= completion` holds for
+    /// THIS fixture's provider family and is asserted as such; it is not a
+    /// universal invariant (#1444 review).
+    #[test]
+    fn read_token_totals_parses_reasoning_and_cached_tokens_when_present() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(
+            rt.join("metrics.json"),
+            r#"{"total_prompt_tokens": 1200, "total_completion_tokens": 345,
+                "total_reasoning_tokens": 300, "total_cached_tokens": 64, "turns": 4}"#,
+        )
+        .unwrap();
+        let t = read_token_totals(out.path());
+        assert_eq!(t.reasoning, Some(300));
+        assert_eq!(t.cached, Some(64));
+        assert!(t.reasoning.unwrap() <= t.completion);
     }
 
     #[test]
@@ -617,9 +644,13 @@
         // Observability enrichment, never a dispatch-failing path: a missing
         // file (container died before writing) or malformed JSON yields zero
         // totals rather than erroring.
+        // (#1444) `reasoning`/`cached` degrade to `None` on the SAME paths
+        // — "unmeasured" is the honest reading, not a fabricated zero.
         let missing = TempDir::new().unwrap();
         let t = read_token_totals(missing.path());
         assert_eq!(t.total(), 0, "missing metrics.json → zero totals");
+        assert_eq!(t.reasoning, None);
+        assert_eq!(t.cached, None);
 
         let bad = TempDir::new().unwrap();
         let rt = bad.path().join(".darkmux-runtime");
@@ -627,6 +658,8 @@
         fs::write(rt.join("metrics.json"), "{not valid json").unwrap();
         let t = read_token_totals(bad.path());
         assert_eq!(t.total(), 0, "malformed metrics.json → zero totals");
+        assert_eq!(t.reasoning, None);
+        assert_eq!(t.cached, None);
     }
 
     #[test]
@@ -634,7 +667,7 @@
         // Guard the derived sum against overflow on absurd inputs (the
         // runtime caps real totals far below this, but the helper must not
         // panic in a release build with overflow checks off — saturate).
-        let t = TokenTotals { prompt: u32::MAX, completion: 10 };
+        let t = TokenTotals { prompt: u32::MAX, completion: 10, reasoning: None, cached: None };
         assert_eq!(t.total(), u32::MAX);
     }
 
@@ -6487,6 +6520,248 @@
         assert_eq!(payload["prompt_tokens"], 24000);
         assert_eq!(payload["completion_tokens"], 850);
         assert_eq!(payload["total_tokens"], 24850);
+        // (#1444) This fixture's `usage` carries no reasoning/cached
+        // fields at all (the ordinary LMStudio-local shape) — must render
+        // `null`, never a fabricated `0`.
+        assert!(payload["reasoning_tokens"].is_null());
+        assert!(payload["cached_tokens"].is_null());
+    }
+
+    /// (#1444) A turn whose `usage` DOES carry `reasoning_tokens`/
+    /// `cached_tokens` (the shape `trajectory::append_model_completed`
+    /// writes when the provider reported them) maps them through as real
+    /// numbers. On THIS fixture's provider family reasoning is a subset of
+    /// completion — asserted as a property of the fixture, never as a
+    /// universal invariant (see
+    /// `turn_tokens_payload_prefers_the_providers_own_total` below).
+    #[test]
+    fn turn_tokens_payload_maps_reasoning_and_cached_tokens_when_present() {
+        let event = serde_json::json!({
+            "type": "model.completed",
+            "seq": 7,
+            "usage": {
+                "prompt_tokens": 75, "completion_tokens": 1186, "total_tokens": 1261,
+                "reasoning_tokens": 1024, "cached_tokens": 64,
+            },
+        });
+        let payload = turn_tokens_payload(&event).expect("maps usage");
+        assert_eq!(payload["reasoning_tokens"], 1024);
+        assert_eq!(payload["cached_tokens"], 64);
+        assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
+    }
+
+    /// (#1444 review) `total_tokens` must be the PROVIDER'S number whenever
+    /// the provider sent one — this payload used to compute
+    /// `prompt.saturating_add(completion)` unconditionally and throw the
+    /// reported total away.
+    ///
+    /// The fixture is a verbatim recorded block from this machine's own
+    /// corpus (`~/.darkmux/flows/2026-07-05.jsonl`, `gemini-2.5-flash` via
+    /// `openai:generativelanguage.googleapis.com`): the endpoint billed
+    /// 11,598 tokens while prompt + completion sums to 10,098. Recomputing
+    /// the sum understates that one turn's burn by 1,500 tokens — and 284
+    /// blocks in the corpus have this shape, across `gemini-3.1-pro-preview`,
+    /// `gemini-2.5-flash` and `grok-4.3` (30 of 30 for the last).
+    #[test]
+    fn turn_tokens_payload_prefers_the_providers_own_total() {
+        let event = serde_json::json!({
+            "type": "model.completed",
+            "seq": 4,
+            "usage": { "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598 },
+        });
+        let payload = turn_tokens_payload(&event).expect("maps usage");
+        assert_eq!(
+            payload["total_tokens"], 11598,
+            "the provider's own total must win; prompt + completion (10098) understates by 1500"
+        );
+        assert_eq!(payload["prompt_tokens"], 9970);
+        assert_eq!(payload["completion_tokens"], 128);
+    }
+
+    /// (#1444 review) The fallback survives: a `usage` with no
+    /// `total_tokens` at all still derives one from the split, so older
+    /// trajectories (and any cross-runtime writer that omits it) keep
+    /// emitting a total rather than dropping the key.
+    #[test]
+    fn turn_tokens_payload_falls_back_to_the_sum_when_no_total_reported() {
+        let event = serde_json::json!({
+            "type": "model.completed",
+            "seq": 5,
+            "usage": { "prompt_tokens": 300, "completion_tokens": 45 },
+        });
+        let payload = turn_tokens_payload(&event).expect("maps usage");
+        assert_eq!(payload["total_tokens"], 345, "no reported total → derive from the split");
+    }
+
+    // ─── remote_usage_tokens (#1444 review) ───────────────────────────
+
+    /// (#1444 review) `dispatch_remote` performs real HTTP, so nothing in
+    /// the suite ever executed the inline `usage` extraction that used to
+    /// live in its body: nulling `reasoning_tok` there left all 1503 crew
+    /// tests green while the field stopped being recorded on the ONE path
+    /// that actually reports it. Extracted to `remote_usage_tokens` and
+    /// pinned here.
+    #[test]
+    fn remote_usage_tokens_reads_reasoning_and_cached_from_the_details_objects() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 75,
+            "completion_tokens": 1186,
+            "total_tokens": 1261,
+            "completion_tokens_details": { "reasoning_tokens": 1024 },
+            "prompt_tokens_details": { "cached_tokens": 64 },
+        });
+        let u = remote_usage_tokens(&usage);
+        assert_eq!(u.prompt, 75);
+        assert_eq!(u.completion, 1186);
+        assert_eq!(u.total, 1261);
+        assert_eq!(u.reasoning, Some(1024));
+        assert_eq!(u.cached, Some(64));
+    }
+
+    /// (#1444) Absence at BOTH depths — no details object at all, and a
+    /// details object present but not naming the field — must read as
+    /// `None`, never a fabricated `0`.
+    #[test]
+    fn remote_usage_tokens_absent_details_stay_none_never_zero() {
+        let no_objects = serde_json::json!({
+            "prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42,
+        });
+        let u = remote_usage_tokens(&no_objects);
+        assert_eq!(u.reasoning, None);
+        assert_eq!(u.cached, None);
+
+        let empty_objects = serde_json::json!({
+            "prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42,
+            "completion_tokens_details": {}, "prompt_tokens_details": {},
+        });
+        let u = remote_usage_tokens(&empty_objects);
+        assert_eq!(u.reasoning, None, "an empty details object names no zero");
+        assert_eq!(u.cached, None);
+
+        // A reported zero stays distinguishable from "didn't say".
+        let explicit_zero = serde_json::json!({
+            "prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42,
+            "completion_tokens_details": { "reasoning_tokens": 0 },
+        });
+        assert_eq!(remote_usage_tokens(&explicit_zero).reasoning, Some(0));
+    }
+
+    /// (#1444 review) The endpoint's own `total_tokens` wins over the sum.
+    /// Numbers lifted verbatim from a recorded `gemini-2.5-flash` block in
+    /// `~/.darkmux/flows/2026-07-05.jsonl`: the endpoint billed 11,598 while
+    /// prompt + completion is 10,098.
+    #[test]
+    fn remote_usage_tokens_prefers_the_endpoints_own_total() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598,
+        });
+        let u = remote_usage_tokens(&usage);
+        assert_eq!(u.total, 11598, "recomputing the sum would understate by 1500");
+
+        // …and the sum is still the fallback when the endpoint sent none.
+        let no_total = serde_json::json!({ "prompt_tokens": 300, "completion_tokens": 45 });
+        assert_eq!(remote_usage_tokens(&no_total).total, 345);
+
+        // A `usage` that is JSON null (the endpoint omitted it) degrades to
+        // honest zeros rather than panicking.
+        let u = remote_usage_tokens(&serde_json::Value::Null);
+        assert_eq!((u.prompt, u.completion, u.total), (0, 0, 0));
+        assert_eq!(u.reasoning, None);
+    }
+
+    // ─── "direct"-runtime token key parity (#1444 review) ─────────────
+
+    /// (#1444 review) Both `runtime: "direct"` producers — `dispatch_remote`
+    /// and `dispatch_local_single_shot` — write their token block through
+    /// `insert_direct_token_keys`, so their key SET cannot drift apart the
+    /// way it did when #1444's first pass added `reasoning_tokens`/
+    /// `cached_tokens` to one and not the other.
+    ///
+    /// The keys must be present even when every value is unreported: a
+    /// consumer that distinguishes "reported null" from "key absent" — which
+    /// is the entire point of the tri-state — must get the same answer from
+    /// both arms.
+    /// The key names are spelled out as LITERALS here on purpose. An earlier
+    /// draft of this test iterated `DIRECT_TOKEN_KEYS` itself, which made it
+    /// self-referential and vacuous: rewriting the constant's last two
+    /// entries to duplicate `prompt_tokens`/`completion_tokens` — deleting
+    /// the whole #1444 contribution from both direct producers — left this
+    /// test GREEN. Caught by mutation; the literals are what give it teeth.
+    #[test]
+    fn insert_direct_token_keys_always_writes_all_five_keys() {
+        let mut payload = serde_json::json!({ "runtime": "direct" });
+        let obj = payload.as_object_mut().unwrap();
+        insert_direct_token_keys(obj, None, None, None, None, None);
+        for key in [
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "{key} must be PRESENT-and-null when unreported, never absent — \
+                 the two direct producers have to answer identically"
+            );
+            assert!(obj[key].is_null(), "{key} must be null, never a fabricated 0");
+        }
+        // …and the constant the writer iterates must name exactly those five,
+        // so the parity contract and the emission cannot disagree.
+        assert_eq!(
+            DIRECT_TOKEN_KEYS,
+            [
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "reasoning_tokens",
+                "cached_tokens"
+            ]
+        );
+        assert_eq!(obj.len(), 6, "the five token keys plus the pre-existing `runtime`");
+    }
+
+    /// (#1444 review) The remote arm's convention: counts degrade to `0`
+    /// (pre-existing behavior) while the details stay tri-state. The local
+    /// arm's convention: every `SingleShotReply` `Option` forwarded
+    /// untouched. Both go through the same writer, so the key set matches
+    /// even though the values legitimately differ.
+    #[test]
+    fn direct_token_key_set_matches_across_both_producers() {
+        let remote_usage = serde_json::json!({
+            "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598,
+        });
+        let u = remote_usage_tokens(&remote_usage);
+        let mut remote = serde_json::json!({});
+        insert_direct_token_keys(
+            remote.as_object_mut().unwrap(),
+            Some(u.prompt),
+            Some(u.completion),
+            Some(u.total),
+            u.reasoning,
+            u.cached,
+        );
+
+        // The local arm, with an LMStudio reply that reports a split and no
+        // details object at all.
+        let mut local = serde_json::json!({});
+        insert_direct_token_keys(
+            local.as_object_mut().unwrap(),
+            Some(30),
+            Some(12),
+            Some(42),
+            None,
+            None,
+        );
+
+        let remote_keys: Vec<&String> = remote.as_object().unwrap().keys().collect();
+        let local_keys: Vec<&String> = local.as_object().unwrap().keys().collect();
+        assert_eq!(remote_keys, local_keys, "both direct producers must emit the same key set");
+        // The provider's own total survives on the remote side.
+        assert_eq!(remote["total_tokens"], 11598);
+        // …and absence reads identically on both.
+        assert!(remote["reasoning_tokens"].is_null());
+        assert!(local["reasoning_tokens"].is_null());
     }
 
     /// (#795) No `usage` (or JSON-null usage — upstream omitted it) emits
@@ -10320,7 +10595,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "",
             0,
             &super::TrajectorySummary::default(),
-            super::TokenTotals { prompt: 10, completion: 20 },
+            super::TokenTotals { prompt: 10, completion: 20, reasoning: None, cached: None },
             None,
             &stats,
             &extras,
@@ -10335,6 +10610,41 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(payload["host_window"]["samples"], 5);
         assert_eq!(payload["wall_ms"], 1000);
         assert_eq!(payload["result_class"], "ok");
+        // (#1444) Neither `TokenTotals.reasoning` nor `.cached` was set on
+        // this run (metrics.json never carried the field — a local
+        // dispatch) — the payload must render `null`, never a fabricated
+        // `0` that would read as "measured, zero reasoning burn".
+        assert!(payload["reasoning_tokens"].is_null());
+        assert!(payload["cached_tokens"].is_null());
+    }
+
+    /// (#1444) When `TokenTotals` DOES carry a reasoning/cached figure
+    /// (metrics.json had the field, from a hosted reasoning-family
+    /// dispatch), the payload surfaces it as a real number — never
+    /// silently dropped.
+    #[test]
+    fn build_dispatch_complete_payload_carries_reasoning_and_cached_tokens_when_present() {
+        let stats = super::reduce_host_stats(&[]);
+        let payload = super::build_dispatch_complete_payload(
+            1000,
+            super::RestTotals { rest_ms: 0, rests: 0 },
+            None,
+            "stdout-body",
+            "",
+            0,
+            &super::TrajectorySummary::default(),
+            super::TokenTotals { prompt: 100, completion: 600, reasoning: Some(500), cached: Some(20) },
+            None,
+            &stats,
+            &no_extras(),
+            &None,
+            None,
+        );
+        assert_eq!(payload["completion_tokens"], 600);
+        assert_eq!(payload["reasoning_tokens"], 500);
+        assert_eq!(payload["cached_tokens"], 20);
+        // Subset, never additional: reasoning_tokens <= completion_tokens.
+        assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
     }
 
     #[test]

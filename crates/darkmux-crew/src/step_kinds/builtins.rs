@@ -679,6 +679,43 @@ fn clamp_hosted_max_tokens(requested: u32, budget: u64) -> u32 {
 /// scope cut hiding in this diff.
 pub struct DispatchSingleShotStepKind;
 
+/// (#1444 review) The hosted `dispatch.single_shot` step's "step result"
+/// payload, extracted as a pure function so its token block is testable.
+///
+/// It was an inline `json!` inside the hosted arm of
+/// `DispatchSingleShotStepKind::run`, which performs a real HTTP call with
+/// no override seam — so nothing in the suite ever built it, and replacing
+/// `reply.reasoning_tokens` with `Null` there left all 1503 crew tests
+/// green. Same pure-payload/emitter division `map_item_token_payload` and
+/// `turn_tokens_payload` already use.
+///
+/// `null` for a field the endpoint never reported, never a fabricated `0`.
+/// Nothing here derives one token field from another: whether reasoning
+/// sits inside `completion_tokens` is provider-scoped (see the runtime
+/// crate's `lmstudio::CompletionTokensDetails::reasoning_tokens`).
+fn hosted_single_shot_step_payload(
+    step_id: &str,
+    budget: u64,
+    max_tokens_requested: u32,
+    max_tokens_sent: u32,
+    reply: &crate::single_shot::SingleShotReply,
+) -> serde_json::Value {
+    serde_json::json!({
+        "step_id": step_id,
+        "kind": "dispatch.single_shot",
+        "runtime": "direct",
+        "remote_max_tokens_per_execution": budget,
+        "max_tokens_requested": max_tokens_requested,
+        "max_tokens_sent": max_tokens_sent,
+        "prompt_tokens": reply.prompt_tokens,
+        "completion_tokens": reply.completion_tokens,
+        "total_tokens": reply.total_tokens,
+        // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0)
+        "reasoning_tokens": reply.reasoning_tokens,
+        "cached_tokens": reply.cached_tokens,
+    })
+}
+
 impl StepKind for DispatchSingleShotStepKind {
     fn id(&self) -> &'static str {
         "dispatch.single_shot"
@@ -836,17 +873,13 @@ impl StepKind for DispatchSingleShotStepKind {
                 machine_uid: None,
                 prev_hash: None,
                 hash: None,
-                payload: Some(serde_json::json!({
-                    "step_id": step.id,
-                    "kind": "dispatch.single_shot",
-                    "runtime": "direct",
-                    "remote_max_tokens_per_execution": budget,
-                    "max_tokens_requested": max_tokens,
-                    "max_tokens_sent": clamped_max_tokens,
-                    "prompt_tokens": reply.prompt_tokens,
-                    "completion_tokens": reply.completion_tokens,
-                    "total_tokens": reply.total_tokens,
-                })),
+                payload: Some(hosted_single_shot_step_payload(
+                    &step.id,
+                    budget,
+                    max_tokens,
+                    clamped_max_tokens,
+                    &reply,
+                )),
                 work_id: None,
                 attempt: None,
             });
@@ -958,6 +991,27 @@ pub struct MapItemResult {
     pub prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u64>,
+    /// (#1444 review) `usage.completion_tokens_details.reasoning_tokens` and
+    /// `usage.prompt_tokens_details.cached_tokens`, accumulated across an
+    /// item's attempts the same way the split above is.
+    ///
+    /// #1444's first pass added both to `SingleShotReply` and then dropped
+    /// them HERE, so `dispatch.map` — the highest-volume hosted-remote path
+    /// in the product, and the one the review funnel's probe and verify
+    /// stages run on — emitted a `telemetry.tokens` record with no reasoning
+    /// burn in it at all, while the 1.44.0 schema entry claimed
+    /// `telemetry.tokens` coverage. Exactly the class of loss #1530 closed
+    /// for the prompt/completion split, one field-pair later.
+    ///
+    /// Still `Option`, with the same honesty rule as every sibling: a
+    /// provider that never named the field leaves it `None`, and
+    /// [`map_item_token_payload`] omits the key rather than inventing a
+    /// zero. Tracked with flags INDEPENDENT of `any_split` — see
+    /// [`accumulate_details`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
     #[serde(default)]
@@ -1824,6 +1878,20 @@ fn map_item_token_payload(res: &MapItemResult) -> Option<serde_json::Value> {
     if let Some(c) = res.completion_tokens {
         obj.insert("completion_tokens".into(), serde_json::json!(c));
     }
+    // (#1444 review) Same omit-never-zero rule as the split above. NOTE the
+    // deliberate divergence from the runtime-side `telemetry.tokens`
+    // producers (`turn_tokens_payload`, `dispatch_remote`), which emit these
+    // keys as explicit JSON `null` when unreported: this emitter's whole
+    // convention is omission, and mixing the two inside one payload would be
+    // worse than either. Both readings mean "the provider didn't say"; the
+    // family-wide reconciliation this function's own doc already flags for
+    // `review_token_telemetry_payload` covers these two as well.
+    if let Some(r) = res.reasoning_tokens {
+        obj.insert("reasoning_tokens".into(), serde_json::json!(r));
+    }
+    if let Some(c) = res.cached_tokens {
+        obj.insert("cached_tokens".into(), serde_json::json!(c));
+    }
     Some(payload)
 }
 
@@ -1853,6 +1921,38 @@ fn accumulate_split(
     *psum += reply_prompt.unwrap_or(0);
     *csum += reply_completion.unwrap_or(0);
     *any_split = true;
+}
+
+/// (#1444 review) The `reasoning_tokens`/`cached_tokens` sibling of
+/// [`accumulate_split`], with the same honesty rule and one difference that
+/// matters: the two fields carry INDEPENDENT "was it ever reported" flags
+/// rather than sharing one.
+///
+/// `accumulate_split` can share `any_split` because a provider that reports
+/// a usage split reports both halves of it. These two are genuinely
+/// independent — `completion_tokens_details` and `prompt_tokens_details` are
+/// separate objects, and a provider can name one without the other (the
+/// runtime's own accumulator test pins exactly that turn shape: reasoning
+/// reported, `prompt_tokens_details` absent). Folding them under a shared
+/// flag would fabricate a `0` for whichever one the provider never named —
+/// the absent-vs-zero collapse #1444 exists to prevent, reintroduced inside
+/// the fix for it.
+fn accumulate_details(
+    reply_reasoning: Option<u64>,
+    reply_cached: Option<u64>,
+    rsum: &mut u64,
+    cachesum: &mut u64,
+    any_reasoning: &mut bool,
+    any_cached: &mut bool,
+) {
+    if let Some(r) = reply_reasoning {
+        *rsum += r;
+        *any_reasoning = true;
+    }
+    if let Some(c) = reply_cached {
+        *cachesum += c;
+        *any_cached = true;
+    }
 }
 
 /// (#1605) The bounded transient-error retry's backoff — short on purpose
@@ -1888,6 +1988,9 @@ fn map_local_item(
     let mut any_usage = false;
     // (#1530 dogfood) Parallel to `sum`/`any_usage`, for the usage SPLIT.
     let (mut psum, mut csum, mut any_split) = (0u64, 0u64, false);
+    // (#1444 review) Same shape again for the usage DETAILS, with one flag
+    // per field — see [`accumulate_details`] for why they can't share one.
+    let (mut rsum, mut cachesum, mut any_reasoning, mut any_cached) = (0u64, 0u64, false, false);
     // (#1442) Cumulative dispatch wall-clock across every attempt — the same
     // per-attempt accumulation `sum` (tokens) uses. A LOCAL item's
     // `served_model` is ALWAYS `None` by construction (see [`MapItemResult`]'s
@@ -1937,6 +2040,14 @@ fn map_local_item(
                     &mut csum,
                     &mut any_split,
                 );
+                accumulate_details(
+                    reply.reasoning_tokens,
+                    reply.cached_tokens,
+                    &mut rsum,
+                    &mut cachesum,
+                    &mut any_reasoning,
+                    &mut any_cached,
+                );
                 if !reply.content.trim().is_empty() {
                     return MapItemResult {
                         index,
@@ -1946,6 +2057,8 @@ fn map_local_item(
                         total_tokens: item_total_tokens(any_usage, sum),
                         prompt_tokens: item_split_tokens(any_split, psum),
                         completion_tokens: item_split_tokens(any_split, csum),
+                        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
+                        cached_tokens: item_split_tokens(any_cached, cachesum),
                         served_model: None,
                         wall_ms,
                         retried: error_retries_used,
@@ -1975,6 +2088,8 @@ fn map_local_item(
                         total_tokens: item_total_tokens(any_usage, sum),
                         prompt_tokens: item_split_tokens(any_split, psum),
                         completion_tokens: item_split_tokens(any_split, csum),
+                        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
+                        cached_tokens: item_split_tokens(any_cached, cachesum),
                         served_model: None,
                         wall_ms,
                         retried: error_retries_used,
@@ -1997,6 +2112,8 @@ fn map_local_item(
         total_tokens: item_total_tokens(any_usage, sum),
         prompt_tokens: item_split_tokens(any_split, psum),
         completion_tokens: item_split_tokens(any_split, csum),
+        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
+        cached_tokens: item_split_tokens(any_cached, cachesum),
         served_model: None,
         wall_ms,
         retried: error_retries_used,
@@ -2030,6 +2147,9 @@ fn map_hosted_item(
     let mut any_usage = false;
     // (#1530 dogfood) Parallel to `sum`/`any_usage`, for the usage SPLIT.
     let (mut psum, mut csum, mut any_split) = (0u64, 0u64, false);
+    // (#1444 review) Same shape again for the usage DETAILS, with one flag
+    // per field — see [`accumulate_details`] for why they can't share one.
+    let (mut rsum, mut cachesum, mut any_reasoning, mut any_cached) = (0u64, 0u64, false, false);
     // (#1442) Cumulative dispatch wall-clock across every attempt (the same
     // shape as `sum`), and the ENDPOINT-reported served model — captured from
     // the reply body's `model` field (last non-`None` across attempts wins, so
@@ -2066,9 +2186,12 @@ fn map_hosted_item(
                     content: String::new(),
                     error: Some(MAP_BUDGET_SKIP_ERROR.to_string()),
                     total_tokens: None,
-                    // No call fired, so there is no split to report either.
+                    // No call fired, so there is no split — and (#1444
+                    // review) no details — to report either.
                     prompt_tokens: None,
                     completion_tokens: None,
+                    reasoning_tokens: None,
+                    cached_tokens: None,
                     served_model: None,
                     wall_ms,
                     retried: 0,
@@ -2125,6 +2248,14 @@ fn map_hosted_item(
                     &mut csum,
                     &mut any_split,
                 );
+                accumulate_details(
+                    reply.reasoning_tokens,
+                    reply.cached_tokens,
+                    &mut rsum,
+                    &mut cachesum,
+                    &mut any_reasoning,
+                    &mut any_cached,
+                );
                 if reply.model.is_some() {
                     served_model = reply.model.clone();
                 }
@@ -2137,6 +2268,8 @@ fn map_hosted_item(
                         total_tokens: item_total_tokens(any_usage, sum),
                         prompt_tokens: item_split_tokens(any_split, psum),
                         completion_tokens: item_split_tokens(any_split, csum),
+                        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
+                        cached_tokens: item_split_tokens(any_cached, cachesum),
                         served_model,
                         wall_ms,
                         retried: error_retries_used,
@@ -2164,6 +2297,8 @@ fn map_hosted_item(
                         total_tokens: item_total_tokens(any_usage, sum),
                         prompt_tokens: item_split_tokens(any_split, psum),
                         completion_tokens: item_split_tokens(any_split, csum),
+                        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
+                        cached_tokens: item_split_tokens(any_cached, cachesum),
                         served_model,
                         wall_ms,
                         retried: error_retries_used,
@@ -2188,6 +2323,8 @@ fn map_hosted_item(
         total_tokens: item_total_tokens(any_usage, sum),
         prompt_tokens: item_split_tokens(any_split, psum),
         completion_tokens: item_split_tokens(any_split, csum),
+        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
+        cached_tokens: item_split_tokens(any_cached, cachesum),
         served_model,
         wall_ms,
         retried: error_retries_used,
@@ -3354,6 +3491,8 @@ mod tests {
             total_tokens: Some(10),
             prompt_tokens: None,
             completion_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
             served_model: None,
             wall_ms: 0,
             retried: 0,
@@ -3366,6 +3505,59 @@ mod tests {
         );
     }
 
+    /// (#1444 review) The hosted `dispatch.single_shot` step's "step result"
+    /// record. This payload used to be an inline `json!` inside an arm that
+    /// makes a real HTTP call with no override seam, so nothing executed it:
+    /// replacing `reply.reasoning_tokens` with `Null` there left all 1503
+    /// crew tests green. Extracted to `hosted_single_shot_step_payload` and
+    /// pinned here.
+    #[test]
+    fn single_shot_step_telemetry_carries_reasoning_and_cached_tokens() {
+        let reply = crate::single_shot::SingleShotReply {
+            content: "ok".to_string(),
+            total_tokens: Some(1261),
+            prompt_tokens: Some(75),
+            completion_tokens: Some(1186),
+            reasoning_tokens: Some(1024),
+            cached_tokens: Some(64),
+            model: Some("hosted".to_string()),
+        };
+        let payload = hosted_single_shot_step_payload("s1", 500_000, 4096, 4096, &reply);
+        assert_eq!(payload["reasoning_tokens"], 1024);
+        assert_eq!(payload["cached_tokens"], 64);
+        // Neighbors, so a copy-paste slip between fields cannot pass.
+        assert_eq!(payload["prompt_tokens"], 75);
+        assert_eq!(payload["completion_tokens"], 1186);
+        assert_eq!(payload["total_tokens"], 1261);
+        assert_eq!(payload["step_id"], "s1");
+        assert_eq!(payload["kind"], "dispatch.single_shot");
+        assert_eq!(payload["runtime"], "direct");
+        assert_eq!(payload["max_tokens_sent"], 4096);
+    }
+
+    /// (#1444 review) An endpoint that reported no details object leaves
+    /// both keys PRESENT-and-null — never absent, never `0`. The runtime-
+    /// side `telemetry.tokens` producers use the same null convention, so a
+    /// consumer reading this family sees one answer for "didn't say".
+    #[test]
+    fn single_shot_step_telemetry_renders_unreported_details_as_null() {
+        let reply = crate::single_shot::SingleShotReply {
+            content: "ok".to_string(),
+            total_tokens: Some(42),
+            prompt_tokens: Some(30),
+            completion_tokens: Some(12),
+            reasoning_tokens: None,
+            cached_tokens: None,
+            model: None,
+        };
+        let payload = hosted_single_shot_step_payload("s1", 500_000, 4096, 4096, &reply);
+        let obj = payload.as_object().expect("object");
+        assert!(obj.contains_key("reasoning_tokens"), "the key stays present");
+        assert!(payload["reasoning_tokens"].is_null(), "null, never a fabricated 0");
+        assert!(obj.contains_key("cached_tokens"));
+        assert!(payload["cached_tokens"].is_null());
+    }
+
     #[test]
     fn map_item_token_telemetry_carries_the_prompt_completion_split() {
         let res = MapItemResult {
@@ -3376,6 +3568,8 @@ mod tests {
             total_tokens: Some(4547),
             prompt_tokens: Some(2490),
             completion_tokens: Some(2057),
+            reasoning_tokens: None,
+            cached_tokens: None,
             served_model: None,
             wall_ms: 0,
             retried: 0,
@@ -3384,6 +3578,108 @@ mod tests {
         assert_eq!(payload["total_tokens"], 4547);
         assert_eq!(payload["prompt_tokens"], 2490, "GENERATED/fresh/re-read read the split");
         assert_eq!(payload["completion_tokens"], 2057);
+    }
+
+    /// (#1444 review) `dispatch.map` is the highest-volume hosted-remote
+    /// path in the product — the review funnel's probe and verify stages run
+    /// on it — and #1444's first pass gave it NO reasoning coverage at all:
+    /// `SingleShotReply` carried both new fields, `MapItemResult` dropped
+    /// them, and `accumulate_split` folded only prompt and completion. The
+    /// 1.44.0 schema entry claimed `telemetry.tokens` coverage while this
+    /// producer had none — exactly the loss #1530 closed for the split, one
+    /// field-pair later.
+    #[test]
+    fn map_item_token_telemetry_carries_reasoning_and_cached_tokens() {
+        let res = MapItemResult {
+            index: 0,
+            ok: true,
+            content: "x".to_string(),
+            error: None,
+            total_tokens: Some(1261),
+            prompt_tokens: Some(75),
+            completion_tokens: Some(1186),
+            reasoning_tokens: Some(1024),
+            cached_tokens: Some(64),
+            served_model: None,
+            wall_ms: 0,
+            retried: 0,
+        };
+        let payload = map_item_token_payload(&res).expect("a reply with usage emits a record");
+        assert_eq!(payload["reasoning_tokens"], 1024);
+        assert_eq!(payload["cached_tokens"], 64);
+        // The neighbors must still land where they belong.
+        assert_eq!(payload["total_tokens"], 1261);
+        assert_eq!(payload["prompt_tokens"], 75);
+        assert_eq!(payload["completion_tokens"], 1186);
+    }
+
+    /// (#1444 review) The omit-never-fabricate rule extends to the two new
+    /// fields, and each is independent: an item whose provider reported
+    /// reasoning but no `prompt_tokens_details` emits `reasoning_tokens`
+    /// and leaves `cached_tokens` off entirely — never a zero.
+    #[test]
+    fn map_item_token_telemetry_omits_unreported_details_independently() {
+        let res = MapItemResult {
+            index: 0,
+            ok: true,
+            content: "x".to_string(),
+            error: None,
+            total_tokens: Some(550),
+            prompt_tokens: Some(200),
+            completion_tokens: Some(350),
+            reasoning_tokens: Some(300),
+            cached_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+            retried: 0,
+        };
+        let payload = map_item_token_payload(&res).expect("emits");
+        assert_eq!(payload["reasoning_tokens"], 300);
+        assert!(
+            payload.get("cached_tokens").is_none(),
+            "an unreported field is omitted, never zeroed — and never dragged \
+             along by its sibling being present"
+        );
+
+        let neither = MapItemResult { reasoning_tokens: None, cached_tokens: None, ..res };
+        let payload = map_item_token_payload(&neither).expect("emits");
+        assert!(payload.get("reasoning_tokens").is_none());
+        assert!(payload.get("cached_tokens").is_none());
+    }
+
+    /// (#1444 review) The accumulator behind those fields. Independent flags
+    /// are the point: a provider can name `completion_tokens_details`
+    /// without `prompt_tokens_details` (the runtime's own two-turn
+    /// accumulator test pins exactly that turn shape), so a shared
+    /// `any_*` flag would fabricate a `0` for whichever one went unnamed.
+    #[test]
+    fn accumulate_details_tracks_each_field_independently() {
+        let (mut r, mut c, mut any_r, mut any_c) = (0u64, 0u64, false, false);
+
+        // No attempt reported anything → both stay absent.
+        accumulate_details(None, None, &mut r, &mut c, &mut any_r, &mut any_c);
+        assert_eq!(item_split_tokens(any_r, r), None);
+        assert_eq!(item_split_tokens(any_c, c), None);
+
+        // Attempt 1 reports both; attempt 2 reports reasoning only.
+        accumulate_details(Some(500), Some(20), &mut r, &mut c, &mut any_r, &mut any_c);
+        accumulate_details(Some(300), None, &mut r, &mut c, &mut any_r, &mut any_c);
+        assert_eq!(item_split_tokens(any_r, r), Some(800), "500 + 300 across attempts");
+        assert_eq!(
+            item_split_tokens(any_c, c),
+            Some(20),
+            "attempt 2's silence on cached must not reset or zero what attempt 1 reported"
+        );
+
+        // The mirror case: cached reported, reasoning never.
+        let (mut r2, mut c2, mut any_r2, mut any_c2) = (0u64, 0u64, false, false);
+        accumulate_details(None, Some(64), &mut r2, &mut c2, &mut any_r2, &mut any_c2);
+        assert_eq!(
+            item_split_tokens(any_r2, r2),
+            None,
+            "a shared flag would have fabricated Some(0) here"
+        );
+        assert_eq!(item_split_tokens(any_c2, c2), Some(64));
     }
 
     /// The no-fabrication rule survives the fix: a provider reporting only a
@@ -3399,6 +3695,8 @@ mod tests {
             total_tokens: Some(1521),
             prompt_tokens: None,
             completion_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
             served_model: None,
             wall_ms: 0,
             retried: 0,
@@ -3424,6 +3722,8 @@ mod tests {
             total_tokens: None,
             prompt_tokens: Some(30),
             completion_tokens: Some(12),
+            reasoning_tokens: None,
+            cached_tokens: None,
             served_model: None,
             wall_ms: 0,
             retried: 0,
@@ -3446,6 +3746,8 @@ mod tests {
             total_tokens: None,
             prompt_tokens: None,
             completion_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
             served_model: None,
             wall_ms: 0,
             retried: 0,
@@ -3481,9 +3783,9 @@ mod tests {
         // mission graph's max-fold token meter reads as the step's true
         // spend (any per-item value is <= the sum).
         let results = vec![
-            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
-            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
-            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
+            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
+            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
+            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
         ];
         let s = map_step(json!({}));
         let rec = DispatchMapStepKind::aggregate_record(&s, "m", true, &results);
@@ -3499,7 +3801,7 @@ mod tests {
             "any failed item raises the level"
         );
 
-        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0, retried: 0 }];
+        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 }];
         let rec = DispatchMapStepKind::aggregate_record(&s, "m", false, &clean);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
         assert_eq!(rec.payload.as_ref().unwrap()["remote"], false);
@@ -3636,6 +3938,8 @@ mod tests {
             total_tokens: total,
             prompt_tokens: None,
             completion_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
             model: Some("hosted".to_string()),
         }
     }
@@ -3735,6 +4039,8 @@ mod tests {
                 total_tokens: total,
                 prompt_tokens: None,
                 completion_tokens: None,
+                reasoning_tokens: None,
+                cached_tokens: None,
                 model: Some("hosted".to_string()),
             })
         });
@@ -3876,6 +4182,8 @@ mod tests {
                     total_tokens: *total,
                     prompt_tokens: None,
                     completion_tokens: None,
+                    reasoning_tokens: None,
+                    cached_tokens: None,
                     model: Some("hosted".to_string()),
                 }),
                 Err(e) => Err(anyhow!("{e}")),
@@ -4064,6 +4372,8 @@ mod tests {
                 total_tokens: total,
                 prompt_tokens: None,
                 completion_tokens: None,
+                reasoning_tokens: None,
+                cached_tokens: None,
                 model: served.map(str::to_string),
             })
         });
@@ -4352,6 +4662,8 @@ mod tests {
                     total_tokens: total,
                     prompt_tokens: None,
                     completion_tokens: None,
+                    reasoning_tokens: None,
+                    cached_tokens: None,
                     model: Some("served-r".to_string()),
                 })
             });
