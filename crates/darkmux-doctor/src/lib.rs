@@ -1242,10 +1242,21 @@ fn utility_binding_status(
         return Check {
             name,
             status: Status::Pass,
-            message: "no machine utility model registered; compaction uses the runtime default"
+            // (Second review round, #2571) Was "compaction uses the runtime
+            // default" — there IS no runtime default any more since #2571
+            // dropped `DEFAULT_COMPACTOR_MODEL` from production. An unset
+            // `internal.utility` binding now means compaction is OFF
+            // outright for every dispatch on this machine (disclosed loudly
+            // at dispatch time by `compactor_disclosure_message` /
+            // `unset_compactor_warning`), not silently degraded to a
+            // built-in fallback. This is the same surface those two
+            // disclosures point an operator back to, so it has to say the
+            // same thing they do.
+            message: "no machine utility model registered; compaction is OFF for every \
+                      dispatch on this machine (no runtime fallback since #2571)"
                 .into(),
             hint: Some(
-                "Optional: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": \"<model-id>\" }`. It serves compaction (and future estimation/mission-compile) for every role, decoupled from your profiles. (#590)".into(),
+                "Optional: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": \"<model-id>\" }`. It serves compaction (and future estimation/mission-compile) for every role, decoupled from your profiles — without it, long dispatches run without compaction. (#590, #2571)".into(),
             ),
         };
     };
@@ -9641,6 +9652,28 @@ mod tests {
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains("no machine utility model"));
         assert!(c.hint.unwrap().contains("internal"));
+    }
+
+    /// (Second review round, #2571) Pins the corrected message — the
+    /// pre-fix text said "compaction uses the runtime default", which
+    /// became false the moment #2571 removed `DEFAULT_COMPACTOR_MODEL`
+    /// from production. This check is a Pass on the same green surface the
+    /// disclosure messages (`compactor_disclosure_message` /
+    /// `unset_compactor_warning`) treat as worth a loud warning at dispatch
+    /// time; the two must not contradict each other.
+    #[test]
+    fn utility_binding_unregistered_message_says_compaction_is_off_not_defaulted() {
+        let c = super::utility_binding_status(None, None);
+        assert!(
+            c.message.to_ascii_lowercase().contains("off"),
+            "message must say compaction is OFF, not that it falls back to a default: {}",
+            c.message
+        );
+        assert!(
+            !c.message.to_ascii_lowercase().contains("runtime default"),
+            "message must not claim a runtime default exists — #2571 removed it: {}",
+            c.message
+        );
     }
 
     #[test]

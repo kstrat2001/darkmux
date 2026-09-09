@@ -477,31 +477,48 @@ impl CompactionConfig {
 
 /// (MUST FIX 1, #2571 follow-up) The operator-facing disclosure a dispatch
 /// owes at startup when it is about to run with NO compactor bound but a
-/// context window that says a long-running dispatch WOULD have compacted
-/// otherwise. Before this, an unset `internal.utility` binding produced no
-/// disclosure anywhere — no message, no trajectory event, no flow record,
-/// no envelope field — so a zero compaction count read identically to
-/// "never needed one." A long dispatch would run its transcript up against
-/// the primary model's context with only a soft trim between it and
-/// overflow, silently, with no context-overflow handling anywhere in the
-/// runtime to catch it.
+/// real compaction trigger configured — either a context window (the
+/// formula/window-derived trigger) or an absolute
+/// `--compact-threshold-tokens` (which needs no window at all; the
+/// original version of this function gated on `context_window` alone and
+/// left exactly that threshold-only mode silent — a dispatch configured
+/// that way is precisely the long dispatch that WOULD have compacted and
+/// now silently doesn't). Before this, an unset `internal.utility` binding
+/// produced no disclosure anywhere — no message, no trajectory event, no
+/// flow record, no envelope field — so a zero compaction count read
+/// identically to "never needed one." A long dispatch would run its
+/// transcript up against the primary model's context with only a soft trim
+/// between it and overflow, silently, with no context-overflow handling
+/// anywhere in the runtime to catch it.
 ///
 /// Pure so `main.rs`'s actual `eprintln!` is testable without capturing
-/// stderr — call sites just print whatever this returns. `None` when
+/// stderr — call sites just print whatever this returns. `None` only when
 /// compaction IS configured (`compactor_model` is `Some`, nothing to warn
-/// about) or when there's no context window to grow unbounded against
-/// (compaction was never going to trigger either way, so silence isn't
-/// hiding anything).
+/// about) — by the time production code reaches this function,
+/// `CompactionConfig::from_overrides_with_bail_and_custom` has already
+/// guaranteed a real trigger exists (either `context_window` or an
+/// explicit `threshold_tokens`; the constructor panics otherwise), so
+/// there is no "nothing was ever going to trigger" case left to stay
+/// silent for.
 pub fn compactor_disclosure_message(cfg: &CompactionConfig) -> Option<String> {
     if cfg.compactor_model.is_some() {
         return None;
     }
-    let window = cfg.context_window?;
+    let trigger_desc = match cfg.context_window {
+        Some(window) => format!(
+            "The primary model's context window is {window} tokens; this dispatch will grow \
+             its transcript against that window"
+        ),
+        None => format!(
+            "This dispatch has an absolute compaction threshold of {} tokens configured (no \
+             context window is known); it will grow its transcript toward that count",
+            cfg.threshold_tokens
+        ),
+    };
     Some(format!(
         "darkmux-runtime: no compactor is configured for this dispatch (#2571) — \
-         compaction is OFF. The primary model's context window is {window} tokens; this \
-         dispatch will grow its transcript against that window with only the built-in trim \
-         between it and overflow, and nothing will summarize the middle. This means the \
+         compaction is OFF. {trigger_desc} with only the built-in trim between it and \
+         overflow, and nothing will summarize the middle. This means the \
          host's `internal.utility` binding is unset (or an old registry never set it) — bind \
          it, or set an explicit `profile.runtime.compaction` compactor, before a long-running \
          dispatch, or expect it to truncate or fail on overflow instead of compacting."
@@ -2397,14 +2414,26 @@ mod tests {
         );
     }
 
+    /// (MUST FIX 1, second review round) Renamed from
+    /// `compactor_disclosure_silent_when_no_context_window` — that name and
+    /// assertion described the exact gap the second review found: a
+    /// dispatch configured threshold-only (an explicit
+    /// `--compact-threshold-tokens`, no `--context-window`) has a real,
+    /// reachable compaction trigger — the absolute threshold needs no
+    /// window at all — so silence here was hiding exactly the dispatch
+    /// that would have compacted and now doesn't.
     #[test]
-    fn compactor_disclosure_silent_when_no_context_window() {
+    fn compactor_disclosure_fires_when_unset_with_only_a_threshold() {
         let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, None, None);
-        assert_eq!(
-            compactor_disclosure_message(&cfg),
-            None,
-            "no context window means compaction was never going to trigger either way — \
-             nothing to disclose"
+        let msg = compactor_disclosure_message(&cfg)
+            .expect("no compactor + an absolute threshold must disclose, even with no window");
+        assert!(
+            msg.contains("30000"),
+            "disclosure must name the actual threshold so an operator can act on it: {msg}"
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("compaction is off"),
+            "disclosure must say plainly that compaction is off: {msg}"
         );
     }
 

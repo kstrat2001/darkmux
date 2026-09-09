@@ -664,23 +664,44 @@ impl CompactionDispatchArgs {
     /// (MUST FIX 1, #2571 follow-up) The host-side twin of the runtime's
     /// own `compactor_disclosure_message`: fires under the identical
     /// condition (`compactor_model` still `None` after every overlay, but a
-    /// context window IS set, so compaction would otherwise have fired) at
-    /// the point the host is about to apply — or, in this case, skip
-    /// applying — the compaction flags to the dispatch. `None` when a
-    /// compactor is configured, or when there's no context window for a
-    /// long dispatch to grow unbounded against.
+    /// real compaction trigger IS configured, so compaction would otherwise
+    /// have fired) at the point the host is about to apply — or, in this
+    /// case, skip applying — the compaction flags to the dispatch.
+    ///
+    /// (Second review round) The original version gated on `context_window`
+    /// alone, which left the absolute-threshold-only mode silent — the
+    /// compaction trigger also fires on `threshold_tokens` with no window
+    /// at all, and `CompactionDispatchArgs::from_profile` reads that field
+    /// independently of `context_window` (which comes from the primary
+    /// model's `n_ctx` and is absent whenever the primary is
+    /// endpoint-bearing). A dispatch configured threshold-only with no
+    /// compactor is exactly the long dispatch that would have compacted and
+    /// now silently doesn't, reachable from the host the same way it's
+    /// reachable from the runtime directly. Fires on EITHER trigger now;
+    /// `None` only when a compactor is configured, or when neither trigger
+    /// is set (nothing was ever going to compact either way).
     pub fn unset_compactor_warning(&self) -> Option<String> {
         if self.compactor_model.is_some() {
             return None;
         }
-        let window = self.context_window?;
-        Some(format!(
-            "darkmux dispatch: no compactor is bound for this dispatch (`internal.utility` is \
-             unset, and no `profile.runtime.compaction` compactor was pinned) — compaction is \
-             OFF. The primary model's context window is {window} tokens; a long-running \
-             dispatch will grow its transcript against that window with only the runtime's \
-             built-in trim between it and overflow. (#2571)"
-        ))
+        match (self.context_window, self.threshold_tokens) {
+            (None, None) => None,
+            (Some(window), _) => Some(format!(
+                "darkmux dispatch: no compactor is bound for this dispatch (`internal.utility` \
+                 is unset, and no `profile.runtime.compaction` compactor was pinned) — \
+                 compaction is OFF. The primary model's context window is {window} tokens; a \
+                 long-running dispatch will grow its transcript against that window with only \
+                 the runtime's built-in trim between it and overflow. (#2571)"
+            )),
+            (None, Some(threshold)) => Some(format!(
+                "darkmux dispatch: no compactor is bound for this dispatch (`internal.utility` \
+                 is unset, and no `profile.runtime.compaction` compactor was pinned) — \
+                 compaction is OFF. This dispatch has an absolute compaction threshold of \
+                 {threshold} tokens configured (no context window is known); a long-running \
+                 dispatch will grow its transcript toward that count with only the runtime's \
+                 built-in trim between it and overflow. (#2571)"
+            )),
+        }
     }
 }
 
@@ -1197,6 +1218,28 @@ mod tests {
     fn unset_compactor_warning_silent_when_no_context_window() {
         let c = CompactionDispatchArgs::default();
         assert_eq!(c.unset_compactor_warning(), None);
+    }
+
+    /// (Second review round) The threshold-only reachable case: an
+    /// endpoint-bearing primary (or any profile with no declared `n_ctx`)
+    /// leaves `context_window` `None`, but `threshold_tokens` is read
+    /// independently from `profile.runtime.compaction.threshold_tokens` —
+    /// a real, reachable compaction trigger that the pre-fix version of
+    /// this function stayed silent about.
+    #[test]
+    fn unset_compactor_warning_fires_when_no_compactor_and_only_a_threshold_is_set() {
+        let c = CompactionDispatchArgs {
+            threshold_tokens: Some(30_000),
+            ..Default::default()
+        };
+        let msg = c
+            .unset_compactor_warning()
+            .expect("no compactor + an absolute threshold must warn, even with no window");
+        assert!(msg.contains("30000"), "warning must name the threshold: {msg}");
+        assert!(
+            msg.to_ascii_lowercase().contains("compaction is off"),
+            "warning must say plainly that compaction is off: {msg}"
+        );
     }
 
     // ─── #557 slice 2 build_telemetry_record ──────────────────────────

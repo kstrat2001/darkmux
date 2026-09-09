@@ -4984,10 +4984,36 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // from "was never bound." Say so here, at the same point the
             // bound case warns on a load failure — same class of disclosure,
             // opposite trigger. `unset_compactor_warning` is pure and
-            // covered directly by `dispatch.rs`'s own unit tests; this call
-            // site sits behind the same `model_base_url_override.is_none()`
-            // mock-harness gate the bound arm above already notes is
-            // uncovered by this crate's dispatch()-level tests.
+            // covered directly by `dispatch.rs`'s own unit tests; the WIRING
+            // of this call site is pinned by
+            // `tests/cli.rs::dispatch_host_side_unset_compactor_disclosure_
+            // fires_on_the_local_path` (a fully hermetic real-binary spawn —
+            // fake `lms`/`docker` on `PATH`, no real LMStudio or Docker
+            // touched).
+            //
+            // (Second review round, "also consider") On the direct
+            // `darkmux dispatch` CLI path the runtime ALSO prints its own
+            // twin (`compaction::compactor_disclosure_message`,
+            // `runtime/src/main.rs`) under the identical condition — the
+            // host forwards `compactor_model`/`context_window`/
+            // `threshold_tokens` to the runtime unchanged as CLI flags, so
+            // whenever this branch fires the runtime's copy will too, once
+            // its (buffered, `wait_with_output`-captured) stderr is dumped
+            // by `main.rs`'s `if !quiet && !result.stderr.is_empty()`. Kept
+            // BOTH deliberately rather than suppressing either: the runtime
+            // copy is the single canonical source reachable from every
+            // invocation path (`lab run`, a bare `docker run` against the
+            // image, any non-darkmux harness) and prints only once the whole
+            // dispatch is DONE (`wait_with_output` buffers, it doesn't
+            // stream); this host copy is the operator's only ADVANCE
+            // warning — it prints immediately, at dispatch START, which
+            // matters on a long-running dispatch where the runtime's copy
+            // might not surface for hours. Suppressing this one would trade
+            // a real property (early warning) for solving a mild
+            // duplication (two similarly-worded paragraphs, not two
+            // contradictory ones) — the actual fix for the duplication is
+            // streaming the container's stderr live instead of buffering it
+            // for the final dump, which is a separate, larger change.
             eprintln!("{warning}");
         }
     }
@@ -9544,10 +9570,16 @@ fn resolve_dispatch_model_with_hosts(
 
 /// (#590) Best-effort: the machine's registered utility model
 /// (`internal.utility`), for overlaying onto the compactor. `None` if the
-/// registry isn't loadable or no utility model is registered — the runtime
-/// then keeps its built-in default compactor. Mirrors the loud-but-soft
-/// posture of `resolve_dispatch_model_internal`: a missing binding is not an
-/// error, just an absent overlay.
+/// registry isn't loadable or no utility model is registered — (#2571) NOT
+/// a case where the runtime keeps a built-in default compactor; there is no
+/// runtime default any more. This `None` flows straight through
+/// `apply_utility_model` into `compaction.compactor_model`, which stays
+/// `None`, which means compaction is OFF outright for the dispatch
+/// (disclosed loudly by `unset_compactor_warning` at the call site above).
+/// Mirrors the loud-but-soft posture of `resolve_dispatch_model_internal`: a
+/// missing binding is not an error, just an absent overlay — but "absent
+/// overlay" is a genuinely different, disclosed degraded mode now, not a
+/// silent substitution.
 fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
     darkmux_profiles::profiles::load_registry(config_path)
         .ok()

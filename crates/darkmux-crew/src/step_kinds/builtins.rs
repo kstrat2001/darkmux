@@ -3624,6 +3624,174 @@ mod tests {
         mock.assert_hits(1);
     }
 
+    // ─── Also fix (second review round): the DROP-PATH error bookend's
+    //     model field, unpinned in both kinds ───────────────────────────
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_single_shot_local_streaming_drop_path_error_bookend_carries_the_namespaced_identifier() {
+        // (Also fix, second review round) The two streaming bookend tests
+        // above (`..._local_streaming_bookends_carry_the_namespaced_
+        // identifier`) only ever reach the CLEAN path: `bookend.close(...)`
+        // fires with `wire_model.as_ref()`, so they pin the START and the
+        // real COMPLETE record. `StepBookend`'s on_abort record — the
+        // "dispatch error" the Drop impl emits when `run_single_shot`
+        // returns early via `?` WITHOUT ever reaching `close` — is a
+        // SEPARATE construction site (line ~994, `Self::bookend_record(step,
+        // wire_model.as_ref(), "dispatch error", ...)`), and nothing
+        // exercised it: mutating that call back to the bare `model` compiled
+        // and left the whole suite green, because no test ever forced the
+        // dispatch itself to fail on the STREAMING path.
+        //
+        // This does: same streaming+channel harness as the sibling test
+        // above, but the mock answers 400 (matching `..._local_failure_
+        // names_the_lost_residency`'s shape), so `single_shot_chat(&req)?`
+        // at the end of `run_single_shot` returns early — `bookend.close`
+        // is never called, and `StepBookend`'s Drop fires the on_abort
+        // record into the channel instead.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(400).header("content-type", "application/json").json_body(json!({
+                "error": { "message": "Model \"darkmux:qwen3-4b\" not found" },
+            }));
+        });
+
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(
+            Some(tx),
+            None,
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+        let result = DispatchSingleShotStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        drop(ctx);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+
+        result.expect_err("the mocked 400 must surface as an Err — this test needs the drop path, not the clean one");
+        mock.assert_hits(1);
+
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let error_bookends: Vec<&darkmux_flow::FlowRecord> =
+            emitted.iter().filter(|r| r.action == "dispatch error").collect();
+        assert_eq!(
+            error_bookends.len(),
+            1,
+            "expected exactly the drop-emitted error bookend (no start-only or double-emit): \
+             {emitted:?}"
+        );
+        assert_eq!(
+            error_bookends[0].model.as_deref(),
+            Some("darkmux:qwen3-4b"),
+            "the DROP-PATH error bookend must carry the namespaced identifier the dispatch \
+             actually addressed, not the bare config.model: {:?}",
+            error_bookends[0]
+        );
+    }
+
+    #[test]
+    fn dispatch_map_local_streaming_drop_path_error_bookend_carries_the_namespaced_identifier() {
+        // (Also fix, second review round) `dispatch.map`'s twin of the test
+        // above. Unlike `dispatch.single_shot`, `dispatch.map`'s per-item
+        // failures are ALL isolated into `MapItemResult` by design (the
+        // "per-item error isolation" policy this kind documents) — neither
+        // `map_local_item` nor `map_hosted_item` ever propagates a `?` back
+        // through `run_map`. So there is no ordinary dispatch failure that
+        // reaches `StepBookend`'s Drop for this kind; the only route is a
+        // genuine panic between `StepBookend::new` (bookend creation) and
+        // `bookend.close` (after the per-item loop). This test drives that
+        // panic through the SAME seam a real `bucket_group` sibling failure
+        // would use in production: the `MapDispatchOverride` test seam
+        // (`StepRunCtx::dispatch_override`, already exercised in
+        // `scheduler.rs`'s `dispatch_override_intercepts_dispatch_map_items_
+        // on_the_worker_thread`) intercepts the per-item transport call —
+        // panicking there is a stand-in for a transport-layer bug the
+        // override seam exists to let tests reach without a live server.
+        //
+        // LOCAL (no `config.endpoint`) is required, not incidental: a
+        // HOSTED item's `wire_model` and its bare `config.model` are the
+        // SAME string (#2570 — hosted steps keep the bare model verbatim,
+        // since an endpoint deployment name is never loaded into local
+        // residency), so a hosted-only version of this test could not
+        // distinguish "used wire_model" from "used the bare value" — the
+        // exact mutation this test exists to catch is only observable on
+        // the LOCAL arm, where `wire_model` is the namespaced
+        // `darkmux:qwen3-4b` and the bare `config.model` is plain
+        // `qwen3-4b`.
+        let ovr: MapDispatchOverride =
+            Arc::new(|_call: &OverrideDispatchCall<'_>| -> Result<crate::single_shot::SingleShotReply> {
+                panic!("deliberate panic — this test needs run_map to exit via unwind, not `?`, \
+                        to exercise StepBookend's Drop-emitted record");
+            });
+
+        let s = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "collection": ["a"],
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(
+            Some(tx),
+            None,
+            Some(ovr),
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            DispatchMapStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx)
+        }));
+        drop(ctx);
+
+        assert!(
+            result.is_err(),
+            "the override's panic must propagate out of run_streaming — this test needs the \
+             UNWIND path, not a caught error, to reach StepBookend's Drop"
+        );
+
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let error_bookends: Vec<&darkmux_flow::FlowRecord> =
+            emitted.iter().filter(|r| r.action == "dispatch error").collect();
+        assert_eq!(
+            error_bookends.len(),
+            1,
+            "expected exactly the drop-emitted error bookend (no clean complete — run_map \
+             panicked before reaching bookend.close): {emitted:?}"
+        );
+        assert_eq!(
+            error_bookends[0].model.as_deref(),
+            Some("darkmux:qwen3-4b"),
+            "the DROP-PATH error bookend must carry the namespaced identifier the map step \
+             actually addresses, not the bare config.model: {:?}",
+            error_bookends[0]
+        );
+    }
+
     #[test]
     fn compose_message_with_no_input_returns_base_unchanged() {
         let input = BTreeMap::new();
