@@ -2873,6 +2873,14 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     let reply = match result {
         Ok(r) => r,
         Err(e) => {
+            // (#2240) `model_id` is now darkmux's namespaced IDENTIFIER, which
+            // LMStudio 400s on when the instance is gone instead of silently
+            // JIT-loading a fresh copy the way a bare key did. Say what that
+            // actually means before handing the raw error on.
+            let e = match residency_lost_detail(&model_id, &format!("{e:#}")) {
+                Some(msg) => e.context(msg),
+                None => e,
+            };
             bookend.close(
                 "dispatch",
                 build_remote_record(
@@ -7951,11 +7959,151 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
 /// from its name and doc, but touches real LMStudio as a side effect of
 /// "just resolving a model id"). `false` everywhere else preserves
 /// existing behavior exactly.
+///
+/// (#2240) The wire `model` id for a REAL LMStudio dispatch of the selected
+/// `id`: the SAME darkmux-namespaced identifier `ensure_model_resident`
+/// derives for its `lms load`/`lms ps` calls (`bare_model_key` +
+/// `darkmux_gestalt::namespaced_identifier`), so the id landing in the HTTP
+/// `model` field / the container's `--model` flag is byte-identical to the
+/// one LMStudio just loaded (or reused) it under.
+///
+/// Before this, `resolve_dispatch_model_internal` put the BARE `id` on the
+/// wire while the residency preflight loaded the model under `darkmux:<id>`
+/// — a real contract split, not a cosmetic one: the namespace convention
+/// (registry item 4, ABSOLUTE for model lifecycle, #1274) says darkmux
+/// dispatches only TO `darkmux:*` instances, because a user-loaded copy of
+/// the right model has unknown load configuration (the #1135 ghost — a
+/// model silently JIT-loaded at LMStudio's 4096 default instead of the
+/// profile's declared `n_ctx`, producing confident-but-truncated output a
+/// smoke test can't catch). A bare-key dispatch happened to resolve
+/// correctly when darkmux's was the ONLY resident under that base model —
+/// but the planner deliberately creates co-residency on purpose (loading
+/// `darkmux:foo` alongside a foreign `foo` is a sanctioned outcome), and
+/// LMStudio's own bug tracker documents bare-key resolution across
+/// multiple same-key residents as undocumented/ambiguous (its own
+/// maintainers have open "more-info-needed" reports on exactly this
+/// shape). LMStudio's own docs confirm the fix direction is valid: an
+/// instance loaded under `--identifier <name>` is addressed in the chat
+/// completions `model` field BY that identifier — the documented way to
+/// disambiguate multiple resident copies of the same base model, and
+/// exactly the mechanism `is_reloadable_target`/`ensure_model_resident`
+/// already lean on for load/unload. This function now returns that same
+/// identifier for dispatch, not just for residency bookkeeping.
+///
+/// `id` is unchanged (not namespaced) when `profile.models` carries no
+/// entry matching it — `select_model`'s contract guarantees a match today,
+/// but a wire value must never come from an unwrap/panic on that
+/// guarantee; falling back to the bare id here reproduces the PRE-#2240
+/// behavior for that unreached case rather than inventing a new failure
+/// mode.
+///
+/// **This trades a silent wrong answer for a loud failure, and the loud
+/// failure is NEW.** A bare model key always resolves — worst case by
+/// LMStudio JIT-loading a fresh copy at its own 4096 default (the #1135
+/// ghost). A namespaced identifier exists only while darkmux's own
+/// instance is resident, and LMStudio answers a request naming an absent
+/// identifier with a hard 400 "not found" rather than loading anything.
+/// So if the instance disappears BETWEEN the residency preflight and the
+/// call — a TTL expiry, an `lms unload` or `darkmux machine eject` from
+/// another shell, an LMStudio restart — this dispatch now fails instead of
+/// silently running against a JIT-loaded copy at the wrong context. That
+/// is the right trade (a confidently-truncated answer is worse than an
+/// error), but it is a real behavior change, and
+/// [`residency_lost_detail`] exists so the operator reads it as "darkmux's
+/// instance went away" and not as a raw LMStudio 400.
+fn dispatch_wire_model_id(id: &str, profile: &darkmux_types::Profile) -> String {
+    match profile.models.iter().find(|m| m.id == id) {
+        Some(pm) => {
+            let model_key = bare_model_key(&pm.id);
+            darkmux_gestalt::namespaced_identifier(model_key, pm.identifier.as_deref())
+        }
+        None => id.to_string(),
+    }
+}
+
+/// (#2240) Re-word a dispatch failure that means *darkmux's own instance is
+/// no longer resident* — the new hard-failure mode
+/// [`dispatch_wire_model_id`] introduces.
+///
+/// Pre-#2240 the wire carried a bare model KEY, which LMStudio would always
+/// resolve, JIT-loading a copy at its own default context if it had to. The
+/// wire now carries the darkmux IDENTIFIER, which exists only while our
+/// instance is loaded — so a preflight-then-vanish window (TTL expiry, an
+/// `lms unload`/`darkmux machine eject` from another shell, an LMStudio
+/// restart) surfaces as LMStudio's raw 400 "model not found", which reads
+/// like the profile names a model the operator never downloaded. It does
+/// not; it names an instance that was there a moment ago.
+///
+/// Deliberately NARROW: `None` unless the wire id carries the darkmux
+/// namespace, so this can never re-word a genuine "you typed a model id
+/// that does not exist". That does leave the documented `identifier`
+/// opt-out uncovered — an operator who named their own alias sees
+/// LMStudio's own error naming that same alias back, which is already
+/// recognizable to the person who chose it.
+///
+/// Pure over its inputs so the classification is unit-testable without a
+/// live LMStudio, exactly like [`identifier_already_resident`].
+pub(crate) fn residency_lost_detail(wire_model: &str, detail: &str) -> Option<String> {
+    if !darkmux_gestalt::is_darkmux_owned(wire_model) {
+        return None;
+    }
+    let lower = detail.to_ascii_lowercase();
+    if !(lower.contains("not found")
+        || lower.contains("model_not_found")
+        || lower.contains("no models loaded"))
+    {
+        return None;
+    }
+    Some(format!(
+        "darkmux dispatch: LMStudio has no instance named `{wire_model}`. darkmux \
+         dispatches only to its OWN namespaced instance (#1274), and the residency \
+         preflight had just loaded (or reused) one under that identifier — so it went \
+         away between the preflight and this call: a TTL expiry, an `lms unload` / \
+         `darkmux machine eject` from another shell, or an LMStudio restart. `lms ps` \
+         shows what is resident now; re-running the dispatch reloads it. (#2240)"
+    ))
+}
+
 fn resolve_dispatch_model_internal(
     role: &crate::types::Role,
     profile_override: Option<&str>,
     config_path: Option<&str>,
     skip_lmstudio_residency: bool,
+) -> Result<String> {
+    resolve_dispatch_model_with_hosts(
+        role,
+        profile_override,
+        config_path,
+        skip_lmstudio_residency,
+        &ensure_model_loaded_at_ctx,
+        &probe_loaded_model_list,
+    )
+}
+
+/// (#2240) The host-effect seam for [`resolve_dispatch_model_internal`],
+/// following the one [`ensure_model_resident`] already established rather
+/// than inventing a second shape.
+///
+/// The RETURN VALUE of this function IS the dispatch's wire `model` id — it
+/// reaches LMStudio's chat-completions body and the container's `--model`
+/// flag with no further transformation, so the return value is a contract
+/// in its own right. Pinning only the pure [`dispatch_wire_model_id`]
+/// helper left the CALL SITE untested: deleting the
+/// `wire_id = dispatch_wire_model_id(..)` assignment, and hoisting it OUT
+/// of the `!skip_lmstudio_residency` guard (which would put
+/// `darkmux:<mock-id>` on the wire for every mock-server dispatch), each
+/// left the whole crate green. The two injected effects are precisely the
+/// ones that would otherwise shell out to a real `lms`
+/// (`ensure_model_loaded_at_ctx` → `lms load`, `probe_loaded_model_list` →
+/// `lms ps`), so a unit test can drive BOTH arms of that guard and assert
+/// the returned wire id without touching the operator's LMStudio.
+fn resolve_dispatch_model_with_hosts(
+    role: &crate::types::Role,
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+    skip_lmstudio_residency: bool,
+    ensure_resident: &dyn Fn(&darkmux_types::ProfileModel) -> Result<()>,
+    list_loaded: &dyn Fn() -> Result<Vec<String>>,
 ) -> Result<String> {
     use crate::select::select_model;
     use darkmux_profiles::profiles::load_registry;
@@ -8061,10 +8209,29 @@ fn resolve_dispatch_model_internal(
             // (e.g. 4096 on devstral), silently truncating large inputs (a
             // pr-review diff overflows 4096 → garbage review, no error). The
             // profile *declares* the context; honor it.
+            //
+            // (#2240) `wire_id` starts as the bare selection and is upgraded
+            // below, only for a real LMStudio dispatch, to the SAME
+            // darkmux-namespaced identifier the JIT-load just created (or
+            // reused). Putting the bare key on the wire let a dispatch aimed
+            // at "foo" resolve to a co-resident user-loaded "foo" instead of
+            // darkmux's own instance — the namespace convention's registry
+            // item 4 is ABSOLUTE for model lifecycle (#1274): darkmux
+            // dispatches only TO `darkmux:*` instances, because a
+            // user-loaded copy of the right model has unknown load
+            // configuration (the #1135 ghost — a model silently JIT-loaded
+            // at LMStudio's 4096 default instead of the profile's n_ctx).
+            // This mirrors the identifier `ensure_model_resident` itself
+            // derives for the `lms load`/`lms ps` calls — see that
+            // function's `model_key`/`identifier` derivation — so the id
+            // this function hands back to the wire is byte-identical to the
+            // one that now answers for it.
+            let mut wire_id = id.clone();
             if !skip_lmstudio_residency {
                 if let Some(pm) = profile.models.iter().find(|m| m.id == id) {
-                    ensure_model_loaded_at_ctx(pm)?;
+                    ensure_resident(pm)?;
                 }
+                wire_id = dispatch_wire_model_id(&id, profile);
             }
             // (#450 review note / #408) Cross-check against actual
             // LMStudio loaded models. Residents loaded for one profile (a
@@ -8077,7 +8244,7 @@ fn resolve_dispatch_model_internal(
             // misconfiguration operator-visible at dispatch time, not at
             // LMStudio's cryptic "model not loaded" error.
             if !skip_lmstudio_residency {
-                if let Ok(loaded_ids) = probe_loaded_model_list() {
+                if let Ok(loaded_ids) = list_loaded() {
                 if !loaded_ids.is_empty() && !loaded_ids.iter().any(|m| m == &id) {
                     let loaded = loaded_ids.join(", ");
                     if strict_selection_enabled() {
@@ -8114,10 +8281,23 @@ fn resolve_dispatch_model_internal(
                 }
                 }
             }
-            eprintln!(
-                "darkmux dispatch: selected model `{id}` via profile `{active_name}`"
-            );
-            Ok(id)
+            // (#2240 review) The #408 mismatch warning ~30 lines above names
+            // this model by its KEY (``selects `{id}` ``) and advises
+            // ``lms load {id}`` — `lms load` takes a KEY, never an
+            // identifier, so THAT remedy has to stay bare. Both lines can
+            // fire in one dispatch, so this one names the same key and then
+            // discloses the instance actually being dispatched against,
+            // rather than silently printing a second spelling of one model
+            // and leaving the operator to work out they are the same thing.
+            if wire_id == id {
+                eprintln!("darkmux dispatch: selected model `{id}` via profile `{active_name}`");
+            } else {
+                eprintln!(
+                    "darkmux dispatch: selected model `{id}` via profile `{active_name}`; \
+                     dispatching against darkmux's own resident instance `{wire_id}` (#2240)"
+                );
+            }
+            Ok(wire_id)
         }
         Err(e) => {
             eprintln!(

@@ -8092,6 +8092,225 @@ fn a_namespaced_utility_binding_still_finds_darkmuxs_own_resident() {
     ));
 }
 
+// ── (#2240) The dispatch WIRE model id must be the namespaced identifier ────
+
+/// The regression itself. Pre-#2240, `resolve_dispatch_model_internal`
+/// loaded the model under `darkmux:<id>` (the residency preflight) but
+/// returned the BARE `id` for the caller to put on the wire — so a
+/// dispatch aimed at "foo" could resolve, under co-residency, to a
+/// foreign `foo` LMStudio also has loaded. `dispatch_wire_model_id` is the
+/// pure computation this function now upgrades the returned id through;
+/// it must match darkmux's own load exactly, for the default (no explicit
+/// `identifier`) case.
+#[test]
+fn dispatch_wire_model_id_namespaces_a_plain_profile_model() {
+    use darkmux_types::{Profile, ProfileModel};
+    let profile = Profile {
+        extras: Default::default(),
+        description: None,
+        default_model: None,
+        models: vec![ProfileModel {
+            endpoint: None,
+            extras: Default::default(),
+            id: "qwen3-4b-instruct-2507".into(),
+            n_ctx: Some(120_000),
+            capabilities: Default::default(),
+            identifier: None,
+        }],
+        runtime: None,
+        use_when: None,
+    };
+    assert_eq!(
+        super::dispatch_wire_model_id("qwen3-4b-instruct-2507", &profile),
+        "darkmux:qwen3-4b-instruct-2507"
+    );
+}
+
+/// The documented opt-out: a profile that declares its own `identifier`
+/// must have THAT string on the wire, unprefixed — matching what
+/// `ensure_model_resident` actually loads it under (`namespaced_identifier`
+/// passes an explicit identifier through verbatim).
+#[test]
+fn dispatch_wire_model_id_passes_through_an_explicit_identifier() {
+    use darkmux_types::{Profile, ProfileModel};
+    let profile = Profile {
+        extras: Default::default(),
+        description: None,
+        default_model: None,
+        models: vec![ProfileModel {
+            endpoint: None,
+            extras: Default::default(),
+            id: "qwen3-4b-instruct-2507".into(),
+            n_ctx: Some(120_000),
+            capabilities: Default::default(),
+            identifier: Some("my-custom-alias".into()),
+        }],
+        runtime: None,
+        use_when: None,
+    };
+    assert_eq!(
+        super::dispatch_wire_model_id("qwen3-4b-instruct-2507", &profile),
+        "my-custom-alias"
+    );
+}
+
+/// Safety net for the branch `select_model`'s contract makes unreachable
+/// today: an `id` with no matching `profile.models` entry must fall back to
+/// the bare id (pre-#2240 behavior for this case) rather than panic or
+/// silently mint a wrong namespace.
+#[test]
+fn dispatch_wire_model_id_falls_back_to_bare_id_when_unmatched_in_profile() {
+    use darkmux_types::Profile;
+    let profile = Profile {
+        extras: Default::default(),
+        description: None,
+        default_model: None,
+        models: vec![],
+        runtime: None,
+        use_when: None,
+    };
+    assert_eq!(super::dispatch_wire_model_id("ghost-model", &profile), "ghost-model");
+}
+
+// ── (#2240 review) The CALL SITE, not just the pure helper ─────────────────
+//
+// The three tests above pin `dispatch_wire_model_id` as a pure function and
+// nothing else. Adversarial review measured what that leaves unguarded: with
+// the call site's `wire_id = dispatch_wire_model_id(&id, profile)` replaced
+// by a discard, the whole crate stayed at 1499 passed / 0 failed; hoisting
+// the same assignment OUT of the `!skip_lmstudio_residency` guard — which
+// would put `darkmux:<mock-id>` on the wire for every mock-server dispatch —
+// also stayed fully green. Nothing in the crate could observe a wire model
+// value at all: the two real-container tests are `#[ignore]`, the single-shot
+// mock asserts only the exit code and that the endpoint was hit (never the
+// request's `model`), and the docker-argv golden hand-builds its config
+// without routing through the resolver.
+//
+// These two tests close that by asserting the RESOLVER'S RETURN VALUE — which
+// IS the wire `model` id, passed to LMStudio's chat body and the container's
+// `--model` flag untransformed. They drive both arms of the guard through
+// `resolve_dispatch_model_with_hosts`, the host-effect seam that follows
+// `ensure_model_resident`'s existing shape, so neither test touches a real
+// `lms`.
+
+/// A registry with ONE healthy local profile, so resolution reaches the
+/// residency/wire branch instead of bailing early on a quarantine or a
+/// load failure.
+fn wire_id_test_registry(dir: &std::path::Path) -> std::path::PathBuf {
+    let pf = dir.join("profiles.json");
+    std::fs::write(
+        &pf,
+        r#"{"profiles":{
+                "fast":{"models":[{"id":"model-a","n_ctx":32000}]}
+            },
+            "default_profile":"fast"}"#,
+    )
+    .unwrap();
+    pf
+}
+
+fn wire_id_test_role() -> crate::types::Role {
+    serde_json::from_str(
+        r#"{"id":"r","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+    )
+    .unwrap()
+}
+
+/// RED on the "delete the assignment" mutation. A real LMStudio dispatch
+/// must hand its caller the darkmux-NAMESPACED identifier — the same one
+/// the residency preflight just loaded the model under — because that
+/// return value goes straight onto the HTTP `model` field.
+#[test]
+#[serial]
+fn resolver_returns_the_namespaced_identifier_for_a_real_lmstudio_dispatch() {
+    let tmp = TempDir::new().unwrap();
+    let pf = wire_id_test_registry(tmp.path());
+    // The residency preflight ran (`lms load` would have been called for
+    // `model-a`) — recorded, not stubbed away, so a regression that stops
+    // loading is visible here too.
+    let ensured = std::cell::RefCell::new(Vec::<String>::new());
+    let wire = super::resolve_dispatch_model_with_hosts(
+        &wire_id_test_role(),
+        None,
+        pf.to_str(),
+        false,
+        &|pm| {
+            ensured.borrow_mut().push(pm.id.clone());
+            Ok(())
+        },
+        // What `lms ps` reports for a darkmux load: BOTH spellings, so the
+        // #408 cross-check (which compares against the bare KEY) finds its
+        // match and this test exercises the wire path, not the warning.
+        &|| Ok(vec!["model-a".to_string(), "darkmux:model-a".to_string()]),
+    )
+    .expect("a healthy local profile must resolve");
+    assert_eq!(
+        ensured.borrow().as_slice(),
+        &["model-a".to_string()],
+        "the residency preflight must still run for the selected model"
+    );
+    assert_eq!(
+        wire, "darkmux:model-a",
+        "the resolver's RETURN VALUE is the wire `model` id; it must be darkmux's \
+         own namespaced identifier, not the bare key (#2240)"
+    );
+}
+
+/// RED on the "hoist the assignment out of the guard" mutation. The
+/// `skip_lmstudio_residency` arm targets a mock / non-LMStudio base URL
+/// where darkmux loaded nothing and there is no instance to namespace
+/// against — namespacing there would send `darkmux:<mock-id>` to a server
+/// that has never heard of it.
+#[test]
+#[serial]
+fn resolver_stays_bare_when_residency_is_skipped_for_a_non_lmstudio_base_url() {
+    let tmp = TempDir::new().unwrap();
+    let pf = wire_id_test_registry(tmp.path());
+    let wire = super::resolve_dispatch_model_with_hosts(
+        &wire_id_test_role(),
+        None,
+        pf.to_str(),
+        true,
+        // Both effects must be UNREACHED on this arm — that is the whole
+        // point of the flag (a real `lms load` of a mock's made-up id fell
+        // into an interactive picker and hung forever).
+        &|pm| panic!("residency preflight must not run when it is skipped: {}", pm.id),
+        &|| panic!("`lms ps` must not run when residency is skipped"),
+    )
+    .expect("a healthy local profile must resolve");
+    assert_eq!(
+        wire, "model-a",
+        "a mock-server dispatch has no darkmux instance to address; the wire id \
+         must stay the bare selection (#2240)"
+    );
+}
+
+/// (#2240) The new hard-failure mode this fix introduces, classified.
+/// A bare key always resolved (worst case a JIT load at 4096 — the #1135
+/// ghost); a namespaced identifier 400s once darkmux's instance is gone.
+#[test]
+fn residency_lost_detail_names_the_vanished_instance_but_not_a_typo() {
+    let msg = super::residency_lost_detail(
+        "darkmux:model-a",
+        "LMStudio returned HTTP 400: {\"error\":\"Model 'darkmux:model-a' not found. \
+         Please load it first\"}",
+    )
+    .expect("an absent darkmux instance must be re-worded, not passed through raw");
+    assert!(msg.contains("darkmux:model-a"), "got: {msg}");
+    assert!(msg.contains("lms ps"), "the remedy must be actionable: {msg}");
+
+    // A bare id is NOT ours to explain — that really is "you named a model
+    // that does not exist", and re-wording it would mislead.
+    assert!(super::residency_lost_detail("model-a", "Model 'model-a' not found").is_none());
+
+    // And an unrelated failure against our own instance stays untouched.
+    assert!(super::residency_lost_detail(
+        "darkmux:model-a",
+        "curl: (7) Failed to connect to localhost port 1234"
+    )
+    .is_none());
+}
+
 // ── (#1617 review) The documented `identifier` opt-out is still darkmux's ───
 
 /// The regression the first shape of the #1609 guard introduced.
