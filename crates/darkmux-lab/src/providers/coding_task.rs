@@ -578,11 +578,27 @@ impl WorkloadProvider for CodingTaskProvider {
         // `turns: 0` won over an 84-turn trajectory (Beat 40).
         //
         // Trajectory turns: the openclaw path emits `prompt.submitted`;
-        // the internal runtime emits one `model.completed` per turn (and
-        // never `prompt.submitted`), so take the max of both shapes.
+        // the internal runtime emits `model.completed` (and never
+        // `prompt.submitted`), so take the max of both shapes.
+        //
+        // (#1947) The internal runtime does NOT emit one `model.completed`
+        // per turn — a reasoning checkpoint (#1221) closes one
+        // chat-completion call early and re-opens a new one for the SAME
+        // logical turn, and that continuation still emits its own
+        // `model.completed`. `loop_runner.rs` dispatches the continuation
+        // with the SAME `seq` as the turn it resumes (`next_seq = turns`,
+        // unincremented) and only stamps a genuinely NEW turn with
+        // `next_seq = turns + 1`. Counting EVENTS therefore counted "how
+        // many times this turn got interrupted to check in" as if each
+        // interruption were its own turn — one long checkpointed turn
+        // inflated the count 5-13x. Counting DISTINCT `seq` values among
+        // those events recovers the runtime's own notion of a turn (a
+        // missing `seq` — malformed/pre-seq legacy line — still counts on
+        // its own rather than being silently dropped).
+        //
         // Compactions: `compactionSummary` dedup (openclaw) vs
         // `compaction` events (internal runtime).
-        let trajectory_turns = trajectory_turns.max(count_event_type(&events, "model.completed"));
+        let trajectory_turns = trajectory_turns.max(count_distinct_model_turns(&events));
         let trajectory_compactions =
             (tokens_before.len() as u32).max(count_event_type(&events, "compaction"));
         let turns = reconcile_count(runtime_metrics.as_ref().and_then(|m| m.turns), trajectory_turns);
@@ -1257,6 +1273,46 @@ fn count_event_type(events: &[serde_json::Value], ty: &str) -> u32 {
         .count() as u32
 }
 
+/// (#1947) Count LOGICAL turns from `model.completed` events — distinct
+/// `seq` values, not raw event count. A reasoning checkpoint (#1221) closes
+/// one chat-completion call early and re-opens a new one for the SAME
+/// logical turn; the runtime stamps that continuation with the SAME `seq`
+/// as the turn it resumes (`loop_runner.rs`: `next_seq = turns` when
+/// `resuming_after_checkpoint`, only `turns + 1` for a genuinely new turn).
+/// `count_event_type(events, "model.completed")` counts every one of those
+/// interruptions as its own turn, inflating the count 5-13x on a
+/// heavily-checkpointed turn. A `model.completed` missing `seq`
+/// (malformed/pre-seq legacy line) still counts on its own rather than
+/// being silently dropped.
+///
+/// SECOND IMPLEMENTATION OF THE SAME RULE — keep in sync, don't drift.
+/// `darkmux_crew::dispatch_internal`'s trajectory tailer applies this rule
+/// host-side while streaming (`match "model.completed"`, `last_counted_turn_seq`)
+/// to derive `dispatch.complete`'s `total_turns`. It can only hold ONE prior
+/// seq because it sees the stream a line at a time, so it tests adjacency
+/// (`seq != last_counted_turn_seq`) where this reads the whole file and can
+/// hold a set. They agree on every trajectory the runtime actually emits
+/// (seq is non-decreasing, so equal-seq events are adjacent) and diverge only
+/// on a non-monotone file — `[seq 1, no seq, seq 1]` is 3 there, 2 here.
+/// Deliberately NOT unified: the streaming side cannot buffer a set, and the
+/// divergent input is unreachable from the runtime's writer.
+fn count_distinct_model_turns(events: &[serde_json::Value]) -> u32 {
+    let mut seqs = std::collections::HashSet::new();
+    let mut without_seq: u32 = 0;
+    for e in events {
+        if e.get("type").and_then(|t| t.as_str()) != Some("model.completed") {
+            continue;
+        }
+        match e.get("seq").and_then(|s| s.as_u64()) {
+            Some(seq) => {
+                seqs.insert(seq);
+            }
+            None => without_seq += 1,
+        }
+    }
+    seqs.len() as u32 + without_seq
+}
+
 /// (#371) Reconcile a runtime-reported count with the trajectory-derived
 /// count. The trajectory is append-only ground truth, so the metric can
 /// never legitimately be LOWER than what the trajectory recorded — a
@@ -1394,6 +1450,64 @@ mod tests {
         assert_eq!(count_event_type(&events, "model.completed"), 3);
         assert_eq!(count_event_type(&events, "compaction"), 1);
         assert_eq!(count_event_type(&events, "nonexistent"), 0);
+    }
+
+    /// (#1947) A reasoning checkpoint mid-turn closes one chat-completion
+    /// call and re-opens another for the SAME logical turn — the runtime
+    /// stamps every `model.completed` from that turn with the SAME `seq`.
+    /// Five events, one turn: naive event-counting (the pre-fix bug) would
+    /// say 5.
+    #[test]
+    fn count_distinct_model_turns_dedupes_a_checkpointed_turn() {
+        let events: Vec<serde_json::Value> = vec![
+            serde_json::json!({"type": "dispatch.start"}),
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+        ];
+        assert_eq!(count_distinct_model_turns(&events), 1);
+    }
+
+    /// Inverted case: genuinely separate turns (distinct `seq`) must still
+    /// count separately — a fixture using only single-emission turns
+    /// couldn't fail against the dedup bug, so this must NOT collapse to 1.
+    #[test]
+    fn count_distinct_model_turns_counts_genuinely_separate_turns() {
+        let events: Vec<serde_json::Value> = vec![
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+            serde_json::json!({"type": "model.completed", "seq": 2}),
+            serde_json::json!({"type": "model.completed", "seq": 3}),
+        ];
+        assert_eq!(count_distinct_model_turns(&events), 3);
+    }
+
+    /// A checkpointed turn (seq 1 x3) followed by two genuinely new turns
+    /// (seq 2, seq 3) — the realistic shape: mostly-1 turn count inflation
+    /// mixed with real turns that must not get swallowed by the dedup.
+    #[test]
+    fn count_distinct_model_turns_mixes_checkpointed_and_genuine_turns() {
+        let events: Vec<serde_json::Value> = vec![
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+            serde_json::json!({"type": "model.completed", "seq": 2}),
+            serde_json::json!({"type": "model.completed", "seq": 3}),
+        ];
+        assert_eq!(count_distinct_model_turns(&events), 3);
+    }
+
+    /// A `model.completed` missing `seq` (malformed/pre-seq legacy line)
+    /// counts on its own rather than being silently dropped.
+    #[test]
+    fn count_distinct_model_turns_keeps_events_missing_seq() {
+        let events: Vec<serde_json::Value> = vec![
+            serde_json::json!({"type": "model.completed"}),
+            serde_json::json!({"type": "model.completed"}),
+            serde_json::json!({"type": "model.completed", "seq": 1}),
+        ];
+        assert_eq!(count_distinct_model_turns(&events), 3);
     }
 
     fn make_loaded(spec: WorkloadSpec, base_dir: PathBuf) -> LoadedWorkload {
@@ -2010,6 +2124,90 @@ not-valid-json
         assert_eq!(report.turns, 4);
         assert_eq!(report.compactions, 2); // dedup by 80-char prefix
         assert_eq!(report.tokens_before, vec![48000, 50000]);
+    }
+
+    /// (#1947) The seq-dedup must be WIRED INTO the analyze path, not just
+    /// live correctly in an isolated helper. Beat-40 shape: `metrics.json`
+    /// is present but stale at `turns: 0` (the exit-time write raced a
+    /// mid-dispatch hard error), so `reconcile_count`'s max() hands the
+    /// decision to the trajectory recount — the branch this fix changed.
+    /// Five `model.completed` events all stamped `seq: 1` are ONE logical
+    /// turn that a reasoning checkpoint (#1221) re-opened four times.
+    ///
+    /// Red-proves against a plausible "be safe, take the max of both
+    /// counts" edit at the call site
+    /// (`.max(count_event_type(&events, "model.completed"))`), which
+    /// fully reinstates #1947 while every helper-level unit test stays
+    /// green: that edit makes this report 5.
+    #[test]
+    fn inspect_reports_one_turn_for_a_checkpointed_turn() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            r#"{"session_id":"sess","duration_ms":300000}"#,
+        )
+        .unwrap();
+        // Present-but-zeroed: forces the trajectory branch to decide.
+        fs::write(
+            run_dir.join("metrics.json"),
+            r#"{"turns":0,"compactions":0}"#,
+        )
+        .unwrap();
+        let trajectory = r#"{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+"#;
+        fs::write(run_dir.join("trajectory.jsonl"), trajectory).unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        assert_eq!(
+            report.turns, 1,
+            "five model.completed events at seq 1 are ONE logical turn"
+        );
+        // The notes line is what the operator actually reads — pin it too,
+        // so a fix that corrects the field but not the rendered summary
+        // can't pass.
+        assert!(
+            report.notes.iter().any(|n| n == "turns=1"),
+            "notes must agree with the turn count: {:?}",
+            report.notes
+        );
+    }
+
+    /// Inverted case for the analyze path: genuinely separate turns must
+    /// survive the dedup. Three seq-1 events (one checkpointed turn) plus
+    /// seq 2 and seq 3 = 3 turns from 5 events — so neither a
+    /// count-the-events regression (would say 5) nor a degenerate
+    /// always-1 implementation passes.
+    #[test]
+    fn inspect_still_counts_genuinely_separate_turns() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            r#"{"session_id":"sess","duration_ms":300000}"#,
+        )
+        .unwrap();
+        fs::write(
+            run_dir.join("metrics.json"),
+            r#"{"turns":0,"compactions":0}"#,
+        )
+        .unwrap();
+        let trajectory = r#"{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":2}
+{"type":"model.completed","seq":3}
+"#;
+        fs::write(run_dir.join("trajectory.jsonl"), trajectory).unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        assert_eq!(report.turns, 3);
     }
 
     /// (#359) Internal-runtime dispatches write `metrics.json` to

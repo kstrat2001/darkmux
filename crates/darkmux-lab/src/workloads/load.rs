@@ -341,6 +341,14 @@ mod tests {
         assert_eq!(loaded.source, WorkloadSource::User);
     }
 
+    // `serial_test` coordinates only among ANNOTATED tests, so a reader of a
+    // process-wide env var needs the guard just as much as a writer does.
+    // Unguarded, this raced `missing_workload_with_no_workloads_says_none`
+    // (which sets the same var, under the guard) and read its `.../nope`
+    // path instead of its own — seen on CI, not reproducible locally at
+    // 6/6 runs either way, which is what a scheduling-dependent race looks
+    // like rather than evidence that it is gone.
+    #[serial_test::serial]
     #[test]
     fn builtin_dirs_include_env_override() {
         unsafe { env::set_var("DARKMUX_TEMPLATES_DIR", "/tmp/test-templates") };
