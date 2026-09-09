@@ -1,0 +1,20 @@
+{
+  "_why": "(#2265 review) ONE table of finding keys, read by BOTH predicates: the runtime's `finding_key_shape_ok` (which refuses a bad `for` key where the model can read the refusal) and the host's `findings::parse_key` (which decides what can address a stored finding). They MUST agree: a key the runtime accepts and the host rejects is a mod the host would otherwise drop on the floor. `sess/extra/1` and `a/../b/1` are the two that disagreed in the first version.",
+  "cases": [
+    { "key": "sess-a/1", "valid": true },
+    { "key": "sess-a/01", "valid": true },
+    { "key": "crew-dispatch-coder-1788402801-0/12", "valid": true },
+    { "key": "sess/extra/1", "valid": false },
+    { "key": "a/../b/1", "valid": false },
+    { "key": "../x/1", "valid": false },
+    { "key": "./x/1", "valid": false },
+    { "key": ".hidden/1", "valid": false },
+    { "key": "sess-a/1/2", "valid": false },
+    { "key": "/1", "valid": false },
+    { "key": "sess-a/x", "valid": false },
+    { "key": "sess-a/", "valid": false },
+    { "key": "sess-a", "valid": false },
+    { "key": "sess\\a/1", "valid": false },
+    { "key": "", "valid": false }
+  ]
+}

@@ -11,6 +11,18 @@ members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-p
 # chat-completions server for the mock-model dispatch harness, deliberately
 # NOT a subcommand of the main binary and NOT a path dependency of anything
 # in this workspace.
+#
+# (#2544) Being outside THIS workspace does not mean outside mutation-testing
+# coverage — `cargo mutants --workspace` structurally cannot reach any path
+# listed here (proven on #2599, a diff entirely under `runtime/` that failed
+# the PR gate for exactly this reason), so `.github/workflows/quality.yml`'s
+# `mutants-in-diff` job runs SEPARATE `--manifest-path` invocations against
+# `runtime/Cargo.toml` and `plugins/darkmux-bundler-rust/Cargo.toml` — the
+# floor script (`scripts/ci-mutants-summary.py`) derives its excluded-path
+# list from THIS array, so a future addition here is counted correctly
+# without also touching that script. `tools/darkmux-mock-model` is
+# deliberately left uncovered (dev/test infrastructure, not production code —
+# see the workflow's own comment for the reasoning).
 exclude = ["runtime", "plugins/darkmux-bundler-rust", "tools/darkmux-mock-model"]
 
 [package]
