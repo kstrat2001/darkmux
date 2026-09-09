@@ -430,22 +430,12 @@ export function MissionGraphLens({
   // already fills, so this costs no extra request; on a daemon build it
   // returns `null` and this source contributes nothing.
   //
-  // Keyed on a cheap SIGNATURE, never on the array's identity — the same
-  // rule `usePlaybackTransport` states for its own range memo, and here it
-  // is load-bearing rather than tidy. `useDay`'s memo lists `source` in its
-  // dependencies and `getSource()` builds a fresh object literal on every
-  // call, so `staticDay.records` is a NEW array on every render even when
-  // the day has not changed. Feeding that identity into `allRecords` fed a
-  // new `events` into `onEvents`, which set state in `App.tsx`, which
-  // re-rendered this lens — an infinite loop that pinned a core at 100% and
-  // hung the suite with no failing assertion anywhere. (The root cause is
-  // `useDay`'s unstable return; fixing that touches every consumer and is
-  // its own change.)
+  // `staticDay.records` is now referentially stable across unrelated
+  // re-renders (`useDay` no longer recomputes on every render — #2377
+  // fixed the root cause instead of keeping this consumer's signature-memo
+  // workaround), so it is safe to feed straight into `allRecords` below.
   const staticDay = useDay(null);
-  const staticDayRaw = daemonBacked ? null : staticDay.records;
-  const staticDaySig = staticDayRaw ? `${staticDayRaw.length}:${staticDayRaw[0]?.ts ?? ""}:${staticDayRaw[staticDayRaw.length - 1]?.ts ?? ""}` : "";
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- the signature IS the dependency; see above.
-  const staticDayRecords = useMemo(() => staticDayRaw, [staticDaySig]);
+  const staticDayRecords = daemonBacked ? null : staticDay.records;
 
   const [ownedBy, setOwnedBy] = useState<string | null>(null);
   useEffect(() => {

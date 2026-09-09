@@ -43,6 +43,13 @@ export function useDay(requestedDate: string | null): Day {
   const source = getSource();
   const flowSrc = source.flow;
   const daemonDate = source.kind === "daemon" ? requestedDate : null;
+  // `getSource()` builds a fresh object literal on every call (deliberately
+  // — see that module's doc: no module-level cache, so tests can inject and
+  // remove metas per case). Depending on `source` itself below would defeat
+  // the memo below on every render, not just when the day actually changes
+  // (#2377). Depend on the one field the memo body reads that isn't already
+  // captured by `flowSrc`/`daemonDate`.
+  const sourceDate = source.date;
 
   const staticQuery = useQuery({
     queryKey: queryKeys.staticFlowSrc(flowSrc ?? ""),
@@ -58,9 +65,9 @@ export function useDay(requestedDate: string | null): Day {
 
   return useMemo(() => {
     if (flowSrc !== null) {
-      if (staticQuery.data === undefined) return { records: null, raw: null, loading: true, date: source.date, error: null };
+      if (staticQuery.data === undefined) return { records: null, raw: null, loading: true, date: sourceDate, error: null };
       const records = normalizeRecords(staticQuery.data);
-      const date = source.date ?? firstRecordDate(staticQuery.data);
+      const date = sourceDate ?? firstRecordDate(staticQuery.data);
       return { records, raw: staticQuery.data, loading: false, date, error: null };
     }
     if (daemonDate !== null) {
@@ -70,5 +77,5 @@ export function useDay(requestedDate: string | null): Day {
       return { records: normalizeRecords(raw), raw, loading: false, date: daemonDate, error: null };
     }
     return { records: null, raw: null, loading: false, date: null, error: null };
-  }, [flowSrc, daemonDate, staticQuery.data, dayQuery.data, source]);
+  }, [flowSrc, daemonDate, sourceDate, staticQuery.data, dayQuery.data]);
 }
