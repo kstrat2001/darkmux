@@ -829,14 +829,41 @@ fn mint_ephemeral_correlation_id(config_id: &str) -> String {
 }
 
 /// Fill `cwd` into every `procedural.shell` step's config that doesn't
-/// already declare one — never overrides a step-authored `cwd`.
+/// already declare a working directory of its own — never overrides one
+/// the step's author wrote.
+///
+/// **(#2532) "A working directory of its own" is EITHER spelling.**
+/// `procedural.shell` reads three tiers (`step_kinds::builtins::
+/// resolve_shell_cwd`): its own `cwd` key, then `Task.workdir`, then a step
+/// config `workdir`. `cwd` is the highest of the three, so checking only
+/// `cwd` here meant a step authored with `workdir` got `cwd` INJECTED over
+/// it and the authored value lost — one document running in two different
+/// directories depending on whether it was launched from the panel or from
+/// `mission launch`. That is not a cosmetic difference on this path:
+/// `docs/guide/pr-flow.html` sells this injection as the safety property of
+/// the shipped pr-flow verbs ("Two concurrent darkmux sessions in two
+/// different worktrees never see each other's PRs by accident"), and those
+/// verbs are `procedural.shell` steps running `gh`, which resolves its
+/// repository from the working directory. An operator who spelled it
+/// `workdir` would have had `gh pr merge` target whatever repository the
+/// panel session happened to be sitting in.
+///
+/// A step naming EITHER key is left completely alone — including the
+/// `workdir` case, where the authored value then resolves through tier 3
+/// (the panel mints no `Task.workdir`, so nothing sits between them).
 fn apply_default_cwd(steps: &mut BTreeMap<String, Step>, cwd: &Path) {
     let cwd_str = cwd.to_string_lossy().to_string();
     for step in steps.values_mut() {
         if step.kind != "procedural.shell" {
             continue;
         }
-        if step.config.get("cwd").and_then(|v| v.as_str()).is_some() {
+        // An authored key is an authored key, empty string included: a
+        // `"cwd": ""` is a config defect the resolver names precisely
+        // ("step config `cwd` is set but empty"), and silently substituting
+        // the panel's directory for it would hide exactly that.
+        let authored =
+            ["cwd", "workdir"].iter().any(|key| step.config.get(*key).and_then(|v| v.as_str()).is_some());
+        if authored {
             continue;
         }
         match &mut step.config {
@@ -1039,6 +1066,72 @@ mod tests {
             outcome_from: None,
             extras: Map::new(),
         }
+    }
+
+    // ── apply_default_cwd ────────────────────────────────────────────
+
+    /// (#2532) **An authored `workdir` survives the panel path.**
+    /// `procedural.shell` reads `cwd`, then `Task.workdir`, then a step
+    /// config `workdir` — so a step that named `workdir` and got `cwd`
+    /// injected over it ran in the PANEL's directory, not its own, while
+    /// the same document launched through `mission launch` ran in the
+    /// authored one. `docs/guide/pr-flow.html` sells this injection as the
+    /// safety property of the pr-flow verbs ("two concurrent darkmux
+    /// sessions in two different worktrees never see each other's PRs by
+    /// accident"), and those verbs run `gh`, which reads its repository off
+    /// the working directory — so the pre-fix behavior pointed
+    /// `gh pr merge` at the panel session's repository.
+    ///
+    /// Runs the steps for real through the SAME registry the panel uses,
+    /// so this asserts the directory the command actually ran in, not just
+    /// the shape of the config. Red-proved by restoring the `cwd`-only
+    /// check: the authored step then prints the panel directory.
+    #[test]
+    fn apply_default_cwd_leaves_a_step_authored_workdir_alone() {
+        let panel_dir = tempfile::tempdir().unwrap();
+        let authored_dir = tempfile::tempdir().unwrap();
+
+        let mut steps: BTreeMap<String, Step> = serde_json::from_value(serde_json::json!({
+            "authored": {
+                "id": "authored", "task_id": "t", "kind": "procedural.shell",
+                "config": {"command": "pwd", "workdir": authored_dir.path().to_str().unwrap()},
+            },
+            "bare": {
+                "id": "bare", "task_id": "t", "kind": "procedural.shell",
+                "config": {"command": "pwd"},
+            },
+        }))
+        .unwrap();
+
+        apply_default_cwd(&mut steps, panel_dir.path());
+
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": "t", "phase_id": "p", "description": "", "step_ids": ["authored", "bare"],
+        }))
+        .unwrap();
+        let registry = StepKindRegistry::with_builtins();
+        let kind = registry.get("procedural.shell").unwrap();
+
+        let ran_in = |id: &str| {
+            let out = kind.run(&steps[id], &task, &BTreeMap::new()).unwrap();
+            std::fs::canonicalize(out.output.trim()).unwrap()
+        };
+        // The behavioral claim first, so the mutation that reds this test
+        // reds it on WHERE THE COMMAND RAN, not on the shape of a config.
+        assert_eq!(
+            ran_in("authored"),
+            std::fs::canonicalize(authored_dir.path()).unwrap(),
+            "the authored `workdir` is where the command runs"
+        );
+        assert_eq!(
+            ran_in("bare"),
+            std::fs::canonicalize(panel_dir.path()).unwrap(),
+            "and a step naming NO directory still gets the panel session's — the property pr-flow.html sells"
+        );
+        assert!(
+            steps["authored"].config.get("cwd").is_none(),
+            "a step that already names its own working directory must not be injected into"
+        );
     }
 
     // ── parse_command ────────────────────────────────────────────────

@@ -504,8 +504,15 @@ impl SeatClaim {
 /// properties of the whole job, fixed for its duration, not re-declared at
 /// every Step; a dispatch-shaped step kind (`DispatchInternalStepKind`)
 /// sources its assignment from THESE fields first, falling back to
-/// `Step.config` only when the Task leaves a field unset. Purely-procedural
-/// step kinds (`procedural.*`) ignore `task` entirely.
+/// `Step.config` only when the Task leaves a field unset.
+///
+/// (#2532) Purely-procedural step kinds (`procedural.*`) read at most ONE
+/// of these fields, and only `procedural.shell` reads any: `task.workdir`,
+/// as the directory its command runs in, under the SAME task-before-step-
+/// config tier order stated above (`builtins::resolve_shell_cwd`). That
+/// kind's own `cwd` key still outranks both — `cwd` has no Task
+/// counterpart, so no tier question arises for it. Every other
+/// `procedural.*` kind ignores `task` entirely.
 pub trait StepKind: Send + Sync {
     fn id(&self) -> &'static str;
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome>;

@@ -4383,6 +4383,14 @@ mod tests {
     /// sized (i.e. one-at-a-time) batches. Measured ~12.0s against the
     /// ceiling of 8s below; ~3.0s after.
     #[test]
+    // (#2532) `#[serial_test::serial]`: these steps name no `cwd`/`workdir`,
+    // so each one READS the process cwd through
+    // `step_kinds::builtins::resolve_shell_cwd`'s ambient tier — and on
+    // scheduler worker THREADS, which share the same process global. A
+    // concurrent test that deletes the ambient directory (this crate has
+    // one — see `CwdGuard` in `step_kinds::builtins`'s test module) would
+    // make all four steps refuse, which reads as a scheduler bug.
+    #[serial_test::serial]
     fn dispatch_free_siblings_do_not_serialize_behind_the_remote_cap() {
         const N: usize = 4;
         const SLEEP_SECS: u64 = 3;
