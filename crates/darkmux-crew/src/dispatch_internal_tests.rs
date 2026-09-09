@@ -2473,48 +2473,93 @@
         }
     }
 
-    /// **Enumeration, not a pin.** `dispatch_remote` is a module-PRIVATE
-    /// `fn` (see its own `fn dispatch_remote(` declaration) — Rust's
-    /// visibility rules make every possible call site of it, present or
-    /// future, live inside THIS file. So rather than asserting the two
-    /// known sites individually, this test greps the file's own source for
-    /// every textual call to `dispatch_remote(` (excluding its own `fn`
-    /// declaration line), maps each one back to its enclosing top-level
-    /// function by brace-matching, and requires that function's body to
-    /// contain the shared refusal anchor BEFORE the call. A third call
-    /// site added anywhere in this file without the guard — the exact
-    /// class #2580's review found, and the same class #2561 fixed once
-    /// already for `dispatch()` — fails this test by construction, not by
-    /// someone remembering to extend a list.
+    /// **Sound within a bounded scope, honestly scoped where it isn't.**
+    /// `dispatch_remote` is a module-PRIVATE `fn` (see its own `fn
+    /// dispatch_remote(` declaration, pinned bare/non-`pub` below), so
+    /// Rust's visibility rule — a private item is visible to its defining
+    /// module AND ALL of that module's DESCENDANTS — puts every possible
+    /// call site inside either this file or a module this file declares.
+    /// This file declares exactly one descendant module, its own
+    /// `#[cfg(test)] mod tests` (this very file), pinned below too — so
+    /// "every call site lives in this file" is an ENUMERATION over real,
+    /// asserted invariants, not a hopeful claim.
     ///
-    /// **What this cannot see, named plainly:** it is a source scan of ONE
-    /// file, sound only because `dispatch_remote` is private to it. If a
-    /// future change makes `dispatch_remote` `pub`/`pub(crate)`, or a new
-    /// function reimplements the same "hosted single-shot HTTP call"
-    /// behavior WITHOUT calling `dispatch_remote` itself, this test cannot
-    /// see either — a `pub` widening would need the scan to cover the
-    /// whole crate (or workspace), and a reimplementation needs its own
-    /// named guard, not this one. It also cannot see the THIRD route the
-    /// same review found — `darkmux dispatch --machine <peer>
-    /// --resume-from`, routed through `dispatch_via_queue` in
-    /// `darkmux-fleet` before this file's `dispatch()` is ever reached —
-    /// which never calls `dispatch_remote` from here at all; that route is
-    /// filed separately as #2584 and is deliberately out of scope for this
-    /// enumeration.
+    /// (#2580 round 2 proved the prior version of this doc claimed more
+    /// than the code delivered: adding `pub mod e6_child;` here with an
+    /// unguarded call inside compiled and passed the pre-pin version of
+    /// this test green, because nothing pinned the descendant-module set;
+    /// flipping `fn` to `pub fn` did too, because `"fn dispatch_remote("`
+    /// is *also* a substring of `"pub fn dispatch_remote("` and nothing
+    /// pinned visibility. Both are pinned now — the two assertions
+    /// immediately after the sanity check below.)
     ///
-    /// One more honest limit: the "guard precedes call" check is TEXTUAL
-    /// (does the anchor string appear before the call, once line-
-    /// continuations are collapsed), not structural. It does not parse
-    /// that the anchor sits inside an actual `if opts.resume_from.
-    /// is_some() { bail!(...) }` — a code COMMENT mentioning the same
-    /// phrase before an unguarded call would also satisfy it. Same shape
-    /// `step_kinds::liveness_conformance`'s `body.contains(site.anchor)`
-    /// already accepts for that module's own conformance checks; a stray
-    /// comment collision is the accepted false-negative risk of a
-    /// source-text check, traded for not needing a real Rust parser here.
+    /// The scan then finds every genuine CALL to `dispatch_remote(` — the
+    /// identifier, not a longer name that merely contains it, at a real
+    /// code position (comments and string literals are lexically skipped
+    /// via `skip_non_code_span`, not just line-matched, so a comment or
+    /// string mentioning the name can't be mistaken for a call), tolerant
+    /// of whitespace between the name and the opening paren — maps each
+    /// one back to its enclosing top-level function by brace-matching, and
+    /// requires an `if` block (found the same lexical way) whose CONDITION
+    /// mentions `resume_from`, whose block closes BEFORE the call, and
+    /// whose block contains BOTH the shared refusal anchor AND a diverging
+    /// construct (`bail!`/`return Err`/`panic!`) — i.e. the anchor has to
+    /// sit inside the actual guard, not merely appear somewhere earlier in
+    /// the function. A third call site added anywhere in this file, in any
+    /// of these shapes, without a real guard fails this test by
+    /// construction, not by someone remembering to extend a list.
+    ///
+    /// **What this cannot see, named plainly:**
+    /// - **A `pub`/`pub(crate)` widening of `dispatch_remote`, or a new
+    ///   descendant module.** Both are pinned by the assertions below, so
+    ///   either fails LOUD (this test breaks) rather than silently — but if
+    ///   `dispatch_remote` genuinely needs wider visibility one day, this
+    ///   scan's whole premise is gone and it needs a real redesign (a
+    ///   crate-or-workspace-wide scan), not a bigger pin.
+    /// - **A reimplementation of the same "hosted single-shot HTTP call"
+    ///   behavior that never calls `dispatch_remote` itself.** That needs
+    ///   its own named guard, not this one.
+    /// - **The third route the #2580 review found** —
+    ///   `darkmux dispatch --machine <peer> --resume-from`, routed through
+    ///   `dispatch_via_queue` in `darkmux-fleet` before this file's
+    ///   `dispatch()` is ever reached — which never calls `dispatch_remote`
+    ///   from here at all. Filed separately as #2584, deliberately out of
+    ///   scope for this enumeration.
+    /// - **A call reached only through an alias** — binding
+    ///   `dispatch_remote` to a `fn` pointer or closure and calling through
+    ///   that binding instead of the name. This scan matches the literal
+    ///   identifier `dispatch_remote` followed by `(`; it does no name
+    ///   resolution or dataflow analysis, so an aliased indirect call is
+    ///   genuinely invisible to it. Not attempted — a real fix needs a
+    ///   Rust-aware analyzer, not a bigger text scan.
+    /// - **A call inside an `impl` block method or a macro body.** The
+    ///   function-span extractor only indexes column-0 `fn`/`pub fn` items,
+    ///   so a call nested inside either shape can't be mapped to an
+    ///   enclosing function — that FAILS THE TEST LOUDLY (a panic naming
+    ///   the shape) rather than silently certifying it, so this is a
+    ///   coverage gap that blocks, not a soundness hole. Extend the
+    ///   extractor if this file ever needs that shape.
+    /// - **A guard whose message text is factored into a helper function**
+    ///   instead of inlined at the `bail!`/`return Err` site. The anchor
+    ///   match is textual against the CALLING function's own body; a
+    ///   helper that builds the message elsewhere makes the anchor
+    ///   invisible here. Deliberately not chased across a call graph —
+    ///   inline the check (matching both existing guards' shape) or extend
+    ///   this test to also scan the helper; the failure message says this.
+    ///
+    /// One more honest limit, narrowed by the structural if-block
+    /// requirement above but not eliminated: the anchor match inside a
+    /// qualifying block is still TEXTUAL (does the phrase appear, after
+    /// `\`-continuation collapsing, alongside a diverging keyword), not a
+    /// real control-flow prover. A comment inside a genuinely
+    /// `resume_from`-conditioned, genuinely-diverging block that happened
+    /// to also contain the exact anchor phrase would still satisfy it —
+    /// accepted as vanishingly unlikely given how specific the phrase is,
+    /// same category `step_kinds::liveness_conformance`'s
+    /// `body.contains(site.anchor)` already accepts for that module's own
+    /// conformance checks.
     #[test]
     fn every_dispatch_remote_call_site_is_guarded_against_resume_from() {
-        const GUARD_ANCHOR: &str = "not supported on the remote single-shot dispatch path";
         const DEFINITION_MARKER: &str = "fn dispatch_remote(";
 
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dispatch_internal.rs");
@@ -2534,28 +2579,57 @@
             functions.len()
         );
 
-        // Every CALL to `dispatch_remote(` — i.e. every occurrence of the
-        // substring that is not the `fn dispatch_remote(` declaration
-        // itself.
-        let mut call_offsets = Vec::new();
-        let mut search_from = 0usize;
-        while let Some(rel) = src[search_from..].find("dispatch_remote(") {
-            let at = search_from + rel;
-            let is_declaration = at >= 3 && &src[at.saturating_sub(3)..at] == "fn ";
-            if !is_declaration {
-                call_offsets.push(at);
-            }
-            search_from = at + "dispatch_remote(".len();
-        }
+        // ── pin: `dispatch_remote` stays module-PRIVATE ─────────────────
+        // `"fn dispatch_remote("` matches as a substring of `"pub fn
+        // dispatch_remote("` too, so counting occurrences alone (the
+        // pre-#2580-round-2 check) says nothing about visibility. Confirm
+        // the text on the declaration's own line, before the marker, is
+        // empty — i.e. the declaration is bare `fn dispatch_remote(`, not
+        // `pub fn` / `pub(crate) fn`.
+        assert_eq!(
+            src.matches(DEFINITION_MARKER).count(),
+            1,
+            "expected exactly one `{DEFINITION_MARKER}` declaration — found {}",
+            src.matches(DEFINITION_MARKER).count()
+        );
+        let def_at = src.find(DEFINITION_MARKER).expect("checked above: exactly one occurrence");
+        let line_prefix = src[..def_at].rsplit('\n').next().unwrap_or("");
+        assert_eq!(
+            line_prefix,
+            "",
+            "`dispatch_remote` must stay module-PRIVATE for this whole scan's premise to hold \
+             (see this test's own doc comment) — found `{line_prefix}fn dispatch_remote(`, \
+             which reads as a widened visibility (`pub fn` / `pub(crate) fn`). Reviewer-proven \
+             (#2580 round 2): flipping `fn` to `pub fn` here compiled and passed the pre-pin \
+             version of this test green. If `dispatch_remote` genuinely needs wider visibility, \
+             this scan's premise is gone and it needs a real redesign, not a bigger pin."
+        );
+
+        // ── pin: this file declares no descendant module other than its
+        //    own `#[cfg(test)] mod tests` ────────────────────────────────
+        // Rust visibility makes a private item visible to every descendant
+        // module, not just the defining file — #2580 round 2 proved this by
+        // adding `pub mod e6_child;` here with an unguarded call inside,
+        // which compiled and passed the pre-pin version of this test green.
+        let mod_decls = top_level_mod_declarations(&src);
+        assert_eq!(
+            mod_decls,
+            vec!["mod tests;".to_string()],
+            "this scan's premise requires this file to declare NO descendant module other than \
+             its own `#[cfg(test)] mod tests` — found: {mod_decls:?}. A new `mod` here is a \
+             place a call to `dispatch_remote(` could live that this scan cannot see; if one is \
+             genuinely needed, this test must grow to also scan that module's file."
+        );
+
+        // Every genuine CALL to `dispatch_remote(` — the identifier at a
+        // real code position (comments/strings lexically skipped),
+        // tolerant of whitespace before the paren, excluding the
+        // declaration itself.
+        let call_offsets = find_dispatch_remote_calls(&src);
         assert!(
             !call_offsets.is_empty(),
             "found zero calls to `dispatch_remote(` — either the extractor regressed or the \
              function was deleted; either way this test's premise no longer holds"
-        );
-        assert!(
-            src.matches(DEFINITION_MARKER).count() == 1,
-            "expected exactly one `{DEFINITION_MARKER}` declaration — found {}",
-            src.matches(DEFINITION_MARKER).count()
         );
 
         for call_at in call_offsets {
@@ -2565,28 +2639,30 @@
                 .unwrap_or_else(|| {
                     panic!(
                         "a `dispatch_remote(` call at byte offset {call_at} is not inside any \
-                         top-level function this test could find — the extractor needs fixing"
+                         top-level (column-0 `fn`/`pub fn`) function this scan indexes. This is \
+                         not necessarily a broken extractor: the two shapes this scan cannot map \
+                         to an enclosing function are a call inside an `impl` block METHOD \
+                         (nested, not column-0) and a call inside a MACRO body. If the call is \
+                         one of those, extend `top_level_function_spans` to index that shape \
+                         before this test can vouch for it; if it really is inside a plain \
+                         top-level fn, the extractor regressed."
                     )
                 });
             let body = &src[*fn_start..*fn_end];
             let call_at_in_body = call_at - fn_start;
-            // The anchor is matched against the COMPILED text of the
-            // bail!/format! literal, not the raw source: this repo wraps
-            // long guard messages across lines with `\`-continuations
-            // (rustc drops the backslash, the newline, and all of the next
-            // line's leading whitespace — see `collapse_str_continuations`'s
-            // own doc), so a naive raw-byte search for a multi-word anchor
-            // would miss it purely because of where a line happened to
-            // wrap, independent of whether the guard is actually there.
-            let normalized_prefix = collapse_str_continuations(&body[..call_at_in_body]);
-            let guard_precedes_call = normalized_prefix.contains(GUARD_ANCHOR);
 
             assert!(
-                guard_precedes_call,
-                "`{fn_name}` calls `dispatch_remote(` at file offset {call_at} without the \
-                 resume_from guard (anchor {GUARD_ANCHOR:?}) appearing BEFORE it in the same \
-                 function — this is the #2561/#2580 bypass class: a caller can silently spend \
-                 real tokens under a --resume-from flag that was never honored"
+                resume_from_guard_precedes(body, call_at_in_body),
+                "`{fn_name}` calls `dispatch_remote(` at file offset {call_at} without a \
+                 `resume_from`-conditioned guard preceding it — this scan requires an `if` \
+                 block whose condition mentions `resume_from`, closes BEFORE the call, and \
+                 contains BOTH the anchor {RESUME_FROM_GUARD_ANCHOR:?} and a diverging \
+                 bail!/return Err/panic!. This is the #2561/#2580 bypass class: a caller can \
+                 silently spend real tokens under a --resume-from flag that was never honored. \
+                 If the guard's message text is factored into a helper function instead of \
+                 inlined at the bail!/return site, that does not count here — inline it \
+                 (matching both existing guards' shape) or extend this test to also scan the \
+                 helper."
             );
         }
     }
@@ -2621,93 +2697,111 @@
         out
     }
 
+    /// If `cs[i]` begins a `//` line comment, `/* */` block comment, raw
+    /// string, ordinary string, or char literal, returns the index just
+    /// past it — i.e. where scanning should resume. Otherwise `None`: this
+    /// index is genuine code. The ONE lexical rule every extractor in this
+    /// test module shares (`top_level_function_spans`,
+    /// `top_level_mod_declarations`, `find_dispatch_remote_calls`,
+    /// `find_if_blocks`) — so a comment or string mentioning
+    /// `dispatch_remote(` or `mod` cannot be treated as code by one pass
+    /// while being correctly skipped by another (the #2580 round 2 "a
+    /// comment mentioning the function name reported as an unguarded call"
+    /// false positive this generalizes away — every extractor now agrees
+    /// on what counts as code).
+    fn skip_non_code_span(cs: &[char], i: usize) -> Option<usize> {
+        let c = cs[i];
+        let next = cs.get(i + 1).copied();
+        match c {
+            '/' if next == Some('/') => {
+                let mut j = i;
+                while j < cs.len() && cs[j] != '\n' {
+                    j += 1;
+                }
+                Some(j)
+            }
+            '/' if next == Some('*') => {
+                let mut j = i + 2;
+                while j + 1 < cs.len() && !(cs[j] == '*' && cs[j + 1] == '/') {
+                    j += 1;
+                }
+                Some((j + 2).min(cs.len()))
+            }
+            'r' if next == Some('"') || next == Some('#') => {
+                let mut hashes = 0usize;
+                let mut j = i + 1;
+                while cs.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if cs.get(j) != Some(&'"') {
+                    return None;
+                }
+                j += 1;
+                loop {
+                    if j >= cs.len() {
+                        break;
+                    }
+                    if cs[j] == '"' && (1..=hashes).all(|k| cs.get(j + k) == Some(&'#')) {
+                        j += 1 + hashes;
+                        break;
+                    }
+                    j += 1;
+                }
+                Some(j)
+            }
+            '"' => {
+                let mut j = i + 1;
+                while j < cs.len() && cs[j] != '"' {
+                    if cs[j] == '\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                Some((j + 1).min(cs.len()))
+            }
+            '\'' => {
+                let is_char_lit = match next {
+                    Some('\\') => true,
+                    Some(_) => cs.get(i + 2) == Some(&'\''),
+                    None => false,
+                };
+                if is_char_lit {
+                    let mut j = i + 1;
+                    while j < cs.len() && cs[j] != '\'' {
+                        if cs[j] == '\\' {
+                            j += 1;
+                        }
+                        j += 1;
+                    }
+                    Some((j + 1).min(cs.len()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Every top-level (column-0, i.e. no leading whitespace on the `fn`/
     /// `pub fn` keyword) function in `src`, as `(name, body_start,
     /// body_end)` byte-offset spans (the span covers from the opening `{`
     /// through its matching closing `}` inclusive). Shares the exact
     /// comment/string/raw-string/char-literal skipping discipline
-    /// `step_kinds::liveness_conformance::fn_body` uses, generalized to
-    /// walk the WHOLE file once rather than searching for one named
-    /// function — this test needs "which function contains offset X", not
-    /// "give me function Y's body".
+    /// `step_kinds::liveness_conformance::fn_body` uses (now factored into
+    /// `skip_non_code_span`, shared with every other extractor in this
+    /// module), generalized to walk the WHOLE file once rather than
+    /// searching for one named function — this test needs "which function
+    /// contains offset X", not "give me function Y's body".
     fn top_level_function_spans(src: &str) -> Vec<(String, usize, usize)> {
         let mut spans = Vec::new();
         let cs: Vec<char> = src.chars().collect();
         let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
         let mut i = 0usize;
         while i < cs.len() {
-            let c = cs[i];
-            let next = cs.get(i + 1).copied();
-            match c {
-                '/' if next == Some('/') => {
-                    while i < cs.len() && cs[i] != '\n' {
-                        i += 1;
-                    }
-                    continue;
-                }
-                '/' if next == Some('*') => {
-                    i += 2;
-                    while i + 1 < cs.len() && !(cs[i] == '*' && cs[i + 1] == '/') {
-                        i += 1;
-                    }
-                    i += 2;
-                    continue;
-                }
-                'r' if next == Some('"') || next == Some('#') => {
-                    let mut hashes = 0usize;
-                    let mut j = i + 1;
-                    while cs.get(j) == Some(&'#') {
-                        hashes += 1;
-                        j += 1;
-                    }
-                    if cs.get(j) != Some(&'"') {
-                        i += 1;
-                        continue;
-                    }
-                    j += 1;
-                    loop {
-                        if j >= cs.len() {
-                            break;
-                        }
-                        if cs[j] == '"' && (1..=hashes).all(|k| cs.get(j + k) == Some(&'#')) {
-                            j += 1 + hashes;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    i = j;
-                    continue;
-                }
-                '"' => {
-                    i += 1;
-                    while i < cs.len() && cs[i] != '"' {
-                        if cs[i] == '\\' {
-                            i += 1;
-                        }
-                        i += 1;
-                    }
-                    i += 1;
-                    continue;
-                }
-                '\'' => {
-                    let is_char_lit = match next {
-                        Some('\\') => true,
-                        Some(_) => cs.get(i + 2) == Some(&'\''),
-                        None => false,
-                    };
-                    if is_char_lit {
-                        i += 1;
-                        while i < cs.len() && cs[i] != '\'' {
-                            if cs[i] == '\\' {
-                                i += 1;
-                            }
-                            i += 1;
-                        }
-                    }
-                    i += 1;
-                    continue;
-                }
-                _ => {}
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
             }
             // A column-0 `fn ` or `pub fn ` — i.e. this char starts a line
             // (i == 0 or the previous char is '\n') and the line begins
@@ -2782,6 +2876,211 @@
             i += 1;
         }
         spans
+    }
+
+    /// Every top-level (column-0) `mod`/`pub mod`/`pub(crate) mod`
+    /// DECLARATION line in `src`, as trimmed line text — via
+    /// `skip_non_code_span`, so a `mod` appearing only in a comment or
+    /// string (e.g. a path like `runtime/src/tools/mod.rs`, or this very
+    /// doc comment) is not mistaken for a declaration. Every module
+    /// declared here is a DESCENDANT module, and Rust makes this file's
+    /// private items (including `dispatch_remote`) visible to every
+    /// descendant — see `every_dispatch_remote_call_site_is_guarded_
+    /// against_resume_from`'s own doc comment.
+    fn top_level_mod_declarations(src: &str) -> Vec<String> {
+        let cs: Vec<char> = src.chars().collect();
+        let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            let at_line_start = i == 0 || cs[i - 1] == '\n';
+            if at_line_start {
+                let lookahead: String = cs[i..(i + 15).min(cs.len())].iter().collect();
+                let is_mod_decl = lookahead.starts_with("mod ")
+                    || lookahead.starts_with("pub mod ")
+                    || lookahead.starts_with("pub(crate) mod ");
+                if is_mod_decl {
+                    let mut j = i;
+                    while j < cs.len() && cs[j] != '\n' {
+                        j += 1;
+                    }
+                    let b0 = byte_offsets[i];
+                    let b1 = if j < byte_offsets.len() { byte_offsets[j] } else { src.len() };
+                    out.push(src[b0..b1].trim().to_string());
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Every call-shaped occurrence of `dispatch_remote` in `src`: the
+    /// whole identifier `dispatch_remote` (not a longer identifier that
+    /// merely contains it, e.g. a hypothetical `dispatch_remote_helper`),
+    /// found only at genuine code positions via `skip_non_code_span` (a
+    /// comment or string mentioning the name is invisible here, same
+    /// lexical rule `top_level_function_spans` uses), followed by optional
+    /// whitespace and then `(` — so `dispatch_remote (opts, ...)` (legal
+    /// Rust, invisible to a fixed `"dispatch_remote("` substring search) is
+    /// caught too. Excludes the `fn dispatch_remote(` / `pub fn
+    /// dispatch_remote(` declaration itself (identified the same way the
+    /// visibility pin above does: the four characters immediately before
+    /// the identifier end in `"fn "`). Returns the byte offset of the
+    /// start of `dispatch_remote` for each hit.
+    fn find_dispatch_remote_calls(src: &str) -> Vec<usize> {
+        const NAME: &str = "dispatch_remote";
+        let cs: Vec<char> = src.chars().collect();
+        let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
+        let name_chars: Vec<char> = NAME.chars().collect();
+        let mut hits = Vec::new();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            let end = i + name_chars.len();
+            let name_matches = end <= cs.len() && cs[i..end] == name_chars[..];
+            if name_matches {
+                let before_ok = i == 0 || !(cs[i - 1].is_alphanumeric() || cs[i - 1] == '_');
+                let after_ok = cs.get(end).map(|c| !(c.is_alphanumeric() || *c == '_')).unwrap_or(true);
+                if before_ok && after_ok {
+                    let mut j = end;
+                    while j < cs.len() && matches!(cs[j], ' ' | '\t' | '\r' | '\n') {
+                        j += 1;
+                    }
+                    let is_call = cs.get(j) == Some(&'(');
+                    let prefix: String = cs[i.saturating_sub(4)..i].iter().collect();
+                    let is_declaration = prefix.ends_with("fn ");
+                    if is_call && !is_declaration {
+                        hits.push(byte_offsets[i]);
+                    }
+                }
+            }
+            i += 1;
+        }
+        hits
+    }
+
+    /// Every top-level-ish `if` in `body`, as `(cond_start, block_start,
+    /// block_end)` byte offsets INTO `body` — `cond_start` is the `if`
+    /// keyword's own start, `block_start`/`block_end` bound the `{...}`
+    /// block (inclusive of both braces), found via `skip_non_code_span`.
+    /// Used to check that a guard's anchor text sits inside an ACTUAL
+    /// `resume_from`-conditioned block, not merely somewhere earlier in the
+    /// function (the #2580 round 2 "anchor in an unrelated sibling branch"
+    /// exploit).
+    fn find_if_blocks(body: &str) -> Vec<(usize, usize, usize)> {
+        let cs: Vec<char> = body.chars().collect();
+        let byte_offsets: Vec<usize> = body.char_indices().map(|(b, _)| b).collect();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            let before_ok = i == 0 || !(cs[i - 1].is_alphanumeric() || cs[i - 1] == '_');
+            let lookahead: String = cs[i..(i + 3).min(cs.len())].iter().collect();
+            let is_if = before_ok && (lookahead.starts_with("if ") || lookahead.starts_with("if("));
+            if is_if {
+                let cond_start = i;
+                let mut j = i + 2;
+                let mut paren_depth = 0i32;
+                loop {
+                    if j >= cs.len() {
+                        break;
+                    }
+                    if let Some(skip_to) = skip_non_code_span(&cs, j) {
+                        j = skip_to;
+                        continue;
+                    }
+                    match cs[j] {
+                        '(' => paren_depth += 1,
+                        ')' => paren_depth -= 1,
+                        '{' if paren_depth <= 0 => break,
+                        ';' if paren_depth <= 0 => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j < cs.len() && cs[j] == '{' {
+                    let block_start_char = j;
+                    let mut depth = 0i32;
+                    let mut m = j;
+                    loop {
+                        if m >= cs.len() {
+                            break;
+                        }
+                        if let Some(skip_to) = skip_non_code_span(&cs, m) {
+                            m = skip_to;
+                            continue;
+                        }
+                        match cs[m] {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    let cond_start_b = byte_offsets[cond_start];
+                                    let block_start_b = byte_offsets[block_start_char];
+                                    let block_end_b =
+                                        if m + 1 < byte_offsets.len() { byte_offsets[m + 1] } else { body.len() };
+                                    out.push((cond_start_b, block_start_b, block_end_b));
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        m += 1;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The refusal message every `dispatch_remote` guard must contain,
+    /// shared by `resume_from_guard_precedes` and the conformance test's
+    /// own failure message.
+    const RESUME_FROM_GUARD_ANCHOR: &str = "not supported on the remote single-shot dispatch path";
+
+    /// True iff `body[..call_at_in_body]` contains an `if` block (per
+    /// `find_if_blocks`) whose CONDITION mentions `resume_from`, whose
+    /// block closes at or before `call_at_in_body`, and whose block text
+    /// (after `\`-continuation collapsing) contains BOTH
+    /// `RESUME_FROM_GUARD_ANCHOR` and a diverging construct
+    /// (`bail!`/`return Err`/`panic!`). Requiring the anchor to sit INSIDE
+    /// the resume_from-conditioned, diverging block — not merely earlier in
+    /// the function — is what rejects an unrelated `bail!` elsewhere that
+    /// happens to mention the same phrase (the #2580 round 2 "anchor in a
+    /// sibling branch" exploit): that `bail!`'s enclosing `if` condition
+    /// won't mention `resume_from`, so it never qualifies. Deliberately
+    /// does NOT chase the anchor into a helper function the block merely
+    /// calls — see the conformance test's own doc comment for why.
+    fn resume_from_guard_precedes(body: &str, call_at_in_body: usize) -> bool {
+        for (cond_start, block_start, block_end) in find_if_blocks(body) {
+            if block_end > call_at_in_body {
+                continue;
+            }
+            let cond_text = &body[cond_start..block_start];
+            if !cond_text.contains("resume_from") {
+                continue;
+            }
+            let block_text = collapse_str_continuations(&body[block_start..block_end]);
+            let diverges =
+                block_text.contains("bail!") || block_text.contains("return Err") || block_text.contains("panic!");
+            if diverges && block_text.contains(RESUME_FROM_GUARD_ANCHOR) {
+                return true;
+            }
+        }
+        false
     }
 
     // ── the message itself: three shapes, three remedies ───────────────
