@@ -73,10 +73,17 @@ against a real fixture directory before being closed here.
    sweep, zero mutants always means a defect (a dropped flag, a stray
    `.cargo/mutants.toml`, a filter matching nothing) — there is no such thing
    as a package with nothing to mutate here. For the PR diff job, zero IS
-   legitimate when the diff added no Rust lines, so the workflow passes the
-   added-line count in via `--changed-lines`; zero mutants against a non-zero
-   count of added Rust lines is the same exit-0/zero-mutants/green shape the
-   package-scoping bug wore for its entire life.
+   legitimate when the diff added no *mutable* Rust lines, so the workflow
+   passes a count in via `--changed-lines`; zero mutants against a non-zero
+   count is the same exit-0/zero-mutants/green shape the package-scoping bug
+   wore for its entire life.
+
+   That count is computed HERE (`--count-changed-lines`), not by a `grep` in
+   the workflow, and it is deliberately narrower than "added lines matching
+   `^+`". See `added_line_is_countable` below for what it excludes and why —
+   the first version of this floor counted every added line, and PR #2514
+   (13 added lines: 12 of doc comment and one `#[serial_test::serial]`) failed
+   a gate it should never have been shown to.
 
 ## What is advisory and what gates
 
@@ -111,6 +118,121 @@ EXIT_MEANING = {
     6: "FilterDiffInvalid — the --in-diff file could not be parsed",
     70: "Software — an internal cargo-mutants error",
 }
+
+
+# ---------------------------------------------------------------------------
+# The changed-line floor's counter.
+#
+# A HEURISTIC, stated as one. It approximates the question "did this diff add a
+# line cargo-mutants could plausibly have generated a mutant from?" by throwing
+# away added lines that are unambiguously not mutable code. It does NOT parse
+# Rust, and a precise answer would mean reimplementing cargo-mutants' own
+# visitor — not worth it for a floor whose only job is to notice that the tool
+# measured nothing.
+#
+# DIRECTION OF ERROR, on purpose: a line is excluded only when it can be
+# classified with certainty. Anything ambiguous COUNTS AS CODE, which keeps the
+# floor armed. So the heuristic can still produce a false FAIL (a shape it
+# hasn't learned about), and never produces a false PASS on its own.
+#
+# What it will still get wrong, all in the count-it-as-code direction:
+#   * a MULTI-LINE attribute — `#[serde(` / `rename_all = "x"` / `)]` — where
+#     only the first line is recognized and the continuations count as code;
+#   * a MULTI-LINE block comment: `/* …` alone, a ` * …` continuation, and a
+#     bare `*/` all count as code. Tracking block-comment state across a diff
+#     is unreliable anyway, because the opening `/*` is often a CONTEXT line
+#     that never appears as an added line;
+#   * a `use` statement, which cargo-mutants never mutates but which this does
+#     count — a pure import-reshuffle PR can still trip the floor;
+#   * a doc comment whose body contains code (```rust fences): correctly
+#     excluded here, but only because the whole line starts with `///`.
+#
+# Why not ask cargo-mutants itself. `cargo mutants --workspace --list
+# --in-diff <diff>` looked like an exact discriminator and is cheap (measured
+# 1.2s, parse-only, no build) — it reports 0 for #2514's comment-only diff and
+# 5 for a `crates/`-only diff that this job's root-package scope misses. It was
+# REJECTED as circular: it shares cargo-mutants' diff parser, path resolution
+# and source visitor with the run it would be checking, so when one of those is
+# the thing that broke, both numbers go to zero together and the floor turns
+# itself off silently. Measured, not assumed: a diff carrying 848 real added
+# code lines whose paths were rewritten to files not in the tree — the exact
+# "--in-diff paths don't resolve" shape this floor exists to catch — makes
+# `--workspace --list --in-diff` print `INFO No mutants to filter` and exit 0.
+# A guard has to be independent of what it guards; git plus this classifier is.
+# ---------------------------------------------------------------------------
+
+# A line made only of these is structure, never a mutation site: `}`, `});`,
+# `)`, `],`, `};`.
+_STRUCTURE_ONLY_CHARS = set("{}()[];,")
+
+
+def added_line_is_countable(text: str) -> bool:
+    """Could this added line (the diff's leading `+` already stripped)
+    plausibly have produced a mutant? Ambiguous shapes answer True — see the
+    module comment above this function for the full list of known misses."""
+    s = text.strip()
+    if not s:
+        return False  # blank
+    # The `s and` is redundant at runtime — the blank check above already
+    # returned — and is spelled out anyway so this branch does not rest on
+    # `all()` over an empty string being vacuously True. Without it, deleting
+    # the blank check above leaves every test green, which is the "test that
+    # cannot fail" shape this whole job exists to find.
+    if s and all(ch in _STRUCTURE_ONLY_CHARS for ch in s):
+        return False  # `}` / `});` / `],` / `)`
+    if s.startswith("//"):
+        return False  # `//`, `///`, `//!` — line comments and doc comments
+    if len(s) >= 4 and s.startswith("/*") and s.endswith("*/"):
+        return False  # a block comment that opens and closes on one line
+    if (s.startswith("#[") or s.startswith("#![")) and s.endswith("]") and s.count("[") == s.count("]"):
+        return False  # a single-line attribute; an unbalanced one counts as code
+    return True
+
+
+def count_added_lines(diff_text: str) -> tuple[int, int]:
+    """Return (added, countable) over a unified diff.
+
+    `added` is every added line, the number the workflow's old `grep -cE
+    '^\\+([^+]|$)'` produced. `countable` is the subset that could plausibly
+    have produced a mutant, and is the one the floor asserts on. `+++ b/path`
+    file headers are not added lines and are excluded from both."""
+    added = 0
+    countable = 0
+    for line in diff_text.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        added += 1
+        if added_line_is_countable(line[1:]):
+            countable += 1
+    return added, countable
+
+
+def count_changed_lines_main(args: list[str]) -> int:
+    """`--count-changed-lines <diff>`: print the countable total on stdout (the
+    workflow captures it) and the breakdown on stderr (the job log reads it).
+
+    Anything that goes wrong exits non-zero rather than printing a 0. A guard
+    that cannot read its input must fail the step, not silently disarm itself —
+    which is the whole shape of #1716."""
+    i = args.index("--count-changed-lines")
+    if i + 1 >= len(args):
+        print("--count-changed-lines requires a path to a unified diff", file=sys.stderr)
+        return 2
+    path = Path(args[i + 1])
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as exc:
+        print(f"--count-changed-lines could not read {path}: {exc}", file=sys.stderr)
+        return 2
+    added, countable = count_added_lines(text)
+    print(countable)
+    print(
+        f"{added} added Rust line(s) in scope; {countable} could plausibly produce a "
+        f"mutant ({added - countable} blank / structure-only / comment-only / "
+        "attribute-only)",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def find_out_dir(candidates: list[str]) -> Path | None:
@@ -257,14 +379,18 @@ def main(
                 "**This PR changed Rust code but produced ZERO mutants — this is not a pass.**",
                 "",
                 f"`cargo mutants` exited {exit_code} and mutated nothing, against "
-                f"{changed_lines} added Rust line(s) in the diff.",
+                f"{changed_lines} added Rust line(s) in the diff that could plausibly have "
+                "produced a mutant (blank, structure-only, comment-only and single-line "
+                "attribute lines are already excluded from that count).",
                 "",
                 "Causes seen in this repo, in order of likelihood: the `--in-diff` file's paths "
                 "don't resolve against the checked-out tree (cargo-mutants logs `No mutants to "
                 "filter` and exits 0), the diff is unparseable (`Diff file is empty`, also exit "
-                "0), or the package scope excludes the crate that changed. It can also be "
-                "legitimate — a diff that only adds comments, blank lines or `use` statements "
-                "has no mutable code in it. Read the raw log above before assuming which.",
+                "0), or the package scope excludes the crate that changed. It can still be "
+                "legitimate — the count is a heuristic that cannot parse Rust, and it counts "
+                "`use` statements, multi-line attributes and multi-line block-comment bodies as "
+                "code (see `added_line_is_countable`). Read the raw log above before assuming "
+                "which.",
             ]
             print("\n".join(lines))
             return 1
@@ -474,6 +600,175 @@ SELF_TEST_CASES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Self-test, part 2: the changed-line counter and the floor it feeds.
+#
+# These cases run END TO END — the diff goes through `--count-changed-lines`,
+# and the number that comes out is handed straight to the floor at exit 0 with
+# no output directory ("cargo-mutants ran and mutated nothing"). That is the
+# real composition CI performs, so a row here is the actual gate verdict for
+# that diff, not two half-tests that happen to agree.
+#
+# `expect_gate` 0 = the PR passes, 1 = the floor fires.
+# ---------------------------------------------------------------------------
+
+# PR #2514's entire src/ diff, reproduced: twelve `///` lines and one
+# single-line attribute. The floor as first written counted 13 and failed it.
+_DIFF_2514 = """diff --git a/src/coder_phase_tests.rs b/src/coder_phase_tests.rs
+--- a/src/coder_phase_tests.rs
++++ b/src/coder_phase_tests.rs
+@@ -1122,7 +1122,20 @@
+         assert_eq!(branch_name("s1"), "darkmux/s1");
+     }
+
++    /// `worktree_path` joins `worktrees_base_dir()` — which reads the shared
++    /// `DARKMUX_HOME` env var live, uncached, on every call. This test
++    /// never sets `DARKMUX_HOME` itself, but the two `worktree_path` calls
++    /// below straddle a window in which *another* test can: without
++    /// `#[serial]` this test can interleave with any of the many
++    /// `#[serial]`-marked tests elsewhere in this binary that
++    /// `set_var("DARKMUX_HOME", ...)` then restore it, so the first call can
++    /// observe the operator's real `~/.darkmux` and the second call can
++    /// observe a concurrent test's tempdir — same repo-relative path, two
++    /// different bases, spurious inequality. `#[serial]` closes the window by
++    /// excluding this test from running while any other `#[serial]` test
++    /// (the full set of `DARKMUX_HOME` mutators in this binary) is active.
+     #[test]
++    #[serial_test::serial]
+     fn worktree_path_is_deterministic_under_repo_name() {
+"""
+
+_DIFF_REAL_CODE = """diff --git a/src/mission_status.rs b/src/mission_status.rs
+--- a/src/mission_status.rs
++++ b/src/mission_status.rs
+@@ -70,6 +70,9 @@
+ impl MissionView<'_> {
++    fn done(&self) -> usize {
++        self.finalized + self.aborted
++    }
+ }
+"""
+
+COUNT_SELF_TEST_CASES = [
+    {
+        "name": "PR #2514: doc comments + one attribute count as zero, and the floor passes",
+        "diff": _DIFF_2514,
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # The reason the floor exists. Must stay red.
+        "name": "real added code with zero mutants still fails (the under-scoping shape)",
+        "diff": _DIFF_REAL_CODE,
+        # 3 added lines, of which the trailing `    }` is structure-only.
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        "name": "a closing-brace-only diff counts zero",
+        "diff": "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,4 @@\n+}\n+});\n+    ],\n+)\n",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        "name": "a blank-line-only diff counts zero",
+        "diff": "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,3 @@\n+\n+   \n+\t\n",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        "name": "line comments and single-line block comments count zero",
+        "diff": (
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,4 @@\n"
+            "+// plain\n+//! inner doc\n+/* one liner */\n+    /*x*/\n"
+        ),
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # BOUNDARY, and it is the fail-open direction on purpose: only shapes
+        # the classifier is CERTAIN about are excluded, so a multi-line
+        # attribute's continuation lines and a multi-line block comment's body
+        # count as code and keep the floor armed.
+        "name": "ambiguous shapes count as code — multi-line attribute and block comment",
+        "diff": (
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,6 @@\n"
+            "+#[serde(\n+    rename_all = \"snake_case\"\n+)]\n"
+            "+/* opens here\n+ * body\n+ */\n"
+        ),
+        # `#[serde(` (unbalanced), `rename_all = ...`, `/* opens here`,
+        # `* body`, `*/`. The `)]` line is structure-only and drops out.
+        "expect_count": 5,
+        "expect_gate": 1,
+    },
+    {
+        "name": "`+++ b/path` headers are never counted as added lines",
+        "diff": "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,1 @@\n+// only a comment\n",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        "name": "a mix counts only the mutable line",
+        "diff": (
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,5 @@\n"
+            "+\n+/// doc\n+#[test]\n+let x = a + b;\n+}\n"
+        ),
+        "expect_count": 1,
+        "expect_gate": 1,
+    },
+]
+
+
+def _run_self(argv: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), *argv],
+        capture_output=True,
+        text=True,
+    )
+
+
+def count_self_test() -> list[str]:
+    failures = []
+    for case in COUNT_SELF_TEST_CASES:
+        with tempfile.TemporaryDirectory() as tmp:
+            diff_path = Path(tmp) / "pr.diff"
+            diff_path.write_text(case["diff"])
+            problems = []
+
+            proc = _run_self(["--count-changed-lines", str(diff_path)])
+            got = proc.stdout.strip()
+            if proc.returncode != 0:
+                problems.append(f"counter exited {proc.returncode}: {proc.stderr.strip()}")
+            elif got != str(case["expect_count"]):
+                problems.append(f"counted {got!r}, expected {case['expect_count']}")
+
+            # Hand the count straight to the floor, the way the workflow does:
+            # exit 0, no output directory, i.e. "ran and mutated nothing".
+            if proc.returncode == 0:
+                gate = _run_self(
+                    [
+                        "0",
+                        "diff",
+                        "T",
+                        "--changed-lines",
+                        got,
+                        str(Path(tmp) / "nope" / "mutants.out"),
+                    ]
+                )
+                if gate.returncode != case["expect_gate"]:
+                    problems.append(
+                        f"gate exited {gate.returncode}, expected {case['expect_gate']}\n"
+                        + "".join(
+                            f"    | {ln}\n" for ln in (gate.stdout + gate.stderr).splitlines()
+                        )
+                    )
+            if problems:
+                failures.append(
+                    f"  [count] {case['name']}\n" + "".join(f"    - {p}\n" for p in problems)
+                )
+    return failures
+
+
 def self_test() -> int:
     failures = []
     for case in SELF_TEST_CASES:
@@ -510,16 +805,19 @@ def self_test() -> int:
                     + "    --- output ---\n"
                     + "".join(f"    | {ln}\n" for ln in blob.splitlines())
                 )
+    failures += count_self_test()
     if failures:
         print("ci-mutants-summary self-test FAILED:\n" + "\n".join(failures))
         return 1
-    print(f"ci-mutants-summary self-test passed: {len(SELF_TEST_CASES)} cases")
+    total = len(SELF_TEST_CASES) + len(COUNT_SELF_TEST_CASES)
+    print(f"ci-mutants-summary self-test passed: {total} cases")
     return 0
 
 
 USAGE = (
     "usage: ci-mutants-summary.py <exit_code> <diff|full> <title> "
     "[--changed-lines N] [out_dir_candidate ...]\n"
+    "       ci-mutants-summary.py --count-changed-lines <unified.diff>\n"
     "       ci-mutants-summary.py --self-test"
 )
 
@@ -527,6 +825,8 @@ USAGE = (
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(self_test())
+    if "--count-changed-lines" in sys.argv:
+        sys.exit(count_changed_lines_main(sys.argv[1:]))
 
     args = sys.argv[1:]
     changed_lines = 0

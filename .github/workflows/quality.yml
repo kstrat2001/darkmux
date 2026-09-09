@@ -125,14 +125,25 @@ jobs:
           # deletion-only diff legitimately yields zero mutants, and counting
           # its header line would turn that into a failure.
           #
+          # The count comes from the summary script, NOT from a `grep -c` here,
+          # for two reasons. First, `^\+([^+]|$)` counts every added line —
+          # including comments and attributes, which are Rust lines that
+          # legitimately produce no mutants. PR #2514 (12 doc-comment lines and
+          # one `#[serial_test::serial]`) failed this gate on exactly that. The
+          # script's `added_line_is_countable` throws those away and documents
+          # what it still gets wrong. Second, logic that decides pass/fail
+          # belongs where `--self-test` can reach it; untested gate logic in a
+          # workflow's shell is the shape #1716 was about, relocated.
+          #
           # Written to a file first, deliberately: in a `git ... | grep -c`
           # pipeline (no pipefail under GitHub's `bash -e`) a FAILING git diff
           # feeds grep nothing, grep prints 0, and the guard silently switches
-          # itself off. As a plain command, a git failure fails the step.
+          # itself off. As a plain command, a git failure fails the step — and
+          # the counter likewise exits non-zero rather than printing 0 if it
+          # cannot read the diff.
           git diff "origin/${{ github.base_ref }}"...HEAD -- 'src/*.rs' > /tmp/pr-scope.diff
-          CHANGED=$(grep -cE '^\+([^+]|$)' /tmp/pr-scope.diff || true)
-          CHANGED=${CHANGED:-0}
-          echo "changed Rust lines (in mutation scope): $CHANGED"
+          CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines /tmp/pr-scope.diff)
+          echo "changed Rust lines (in mutation scope, mutable-looking only): $CHANGED"
           echo "changed_lines=$CHANGED" >> "$GITHUB_OUTPUT"
 
       - name: Mutate only what this PR touched
