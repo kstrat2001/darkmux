@@ -529,6 +529,20 @@ pub struct DispatchOpts {
 /// omitting `--compactor-model` no longer falls back to a runtime default.
 /// It disables compaction outright for this dispatch. See that field's own
 /// doc.
+///
+/// (Third review round) Not every constructor reads the profile. The bare
+/// `darkmux dispatch` CLI path (`src/main.rs`) and a few other callers
+/// (`lab`'s `prompt` provider, `review_bench.rs`, `crawl/unit_step.rs`)
+/// build a `default()` — every field `None`, including `threshold_tokens` —
+/// and separately patch in only `context_window` from the profile's `n_ctx`
+/// as a fallback (`dispatch_internal::ensure_context_window`). Only
+/// [`Self::from_profile`] reads `threshold_tokens`, so a claim that the
+/// threshold-only trigger is "reachable whenever the primary is
+/// endpoint-bearing" is true on the `from_profile` paths (the lab providers
+/// that call it directly, e.g. `coding_task`/`tool_bench`, and the loop
+/// override in `lab/loop_report.rs`) and false on the `default()` paths,
+/// where `threshold_tokens` never becomes `Some` regardless of what the
+/// profile declares.
 #[derive(Debug, Clone, Default)]
 pub struct CompactionDispatchArgs {
     /// Absolute trigger. Set from `profile.runtime.compaction.threshold_tokens`
@@ -672,12 +686,19 @@ impl CompactionDispatchArgs {
     /// alone, which left the absolute-threshold-only mode silent — the
     /// compaction trigger also fires on `threshold_tokens` with no window
     /// at all, and `CompactionDispatchArgs::from_profile` reads that field
-    /// independently of `context_window` (which comes from the primary
-    /// model's `n_ctx` and is absent whenever the primary is
-    /// endpoint-bearing). A dispatch configured threshold-only with no
-    /// compactor is exactly the long dispatch that would have compacted and
-    /// now silently doesn't, reachable from the host the same way it's
-    /// reachable from the runtime directly. Fires on EITHER trigger now;
+    /// independently of `context_window`. (Third review round: NOT
+    /// reachable on the bare `darkmux dispatch` path — that path builds a
+    /// `default()` args struct, never `from_profile`, so `threshold_tokens`
+    /// stays `None` there regardless of the profile; only `context_window`
+    /// gets a profile-derived fallback, via `ensure_context_window`. The
+    /// threshold-only arm is reachable through the paths that DO call
+    /// `from_profile` — the lab providers that derive compaction from a
+    /// profile up front, e.g. `coding_task`/`tool_bench`, and the loop
+    /// override in `lab/loop_report.rs`, which applies its overrides on top
+    /// of an already-`from_profile`-derived config.) A dispatch configured
+    /// threshold-only with no compactor, on any of those paths, is exactly
+    /// the long dispatch that would have compacted and now silently
+    /// doesn't. Fires on EITHER trigger now;
     /// `None` only when a compactor is configured, or when neither trigger
     /// is set (nothing was ever going to compact either way).
     pub fn unset_compactor_warning(&self) -> Option<String> {
@@ -1220,12 +1241,17 @@ mod tests {
         assert_eq!(c.unset_compactor_warning(), None);
     }
 
-    /// (Second review round) The threshold-only reachable case: an
-    /// endpoint-bearing primary (or any profile with no declared `n_ctx`)
-    /// leaves `context_window` `None`, but `threshold_tokens` is read
-    /// independently from `profile.runtime.compaction.threshold_tokens` —
-    /// a real, reachable compaction trigger that the pre-fix version of
-    /// this function stayed silent about.
+    /// (Second review round) The threshold-only reachable case: on a
+    /// `from_profile`-derived config, an endpoint-bearing primary (or any
+    /// profile with no declared `n_ctx`) leaves `context_window` `None`,
+    /// but `threshold_tokens` is read independently from
+    /// `profile.runtime.compaction.threshold_tokens` — a real, reachable
+    /// compaction trigger on the paths that call `from_profile` (the lab
+    /// providers that derive compaction from a profile up front, and the
+    /// loop override in `lab/loop_report.rs`; the bare `darkmux dispatch`
+    /// path never reads `threshold_tokens` from the profile at all — see
+    /// this struct's doc) — one the pre-fix version of this function stayed
+    /// silent about.
     #[test]
     fn unset_compactor_warning_fires_when_no_compactor_and_only_a_threshold_is_set() {
         let c = CompactionDispatchArgs {

@@ -127,4 +127,19 @@ fn bound_compactor_stays_silent() {
         "a bound compactor must never trigger the unset-compactor disclosure: stderr was: \
          {stderr}"
     );
+    // (Third review round) Without this, a mangled/renamed flag (e.g.
+    // `--compact-threshold-tokens` typo'd) fails argument parsing before the
+    // disclosure logic is ever reached, so the assertion above passes
+    // vacuously — proven: mangling the flag name above yields `unknown
+    // flag`, zero matches for the disclosure substring either way, exit
+    // code 2. Require the run to have actually reached the transport
+    // (dead-port connection failure, exit code 1) so a parse failure can no
+    // longer masquerade as a passing negative control.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the run must reach the transport (a dead-port connection failure) for the silence \
+         above to mean anything — a non-1 exit means argument parsing itself failed before the \
+         disclosure was ever reachable: stderr was: {stderr}"
+    );
 }

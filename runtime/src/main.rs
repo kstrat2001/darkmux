@@ -943,8 +943,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         compactor_custom_instructions,
     );
     // (MUST FIX 1, #2571 follow-up) Disclose at startup, loudly, when this
-    // dispatch is about to run with no compactor bound but a context window
-    // that says compaction would otherwise have fired. Before this there
+    // dispatch is about to run with no compactor bound but a real
+    // compaction trigger configured — either a context window (the
+    // formula/window-derived trigger) or an absolute
+    // `--compact-threshold-tokens` with no window at all. Before this there
     // was no signal anywhere — no message, no trajectory event, no flow
     // record, no envelope field — so a zero compaction count read
     // identically to "never needed one."
