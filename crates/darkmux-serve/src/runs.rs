@@ -85,7 +85,7 @@
 use crate::LabRunSummary;
 use darkmux_crew::envelope::MissionOutcomeStatus;
 use darkmux_crew::step_kinds::StepKindRegistry;
-use darkmux_crew::types::{Mission, MissionStatus, Phase, Step, Task};
+use darkmux_crew::types::{Mission, MissionStatus, Phase, PhaseStatus, Step, Task};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as StdPath, PathBuf};
 
@@ -1012,8 +1012,9 @@ fn mission_to_run(
 /// happy finalize — see `darkmux_crew::envelope`'s own doc). So a
 /// `Finalized` mission's flat status is read off its envelope; a mission
 /// with no envelope at all (pre-#1284, or a mint that never reached
-/// finalization's write) degrades to `Complete` rather than guessing —
-/// `Finalized` is itself the durable, higher-confidence signal here.
+/// finalization's write) is no longer a single "genuinely no data, degrade
+/// to Complete" case — see the `Ok(None)` arm's own doc (#1564) for why it
+/// now checks the mission's actual on-disk phases before guessing.
 ///
 /// **CONSIDER 4 — the dead `Planned` variant.** An `Active` mission
 /// (`MissionStatus`'s own default) with `started_ts: None` was minted but
@@ -1121,12 +1122,49 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
             // here would be a genuine improvement, not ruled out — it just
             // isn't the cheap fix an unconditional `eprintln!` would be.
             Err(_) => RunStatus::Unparseable,
-            // No envelope at all — a pre-#1284 mint, or a mint that never
-            // reached finalization's write. Genuinely no data, not a parse
-            // failure; degrades to `Complete` rather than guessing —
-            // unchanged by #1881, which is about records that EXIST but
-            // can't be read, not records that were never written.
-            Ok(None) => RunStatus::Complete,
+            // (#1564) No envelope at all — not a parse failure (that's the
+            // `Err` arm above), but no longer a SINGLE "genuinely no data"
+            // case either. Two genuinely different situations reach here
+            // with no `envelope.json` on disk:
+            //
+            // - `mission finalize` (`src/coder_phase.rs`'s whole-mission
+            //   success verb, and pre-#1284 records generally) drives EVERY
+            //   phase to `Complete` before the mission ever reaches
+            //   `Finalized`, and never writes an envelope — an intentional
+            //   gap, documented at `finalize_mission_if_complete`'s own doc.
+            // - `reconcile_mint_failure` (`crates/darkmux-crew/src/
+            //   lifecycle.rs`, the ONLY other production path that leaves a
+            //   `Finalized` mission with no envelope) is a `mission launch`
+            //   MINT failure backstop: it closes straight to `Finalized` —
+            //   the SUCCESS terminal — after force-abandoning every phase
+            //   it managed to mint (`mission_close_with_reasoning` ->
+            //   `reconcile_mission_phases_terminal`). Before this fix, that
+            //   collapsed onto the exact same `Complete` the happy path
+            //   above gets — a mission that abandoned every phase read
+            //   identically to one that did nothing wrong, #1564's own
+            //   conflation, one layer under #2406's phase-level rollup.
+            //
+            // Neither case has an envelope to consult, but both leave a
+            // real signal on disk: `reconcile_mission_phases_terminal`
+            // guarantees every phase is terminal (`Complete`/`Abandoned`)
+            // by the time a mission reaches `Finalized` through either
+            // path, so "did at least one phase actually complete" tells
+            // them apart without guessing. No phases at all stays
+            // `Complete`, unchanged — a genuinely dataless mint/dispatch-
+            // shape mission, the same "no data, don't invent a verdict"
+            // reasoning this arm has always applied.
+            Ok(None) => {
+                let phases: Vec<Phase> = darkmux_crew::loader::load_phases()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|p| p.mission_id == mission.id)
+                    .collect();
+                if phases.is_empty() || phases.iter().any(|p| p.status == PhaseStatus::Complete) {
+                    RunStatus::Complete
+                } else {
+                    RunStatus::Abandoned
+                }
+            }
             Ok(Some(envelope)) => {
                 // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
                 // `RunOutcome::Partial` is NOT read here. `RunStatus` has no
@@ -2790,6 +2828,77 @@ mod tests {
         let clean_env = MissionEnvelope::new("m6", MissionOutcomeStatus::Clean, &[]);
         darkmux_crew::envelope::finalize_mission(&clean_env);
         assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Complete);
+    }
+
+    /// (#1564) The mint-failure backstop's actual on-disk shape:
+    /// `reconcile_mint_failure` (`crates/darkmux-crew/src/lifecycle.rs`)
+    /// closes a mission straight to `Finalized` — the SUCCESS terminal —
+    /// after force-abandoning every phase it managed to mint, and writes NO
+    /// envelope at all. Before this fix, the `Ok(None)` arm's blanket
+    /// `RunStatus::Complete` collapsed that onto the exact same status a
+    /// genuinely successful envelope-less finalize gets: a mission that
+    /// abandoned every phase read identically to one that did nothing
+    /// wrong — the run-level shape of the conflation #1564 named, one
+    /// layer under #2406's phase-level `Degraded` rollup.
+    ///
+    /// Mutating the fix's `phases.iter().any(|p| p.status ==
+    /// PhaseStatus::Complete)` to always `true` (i.e. reverting to the old
+    /// blanket `Complete`) must fail this test.
+    #[test]
+    #[serial_test::serial]
+    fn mission_run_status_finalized_no_envelope_all_phases_abandoned_reads_abandoned() {
+        let _g = CrewGuard::new();
+        darkmux_crew::lifecycle::save_mission(&minimal_mission("m10", vec!["m10-p1".to_string()], None))
+            .unwrap();
+        let mut phase = minimal_phase("m10-p1", "m10", vec![]);
+        phase.status = PhaseStatus::Abandoned;
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+
+        let mut m = minimal_mission("m10", vec!["m10-p1".to_string()], None);
+        m.status = MissionStatus::Finalized;
+        assert_eq!(
+            mission_run_status(&m, &[], now_unix() * 1_000),
+            RunStatus::Abandoned,
+            "a Finalized mission with no envelope and every phase Abandoned must read Abandoned, \
+             never the same Complete a genuinely successful envelope-less finalize gets"
+        );
+    }
+
+    /// The inverted case, pinned alongside the one above so a fix that
+    /// makes EVERY envelope-less Finalized mission read Abandoned (over-
+    /// correcting #1564) is caught too. `mission finalize` (the whole-
+    /// mission CLI success verb, `src/coder_phase.rs`) drives every phase
+    /// to `Complete` before the mission reaches `Finalized`, envelope-less
+    /// by design (`finalize_mission_if_complete`'s own doc) — that
+    /// genuinely successful case must keep reading `Complete`.
+    #[test]
+    #[serial_test::serial]
+    fn mission_run_status_finalized_no_envelope_a_completed_phase_still_reads_complete() {
+        let _g = CrewGuard::new();
+        darkmux_crew::lifecycle::save_mission(&minimal_mission(
+            "m11",
+            vec!["m11-p1".to_string(), "m11-p2".to_string()],
+            None,
+        ))
+        .unwrap();
+        let mut done = minimal_phase("m11-p1", "m11", vec![]);
+        done.status = PhaseStatus::Complete;
+        darkmux_crew::lifecycle::save_phase(&done).unwrap();
+        let mut abandoned = minimal_phase("m11-p2", "m11", vec![]);
+        abandoned.status = PhaseStatus::Abandoned;
+        darkmux_crew::lifecycle::save_phase(&abandoned).unwrap();
+
+        let mut m = minimal_mission(
+            "m11",
+            vec!["m11-p1".to_string(), "m11-p2".to_string()],
+            None,
+        );
+        m.status = MissionStatus::Finalized;
+        assert_eq!(
+            mission_run_status(&m, &[], now_unix() * 1_000),
+            RunStatus::Complete,
+            "at least one genuinely completed phase must still read Complete, even with no envelope"
+        );
     }
 
     #[test]
