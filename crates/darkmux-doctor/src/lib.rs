@@ -4876,8 +4876,9 @@ fn check_mission_config_registry() -> Check {
             // as a config count (#1284 review round 1).
             message,
             hint: Some(
-                "fix the named document(s) under `~/.darkmux/mission-configs/<id>.json` (or the \
-                 checked-out `templates/builtin/mission-configs/<id>.json` for a built-in) — a \
+                "fix the named document(s) under `~/.darkmux/mission-configs/<id>.json` (or, for \
+                 an operator-pointed `DARKMUX_TEMPLATES_DIR`/`config.dirs.templates` override, its \
+                 `templates/builtin/mission-configs/<id>.json`) — a \
                  dangling depends_on, an empty id, or a schema_version your darkmux build \
                  doesn't recognize. A document declaring a schema_version NEWER than this \
                  binary's is the one to look at hardest: it parses cleanly, so any field minted \

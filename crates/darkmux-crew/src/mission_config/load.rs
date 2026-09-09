@@ -2,12 +2,27 @@
 //! Search order: user dir → on-disk built-in template dirs → binary-embedded
 //! built-ins. Closely mirrors `darkmux_lab::workloads::load`'s resolution
 //! (#1284 Packet 1) — same three-tier shape, same
-//! `templates_override_dirs()` override accessor, same cwd/home/system
-//! candidate tree — with one deliberate omission: workloads also resolve a
+//! `templates_override_dirs()` override accessor, same home/system candidate
+//! tree — with one deliberate omission: workloads also resolve a
 //! nested `<dir>/<id>/workload.json` form (for manifests that ship sibling
 //! on-disk resources like sandbox seeds); mission configs are pure data
 //! with no sibling files, so only the flat `<dir>/<id>.json` form exists
 //! here.
+//!
+//! **(#2432) The on-disk tier is NOT cwd-sensitive.** It used to
+//! unconditionally search `<shell's cwd>/templates/builtin/mission-configs/`
+//! ahead of the embedded tier, unscoped by anything the operator declared —
+//! so `darkmux mission launch <id>` picked a different document depending
+//! on which of an operator's several worktrees the shell happened to be
+//! standing in, with no signal that the choice was an accident of `pwd`
+//! rather than a decision. `CONTRIBUTING.md`'s documented dev loop is
+//! rebuild-to-embed (`include_str!` resolves at compile time), so that cwd
+//! search was never the sanctioned "edit and rerun" path anyway — the
+//! sanctioned explicit path is `DARKMUX_TEMPLATES_DIR` (or
+//! `config.dirs.templates`), which already sits at the TOP of
+//! [`builtin_dirs`] via [`darkmux_types::config_access::templates_override_dirs`].
+//! An operator who wants "run the templates in this checkout" sets that
+//! var explicitly for the session; darkmux no longer infers it from `pwd`.
 
 use super::MissionConfig;
 use anyhow::{bail, Context, Result};
@@ -94,9 +109,10 @@ pub(crate) fn find_embedded(id: &str) -> Option<&'static str> {
 pub enum MissionConfigSource {
     /// `<mission_configs_dir()>/<id>.json` — operator override.
     User,
-    /// A `templates/builtin/mission-configs/<id>.json` found on disk
-    /// (repo checkout, `DARKMUX_TEMPLATES_DIR` override, or the
-    /// `~/.darkmux/templates/...` / `/usr/local/share/...` candidates).
+    /// A `templates/builtin/mission-configs/<id>.json` found on disk — the
+    /// explicit `DARKMUX_TEMPLATES_DIR`/`config.dirs.templates` override, or
+    /// the `~/.darkmux/templates/...` / `/usr/local/share/...` candidates.
+    /// (#2432) NOT the shell's cwd — see [`builtin_dirs`].
     OnDisk,
     /// Compiled into the binary (`EMBEDDED_MISSION_CONFIGS`) — always
     /// resolvable even from a bare `cargo install`, no source tree needed.
@@ -130,15 +146,23 @@ pub struct LoadedMissionConfig {
 /// On-disk built-in template dirs, in priority order. Override candidates
 /// come from `env(DARKMUX_TEMPLATES_DIR)` then `config.dirs.templates`
 /// (#661 Slice 3, via the SAME accessor `workloads::load::builtin_dirs`
-/// uses), prepended ahead of cwd/home/system — mirrors that function
-/// exactly, swapping `workloads` for `mission-configs`.
+/// uses), prepended ahead of home/system.
+///
+/// **(#2432) Deliberately NOT cwd-sensitive.** An earlier version of this
+/// function also pushed `<cwd>/templates/builtin/mission-configs`, so the
+/// document that won depended on which directory the shell happened to be
+/// in when `darkmux` ran — invisible to an operator who didn't already know
+/// to suspect it, and dangerous specifically when the cwd's document shares
+/// the binary's `schema_version` but has DIFFERENT content (a stale or
+/// half-edited worktree), because that case parses and validates cleanly
+/// with no error to catch it. The explicit `templates_override_dirs()` tier
+/// above already gives an operator who wants "this checkout's templates"
+/// exactly that, on purpose: `DARKMUX_TEMPLATES_DIR=$PWD/templates/builtin`.
 fn builtin_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for base in darkmux_types::config_access::templates_override_dirs() {
         dirs.push(base.join("mission-configs"));
     }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    dirs.push(cwd.join("templates").join("builtin").join("mission-configs"));
     if let Some(home) = dirs::home_dir() {
         dirs.push(
             home.join(".darkmux")
@@ -502,6 +526,130 @@ mod tests {
             !has_non_user_fallback("definitely-fake-id-1917"),
             "a made-up id has no built-in counterpart — nothing to fall back to"
         );
+    }
+
+    /// RAII guard that changes the process cwd for the test's duration and
+    /// restores it on drop. Every caller MUST be `#[serial_test::serial]` —
+    /// cwd is a process-global resource, and `serial_test` only coordinates
+    /// among ANNOTATED tests, not any unannotated test elsewhere in this
+    /// crate that happens to read/write cwd too.
+    struct CwdGuard {
+        prev: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(dir: &Path) -> Self {
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    /// #2432 — the on-disk tier must NOT be cwd-sensitive. A valid "review"
+    /// document with DIFFERENT content sits at `<cwd>/templates/builtin/
+    /// mission-configs/review.json` (the exact shape of a stale worktree's
+    /// checked-out templates), with no user-tier copy and no
+    /// `DARKMUX_TEMPLATES_DIR` override. `load("review")` must resolve the
+    /// EMBEDDED built-in, not the cwd document — this is the precedence
+    /// claim itself, not just "something loaded": before the #2432 fix this
+    /// test fails, resolving `MissionConfigSource::OnDisk` with the cwd
+    /// document's name instead of the embedded one's.
+    #[test]
+    #[serial_test::serial]
+    fn on_disk_tier_ignores_cwd_templates() {
+        let user_tmp = TempDir::new().unwrap();
+        let _crew_guard = CrewDirGuard::new(user_tmp);
+        let no_override = TempDir::new().unwrap();
+        let _templates_guard = NoBuiltinTemplatesGuard::new(no_override.path());
+
+        let cwd_tmp = TempDir::new().unwrap();
+        write(
+            &cwd_tmp.path().join("templates/builtin/mission-configs/review.json"),
+            r#"{"id":"review","name":"cwd should never win","schema_version":"1.0"}"#,
+        );
+        let _cwd_guard = CwdGuard::new(cwd_tmp.path());
+
+        let loaded = load("review").expect("review must still resolve via the embedded tier");
+        assert_eq!(
+            loaded.source,
+            MissionConfigSource::Embedded,
+            "a document sitting in cwd's templates/ must not outrank the embedded built-in"
+        );
+        assert_ne!(
+            loaded.config.name, "cwd should never win",
+            "the cwd-local document's content must not win"
+        );
+    }
+
+    /// A synthetic id with NO user, embedded, or `DARKMUX_TEMPLATES_DIR`
+    /// counterpart, present ONLY under `<cwd>/templates/builtin/
+    /// mission-configs/` — the shape of a document that resolves purely
+    /// because the shell happens to be standing inside some worktree.
+    /// `load()` must report it not found, not silently resolve it from cwd.
+    #[test]
+    #[serial_test::serial]
+    fn on_disk_tier_does_not_resolve_a_cwd_only_id() {
+        let user_tmp = TempDir::new().unwrap();
+        let _crew_guard = CrewDirGuard::new(user_tmp);
+        let no_override = TempDir::new().unwrap();
+        let _templates_guard = NoBuiltinTemplatesGuard::new(no_override.path());
+
+        let cwd_tmp = TempDir::new().unwrap();
+        write(
+            &cwd_tmp
+                .path()
+                .join("templates/builtin/mission-configs/cwd-only-2432.json"),
+            &doc_json("cwd-only-2432"),
+        );
+        let _cwd_guard = CwdGuard::new(cwd_tmp.path());
+
+        let err = load("cwd-only-2432").unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    /// #2432 — the removal's own justification ("the explicit override
+    /// already sits at the top of `builtin_dirs`") has no coverage without
+    /// this test. `DARKMUX_TEMPLATES_DIR` holds a "review" document with
+    /// DIFFERENT content than the embedded built-in, no user-tier copy
+    /// exists, and no cwd document is involved at all — the override must
+    /// still beat the embedded tier. Red-proved by hoisting the
+    /// `find_embedded` check above the `builtin_dirs()` loop in [`load`]:
+    /// that mutation disables the override outright (the embedded document
+    /// wins over any `DARKMUX_TEMPLATES_DIR` the operator sets) and this is
+    /// the only test in the module that goes red for it —
+    /// `resolves_on_disk_when_present_and_no_user_override` can't catch it
+    /// because its synthetic id has no embedded counterpart to be
+    /// shadowed by.
+    #[test]
+    #[serial_test::serial]
+    fn on_disk_override_beats_embedded_for_a_known_id() {
+        let user_tmp = TempDir::new().unwrap();
+        let _crew_guard = CrewDirGuard::new(user_tmp); // empty user dir
+        let templates_tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_TEMPLATES_DIR").ok();
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_TEMPLATES_DIR", templates_tmp.path()) };
+        write(
+            &templates_tmp.path().join("mission-configs/review.json"),
+            r#"{"id":"review","name":"on-disk override should win"}"#,
+        );
+        let loaded = load("review");
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_TEMPLATES_DIR", v),
+                None => std::env::remove_var("DARKMUX_TEMPLATES_DIR"),
+            }
+        }
+        let loaded = loaded.expect("review must resolve via the on-disk override");
+        assert_eq!(loaded.source, MissionConfigSource::OnDisk);
+        assert_eq!(loaded.config.name, "on-disk override should win");
     }
 
     #[test]
