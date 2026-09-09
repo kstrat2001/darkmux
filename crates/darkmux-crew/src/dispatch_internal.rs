@@ -2741,6 +2741,29 @@ fn remote_chat_attempt(
     let result = run();
     let _ = std::fs::remove_file(&cfg_path); // ALWAYS remove the secret-bearing file
     let out = result.map_err(HostedCallError::Other)?;
+    // (#2462) Gated on `!success()`, never overriding a clean exit — and
+    // written as the SAME conjunction the docker container path's NEW-4
+    // check uses (`is_set() && !status.success()`, a few thousand lines
+    // below) rather than nested inside the failure block, so the claim
+    // "same pattern as the docker path" is checkable at a glance instead
+    // of by reasoning about an enclosing `if` (#2462 review, nit 4).
+    // `interrupt::is_set()` is sticky, so a signal observed anywhere
+    // during THIS dispatch is checked only once the underlying curl call
+    // has already failed; a genuinely successful response is never
+    // reclassified. Without this, a curl child SIGKILLed by
+    // `launch_guard::spawn_reap_watchdog` (the reap-on-signal watchdog
+    // every `dispatch`/`lab run`/etc. invocation arms) exits non-zero with
+    // empty stderr, and `describe_curl_failure` below turns that into
+    // "chat request to ... failed (curl exit -1): " — a bare,
+    // empty-suffixed message that reads as the ENDPOINT breaking. It
+    // didn't; darkmux killed its own child because the operator asked it
+    // to stop.
+    if darkmux_types::interrupt::is_set() && !out.status.success() {
+        return Err(HostedCallError::Other(anyhow!(
+            "hosted dispatch interrupted by an operator signal (SIGINT/SIGTERM/SIGHUP) — \
+             the request to {url} was killed mid-flight"
+        )));
+    }
     if !out.status.success() {
         return Err(HostedCallError::Other(anyhow!(describe_curl_failure(
             url,

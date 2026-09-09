@@ -150,12 +150,72 @@ impl Drop for WatchdogStopGuard {
 /// completion; only a launcher that actually abandoned a worker thread
 /// needed to call it at all (the retired crawl launcher's synchronous, self-polling
 /// loop never does).
+///
+/// # When NOT to call this
+///
+/// (#2462 review) The repo carries two documented positions on this
+/// function, and they are not in conflict once the deciding conditions are
+/// named. `radio_cli.rs` REMOVED its call (#2477) and its comment gives
+/// both reasons: the reap half was redundant, and the hard `exit` skipped
+/// destructors that mattered there. Both reasons are load-bearing AT THAT
+/// SITE and neither holds at the two #2462 sites:
+///
+/// * **Radio's child is deliberately NOT in `child_registry`** (its own
+///   comment says so — the watchdog would `SIGKILL` it out from under its
+///   `LaunchFinalizeGuard`), so the reap could never have reached it. The
+///   `curl` child both #2462 sites block on IS registered, and their `Err`
+///   can land inside the watchdog's own 100ms polling window — so the
+///   synchronous `kill_all` here is the thing that guarantees the child is
+///   dead before this process is.
+/// * **Radio returns an exit code through `main`** and had a real
+///   destructor in flight (`_synth`'s tempdir). At the #2462 sites the
+///   dispatch call has already returned, so the ONLY live destructor the
+///   exit skips is [`WatchdogStopGuard`]'s stop-flag store — whose entire
+///   job ends with the process — and the alternative exit code is std's
+///   generic `1`, which is precisely what the fix is trying not to report.
+///
+/// A site on the #2462 side of that line calls
+/// [`report_reap_and_exit_on_signal`] rather than this function directly,
+/// because the hard exit also skips `main`'s error printing.
 pub(crate) fn reap_and_exit_on_signal() {
     if !darkmux_types::interrupt::is_set() {
         return;
     }
     darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
     std::process::exit(130);
+}
+
+/// [`reap_and_exit_on_signal`] for a call site whose only remaining output
+/// is the `Err` it is holding — it PRINTS that error first, then reaps and
+/// exits 130.
+///
+/// (#2462 review) `main` returns `anyhow::Result<()>`, so an `Err` that
+/// propagates out of `run` is printed by std's own `Termination` impl as
+/// `Error: {err:?}` (anyhow's `Debug`, i.e. the message plus its `Caused
+/// by:` chain). `std::process::exit` runs BEFORE any of that. So a site
+/// that force-exits on the way out of an error path throws the error text
+/// away entirely: the operator gets exit 130 and nothing else on stderr,
+/// and a `--json` orchestrator gets no diagnosis at all.
+///
+/// Measured on the real binary at both #2462 sites: with the exit call in
+/// place, a SIGTERM mid-dispatch produced exit 130 and no error line; with
+/// the call deleted, stderr carried `Error: step … dispatch.internal:
+/// hosted dispatch interrupted by an operator signal …` — the exact
+/// message #2462 exists to produce, discarded by #2462's own exit call.
+/// Nothing caught it because both of the real-signal subprocess tests in
+/// `tests/cli.rs` sent the child's stderr to `/dev/null`; they capture it
+/// to a file and assert the text now.
+///
+/// Formats with `{err:?}` and the `Error: ` prefix DELIBERATELY — that is
+/// byte-for-byte what std would have printed on the ordinary `?` return,
+/// so a signal-interrupted run says exactly what a non-interrupted failure
+/// says, plus the distinguishing exit code.
+pub(crate) fn report_reap_and_exit_on_signal(err: &anyhow::Error) {
+    if !darkmux_types::interrupt::is_set() {
+        return;
+    }
+    eprintln!("Error: {err:?}");
+    reap_and_exit_on_signal();
 }
 
 /// RAII guard shared by every `darkmux mission launch` launcher (#2131):

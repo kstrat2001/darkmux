@@ -283,7 +283,25 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         }) {
             Ok(Ok(r)) => r,
             Ok(Err(e)) | Err(e) => {
-                lifecycle.finish_error(&e);
+                // (#2462) A caught SIGINT/SIGTERM/SIGHUP is why `dispatch`
+                // itself failed here — darkmux's own reap watchdog
+                // (`launch_guard::spawn_reap_watchdog`, armed by the CLI
+                // before calling `lab_run`) kills this run's in-flight
+                // child the moment the signal lands, which is what turns
+                // into the `Err` we're holding right now. `is_set()` is
+                // the SAME sticky, process-wide flag the watchdog itself
+                // polls, checked here — after the fact, not raced against
+                // — so a run that genuinely failed on its own (no signal
+                // ever observed) still records `Error` exactly as before.
+                // Recording `Error` unconditionally is
+                // the #2462 bug: it archives the operator's own Ctrl-C as
+                // "the endpoint broke", pointing a debugging operator at a
+                // provider that never failed.
+                if darkmux_types::interrupt::is_set() {
+                    lifecycle.finish_interrupted(&e);
+                } else {
+                    lifecycle.finish_error(&e);
+                }
                 return Err(e);
             }
         };

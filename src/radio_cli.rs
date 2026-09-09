@@ -256,6 +256,15 @@ fn spawn_mission_launch(config_id: &str, args: &str) -> Result<i32> {
     // `_synth`'s tempdir cleanup above; returning runs them. (This child is
     // not in that registry at all — see the comment above — so neither call
     // ever reached it.)
+    //
+    // (#2462 review) Read as a general verdict on that function, the
+    // paragraph above would contradict `dispatch`/`lab run`, which KEEP the
+    // call. It is not one: both of its reasons are properties of THIS site
+    // (an unregistered child, a live tempdir destructor, an exit code this
+    // loop already returns through `main`), and neither holds there. The
+    // deciding conditions are written down once now — in
+    // `reap_and_exit_on_signal`'s own "When NOT to call this" section —
+    // rather than as two site-local comments a reader has to reconcile.
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning `darkmux mission launch {config_id}`"))?;

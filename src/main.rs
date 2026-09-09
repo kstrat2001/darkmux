@@ -1617,7 +1617,30 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // rationale (closes the #1487 residency-lease bypass a raw `dispatch`
     // fell through). `--machine` routing (and every other caller of
     // `fleet::dispatch_routed`) is untouched.
-    let result = fleet::dispatch_routed_via(opts, crew::dispatch_as_crew_of_one::dispatch_as_crew_of_one)?;
+    let result = match fleet::dispatch_routed_via(opts, crew::dispatch_as_crew_of_one::dispatch_as_crew_of_one) {
+        Ok(r) => r,
+        Err(e) => {
+            // (#2462) `dispatch_as_crew_of_one::dispatch` already finalizes
+            // the crew-of-one mission (`finalize`/`reconcile_on_error`) to a
+            // terminal status BEFORE returning this `Err` — the terminal
+            // record is durable. Matching `mission launch`'s own shape
+            // (`reap_and_exit_on_signal`'s doc), a dispatch a signal
+            // actually ended now exits 130 instead of the default-error 1,
+            // so a wrapper script can tell "the operator stopped this" from
+            // the exit code alone, the same way it already can for `mission
+            // launch`. A no-op (falls through to the ordinary `Err` return
+            // below) when no signal was ever observed.
+            //
+            // (#2462 review) `report_*`, NOT the bare
+            // `reap_and_exit_on_signal`: the force-exit runs before `main`'s
+            // own error printing, so a bare call exits 130 having discarded
+            // the very interrupt message this change exists to produce. See
+            // that function's doc for the measurement, and for why this site
+            // keeps the hard exit where `radio_cli.rs` dropped it.
+            crate::launch_guard::report_reap_and_exit_on_signal(&e);
+            return Err(e);
+        }
+    };
     // (#1955) A `--json` caller receives stdout AND stderr as one payload and
     // pays context for both. On a run that SUCCEEDED the prose is now pure
     // overhead: the envelope carries the checkpoint tally, the detections and

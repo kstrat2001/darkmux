@@ -1211,12 +1211,44 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
 fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: u64) -> Run {
     let (role, model, route) = lab_staffing_role_model_route(summary.staffing.as_ref());
     let status = lab_run_status(summary, now_ms);
-    // (#1907) `lab_run_status` has no abort concept at all — its ONLY
-    // `Abandoned` arm is the staleness gate (the run's artifact trail went
-    // quiet past the budget with no `scores.json` ever written), so an
-    // Abandoned lab run always means "no ending recorded", never a
-    // deliberate teardown.
-    let abandoned_reason = (status == RunStatus::Abandoned).then_some(AbandonReason::NoTerminal);
+    // (#1907, corrected #2462/#1946) `lab_run_status` used to have no abort
+    // concept at all — every `Abandoned` arm was the staleness gate (the
+    // run's artifact trail went quiet past the budget with no
+    // `scores.json` ever written), so `NoTerminal` was always the honest
+    // read. That stopped being true the moment `lab_run_status` grew a
+    // `Some(Lc::Interrupted) => RunStatus::Abandoned` arm: a lifecycle
+    // record written by `finish_interrupted` DID reach a terminal write —
+    // reading it as `NoTerminal` renders "no ending recorded" for a run
+    // whose ending IS recorded, the exact self-contradiction #1946 named.
+    //
+    // (#2462 review) But the STATUS alone does not license `Aborted`, whose
+    // own doc reads "a human explicitly tore the run down" and which the
+    // viewer renders as the literal word "aborted". `Interrupted` has TWO
+    // writers, and only one of them knows a human was involved:
+    //
+    // * `finish_interrupted(err)` — a caught SIGINT/SIGTERM/SIGHUP, always
+    //   `error: Some(..)`. A human tearing the run down is exactly what
+    //   this means.
+    // * `RunLifecycle::drop` — the #1930 RAII backstop, firing on any early
+    //   return, `?`, or unwinding panic, always `error: None`. Inside
+    //   `lab_run` alone that includes `cow_clone_dir_excluding(..)?` and
+    //   `fs::create_dir_all(..)?` (ENOSPC, EPERM, an unsupported
+    //   filesystem) before the provider is ever called, plus any panic a
+    //   provider unwinds with — `with_provider` does not catch unwind.
+    //   Nothing here implies intent.
+    //
+    // Gating on `lifecycle_error` keeps `NoTerminal` for the second — the
+    // honest "darkmux does not know how this ended" — instead of
+    // manufacturing a claim about operator intent. This is also why the
+    // whole `interrupted` backlog on disk today (every one of which
+    // predates `finish_interrupted` and therefore came from `Drop`) keeps
+    // reading "no ending recorded" rather than being retroactively
+    // relabeled as somebody's deliberate teardown.
+    let interrupted_by_signal = summary.lifecycle_status
+        == Some(darkmux_lab::lab::lifecycle::LifecycleStatus::Interrupted)
+        && summary.lifecycle_error.is_some();
+    let abandoned_reason = (status == RunStatus::Abandoned)
+        .then_some(if interrupted_by_signal { AbandonReason::Aborted } else { AbandonReason::NoTerminal });
     Run {
         id: summary.dir.clone(),
         kind: RunKind::Lab,
@@ -1230,6 +1262,23 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
         // honest; a wrong guess (e.g. mtime as start) would be worse than
         // no value. `mtime_ms` becomes `completed_ts` once the run reached
         // its terminal artifact write (`scores.json`).
+        //
+        // (#2462 review) One narrow window can still produce the
+        // self-contradicting row #1946 named — `status: Abandoned` with a
+        // `completed_ts` populated — and it is worth naming rather than
+        // calling unreachable. `finished` means "scores.json exists", and
+        // `tool_bench.rs`'s `run` writes `scores.json` and then performs
+        // TWO more fallible operations in the same call
+        // (`serde_json::to_string_pretty(..)?` and the `manifest.json`
+        // `fs::write(..)?`). An I/O failure THERE, with the interrupt flag
+        // already set, returns an `Err` that `lab_run` archives as
+        // `Interrupted` — so the row reads Abandoned while carrying the
+        // completion timestamp its own `scores.json` earned. It needs a
+        // signal AND an I/O failure inside those few lines, so it is rare,
+        // not impossible. Inside `lab_run` itself no such window exists:
+        // its own fallible steps (`cow_clone_dir_excluding`,
+        // `create_dir_all`) all run BEFORE the provider, when no terminal
+        // artifact can exist yet.
         started_ts: None,
         completed_ts: if summary.finished {
             Some(summary.mtime_ms / 1000)
@@ -3178,14 +3227,33 @@ mod tests {
     /// The same fixture with an explicit lifecycle status — `None` is a run
     /// recorded BEFORE the lifecycle record existed, which must keep the old
     /// artifact-and-staleness inference.
+    ///
+    /// `lifecycle_error` stays `None` here, which is exactly what
+    /// `RunLifecycle::drop` writes: this helper's `Interrupted` is the RAII
+    /// backstop's record, not a caught signal's.
     fn lab_summary_with_lifecycle(
         dir: &str,
         finished: bool,
         degenerate: bool,
         lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
     ) -> LabRunSummary {
+        lab_summary_with_lifecycle_error(dir, finished, degenerate, lifecycle_status, None)
+    }
+
+    /// (#2462 review) The same fixture, with the lifecycle record's `error`
+    /// too — the ONLY thing that distinguishes `finish_interrupted`'s caught
+    /// signal (`Some(..)`) from `RunLifecycle::drop`'s early-return /
+    /// panic backstop (`None`), both of which write status `Interrupted`.
+    fn lab_summary_with_lifecycle_error(
+        dir: &str,
+        finished: bool,
+        degenerate: bool,
+        lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
+        lifecycle_error: Option<&str>,
+    ) -> LabRunSummary {
         LabRunSummary {
             lifecycle_status,
+            lifecycle_error: lifecycle_error.map(str::to_string),
             dir: dir.to_string(),
             mtime_ms: 1_700_000_000_000,
             case_ids: vec![],
@@ -3295,11 +3363,10 @@ mod tests {
         assert_eq!(run.abandoned_reason, None);
     }
 
-    /// (#1907) Lab has no abort concept at all — `lab_run_status`'s only
-    /// `Abandoned` arm is the staleness gate (the artifact trail went quiet
-    /// past the budget with no `scores.json` ever written), so a lab run's
-    /// Abandoned reason must always be the honest "no ending recorded", not
-    /// the deliberate-teardown value.
+    /// (#1907) The staleness-gate `Abandoned` arm (no lifecycle record at
+    /// all, or one still reading `Running`/`Unknown` past the idle budget)
+    /// has no terminal record of any kind — the honest reason stays
+    /// "no ending recorded".
     #[test]
     fn lab_summary_to_run_abandoned_carries_no_terminal_reason() {
         let summary = minimal_lab_summary("dead/case-1", false, false);
@@ -3308,6 +3375,63 @@ mod tests {
         let run = lab_summary_to_run(&summary, None, far_future_ms);
         assert_eq!(run.status, RunStatus::Abandoned);
         assert_eq!(run.abandoned_reason, Some(AbandonReason::NoTerminal));
+    }
+
+    /// (#2462/#1946) The OTHER `Abandoned` arm — a lifecycle record written
+    /// by `finish_interrupted` after a caught SIGINT/SIGTERM/SIGHUP — must
+    /// not carry the same reason as the staleness gate above. `NoTerminal`
+    /// literally means "no ending recorded" (`ui/src/lenses/runs/format.ts`
+    /// renders it as exactly that string); this record has an `ended_at_ms`
+    /// AND an `error` naming the signal, so `NoTerminal` is the
+    /// row-contradicts-itself bug #1946 named. `Aborted` — "a human
+    /// explicitly tore the run down" — is what a caught operator signal is.
+    #[test]
+    fn lab_summary_to_run_signal_interrupted_carries_aborted_not_no_terminal() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        // Fresh `mtime_ms` (not stale) — proves the reason comes from the
+        // lifecycle record, not a staleness-gate coincidence.
+        let summary = lab_summary_with_lifecycle_error(
+            "dead/case-2",
+            false,
+            false,
+            Some(Lc::Interrupted),
+            Some("hosted dispatch interrupted by an operator signal (SIGINT/SIGTERM/SIGHUP)"),
+        );
+        let run = lab_summary_to_run(&summary, None, summary.mtime_ms);
+        assert_eq!(run.status, RunStatus::Abandoned);
+        assert_eq!(
+            run.abandoned_reason,
+            Some(AbandonReason::Aborted),
+            "a signal-interrupted lifecycle record reached a terminal write and names its cause \
+             — it must not render as \"no ending recorded\""
+        );
+    }
+
+    /// (#2462 review) The half the test above would otherwise leave
+    /// unconstrained, and the reason `abandoned_reason` cannot key on the
+    /// status alone. `RunLifecycle::drop` — #1930's RAII backstop, firing on
+    /// an early return, a `?` (`cow_clone_dir_excluding`, `create_dir_all`),
+    /// or an unwinding panic in a provider — writes the SAME `Interrupted`
+    /// status with `error: None`, and knows nothing about human intent.
+    ///
+    /// Rendering that as "aborted" would fabricate a claim, and would do it
+    /// retroactively: every `interrupted` record on disk today predates
+    /// `finish_interrupted` and therefore came from this path. "No ending
+    /// recorded" is the honest read for a record that genuinely does not say
+    /// how the run ended.
+    #[test]
+    fn lab_summary_to_run_drop_written_interrupted_stays_no_terminal() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        let summary =
+            lab_summary_with_lifecycle_error("dead/case-3", false, false, Some(Lc::Interrupted), None);
+        let run = lab_summary_to_run(&summary, None, summary.mtime_ms);
+        assert_eq!(run.status, RunStatus::Abandoned);
+        assert_eq!(
+            run.abandoned_reason,
+            Some(AbandonReason::NoTerminal),
+            "a Drop-written Interrupted record carries no cause at all — calling it a deliberate \
+             human teardown invents intent the record never claimed"
+        );
     }
 
     /// (#1584) The case the `updated_ts` field exists for. An UNFINISHED lab
