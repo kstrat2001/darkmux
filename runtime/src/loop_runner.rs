@@ -9690,6 +9690,31 @@ mod tests {
         assert_eq!(outcome.terminal_reason, TerminalReason::MaxTurns);
     }
 
+    /// (#2541) httpmock's matcher returns the FIRST-REGISTERED mock whose
+    /// predicate matches, not the most specific one. In a scripted
+    /// multi-turn dispatch that means a broad predicate registered ahead
+    /// of a narrower one can silently swallow every later turn's traffic
+    /// — the loop never advances past turn one, and a test whose
+    /// assertions don't happen to depend on reaching later turns stays
+    /// green while covering only turn one.
+    ///
+    /// Call this at the end of a scripted multi-turn dispatch test, naming
+    /// every mock the run is EXPECTED to reach (never the deliberate
+    /// "should not be reached" traps — those already self-assert via
+    /// `Mock::assert_hits(0)`). A shadowed mock then fails loudly, right
+    /// here, instead of the test passing for a reason unrelated to what
+    /// it claims to cover.
+    fn assert_every_mock_was_hit(mocks: &[(&str, &httpmock::Mock)]) {
+        for (label, mock) in mocks {
+            assert!(
+                mock.hits() > 0,
+                "mock `{label}` was never hit (0 requests) — #2541: a broader mock \
+                 registered earlier may be shadowing it (httpmock serves the \
+                 first-registered match, not the most specific one)"
+            );
+        }
+    }
+
     /// (#406 regression guard, Beat 47) The streaming path used to
     /// strip reasoning_content via `accumulator.take_reasoning_content`
     /// before building the response, enforcing the documented Message
@@ -9726,13 +9751,26 @@ mod tests {
         // yet) so it falls through to `turn1`; from request 2 on, `turn2`
         // matches and wins. Same ordering as
         // `loop_accumulates_reasoning_and_cached_tokens_across_turns_tri_state`.
-        // `assert_eq!(outcome.turns, 2)` below pins the routing so it cannot
-        // silently regress again. (Filed as #2541 for the general pattern;
-        // the reviewer established the other six multi-mock tests
-        // discriminate on a genuine model-name predicate and are unaffected.)
+        // `assert_eq!(outcome.turns, 2)` and `assert_every_mock_was_hit`
+        // below pin the routing so it cannot silently regress again.
+        //
+        // (#2541 full audit, instrumented via `Mock::hits()` across every
+        // runtime test registering 2+ mocks — 39 tests, 96 mocks, run
+        // whole-suite: this was the ONLY test where a registered mock a
+        // run was expected to reach went unserved. The other 0-hit mocks
+        // found (8 total, across 7 tests) are all deliberate: either an
+        // explicit `Mock::assert_hits(0)` proving a resumed/mid-turn
+        // dispatch never re-requests a call it already has, a
+        // "never actually serve — this mock only observes" detector
+        // whose predicate always returns false, or one arm of a pair of
+        // genuinely mutually-exclusive predicates whose other branch this
+        // particular scripted run doesn't take. Six of those seven use a
+        // `body_contains("\"model\":\"test-primary\"")` /
+        // `\"test-compactor\"` discriminator; the rest use disjoint
+        // content-sentinel predicates. None of the 39 are shadowed.)
         //
         // Second call (after the tool result): model finishes with stop.
-        let _turn2 = server.mock(|when, then| {
+        let turn2 = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
                 .body_contains("\"role\":\"tool\"");
@@ -9748,7 +9786,7 @@ mod tests {
         // (promotion does NOT fire — tool_calls field is populated).
         // The reasoning is set on the response; without the post-
         // promoter clear, it would leak into the next request.
-        let _turn1 = server.mock(|when, then| {
+        let turn1 = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
                 .body_contains("\"role\":\"user\"");
@@ -9798,6 +9836,16 @@ mod tests {
              a higher count means turn1's mock is shadowing turn2's again"
         );
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+
+        // (#2541) The structural version of the ordering-comment above:
+        // name every scripted mock and require it was actually served.
+        // Unlike the turns/terminal_reason checks (which only catch
+        // shadowing indirectly, through its downstream symptom), this
+        // fails right at the shadowed mock and names it.
+        assert_every_mock_was_hit(&[
+            ("turn1 (tool_calls response)", &turn1),
+            ("turn2 (stop response)", &turn2),
+        ]);
 
         // The first assistant message in the conversation must have
         // reasoning_content stripped — even though the model emitted
