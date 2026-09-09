@@ -96,6 +96,7 @@ What GATES is tool integrity: the tool did not run, or it ran and reported
 numbers we cannot reconcile. That distinction is the whole of #1716.
 """
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -147,6 +148,55 @@ EXIT_MEANING = {
 #   * a doc comment whose body contains code (```rust fences): correctly
 #     excluded here, but only because the whole line starts with `///`.
 #
+# Test code (#2582). cargo-mutants never mutates `#[cfg(test)]` items, so a PR
+# whose only added lines live inside `mod tests` legitimately produces zero
+# mutants — and PR #2579 (two inline unit tests, nothing else) proved the
+# counter did not know that and failed an honest PR. Two exclusions:
+#
+#   * a whole FILE under a `tests/` directory (Cargo's integration-test
+#     convention — `tests/cli.rs`, `crates/foo/tests/bar.rs`) is skipped
+#     entirely, no attribute needed;
+#   * a line inside a `#[cfg(test)]`-attributed item (`mod`, `fn`, …) is
+#     excluded via `_test_module_ranges`, which reads the file's CURRENT
+#     on-disk content (the checked-out tree — always present in the real CI
+#     job) and tracks brace depth from the attribute's own line to its
+#     matching close. This is the PRIMARY mechanism, and it is independent of
+#     the diff: it answers "is line N inside cfg(test)?" the same way
+#     regardless of how much (or little) surrounding context this diff's
+#     hunks happen to show.
+#
+# A hunk header's own trailing text (`@@ ... @@ mod tests {`) looks like a
+# free, built-in version of the same signal — git already computed it — and
+# IS used, but only as a FALLBACK when the file cannot be read (a self-test
+# fixture with no matching file on disk, a deleted file). It is not trusted
+# as the primary mechanism because it is not reliable: git's default
+# heuristic picks the nearest column-0 line above the hunk, and PR #2579's
+# own second hunk proved this out — its enclosing `#[cfg(test)] mod tests {`
+# is thousands of lines above the hunk, but a multi-line string literal
+# inside an EARLIER test (an unindented continuation line reading literally
+# `line two`) sits at column 0 in between, so git's heuristic reports `line
+# two` as the hunk's context instead of `mod tests {`. Reading the real file
+# and tracking braces from the attribute sidesteps that entirely; the header
+# fallback exists only for when there is no file to read.
+#
+# `_test_module_ranges` is not a Rust parser either, but its brace counting
+# (`_brace_deltas_per_line`) IS string/comment-aware — a `{`/`}` inside a
+# `"..."` or `r#"..."#` string, or a `//`/`/* */` comment, is not counted.
+# This was not optional: this repo's own `plan.rs` test module builds a fake
+# unified diff as string literals containing `"  } catch (e) {"`, and a
+# naive per-line character count read those as real braces and closed the
+# enclosing `#[cfg(test)] mod tests` hundreds of lines early — the first cut
+# of this fix passed every self-test case and still failed PR #2579's real
+# second hunk for exactly that reason. Nested `#[cfg(test)]` items are
+# tracked with a stack, but only `#[cfg(test)]` itself is recognized — not
+# `#[cfg(all(test, feature = "x"))]` or similar — and an attributed item whose
+# opening brace lands on a LATER line than the attribute (a multi-line `fn`
+# signature) is not recognized at all; both fall back to counting as code, as
+# does a nested (non-doc) `/* /* */ */` block comment, which the scanner
+# does not track — see `_brace_deltas_per_line`'s docstring. Kept in the same
+# fail-open direction as everything else here: a misplaced boundary shrinks
+# the excluded range, never enlarges it, so the floor stays armed.
+#
 # Why not ask cargo-mutants itself. `cargo mutants --workspace --list
 # --in-diff <diff>` looked like an exact discriminator and is cheap (measured
 # 1.2s, parse-only, no build) — it reports 0 for #2514's comment-only diff and
@@ -189,21 +239,283 @@ def added_line_is_countable(text: str) -> bool:
     return True
 
 
+# A hunk header: `@@ -<old_start>[,<old_count>] +<new_start>[,<new_count>] @@<hint>`.
+# Only the new-side start is needed — it seeds the running new-file line
+# counter — plus the trailing hint text for the header fallback below.
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$")
+
+# The header-fallback pattern (see the module comment): loose on purpose — a
+# missed match here just falls back further, to "count as code".
+_TEST_MOD_HINT_RE = re.compile(r"\bmod\s+\w*test\w*\s*\{")
+
+# Per-process cache of {relative path -> ranges, or None if the file could
+# not be read}. A fresh process per invocation of this script (including each
+# `--self-test` case's own subprocess) means there is no cross-run staleness
+# to worry about.
+_TEST_RANGE_CACHE: dict[str, list[tuple[int, int]] | None] = {}
+
+
+def _brace_deltas_per_line(text: str) -> list[tuple[int, int]]:
+    """Return `(opens, closes)` for every line of `text`, counting only `{`
+    and `}` that are real Rust syntax — never one sitting inside a string, a
+    char literal, or a comment.
+
+    Necessary, not decorative: this repo's own test fixtures are exactly the
+    counter-example. `plan.rs`'s test module (the file behind PR #2579's
+    real second hunk) builds a fake unified diff as a `&str` array containing
+    the literal text `"  } catch (e) {"` — a naive `line.count("{")` reads
+    that as two real braces and closes the enclosing `#[cfg(test)] mod
+    tests` hundreds of lines early, silently un-excluding everything after
+    it. Measured: with naive counting this function's caller reports the
+    real module ending 500+ lines short of its actual close.
+
+    A single forward scan over the whole file (not per-line — a string,
+    block comment, or the file's `mod tests` itself can span lines) tracking
+    which of `code` / a `"..."` string / a raw `r#"..."#` string / a `//`
+    line comment / a `/* */` block comment we are inside. Only `{`/`}` seen
+    while in `code` state count. `'` is deliberately NOT specially handled:
+    a char literal (`'x'`) and a lifetime (`'a`) can never legitimately
+    contain a brace either way, so treating `'` as an ordinary character
+    never miscounts one.
+
+    Known gaps, same fail-open direction as the rest of this module: Rust
+    block comments nest (`/* /* */ */`); this scanner does not, so a nested
+    block comment's inner `*/` closes the scan early and its remaining
+    content is read as ordinary code — a stray brace in that content can
+    still misplace a boundary, exactly the class this function exists to
+    close for strings. Not observed in this repo's fixtures; if it ever
+    happens, the module comment's fail-open guarantee still bounds the
+    damage to "counts a test line as code", never the reverse."""
+    lines = text.splitlines()
+    deltas = [[0, 0] for _ in lines]
+    lineno = 0
+    i = 0
+    n = len(text)
+    state = "code"  # code | dstring | rawstring | line_comment | block_comment
+    raw_hashes = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            lineno += 1
+            if state == "line_comment":
+                state = "code"
+            i += 1
+            continue
+        if state == "code":
+            if ch == "/" and i + 1 < n and text[i + 1] == "/":
+                state = "line_comment"
+                i += 2
+                continue
+            if ch == "/" and i + 1 < n and text[i + 1] == "*":
+                state = "block_comment"
+                i += 2
+                continue
+            if ch == "{":
+                deltas[lineno][0] += 1
+                i += 1
+                continue
+            if ch == "}":
+                deltas[lineno][1] += 1
+                i += 1
+                continue
+            if ch == '"':
+                state = "dstring"
+                i += 1
+                continue
+            if ch == "r" and i + 1 < n and text[i + 1] in ('"', "#"):
+                j = i + 1
+                hashes = 0
+                while j < n and text[j] == "#":
+                    hashes += 1
+                    j += 1
+                if j < n and text[j] == '"':
+                    state = "rawstring"
+                    raw_hashes = hashes
+                    i = j + 1
+                    continue
+            i += 1
+            continue
+        if state == "dstring":
+            if ch == "\\":
+                # Skip the escaped character (including an escaped quote,
+                # which must not end the string) WITHOUT going through the
+                # newline check above — except when the escaped character
+                # IS a newline (Rust's `"...\` + line-break line-continuation,
+                # which strips the break from the string's value but not
+                # from the file), which must still advance `lineno`, or
+                # every delta for the rest of the file silently shifts by
+                # one line. Proven: this is exactly what happened to
+                # `run_record.rs`'s own `mod tests` before this branch
+                # existed — one such continuation in a test's assertion
+                # message desynced `lineno` and closed the range 296 lines
+                # early.
+                if i + 1 < n and text[i + 1] == "\n":
+                    lineno += 1
+                i += 2
+                continue
+            if ch == '"':
+                state = "code"
+            i += 1
+            continue
+        if state == "rawstring":
+            if ch == '"':
+                j = i + 1
+                matched = 0
+                while j < n and matched < raw_hashes and text[j] == "#":
+                    matched += 1
+                    j += 1
+                if matched == raw_hashes:
+                    state = "code"
+                    i = j
+                    continue
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and i + 1 < n and text[i + 1] == "/":
+                state = "code"
+                i += 2
+                continue
+            i += 1
+            continue
+        if state == "line_comment":
+            # Every non-newline character while inside a `//` comment is
+            # inert — the branch above already handles the newline that
+            # ends it. Just advance; a missing branch here is an infinite
+            # loop, not a miscount (proven: this was that bug).
+            i += 1
+            continue
+    return [(o, c) for o, c in deltas]
+
+
+def _test_module_ranges(path: Path) -> list[tuple[int, int]] | None:
+    """Scan `path`'s CURRENT on-disk content for `#[cfg(test)]`-attributed
+    items and return their [start, end] line ranges (1-indexed, inclusive),
+    by tracking brace depth (via `_brace_deltas_per_line`, so strings and
+    comments cannot masquerade as braces) from each attribute's own line to
+    its matching close — a stack, so nested items are handled.
+
+    Returns `None` when the file cannot be read at all (deleted, outside the
+    working directory, a self-test fixture that supplies only a diff) — the
+    caller then falls back to the much weaker hunk-header signal; see the
+    module comment for why the header is not trusted as the primary
+    mechanism. Returns `[]` (not `None`) when the file WAS read but has no
+    `#[cfg(test)]` item — that is a real answer ("nothing to exclude"), not a
+    missing one.
+
+    Not a Rust parser: see the module comment for what this still gets
+    wrong, all in the fail-open ("still counts as code") direction."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    line_texts = text.splitlines()
+    line_deltas = _brace_deltas_per_line(text)
+    ranges: list[tuple[int, int]] = []
+    stack: list[tuple[int, int]] = []  # (depth before the opening brace, start line)
+    depth = 0
+    pending_attr = False
+    for idx, raw in enumerate(line_texts):
+        lineno = idx + 1
+        stripped = raw.strip()
+        opens, closes = line_deltas[idx]
+        if not stripped or stripped.startswith("//"):
+            continue
+        if stripped.startswith("#[cfg(test)]"):
+            pending_attr = True
+            continue
+        if pending_attr:
+            pending_attr = False
+            if opens > closes:
+                stack.append((depth, lineno))
+                depth += opens - closes
+                continue
+            # A `#[cfg(test)]` item with no net brace-open on its own line:
+            # either brace-less (`#[cfg(test)] use x as y;`) or a multi-line
+            # signature whose `{` lands on a later line (unrecognized — see
+            # the module comment). Either way only this one line is known to
+            # be spent on the attribute.
+            ranges.append((lineno, lineno))
+            depth += opens - closes
+            continue
+        depth += opens - closes
+        while stack and depth <= stack[-1][0]:
+            _, start_line = stack.pop()
+            ranges.append((start_line, lineno))
+    return ranges
+
+
 def count_added_lines(diff_text: str) -> tuple[int, int]:
     """Return (added, countable) over a unified diff.
 
     `added` is every added line, the number the workflow's old `grep -cE
     '^\\+([^+]|$)'` produced. `countable` is the subset that could plausibly
     have produced a mutant, and is the one the floor asserts on. `+++ b/path`
-    file headers are not added lines and are excluded from both."""
+    file headers are not added lines and are excluded from both.
+
+    (#2582) Walks the diff's own structure — `diff --git` / `+++ b/<path>`
+    file headers and `@@ ... @@` hunk headers — to know which file and which
+    new-file line number each added line belongs to, so it can also exclude
+    a file under a `tests/` directory entirely, or a line inside a
+    `#[cfg(test)]` item (see the module comment for the exclusion mechanism
+    and its known gaps)."""
     added = 0
     countable = 0
+    file_path: str | None = None
+    skip_file = False
+    file_ranges: list[tuple[int, int]] | None = None
+    hunk_all_test = False
+    new_line = 0
+
     for line in diff_text.splitlines():
-        if not line.startswith("+") or line.startswith("+++"):
+        if line.startswith("diff --git "):
+            # A new file entry starts here; `+++` (below) sets the real
+            # state. Reset defensively so a file entry with no `+++` at all
+            # (a binary-only diff) cannot leak the PREVIOUS file's state.
+            file_path, skip_file, file_ranges, hunk_all_test = None, False, None, False
             continue
+        if line.startswith("+++"):
+            raw = line[4:] if line.startswith("+++ ") else ""
+            if raw.startswith("b/"):
+                raw = raw[2:]
+            if raw in ("", "/dev/null"):
+                file_path, skip_file, file_ranges = None, False, None
+            else:
+                file_path = raw
+                skip_file = "tests" in Path(raw).parent.parts
+                if skip_file:
+                    file_ranges = None
+                else:
+                    if raw not in _TEST_RANGE_CACHE:
+                        _TEST_RANGE_CACHE[raw] = _test_module_ranges(Path(raw))
+                    file_ranges = _TEST_RANGE_CACHE[raw]
+            continue
+        if line.startswith("@@"):
+            m = _HUNK_RE.match(line)
+            if m:
+                new_line = int(m.group(1))
+                hint = m.group(2) or ""
+                # Only meaningful when we have no per-line answer from the
+                # file itself — see the module comment.
+                hunk_all_test = file_ranges is None and bool(_TEST_MOD_HINT_RE.search(hint))
+            # A malformed header leaves `new_line` (and any per-line
+            # classification depending on it) stale for this hunk — better
+            # than crashing on an input `git` itself produced.
+            continue
+        if not line.startswith("+"):
+            if line.startswith(" "):
+                new_line += 1  # a context line: exists in the new file too
+            continue  # a removed ('-') line, or a "\ No newline" marker
         added += 1
-        if added_line_is_countable(line[1:]):
+        if skip_file:
+            new_line += 1
+            continue
+        if file_ranges is not None:
+            excluded = any(start <= new_line <= end for start, end in file_ranges)
+        else:
+            excluded = hunk_all_test
+        if not excluded and added_line_is_countable(line[1:]):
             countable += 1
+        new_line += 1
     return added, countable
 
 
@@ -719,11 +1031,15 @@ COUNT_SELF_TEST_CASES = [
     {
         # (#2499) The workflow's diff pathspec widened from 'src/*.rs' to
         # '*.rs' when `mutants-in-diff` started passing `--workspace`, so a
-        # `crates/**` diff now reaches this counter for the first time. The
-        # counter itself never looked at the path — `added_line_is_countable`
-        # only reads line CONTENT — so this is the same real-code shape as
-        # `_DIFF_REAL_CODE` above, just under a `crates/` path, proving that
-        # widening held rather than assuming it from the src/ cases alone.
+        # `crates/**` diff now reaches this counter for the first time. This
+        # is the same real-code shape as `_DIFF_REAL_CODE` above, just under
+        # a `crates/` path, proving that widening held rather than assuming
+        # it from the src/ cases alone. (#2582) The counter now DOES look at
+        # the path — for the `tests/` directory and `#[cfg(test)]`
+        # exclusions — but self-test runs isolated (`cwd` is an empty
+        # tempdir, no `source_files` supplied for this case), so there is no
+        # file to read at this path, the module exclusion cannot fire, and
+        # the outcome is unchanged.
         "name": "a crates/ path (the newly in-scope tree) counts the same as src/",
         "diff": (
             "--- a/crates/darkmux-eureka/src/lib.rs\n"
@@ -741,11 +1057,141 @@ COUNT_SELF_TEST_CASES = [
 ]
 
 
-def _run_self(argv: list[str]) -> subprocess.CompletedProcess:
+# ---------------------------------------------------------------------------
+# (#2582) The bug this was filed for: PR #2579 added two inline unit tests
+# and nothing else, and the floor read the legitimate zero as the
+# package-scoping defect it exists to catch. `_MOD_TESTS_SOURCE` below is a
+# minimal, faithful reproduction of that PR's SECOND hunk specifically — not
+# the easy one. `source_files` writes real content to disk so these cases
+# exercise the PRIMARY mechanism (`_test_module_ranges` reading the file),
+# not the hunk-header fallback.
+# ---------------------------------------------------------------------------
+
+# The new-file content a `#[cfg(test)] mod tests` grows a second test inside.
+# Line 5-7 is a plain (non-raw) string literal spanning three physical lines
+# — `line two` at column 0 is deliberate: it is what makes git's own
+# hunk-header heuristic (nearest column-0 line above the hunk) name `line
+# two` as context instead of `mod tests {`, exactly as it did on PR #2579's
+# real second hunk. If this fix relied on the header, this case would fail.
+_MOD_TESTS_SOURCE = (
+    "#[cfg(test)]\n"
+    "mod tests {\n"
+    "    #[test]\n"
+    "    fn existing_test() {\n"
+    "        let multi = \"line one\n"
+    "line two\n"
+    "line three\";\n"
+    "        assert_eq!(multi.len(), 5);\n"
+    "    }\n"
+    "\n"
+    "    #[test]\n"
+    "    fn new_test_still_zero() {\n"
+    "        assert_eq!(2 + 2, 4);\n"
+    "    }\n"
+    "}\n"
+)
+
+# The diff that grew `_MOD_TESTS_SOURCE` from its 10-line predecessor. Old
+# start=7 (context begins mid-string, at "line three";") is what makes git
+# resolve the header context from `line two` at old line 6 rather than the
+# real enclosing `mod tests {` at old line 2.
+_DIFF_MOD_TESTS = (
+    "--- a/crates/fake/src/example.rs\n"
+    "+++ b/crates/fake/src/example.rs\n"
+    "@@ -7,4 +7,9 @@ line two\n"
+    " line three\";\n"
+    "         assert_eq!(multi.len(), 5);\n"
+    "     }\n"
+    "+\n"
+    "+    #[test]\n"
+    "+    fn new_test_still_zero() {\n"
+    "+        assert_eq!(2 + 2, 4);\n"
+    "+    }\n"
+    " }\n"
+)
+
+_PROD_ONLY_SOURCE = "pub fn helper() -> usize {\n    1 + 1\n}\n"
+
+_DIFF_PROD_ONLY = (
+    "--- a/crates/fake/src/prod_only.rs\n"
+    "+++ b/crates/fake/src/prod_only.rs\n"
+    "@@ -0,0 +1,3 @@\n"
+    "+pub fn helper() -> usize {\n"
+    "+    1 + 1\n"
+    "+}\n"
+)
+
+TEST_MODULE_SELF_TEST_CASES = [
+    {
+        # This is the reproduction of #2582 / PR #2579 itself: a diff whose
+        # ONLY added lines are inside `#[cfg(test)] mod tests`, in a hunk
+        # whose own header context is misleading. Before the fix this
+        # counted 2 (the new fn's signature + its assert line) and failed
+        # the floor exactly like the real PR did.
+        "name": "#2582: a test-only diff (misleading hunk header) counts zero and the floor passes",
+        "diff": _DIFF_MOD_TESTS,
+        "source_files": {"crates/fake/src/example.rs": _MOD_TESTS_SOURCE},
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # The other half of the same fix: a production-only diff must count
+        # exactly as it did before #2582 — the module exclusion must not
+        # over-fire on ordinary code just because the counter now reads the
+        # file. Same file is on disk (proving the counter DID look) and
+        # carries no `#[cfg(test)]` at all.
+        "name": "#2582: a production-only diff counts unchanged and the floor still fails",
+        "diff": _DIFF_PROD_ONLY,
+        "source_files": {"crates/fake/src/prod_only.rs": _PROD_ONLY_SOURCE},
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        # The case that MUST stay red: a diff mixing a test-only hunk (zero
+        # contribution) with a production hunk that added real mutable code
+        # cargo-mutants found no mutants for. Proves the fix excludes the
+        # TEST half only — it must never zero out an honest under-scoping
+        # defect just because part of the same diff happens to be tests.
+        "name": "#2582: a mixed diff counts only the production half, and the floor still fails",
+        "diff": _DIFF_MOD_TESTS + _DIFF_PROD_ONLY,
+        "source_files": {
+            "crates/fake/src/example.rs": _MOD_TESTS_SOURCE,
+            "crates/fake/src/prod_only.rs": _PROD_ONLY_SOURCE,
+        },
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        # The other exclusion #2582 asked for: a whole file under a `tests/`
+        # directory (Cargo's integration-test convention) is skipped by PATH
+        # alone — no `source_files` here, proving this does not depend on
+        # reading the file at all. Without the fix this would count 2 (the
+        # `fn` signature and the `assert_eq!` line; the `#[test]` attribute
+        # and the closing `}` already excluded on their own).
+        "name": "#2582: a file under tests/ is excluded wholesale, by path alone",
+        "diff": (
+            "--- a/tests/golden_check.rs\n"
+            "+++ b/tests/golden_check.rs\n"
+            "@@ -0,0 +1,4 @@\n"
+            "+#[test]\n"
+            "+fn golden_matches() {\n"
+            "+    assert_eq!(2 + 2, 4);\n"
+            "+}\n"
+        ),
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+]
+
+COUNT_SELF_TEST_CASES += TEST_MODULE_SELF_TEST_CASES
+
+
+def _run_self(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), *argv],
         capture_output=True,
         text=True,
+        cwd=cwd,
     )
 
 
@@ -753,11 +1199,29 @@ def count_self_test() -> list[str]:
     failures = []
     for case in COUNT_SELF_TEST_CASES:
         with tempfile.TemporaryDirectory() as tmp:
-            diff_path = Path(tmp) / "pr.diff"
+            tmp_path = Path(tmp)
+            # (#2582) Run every case with `cwd` pinned to this EMPTY tempdir,
+            # never the real repo. `_test_module_ranges` reads files by the
+            # relative path named in the diff's `+++ b/<path>` header, and
+            # several of these fixture diffs deliberately reuse real-looking
+            # repo paths (`src/mission_status.rs`,
+            # `crates/darkmux-eureka/src/lib.rs`) as realistic examples. If
+            # this ran from the repo root, the counter would read the ACTUAL
+            # files at those paths instead of the fixture's synthetic diff —
+            # `darkmux-eureka/src/lib.rs` genuinely has a `#[cfg(test)]`
+            # module, so a case with no relation to it would silently start
+            # asserting on real repo content instead of the diff under test.
+            # A case that wants the file-read mechanism exercised supplies
+            # `source_files` to write real content into this same tempdir.
+            diff_path = tmp_path / "pr.diff"
             diff_path.write_text(case["diff"])
+            for rel, content in case.get("source_files", {}).items():
+                dest = tmp_path / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content)
             problems = []
 
-            proc = _run_self(["--count-changed-lines", str(diff_path)])
+            proc = _run_self(["--count-changed-lines", str(diff_path)], cwd=tmp_path)
             got = proc.stdout.strip()
             if proc.returncode != 0:
                 problems.append(f"counter exited {proc.returncode}: {proc.stderr.strip()}")
@@ -774,8 +1238,9 @@ def count_self_test() -> list[str]:
                         "T",
                         "--changed-lines",
                         got,
-                        str(Path(tmp) / "nope" / "mutants.out"),
-                    ]
+                        str(tmp_path / "nope" / "mutants.out"),
+                    ],
+                    cwd=tmp_path,
                 )
                 if gate.returncode != case["expect_gate"]:
                     problems.append(
