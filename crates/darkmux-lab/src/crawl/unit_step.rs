@@ -1874,8 +1874,45 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         // breaker did) but it does mean a reader must not treat
         // `stopped_by != "error"` as "nothing errored" — `units_errored` is
         // the field that answers THAT, and it stays exact.
+        //
+        // (#2569) `"interrupted"` is named SECOND, ahead of `"error"` for
+        // the identical reason `"thermal"` is named first: a unit the
+        // operator abandoned (`mission abort`, or a SIGINT that lands the
+        // in-flight step at `Abandoned`) is also a thing that ENDED the
+        // run, not an incidental failure that happened along the way. An
+        // errored unit BEFORE the interrupt is possible the same way one
+        // is possible before a thermal stop, and `units_errored` stays the
+        // exact count for that regardless of which name `stopped_by`
+        // carries. Ranked BEHIND `"thermal"`, not ahead of it: when the
+        // breaker fired at all, the hardware constraint is the more
+        // useful thing to surface, even if the operator also pulled the
+        // plug afterward — the run was already ending on its own. This is
+        // the same "the thing that actually ended the run outranks
+        // whatever merely happened along the way" precedent #2454 set,
+        // applied to a second cause.
+        //
+        // Two of `CrawlSummary`'s other terminal-state counters are
+        // deliberately NOT consulted here, and that is not an oversight:
+        // `units_not_run` is left out, but NOT for the reason an earlier
+        // version of this comment gave — deselection (`--param units=`/
+        // `limit=`) doesn't exist any more (`select_units` and
+        // `src/crawl_launch.rs` were both deleted in #2301/#2313, and
+        // `crawl.json` declares no `units`/`limit` input), so #2274,
+        // which blamed this exclusion on deselected units getting folded
+        // in, was closed as stale. With deselection gone, `units_not_run`
+        // today counts only units that genuinely never got a row. It is
+        // still not consulted here, on purpose: giving `stopped_by` a
+        // branch for it is #2573's job, deliberately not folded into
+        // this fix. `units_budget_exhausted` is a PER-UNIT outcome (one
+        // unit ran out of its own turn/token budget); it does not halt the
+        // crawl — the next unit still runs — so it answers a different
+        // question than "why is the RUN shorter than planned".
+        // `tests::every_terminal_state_counter_on_the_summary_is_
+        // accounted_for_in_stopped_by` pins this enumeration structurally.
         stopped_by: if units_skipped > 0 {
             "thermal".into()
+        } else if units_interrupted > 0 {
+            "interrupted".into()
         } else if units_errored > 0 {
             "error".into()
         } else {

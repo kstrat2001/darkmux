@@ -1034,6 +1034,166 @@ fn a_thermal_stop_gets_its_own_bucket_and_names_the_run_without_hiding_the_error
     );
 }
 
+/// (#2569) A genuinely completed run — no thermal event, no error, no
+/// interrupt — is the INVERTED case every other branch in the chain is
+/// measured against: it must still read `"done"`. Without this pinned
+/// separately, a bug that made `stopped_by` fire on every run (not just
+/// interrupted ones) would slip past the other tests here, each of which
+/// only asserts what fires when its own bucket is nonzero.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_clean_run_still_reads_done() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", "stop", 1, 100, 1_000)));
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Complete, Some(&outcome_json("u-0002", "stop", 2, 200, 2_000)));
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_skipped, 0);
+    assert_eq!(s.units_errored, 0);
+    assert_eq!(s.units_interrupted, 0);
+    assert_eq!(s.stopped_by, "done", "nothing stopped this run early — it must read as a clean finish");
+}
+
+/// (#2569) The bug: a crawl the operator stopped on purpose — a graceful
+/// `mission abort` or a SIGINT mid-dispatch, both of which the scheduler
+/// reconciles to `Abandoned` (`darkmux_crew::lifecycle`'s phase-abandon
+/// path) — has no thermal event and no genuine error, so it read as
+/// `stopped_by: "done"`. `units_interrupted` already counted these rows;
+/// it was simply never consulted.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn an_interrupted_run_is_named_not_read_as_done() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", "stop", 1, 100, 1_000)));
+    // The operator interrupted the run mid-dispatch on u2; the scheduler
+    // reconciles the still-in-flight step to Abandoned.
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Abandoned, None);
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_interrupted, 1, "the abandoned step landed in its own bucket");
+    assert_eq!(s.units_errored, 0, "an abandoned unit is not folded into the error count");
+    assert_eq!(
+        s.stopped_by, "interrupted",
+        "the operator stopped this run — it must not read as a clean finish"
+    );
+}
+
+/// (#2569) Ranking, half one: an interrupted unit alongside an EARLIER
+/// error still names `"interrupted"` — the interrupt is what ended the
+/// run; the earlier error did not. Same precedence rule #2454 established
+/// for `"thermal"` vs `"error"`, applied to the new branch.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn an_interrupt_outranks_an_earlier_error_the_same_way_thermal_does() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    // Errored before the operator ever intervened.
+    save_unit_step(
+        MISSION,
+        PHASE,
+        "u1",
+        NodeStatus::Error,
+        Some("`crawl.unit`: unit `u-0001` ended `timeout` — dispatch ended `timeout`"),
+    );
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Abandoned, None);
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_errored, 1);
+    assert_eq!(s.units_interrupted, 1);
+    assert_eq!(
+        s.stopped_by, "interrupted",
+        "the interrupt is what ended the run; the earlier error did not"
+    );
+}
+
+/// (#2569) Ranking, half two: when BOTH the thermal breaker fired AND the
+/// operator interrupted the run, `"thermal"` still wins. Deliberate, not
+/// incidental — when the breaker already tripped, the hardware constraint
+/// is the more useful thing to surface, even if the operator also pulled
+/// the plug afterward: the run was already ending on its own.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn thermal_still_outranks_an_interrupt_alongside_it() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", THERMAL_STOP, 0, 0, 0)));
+    save_unit_step(MISSION, PHASE, "u2", NodeStatus::Abandoned, None);
+
+    let s = summarize_mission(MISSION).unwrap();
+    assert_eq!(s.units_skipped, 1);
+    assert_eq!(s.units_interrupted, 1);
+    assert_eq!(
+        s.stopped_by, "thermal",
+        "the breaker outranks an interrupt that happened alongside it"
+    );
+}
+
+/// (#2569) Structural coverage for the CLASS this bug belongs to: "a
+/// terminal-state counter that exists on `CrawlSummary` but is never
+/// consulted by `stopped_by`". Every field is named here, deliberately,
+/// with a verdict on whether `stopped_by` consults it and why — no `..`
+/// in the destructure, so a new field added to `CrawlSummary` breaks this
+/// test AT COMPILE TIME, forcing whoever adds it to visit this list and
+/// decide, rather than silently repeating `units_interrupted`'s mistake.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn every_terminal_state_counter_on_the_summary_is_accounted_for_in_stopped_by() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    save_unit_step(MISSION, PHASE, "u1", NodeStatus::Complete, Some(&outcome_json("u-0001", "stop", 0, 0, 0)));
+    let s = summarize_mission(MISSION).unwrap();
+
+    let CrawlSummary {
+        schema_version: _,
+        mission_id: _,
+        workspace: _,
+        units_in_plan: _,
+        units_selected: _,
+        // EXCLUDED on purpose, but not for the reason #2274 gave — that
+        // issue blamed this on deselected units (`--param units=`/
+        // `limit=`) getting folded in, and was closed as stale: that
+        // mechanism no longer exists (`select_units`/`crawl_launch.rs`
+        // were deleted in #2301/#2313). With deselection gone,
+        // `units_not_run` today means genuinely unreached. A branch for
+        // it is #2573's job, deliberately not folded into `stopped_by`
+        // here.
+        units_not_run: _,
+        // The "nothing wrong" bucket — not a stop cause by definition.
+        units_completed: _,
+        // Consulted — lowest-priority stop cause.
+        units_errored: _,
+        // Consulted (#2569) — the operator stopped the run.
+        units_interrupted: _,
+        // EXCLUDED on purpose: a PER-UNIT outcome (that one unit ran out
+        // of its own turn/token budget) that does not halt the crawl —
+        // the next unit still runs. It answers "did this unit run out of
+        // room", not "why is the RUN shorter than planned".
+        units_budget_exhausted: _,
+        // Consulted — highest-priority stop cause.
+        units_skipped: _,
+        findings: _,
+        prompt_tokens: _,
+        completion_tokens: _,
+        wall_ms: _,
+        tokens_per_hour: _,
+        stopped_by: _,
+        est_tokens: _,
+        model: _,
+        profile: _,
+        sources: _,
+        units: _,
+        finding_refs: _,
+        plans_errored: _,
+    } = s;
+}
+
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
 fn an_errored_unit_never_refuses_the_whole_summary() {
