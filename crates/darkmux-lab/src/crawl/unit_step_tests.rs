@@ -308,6 +308,94 @@ fn omitted_config_timeout_seconds_leaves_the_override_field_absent() {
     );
 }
 
+/// (#2542 follow-up review, MUST FIX) The string form of `timeout_seconds`
+/// must route identically to the literal-integer form the two tests above
+/// cover. `--param timeout_seconds=45` (the shape `src/mission_launch.rs`'s
+/// `collect_inputs` always produces — every `--param` value lands as a JSON
+/// string) reached `UnitStepConfig::from_step`'s `.and_then(|v| v.as_u64())`
+/// parse, which has no string fallback, so the config key silently read as
+/// absent: `timeout_override_seconds` stayed `None` and the unit ran with
+/// no per-dispatch bound at all — the exact #2542 failure, one hop further
+/// down the same key. Mirrors `draws`'s own string-or-number parse
+/// immediately below in `unit_step.rs`, for the same documented reason.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn config_timeout_seconds_string_form_routes_into_the_container_paths_override_field() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 0, 0);
+
+    let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let out_for_dispatch = out.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+        *captured.lock().unwrap() = Some(opts);
+        ok_result(envelope("stop", 10, 5, 1_000), out_for_dispatch.clone())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate",
+        "timeout_seconds": "45"
+    }));
+    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+
+    let opts = seen.lock().unwrap().take().unwrap();
+    assert_eq!(
+        opts.timeout_override_seconds,
+        Some(45),
+        "the STRING form of config.timeout_seconds — the shape a `--param timeout_seconds=45` \
+         launch actually produces — must route identically to the literal-integer form"
+    );
+}
+
+/// (#2542 follow-up review, "Also fix") `0` must be REFUSED at config-parse
+/// time, not silently accepted. `timeout_override_seconds: Some(0)` resolves
+/// through `effective_inactivity_timeout_seconds` to an already-expired
+/// inactivity deadline — the host watchdog kills the unit at its first poll
+/// — which is an instant kill, not "unbounded". Mirrors `darkmux dispatch
+/// --timeout`'s own `range(1..)` clap validator (`src/cli.rs`, #2480 review
+/// blocker 6), which refuses `0` on the CLI path for the identical reason;
+/// this config-file route to the same field gets the same floor.
+#[test]
+fn config_timeout_seconds_zero_is_refused_at_config_parse_time() {
+    let step = unit_step(serde_json::json!({
+        "plan": "/nonexistent/plan.json", "unit": "u-0001", "rule": "r", "timeout_seconds": 0
+    }));
+    let err = UnitStepConfig::from_step(&step).expect_err("a 0 timeout_seconds must be refused");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("must be >= 1"), "the floor is named: {msg}");
+    assert!(msg.to_lowercase().contains("instant kill"), "the WHY is named, not just the rule: {msg}");
+}
+
+/// The same floor holds for the string form of `0` — a `--param
+/// timeout_seconds=0` reaches step config as `"0"`, not `0`, and a check
+/// wired only into the `as_u64` branch would let this shape through.
+#[test]
+fn config_timeout_seconds_zero_is_refused_in_its_string_form_too() {
+    let step = unit_step(serde_json::json!({
+        "plan": "/nonexistent/plan.json", "unit": "u-0001", "rule": "r", "timeout_seconds": "0"
+    }));
+    let err = UnitStepConfig::from_step(&step).expect_err("the string form's 0 must be refused identically");
+    assert!(format!("{err:#}").contains("must be >= 1"), "{err:#}");
+}
+
+/// A garbage (non-numeric, non-parseable) `timeout_seconds` must error
+/// loudly by name, matching `draws`'s and `no_progress_turns`'s own
+/// convention — never silently read as absent.
+#[test]
+fn config_timeout_seconds_garbage_value_is_refused_by_name() {
+    let step = unit_step(serde_json::json!({
+        "plan": "/nonexistent/plan.json", "unit": "u-0001", "rule": "r", "timeout_seconds": "soon"
+    }));
+    let err = UnitStepConfig::from_step(&step).expect_err("a non-numeric timeout_seconds must be refused");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("must be a positive"), "{msg}");
+    assert!(msg.contains("soon"), "the offending value is named: {msg}");
+}
+
 /// (#2454) The thermal breaker's between-units gate: a `STOP` file present
 /// at the mission-relative path `thermal_governor::
 /// stop_file_path_from_record_context` derives (`<darkmux root>/crawl/
