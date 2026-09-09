@@ -8224,6 +8224,14 @@ fn the_wait_command_fails_fast_when_the_darkmux_binary_is_missing() {
         stderr.contains("exit"),
         "and the exit status, so a missing binary (127) reads differently from a real error: {stderr}"
     );
+    // The word "exit" alone would still pass a regression to a flat
+    // `exit 1` with a generic message — assert the real shell "command not
+    // found" code the wait command's `exit "$rc"` actually propagates.
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "a missing binary is shell exit 127 (command not found), not a made-up 1: stdout {stdout}\nstderr {stderr}"
+    );
     assert!(
         !stdout.contains("\"found\":false"),
         "must not report the clean-decline shape for an infra failure: {stdout}"
@@ -8266,6 +8274,16 @@ fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
         stderr.contains("not a finding key") || stderr.contains("not-a-valid-key"),
         "and carries the real command's own error text, not a generic message: {stderr}"
     );
+    // Same regression window as the missing-binary test above: a flat
+    // `exit 1` with a generic message keeps every `assert!` above green.
+    // `mod list --for <invalid key>` exits 1 (anyhow's default failure
+    // code via `main`'s `?`, not clap's usage-error 2) — pin that number,
+    // not just "some" nonzero status.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the real `mod list` exit code for an unaddressable key must reach here unmodified: stdout {stdout}\nstderr {stderr}"
+    );
     assert!(
         !stdout.contains("\"found\":false"),
         "must not report the clean-decline shape for a real error: {stdout}"
@@ -8273,6 +8291,62 @@ fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
     assert!(
         elapsed < std::time::Duration::from_secs(10),
         "a config/infra error is diagnosable on the FIRST probe — it must not burn the 60s bound: {elapsed:?}"
+    );
+}
+
+/// A `mod list --for` that exits 0 with an empty `{"mods": []}` on stdout
+/// but happens to write a line containing the five bytes `"key"` to
+/// stderr (a wrapper's startup warning, loader noise — `DARKMUX_BIN` is
+/// not guaranteed to be darkmux itself, see `builtins.rs`'s
+/// `current_exe()` default) must NOT be reported as `found: true`. The
+/// probe now redirects `mod list`'s stderr to a temp file and greps only
+/// stdout — before that fix the probe merged stderr into the string it
+/// grepped (`2>&1`), so this exact stub produced `found: true` with
+/// nothing ever generated.
+///
+/// Red-proved: reverting the probe's `2>"$errf"` back to `2>&1` (and the
+/// grepped variable back to the merged one) turns this red — the stub's
+/// stderr line satisfies the `grep -q '"key"'` check on the FIRST probe.
+#[test]
+fn the_wait_command_does_not_false_positive_on_key_text_in_mod_list_stderr() {
+    let home = TempDir::new().unwrap();
+    let stub_dir = TempDir::new().unwrap();
+    let stub = stub_dir.path().join("fake-darkmux");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'warning: unrecognized \"key\" in config\\n' >&2\nprintf '{\"mods\": []}\\n'\nexit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let out = run_wait_command_with_bin(
+        home.path(),
+        &create_mod_wait_command("sess-falsepos/1", "3"),
+        &stub.to_string_lossy(),
+    );
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "an exit-0 mod list, however noisy on stderr, is not a step failure: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        !stdout.contains("\"found\":true"),
+        "nothing was generated — `\"key\"` landing on stderr must not read as a match: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        stdout.contains("\"found\":false"),
+        "the honest outcome for an empty store is the clean decline: {stdout}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(3) && elapsed < std::time::Duration::from_secs(15),
+        "the poll burns its full 3s bound rather than false-matching on the first probe: {elapsed:?}"
     );
 }
 
