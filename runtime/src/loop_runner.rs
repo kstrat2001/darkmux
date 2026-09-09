@@ -4972,7 +4972,7 @@ mod tests {
     /// `assistant_messages_in_history_never_carry_reasoning_content` does
     /// (a `read` call on `/workspace/x.txt`), known to round-trip cleanly
     /// with no Docker/real LMStudio involved.
-    fn register_three_turn_tool_then_stop_script(server: &httpmock::MockServer) {
+    fn register_three_turn_tool_then_stop_script(server: &crate::test_support::GuardedMockServer) {
         use httpmock::prelude::*;
         let tool_calls = serde_json::json!([{
             "id": "call_1",
@@ -5010,12 +5010,11 @@ mod tests {
         use crate::lmstudio::{LmStudioClient, Message};
         use crate::tools::Tool;
         use crate::trajectory::Trajectory;
-        use httpmock::prelude::*;
 
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::set_var("DARKMUX_TURN_DELAY_MS", "500");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         register_three_turn_tool_then_stop_script(&server);
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
@@ -5079,7 +5078,7 @@ mod tests {
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         register_three_turn_tool_then_stop_script(&server);
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
@@ -5191,7 +5190,7 @@ mod tests {
         // checkpoint reflect turns==1" — a fresh dispatch paused before
         // turn 1 would trivially have no checkpoint yet regardless of this
         // fix, since nothing has happened.
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let tool_calls = serde_json::json!([{
             "id": "call_1",
             "type": "function",
@@ -5275,7 +5274,7 @@ mod tests {
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let tool_calls = serde_json::json!([{
             "id": "call_1",
             "type": "function",
@@ -5336,7 +5335,7 @@ mod tests {
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let tool_calls = serde_json::json!([{
             "id": "call_1",
             "type": "function",
@@ -5346,7 +5345,11 @@ mod tests {
         // starts directly at the request a fresh dispatch would send as
         // its THIRD call.
         let tc1 = tool_calls.clone();
-        let turn1_mock = server.mock(move |when, then| {
+        // `mock_expect_zero` (#2599): the whole point of these two mocks is
+        // that a resumed dispatch must NEVER hit them — `assert_hits(0)`
+        // below already pins that explicitly; this declares the zero
+        // legitimate to `GuardedMockServer`'s own drop-time check too.
+        let turn1_mock = server.mock_expect_zero(move |when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
@@ -5354,7 +5357,7 @@ mod tests {
             then.status(200).json_body(chat_response_json(None, Some(tc1.clone()), "tool_calls", 100, 20));
         });
         let tc2 = tool_calls.clone();
-        let turn2_mock = server.mock(move |when, then| {
+        let turn2_mock = server.mock_expect_zero(move |when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 1
@@ -5439,11 +5442,14 @@ mod tests {
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // A request shaped like the ORIGINAL turn 1 (no tool results yet)
         // must NEVER land — proves the resume doesn't re-request the
         // model for a turn it already has an assistant message for.
-        let original_turn1_mock = server.mock(|when, then| {
+        // `mock_expect_zero` (#2599): `assert_hits(0)` below already pins
+        // this explicitly; this declares the zero legitimate to
+        // `GuardedMockServer`'s own drop-time check too.
+        let original_turn1_mock = server.mock_expect_zero(|when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
@@ -5572,7 +5578,7 @@ mod tests {
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _turn2_mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
@@ -5706,7 +5712,7 @@ mod tests {
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _turn2_mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 140, 5));
@@ -5799,7 +5805,7 @@ mod tests {
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // The ONLY registered mock requires the elision marker to be
         // present in the outgoing request body — if the trim never ran
         // (or ran AFTER this request instead of before it), the body
@@ -5908,12 +5914,11 @@ mod tests {
         use crate::lmstudio::{LmStudioClient, Message};
         use crate::tools::Tool;
         use crate::trajectory::Trajectory;
-        use httpmock::prelude::*;
 
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS"); // unset → 0 default
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         register_three_turn_tool_then_stop_script(&server);
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
@@ -5951,7 +5956,7 @@ mod tests {
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::set_var("DARKMUX_TURN_DELAY_MS", "500");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _m = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 50, 5));
@@ -6011,7 +6016,7 @@ mod tests {
         std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
         std::env::set_var("DARKMUX_TURN_DELAY_MS", "500");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Call 1: turn 1 completes via a tool call — 0 "role":"tool"
         // substrings in the request body (nothing has executed yet).
         let tool_calls = serde_json::json!([{
@@ -6109,7 +6114,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn generation_bound_caps_the_request_below_the_answer_bound() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
@@ -6150,7 +6155,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn generation_bound_salvage_sends_no_reasoning_nudge() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -6230,7 +6235,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn reasoning_bound_still_wins_over_the_generation_default() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let tool_calls = serde_json::json!([{
             "id": "call_1",
             "type": "function",
@@ -6297,7 +6302,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn generation_checkpoint_budget_exhausts_at_the_floor_not_the_naive_ratio() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -7079,7 +7084,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_non_reasoning_turn_resumes_its_answer_without_think_delimiters() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Plain content, no `<think>` anywhere, no `reasoning_content`.
         let answer: String = (0..200).map(|j| format!("word{j} ")).collect();
         let body = answer.clone();
@@ -7141,7 +7146,7 @@ mod tests {
     #[serial_test::serial]
     fn an_empty_call_does_not_discard_the_work_already_banked() {
         const BANKED: &str = "BANKED-WORK-FROM-AN-EARLIER-CHECKPOINT";
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // First call: real content, cut at the boundary.
         let _first = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
@@ -7220,7 +7225,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_concluding_checkpointed_turn_keeps_its_whole_answer() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Two MUTUALLY EXCLUSIVE mocks keyed on the request body. `mock()` takes
         // an FnOnce that runs ONCE at registration, so a call-counter inside it
         // is evaluated a single time and the mock answers identically forever —
@@ -7300,7 +7305,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn concluding_closes_the_thought_without_restarting_the_turn() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Deliberately degenerate: one clause repeated, so the gate concludes
         // on the very first checkpoint and every later call is post-close.
         let repetitive = format!(
@@ -7379,7 +7384,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn checkpoint_prefill_replaces_previous_and_carries_accumulated_thought() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Distinct tokens so the accumulation is verifiable by inspection and
         // the degeneracy gate stays on the `continue` branch for this run.
         // An inline-think model cut mid-thought: an UNCLOSED `<think>`, which is
@@ -7472,7 +7477,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_escalates_when_cumulative_completion_tokens_exceeds_cap() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Each turn reports 10000 completion tokens (the per-call
         // cap). After 25 turns cumulative = 250000 == cap → next
         // iteration's pre-loop check trips the escalation.
@@ -7537,7 +7542,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_does_not_escalate_when_under_cumulative_budget() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _stop_mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -7574,7 +7579,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_returns_maxturns_terminal_reason_when_cap_hit() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Primary mock: every call returns finish_reason=tool_calls.
         // The loop will never see stop; will run MAX_TURNS=100 turns
         // and bail with the structured terminal_reason.
@@ -7631,7 +7636,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_emits_tool_repeated_failure_event_after_third_consecutive_bash_failure() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Each turn the mock returns a bash call against a path that
         // doesn't exist in the test workspace → tool returns
         // "exit: N" with non-zero exit. The dispatch wrapper still
@@ -7699,7 +7704,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_emits_cycle_suspected_event_after_third_identical_tool_call() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Mock returns the SAME read call every time. Loop will keep
         // dispatching (`tool_calls` finish_reason) until MAX_TURNS.
         let _bail_mock = server.mock(|when, then| {
@@ -7776,7 +7781,7 @@ mod tests {
         // disabled by a prior test's env mutation that didn't unset).
         std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _bail_mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -7880,7 +7885,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_recovers_tool_call_from_xml_in_content_when_finish_reason_is_stop() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Every call returns the bail shape: finish=stop, content has
         // an XML tool_call, tool_calls field is null. Without the
         // promoter, loop exits at turn 1. With the promoter, loop
@@ -8091,7 +8096,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_salvages_tool_call_on_per_turn_cap_hit() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // First response: length-finish + valid tool call at the cap.
         // Second response: stop to terminate the loop cleanly.
         let _mock = server.mock(|when, then| {
@@ -8195,7 +8200,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn malformed_tool_call_names_are_never_dispatched_and_coalesced() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let mut calls = vec![
             valid_read_call("call_ok_1", "/workspace/a.txt"),
             valid_read_call("call_ok_2", "/workspace/b.txt"),
@@ -8347,7 +8352,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn malformed_tool_call_names_do_not_advance_the_consecutive_failure_counter() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let bogus_name = "} catch (error) { --- [TOOL_CALLS]same bogus name every time";
         let mut calls = vec![valid_read_call("call_ok_1", "/workspace/a.txt")];
         for i in 0..3 {
@@ -8422,7 +8427,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_turn_of_only_invalid_tool_calls_still_progresses() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let calls = vec![
             malformed_call("call_bad_1", "} catch (error) { --- [TOOL_CALLS]one"),
             malformed_call("call_bad_2", "} catch (error) { --- [TOOL_CALLS]two"),
@@ -8516,7 +8521,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn ungranted_real_tool_call_is_never_dispatched_and_names_the_correct_reason() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let calls = vec![ungranted_bash_call("call_bash_1")];
         let _turn1 = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
@@ -8624,7 +8629,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn mixed_reason_buckets_produce_separate_detector_events() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let calls = vec![
             valid_read_call("call_ok", "/workspace/a.txt"),
             ungranted_bash_call("call_bash"),
@@ -8729,7 +8734,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn generation_bound_salvage_and_malformed_names_compose_on_the_same_turn() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let calls = serde_json::json!([
             {
                 "id": "call_ok",
@@ -8837,7 +8842,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn three_consecutive_all_malformed_turns_escalate() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -8903,7 +8908,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_mixed_turn_resets_the_consecutive_malformed_counter() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let bad_call = |id: &str, marker: &str| {
             serde_json::json!([{
                 "id": id,
@@ -9056,7 +9061,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn salvage_record_names_the_reasoning_checkpoint_interval_bound() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Priming turn (0 "role":"tool" in the accumulating request body):
         // demonstrates reasoning via a closed think block, dispatches
         // cleanly (finish_reason=tool_calls, not length) so it does NOT
@@ -9144,7 +9149,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn salvage_record_names_the_max_tokens_per_call_bound_once_in_answer_region() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -9203,7 +9208,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn per_call_cap_override_moves_the_salvage_threshold() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -9274,7 +9279,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn cap_cliff_partial_content_recovers_instead_of_killing_the_dispatch() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -9332,7 +9337,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn below_cap_length_is_still_a_context_overflow_hard_error() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -9379,7 +9384,7 @@ mod tests {
     #[serial_test::serial]
     fn loop_salvages_tool_call_even_when_feedback_injection_disabled() {
         std::env::set_var("DARKMUX_FEEDBACK_INJECTION", "0");
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -9453,7 +9458,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn salvage_clears_truncated_content_from_history() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -9523,7 +9528,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_does_not_salvage_on_malformed_tool_args() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -9597,7 +9602,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_recovers_tool_call_from_xml_when_finish_reason_is_length() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _bail_mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -9641,7 +9646,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_recovers_tool_call_from_xml_in_reasoning_when_finish_reason_is_stop() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _bail_mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             // content is null; reasoning_content carries the call —
@@ -9699,11 +9704,27 @@ mod tests {
     /// green while covering only turn one.
     ///
     /// Call this at the end of a scripted multi-turn dispatch test, naming
-    /// every mock the run is EXPECTED to reach (never the deliberate
-    /// "should not be reached" traps — those already self-assert via
-    /// `Mock::assert_hits(0)`). A shadowed mock then fails loudly, right
-    /// here, instead of the test passing for a reason unrelated to what
-    /// it claims to cover.
+    /// every mock the run is EXPECTED to reach. A shadowed mock then fails
+    /// loudly, right here, instead of the test passing for a reason
+    /// unrelated to what it claims to cover.
+    ///
+    /// This does NOT, on its own, cover a "should not be reached" trap —
+    /// and "it already self-asserts via `Mock::assert_hits(0)`" is not a
+    /// safe reason to omit one. `Mock::assert_hits(0)` only proves the
+    /// trap was never SERVED; it proves nothing about whether the trap's
+    /// matcher was ever even EVALUATED. A trap that does its real work
+    /// inside the matcher closure (a side-channel counter, an
+    /// invariant check) rather than through being served can be silently
+    /// shadowed by an earlier mock whose predicates happen to cover every
+    /// request — the matcher never runs, the counter never moves, and
+    /// `assert_hits(0)` stays trivially true throughout (#2599: exactly
+    /// this shape shadowed `a_salvage_after_a_checkpoint_never_leaves_two_
+    /// assistant_messages_adjacent`'s detector for as long as it was
+    /// registered after the two mocks whose predicates already covered
+    /// every request). Before excluding a trap from this list, confirm
+    /// independently that its matcher is actually reached — e.g. by
+    /// registering it FIRST among the mocks on its server, or by naming it
+    /// here too if the run is expected to reach it at least once.
     fn assert_every_mock_was_hit(mocks: &[(&str, &httpmock::Mock)]) {
         for (label, mock) in mocks {
             assert!(
@@ -9732,7 +9753,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn assistant_messages_in_history_never_carry_reasoning_content() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // (#1444 review) Registration ORDER is load-bearing, and this test
         // had it backwards. httpmock returns the FIRST-REGISTERED mock whose
         // predicate matches, not the most specific one — and `turn1`'s
@@ -9755,19 +9776,45 @@ mod tests {
         // below pin the routing so it cannot silently regress again.
         //
         // (#2541 full audit, instrumented via `Mock::hits()` across every
-        // runtime test registering 2+ mocks — 39 tests, 96 mocks, run
+        // runtime test registering 2+ mocks — 43 tests, 105 mocks, run
         // whole-suite: this was the ONLY test where a registered mock a
-        // run was expected to reach went unserved. The other 0-hit mocks
-        // found (8 total, across 7 tests) are all deliberate: either an
-        // explicit `Mock::assert_hits(0)` proving a resumed/mid-turn
-        // dispatch never re-requests a call it already has, a
-        // "never actually serve — this mock only observes" detector
-        // whose predicate always returns false, or one arm of a pair of
-        // genuinely mutually-exclusive predicates whose other branch this
-        // particular scripted run doesn't take. Six of those seven use a
+        // run was expected to reach went unserved. (Corrected in #2599's
+        // review from an initial 39 tests / 96 mocks: a direct-registration
+        // scan misses a helper function that registers mocks on the
+        // caller's behalf — `register_three_turn_tool_then_stop_script`
+        // registers 3 mocks and is called by 3 tests with no registration
+        // sites of their own, invisible to a scan that attributes
+        // registrations to the enclosing function — and misses a test
+        // whose two mocks live on two DIFFERENT servers, where shadowing
+        // is structurally impossible but the mocks still belong in the
+        // candidate set.) The other 0-hit mocks found (9 total, across 8
+        // tests — corrected from 8/7; the missed one is a bare
+        // registration with no `let` binding, so its hit count can't be
+        // read without going back and binding it first) are all
+        // deliberate: either an explicit `Mock::assert_hits(0)` proving a
+        // resumed/mid-turn dispatch never re-requests a call it already
+        // has, a "never actually serve — this mock only observes" detector
+        // whose predicate always returns false (but see the #2599 note on
+        // `assert_every_mock_was_hit` above — "the predicate always
+        // returns false" is not the same as "the matcher is actually
+        // reached", and one of exactly this shape was NOT), or one arm of
+        // a pair of genuinely mutually-exclusive predicates whose other
+        // branch this particular scripted run doesn't take. Of those
+        // mutually-exclusive pairs, exactly ONE uses a
         // `body_contains("\"model\":\"test-primary\"")` /
-        // `\"test-compactor\"` discriminator; the rest use disjoint
-        // content-sentinel predicates. None of the 39 are shadowed.)
+        // `\"test-compactor\"` discriminator (corrected from "six of
+        // seven" — that fraction was inherited from an older comment
+        // describing a different set and never re-checked); two use
+        // tool-role count matchers, four use disjoint content-sentinel
+        // predicates, and one uses a token-limit predicate. None of the 43
+        // are shadowed. Noted, not fixed: at least one of these mutually-
+        // exclusive-arm exemptions (`checkpoint_regression_tests::
+        // an_answer_after_the_models_own_think_close_is_delivered`'s
+        // `_m3`, and arguably `an_empty_tool_calls_turn_does_not_delete_
+        // the_accumulation`'s `_m3` alongside it) belongs to a run that
+        // escalates after turn two, so a scripted third turn in that test
+        // is never exercised — coverage its name implies but does not
+        // reach.)
         //
         // Second call (after the tool result): model finishes with stop.
         let turn2 = server.mock(|when, then| {
@@ -9885,7 +9932,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_request_carries_max_tokens_cap() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Captures the request body so the test can verify max_tokens.
         let captured = server.mock(|when, then| {
             when.method(POST)
@@ -9927,7 +9974,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn max_tokens_per_call_bounds_the_answer_region_on_a_fresh_turns_first_call() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let captured = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
@@ -9964,7 +10011,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_runs_against_mock_and_terminates_on_stop() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let stop_mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -10015,7 +10062,7 @@ mod tests {
     /// seen" contract `total_reasoning_tokens`'s own doc names.
     #[test]
     fn loop_accumulates_reasoning_and_cached_tokens_across_turns_tri_state() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // (#1444 test-infra finding) httpmock's `find_mock` returns the
         // FIRST-registered mock (ascending internal id) whose predicate is
         // satisfied — NOT the most specific one. `turn1`'s predicate
@@ -10144,7 +10191,7 @@ mod tests {
             custom_instructions: None,
         };
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
 
         // Primary model: every call returns tool_calls with above-
         // threshold prompt_tokens. The loop will keep calling until
@@ -10289,8 +10336,8 @@ mod tests {
             custom_instructions: None,
         };
 
-        let primary_server = MockServer::start();
-        let compactor_server = MockServer::start();
+        let primary_server = crate::test_support::GuardedMockServer::start();
+        let compactor_server = crate::test_support::GuardedMockServer::start();
 
         let _primary_mock = primary_server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
@@ -10394,7 +10441,7 @@ mod tests {
             custom_instructions: None,
         };
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Primary: EVERY call reports prompt_tokens FROZEN at 4000 — below the
         // 5000 threshold, so the reported count never trips needs_compaction
         // (the #854 endpoint-misreport). Same read call each turn keeps the
@@ -10515,7 +10562,7 @@ mod tests {
             custom_instructions: None,
         };
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
 
         let _primary_mock = server.mock(|when, then| {
             when.method(POST)
@@ -10617,7 +10664,7 @@ mod tests {
             custom_instructions: None,
         };
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _primary_mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
@@ -10724,10 +10771,13 @@ mod tests {
             custom_instructions: None,
         };
 
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Must NEVER be hit — escalating means the resume never reaches
         // the main loop's first post-resume request at all.
-        let primary_mock = server.mock(|when, then| {
+        // `mock_expect_zero` (#2599): `assert_hits(0)` below already pins
+        // this explicitly; this declares the zero legitimate to
+        // `GuardedMockServer`'s own drop-time check too.
+        let primary_mock = server.mock_expect_zero(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
                 .body_contains("\"model\":\"test-primary\"");
@@ -10840,7 +10890,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_recovers_from_length_stall_when_content_empty_and_no_tool_calls() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // First call: no nudge in payload → stall response.
         let _stall = server.mock(|when, then| {
             when.method(POST)
@@ -10936,7 +10986,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn length_with_content_at_cap_keeps_the_turn_and_asks_for_a_conclusion() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _truncated = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -11090,7 +11140,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn length_with_content_and_empty_tool_calls_array_recovers_at_cap() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _truncated = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -11124,7 +11174,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_recovers_from_length_stall_when_tool_calls_is_empty_array() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _stall = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
@@ -11175,7 +11225,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_escalates_when_stall_recovery_budget_exhausted() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Every call returns the stall shape: length + no content +
         // no tool_calls. The loop will recover twice (consuming the
         // budget), then escalate on the third stall.
@@ -11234,7 +11284,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_recovers_from_empty_tool_calls_then_escalates() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _stall = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -11313,7 +11363,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_productive_turn_pays_down_the_stall_recovery_budget() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // A distinctive fragment of `STALL_NUDGE_MESSAGE` — one occurrence
         // per recovery already injected. httpmock's `.matches()` takes a
         // plain `fn(&HttpMockRequest) -> bool` (a non-capturing function
@@ -11453,7 +11503,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_two_to_one_stall_ratio_still_escalates() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _stall = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
@@ -11553,7 +11603,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_checkpoint_continuation_does_not_erase_a_recovery_from_the_same_turn() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         // Distinct tokens so the accumulation is never degenerate (the
         // degeneracy gate would otherwise abandon the prefill and take
         // `has_prefill()` — and with it the continuation — away). The
@@ -11657,7 +11707,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn genuine_reasoning_bound_cut_still_produces_intra_turn_stall_kind() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _stall = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
@@ -11697,7 +11747,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_emits_intra_turn_stall_recovered_trajectory_event() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _stall = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
@@ -11787,7 +11837,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn loop_emits_empty_tool_calls_recovered_trajectory_event() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _stall = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
@@ -11859,7 +11909,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn escalation_triggered_record_carries_model_and_prompt_tokens() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let _stall = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(None, None, "tool_calls", 19133, 648));
@@ -11921,7 +11971,7 @@ mod tests {
         use crate::checkpoint;
 
         for (budget, expected_turns) in [(1u32, 2u32), (4u32, 5u32)] {
-            let server = MockServer::start();
+            let server = crate::test_support::GuardedMockServer::start();
             let _stall = server.mock(|when, then| {
                 when.method(POST).path("/v1/chat/completions");
                 then.status(200).json_body(chat_response_json(None, None, "tool_calls", 100, 50));
@@ -12182,7 +12232,7 @@ mod reasoning_feedback_probe {
     #[test]
     #[serial_test::serial]
     fn probe_whether_truncated_reasoning_is_echoed_on_the_next_request() {
-        let server = MockServer::start();
+        let server = crate::test_support::GuardedMockServer::start();
         let first = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions")
                 .matches(|req| {

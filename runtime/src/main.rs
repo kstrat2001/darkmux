@@ -40,6 +40,8 @@ mod reasoning_loop;
 mod tool_result_prune;
 mod tools;
 mod trajectory;
+#[cfg(test)]
+mod test_support;
 
 use lmstudio::{LmStudioClient, Message};
 use tools::Tool;

@@ -15,11 +15,21 @@
 //! that runs ONCE at registration, so a call counter inside it never advances
 //! and the mock answers identically forever. Use mutually exclusive mocks keyed
 //! on the request body via `.matches(...)`, as every test here does.
+//!
+//! Servers in this file are `crate::test_support::GuardedMockServer`, not a
+//! bare `httpmock::MockServer` (#2599) — it wraps the same `.mock(...)` API
+//! but asserts at drop that every registered mock was actually hit, unless
+//! the call site used `.mock_expect_zero(...)` instead. A mock that is
+//! genuinely meant to be a deliberate trap, an untaken branch of a
+//! mutually-exclusive pair, or (as with `_detector` below) an observe-only
+//! matcher whose real job happens inside the matcher closure — register it
+//! with `.mock_expect_zero(...)`.
 #![allow(clippy::too_many_arguments)]
 
 use super::tests::chat_response_json;
 use super::*;
 use crate::lmstudio::LmStudioClient;
+use crate::test_support::GuardedMockServer;
 use crate::trajectory::Trajectory;
 use httpmock::prelude::*;
 
@@ -58,7 +68,7 @@ fn deliverable(o: &LoopOutcome) -> String {
         .unwrap_or_else(|| "<empty>".into())
 }
 
-fn go(server: &MockServer, prefix: &str, max_turns: Option<u32>) -> Result<LoopOutcome> {
+fn go(server: &GuardedMockServer, prefix: &str, max_turns: Option<u32>) -> Result<LoopOutcome> {
     let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
     let tmp = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
     let mut traj = Trajectory::open(tmp.path());
@@ -91,7 +101,7 @@ fn go(server: &MockServer, prefix: &str, max_turns: Option<u32>) -> Result<LoopO
 #[test]
 #[serial_test::serial]
 fn a_repetitive_but_legitimate_answer_is_never_deleted() {
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
     let part_one = format!(
         "SECTION-ONE the audit of module alpha found the following items.\n{}",
         "- [ ] verify the handler returns the right status code\n".repeat(200)
@@ -105,7 +115,13 @@ fn a_repetitive_but_legitimate_answer_is_never_deleted() {
         then.status(200)
             .json_body(chat_response_json(Some(&part_one), None, "length", 100, 200));
     });
-    let _m2 = server.mock(move |when, then| {
+    // (#2599, found by GuardedMockServer) Never actually hit: the current
+    // degeneracy verdict escalates on turn 1's repetitive answer before a
+    // second call is ever made, so the "model converges after a nudge"
+    // continuation this mock was written for is not the path this test
+    // exercises today. The test's own assertion doesn't depend on it —
+    // recorded, not fixed.
+    let _m2 = server.mock_expect_zero(move |when, then| {
         when.method(POST)
             .path("/v1/chat/completions")
             .matches(|r: &HttpMockRequest| {
@@ -132,7 +148,7 @@ fn a_repetitive_but_legitimate_answer_is_never_deleted() {
 #[test]
 #[serial_test::serial]
 fn an_empty_tool_calls_turn_does_not_delete_the_accumulation() {
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
     let part_one = format!(
         "PART-ONE here are the first results.\n{}",
         (0..200).map(|j| format!("item{j} ")).collect::<String>()
@@ -159,7 +175,13 @@ fn an_empty_tool_calls_turn_does_not_delete_the_accumulation() {
             5,
         ));
     });
-    let _m3 = server.mock(move |when, then| {
+    // (#2599, found by GuardedMockServer) Never actually hit: the empty-
+    // tool-calls recovery budget is exhausted before this turn's nudge
+    // ever earns a clean recovery, so the run escalates instead of
+    // reaching the "recovered after the nudge" continuation this mock was
+    // written for. The test's own assertion doesn't depend on it —
+    // recorded, not fixed.
+    let _m3 = server.mock_expect_zero(move |when, then| {
         when.method(POST)
             .path("/v1/chat/completions")
             .matches(|r: &HttpMockRequest| {
@@ -187,7 +209,7 @@ fn an_empty_tool_calls_turn_does_not_delete_the_accumulation() {
 #[test]
 #[serial_test::serial]
 fn a_repeating_answer_region_terminates_instead_of_running_forever() {
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
     // While the thought is OPEN (no "</think>" in the thread yet): a degenerate
     // INLINE think block, so the gate closes the thought.
     let open_reasoning = format!(
@@ -227,7 +249,7 @@ fn a_repeating_answer_region_terminates_instead_of_running_forever() {
 #[test]
 #[serial_test::serial]
 fn the_models_own_think_close_on_a_terminal_turn_is_not_the_answer() {
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
     let opening = format!("<think>\nSCRATCH-A {}", (0..300).map(|j| format!("distinct reasoning step {j} about module alpha. ")).collect::<String>());
     let _m1 = server.mock(move |when, then| {
         when.method(POST)
@@ -263,7 +285,7 @@ fn the_models_own_think_close_on_a_terminal_turn_is_not_the_answer() {
 #[test]
 #[serial_test::serial]
 fn an_answer_after_the_models_own_think_close_is_delivered() {
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
     let opening = format!("<think>\nSCRATCH-A {}", (0..300).map(|j| format!("distinct reasoning step {j} about module alpha. ")).collect::<String>());
     let _m1 = server.mock(move |when, then| {
         when.method(POST)
@@ -287,7 +309,12 @@ fn an_answer_after_the_models_own_think_close_is_delivered() {
         then.status(200)
             .json_body(chat_response_json(Some(&closing_then_answer), None, "length", 100, 200));
     });
-    let _m3 = server.mock(move |when, then| {
+    // (#2599, found by GuardedMockServer) Never actually hit: checkpoint 2
+    // escalates (intra-turn stall exhausted) before a third call is ever
+    // made, so the "delivers a further ANSWER-PART-TWO" continuation this
+    // mock was written for is not the path this test exercises today. The
+    // test's own assertion doesn't depend on it — recorded, not fixed.
+    let _m3 = server.mock_expect_zero(move |when, then| {
         when.method(POST)
             .path("/v1/chat/completions")
             .matches(|r: &HttpMockRequest| body_of(r).contains("ANSWER-PART-ONE"));
@@ -313,7 +340,7 @@ fn an_answer_after_the_models_own_think_close_is_delivered() {
 #[test]
 #[serial_test::serial]
 fn an_absent_usage_object_does_not_make_every_boundary_fatal() {
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
     let answer: String = (0..200).map(|j| format!("word{j} ")).collect();
     let _m = server.mock(move |when, then| {
         when.method(POST).path("/v1/chat/completions");
@@ -368,7 +395,7 @@ fn an_absent_usage_object_does_not_make_every_boundary_fatal() {
 #[serial_test::serial]
 fn a_salvaged_mid_turn_does_not_fold_and_does_not_restore_cleared_content() {
     const MARKER: &str = "ACCUMULATED-THOUGHT-THAT-MUST-NOT-RETURN";
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
 
     // Call 1: reasoning at the checkpoint interval — banks an accumulation.
     // Genuinely novel text, NOT a repeated phrase. A first draft repeated one
@@ -452,7 +479,7 @@ fn a_salvaged_mid_turn_does_not_fold_and_does_not_restore_cleared_content() {
 #[test]
 #[serial_test::serial]
 fn a_reasoning_checkpoint_dispatches_tools_without_nudging_the_model_to_think_less() {
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
     // (#2164) Turn 1 is a PRIMING call that demonstrates reasoning (a closed
     // think block) so `dispatch_has_reasoned` is true before the interesting turn —
     // otherwise this dispatch's very first call would carry the ANSWER
@@ -566,7 +593,7 @@ fn a_reasoning_checkpoint_dispatches_tools_without_nudging_the_model_to_think_le
 #[test]
 #[serial_test::serial]
 fn a_non_reasoning_models_first_call_is_not_capped_by_the_reasoning_interval() {
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
 
     // 15 well-formed tool calls totalling comfortably over 1000 completion
     // tokens — the shape a real Devstral batch takes.
@@ -594,7 +621,13 @@ fn a_non_reasoning_models_first_call_is_not_capped_by_the_reasoning_interval() {
     // Whenever the outgoing request's `max_tokens` is <= 1000 — what a
     // fresh turn's first call sent PRE-#2164 — serve the truncated,
     // salvage-shaped response with a `length` finish at the cap.
-    server.mock(move |when, then| {
+    //
+    // Legitimately never hit on current (post-#2164) main, per this test's
+    // own doc comment above: the fix means the first call always carries
+    // the large answer bound, so only the CLEAN branch mock below is ever
+    // served. `mock_expect_zero` (#2599) declares that instead of leaving
+    // it for `GuardedMockServer`'s drop-time check to flag.
+    server.mock_expect_zero(move |when, then| {
         when.method(POST).path("/v1/chat/completions").matches(|req| {
             let b = body_of(req);
             let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
@@ -700,7 +733,7 @@ fn a_non_reasoning_models_first_call_is_not_capped_by_the_reasoning_interval() {
 #[test]
 #[serial_test::serial]
 fn a_separate_field_reasoning_turn_is_seen_even_when_it_also_dispatches_tools() {
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
 
     let mut turn1_body = chat_response_json(
         None,
@@ -802,12 +835,39 @@ fn body_has_adjacent_assistants(r: &HttpMockRequest) -> bool {
 #[serial_test::serial]
 fn a_salvage_after_a_checkpoint_never_leaves_two_assistant_messages_adjacent() {
     const MARK: &str = "BANKED-REASONING";
-    let server = MockServer::start();
+    let server = GuardedMockServer::start();
 
     let opening = format!(
         "<think>\n{MARK} {}",
         (0..60).map(|i| format!("tracing call site {i} through module {i}. ")).collect::<String>()
     );
+
+    // Registered FIRST, ahead of `_m1`/`_m2` below. httpmock serves the
+    // FIRST-REGISTERED mock whose predicate matches (#2541) — `_m1` and
+    // `_m2`'s predicates are exact complements (`!contains(MARK)` /
+    // `contains(MARK)`), so together they match every request. Registering
+    // the detector after them means it is never even consulted: the
+    // counter it increments stays at 0 regardless of whether the
+    // invariant holds, and the assertion below cannot fail. Registering it
+    // FIRST fixes that without changing routing — its own predicate
+    // (`body_has_adjacent_assistants`) is false for every well-formed
+    // request, so it always falls through to `_m1`/`_m2` and only
+    // intercepts (and counts) a request that actually violates the
+    // invariant.
+    ADJACENT_ASSISTANT_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
+    // `mock_expect_zero`: this mock is deliberately never meant to be
+    // served (see the doc comment above) — its real job is the matcher
+    // closure's side-channel count, not its response. `GuardedMockServer`
+    // (#2599) would otherwise flag it as an unhit mock at teardown, same
+    // as it would any other silently-shadowed mock; this declares the
+    // zero legitimate instead of leaving it invisible to the guard.
+    let _detector = server.mock_expect_zero(|when, then| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .matches(body_has_adjacent_assistants);
+        then.status(500).body("never served — this mock only observes");
+    });
+
     let _m1 = server.mock(move |when, then| {
         when.method(POST).path("/v1/chat/completions").matches(|r: &HttpMockRequest| {
             !body_of(r).contains(MARK)
@@ -830,14 +890,6 @@ fn a_salvage_after_a_checkpoint_never_leaves_two_assistant_messages_adjacent() {
             100,
             200,
         ));
-    });
-
-    ADJACENT_ASSISTANT_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
-    let _detector = server.mock(|when, then| {
-        when.method(POST)
-            .path("/v1/chat/completions")
-            .matches(body_has_adjacent_assistants);
-        then.status(500).body("never served — this mock only observes");
     });
 
     let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));

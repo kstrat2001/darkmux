@@ -1497,6 +1497,7 @@ pub struct BudgetSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::GuardedMockServer;
 
     // ─── #372 T2-B: structured_compact() end-to-end (mocked LMStudio) ─
 
@@ -1556,7 +1557,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn structured_compact_happy_path_splices_synthetic_system_message() {
-        let server = MockServer::start();
+        let server = GuardedMockServer::start();
         // (#381 Independence S1) `body_contains` ties this integration
         // path to the extracted `build_compactor_user_message` helper.
         // Without it, a future refactor could leave the helper +
@@ -1621,7 +1622,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn compact_tail_boundary_orphans_tool_result() {
-        let server = MockServer::start();
+        let server = GuardedMockServer::start();
         // (#1389) A realistic summary that clears the degenerate floor; the
         // middle messages below carry long content so the min-reduction guard
         // is satisfied (this test's subject is the orphan invariant, not the
@@ -1715,7 +1716,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn compact_returns_inserted_summary_char_count() {
-        let server = MockServer::start();
+        let server = GuardedMockServer::start();
         // (#1389) >= MIN_SUMMARY_CHARS and no structural delimiters, so it
         // clears the degenerate-summary floor and passes through the
         // sanitizer unchanged; the enlarged middle (see the helper) clears
@@ -1754,7 +1755,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn structured_compact_retries_once_on_parse_fail() {
-        let server = MockServer::start();
+        let server = GuardedMockServer::start();
         // Use two mocks: first call returns malformed JSON, second
         // returns valid. httpmock plays them in declaration order
         // when paths match (assuming hits accumulate); to make
@@ -1792,7 +1793,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn structured_compact_bails_when_both_attempts_malformed() {
-        let server = MockServer::start();
+        let server = GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200)
@@ -2781,7 +2782,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn structured_compact_with_custom_instructions_appends_to_system_prompt() {
-        let server = MockServer::start();
+        let server = GuardedMockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
@@ -3323,7 +3324,7 @@ mod tests {
         // narrative path retries once, then escalates via Err WITHOUT
         // installing the garbage. messages stay intact for the caller's
         // error path.
-        let server = MockServer::start();
+        let server = GuardedMockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200)
@@ -3355,7 +3356,7 @@ mod tests {
         // pass. Here the "summary" is LONGER than the small middle, so the
         // reduction is negative. Exactly ONE compactor call (no re-summarize
         // of identical input).
-        let server = MockServer::start();
+        let server = GuardedMockServer::start();
         let long_summary = "This summary is deliberately verbose and long enough to clear the \
                             degenerate-output floor, but the conversation middle it replaces is \
                             tiny, so installing it would barely reduce — or even grow — the \
@@ -3398,7 +3399,7 @@ mod tests {
         // A good summary (clears floor + reduction) that ALSO echoes a code
         // fence gets installed with the fence neutralized (the happy path
         // still applies the sanitizer).
-        let server = MockServer::start();
+        let server = GuardedMockServer::start();
         let good = "Refactored the auth module and verified the change. ```rust\nfn ok(){}\n``` \
                     Ran the full test suite plus clippy, both clean. Remaining work is to \
                     update the workspace manifest and re-run before opening the PR for review."
