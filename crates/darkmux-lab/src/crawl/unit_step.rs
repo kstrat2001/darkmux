@@ -844,11 +844,49 @@ impl UnitStepConfig {
             .context("no_progress_turns does not fit usize")?,
             None => DEFAULT_NO_PROGRESS_TURNS,
         };
-        let timeout_seconds = step
-            .config
-            .get("timeout_seconds")
-            .and_then(|v| v.as_u64())
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+        // (#2542 follow-up review) String-or-number, leniently — the same
+        // parse `draws` below uses, for the same reason: a `--param
+        // timeout_seconds=45` reaches step config as a JSON string, never a
+        // number, and `.as_u64()` alone silently read that as absent —
+        // `timeout_override_seconds` stayed `None` and the unit ran
+        // unbounded, the exact failure this field exists to prevent, just
+        // one hop further down the same config-key path #2542 fixed for the
+        // literal-integer form.
+        let timeout_seconds = match step.config.get("timeout_seconds") {
+            None => None,
+            Some(serde_json::Value::Null) => None,
+            Some(v) => {
+                let n = v
+                    .as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "step `{}`: `{CRAWL_UNIT_KIND}` config.timeout_seconds must be a positive \
+                             integer, got {v}",
+                            step.id
+                        )
+                    })?;
+                // (#2542 follow-up review) `0` is refused, not accepted as
+                // "unbounded" or silently accepted as "instant kill": it
+                // resolves straight into `timeout_override_seconds`, which
+                // `effective_inactivity_timeout_seconds` treats as an
+                // already-elapsed inactivity deadline — the host watchdog
+                // kills the unit at its first poll. Mirrors `darkmux
+                // dispatch --timeout`'s own `range(1..)` clap validator
+                // (src/cli.rs, #2480 review blocker 6), which refused `0`
+                // for exactly this reason on the CLI path; a config-file
+                // route to the same field gets the same floor.
+                anyhow::ensure!(
+                    n >= 1,
+                    "step `{}`: `{CRAWL_UNIT_KIND}` config.timeout_seconds must be >= 1 — `0` \
+                     resolves to an already-expired inactivity deadline (an instant kill), not \
+                     'unbounded'. Omit `timeout_seconds` for the standing env/config/600 default, \
+                     or set a real positive bound.",
+                    step.id
+                );
+                Some(u32::try_from(n).unwrap_or(u32::MAX))
+            }
+        };
         // Empty-string filtered (matches `str_field`'s convention above):
         // an unresolved `{{intent_file}}` template on a launch with no
         // `intent_file` param renders as `""`, which must read as ABSENT,
@@ -1331,6 +1369,19 @@ impl StepKind for CrawlUnitStepKind {
                 role_id: role_id.clone(),
                 message: message.clone(),
                 session_id: Some(draw_session_id.clone()),
+                // (#2542) This field bounds ONLY the tool-less single-call
+                // paths (`dispatch_remote`'s `curl -m`, the single-shot
+                // path) — see `DispatchOpts::timeout_seconds`'s own doc.
+                // Every shipped crawl-unit role is tool-granting and runs in
+                // a container, the ONE path that field never reaches, so it
+                // is set here only for parity with every other caller's
+                // convention of filling the required `u32`; the real bound
+                // is `timeout_override_seconds` below. (`role_id` is
+                // author-supplied — a hand-authored tool-less role would
+                // take the remote path instead, where this field DOES bound
+                // it. Not a defect either way: `timeout_override_seconds`
+                // below carries the same resolved value, so the two fields
+                // can never disagree about what the bound should be.)
                 timeout_seconds: cfg.timeout_seconds.unwrap_or(600),
                 skip_preflight: false,
                 json: true,
@@ -1370,7 +1421,19 @@ impl StepKind for CrawlUnitStepKind {
                 // now, not this kind's own parameter — see the issue.
                 resume_from: None,
                 max_turns_override: Some(default_unit_max_turns(unit)),
-                timeout_override_seconds: None, // (#2480) no per-unit surface yet
+                // (#2542) The real per-unit bound: `DispatchOpts::
+                // timeout_override_seconds` is the ONLY field the
+                // container-agentic path reads (it feeds the inactivity
+                // budget `dispatch_internal::effective_inactivity_
+                // timeout_seconds` resolves), so `config.timeout_seconds`
+                // has to route HERE, not into `timeout_seconds` above, or
+                // the knob a mission-config author sets bounds nothing —
+                // #2480's bug one abstraction layer up. A step that never
+                // set `timeout_seconds` stays `None`, so the standing
+                // `env(DARKMUX_INACTIVITY_TIMEOUT_SECONDS)` / `config.
+                // runtime.inactivity_timeout_seconds` / 600 resolution is
+                // unchanged from before this fix.
+                timeout_override_seconds: cfg.timeout_seconds,
                 // Provenance the runtime cannot know — merged by the host
                 // tailer under `payload.context` on every record this unit's
                 // dispatch produces.
