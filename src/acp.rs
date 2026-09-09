@@ -657,9 +657,11 @@ type RouterCall = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
 /// instead of rendering the bare reason) never touches a live model under
 /// test either. Takes the fully-assembled user message (grounding + the
 /// original text — see `radio_answer::build_answer_message`) plus the
-/// session's config-option overrides; `run()`'s production call site wires
-/// `radio_answer::dispatch_answerer_call_with` directly (its signature
-/// already matches this alias exactly).
+/// session's config-option overrides; `run()`'s production call site wraps
+/// `radio_answer::dispatch_answerer_call_with` with the surface pinned to
+/// [`crate::radio::RadioSurface::Panel`] — ACP is the panel surface by
+/// construction, so that argument is never a runtime choice here the way
+/// it is in `radio_cli.rs` (#1861).
 type AnswererCall = Arc<dyn Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync>;
 
 /// The DATA-BOUNDARY seam (#1698 Packet B2 gate): how much of this
@@ -700,7 +702,12 @@ pub fn run() -> Result<i32> {
         .build()
         .context("building the tokio runtime for `darkmux acp`")?;
     let router: RouterCall = Arc::new(crate::radio::dispatch_router_call);
-    let answerer: AnswererCall = Arc::new(crate::radio_answer::dispatch_answerer_call_with);
+    // (#1861) ACP is the panel surface by construction — pinned here, not
+    // threaded as a runtime choice the way `radio_cli.rs` threads the CLI
+    // surface. Pinned by a test; see this file's test module.
+    let answerer: AnswererCall = Arc::new(|m: &str, overrides: &crate::radio_answer::AnswererOverrides| {
+        crate::radio_answer::dispatch_answerer_call_with(m, overrides, crate::radio::RadioSurface::Panel)
+    });
     let scope: ScopeCall = Arc::new(crate::radio_answer::grounding_scope_for);
     rt.block_on(serve(router, AnsweringSeat { call: answerer, scope }, Arc::new(IdleState::new()), AcpStdio::new()))?;
     Ok(0)
@@ -1585,9 +1592,15 @@ async fn answer_no_slash_refusal(
     let cwd_owned = cwd.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
         let catalog = crate::radio::compile_catalog();
-        crate::radio_answer::answer(&text_owned, &catalog, &shelf, &cwd_owned, scope, &mut |m: &str| {
-            (seat.call)(m, &overrides)
-        })
+        crate::radio_answer::answer(
+            &text_owned,
+            &catalog,
+            &shelf,
+            &cwd_owned,
+            scope,
+            crate::radio::RadioSurface::Panel,
+            &mut |m: &str| (seat.call)(m, &overrides),
+        )
     })
     .await
     .context("joining the radio answering task")?;
@@ -2260,6 +2273,40 @@ mod tests {
             "above the floor the multiplier is what applies"
         );
         assert_eq!(hard_idle_threshold(u64::MAX), u64::MAX, "and the multiply saturates rather than wrapping");
+    }
+
+    /// (#1861 review) This file's PRODUCTION half — everything ahead of
+    /// its own test module. Searched instead of the whole file on purpose:
+    /// a needle spelled out in a test must never be able to satisfy an
+    /// assertion about the production call site.
+    fn production_source() -> &'static str {
+        let src = include_str!("acp.rs");
+        let cut = src.find("#[cfg(test)]").expect("this file has a test module");
+        &src[..cut]
+    }
+
+    /// (#1861 review) ACP's two answering call sites — `run()`'s
+    /// `AnswererCall` closure and `answer_no_slash_refusal`'s `answer()`
+    /// call — both CLAIM the panel surface in their comments. Neither was
+    /// pinned: flipping either literal to `Cli` would make the panel start
+    /// rewriting its own real `/id` references as invented, with every
+    /// test green. Both sites need a live connection to exercise, so the
+    /// claim is pinned against the artifact that makes it.
+    #[test]
+    fn both_acp_answering_call_sites_pin_the_panel_surface() {
+        let src = production_source();
+        assert!(
+            src.contains("dispatch_answerer_call_with(m, overrides, crate::radio::RadioSurface::Panel)"),
+            "run()'s answerer closure must pin the panel surface"
+        );
+        assert!(
+            src.contains("            scope,\n            crate::radio::RadioSurface::Panel,"),
+            "answer_no_slash_refusal must pass the panel surface to `answer()`"
+        );
+        assert!(
+            !src.contains("RadioSurface::Cli"),
+            "ACP is the panel surface by construction — nothing here may claim the CLI's"
+        );
     }
 
     /// RAII env-var guard — isolates `DARKMUX_CREW_DIR`/`DARKMUX_FLOWS_DIR`

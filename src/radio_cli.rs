@@ -77,7 +77,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let shelf = crate::radio_answer::ArtifactShelf::default();
             let overrides = crate::radio_answer::AnswererOverrides::default();
-            match crate::radio_answer::answer_live(text, &catalog, &shelf, &cwd, &overrides) {
+            match crate::radio_answer::answer_live(text, &catalog, &shelf, &cwd, &overrides, radio::RadioSurface::Cli) {
                 Ok(outcome) => {
                     println!("radio: {}", outcome.rendered);
                     Ok(0)
@@ -393,6 +393,34 @@ fn cli_gate_handler() -> Box<crate::crew::gate::GateHandler<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#1861 review) This file's PRODUCTION half — everything ahead of
+    /// its own test module. Searched instead of the whole file on purpose:
+    /// a needle spelled out in a test must never be able to satisfy an
+    /// assertion about the production call site.
+    fn production_source() -> &'static str {
+        let src = include_str!("radio_cli.rs");
+        let cut = src.find("#[cfg(test)]").expect("this file has a test module");
+        &src[..cut]
+    }
+
+    /// (#1861 review) Every sanitizer test pins the HELPER; none pinned
+    /// that the caller passes the right surface, so flipping this one
+    /// literal to `Panel` reinstated the whole reported defect with all
+    /// tests still green. `run()` reaches a live model, so the claim is
+    /// pinned where it is actually made.
+    #[test]
+    fn the_cli_entry_point_answers_on_the_cli_surface() {
+        let src = production_source();
+        assert!(
+            src.contains("answer_live(text, &catalog, &shelf, &cwd, &overrides, radio::RadioSurface::Cli)"),
+            "the CLI answering call must pass the CLI surface"
+        );
+        assert!(
+            !src.contains("RadioSurface::Panel"),
+            "nothing in `darkmux radio`'s own path may claim the panel surface"
+        );
+    }
 
     // (Issue #1698 test-plan note) `--dry-run` needs a real routing call,
     // which needs a live model — the CLI's own `run()` wires
