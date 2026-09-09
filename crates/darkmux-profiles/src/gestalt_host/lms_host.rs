@@ -21,7 +21,7 @@
 //!   failure can be classified into the `Eq` [`HostError`] vocabulary the
 //!   packet-3 executor matches on, instead of an opaque anyhow bail.
 
-use crate::lms::lms_bin;
+use crate::lms::{lms_bin, pin_cwd};
 use darkmux_gestalt::{CatalogFact, Deadline, HostError, LoadReport, ModelHost, ResidentFact};
 use darkmux_gestalt::OwnedTarget;
 use std::process::{Command, Stdio};
@@ -405,25 +405,24 @@ pub(crate) fn run_bounded(
     deadline: Deadline,
     stdout_mode: StdoutMode,
 ) -> Result<BoundedRun, HostError> {
-    // (#1863) Every caller through this chokepoint inherits the daemon's cwd
-    // by default. This project's own workflow is git worktrees that get
-    // removed — routinely, mid-session — and a daemon started from one keeps
-    // that now-deleted directory as its cwd for the rest of its life.
-    // Live-verified mechanism: `Command::spawn()` itself does NOT fail when
-    // the inherited cwd is gone (fork/exec doesn't need to resolve it) — the
-    // crash is inside the CHILD. `lms` is a Node CLI, and Node crashes hard
-    // reading its own `process.cwd()` at startup (`node -e 'process.cwd()'`
-    // from a deleted cwd exits 1: "ENOENT: process.cwd failed ... the current
-    // working directory was likely removed" — the exact shape the machine
-    // page reported), even though `lms` never reads or writes anything
-    // relative to cwd itself — it only talks to LMStudio's local socket. Pin
-    // to `/`: it needs no resolution (no `dirs::home_dir()` call that could
-    // return `None`, no darkmux-root lookup that could itself be
-    // cwd-sensitive via the project-local `./.darkmux` preference in
-    // `paths::resolve`), and it is guaranteed to exist for the whole life of
-    // the process on every POSIX target this project ships (Windows is not a
-    // build target — see CLAUDE.md).
-    cmd.current_dir("/");
+    // (#1863, named+tested #2534) Every caller through this chokepoint
+    // inherits the daemon's cwd by default. This project's own workflow is
+    // git worktrees that get removed — routinely, mid-session — and a
+    // daemon started from one keeps that now-deleted directory as its cwd
+    // for the rest of its life. Live-verified mechanism: `Command::spawn()`
+    // itself does NOT fail when the inherited cwd is gone (fork/exec
+    // doesn't need to resolve it) — the crash is inside the CHILD. `lms` is
+    // a Node CLI, and Node crashes hard reading its own `process.cwd()` at
+    // startup (`node -e 'process.cwd()'` from a deleted cwd exits 1:
+    // "ENOENT: process.cwd failed ... the current working directory was
+    // likely removed" — the exact shape the machine page reported), even
+    // though `lms` never reads or writes anything relative to cwd itself —
+    // it only talks to LMStudio's local socket. `pin_cwd` (`crate::lms`) is
+    // the one place this rule is written; every other spawn site in the
+    // workspace calls it too rather than repeating `.current_dir("/")`
+    // inline, and `pin_cwd_conformance` (this crate's `tests/`) asserts
+    // that holds.
+    pin_cwd(&mut cmd);
     cmd.stdin(Stdio::null());
     cmd.stdout(match stdout_mode {
         StdoutMode::Null => Stdio::null(),

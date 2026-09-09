@@ -34,6 +34,31 @@ pub(crate) fn lms_bin() -> String {
     darkmux_types::config_access::lms_bin()
 }
 
+/// Pin a model-host (or model-host-adjacent) child's working directory to
+/// `/`, so its spawn survives a daemon or dispatch process whose cwd was a
+/// git worktree that has since been removed (#1863).
+///
+/// **Named per #2534.** #1863 pinned every such spawn's cwd, but only the
+/// `run_bounded` chokepoint got a test — three spawns that bypass it (a
+/// bespoke stdio-inheriting load loop, a dispatch-path `lms ps` probe, and
+/// a lab-run hardware fingerprint) each carried their OWN copy of
+/// `cmd.current_dir("/")` with no test protecting it: deleting any one of
+/// them left the whole crate suite green. Giving the pin a name a reader
+/// can follow — and a conformance test that scans for every site that
+/// spawns `lms` (or an equally cwd-fragile probe) and asserts it calls
+/// this helper — is what makes a NEW unpinned spawn loud instead of silent.
+/// See `pin_cwd_conformance` (this crate's `tests/`) for the enumeration
+/// and `crate::gestalt_host::lms_host::run_bounded` for the chokepoint this
+/// helper is factored out of.
+///
+/// `/` needs no resolution (no `dirs::home_dir()` call that could return
+/// `None`, no darkmux-root lookup that could itself be cwd-sensitive) and
+/// is guaranteed to exist for the whole life of the process on every POSIX
+/// target this project ships (Windows is not a build target).
+pub fn pin_cwd(cmd: &mut Command) {
+    cmd.current_dir("/");
+}
+
 pub fn list_loaded() -> Result<Vec<LoadedModel>> {
     let mut cmd = Command::new(lms_bin());
     cmd.args(["ps", "--json"]);
@@ -244,12 +269,11 @@ pub fn load_with_identifier(
         "--identifier",
         identifier,
     ]);
-    // (#1863) This spawn bypasses `run_bounded`'s chokepoint fix (see that
-    // function's comment) by construction — it needs bespoke stdio handling
-    // for the load spinner — so it needs its own cwd pin. Same directory,
-    // same reasoning: `lms` never reads or writes relative to cwd, and `/`
-    // is guaranteed to exist for the process's whole life.
-    cmd.current_dir("/");
+    // (#1863, named+tested #2534) This spawn bypasses `run_bounded`'s
+    // chokepoint fix (see that function's comment) by construction — it
+    // needs bespoke stdio handling for the load spinner — so it needs its
+    // own cwd pin.
+    pin_cwd(&mut cmd);
     if quiet {
         // (#1135) `quiet` must actually SUPPRESS. `Command` inherits the
         // parent's stdio by default, so merely *not* setting it left the

@@ -118,15 +118,17 @@ impl MachineFingerprint {
     /// fingerprinting.
     pub fn detect(machine_id: &str) -> Self {
         let hw = darkmux_hardware::detect();
-        // (#1863) A lab run is routinely launched from a git worktree that
-        // gets removed later in the same session — if that worktree was the
-        // process's cwd, both spawns below would otherwise inherit a
-        // now-deleted directory and fail outright rather than degrade to
-        // `None`. Neither `sw_vers` nor `lms` reads or writes relative to
-        // cwd, so pin both to `/`: guaranteed to exist for the process's
-        // whole life, no resolution needed.
-        let os_version = std::process::Command::new("sw_vers")
-            .current_dir("/")
+        // (#1863, named+tested #2534) A lab run is routinely launched from a
+        // git worktree that gets removed later in the same session — if
+        // that worktree was the process's cwd, both spawns below would
+        // otherwise inherit a now-deleted directory and fail outright
+        // rather than degrade to `None`. Neither `sw_vers` nor `lms` reads
+        // or writes relative to cwd, so pin both via the one named helper
+        // (`darkmux_profiles::lms::pin_cwd` — see its doc comment for why
+        // `/`) rather than each repeating `.current_dir("/")` inline.
+        let mut sw_vers_cmd = std::process::Command::new("sw_vers");
+        darkmux_profiles::lms::pin_cwd(&mut sw_vers_cmd);
+        let os_version = sw_vers_cmd
             .arg("-productVersion")
             .output()
             .ok()
@@ -136,8 +138,9 @@ impl MachineFingerprint {
         // `lms --version` emits one plain line (`CLI commit: efce996`);
         // bare `lms version` emits a multi-line ANSI-art banner, which the
         // first tool-bench live run stored verbatim as the fingerprint.
-        let engine_version = std::process::Command::new("lms")
-            .current_dir("/")
+        let mut lms_version_cmd = std::process::Command::new("lms");
+        darkmux_profiles::lms::pin_cwd(&mut lms_version_cmd);
+        let engine_version = lms_version_cmd
             .arg("--version")
             .output()
             .ok()
