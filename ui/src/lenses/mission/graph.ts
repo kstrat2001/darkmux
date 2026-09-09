@@ -73,6 +73,17 @@ export interface MissionGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
   note?: string;
+  /** (#2518) Epoch ms this snapshot was BUILT server-side
+   * (`mission_graph.rs::MissionGraph.generated_at_ms`, always present on
+   * the wire — `current_millis()` at build time). Was already being sent
+   * and silently dropped by this type before #2518; now load-bearing —
+   * see `foldFlowRecords`'s own doc for why a snapshot's own build time is
+   * what tells a STALE flow record (already baked into this snapshot's own
+   * fresh computation) apart from a NEWER one (arrived since, still worth
+   * folding). Optional so a fixture with no opinion on freshness (most of
+   * this file's own test fixtures) falls back to today's fold-everything
+   * behavior — see `foldFlowRecords`. */
+  generated_at_ms?: number;
 }
 
 // ─── layout (mission-graph.html: computeLayout) ────────────────────────────
@@ -759,10 +770,48 @@ export function applyFlowRecord(graph: MissionGraph, rec: FlowRecord, idx: Graph
  * `MissionGraphLens` recomputes from on every backfill/live-tail change,
  * rather than the legacy page's incremental per-record `setState` — see
  * this module's own doc for why a pure fold replaces the imperative
- * reducer in this port. */
+ * reducer in this port.
+ *
+ * (#2518) Skips any record whose `ts` is NOT STRICTLY NEWER than
+ * `baseGraph.generated_at_ms` — a record at or before the snapshot's own
+ * build time is already baked into that snapshot's fresh, server-computed
+ * values (`mission_graph.rs::derive_task_status`/`phase_task_rollup`
+ * re-derive from CURRENT data on every build), so replaying it can only
+ * ever be redundant or actively WRONG, never additive.
+ *
+ * Before this gate, a handle whose own node status a flow record can flip
+ * (`STATUS_ACTIONS` — phases and steps; tasks carry no status-bearing
+ * action of their own) had every record it had EVER received replayed
+ * against the fresh snapshot on every fold, `keepPageStatus`-guarded. That
+ * guard is right for a LIVE record racing ahead of the periodic
+ * `graph.json` poll — the exact case a record here that IS newer than the
+ * snapshot still needs to win, unconditionally, same as before this fix.
+ * It is wrong for a HISTORICAL record: a phase legitimately reads
+ * `planned` again in a fresh, later snapshot (`derive_task_status` can
+ * regress `Running`→`Planned` between a task's steps, and #2406 makes a
+ * phase's own display status a rollup of its tasks') and an old "phase
+ * start" record from back when the phase first went `Running` would
+ * out-rank it and PIN the chip at `running` forever — proven with a real
+ * fold+render before this fix landed (`running`→`planned` snapshot regress
+ * + a stale matching record ⇒ the chip stayed on `running` after the
+ * reconcile poll; see this repo's `mission-lens-status-vocab.spec.js`
+ * "#2518" case). Filtering by snapshot recency here, rather than loosening
+ * `keepPageStatus` itself, keeps the unknown-status arrival/held asymmetry
+ * `keepPageStatus` documents completely untouched — this only decides
+ * which records are even ELIGIBLE to reach it.
+ *
+ * `<=`, not `<`: a record stamped in the exact same instant the snapshot
+ * was built carries no information the snapshot doesn't already have.
+ * `generated_at_ms` missing (older fixtures, hand-built graphs with no
+ * opinion on freshness) folds every record, unfiltered — today's
+ * pre-#2518 behavior, preserved as the lenient-on-read default. */
 export function foldFlowRecords(baseGraph: MissionGraph, records: FlowRecord[], idx: GraphIndex, missionId: string): MissionGraph {
+  const snapshotMs = baseGraph.generated_at_ms;
   let g = baseGraph;
-  for (const rec of records) g = applyFlowRecord(g, rec, idx, missionId);
+  for (const rec of records) {
+    if (snapshotMs !== undefined && tsToMs(rec.ts) <= snapshotMs) continue;
+    g = applyFlowRecord(g, rec, idx, missionId);
+  }
   return g;
 }
 
