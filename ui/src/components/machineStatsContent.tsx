@@ -580,6 +580,29 @@ export function useMachineStatsContent({
     !isMissionOrDispatch && daemonLoad != null
       ? daemonWindowLabel(daemonLoad.window?.span_ms ?? 0)
       : scope.scopeLabel;
+  // (#2270) `HostExtras` (below) renders thermal/power/energy off
+  // `daemonLoad` DIRECTLY, unconditionally on every route — see that
+  // component's own doc for why (those readings are never scoped to a
+  // dispatch on the wire). On a mission/dispatch route that means those
+  // three rows are NOT the same window `scopeLabel` above just promised
+  // ("this mission"/"this dispatch") — they are still the daemon ring's
+  // rolling window, exactly like every other route. This is the BARE span
+  // of that window ("2 min", "<1 min"), for `meterFootnote` to name in a
+  // sentence of its own; the composed `daemonWindowLabel` form reads
+  // correctly only as a standalone lead-in, which is what `scopeLabel`
+  // above uses it for.
+  //
+  // `null` when there is NO daemon reading at all (an older daemon, a
+  // disabled sampler, an unreachable one, or a poll that hasn't resolved
+  // yet): `HostExtras` then renders no thermal/power/energy row at all, so
+  // there is nothing for the second sentence to describe and the footnote
+  // keeps its single-sentence form. Deriving a fallback from
+  // `scope.scopeLabel` here would make both halves of that sentence say
+  // "this mission" and contradict itself.
+  const extrasWindowLabel =
+    daemonLoad != null
+      ? windowMinutesLabel(daemonLoad.window?.span_ms ?? 0)
+      : null;
   // (#2250 layout model) "sampler cost" is a fact like any other, so it is
   // a kv row in Load rather than a free-floating caption line with its own
   // one-off style rule (`.machine-drawer__sampler-cost`, now deleted).
@@ -823,10 +846,13 @@ export function useMachineStatsContent({
   // and the sections stay uncluttered.
   //
   // It NAMES each aggregate rather than saying "avg and max", because the
-  // operator noticed thermal's "highest severity" is obviously windowed
-  // and was not listed — an unnamed value leaves the reader guessing which
-  // window it belongs to. The split is exhaustive and checkable against
-  // the code, not asserted:
+  // operator noticed the windowed thermal row was obviously windowed and
+  // was not listed — an unnamed value leaves the reader guessing which
+  // window it belongs to. That row is now labeled "peak (N min)" (#2440
+  // round 2), so this sentence calls it "the thermal peak"; it named the
+  // row's old "highest severity" label until #2270 caught the drift, which
+  // is exactly the way this sentence goes stale. The split is exhaustive
+  // and checkable against the code, not asserted:
   //   `load.window` -> cpu/gpu/mem `.mean`/`.max` (the avg·max under each
   //     gauge), `thermal.worst_state`, `thermal.above_nominal_ms`,
   //     `power_mw` (avg/p95/max), `energy_mwh`
@@ -844,9 +870,31 @@ export function useMachineStatsContent({
   // view). Hardcoding 24h would be wrong in most of those, so this reuses
   // the SAME value the Load section shows rather than asserting a figure it
   // cannot back. Rendered last so it reads as a footnote to the whole panel.
+  //
+  // (#2270) On a mission/dispatch route, `scopeLabel` ("this mission"/"this
+  // dispatch") is TRUE for the gauges' avg/max — `scope.samples` really is
+  // that run's own records — but thermal/power/energy are not that run's
+  // records at all; `HostExtras` reads `daemonLoad` directly, the same
+  // rolling ring every other route uses (see that component's own doc). A
+  // mission that ran above-nominal for 1h47m can only ever show up to the
+  // ring's own ceiling (10 min), so "measured over this mission" on that
+  // number claims a scope the reading never had. One sentence can't
+  // honestly cover both windows when they differ, so this splits into two
+  // — but ONLY when there is a daemon reading for the second half to
+  // describe (`extrasWindowLabel != null`; see its own doc). Every other
+  // route has one window for everything and keeps the single sentence.
+  //
+  // The split branch also says "current and host-wide" rather than plain
+  // "current": on a mission/dispatch route with a daemon reading,
+  // `effectiveHostAggregate` overrides every one of those live figures —
+  // the gauges' large numbers included — with the daemon's own host-wide
+  // sample. Saying only "current" there would repeat, one clause later,
+  // exactly the scope conflation the sentence before it just corrected.
   const meterFootnote = scopeLabel ? (
     <div className="machine-drawer__footnote">
-      {`Measured over ${scopeLabel} — each gauge's avg and max, the highest thermal severity and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`}
+      {isMissionOrDispatch && extrasWindowLabel != null
+        ? `Measured over ${scopeLabel} — each gauge's avg and max. Thermal, power and energy are not this ${route.kind === "mission" ? "mission" : "dispatch"}'s; they come from the daemon's host-wide sampler and cover its last ${extrasWindowLabel}. Everything else is current and host-wide: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`
+        : `Measured over ${scopeLabel} — each gauge's avg and max, the thermal peak and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`}
     </div>
   ) : null;
 

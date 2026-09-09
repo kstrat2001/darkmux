@@ -826,16 +826,218 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     // though the mission's own last sample was GPU 55%.
     await waitFor(() => expect(screen.getByText("56%")).toBeInTheDocument());
 
-    // Scope label stays the mission's own — the daemon suffix/cost line is
-    // a non-mission/non-dispatch-only affordance.
+    // Gauge scope label stays the mission's own — the "sampler cost" kv
+    // row is a non-mission/non-dispatch-only affordance, unaffected by
+    // #2270 below (it never claimed a mission scope to begin with).
     expect(
       document.querySelector(".machine-drawer__footnote")!.textContent,
     ).toContain("this mission");
-    expect(screen.queryByText(/daemon sampler/)).toBeNull();
     expect(screen.queryByText(/sampler cost/)).toBeNull();
     // avg/max stay the mission's OWN dispatch-derived numbers (55, the
     // single sample's own value), not the daemon's window (50/60).
     expect(screen.getByText(/55% avg/)).toBeInTheDocument();
+
+    // (#2270) Thermal/power/energy are NOT the mission's own records —
+    // `HostExtras` reads `daemonLoad` directly on every route, so those
+    // three rows are still the daemon ring's rolling window here, exactly
+    // like a non-mission route. The footnote used to claim "this mission"
+    // for them too (a scope the reading never had, and one that silently
+    // caps at the ring's 10-minute ceiling for any longer mission) — it
+    // must now name the ring's own window instead, honestly, alongside
+    // (not instead of) the mission scope it correctly keeps for the
+    // gauges.
+    const footnoteText =
+      document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
+    expect(footnoteText).toContain("not this mission's");
+    expect(footnoteText).toContain("cover its last 2 min");
+  });
+
+  it("(#2270) on a dispatch route, the footnote names the dispatch scope for the gauges and the daemon ring for thermal/power/energy separately", async () => {
+    stubDaemonFetch();
+    render(
+      <MachineDrawer
+        route={{ kind: "dispatch", dispatchId: "d1" }}
+        routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    await waitFor(() => expect(screen.getByText("56%")).toBeInTheDocument());
+    const footnoteText =
+      document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
+    expect(footnoteText).toContain("Measured over this dispatch");
+    expect(footnoteText).toContain("not this dispatch's");
+    expect(footnoteText).toContain("cover its last 2 min");
+  });
+
+  /** (#2270 review) The split sentence's SECOND half describes the
+   * thermal/power/energy rows — which only exist when there is a daemon
+   * reading. With none (an older daemon, `runtime.host_sampler_interval_ms:
+   * 0`, an unreachable one, or a poll that hasn't resolved), gating the
+   * split on `isMissionOrDispatch` ALONE made both halves resolve to the
+   * run's own scope, so one sentence said thermal/power/energy were "not
+   * this mission's" and then that they were measured "over this mission" —
+   * wrong in both directions at once, about rows that are not even on the
+   * page. The footnote must fall back to its single-sentence form here,
+   * byte for byte the same text every other daemon-less route gets. */
+  it("(#2270) on a mission route with NO daemon load, the footnote keeps the single-sentence form instead of contradicting itself", async () => {
+    // An older daemon: `/machine/resources` resolves fine, but carries no
+    // `load` block at all, so `useDaemonLoad` returns null on a settled
+    // query rather than merely a pending one.
+    const { load: _noLoad, ...RESOURCES_WITHOUT_LOAD } = RESOURCES_WITH_LOAD;
+    const fetchMock = stubDaemonFetch(RESOURCES_WITHOUT_LOAD);
+    render(
+      <MachineDrawer
+        route={{ kind: "mission", missionId: "m1", stepId: null }}
+        routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    // A load-less payload leaves NOTHING on the page that changes when the
+    // poll settles, so there is no positive condition to `waitFor` — and
+    // microtask flushes alone do not get there (`Response.json()` needs
+    // real turns of the event loop). This settles on a timer instead,
+    // long enough that the same wait shows the daemon's own rows on the
+    // sibling populated-fixture test below. Both the transient
+    // not-yet-resolved state and the permanent no-`load` one render
+    // identically here, which is the point: the footnote must be right in
+    // both.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    // The mission's own numbers, unoverridden — no daemon `now` to take.
+    expect(screen.getByText(/55% avg/)).toBeInTheDocument();
+    // No thermal/power/energy row on the page for a second sentence to
+    // describe, so there must not be one.
+    expect(document.querySelector(".thermal-row")).toBeNull();
+    expect(document.querySelector(".power-block")).toBeNull();
+    expect(
+      document.querySelector(".machine-drawer__footnote")!.textContent,
+    ).toBe(
+      "Measured over this mission — each gauge's avg and max, the thermal peak and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.",
+    );
+  });
+
+  /** (#2270 review) Every other fixture in this file spans 90s, which
+   * rounds to "2 min" — so replacing `windowMinutesLabel`'s whole body with
+   * `return "2 min"` left the entire file green, including the fleet test
+   * above whose own comment claims it proves the label is not hardcoded. A
+   * SECOND span is what actually pins it: 400s rounds to 7 min, a value no
+   * plausible hardcode produces. Covers both call sites of that helper's
+   * output at once — the composed lead-in on a fleet route (here) and the
+   * bare form in the mission split sentence (the test below). */
+  it("(#2270 review) a second, different span proves the window label is computed, not hardcoded", async () => {
+    stubDaemonFetch({
+      ...RESOURCES_WITH_LOAD,
+      load: {
+        ...RESOURCES_WITH_LOAD.load,
+        window: { ...RESOURCES_WITH_LOAD.load.window, span_ms: 400_000 },
+      },
+    });
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    // 400_000ms → 6.67 min → 7, not the 2 every other fixture here rounds
+    // to and not the ring's 10-minute ceiling.
+    await waitFor(() =>
+      expect(
+        document.querySelector(".machine-drawer__footnote")?.textContent ?? "",
+      ).toContain("last 7 min · daemon sampler"),
+    );
+    expect(screen.queryByText(/last 2 min/)).toBeNull();
+  });
+
+  /** (#2270 review) The two tests above run against a fixture whose
+   * thermal, power and energy are all null, so neither ever co-observes
+   * the split sentence with the rows it describes. This one populates all
+   * three: the sentence's claim ("not this mission's; ... cover its last
+   * 7 min") is asserted alongside the rendered rows themselves, at a span
+   * that is not the file's default 2 min. */
+  it("(#2270 review) on a mission route the split sentence's window matches the thermal/power rows actually rendered beside it", async () => {
+    stubDaemonFetch({
+      ...RESOURCES_WITH_LOAD,
+      load: {
+        now: {
+          ...RESOURCES_WITH_LOAD.load.now,
+          thermal: { state: "fair", cpu_speed_limit_pct: 87 },
+          power_mw: { cpu: 5200, gpu: 3400, ane: 400, total: 9000 },
+        },
+        window: {
+          ...RESOURCES_WITH_LOAD.load.window,
+          span_ms: 400_000,
+          power_mw: {
+            total: { mean: 7800, p95: 9200, max: 11000 },
+            gpu: { mean: 2600, p95: 3600, max: 4200 },
+            cpu: { mean: 4700, p95: 5300, max: 6200 },
+          },
+          thermal: {
+            worst_state: "serious",
+            above_nominal_ms: 45_000,
+            min_cpu_speed_limit_pct: 80,
+          },
+          energy_mwh: 1289,
+        },
+      },
+    });
+    render(
+      <MachineDrawer
+        route={{ kind: "mission", missionId: "m1", stepId: null }}
+        routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    // The rows the second sentence is ABOUT are on the page here: the
+    // window's thermal peak (serious, differing from the lit fair), the
+    // time above nominal, and the power/energy block.
+    await waitFor(() =>
+      expect(screen.getByText("peak (7 min)")).toBeInTheDocument(),
+    );
+    // `kvValue`, not `getByText("Serious")` — the ladder renders a dimmed
+    // "Serious" step of its own on every thermal panel, so a bare text
+    // query matches two nodes and proves neither.
+    expect(kvValue("peak (7 min)")).toBe("Serious");
+    expect(kvValue("above nominal")).toBe("45s");
+    expect(kvValue("energy")).not.toBeNull();
+    const footnoteText =
+      document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
+    expect(footnoteText).toContain("Measured over this mission");
+    expect(footnoteText).toContain("not this mission's");
+    // The SAME span the "peak (7 min)" row above reports — one window, one
+    // number, no drift between the row and the sentence describing it.
+    expect(footnoteText).toContain("cover its last 7 min");
+    expect(footnoteText).not.toContain("2 min");
   });
 });
 
