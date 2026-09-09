@@ -262,10 +262,19 @@ pub struct CompactionConfig {
     /// context IT was loaded at, or, absent one, LMStudio would return a
     /// flat "model not found" (an identifier can't be JIT-loaded, unlike a
     /// bare key). `needs_compaction` now treats `None` as "compaction is
-    /// off for this dispatch" — the same degraded-but-completing mode a
-    /// failed compactor LOAD already produces on the host side (see
-    /// `ensure_utility_resident`'s doc in `dispatch_internal.rs`) — rather
-    /// than inventing a model to address that nothing on the host chose.
+    /// off for this dispatch."
+    ///
+    /// **This is NOT the same degraded mode a failed compactor LOAD
+    /// produces.** `ensure_utility_resident`'s own doc (`dispatch_internal.
+    /// rs`) is explicit that since #2536 a failed load no longer degrades
+    /// gracefully: the wire carries the darkmux identifier regardless, so
+    /// the dispatch DIES at its first compaction, hours in, with a warning
+    /// that says exactly that. `compactor_model: None` is a DIFFERENT,
+    /// genuinely new degraded mode chosen here — compaction never attempts
+    /// at all, and the dispatch completes (or overflows) instead of dying
+    /// mid-run. Disclosed to the operator via
+    /// [`compactor_disclosure_message`] rather than argued as precedent
+    /// this codebase already established.
     pub compactor_model: Option<String>,
     /// Which compactor implementation runs when the trigger fires.
     /// Operator opts into tier-2 by setting
@@ -466,6 +475,39 @@ impl CompactionConfig {
     }
 }
 
+/// (MUST FIX 1, #2571 follow-up) The operator-facing disclosure a dispatch
+/// owes at startup when it is about to run with NO compactor bound but a
+/// context window that says a long-running dispatch WOULD have compacted
+/// otherwise. Before this, an unset `internal.utility` binding produced no
+/// disclosure anywhere — no message, no trajectory event, no flow record,
+/// no envelope field — so a zero compaction count read identically to
+/// "never needed one." A long dispatch would run its transcript up against
+/// the primary model's context with only a soft trim between it and
+/// overflow, silently, with no context-overflow handling anywhere in the
+/// runtime to catch it.
+///
+/// Pure so `main.rs`'s actual `eprintln!` is testable without capturing
+/// stderr — call sites just print whatever this returns. `None` when
+/// compaction IS configured (`compactor_model` is `Some`, nothing to warn
+/// about) or when there's no context window to grow unbounded against
+/// (compaction was never going to trigger either way, so silence isn't
+/// hiding anything).
+pub fn compactor_disclosure_message(cfg: &CompactionConfig) -> Option<String> {
+    if cfg.compactor_model.is_some() {
+        return None;
+    }
+    let window = cfg.context_window?;
+    Some(format!(
+        "darkmux-runtime: no compactor is configured for this dispatch (#2571) — \
+         compaction is OFF. The primary model's context window is {window} tokens; this \
+         dispatch will grow its transcript against that window with only the built-in trim \
+         between it and overflow, and nothing will summarize the middle. This means the \
+         host's `internal.utility` binding is unset (or an old registry never set it) — bind \
+         it, or set an explicit `profile.runtime.compaction` compactor, before a long-running \
+         dispatch, or expect it to truncate or fail on overflow instead of compacting."
+    ))
+}
+
 /// (#482) CLI-input validation called from the runtime's `run`
 /// entrypoint before constructing a `CompactionConfig`. The contract:
 /// the runtime needs ONE of
@@ -549,15 +591,20 @@ pub fn validate_compaction_cli_inputs(
 /// - The conversation is long enough that middle-replace has
 ///   something meaningful to replace (head + 1 middle + tail).
 ///
-/// (#2571) The `compactor_model` gate is checked FIRST and unconditionally
-/// — before either token trigger — so a profile that happens to set an
-/// explicit `threshold_ratio`/`context_window` (which the host derives
-/// from the profile's default model regardless of whether a compactor is
-/// bound) can never trip the formula trigger into calling [`compact`] /
-/// [`structured_compact`] with nothing to address. `compact`/
-/// `structured_compact` both trust this gate: a caller invoking either
-/// directly without checking `needs_compaction` first gets a loud `Err`
-/// from them, never a silent default.
+/// (#2571) The `compactor_model` gate is UNCONDITIONAL — checked
+/// regardless of either token trigger's own state — so a profile that
+/// happens to set an explicit `threshold_ratio`/`context_window` (which
+/// the host derives from the profile's default model regardless of
+/// whether a compactor is bound) can never trip the formula trigger into
+/// calling [`compact`] / [`structured_compact`] with nothing to address.
+/// `compact`/`structured_compact` both trust this gate: a caller invoking
+/// either directly without checking `needs_compaction` first gets a loud
+/// `Err` from them, never a silent default. (The gate is written FIRST in
+/// the function body below for readability, not because ordering is
+/// load-bearing — every branch below it already returns `false` on its
+/// own inputs and none of them returns `true` early, so nothing here is
+/// pinned by a test that would catch the gate moving later; only its
+/// unconditional presence is.)
 pub fn needs_compaction(
     latest_prompt_tokens: u32,
     message_count: usize,
@@ -2315,6 +2362,50 @@ mod tests {
         );
         assert!(cfg.threshold_ratio.is_none());
         assert!(cfg.context_window.is_none());
+    }
+
+    // ─── MUST FIX 1 (#2571 follow-up): the compactor-unset disclosure ────
+
+    #[test]
+    fn compactor_disclosure_fires_when_unset_with_a_context_window() {
+        let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, Some(101_000), None);
+        let msg = compactor_disclosure_message(&cfg)
+            .expect("no compactor + a real context window must disclose");
+        assert!(
+            msg.contains("101000"),
+            "disclosure must name the actual context window so an operator can act on it: {msg}"
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("compaction is off"),
+            "disclosure must say plainly that compaction is off: {msg}"
+        );
+    }
+
+    #[test]
+    fn compactor_disclosure_silent_when_a_compactor_is_bound() {
+        let cfg = CompactionConfig::from_overrides(
+            Some(30_000),
+            Some("darkmux:qwen3-4b-instruct-2507".to_string()),
+            None,
+            Some(101_000),
+            None,
+        );
+        assert_eq!(
+            compactor_disclosure_message(&cfg),
+            None,
+            "a configured compactor must not trigger the unset-compactor disclosure"
+        );
+    }
+
+    #[test]
+    fn compactor_disclosure_silent_when_no_context_window() {
+        let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, None, None);
+        assert_eq!(
+            compactor_disclosure_message(&cfg),
+            None,
+            "no context window means compaction was never going to trigger either way — \
+             nothing to disclose"
+        );
     }
 
     /// (#482) Replaces the pre-#482 silent-fallback test. With no

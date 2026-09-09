@@ -942,6 +942,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         bail_after_compactions,
         compactor_custom_instructions,
     );
+    // (MUST FIX 1, #2571 follow-up) Disclose at startup, loudly, when this
+    // dispatch is about to run with no compactor bound but a context window
+    // that says compaction would otherwise have fired. Before this there
+    // was no signal anywhere — no message, no trajectory event, no flow
+    // record, no envelope field — so a zero compaction count read
+    // identically to "never needed one."
+    if let Some(msg) = compaction::compactor_disclosure_message(&compaction_cfg) {
+        eprintln!("{msg}");
+    }
     // (#1038) Wrap the role's output schema (--response-schema) into an LMStudio
     // json_schema response_format so every model turn is grammar-constrained to
     // that shape. Invalid/absent schema ⇒ None ⇒ free-form (today's behavior).

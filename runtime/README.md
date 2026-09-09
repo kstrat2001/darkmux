@@ -106,6 +106,15 @@ derives it from `profile.runtime.compaction.*` and passes it as CLI flags —
 and cumulative-token bounds arrive the same way via `--max-turns` / `--max-tokens`.
 The operator's tuning surface is the profile JSON, not shell env.
 
+**`--compactor-model` is now load-bearing, not cosmetic (#2571).** Omitting it
+does not fall back to a runtime default — it disables compaction outright for
+that dispatch. The runtime prints a startup disclosure when a context window
+was supplied but no compactor was; the host prints the equivalent warning
+before it would have applied the compaction flags. A dispatch with no
+compactor still runs (it just won't compact), so a long-running one will grow
+its transcript against the context window with only the built-in trim between
+it and overflow.
+
 ## Tests
 
 ```

@@ -4973,6 +4973,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                     eprintln!("{warning}");
                 }
             }
+        } else if let Some(warning) = compaction.unset_compactor_warning() {
+            // (MUST FIX 1, #2571 follow-up) `compactor_model` stayed `None`
+            // all the way through `from_profile` + `apply_utility_model` —
+            // no compactor is going to be loaded, and `apply_compaction_flags`
+            // (below, at the docker-spawn site) will therefore omit
+            // `--compactor-model` entirely. Before this, that silence was
+            // the ONLY signal: no message, no trajectory event, no flow
+            // record, no envelope field distinguished "never needed one"
+            // from "was never bound." Say so here, at the same point the
+            // bound case warns on a load failure — same class of disclosure,
+            // opposite trigger. `unset_compactor_warning` is pure and
+            // covered directly by `dispatch.rs`'s own unit tests; this call
+            // site sits behind the same `model_base_url_override.is_none()`
+            // mock-harness gate the bound arm above already notes is
+            // uncovered by this crate's dispatch()-level tests.
+            eprintln!("{warning}");
         }
     }
 
