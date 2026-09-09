@@ -4980,10 +4980,22 @@ mod tests {
     /// through a chain of `#[track_caller]` functions, so an un-annotated
     /// intermediate like this one used to stop that propagation cold.
     /// With it, a shadowed mock this helper registers is attributed to
-    /// whichever TEST called it, not to this function's own body — see
+    /// whichever TEST called it, not to this function's own body.
+    ///
+    /// Not red-provable here, by nature rather than by gap: all 3 real
+    /// callers register mocks that are always hit, so `GuardedMockServer`'s
+    /// Drop-time check never fires at this call site and removing the
+    /// annotation leaves the whole suite green (confirmed by mutation —
+    /// you cannot red-prove a diagnostic for a bug that does not exist).
+    /// The mechanism itself is proved on the ANALOG self-test instead —
     /// `test_support::self_tests::
     /// a_helper_marked_track_caller_reports_the_calling_tests_own_line`
-    /// for the two-callers-report-distinct-lines proof.
+    /// builds a helper with a deliberately unhit mock and shows two
+    /// distinct callers report two distinct lines — and that proof
+    /// transfers here because both helpers share the same shape (an
+    /// un-annotated intermediate between the test and
+    /// `GuardedMockServer::register`), not because this call site was
+    /// itself observed failing without the annotation.
     #[track_caller]
     fn register_three_turn_tool_then_stop_script(server: &crate::test_support::GuardedMockServer) {
         use httpmock::prelude::*;
@@ -9768,61 +9780,72 @@ mod tests {
         // `turn2` below to have been hit at least once.
         //
         // (#2541 full audit, instrumented via `Mock::hits()` across every
-        // runtime test registering 2+ mocks — 44 tests, 105 registrations,
-        // run whole-suite: this was the ONLY test where a registered mock
-        // a run was expected to reach went unserved. (Corrected in #2599's
-        // FIRST review pass from an initial 39 tests / 96 mocks: a
-        // direct-registration scan misses a helper function that
-        // registers mocks on the caller's behalf —
-        // `register_three_turn_tool_then_stop_script` registers 3 mocks
-        // and is called by 3 tests with no registration sites of their
-        // own, invisible to a scan that attributes registrations to the
-        // enclosing function — and misses a test whose two mocks live on
-        // two DIFFERENT servers, where shadowing is structurally
-        // impossible but the mocks still belong in the candidate set.
-        // Corrected AGAIN in #2599's SECOND review pass from 43 tests to
-        // 44: two independent source-level counting methods agree on 44
-        // tests / 105 registrations for this population (a test qualifies
-        // once it registers 2+ mocks, counting a helper's registrations
-        // against every caller). A THIRD, runtime-instrumented count of
-        // every `GuardedMockServer::start()` call in the whole crate (not
-        // just this 2+-mock population) comes out one higher than the
-        // 94 static call sites that make it up, because
+        // runtime test registering 2+ mocks, run whole-suite: this was
+        // the ONLY test where a registered mock a run was expected to
+        // reach went unserved.
+        //
+        // (#2599 round 3 review) Don't trust a specific test/registration
+        // count for this population — it doesn't reproduce. Three
+        // independent counting passes gave three different totals (an
+        // initial manual audit landed on 44 tests / 105 registrations;
+        // a later runtime-instrumented count gave 42 / 100; a separate
+        // source-level parse gave 43 / 106), and the gaps trace to the
+        // population DEFINITION doing the work rather than to counting
+        // error: whether a helper's registrations attribute to every
+        // caller (`register_three_turn_tool_then_stop_script` registers 3
+        // mocks with no registration site of its own and is called by 3
+        // tests), whether two same-named tests in different modules
+        // collapse under a name-based count, and whether a test that
+        // registers one mock per iteration of a loop counts at all
+        // (shadowing needs 2+ DISTINCT mocks on the same server). Rather
+        // than pick a fourth number, this comment describes what was
+        // audited instead of asserting a population size: every runtime
+        // test that registers 2+ mocks was checked via `Mock::hits()`
+        // across a whole-suite run, and (see the exemption count below)
+        // every found-unhit mock is now either fixed (this test) or
+        // deliberately exempted via `mock_expect_zero`.
+        //
+        // Two counts DO reproduce exactly and are safe to rely on. First:
+        // 94 static `GuardedMockServer::start()` call sites outside
+        // `test_support.rs` (confirmed by
+        // `grep -c 'let .*= .*GuardedMockServer::start();'` across
+        // `checkpoint_regression_tests.rs`, `compaction.rs`, and this
+        // file). Second: a RUNTIME-instrumented count of every
+        // `GuardedMockServer::start()` call across the whole crate comes
+        // out exactly one higher than those 94 static sites, because
         // `max_stall_recoveries_override_changes_the_escalation_point`
         // constructs its server inside a 2-iteration `for` loop — one
         // static site, two servers at run time. That test registers only
-        // ONE mock per iteration, so it is not itself part of the
-        // 44-test/105-registration shadowing-audit population (shadowing
-        // needs 2+ DISTINCT mocks); it is exactly the test responsible for
-        // the crate-wide static-vs-runtime construction-count gap.) The
-        // other 0-hit mocks found (9 total, across 8 tests — corrected
-        // from 8/7; the missed one is a bare registration with no `let`
-        // binding, so its hit count can't be read without going back and
-        // binding it first) are all deliberate, and every one is now
-        // registered through `GuardedMockServer::mock_expect_zero` with a
-        // written reason (#2599) rather than left to a hits-only check:
-        // an explicit `Mock::assert_hits(0)` proving a resumed/mid-turn
-        // dispatch never re-requests a call it already has, a "never
-        // actually serve — this mock only observes" detector whose
-        // predicate always returns false but does its real work as a
-        // side-channel counter (see `GuardedMockServer::mock_expect_zero`'s
-        // own doc in `test_support.rs` for why a hits-only check cannot
-        // safely exempt this shape on its own), or one arm of a pair of
+        // ONE mock per iteration, so — per the DEFINITION problem above —
+        // it is not part of any 2+-mock shadowing-audit population
+        // regardless of which count of that population you trust; it is
+        // exactly the test responsible for the crate-wide static-vs-
+        // runtime construction-count gap.
+        //
+        // The 0-hit mocks found (9 total, across 8 tests) are all
+        // deliberate, and every one is now registered through
+        // `GuardedMockServer::mock_expect_zero` with a written reason
+        // (#2599) rather than left to a hits-only check: an explicit
+        // `Mock::assert_hits(0)` proving a resumed/mid-turn dispatch never
+        // re-requests a call it already has, a "never actually serve —
+        // this mock only observes" detector whose predicate always
+        // returns false but does its real work as a side-channel counter
+        // (see `GuardedMockServer::mock_expect_zero`'s own doc in
+        // `test_support.rs` for why a hits-only check cannot safely
+        // exempt this shape on its own), or one arm of a pair of
         // genuinely mutually-exclusive predicates whose other branch this
-        // particular scripted run doesn't take. Of the 9: one uses a
+        // particular scripted run doesn't take. This 9-total breakdown
+        // DOES reproduce: one uses a
         // `body_contains("\"model\":\"test-primary\"")` /
-        // `\"test-compactor\"` discriminator (corrected from "six of
-        // seven" — that fraction was inherited from an older comment
-        // describing a different set and never re-checked); three use
-        // tool-role count matchers, three use disjoint content-sentinel
-        // predicates, one uses a token-limit predicate, and one is
+        // `\"test-compactor\"` discriminator, three use tool-role count
+        // matchers, three use disjoint content-sentinel predicates, one
+        // uses a token-limit predicate, and one is
         // `checkpoint_regression_tests::
         // a_salvage_after_a_checkpoint_never_leaves_two_assistant_messages_
-        // adjacent`'s observe-only `_detector` (corrected from
-        // "two/four/one", which omitted the detector as its own
-        // category). None of the 44
-        // are shadowed. Noted, not fixed: at least one of these mutually-
-        // exclusive-arm exemptions (`checkpoint_regression_tests::
+        // adjacent`'s observe-only `_detector` — 1 + 3 + 3 + 1 + 1 = 9.
+        // None of the 9 were found shadowed. Noted, not fixed: at least
+        // one of these mutually-exclusive-arm exemptions
+        // (`checkpoint_regression_tests::
         // an_answer_after_the_models_own_think_close_is_delivered`'s
         // `_m3`, and arguably `an_empty_tool_calls_turn_does_not_delete_
         // the_accumulation`'s `_m3` alongside it) belongs to a run that

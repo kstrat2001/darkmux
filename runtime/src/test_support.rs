@@ -71,8 +71,10 @@ struct Registration {
 /// guarantee it (or the exempted mock itself) is ever reachable is to
 /// register it before anything that could shadow it — which is the SAME
 /// mechanism as the ordering rule below, just paid for with a parallel
-/// bookkeeping structure instead of a single `Cell<bool>`. So this type
-/// enforces the ordering directly: `mock_expect_zero` panics IMMEDIATELY,
+/// bookkeeping structure the ordering rule doesn't need at all: it reads
+/// its answer straight out of the `registrations` list already kept for
+/// the hits check, by scanning for the first non-exempt entry. So this
+/// type enforces the ordering directly: `mock_expect_zero` panics IMMEDIATELY,
 /// at registration, naming both call sites, if any real `.mock(...)` was
 /// already registered on this server — the shadow shape becomes
 /// unrepresentable rather than merely detected after the fact. Every
@@ -107,19 +109,11 @@ struct Registration {
 pub struct GuardedMockServer {
     server: MockServer,
     registrations: std::cell::RefCell<Vec<Registration>>,
-    /// Set the first time `.mock(...)` (a REAL, non-exempt registration)
-    /// is called. `mock_expect_zero` refuses to register once this is
-    /// true — see the module doc's "order-enforced" section.
-    real_mock_registered: std::cell::Cell<bool>,
 }
 
 impl GuardedMockServer {
     pub fn start() -> Self {
-        Self {
-            server: MockServer::start(),
-            registrations: std::cell::RefCell::new(Vec::new()),
-            real_mock_registered: std::cell::Cell::new(false),
-        }
+        Self { server: MockServer::start(), registrations: std::cell::RefCell::new(Vec::new()) }
     }
 
     /// The base URL of the wrapped server — enough to point an
@@ -136,7 +130,6 @@ impl GuardedMockServer {
     where
         F: FnOnce(When, Then),
     {
-        self.real_mock_registered.set(true);
         self.register(false, config_fn)
     }
 
@@ -150,7 +143,11 @@ impl GuardedMockServer {
     ///
     /// `reason` must be a non-empty, human-readable explanation of why
     /// zero hits is the correct outcome here — it is checked at
-    /// registration, not just decorative.
+    /// registration (rejected if empty/whitespace-only), not just
+    /// decorative. It exists for the reader at the call site: this type
+    /// never stores or surfaces it anywhere else (not in the panic
+    /// message, not in `Registration`) — don't expect it to show up in
+    /// a failure report.
     ///
     /// This does NOT, on its own, prove the mock's matcher was ever
     /// EVALUATED — and "it already self-asserts via `Mock::assert_hits(0)`"
@@ -166,34 +163,72 @@ impl GuardedMockServer {
     /// what the ordering rule below closes — not by detecting the shadow
     /// after the fact, but by making it unrepresentable.
     ///
+    /// # What the ordering guarantee does NOT cover
+    ///
+    /// Ordering removes SHADOWING as a cause of a never-evaluated matcher;
+    /// it does not establish that the matcher was ever evaluated at all.
+    /// An exemption registered first, on a run that issues zero requests
+    /// to this server, has its closure invoked zero times and drops
+    /// silently — nothing here or in `Drop` distinguishes that from a
+    /// closure that ran and found nothing to complain about. For the one
+    /// shape that actually cares (an observe-only detector whose real work
+    /// is a side-channel counter, not a response), the backstop in
+    /// practice is incidental, not structural: its sibling mocks on the
+    /// same server are real, non-exempt registrations, and their own
+    /// Drop-time hits check proves *some* request reached the server. That
+    /// is a genuine guard today, but it is nowhere enforced by this type —
+    /// it evaporates the moment someone converts those siblings to
+    /// `mock_expect_zero` too, or writes an observe-only detector alone on
+    /// its own server.
+    ///
+    /// Also uncovered: this rule guards exemption-after-real, not
+    /// exemption-after-exemption. A broad `mock_expect_zero` registered
+    /// before a narrower one shadows it exactly as a real mock would, and
+    /// neither call panics, because the check only looks for a REAL
+    /// (non-exempt) registration ahead of it. No live case in this crate
+    /// needs two exemptions on one server with overlapping predicates
+    /// (not worth machinery for zero instances), but a future one would
+    /// go uncaught — worth knowing, not worth building for yet. The
+    /// reverse (a real mock shadowed by an exemption registered before
+    /// it) IS caught, the ordinary way: the real mock goes unhit and
+    /// `Drop`'s base check fires on it.
+    ///
     /// Panics IMMEDIATELY (not at drop) if any real `.mock(...)` was
     /// already registered on this server: httpmock's matching is strict
     /// first-registered-wins (see the module doc), so an expect-zero mock
     /// registered after a real one can be silently shadowed by it — which
     /// is the exact defect this type exists to prevent. Move every
     /// `mock_expect_zero` call ahead of every `mock` call on the same
-    /// server.
+    /// server. Names BOTH call sites in the panic — where the
+    /// `mock_expect_zero` call itself is, and where the real `.mock(...)`
+    /// that already exists on this server was registered — because in a
+    /// large test file, with servers threaded through helper functions,
+    /// "move this ahead of every real registration" is only actionable if
+    /// the offending registration is named, not just this call's own
+    /// location.
     #[track_caller]
     pub fn mock_expect_zero<F>(&self, reason: &'static str, config_fn: F) -> Mock<'_>
     where
         F: FnOnce(When, Then),
     {
+        let caller = std::panic::Location::caller();
         assert!(
             !reason.trim().is_empty(),
-            "mock_expect_zero(...) at {} requires a non-empty reason explaining why zero \
-             hits is legitimate here",
-            std::panic::Location::caller(),
+            "mock_expect_zero(...) at {caller} requires a non-empty reason explaining why \
+             zero hits is legitimate here",
         );
-        assert!(
-            !self.real_mock_registered.get(),
-            "mock_expect_zero(...) at {} was registered AFTER a real .mock(...) already \
-             exists on this server (#2599). httpmock serves the first-registered match — \
-             an expect-zero mock registered after a real one can be silently shadowed by \
-             it, and its matcher may never even be evaluated, which is exactly the defect \
-             class this type exists to prevent. Move this mock_expect_zero(...) call to \
-             before every .mock(...) call on this server.",
-            std::panic::Location::caller(),
-        );
+        if let Some(real) = self.registrations.borrow().iter().find(|reg| !reg.expect_zero) {
+            panic!(
+                "mock_expect_zero(...) at {caller} was registered AFTER a real .mock(...) \
+                 already exists on this server, registered at {} (#2599). httpmock serves \
+                 the first-registered match — an expect-zero mock registered after a real \
+                 one can be silently shadowed by it, and its matcher may never even be \
+                 evaluated, which is exactly the defect class this type exists to prevent. \
+                 Move the mock_expect_zero(...) call at {caller} to before the real \
+                 .mock(...) call at {}.",
+                real.location, real.location,
+            );
+        }
         self.register(true, config_fn)
     }
 
@@ -363,6 +398,68 @@ mod self_tests {
                     .header("x-only-if-not-shadowed", "true");
                 then.status(200);
             },
+        );
+    }
+
+    /// (#2599 round 3 review) MUST FIX: the panic must name the offending
+    /// REAL `.mock(...)` call site, not just `mock_expect_zero`'s own
+    /// location twice over. "Move this ahead of every real registration"
+    /// is only actionable in a large test file — with servers threaded
+    /// through helpers — if the offending registration is actually named.
+    /// `#[should_panic(expected = ...)]` can only check ONE substring, so
+    /// this uses the same hook-based capture the track-caller self-test
+    /// above uses, then counts DISTINCT `file:line` locations named in the
+    /// full panic text: exactly 2 (the `mock_expect_zero` call and the
+    /// real `.mock(...)` call), not 1. Red-proved: reverting to the
+    /// pre-fix message (which formats `Location::caller()` — the
+    /// `mock_expect_zero` site — twice and never names the real mock's
+    /// own location) collapses this to 1 distinct location and fails the
+    /// assertion below.
+    #[test]
+    #[serial_test::serial]
+    fn the_panic_names_both_the_exemption_and_the_real_mock_it_was_shadowed_by() {
+        let server = GuardedMockServer::start();
+        let _catch_all = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/ok");
+            then.status(200);
+        });
+        let msg = capture_panic_message(std::panic::AssertUnwindSafe(|| {
+            let _would_be_shadowed = server.mock_expect_zero(
+                "self-test: expected to panic before registering, naming both sites",
+                |when, then| {
+                    when.method(httpmock::Method::GET)
+                        .path("/ok")
+                        .header("x-only-if-not-shadowed", "true");
+                    then.status(200);
+                },
+            );
+        }));
+        // catch_unwind recovered from the panic above, so execution is no
+        // longer unwinding by the time `server` drops at the end of this
+        // function — its OWN Drop-time hits check (a SEPARATE mechanism
+        // from the one under test here) would otherwise fire on
+        // `_catch_all`, which nothing has requested yet, and mask this
+        // test's real assertion behind an unrelated panic. Hit it for
+        // real so only the assertion below is exercised.
+        let response = raw_http_get(&format!("{}/ok", server.base_url()));
+        assert_eq!(response, 200, "sanity: the real mock must actually be reachable");
+        let file = std::path::Path::new(file!())
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("test_support.rs");
+        let prefix = format!("{file}:");
+        let distinct_lines: std::collections::HashSet<&str> = msg
+            .split(&prefix)
+            .skip(1)
+            .filter_map(|rest| rest.split(':').next())
+            .collect();
+        assert_eq!(
+            distinct_lines.len(),
+            2,
+            "the panic must name TWO distinct locations — the mock_expect_zero call site \
+             AND the real .mock(...) call site it was shadowed by — not the same location \
+             twice over; found {} distinct line(s) in: {msg}",
+            distinct_lines.len(),
         );
     }
 
