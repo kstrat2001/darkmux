@@ -2393,6 +2393,397 @@
         }
     }
 
+    // ─── #2580 review finding: the SECOND unguarded route into
+    //     `dispatch_remote` — `dispatch_local_single_shot` ignored
+    //     `resume_from` exactly as `dispatch()`'s pre-fix branch did ───────
+
+    /// `dispatch_local_single_shot` is `dispatch_routed_via`'s substitutable
+    /// `local_dispatch` primitive (see its own doc comment) — not just
+    /// radio's private helper — so an unguarded `resume_from` here is the
+    /// same #2561 bypass reintroduced verbatim for the next caller. Same
+    /// ORDER discipline as `dispatch_remote_refuses_resume_from_before_
+    /// the_http_call` above: a real loopback HTTP mock stands in for the
+    /// remote endpoint, and the assertion is that its `rx` channel NEVER
+    /// receives a request, not merely that the call returns an `Err`
+    /// containing the right words (which a mock error body could also
+    /// produce).
+    #[test]
+    #[serial]
+    fn dispatch_local_single_shot_refuses_resume_from_before_the_http_call() {
+        let (base_url, rx) =
+            one_shot_http_mock(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            format!(
+                r#"{{"profiles":{{"cloud":{{"models":[
+                        {{"id":"gpt-remote","n_ctx":100000,
+                         "endpoint":{{"url":"{base_url}"}}}}
+                    ]}}}},
+                    "default_profile":"cloud"}}"#
+            ),
+        )
+        .unwrap();
+
+        // No checkpoint.json here either — the fix must refuse on the FLAG
+        // alone, before ever reading it.
+        let resume_from = TempDir::new().unwrap();
+
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string(); // real built-in, tool-less
+        opts.resume_from = Some(resume_from.path().to_path_buf());
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+
+        let err = dispatch_local_single_shot(opts).expect_err(
+            "--resume-from on dispatch_local_single_shot resolving to the remote path must refuse",
+        );
+        let msg = format!("{err:#}");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        assert!(
+            msg.contains("not supported on the remote single-shot dispatch path"),
+            "must name the remote single-shot path as the reason: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "darkmux never silently starts a dispatch fresh under a name that looked \
+                 like a resume"
+            ),
+            "must carry the same promise the other guard states: {msg}"
+        );
+
+        match rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(request) => panic!(
+                "the remote HTTP call must never happen for a refused resume, but the mock \
+                 received a request: {request}"
+            ),
+            Err(e) => panic!("unexpected mock channel state: {e:?}"),
+        }
+    }
+
+    /// **Enumeration, not a pin.** `dispatch_remote` is a module-PRIVATE
+    /// `fn` (see its own `fn dispatch_remote(` declaration) — Rust's
+    /// visibility rules make every possible call site of it, present or
+    /// future, live inside THIS file. So rather than asserting the two
+    /// known sites individually, this test greps the file's own source for
+    /// every textual call to `dispatch_remote(` (excluding its own `fn`
+    /// declaration line), maps each one back to its enclosing top-level
+    /// function by brace-matching, and requires that function's body to
+    /// contain the shared refusal anchor BEFORE the call. A third call
+    /// site added anywhere in this file without the guard — the exact
+    /// class #2580's review found, and the same class #2561 fixed once
+    /// already for `dispatch()` — fails this test by construction, not by
+    /// someone remembering to extend a list.
+    ///
+    /// **What this cannot see, named plainly:** it is a source scan of ONE
+    /// file, sound only because `dispatch_remote` is private to it. If a
+    /// future change makes `dispatch_remote` `pub`/`pub(crate)`, or a new
+    /// function reimplements the same "hosted single-shot HTTP call"
+    /// behavior WITHOUT calling `dispatch_remote` itself, this test cannot
+    /// see either — a `pub` widening would need the scan to cover the
+    /// whole crate (or workspace), and a reimplementation needs its own
+    /// named guard, not this one. It also cannot see the THIRD route the
+    /// same review found — `darkmux dispatch --machine <peer>
+    /// --resume-from`, routed through `dispatch_via_queue` in
+    /// `darkmux-fleet` before this file's `dispatch()` is ever reached —
+    /// which never calls `dispatch_remote` from here at all; that route is
+    /// filed separately as #2584 and is deliberately out of scope for this
+    /// enumeration.
+    ///
+    /// One more honest limit: the "guard precedes call" check is TEXTUAL
+    /// (does the anchor string appear before the call, once line-
+    /// continuations are collapsed), not structural. It does not parse
+    /// that the anchor sits inside an actual `if opts.resume_from.
+    /// is_some() { bail!(...) }` — a code COMMENT mentioning the same
+    /// phrase before an unguarded call would also satisfy it. Same shape
+    /// `step_kinds::liveness_conformance`'s `body.contains(site.anchor)`
+    /// already accepts for that module's own conformance checks; a stray
+    /// comment collision is the accepted false-negative risk of a
+    /// source-text check, traded for not needing a real Rust parser here.
+    #[test]
+    fn every_dispatch_remote_call_site_is_guarded_against_resume_from() {
+        const GUARD_ANCHOR: &str = "not supported on the remote single-shot dispatch path";
+        const DEFINITION_MARKER: &str = "fn dispatch_remote(";
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dispatch_internal.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {} for resume_from conformance: {e}", path.display()));
+
+        // Every top-level (column-0) `fn`/`pub fn` in the file, with its
+        // full body span, via the same brace-matching lexer discipline
+        // `step_kinds::liveness_conformance::fn_body` uses (comments,
+        // strings, raw strings and char literals skipped so a stray `{`/`}`
+        // inside one can't end a body early).
+        let functions = top_level_function_spans(&src);
+        assert!(
+            functions.len() > 10,
+            "sanity: found only {} top-level fns in dispatch_internal.rs — the \
+             extractor is almost certainly broken, not this file suddenly tiny",
+            functions.len()
+        );
+
+        // Every CALL to `dispatch_remote(` — i.e. every occurrence of the
+        // substring that is not the `fn dispatch_remote(` declaration
+        // itself.
+        let mut call_offsets = Vec::new();
+        let mut search_from = 0usize;
+        while let Some(rel) = src[search_from..].find("dispatch_remote(") {
+            let at = search_from + rel;
+            let is_declaration = at >= 3 && &src[at.saturating_sub(3)..at] == "fn ";
+            if !is_declaration {
+                call_offsets.push(at);
+            }
+            search_from = at + "dispatch_remote(".len();
+        }
+        assert!(
+            !call_offsets.is_empty(),
+            "found zero calls to `dispatch_remote(` — either the extractor regressed or the \
+             function was deleted; either way this test's premise no longer holds"
+        );
+        assert!(
+            src.matches(DEFINITION_MARKER).count() == 1,
+            "expected exactly one `{DEFINITION_MARKER}` declaration — found {}",
+            src.matches(DEFINITION_MARKER).count()
+        );
+
+        for call_at in call_offsets {
+            let (fn_name, fn_start, fn_end) = functions
+                .iter()
+                .find(|(_, start, end)| *start <= call_at && call_at < *end)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a `dispatch_remote(` call at byte offset {call_at} is not inside any \
+                         top-level function this test could find — the extractor needs fixing"
+                    )
+                });
+            let body = &src[*fn_start..*fn_end];
+            let call_at_in_body = call_at - fn_start;
+            // The anchor is matched against the COMPILED text of the
+            // bail!/format! literal, not the raw source: this repo wraps
+            // long guard messages across lines with `\`-continuations
+            // (rustc drops the backslash, the newline, and all of the next
+            // line's leading whitespace — see `collapse_str_continuations`'s
+            // own doc), so a naive raw-byte search for a multi-word anchor
+            // would miss it purely because of where a line happened to
+            // wrap, independent of whether the guard is actually there.
+            let normalized_prefix = collapse_str_continuations(&body[..call_at_in_body]);
+            let guard_precedes_call = normalized_prefix.contains(GUARD_ANCHOR);
+
+            assert!(
+                guard_precedes_call,
+                "`{fn_name}` calls `dispatch_remote(` at file offset {call_at} without the \
+                 resume_from guard (anchor {GUARD_ANCHOR:?}) appearing BEFORE it in the same \
+                 function — this is the #2561/#2580 bypass class: a caller can silently spend \
+                 real tokens under a --resume-from flag that was never honored"
+            );
+        }
+    }
+
+    /// Collapse Rust string-literal line continuations: a `\` immediately
+    /// followed by a newline strips the newline AND all of the following
+    /// line's leading whitespace (Rust reference, "String literals" —
+    /// this is how `bail!("...long text... \` / `    more text")` compiles
+    /// down to one unbroken sentence). This repo wraps long operator-facing
+    /// messages that way throughout `dispatch_internal.rs`, so a raw-byte
+    /// substring search for a multi-word anchor would be brittle to
+    /// wherever those messages happen to be line-wrapped; normalizing
+    /// first searches what the literal actually SAYS, not how the source
+    /// happens to be formatted. Deliberately does not attempt to also
+    /// resolve `\"`, `\\`, `\n` etc. escapes — the anchors this test uses
+    /// contain none of those, so that generality isn't needed here.
+    fn collapse_str_continuations(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let cs: Vec<char> = s.chars().collect();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if cs[i] == '\\' && cs.get(i + 1) == Some(&'\n') {
+                i += 2;
+                while i < cs.len() && matches!(cs[i], ' ' | '\t' | '\r' | '\n') {
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(cs[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Every top-level (column-0, i.e. no leading whitespace on the `fn`/
+    /// `pub fn` keyword) function in `src`, as `(name, body_start,
+    /// body_end)` byte-offset spans (the span covers from the opening `{`
+    /// through its matching closing `}` inclusive). Shares the exact
+    /// comment/string/raw-string/char-literal skipping discipline
+    /// `step_kinds::liveness_conformance::fn_body` uses, generalized to
+    /// walk the WHOLE file once rather than searching for one named
+    /// function — this test needs "which function contains offset X", not
+    /// "give me function Y's body".
+    fn top_level_function_spans(src: &str) -> Vec<(String, usize, usize)> {
+        let mut spans = Vec::new();
+        let cs: Vec<char> = src.chars().collect();
+        let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
+        let mut i = 0usize;
+        while i < cs.len() {
+            let c = cs[i];
+            let next = cs.get(i + 1).copied();
+            match c {
+                '/' if next == Some('/') => {
+                    while i < cs.len() && cs[i] != '\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                '/' if next == Some('*') => {
+                    i += 2;
+                    while i + 1 < cs.len() && !(cs[i] == '*' && cs[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                'r' if next == Some('"') || next == Some('#') => {
+                    let mut hashes = 0usize;
+                    let mut j = i + 1;
+                    while cs.get(j) == Some(&'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if cs.get(j) != Some(&'"') {
+                        i += 1;
+                        continue;
+                    }
+                    j += 1;
+                    loop {
+                        if j >= cs.len() {
+                            break;
+                        }
+                        if cs[j] == '"' && (1..=hashes).all(|k| cs.get(j + k) == Some(&'#')) {
+                            j += 1 + hashes;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                '"' => {
+                    i += 1;
+                    while i < cs.len() && cs[i] != '"' {
+                        if cs[i] == '\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                '\'' => {
+                    let is_char_lit = match next {
+                        Some('\\') => true,
+                        Some(_) => cs.get(i + 2) == Some(&'\''),
+                        None => false,
+                    };
+                    if is_char_lit {
+                        i += 1;
+                        while i < cs.len() && cs[i] != '\'' {
+                            if cs[i] == '\\' {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            // A column-0 `fn ` or `pub fn ` — i.e. this char starts a line
+            // (i == 0 or the previous char is '\n') and the line begins
+            // with one of those two keywords.
+            let at_line_start = i == 0 || cs[i - 1] == '\n';
+            if at_line_start {
+                let rest: String = cs[i..(i + 8).min(cs.len())].iter().collect();
+                let (is_fn, kw_len) = if rest.starts_with("pub fn ") {
+                    (true, 7)
+                } else if rest.starts_with("fn ") {
+                    (true, 3)
+                } else {
+                    (false, 0)
+                };
+                if is_fn {
+                    let name_start = i + kw_len;
+                    let mut k = name_start;
+                    while k < cs.len() && (cs[k].is_alphanumeric() || cs[k] == '_') {
+                        k += 1;
+                    }
+                    let name: String = cs[name_start..k].iter().collect();
+                    // Scan forward from the name to this fn's opening `{`,
+                    // stepping over the signature (which may itself contain
+                    // strings/comments/nested parens/braces in generics —
+                    // none of that appears in this file's free functions,
+                    // so a plain scan for the first top-level `{` at
+                    // depth-from-signature 0 is sufficient here).
+                    let mut j = k;
+                    let mut paren_depth = 0i32;
+                    while j < cs.len() {
+                        match cs[j] {
+                            '(' => paren_depth += 1,
+                            ')' => paren_depth -= 1,
+                            '{' if paren_depth == 0 => break,
+                            ';' if paren_depth == 0 => break, // a trait decl with no body
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if j < cs.len() && cs[j] == '{' {
+                        let mut depth = 0i32;
+                        let mut m = j;
+                        let body_start_char = j;
+                        loop {
+                            if m >= cs.len() {
+                                break;
+                            }
+                            match cs[m] {
+                                '{' => depth += 1,
+                                '}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        let start_b = byte_offsets[body_start_char];
+                                        let end_b = if m + 1 < byte_offsets.len() {
+                                            byte_offsets[m + 1]
+                                        } else {
+                                            src.len()
+                                        };
+                                        spans.push((name.clone(), start_b, end_b));
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            m += 1;
+                        }
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        spans
+    }
+
     // ── the message itself: three shapes, three remedies ───────────────
 
     #[test]

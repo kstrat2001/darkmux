@@ -3373,6 +3373,30 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     // check above already ruled out the one case `dispatch()` would force
     // through the container for a remote target.
     if let Some((remote_role, system_prompt, pm)) = try_resolve_remote_target(&opts)? {
+        // (#2580 follow-up, same class as `dispatch()`'s own guard a few
+        // hundred lines below) `dispatch_remote` never reads `resume_from`
+        // — no checkpoint, no container, nothing to resume INTO. This
+        // container-free primitive is `dispatch_routed_via`'s
+        // substitutable `local_dispatch` seam (see this function's own
+        // doc), not just radio's private helper, so a future caller that
+        // passes `resume_from` through unexamined would hit the exact
+        // #2561 bypass this refuses before `dispatch_remote` is ever
+        // called: no HTTP request, no `dispatch.start` record, no tokens
+        // spent.
+        if opts.resume_from.is_some() {
+            bail!(
+                "darkmux dispatch: --resume-from is not supported on the \
+                 remote single-shot dispatch path (role `{}` resolved to a \
+                 bare hosted chat-completions call via the container-free \
+                 single-shot primitive — no Docker, no container, no \
+                 checkpoint). darkmux never silently starts a dispatch \
+                 fresh under a name that looked like a resume: resume \
+                 needs the container path (the ordinary `dispatch()` entry \
+                 point with a tool-granting role) — or drop --resume-from \
+                 to start this role fresh on purpose.",
+                opts.role_id
+            );
+        }
         return dispatch_remote(&opts, &remote_role, &system_prompt, &pm);
     }
 
