@@ -1334,6 +1334,23 @@ impl StepKind for CrawlUnitStepKind {
                 timeout_seconds: cfg.timeout_seconds.unwrap_or(600),
                 skip_preflight: false,
                 json: true,
+                // (#2294) Git does NOT work inside this dispatch. Each
+                // `tree_root/<source>` is a detached worktree of a bare
+                // mirror that lives outside this mount, so its `.git`
+                // pointer file names a host path the container can't see —
+                // and `crawler.md` tells the model it may run `git log` /
+                // `git show`. `dispatch()`'s workdir preflight
+                // (`darkmux_types::workdir::find_split_gitdirs`, which scans
+                // one level down precisely because of THIS shape) warns the
+                // operator, records it, and tells the model up front that
+                // git is unavailable so it doesn't burn turns retrying.
+                //
+                // `tree_root` is SHARED across sources — every unit of the
+                // plan gets the same mount root, and an `EdgeSpec` names two
+                // sources at once — which is why that scan reports EVERY
+                // sibling checkout rather than the first: a note naming only
+                // the first sorted source would describe a directory this
+                // unit is not working on.
                 workdir: Some(ctx.tree_root.clone()),
                 phase_id: Some(task.phase_id.clone()),
                 machine: None,

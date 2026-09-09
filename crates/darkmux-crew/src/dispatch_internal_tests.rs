@@ -1834,6 +1834,533 @@
         );
     }
 
+    // ─── #2294: the workdir split-gitdir preflight ──────────────────────
+    //
+    // A REAL `git worktree add` fixture (via the `git` binary), not a
+    // hand-written `.git` file — the exact bytes git writes into a
+    // worktree's `.git` are the thing this detector parses. Git config is
+    // isolated (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` → /dev/null, plus
+    // explicit `-c` for the two knobs that would otherwise decide the
+    // fixture's shape) so these assert BEHAVIOR, not the ambient config of
+    // whatever machine runs the suite: `worktree.useRelativePaths` picks
+    // the absolute-vs-relative pointer form, and a global
+    // `commit.gpgsign=true` would fail the fixture's own `git commit`.
+
+    fn run_git_for_test(args: &[&str], cwd: &Path) {
+        let out = std::process::Command::new("git")
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .args(["-c", "commit.gpgsign=false", "-c", "worktree.useRelativePaths=false"])
+            .args(args)
+            .output()
+            .expect("git must be on PATH to run this test");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Real repo + a real worktree off it. Returns (tempdir-guard,
+    /// worktree-path) — mirrors exactly what the workdir would point at in
+    /// the field (#2294's original report: `mission launch coder-phase`'s
+    /// auto-created phase worktree).
+    fn real_worktree_for_test() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let main_repo = tmp.path().join("main-repo");
+        std::fs::create_dir(&main_repo).unwrap();
+        run_git_for_test(&["init", "-q", "-b", "main"], &main_repo);
+        std::fs::write(main_repo.join("f.txt"), "hi\n").unwrap();
+        run_git_for_test(&["add", "f.txt"], &main_repo);
+        run_git_for_test(&["commit", "-q", "-m", "init"], &main_repo);
+        let worktree = tmp.path().join("the-worktree");
+        run_git_for_test(
+            &["worktree", "add", "-q", worktree.to_str().unwrap(), "-b", "wt"],
+            &main_repo,
+        );
+        (tmp, worktree)
+    }
+
+    /// **This is the call-site test.** It drives the REAL `dispatch()`
+    /// entry point with a real git-worktree workdir and asserts the warning
+    /// came out of the sink `dispatch()` writes to. The dispatch is aimed at
+    /// a role id that does not exist, so it returns `Err` immediately after
+    /// the preflight — no Docker, no model, no container — which is exactly
+    /// the amount of `dispatch()` needed to prove the preflight is WIRED.
+    ///
+    /// The predecessor of this test called the message builder directly with
+    /// hand-built arguments while its doc comment claimed to pin the call
+    /// site; deleting the whole call-site block from `dispatch()` left the
+    /// suite green. Red-prove THIS one by deleting the
+    /// `emit_preflight_warning(&split_gitdir_warning(...))` block from
+    /// `dispatch()` — not by deleting the builder.
+    ///
+    /// `#[serial]` + `DARKMUX_HOME` because `dispatch()` loads roles (and,
+    /// past this point, would resolve profiles) out of the darkmux root —
+    /// the test must never read the operator's real `~/.darkmux`.
+    #[test]
+    #[serial]
+    fn dispatch_warns_at_the_call_site_for_a_real_worktree_workdir() {
+        let (_tmp, worktree) = real_worktree_for_test();
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.workdir = Some(worktree.clone());
+        let captured = capture_preflight_warnings(|| {
+            // Err is expected and irrelevant — the role id is bogus so
+            // `dispatch()` bails right after the preflight.
+            let _ = dispatch(opts);
+        });
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        let msg = captured
+            .iter()
+            .find(|m| m.contains("WARNING"))
+            .unwrap_or_else(|| panic!("dispatch() must warn for a worktree workdir; got {captured:?}"));
+        assert!(msg.contains("git WORKTREE"), "{msg}");
+        assert!(
+            msg.contains(&worktree.display().to_string()),
+            "the message must name the operator's own workdir value: {msg}"
+        );
+        assert!(
+            msg.contains("worktrees"),
+            "the message must surface the real `gitdir:` target: {msg}"
+        );
+    }
+
+    /// The negative half of the call site: an ordinary directory workdir
+    /// must produce NO warning out of `dispatch()`. Without this, a call
+    /// site mutated to warn unconditionally would still pass the positive
+    /// test above.
+    #[test]
+    #[serial]
+    fn dispatch_does_not_warn_at_the_call_site_for_a_plain_workdir() {
+        let tmp = TempDir::new().unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.workdir = Some(plain);
+        let captured = capture_preflight_warnings(|| {
+            let _ = dispatch(opts);
+        });
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert!(
+            captured.is_empty(),
+            "a plain directory workdir must produce no preflight warning; got {captured:?}"
+        );
+    }
+
+    /// The crawl shape, through the REAL `dispatch()`.
+    /// `darkmux_lab::crawl::unit_step` mounts the materialized workspace's
+    /// `tree/` PARENT, and each `tree/<source>` under it is a detached
+    /// worktree of a bare mirror outside the mount — so the mount root
+    /// itself has no `.git` and a workdir-only check saw nothing, while
+    /// `templates/builtin/roles/crawler.md` INSTRUCTS the model to run
+    /// `git log` and `git show`.
+    #[test]
+    #[serial]
+    fn dispatch_warns_at_the_call_site_for_the_crawl_tree_root_shape() {
+        let (tmp, worktree) = real_worktree_for_test();
+        let main_repo = worktree.parent().unwrap().join("main-repo");
+        let tree_root = tmp.path().join("tree");
+        std::fs::create_dir(&tree_root).unwrap();
+        let source_tree = tree_root.join("the-source");
+        run_git_for_test(
+            &["worktree", "add", "-q", "--detach", source_tree.to_str().unwrap()],
+            &main_repo,
+        );
+
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.workdir = Some(tree_root.clone());
+        let captured = capture_preflight_warnings(|| {
+            let _ = dispatch(opts);
+        });
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        let msg = captured.iter().find(|m| m.contains("WARNING")).unwrap_or_else(|| {
+            panic!("dispatch() must warn for the crawl tree-root shape; got {captured:?}")
+        });
+        assert!(msg.contains(&source_tree.display().to_string()), "{msg}");
+        assert!(msg.contains("git is unavailable in /workspace/the-source"), "{msg}");
+    }
+
+    /// **This is the NOTE's call-site test** — the second consumer of the
+    /// same detection, and the one the commit argues is the actual remedy
+    /// ("warning the operator alone is not a remedy here"). Before it,
+    /// deleting the `with_workspace_notes(...)` line from `dispatch()`
+    /// built clean and left the whole crate green.
+    ///
+    /// The doc comment it replaces claimed the site "is NOT reachable from
+    /// a unit test: it sits past role loading and model resolution". Half
+    /// of that was false: model resolution runs AFTER the prompt is
+    /// assembled. So this drives the real `dispatch()` with a REAL built-in
+    /// role out of a temp `DARKMUX_HOME`, and a `config_path` naming a
+    /// registry file that does not exist — `try_resolve_remote_target`
+    /// folds that to `Ok(None)` (local container path) while
+    /// `resolve_dispatch_model_internal` hard-stops on it, so the dispatch
+    /// reaches the prompt, the seam captures it, and the run bails at model
+    /// selection without contacting LMStudio or Docker.
+    ///
+    /// Red-prove by deleting the `with_workspace_notes` assignment in
+    /// `dispatch()` — not by touching the builder.
+    #[test]
+    #[serial]
+    fn dispatch_appends_the_no_git_note_at_the_call_site() {
+        let (_tmp, worktree) = real_worktree_for_test();
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let mut opts = dispatch_preflight_probe_opts();
+        // A real built-in role, so role loading + prompt resolution succeed.
+        opts.role_id = "coder".to_string();
+        // A registry path that does not exist ⇒ the dispatch bails at model
+        // resolution, which is the step AFTER prompt assembly.
+        opts.config_path = Some(
+            home.path()
+                .join("no-such-profiles-2294.json")
+                .display()
+                .to_string(),
+        );
+        opts.workdir = Some(worktree.clone());
+
+        let prompts = capture_system_prompts(|| {
+            let err = dispatch(opts).expect_err("no registry ⇒ model selection must fail");
+            assert!(
+                format!("{err:#}").contains("model selection failed"),
+                "the dispatch must get as far as model resolution, and no further: {err:#}"
+            );
+        });
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        let assembled = prompts
+            .last()
+            .unwrap_or_else(|| panic!("dispatch() must assemble a system prompt; got {prompts:?}"));
+        assert!(
+            assembled.contains("<workspace-note>"),
+            "the model-facing note must reach the assembled system prompt: {assembled}"
+        );
+        assert!(
+            assembled.contains("Git is not available in /workspace."),
+            "and it must name the container path: {assembled}"
+        );
+    }
+
+    /// The negative half: an ordinary directory workdir must leave the role
+    /// prompt alone. Without it, a call site mutated to append the note
+    /// unconditionally would still pass the positive test above.
+    #[test]
+    #[serial]
+    fn dispatch_appends_no_note_at_the_call_site_for_a_plain_workdir() {
+        let tmp = TempDir::new().unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "coder".to_string();
+        opts.config_path = Some(
+            home.path()
+                .join("no-such-profiles-2294.json")
+                .display()
+                .to_string(),
+        );
+        opts.workdir = Some(plain);
+
+        let prompts = capture_system_prompts(|| {
+            let _ = dispatch(opts);
+        });
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        let assembled = prompts
+            .last()
+            .unwrap_or_else(|| panic!("dispatch() must assemble a system prompt; got {prompts:?}"));
+        assert!(
+            !assembled.contains("<workspace-note>"),
+            "a plain directory workdir must not get the note: {assembled}"
+        );
+    }
+
+    /// Opts that reach `dispatch()`'s workdir preflight and then bail: a
+    /// role id no manifest declares, and `skip_preflight` so no Docker
+    /// daemon is contacted on the way.
+    fn dispatch_preflight_probe_opts() -> crate::dispatch::DispatchOpts {
+        crate::dispatch::DispatchOpts {
+            brief_refs: Vec::new(),
+            workspace_read_only: false,
+            record_context: None,
+            resume_from: None,
+            host_out: None,
+            max_turns_override: None,
+            timeout_override_seconds: None,
+            role_id: "no-such-role-2294-preflight-probe".to_string(),
+            message: "probe".to_string(),
+            session_id: None,
+            timeout_seconds: 5,
+            skip_preflight: true,
+            json: true,
+            workdir: None,
+            phase_id: None,
+            machine: None,
+            wait: true,
+            compaction: crate::dispatch::CompactionDispatchArgs::default(),
+            profile_name: None,
+            config_path: None,
+            force_container: false,
+            max_completion_tokens: None,
+            image: None,
+            model_base_url_override: None,
+            step_id: None,
+            system_prompt_override: None,
+        }
+    }
+
+    // ── the message itself: three shapes, three remedies ───────────────
+
+    #[test]
+    fn split_gitdir_warning_names_the_worktree_remedy() {
+        let (_tmp, worktree) = real_worktree_for_test();
+        let found = darkmux_types::workdir::find_split_gitdirs(&worktree);
+        let msg = split_gitdir_warning(&worktree, &found);
+        assert!(msg.contains("git WORKTREE"), "{msg}");
+        assert!(msg.contains("plain clone or the main checkout"), "{msg}");
+        assert!(
+            msg.contains("git is unavailable in /workspace"),
+            "the operator is told the model was told, and where: {msg}"
+        );
+    }
+
+    /// A SUBMODULE checkout also has a `.git` pointer file, and the
+    /// pre-review message called it a worktree and sent the operator at "a
+    /// plain clone or the main checkout" — which does not fix it. The
+    /// remedy is the superproject root, where the relative pointer resolves
+    /// inside the mount.
+    #[test]
+    fn split_gitdir_warning_names_the_superproject_for_a_submodule() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("super-repo").join("vendor").join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../../.git/modules/vendor/sub\n").unwrap();
+        let found = darkmux_types::workdir::find_split_gitdirs(&sub);
+        let msg = split_gitdir_warning(&sub, &found);
+        assert!(msg.contains("git SUBMODULE"), "{msg}");
+        assert!(
+            msg.contains(&tmp.path().join("super-repo").display().to_string()),
+            "the remedy must NAME the superproject root: {msg}"
+        );
+        assert!(
+            !msg.contains("plain clone or the main checkout"),
+            "the worktree remedy must not be offered for a submodule: {msg}"
+        );
+    }
+
+    /// `--separate-git-dir` writes an absolute pointer with neither
+    /// structural marker. There is no main checkout and no superproject, so
+    /// the message must offer NEITHER of the other two remedies.
+    #[test]
+    fn split_gitdir_warning_stays_neutral_for_a_separate_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("the-repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join(".git"), "gitdir: /elsewhere/the-repo.git\n").unwrap();
+        let found = darkmux_types::workdir::find_split_gitdirs(&repo);
+        let msg = split_gitdir_warning(&repo, &found);
+        assert!(msg.contains("--separate-git-dir"), "{msg}");
+        assert!(
+            msg.contains("no main checkout or superproject to fall back to"),
+            "the message must say plainly that neither other remedy exists here: {msg}"
+        );
+        for offered in [
+            "point the workdir at a plain clone or the main checkout",
+            "Point the workdir at the SUPERPROJECT ROOT",
+            "Point the workdir at the superproject root",
+        ] {
+            assert!(
+                !msg.contains(offered),
+                "neither of the other two remedies may be OFFERED here: {msg}"
+            );
+        }
+    }
+
+    /// The crawl shape: the mounted workdir is the tree ROOT and the
+    /// worktree is one level under it, so both the warning and the
+    /// model-facing note have to name `/workspace/<source>`, not
+    /// `/workspace`.
+    #[test]
+    fn split_gitdir_warning_names_the_nested_checkout_and_its_container_path() {
+        let tmp = TempDir::new().unwrap();
+        let tree_root = tmp.path().join("tree");
+        let source = tree_root.join("the-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join(".git"), "gitdir: /elsewhere/.git/worktrees/the-source\n").unwrap();
+        let found = darkmux_types::workdir::find_split_gitdirs(&tree_root);
+        let msg = split_gitdir_warning(&tree_root, &found);
+        assert!(msg.contains("contains, at"), "{msg}");
+        assert!(msg.contains(&source.display().to_string()), "{msg}");
+        assert!(
+            msg.contains("git is unavailable in /workspace/the-source"),
+            "the container path must be the nested one: {msg}"
+        );
+    }
+
+    /// A two-source crawl is the ordinary case: both sources materialize as
+    /// siblings under the SHARED `tree/` root that every unit gets as its
+    /// workdir. The warning must describe both — naming one sibling would
+    /// describe a directory the dispatch may not be touching at all.
+    #[test]
+    fn split_gitdir_warning_describes_every_sibling_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let tree_root = tmp.path().join("tree");
+        for source in ["alpha", "zeta"] {
+            let dir = tree_root.join(source);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(".git"),
+                format!("gitdir: /mirrors/{source}.git/worktrees/{source}\n"),
+            )
+            .unwrap();
+        }
+        let found = darkmux_types::workdir::find_split_gitdirs(&tree_root);
+        assert_eq!(found.len(), 2, "{found:?}");
+        let msg = split_gitdir_warning(&tree_root, &found);
+        assert!(msg.contains("contains 2 checkouts"), "{msg}");
+        for source in ["alpha", "zeta"] {
+            assert!(
+                msg.contains(&tree_root.join(source).display().to_string()),
+                "every checkout must be named: {msg}"
+            );
+            assert!(msg.contains(&format!("/workspace/{source}")), "{msg}");
+        }
+    }
+
+    // ── the model-facing note ──────────────────────────────────────────
+
+    #[test]
+    fn with_workspace_notes_appends_the_no_git_block_only_when_the_detector_fires() {
+        let (_tmp, worktree) = real_worktree_for_test();
+        let found = darkmux_types::workdir::find_split_gitdirs(&worktree);
+
+        let plain = with_workspace_notes("ROLE PROMPT".to_string(), None, &[]);
+        assert_eq!(plain, "ROLE PROMPT", "no workdir ⇒ the prompt is untouched");
+        let none_found = with_workspace_notes("ROLE PROMPT".to_string(), Some(&worktree), &[]);
+        assert_eq!(none_found, "ROLE PROMPT", "no hit ⇒ the prompt is untouched");
+
+        let noted = with_workspace_notes("ROLE PROMPT".to_string(), Some(&worktree), &found);
+        assert!(noted.starts_with("ROLE PROMPT\n\n"), "{noted}");
+        assert!(noted.contains("Git is not available in /workspace."), "{noted}");
+        assert!(noted.contains("Do not run git"), "{noted}");
+        // AI-convention vocabulary only: no darkmux-internal terms reach a
+        // clean-context model (CLAUDE.md, model-facing prompt construction).
+        for jargon in ["operator", "workdir", "dispatch", "darkmux", "gitdir"] {
+            assert!(
+                !noted[("ROLE PROMPT".len())..].to_lowercase().contains(jargon),
+                "model-facing note must not use `{jargon}`: {noted}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_git_note_names_the_nested_container_path() {
+        let note = no_git_system_prompt_note(&["/workspace/the-source".to_string()]);
+        assert!(note.contains("Git is not available in /workspace/the-source."), "{note}");
+    }
+
+    /// **Every imperative in the note is scoped to the named paths.** The
+    /// first draft opened path-scoped and then went global — "Do not run
+    /// git, do not retry it …, Read and search the files directly with your
+    /// tools" — which is wrong the moment the workspace holds anything but
+    /// the one broken checkout. The live shape it breaks on: a workdir with
+    /// no `.git` holding an ordinary clone next to seven worktrees. git
+    /// works in the clone; the scan fires on a worktree; the model is told
+    /// to stop using git everywhere.
+    #[test]
+    fn the_no_git_note_scopes_every_imperative_to_the_named_paths() {
+        let note = no_git_system_prompt_note(&["/workspace/broken".to_string()]);
+        for unscoped in [
+            "Do not run git, do not retry it with different arguments",
+            "Read and search the files directly with your tools",
+        ] {
+            assert!(
+                !note.contains(unscoped),
+                "this imperative applies to the whole workspace: {note}"
+            );
+        }
+        assert!(note.contains("Do not run git in that directory"), "{note}");
+        assert!(note.contains("Read and search the files in that directory"), "{note}");
+        assert!(
+            note.contains("git may work normally in any other directory"),
+            "the note must say plainly that other directories may differ: {note}"
+        );
+    }
+
+    /// A multi-source crawl mounts one root holding several broken
+    /// checkouts; the note names them all, and its imperatives are scoped
+    /// to that set rather than to the workspace.
+    #[test]
+    fn the_no_git_note_names_every_affected_path() {
+        let note = no_git_system_prompt_note(&[
+            "/workspace/alpha".to_string(),
+            "/workspace/zeta".to_string(),
+        ]);
+        assert!(
+            note.contains("Git is not available in these directories: /workspace/alpha, /workspace/zeta."),
+            "{note}"
+        );
+        assert!(note.contains("Do not run git in those directories"), "{note}");
+        assert!(
+            note.contains("git may work normally in any other directory"),
+            "{note}"
+        );
+    }
+
     // ─── #2153: resolve_host_out (caller-named out dir) ────────────────
 
     #[test]

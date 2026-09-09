@@ -153,6 +153,325 @@ pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host
     args.push(format!("{}:/darkmux-out", host_out.display()));
 }
 
+/// (#2294) The container path a split-gitdir checkout is mounted at, so
+/// both the operator warning and the model-facing note name a path the
+/// reader can actually see. `apply_volume_mounts` above mounts the
+/// workdir at `/workspace`, so a checkout AT the workdir is `/workspace`
+/// and one one level under it is `/workspace/<child>`.
+pub(crate) fn container_path_for(workdir: &Path, checkout: &Path) -> String {
+    match checkout.strip_prefix(workdir) {
+        Ok(rel) if rel.as_os_str().is_empty() => "/workspace".to_string(),
+        Ok(rel) => format!("/workspace/{}", rel.display()),
+        // Not under the workdir (shouldn't happen — `find_split_gitdirs`
+        // only ever returns the workdir or a child of it) — name the host
+        // path rather than inventing a container path.
+        Err(_) => checkout.display().to_string(),
+    }
+}
+
+/// (#2294) The per-checkout remedy sentence. Three shapes, three remedies
+/// (this is why the message isn't one string): a WORKTREE's gitdir is a
+/// sibling tree, so the fix is to dispatch against a plain clone; a
+/// SUBMODULE's gitdir is usually a RELATIVE path into the superproject, so
+/// the fix is to dispatch against the superproject root, where that same
+/// pointer resolves inside the mount and git works normally; a
+/// `--separate-git-dir` checkout has NEITHER, so its remedy stays neutral
+/// rather than naming a main checkout that does not exist. Telling a
+/// submodule operator to "use the main checkout" — which the
+/// pre-#2294-review message did, because it assumed every pointer file was
+/// a worktree — points away from the one thing that works.
+fn split_gitdir_remedy(found: &darkmux_types::workdir::SplitGitdir) -> String {
+    use darkmux_types::workdir::GitdirPointerKind;
+    match found.kind {
+        GitdirPointerKind::Worktree => {
+            "If the role needs git here, point the workdir at a plain clone or the main checkout \
+             instead."
+                .to_string()
+        }
+        GitdirPointerKind::Submodule => match &found.superproject {
+            Some(sp) => format!(
+                "Point the workdir at the SUPERPROJECT ROOT {} instead — the pointer then \
+                 resolves inside the mounted workspace and git works normally.",
+                sp.display()
+            ),
+            None => "Point the workdir at the superproject root instead — the pointer then \
+                     resolves inside the mounted workspace and git works normally."
+                .to_string(),
+        },
+        GitdirPointerKind::Separate => {
+            "This checkout's git directory was placed outside its own tree (the shape \
+             `--separate-git-dir` writes), so there is no main checkout or superproject to fall \
+             back to. If the role needs git here, dispatch against a checkout whose `.git` is an \
+             ordinary directory inside the workdir."
+                .to_string()
+        }
+    }
+}
+
+/// The human name for a pointer kind, as it appears in the warning.
+fn split_gitdir_kind_label(kind: darkmux_types::workdir::GitdirPointerKind) -> &'static str {
+    use darkmux_types::workdir::GitdirPointerKind;
+    match kind {
+        GitdirPointerKind::Worktree => "a git WORKTREE, not an ordinary checkout",
+        GitdirPointerKind::Submodule => "a git SUBMODULE checkout, not a standalone repository",
+        GitdirPointerKind::Separate => {
+            "a checkout whose git directory was placed elsewhere (`--separate-git-dir`)"
+        }
+    }
+}
+
+/// (#2294) Build the operator-facing preflight warning for a workdir that
+/// holds one or more checkouts whose git directory lives outside what gets
+/// bind-mounted — see the call site in `dispatch()` for the full tradeoff
+/// writeup. `workdir` is the operator-typed path (named verbatim so the
+/// operator recognizes their own value).
+///
+/// ONE message for ALL hits, never one message per hit: the crawl's unit
+/// dispatch passes the shared `tree/` root as the workdir for every source
+/// (see [`darkmux_types::workdir::find_split_gitdirs`]), so a multi-source
+/// crawl would otherwise repeat this whole block once per sibling on top of
+/// once per unit.
+///
+/// Returns an empty string for an empty slice — callers guard on that, and
+/// an empty warning is a bug rather than a silent no-op.
+pub(crate) fn split_gitdir_warning(
+    workdir: &Path,
+    found: &[darkmux_types::workdir::SplitGitdir],
+) -> String {
+    match found {
+        [] => String::new(),
+        [one] => {
+            let where_it_is = if one.checkout == workdir {
+                format!("workdir {} is", workdir.display())
+            } else {
+                format!(
+                    "workdir {} contains, at {},",
+                    workdir.display(),
+                    one.checkout.display()
+                )
+            };
+            format!(
+                "darkmux dispatch: WARNING — {} {}. Its `.git` is a pointer file naming {}, which \
+                 sits outside the mounted workspace and is therefore never mounted into the \
+                 container. git commands run inside this dispatch (`git status`, `git diff`, \
+                 `git log`, `git show`, …) fail there with `fatal: not a git repository`. The \
+                 dispatch still runs — the workspace's own files are fully mounted, and the \
+                 role's system prompt is told up front that git is unavailable in {}. {}",
+                where_it_is,
+                split_gitdir_kind_label(one.kind),
+                one.target.display(),
+                container_path_for(workdir, &one.checkout),
+                split_gitdir_remedy(one),
+            )
+        }
+        many => {
+            let mut msg = format!(
+                "darkmux dispatch: WARNING — workdir {} contains {} checkouts whose git \
+                 directories sit outside the mounted workspace and are therefore never mounted \
+                 into the container. git commands run inside this dispatch (`git status`, \
+                 `git diff`, `git log`, `git show`, …) fail in each of them with `fatal: not a \
+                 git repository`. The dispatch still runs — the workspace's own files are fully \
+                 mounted, and the role's system prompt is told up front that git is unavailable \
+                 in each of the paths below. Any other directory under the workdir is \
+                 unaffected.",
+                workdir.display(),
+                many.len(),
+            );
+            for f in many {
+                msg.push_str(&format!(
+                    "\n  - {} — {}; `.git` points at {}; mounted at {}. {}",
+                    f.checkout.display(),
+                    split_gitdir_kind_label(f.kind),
+                    f.target.display(),
+                    container_path_for(workdir, &f.checkout),
+                    split_gitdir_remedy(f),
+                ));
+            }
+            msg
+        }
+    }
+}
+
+/// (#2294) The block appended to the role's system prompt when the
+/// workdir's git directory isn't mounted.
+///
+/// Warning the OPERATOR is not by itself a fix: on the paths that produce
+/// this defect the operator has no available action (`coder_phase` creates
+/// the worktree itself; the crawl mounts its own materialized tree root),
+/// and the MODEL is what burns turns retrying git. The runtime's
+/// consecutive-failure detector keys on `(tool, args)`, so `git status`,
+/// `git diff` and `git log` are three distinct signatures that never reach
+/// its threshold — nothing brakes. Telling the model up front is what stops
+/// the retries.
+///
+/// Written to AI conventions per `CLAUDE.md`: "the workspace", "your
+/// tools", literal command names, imperative verbs — no darkmux-internal
+/// vocabulary, and it says what to do rather than why.
+///
+/// **Both call sites are pinned by a test.** The WARNING's —
+/// `dispatch_warns_at_the_call_site_for_a_real_worktree_workdir` drives the
+/// real `dispatch()` with a real worktree workdir and asserts the message
+/// came out of the injectable warning sink. This note's —
+/// `dispatch_appends_the_no_git_note_at_the_call_site` drives the real
+/// `dispatch()` far enough to assemble the system prompt (a real built-in
+/// role out of a temp `DARKMUX_HOME`, then a `config_path` naming a
+/// registry file that does not exist, so the dispatch bails at model
+/// resolution, which runs AFTER prompt assembly) and asserts the note
+/// through [`capture_assembled_system_prompt`]. Deleting either call site
+/// reds its own test.
+pub(crate) fn with_workspace_notes(
+    system_prompt: String,
+    workdir: Option<&Path>,
+    found: &[darkmux_types::workdir::SplitGitdir],
+) -> String {
+    match workdir {
+        Some(workdir) if !found.is_empty() => {
+            let paths: Vec<String> = found
+                .iter()
+                .map(|f| container_path_for(workdir, &f.checkout))
+                .collect();
+            format!(
+                "{}\n\n{}",
+                system_prompt.trim_end(),
+                no_git_system_prompt_note(&paths)
+            )
+        }
+        _ => system_prompt,
+    }
+}
+
+/// The note text itself. See [`with_workspace_notes`].
+///
+/// **Every imperative is scoped to the named paths**, and the closing
+/// sentence says other directories may differ. The first draft opened
+/// path-scoped ("Git is not available in `<path>`") and then went global
+/// ("Do not run git, … Read and search the files directly with your
+/// tools"), which is wrong whenever the workspace holds more than the one
+/// broken checkout — the live shape on the author's own machine is a
+/// workdir with no `.git` holding an ordinary clone next to seven
+/// worktrees, where git works perfectly in the clone and the model would
+/// have been told to stop using it there too.
+pub(crate) fn no_git_system_prompt_note(container_paths: &[String]) -> String {
+    let (opening, these) = match container_paths {
+        [one] => (format!("Git is not available in {one}."), "that directory"),
+        many => (
+            format!(
+                "Git is not available in these directories: {}.",
+                many.join(", ")
+            ),
+            "those directories",
+        ),
+    };
+    format!(
+        "<workspace-note>\n{opening} `git status`, `git diff`, `git log`, `git show` and every \
+         other git command fail in {these} with `fatal: not a git repository`. Do not run git in \
+         {these}, do not retry it there with different arguments, and do not try to install or \
+         repair it. Read and search the files in {these} directly with your tools, and when you \
+         need to show a change you made there, quote the file content itself rather than \
+         producing a diff. This applies only to the paths named above — git may work normally in \
+         any other directory.\n</workspace-note>"
+    )
+}
+
+// (#2294) Where the preflight workdir warning goes. Production writes to
+// stderr; a test swaps in a capture buffer so the CALL SITE inside
+// `dispatch()` is pinned by a test, not only the message builder.
+#[cfg(test)]
+thread_local! {
+    static PREFLIGHT_WARN_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn emit_preflight_warning(msg: &str) {
+    #[cfg(test)]
+    {
+        let captured = PREFLIGHT_WARN_CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+            Some(buf) => {
+                buf.push(msg.to_string());
+                true
+            }
+            None => false,
+        });
+        if captured {
+            return;
+        }
+    }
+    eprintln!("{msg}");
+}
+
+/// Run `f` with `emit_preflight_warning` redirected into a buffer, and
+/// return what it collected. Test-only; thread-local, so it captures only
+/// what the calling thread emits.
+#[cfg(test)]
+pub(crate) fn capture_preflight_warnings(f: impl FnOnce()) -> Vec<String> {
+    PREFLIGHT_WARN_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    f();
+    PREFLIGHT_WARN_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// (#2294) Warn ONCE per process for any given message.
+///
+/// The preflight runs per DISPATCH, and a crawl grows one task per unit —
+/// a few hundred units against the same materialized `tree/` root would
+/// otherwise print the same multi-line block a few hundred times, which
+/// buries every other line of the run's output. The flow record is
+/// deliberately NOT deduplicated: it is session-scoped, and "why did THIS
+/// session burn turns on git?" has to be answerable from that session's
+/// own records.
+///
+/// Keyed on the message text, so a second workdir with a genuinely
+/// different shape still warns. The tradeoff is that a long-lived process
+/// (the serve daemon, a mission launcher) shows a repeat of the identical
+/// warning only once for its whole lifetime.
+fn emit_preflight_warning_once(msg: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = match seen.lock() {
+        Ok(mut set) => set.insert(msg.to_string()),
+        // A poisoned lock must not silence a diagnostic — warn.
+        Err(_) => true,
+    };
+    if first {
+        emit_preflight_warning(msg);
+    }
+}
+
+// (#2294) Where the ASSEMBLED system prompt goes, so the note's call site
+// inside `dispatch()` is pinned by a test rather than only its builder.
+// A no-op in production (the whole body is `#[cfg(test)]`); the same shape
+// as `emit_preflight_warning`'s capture above.
+#[cfg(test)]
+thread_local! {
+    static SYSTEM_PROMPT_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn capture_assembled_system_prompt(prompt: &str) {
+    #[cfg(test)]
+    SYSTEM_PROMPT_CAPTURE.with(|c| {
+        if let Some(buf) = c.borrow_mut().as_mut() {
+            buf.push(prompt.to_string());
+        }
+    });
+    #[cfg(not(test))]
+    let _ = prompt;
+}
+
+/// Run `f` with `capture_assembled_system_prompt` recording into a buffer,
+/// and return what it collected. Test-only; thread-local.
+#[cfg(test)]
+pub(crate) fn capture_system_prompts(f: impl FnOnce()) -> Vec<String> {
+    SYSTEM_PROMPT_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    f();
+    SYSTEM_PROMPT_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default()
+}
+
 /// (#2295) Bind-mount each briefed mod's `attachments/` READ-ONLY at
 /// `/darkmux-mods/<key>/attachments`, so a role handed a mod block can read
 /// the files that block names. `mounts` is `(host dir, container dir)` pairs
@@ -3695,6 +4014,64 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         }
     }
 
+    // (#2294) PREFLIGHT: does this workdir's git directory live outside
+    // what gets bind-mounted? A `.git` that is a POINTER FILE (`gitdir:
+    // <path>`) rather than the ordinary directory means yes — the real git
+    // directory sits somewhere only the host can see, while
+    // `apply_volume_mounts` mounts `workspace` and `host_out` and nothing
+    // else. Every git command the dispatch runs then fails with a
+    // confusing `fatal: not a git repository: <host path>` deep inside the
+    // sandbox, naming a path the operator never typed.
+    //
+    // TWO producers of this shape live in this repo, not one:
+    //   - `src/coder_phase.rs` creates a git WORKTREE per phase and
+    //     dispatches the coder into it via the workdir.
+    //   - `crates/darkmux-lab/src/crawl/unit_step.rs` mounts the
+    //     materialized workspace's `tree/` PARENT (so the container's
+    //     `/workspace/<source>/…` paths resolve), and each `tree/<source>`
+    //     under it is a detached worktree of a bare mirror outside the
+    //     mount. Hence `find_split_gitdirs`'s one-level child scan — the
+    //     mount root itself has no `.git` at all, so a workdir-only check
+    //     is structurally blind to the crawl, which is the case that hurts
+    //     most: `templates/builtin/roles/crawler.md` INSTRUCTS the model to
+    //     run `git log` and `git show`. That scan returns EVERY sibling
+    //     checkout, not the first: `crawl::unit_step` passes the shared
+    //     `tree/` root for every unit regardless of which source the unit
+    //     works on, so naming one arbitrary sibling would describe a
+    //     directory this dispatch isn't touching.
+    //
+    // Deliberately NOT refused: both producers above are ordinary darkmux
+    // work, so hard-refusing would break the coder and crawl workflows
+    // outright. Also deliberately NOT auto-mounted: making git "just work"
+    // for a worktree needs the WHOLE main repository's `.git` mounted
+    // (git's `commondir` indirection needs objects/refs/HEAD alongside the
+    // worktree's own `worktrees/<name>` subdir), which exposes every
+    // sibling worktree's refs/branches/index to the container — a real
+    // widening of what the sandbox can see, for a capability the role has
+    // a fallback for.
+    //
+    // What happens instead, in three places, all fed by this one detection:
+    //   1. here — a loud host warning naming the shape and its remedy;
+    //   2. the system prompt below — the model is TOLD git is unavailable,
+    //      so it stops retrying (the operator-facing warning alone leaves
+    //      the model burning turns, and on the coder-phase/crawl paths the
+    //      operator has no available action anyway);
+    //   3. a `Level::Warn` flow record once the session id exists, so the
+    //      run record answers "why did this run spend eight turns on git?"
+    //      later. Record exhaustively, display selectively.
+    let workdir_split_gitdirs = opts
+        .workdir
+        .as_deref()
+        .map(darkmux_types::workdir::find_split_gitdirs)
+        .unwrap_or_default();
+    if let Some(workdir) = opts.workdir.as_deref() {
+        if !workdir_split_gitdirs.is_empty() {
+            // Once per process for an identical message — a crawl grows one
+            // task per unit against the same tree root; see the sink's doc.
+            emit_preflight_warning_once(&split_gitdir_warning(workdir, &workdir_split_gitdirs));
+        }
+    }
+
     // (#703) `inject` is true only when the operator named a NON-darkmux image
     // (e.g. `rust:slim`) — then darkmux's static runtime binary is injected
     // into it (bind-mount + entrypoint override) so the coder runs in the
@@ -3775,6 +4152,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     } else {
         system_prompt
     };
+    // (#2294) Consumer 2 of the preflight detection above: tell the MODEL
+    // that git is dead in this workspace. Without it the model retries
+    // git indefinitely — see `no_git_system_prompt_note`'s own doc for why
+    // no existing detector brakes that, and why warning the operator alone
+    // isn't a remedy on the paths that produce this shape.
+    let system_prompt = with_workspace_notes(
+        system_prompt,
+        opts.workdir.as_deref(),
+        &workdir_split_gitdirs,
+    );
+    // (#2294) A no-op in production; in tests this is the seam
+    // `dispatch_appends_the_no_git_note_at_the_call_site` reads, so deleting
+    // the `with_workspace_notes` line above reds a test instead of building
+    // clean. Placed after the LAST thing that composes the prompt so it
+    // pins what actually reaches the runtime.
+    capture_assembled_system_prompt(&system_prompt);
     // #340 — surface unknown role-vocab tokens loudly. Unknown tokens
     // (typos like "exce" for "exec", future tokens not yet wired)
     // get silently dropped by `role_to_runtime`; without this warning
@@ -3911,6 +4304,62 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         None => session_id,
     };
     let phase_id = opts.phase_id.clone();
+
+    // (#2294) Consumer 3 of the preflight detection: a durable record.
+    // Emitted here rather than at the detection site because this is the
+    // first point a `session_id` exists to hang it on. Without it the
+    // finding lives only in whatever terminal happened to be attached, and
+    // "why did this run burn eight turns on git?" is unanswerable from the
+    // run's own artifacts afterward. Record exhaustively, display
+    // selectively — nothing renders this by default; it is there to be
+    // asked for.
+    //
+    // NOT deduplicated the way the console warning is: this record is
+    // session-scoped, and a crawl unit's own session has to carry its own
+    // answer. It is also NOT a liveness bookend, so on a very busy day
+    // `darkmux_serve::read_flow_records_from_file`'s ring can crop it out
+    // of what the daemon serves; the day file itself always has it.
+    if let Some(workdir) = opts.workdir.as_deref() {
+        if !workdir_split_gitdirs.is_empty() {
+            let checkouts: Vec<serde_json::Value> = workdir_split_gitdirs
+                .iter()
+                .map(|found| {
+                    serde_json::json!({
+                        "checkout": found.checkout.display().to_string(),
+                        "gitdir_target": found.target.display().to_string(),
+                        "kind": match found.kind {
+                            darkmux_types::workdir::GitdirPointerKind::Worktree => "worktree",
+                            darkmux_types::workdir::GitdirPointerKind::Submodule => "submodule",
+                            darkmux_types::workdir::GitdirPointerKind::Separate => "separate",
+                        },
+                        "superproject": found.superproject.as_ref().map(|p| p.display().to_string()),
+                        "container_path": container_path_for(workdir, &found.checkout),
+                    })
+                })
+                .collect();
+            let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
+                darkmux_flow::Level::Warn,
+                // Dotted, matching this crate's current record vocabulary.
+                // The three SPACED actions in `darkmux-crew` are the
+                // dispatch-liveness bookends, which the serve tests call
+                // the legacy spelling — a new record must not join them.
+                "dispatch.workdir_git_unavailable",
+                &opts.role_id,
+                &session_id,
+                Some(&model),
+                mission_id.as_deref(),
+                phase_id.as_deref(),
+                Some(serde_json::json!({
+                    "issue": 2294,
+                    "workdir": workdir.display().to_string(),
+                    // EVERY checkout the scan found, not one arbitrary
+                    // sibling — see `find_split_gitdirs`.
+                    "checkouts": checkouts,
+                })),
+            ));
+        }
+    }
+
     // (#1483) The mission-graph step this dispatch runs as (when it's a
     // graph step). Stamped onto every live per-event flow record's payload
     // so the viewer attributes the turn/tool/token climb to the seat card
