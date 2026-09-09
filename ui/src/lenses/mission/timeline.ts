@@ -136,11 +136,29 @@ export interface TimelinePhase {
  * phase nodes gets one implicit "tasks" section, matching legacy. */
 export function groupTimeline(nodes: GraphNode[], edges: GraphEdge[], metrics: MetricsMap, now: number): TimelinePhase[] {
   const nodeLabel: Record<string, string> = {};
-  for (const n of nodes) nodeLabel[n.id] = n.label;
+  const nodeStatus: Record<string, string> = {};
+  for (const n of nodes) {
+    nodeLabel[n.id] = n.label;
+    nodeStatus[n.id] = n.status;
+  }
 
+  // (#2315/#2343) A `depends_on` edge whose source has already read
+  // "complete" is a satisfied dependency, not a reason the target is
+  // waiting — showing it unconditionally is the exact bug both issues
+  // report: a card reads "waits on: <plan task>" long after that plan
+  // task finished. Once satisfied it drops out of the list entirely
+  // (never renders as "satisfied" text — `MissionTimelineView` already
+  // hides the whole `.tlt-waits` line when `waitsOn` is empty, which is
+  // the right rendering: nothing further to explain from the dependency
+  // graph). This does NOT distinguish "still has an unmet dependency"
+  // from "every dependency is met but the scheduler hasn't started this
+  // task's next step yet" — that further distinction is #2343 item 2 (a
+  // `waiting` status derived from step progress), deliberately out of
+  // scope here.
   const waitsOn: Record<string, string[]> = {};
   for (const e of edges) {
     if (e.kind !== "depends_on") continue;
+    if (nodeStatus[e.source] === "complete") continue;
     (waitsOn[e.target] = waitsOn[e.target] || []).push(nodeLabel[e.source] || e.source);
   }
 
