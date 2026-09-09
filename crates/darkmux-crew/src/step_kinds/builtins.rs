@@ -569,6 +569,22 @@ impl StepKind for DispatchInternalStepKind {
         // hyphen convention; future colon sweeps should skip it.
         resolve_local_seat(&role_id, profile_name.as_deref(), config_path.as_deref(), &format!("step:{}", step.id))
     }
+
+    /// (#1511) The role this kind dispatches, read from the SAME
+    /// `task_or_config_str` source `run` and `seat` above both read — one
+    /// expression, three callers, so the consent gate cannot disagree with
+    /// the load. `None` only when neither the Task nor the config names a
+    /// role, which is the same input `seat` reports as
+    /// `LocalModelUnresolved` (no wave load) and `run` fails on.
+    fn dispatch_role(
+        &self,
+        step: &Step,
+        task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        task_or_config_str(task.role_id.as_ref(), step, "role_id")
+    }
 }
 
 /// (#1412) Clamp a requested `max_tokens` down to the per-execution remote
@@ -687,6 +703,23 @@ impl StepKind for DispatchSingleShotStepKind {
             min_ctx,
             seat: format!("step:{}", step.id),
         })
+    }
+
+    /// (#1511) `None` — this kind dispatches a bare MODEL, never a role.
+    /// `run` below builds its request from `config.model` + `config.user` +
+    /// `config.system`; it never resolves a role manifest and never loads a
+    /// role prompt, and `seat` above reads `config.model`/`config.n_ctx`
+    /// for the same reason. There is no role doctrine for the
+    /// licensed-adjacent gate to disclose, so it has nothing to gate — the
+    /// behavior this kind had before #1511 and still has.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
     }
 
     fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
@@ -2228,6 +2261,22 @@ impl StepKind for DispatchMapStepKind {
             seat: format!("step:{}", step.id),
         })
     }
+
+    /// (#1511) `None`, for the same reason `dispatch.single_shot` returns
+    /// `None`: every item of the map is a bare model call built from
+    /// `config.model`/`config.user`, with no role manifest anywhere. This
+    /// is also what keeps an EMPTY `dispatch.map` — which claims
+    /// [`SeatClaim::NoModel`] above and loads nothing — from being refused
+    /// for a role it was never going to dispatch.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// Runs a shell command from `Step.config`. Required: `command`
@@ -2257,6 +2306,22 @@ impl StepKind for ProceduralShellStepKind {
         _ctx: &StepRunCtx,
     ) -> SeatClaim {
         SeatClaim::NoModel
+    }
+
+    /// (#1511) `None` — the documented no-dispatch opt-out, matching this
+    /// kind's [`SeatClaim::NoModel`] above. A shell command speaks to no
+    /// model, so there is no role for the licensed-adjacent consent gate to
+    /// check. This arm is why the gate's `None` case is not a fail-open:
+    /// an ordinary `procedural.*` graph legitimately carries no role, and
+    /// says so here rather than leaving the scheduler to guess.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
     }
 
     fn id(&self) -> &'static str {
@@ -2395,6 +2460,19 @@ impl StepKind for ProceduralNoopStepKind {
         _ctx: &StepRunCtx,
     ) -> SeatClaim {
         SeatClaim::NoModel
+    }
+
+    /// (#1511) `None` — the documented no-dispatch opt-out, matching this
+    /// kind's [`SeatClaim::NoModel`] above. See
+    /// `ProceduralShellStepKind::dispatch_role`.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
     }
 
     fn id(&self) -> &'static str {

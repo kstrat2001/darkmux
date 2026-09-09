@@ -111,6 +111,18 @@ impl StepKind for PlanSitesStepKind {
         PLAN_SITES_KIND
     }
 
+    /// (#1511) `None` — it enumerates the sites to crawl and dispatches no model,
+    /// matching its [`SeatClaim::NoModel`] above.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
+    }
+
     fn display_name(&self) -> &'static str {
         "Plan sites"
     }

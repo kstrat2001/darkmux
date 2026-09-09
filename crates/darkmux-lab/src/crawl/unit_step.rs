@@ -1095,6 +1095,23 @@ impl StepKind for CrawlUnitStepKind {
             &format!("step:{}", step.id),
         )
     }
+
+    /// (#1511) The role this unit dispatches — `task.role_id` when the
+    /// config names one (`"reviewer"` for a review.json task), the same
+    /// hardcoded `"crawler"` fallback `run` and `seat` use otherwise. That
+    /// fallback is precisely why the licensed-adjacent consent gate cannot
+    /// read `task.role_id` itself: with no role on the task the scheduler's
+    /// own field read produced `None`, while this kind went on to dispatch a
+    /// real role.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        Some(task.role_id.as_deref().unwrap_or("crawler").to_string())
+    }
     fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let cfg = UnitStepConfig::from_step(step)?;
         // (#2310 fix-loop E2, S5-7) Legal, honored, and said out loud: a
@@ -1584,6 +1601,18 @@ impl StepKind for CrawlSummaryStepKind {
 
     fn id(&self) -> &'static str {
         CRAWL_SUMMARY_KIND
+    }
+
+    /// (#1511) `None` — folds outcomes, dispatches nothing, matching its
+    /// [`SeatClaim::NoModel`] above.
+    fn dispatch_role(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Option<String> {
+        None
     }
 
     fn display_name(&self) -> &'static str {

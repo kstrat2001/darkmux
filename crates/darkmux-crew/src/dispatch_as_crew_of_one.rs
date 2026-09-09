@@ -608,6 +608,24 @@ mod tests {
             "dispatch.internal"
         }
 
+        /// (#1511) Stands in for a real `dispatch.internal`, so it sources
+        /// its role the same way — `task.role_id`, falling back to
+        /// `config.role_id`. The crew-of-one path's OWN consent check runs
+        /// before `run_step_graph` is entered (see
+        /// `dispatch_as_crew_of_one_with`), and the scheduler's runs again
+        /// on this answer; both must agree on which role this is.
+        fn dispatch_role(
+            &self,
+            step: &crate::types::Step,
+            task: &crate::types::Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &crate::step_kinds::StepRunCtx,
+        ) -> Option<String> {
+            task.role_id.clone().or_else(|| {
+                step.config.get("role_id").and_then(|v| v.as_str()).map(String::from)
+            })
+        }
+
         fn run(
             &self,
             step: &crate::types::Step,

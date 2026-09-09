@@ -103,6 +103,65 @@ fn print_licensed_adjacent_banner(role_id: &str) {
     eprintln!();
 }
 
+/// The operator-facing refusal text shared by BOTH gate variants — the
+/// prompting one's non-TTY bail and [`licensed_adjacent_ack_status`]'s
+/// unconditional one. One string, so the remediation an operator reads is
+/// the same wording whichever path refused, and so a future edit cannot
+/// improve one and leave the other behind.
+fn unacked_error(role_id: &str, dir: &std::path::Path, ack_path: &std::path::Path) -> String {
+    format!(
+        "licensed-adjacent role `{role_id}` requires operator acknowledgment, \
+         and none has been recorded. To acknowledge, run `darkmux dispatch {role_id} \
+         \"<your message>\"` from an interactive terminal and type ACKNOWLEDGE at the \
+         prompt, or pre-acknowledge without the prompt:\n\
+         \n  mkdir -p {} && touch {}\n\
+         \nThen re-run.",
+        dir.display(),
+        ack_path.display()
+    )
+}
+
+/// (#1511) The CHECK-ONLY licensed-adjacent gate: same decision as
+/// [`require_licensed_adjacent_ack`], with the interactive prompt removed.
+/// A role outside the list passes; a role with a recorded ack passes;
+/// anything else prints the disclosure banner and refuses with the same
+/// remediation text the prompting variant's non-TTY arm uses.
+///
+/// **Why a second variant exists.** `require_licensed_adjacent_ack` calls
+/// `stdin.lock().read_line(…)` with no timeout whenever stdin is a TTY, and
+/// the scheduler's consent filter (`scheduler::run_step_graph`) runs on the
+/// scheduler's MAIN thread, sequentially, over EVERY ready step of EVERY
+/// wave, before any of that wave's jobs are built.
+///
+/// Note what the argument is NOT: "blocking the main thread here would
+/// stall the wave" does not by itself distinguish this path, because the
+/// operator sign-off gate (`crate::gate::resolve_gate`) already blocks on
+/// that same thread, in the loop immediately above this one, and its own
+/// comment says so. The distinction that actually holds is WHO OPTS IN.
+/// `resolve_gate` returns immediately unless the step declares
+/// `gate: Some(…)` — a per-step opt-in the operator wrote into the mission
+/// config, so a launch that blocks is a launch that asked to. A consent
+/// prompt has no such opt-in: it would sit on the path of every ready step
+/// of every wave, in every graph, including a mission launched detached
+/// with an inherited TTY, which would then hang forever while eating
+/// keystrokes from the parent shell. So the scheduler refuses instead of
+/// asking.
+///
+/// The place to ACQUIRE an ack is unchanged and still interactive: the
+/// `dispatch` CLI verb's pre-flight (`dispatch_as_crew_of_one_with`), which
+/// runs before `run_step_graph` is ever entered.
+pub(crate) fn licensed_adjacent_ack_status(role_id: &str) -> Result<()> {
+    if !LICENSED_ADJACENT_ROLES.contains(&role_id) {
+        return Ok(());
+    }
+    let ack_path = ack_file_for(role_id)?;
+    if ack_path.exists() {
+        return Ok(());
+    }
+    print_licensed_adjacent_banner(role_id);
+    bail!(unacked_error(role_id, &ack_dir()?, &ack_path));
+}
+
 /// Licensed-adjacent ACK gate. For roles whose prompts operate in
 /// regulated domains, require an operator acknowledgment on first
 /// dispatch. The ack persists at `~/.darkmux/acks/<role>.ack` (or
@@ -117,6 +176,15 @@ fn print_licensed_adjacent_banner(role_id: &str) {
 /// the operator-facing instruction for how to pre-acknowledge.
 ///
 /// **No-op for non-licensed-adjacent roles.**
+///
+/// **This variant PROMPTS, and a prompt can block forever.** It reads
+/// `stdin` with no timeout, so it belongs only on a path that owns the
+/// terminal and has nothing waiting behind it — the `dispatch` CLI verb's
+/// pre-flight (`dispatch_as_crew_of_one_with`, which runs before any graph
+/// starts) and `dispatch_internal`'s own per-dispatch check (already on the
+/// dispatching worker thread). Anything running on the scheduler's MAIN
+/// thread must use [`licensed_adjacent_ack_status`] instead — see that
+/// function's doc for why (#1511).
 pub(crate) fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
     if !LICENSED_ADJACENT_ROLES.contains(&role_id) {
         return Ok(());
@@ -132,14 +200,7 @@ pub(crate) fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
     // remediation. The contract is that the ack is operator-explicit;
     // we don't auto-acknowledge for scripted callers.
     if !std::io::stdin().is_terminal() {
-        bail!(
-            "licensed-adjacent role `{role_id}` requires operator acknowledgment, \
-             but stdin is not a TTY. To pre-acknowledge in scripted contexts, run:\n\
-             \n  mkdir -p {} && touch {}\n\
-             \nThen re-run the dispatch.",
-            ack_dir()?.display(),
-            ack_path.display()
-        );
+        bail!(unacked_error(role_id, &ack_dir()?, &ack_path));
     }
 
     // Interactive: prompt for the ACKNOWLEDGE token. Anything else aborts.
@@ -1429,6 +1490,45 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
                 None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    /// (#1511) The CHECK-ONLY variant the scheduler uses. It refuses
+    /// without a recorded ack and passes with one, and — the property that
+    /// matters — it reaches neither branch of the prompting variant's TTY
+    /// test, so it can never block on `stdin`. The scheduler runs this
+    /// sequentially on its main thread ahead of every job in a wave; a
+    /// prompt there would stop the whole wave, and a mission launched
+    /// detached with an inherited TTY would hang indefinitely.
+    #[test]
+    #[serial_test::serial]
+    fn the_check_only_gate_refuses_without_an_ack_and_passes_with_one() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_ACK_DIR").ok();
+        // Safety: serialized.
+        unsafe {
+            std::env::set_var("DARKMUX_ACK_DIR", tmp.path());
+        }
+
+        // Unlisted role: no-op, same as the prompting variant.
+        licensed_adjacent_ack_status("coder").unwrap();
+
+        // Listed, unacked: refuses, with the operator-facing remediation.
+        let err = licensed_adjacent_ack_status("health-research").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("requires operator acknowledgment"), "got: {s}");
+        assert!(s.contains("mkdir -p"), "got: {s}");
+
+        // The ack file's mere presence is the consent record (the
+        // operator-sovereign escape hatch), and it lets the role through.
+        fs::write(tmp.path().join("health-research.ack"), "acknowledged_at_unix_seconds=1\n").unwrap();
+        licensed_adjacent_ack_status("health-research").unwrap();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_ACK_DIR", v),
+                None => std::env::remove_var("DARKMUX_ACK_DIR"),
             }
         }
     }
