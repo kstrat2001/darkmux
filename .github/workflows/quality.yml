@@ -206,7 +206,45 @@ jobs:
           # SEPARATELY below — this floor is the workspace invocation's own,
           # not "every reachable line everywhere".
           git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr-scope.diff
-          CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines /tmp/pr-scope.diff --manifest-path Cargo.toml)
+
+          # (#2605) The authoritative source, asked once per invocation
+          # BEFORE the floor is computed: `cargo mutants --list --json`,
+          # with NO `--in-diff` (see `ci-mutants-summary.py`'s own module
+          # comment, above `added_line_is_countable`, for why omitting
+          # `--in-diff` here is what keeps this independent of the exact
+          # circularity that sank the earlier `--list --in-diff` idea). It
+          # enumerates every file this invocation's manifest and flags
+          # could EVER produce a mutant for, so the floor can recognize a
+          # file whose only gate is a `#[cfg(test)]` `mod` DECLARATION in a
+          # DIFFERENT file (#2599's shape) as unmutable, the same way
+          # cargo-mutants' own source visitor already does — a per-file
+          # text scan structurally cannot resolve a cross-file attribute.
+          #
+          # Same flags as the root Mutate step below (`--workspace`, no
+          # `--manifest-path` — see that step's own comment for why root
+          # never passes one: cargo-mutants 27.1.0 errors `"" is not a
+          # directory` on a bare `--manifest-path Cargo.toml`, confirmed
+          # locally, #2605). Measured cost (cargo-mutants 27.1.0, this
+          # tree, 2026-09-10): ~10s wall, 13,037 mutants across 185 files —
+          # parse-only, no build, no test, negligible against this job's
+          # 60-minute budget. Failure here is FAIL-OPEN: if `--list` itself
+          # fails (a real tool problem, which the identically-flagged
+          # Mutate step below is then very likely to also hit on its own
+          # terms), `--mutants-list` is simply not passed to the counter —
+          # the counter's own docstring on `count_changed_lines_main` names
+          # this as the deliberate workflow-side fail-open path, so a
+          # broken listing narrows nothing rather than narrowing every PR's
+          # floor to zero. Still loud: a `::warning::` annotation, not a
+          # silently swallowed failure.
+          MUTLIST_ROOT_FLAG=()
+          if cargo mutants --workspace --list --json > /tmp/mutlist-root.json 2>/tmp/mutlist-root.err; then
+            MUTLIST_ROOT_FLAG=(--mutants-list /tmp/mutlist-root.json)
+          else
+            echo "::warning::cargo mutants --workspace --list --json failed — the #2605 listing-based floor narrowing is skipped for the root invocation this run (falling back to the heuristic alone); see the job log below:"
+            cat /tmp/mutlist-root.err
+          fi
+
+          CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines /tmp/pr-scope.diff --manifest-path Cargo.toml "${MUTLIST_ROOT_FLAG[@]}")
           echo "changed Rust lines (in workspace mutation scope, mutable-looking only): $CHANGED"
           echo "changed_lines=$CHANGED" >> "$GITHUB_OUTPUT"
 
@@ -220,7 +258,24 @@ jobs:
           # `/tmp/pr-scope.diff` (repo-root-relative paths) rather than a
           # second `git diff` — the manifest-path exclusion, not the diff
           # itself, is what changes between the two counts.
-          RUNTIME_CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines /tmp/pr-scope.diff --manifest-path runtime/Cargo.toml)
+          # (#2605) Same mechanism, this invocation's own manifest — see the
+          # root block above for the full rationale. Measured cost: ~1.7s
+          # wall, 1,529 mutants across 18 files. This is the invocation
+          # #2599 actually broke: `runtime/src/budget_request_tests.rs` and
+          # `runtime/src/checkpoint_regression_tests.rs`, both real files
+          # already in this tree, are each declared with `#[cfg(test)]
+          # #[path = "..."] mod ...;` in a SIBLING file and carry no
+          # `#[cfg(test)]` of their own — confirmed absent from this
+          # listing's own output.
+          MUTLIST_RUNTIME_FLAG=()
+          if cargo mutants --manifest-path runtime/Cargo.toml --list --json > /tmp/mutlist-runtime.json 2>/tmp/mutlist-runtime.err; then
+            MUTLIST_RUNTIME_FLAG=(--mutants-list /tmp/mutlist-runtime.json)
+          else
+            echo "::warning::cargo mutants --manifest-path runtime/Cargo.toml --list --json failed — the #2605 listing-based floor narrowing is skipped for the runtime/ invocation this run (falling back to the heuristic alone); see the job log below:"
+            cat /tmp/mutlist-runtime.err
+          fi
+
+          RUNTIME_CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines /tmp/pr-scope.diff --manifest-path runtime/Cargo.toml "${MUTLIST_RUNTIME_FLAG[@]}")
           echo "changed Rust lines (in runtime/ mutation scope, mutable-looking only): $RUNTIME_CHANGED"
           echo "runtime_changed_lines=$RUNTIME_CHANGED" >> "$GITHUB_OUTPUT"
 
@@ -257,7 +312,19 @@ jobs:
           # why that class is excluded from the floor already); its own
           # correctness is exercised by whatever integration test depends on
           # it, not by mutating its internals.
-          BUNDLER_CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines /tmp/pr-scope.diff --manifest-path plugins/darkmux-bundler-rust/Cargo.toml)
+          # (#2605) Same mechanism again. Measured cost: ~0.2s wall, 224
+          # mutants across 5 files — this manifest's own baseline test
+          # suite already runs in well under a second, so the listing call
+          # is noise on top of noise.
+          MUTLIST_BUNDLER_FLAG=()
+          if cargo mutants --manifest-path plugins/darkmux-bundler-rust/Cargo.toml --list --json > /tmp/mutlist-bundler.json 2>/tmp/mutlist-bundler.err; then
+            MUTLIST_BUNDLER_FLAG=(--mutants-list /tmp/mutlist-bundler.json)
+          else
+            echo "::warning::cargo mutants --manifest-path plugins/darkmux-bundler-rust/Cargo.toml --list --json failed — the #2605 listing-based floor narrowing is skipped for the bundler invocation this run (falling back to the heuristic alone); see the job log below:"
+            cat /tmp/mutlist-bundler.err
+          fi
+
+          BUNDLER_CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines /tmp/pr-scope.diff --manifest-path plugins/darkmux-bundler-rust/Cargo.toml "${MUTLIST_BUNDLER_FLAG[@]}")
           echo "changed Rust lines (in plugins/darkmux-bundler-rust/ mutation scope, mutable-looking only): $BUNDLER_CHANGED"
           echo "bundler_changed_lines=$BUNDLER_CHANGED" >> "$GITHUB_OUTPUT"
           git diff "origin/${{ github.base_ref }}"...HEAD --relative=plugins/darkmux-bundler-rust -- 'plugins/darkmux-bundler-rust/*.rs' > /tmp/pr-bundler.diff

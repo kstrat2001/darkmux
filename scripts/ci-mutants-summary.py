@@ -223,6 +223,49 @@ EXIT_MEANING = {
 # "--in-diff paths don't resolve" shape this floor exists to catch — makes
 # `--workspace --list --in-diff` print `INFO No mutants to filter` and exit 0.
 # A guard has to be independent of what it guards; git plus this classifier is.
+#
+# (#2605) What IS safe to ask cargo-mutants: the SAME `--list`, without
+# `--in-diff` at all. A test-only module declared as its OWN FILE, gated by a
+# `#[cfg(test)]` attribute on the `mod` STATEMENT in a different file, is
+# invisible to every exclusion above — `_test_module_ranges` reads the
+# module's own file and finds no such attribute there (it lives in the
+# parent), and the file is not under a `tests/` directory, and it is fully
+# inside the manifest's own reachable scope. Every added line in it reads as
+# ordinary code. Real, in-tree proof: `runtime/src/budget_request_tests.rs`
+# and `runtime/src/checkpoint_regression_tests.rs` are exactly this shape —
+# each is declared with `#[cfg(test)] #[path = "..."] mod ...;` in a sibling
+# file and carries no `#[cfg(test)]` of its own — and `cargo mutants
+# --manifest-path runtime/Cargo.toml --list --json` (measured against this
+# real tree, #2605) lists neither file among its 1,529 mutants. cargo-mutants'
+# own source visitor resolves the `#[cfg(...)]` attribute at the DECLARATION
+# site, across the file boundary, the same way rustc does — something no
+# per-file text scan can do, by construction, regardless of how many more
+# shapes it learns.
+#
+# `--list` (no `--in-diff`) does NOT share the rejected idea's circularity:
+# it never touches cargo-mutants' diff parser or its `--in-diff` path
+# matcher — the exact subsystem whose breakage silently zeroed both numbers
+# together above. This script's OWN diff parsing (already proven, above)
+# stays the only thing that reads the diff; cargo-mutants is asked one
+# question with no diff in it at all — "for this manifest and these flags,
+# which files ever produce a mutant" — and the answer is intersected against
+# this script's own file set. A `--list` bug that undercounts would still
+# undercount HERE, same as the rejected approach — no mechanism is immune to
+# the tool it questions being wrong — but it can no longer go wrong in
+# lockstep with a broken `--in-diff` invocation, because there is no
+# `--in-diff` in this call for anything to break in common with.
+#
+# FILE-level, not line-level, on purpose (matching the issue's own framing):
+# cargo-mutants' `--list --json` output carries an exact per-mutant span, and
+# intersecting spans against diff line numbers would be strictly more
+# precise — but also strictly more fragile (span/line-number drift across
+# cargo-mutants versions, multi-line spans that do not track a diff hunk's
+# own line numbers cleanly) for no benefit `_test_module_ranges` and
+# `added_line_is_countable` do not already provide WITHIN a file that
+# genuinely has mutants. What only the tool's own cross-file attribute
+# resolution can add is "is this FILE reachable at all" — so that is the one
+# question asked of it. `mutated_predicate` (below) is a strict AND on top of
+# `reachable_predicate`: excluded by either, countable by neither.
 # ---------------------------------------------------------------------------
 
 # A line made only of these is structure, never a mutation site: `}`, `});`,
@@ -653,6 +696,28 @@ def manifest_scope(manifest_path: Path) -> tuple[str, list[str]]:
     return manifest_dir, parse_workspace_exclude(text)
 
 
+def _scope_path(path: str, manifest_dir: str) -> str | None:
+    """Rewrite `path` (repo-root-relative, as it appears in a diff's
+    `+++ b/<path>` header) relative to `manifest_dir`, or return `None` if
+    `path` is not under `manifest_dir` at all.
+
+    This is the SAME coordinate space cargo-mutants itself reports paths in
+    for a scoped `--manifest-path` invocation — confirmed against a real run
+    (#2605): `cargo mutants --manifest-path runtime/Cargo.toml --list --json`
+    names files as `src/loop_runner.rs`, not `runtime/src/loop_runner.rs` —
+    the same relativity `quality.yml`'s own `--relative=runtime` comment
+    already documents for `--in-diff`. Shared by `reachable_predicate`
+    (below) and `mutated_predicate` so the two cannot drift apart on how a
+    path is scoped to its manifest."""
+    posix_path = Path(path).as_posix()
+    if not manifest_dir:
+        return posix_path
+    prefix = manifest_dir + "/"
+    if not posix_path.startswith(prefix):
+        return None
+    return posix_path[len(prefix) :]
+
+
 def reachable_predicate(manifest_dir: str, excluded_prefixes: list[str]):
     """Build the `reachable(path) -> bool` predicate `count_added_lines`
     takes: True iff `path` (repo-root-relative, as it appears in a diff's
@@ -660,19 +725,82 @@ def reachable_predicate(manifest_dir: str, excluded_prefixes: list[str]):
     `excluded_prefixes` (each relative to `manifest_dir`)."""
 
     def reachable(path: str) -> bool:
-        posix_path = Path(path).as_posix()
-        if manifest_dir:
-            prefix = manifest_dir + "/"
-            if not posix_path.startswith(prefix):
-                return False
-            scoped = posix_path[len(prefix) :]
-        else:
-            scoped = posix_path
+        scoped = _scope_path(path, manifest_dir)
+        if scoped is None:
+            return False
         return not any(
             scoped == excl or scoped.startswith(excl + "/") for excl in excluded_prefixes
         )
 
     return reachable
+
+
+def parse_mutants_list(list_text: str) -> set[str]:
+    """(#2605) Parse `cargo mutants --list --json`'s output (no `--in-diff`
+    — see the module comment above `added_line_is_countable` for why that
+    distinction is load-bearing) into the set of manifest-dir-relative file
+    paths that carry at least one mutant for THIS invocation's own manifest
+    and flags — cargo-mutants' own authoritative answer to "does this file
+    ever produce a mutant here", independent of any particular diff.
+
+    A test-only module declared as its own file behind a `#[cfg(test)]`
+    gate that lives in a DIFFERENT file (the parent's `mod` declaration —
+    #2605's exact shape) never appears in this listing: the file is never
+    compiled outside a test build, so cargo-mutants' own source visitor,
+    which resolves the attribute across the file boundary the same way
+    rustc does, produces zero mutants for it. `_test_module_ranges` and the
+    `tests/`-directory rule are both single-file judgments and cannot see
+    this; a listing produced by the tool that already resolved the
+    cross-file attribute can.
+
+    Raises `json.JSONDecodeError` if `list_text` is not valid JSON, and
+    `ValueError` if it is valid JSON but not a JSON array — both are treated
+    as a HARD failure by the caller (`count_changed_lines_main`), the same
+    "an operator/workflow input we were explicitly handed cannot be
+    trusted" class as an unreadable `--manifest-path` (see that function's
+    docstring): this file is generated by a `cargo mutants --list --json`
+    invocation the workflow captured moments earlier, not diff content, so
+    a malformed shape here means the wiring is broken, not that the input
+    is legitimately empty — a genuinely empty scope is a valid JSON `[]`,
+    which parses fine and yields an empty (but real) set.
+
+    An entry that IS a JSON object but lacks a string `"file"` key is
+    skipped rather than treated as fatal: a future cargo-mutants JSON
+    addition (a new mutant kind with no per-file span, say) must not turn
+    this into a hard failure for every PR the day it ships — the same
+    per-key resilience `load_outcomes_totals` already applies to
+    `outcomes.json`."""
+    data = json.loads(list_text)
+    if not isinstance(data, list):
+        raise ValueError(
+            f"expected a JSON array from `cargo mutants --list --json`, got {type(data).__name__}"
+        )
+    files: set[str] = set()
+    for entry in data:
+        if isinstance(entry, dict) and isinstance(entry.get("file"), str):
+            files.add(Path(entry["file"]).as_posix())
+    return files
+
+
+def mutated_predicate(manifest_dir: str, mutated_files: set[str]):
+    """(#2605) Build the `mutated(path) -> bool` predicate: True iff `path`
+    (repo-root-relative, as it appears in a diff's `+++ b/<path>` header),
+    scoped to `manifest_dir` the same way `reachable_predicate` scopes it
+    (via `_scope_path`), is a member of `mutated_files` — the file set
+    `parse_mutants_list` extracted from THIS invocation's own
+    `cargo mutants --list --json` output.
+
+    Meant to be ANDed with `reachable_predicate`, not to replace it: a file
+    outside the manifest's exclude list can still legitimately carry zero
+    mutants (#2605's shape), and a file the manifest excludes was already
+    unreachable before this existed (#2544) — the two checks answer
+    different questions and both must pass."""
+
+    def mutated(path: str) -> bool:
+        scoped = _scope_path(path, manifest_dir)
+        return scoped is not None and scoped in mutated_files
+
+    return mutated
 
 
 def count_added_lines(diff_text: str, reachable=None) -> tuple[int, int]:
@@ -690,11 +818,16 @@ def count_added_lines(diff_text: str, reachable=None) -> tuple[int, int]:
     `#[cfg(test)]` item (see the module comment for the exclusion mechanism
     and its known gaps).
 
-    `reachable`, if given, is a `Callable[[str], bool]` (see
-    `reachable_predicate` above) — a file for which it returns False is
-    excluded wholesale, the same way a `tests/` file already is (#2544: a
-    path outside this invocation's mutation scope can never produce a
-    mutant regardless of what it contains)."""
+    `reachable`, if given, is a `Callable[[str], bool]` — a file for which
+    it returns False is excluded wholesale, the same way a `tests/` file
+    already is. `count_changed_lines_main` builds this from one or both of
+    `reachable_predicate` (#2544: a path outside this invocation's manifest
+    scope can never produce a mutant regardless of what it contains) and
+    `mutated_predicate` (#2605: a path cargo-mutants' own `--list --json`
+    never named for this invocation can never produce a mutant either,
+    including a whole file whose only gate is a `#[cfg(test)]` `mod`
+    declaration in a DIFFERENT file) ANDed together — excluded by either,
+    countable by neither."""
     added = 0
     countable = 0
     file_path: str | None = None
@@ -759,9 +892,9 @@ def count_added_lines(diff_text: str, reachable=None) -> tuple[int, int]:
 
 
 def count_changed_lines_main(args: list[str]) -> int:
-    """`--count-changed-lines <diff> [--manifest-path <path>]`: print the
-    countable total on stdout (the workflow captures it) and the breakdown
-    on stderr (the job log reads it).
+    """`--count-changed-lines <diff> [--manifest-path <path>] [--mutants-list <path>]`:
+    print the countable total on stdout (the workflow captures it) and the
+    breakdown on stderr (the job log reads it).
 
     Anything that goes wrong exits non-zero rather than printing a 0. A guard
     that cannot read its input must fail the step, not silently disarm itself —
@@ -779,9 +912,29 @@ def count_changed_lines_main(args: list[str]) -> int:
     `tomllib`-unavailable interpreter (#2602 round 2 — see
     `TomlParserUnavailableError`) is the same hard failure, for the same
     reason: this gate must not quietly downgrade to a parser known to
-    mis-read its own scope input."""
+    mis-read its own scope input.
+
+    `--mutants-list`, when given, points at a file holding this SAME
+    invocation's `cargo mutants --list --json` output (no `--in-diff` — see
+    the module comment above `added_line_is_countable`), captured moments
+    earlier by the workflow (#2605). It further narrows the count to files
+    that listing actually names, ANDed with `--manifest-path`'s own scoping
+    when both are given — `manifest_dir` is shared between the two so a
+    listing's manifest-dir-relative `"file"` entries (e.g. `src/foo.rs` for
+    a `--manifest-path runtime/Cargo.toml` listing) line up with the same
+    scoped path `--manifest-path` itself compares against. Omitted
+    entirely, behavior is unchanged: no listing-based narrowing. An
+    UNREADABLE `--mutants-list`, or one whose content is not a JSON array
+    (`parse_mutants_list`), is the SAME hard failure (exit 2) as an
+    unreadable `--manifest-path` — this file is workflow-generated input
+    handed to the script by name, not diff content, so a broken listing
+    step must not silently pass through as "nothing excluded". A workflow
+    that could not produce a listing at all should not pass this flag —
+    that is the fail-open path, and it is the workflow's call to make, not
+    this script's (see `quality.yml`'s own comment on the listing step)."""
     args = list(args)
-    reachable = None
+    manifest_dir = ""
+    predicates = []
     if "--manifest-path" in args:
         mi = args.index("--manifest-path")
         if mi + 1 >= len(args):
@@ -800,7 +953,38 @@ def count_changed_lines_main(args: list[str]) -> int:
         except TomlParserUnavailableError as exc:
             print(f"--manifest-path {manifest_arg}: {exc}", file=sys.stderr)
             return 2
-        reachable = reachable_predicate(manifest_dir, excluded_prefixes)
+        predicates.append(reachable_predicate(manifest_dir, excluded_prefixes))
+
+    if "--mutants-list" in args:
+        li = args.index("--mutants-list")
+        if li + 1 >= len(args):
+            print(
+                "--mutants-list requires a path to `cargo mutants --list --json` output",
+                file=sys.stderr,
+            )
+            return 2
+        list_arg = args[li + 1]
+        del args[li : li + 2]
+        try:
+            list_text = Path(list_arg).read_text(errors="replace")
+        except OSError as exc:
+            print(f"--mutants-list could not read {list_arg}: {exc}", file=sys.stderr)
+            return 2
+        try:
+            mutated_files = parse_mutants_list(list_text)
+        except json.JSONDecodeError as exc:
+            print(f"--mutants-list {list_arg} is not valid JSON: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"--mutants-list {list_arg}: {exc}", file=sys.stderr)
+            return 2
+        predicates.append(mutated_predicate(manifest_dir, mutated_files))
+
+    reachable = None
+    if predicates:
+
+        def reachable(path: str, _predicates=predicates) -> bool:
+            return all(predicate(path) for predicate in _predicates)
 
     i = args.index("--count-changed-lines")
     if i + 1 >= len(args):
@@ -1916,6 +2100,210 @@ MANIFEST_PARSE_SELF_TEST_CASES = [
 COUNT_SELF_TEST_CASES += MANIFEST_PARSE_SELF_TEST_CASES
 
 
+# ---------------------------------------------------------------------------
+# (#2605) The `--mutants-list` half: a test-only module declared as its OWN
+# FILE, gated by `#[cfg(test)]` on the `mod` statement in a DIFFERENT file —
+# invisible to every exclusion above (#2582's `_test_module_ranges` reads
+# the file itself and finds no attribute there; #2544's manifest-exclude
+# list has no opinion on a file fully inside a reachable crate).
+#
+# The fixture shapes below are not invented: they reproduce the REAL files
+# already in this tree, `runtime/src/budget_request_tests.rs` and
+# `runtime/src/checkpoint_regression_tests.rs`, each declared as
+# `#[cfg(test)] #[path = "..."] mod ...;` in a sibling file and carrying no
+# `#[cfg(test)]` of its own — and the real `cargo mutants --manifest-path
+# runtime/Cargo.toml --list --json` output, measured against this tree
+# (#2605), lists neither among its 1,529 mutants. `_MUTANTS_LIST_RUNTIME`
+# below is a trimmed stand-in for that real listing: two real production
+# files that DO carry mutants, `budget_request_tests.rs` conspicuously
+# absent — the same absence the real listing exhibits.
+# ---------------------------------------------------------------------------
+
+_DIFF_TEST_SUPPORT_FILE = (
+    "--- a/runtime/src/budget_request_tests.rs\n"
+    "+++ b/runtime/src/budget_request_tests.rs\n"
+    "@@ -60,3 +60,9 @@\n"
+    "+\n"
+    "+#[test]\n"
+    "+fn a_new_regression_case() {\n"
+    '+    let p = continue_thinking_prefill("x");\n'
+    "+    assert!(p.starts_with(THINK_OPEN));\n"
+    "+}\n"
+)
+
+# The real file's own shape: no `#[cfg(test)]` anywhere in it — the gate is
+# at the DECLARATION site, in `budget_request.rs`, not here.
+_TEST_SUPPORT_SOURCE = (
+    "use super::*;\n"
+    "\n"
+    "#[test]\n"
+    "fn continue_prefill_leaves_the_think_block_open() {\n"
+    '    let p = continue_thinking_prefill("x");\n'
+    "    assert!(p.starts_with(THINK_OPEN));\n"
+    "}\n"
+)
+
+# A trimmed stand-in for the real `cargo mutants --manifest-path
+# runtime/Cargo.toml --list --json` output (#2605): manifest-dir-relative
+# paths (`runtime/` itself is not part of them — see `_scope_path`'s own
+# comment), `budget_request_tests.rs` absent by construction, matching the
+# real run.
+_MUTANTS_LIST_RUNTIME = json.dumps(
+    [
+        {"file": "src/budget_request.rs", "name": "src/budget_request.rs:10:1: replace"},
+        {"file": "src/loop_runner.rs", "name": "src/loop_runner.rs:20:1: replace"},
+    ]
+)
+
+MUTANTS_LIST_SELF_TEST_CASES = [
+    {
+        # THE #2605 REPRODUCTION. Without `--mutants-list`, this diff counts
+        # 3 (the new fn's signature, the `let`, and the `assert!` line —
+        # the `#[test]` attribute and closing `}` already excluded on their
+        # own) and fails the floor exactly like #2599 did: a test-only file
+        # whose gate lives elsewhere reads as ordinary code. With the real
+        # listing wired in, the file never appears in it, so the count
+        # drops to 0 and the gate passes.
+        "name": "#2605: a test-only file gated by a cfg(test) mod declaration elsewhere counts zero",
+        "diff": _DIFF_TEST_SUPPORT_FILE,
+        "source_files": {"runtime/src/budget_request_tests.rs": _TEST_SUPPORT_SOURCE},
+        "manifest_path": "runtime/Cargo.toml",
+        "manifest_content": _RUNTIME_MANIFEST,
+        "manifest_arg": "runtime/Cargo.toml",
+        "mutants_list_content": _MUTANTS_LIST_RUNTIME,
+        "mutants_list_arg": "mutlist.json",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # The companion half, and the case that MUST STAY RED: a diff to a
+        # file the SAME listing DOES name (a production file) counts
+        # normally and the floor still fails on it. Proves `--mutants-list`
+        # narrows, it does not neuter — a genuinely mutable diff producing
+        # no mutants is still caught with the flag wired in, same as
+        # without it.
+        "name": "#2605: a production file the listing DOES name still counts, and the floor still fails",
+        "diff": _DIFF_RUNTIME_ONLY,  # runtime/src/loop_runner.rs
+        "manifest_path": "runtime/Cargo.toml",
+        "manifest_content": _RUNTIME_MANIFEST,
+        "manifest_arg": "runtime/Cargo.toml",
+        "mutants_list_content": _MUTANTS_LIST_RUNTIME,
+        "mutants_list_arg": "mutlist.json",
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        # The manifest-exclude check (#2544) still wins even when a
+        # (deliberately misleading) listing claims the file IS mutated —
+        # `reachable_predicate` and `mutated_predicate` are ANDed, so being
+        # excluded by EITHER excludes it. Proves the two mechanisms compose
+        # rather than one silently overriding the other.
+        "name": "#2605: the manifest-exclude list still wins over a listing that claims the file is mutated",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _ROOT_MANIFEST,  # excludes runtime/
+        "manifest_arg": "Cargo.toml",
+        "mutants_list_content": json.dumps([{"file": "runtime/src/loop_runner.rs"}]),
+        "mutants_list_arg": "mutlist.json",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # No `--manifest-path` at all (the real root invocation's own
+        # shape — `quality.yml` never passes `--manifest-path Cargo.toml`
+        # for the root job; see the comment on the listing step for why).
+        # `manifest_dir` defaults to `""`, so the listing's `"file"` entries
+        # are compared as full repo-root-relative paths, unscoped.
+        "name": "#2605: root scope (no --manifest-path) narrows by the listing too",
+        "diff": _DIFF_ROOT_SRC_ONLY,  # src/mission_status.rs
+        "mutants_list_content": json.dumps([{"file": "src/mission_status.rs"}]),
+        "mutants_list_arg": "mutlist.json",
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        # The mirror of the above: root scope, but the listing does NOT
+        # name the file (the #2605 shape without a manifest at all).
+        "name": "#2605: root scope, a file the listing omits counts zero",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "mutants_list_content": json.dumps([{"file": "some/other/file.rs"}]),
+        "mutants_list_arg": "mutlist.json",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # A genuinely empty listing (`[]`) is a LEGITIMATE answer — a real
+        # `cargo mutants --list --json` invocation that found nothing to
+        # mutate anywhere in scope — and is parsed without a warning,
+        # distinct from the malformed shapes below.
+        "name": "#2605: a genuinely empty listing excludes everything, without warning",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "runtime/Cargo.toml",
+        "manifest_content": _RUNTIME_MANIFEST,
+        "manifest_arg": "runtime/Cargo.toml",
+        "mutants_list_content": "[]",
+        "mutants_list_arg": "mutlist.json",
+        "expect_count": 0,
+        "expect_gate": 0,
+        "expect_stderr_not_contains": ["not valid JSON", "expected a JSON array"],
+    },
+    {
+        # An entry missing the `"file"` key is skipped, not fatal — a
+        # future cargo-mutants JSON addition must not turn every PR red the
+        # day it ships. The usable entry alongside it still counts.
+        "name": "#2605: a listing entry missing 'file' is skipped, not fatal",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "runtime/Cargo.toml",
+        "manifest_content": _RUNTIME_MANIFEST,
+        "manifest_arg": "runtime/Cargo.toml",
+        "mutants_list_content": json.dumps(
+            [{"genre": "FnValue", "name": "no file key here"}, {"file": "src/loop_runner.rs"}]
+        ),
+        "mutants_list_arg": "mutlist.json",
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        # An UNREADABLE `--mutants-list` (nothing written at the named
+        # path) is a hard failure, not a silent "nothing excluded" — same
+        # class, same treatment, as an unreadable `--manifest-path`. A
+        # workflow whose listing step genuinely failed must not pass this
+        # flag at all (that is the real fail-open path — see the docstring
+        # on `count_changed_lines_main` and `quality.yml`'s own listing
+        # step comment); passing it and having it silently do nothing would
+        # hide that the listing step is broken.
+        "name": "#2605: an unreadable --mutants-list fails loudly, not open",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "mutants_list_arg": "does-not-exist.json",
+        "expect_exit": 2,
+        "expect_stderr_contains": ["--mutants-list"],
+    },
+    {
+        # Not valid JSON at all — the listing step produced garbage (a
+        # truncated write, an error message captured instead of output).
+        "name": "#2605: a --mutants-list file that is not valid JSON fails loudly",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "mutants_list_content": "not json at all {{{",
+        "mutants_list_arg": "mutlist.json",
+        "expect_exit": 2,
+        "expect_stderr_contains": ["--mutants-list"],
+    },
+    {
+        # Valid JSON, but not an array — `cargo mutants --list --json`
+        # always emits a top-level array; anything else means the file
+        # is not what it claims to be.
+        "name": "#2605: a --mutants-list file that parses but is not a JSON array fails loudly",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "mutants_list_content": json.dumps({"not": "a list"}),
+        "mutants_list_arg": "mutlist.json",
+        "expect_exit": 2,
+        "expect_stderr_contains": ["--mutants-list", "expected a JSON array"],
+    },
+]
+
+COUNT_SELF_TEST_CASES += MUTANTS_LIST_SELF_TEST_CASES
+
+
 def _run_self(
     argv: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess:
@@ -1971,6 +2359,17 @@ def count_self_test() -> list[str]:
                 mdest = tmp_path / case["manifest_path"]
                 mdest.parent.mkdir(parents=True, exist_ok=True)
                 mdest.write_text(case["manifest_content"])
+            # (#2605) Optional `cargo mutants --list --json` fixture — write
+            # it at `mutants_list_path` (relative to this same isolated
+            # tempdir, default `mutlist.json`) when supplied, and pass
+            # `--mutants-list <mutants_list_arg>` on the counter's argv.
+            # `mutants_list_arg` may legitimately name a path with nothing
+            # written there (the unreadable-listing case), same shape as
+            # `manifest_arg` above.
+            if "mutants_list_content" in case:
+                ldest = tmp_path / case.get("mutants_list_path", "mutlist.json")
+                ldest.parent.mkdir(parents=True, exist_ok=True)
+                ldest.write_text(case["mutants_list_content"])
             count_argv = ["--count-changed-lines", str(diff_path)]
             if "manifest_arg" in case:
                 count_argv += ["--manifest-path", case["manifest_arg"]]
@@ -1983,6 +2382,8 @@ def count_self_test() -> list[str]:
                     "--manifest-path",
                     str(tmp_path / case["manifest_arg_absolute"]),
                 ]
+            if "mutants_list_arg" in case:
+                count_argv += ["--mutants-list", case["mutants_list_arg"]]
             expect_exit = case.get("expect_exit", 0)
             problems = []
 
@@ -2103,7 +2504,8 @@ def self_test() -> int:
 USAGE = (
     "usage: ci-mutants-summary.py <exit_code> <diff|full> <title> "
     "[--changed-lines N] [out_dir_candidate ...]\n"
-    "       ci-mutants-summary.py --count-changed-lines <unified.diff>\n"
+    "       ci-mutants-summary.py --count-changed-lines <unified.diff> "
+    "[--manifest-path <Cargo.toml>] [--mutants-list <list.json>]\n"
     "       ci-mutants-summary.py --self-test"
 )
 
