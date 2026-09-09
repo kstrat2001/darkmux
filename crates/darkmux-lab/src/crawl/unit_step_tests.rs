@@ -1156,10 +1156,14 @@ fn every_terminal_state_counter_on_the_summary_is_accounted_for_in_stopped_by() 
         workspace: _,
         units_in_plan: _,
         units_selected: _,
-        // EXCLUDED on purpose (#2274): also counts units the operator
-        // never SELECTED in the first place (`--param units=`/`limit=`),
-        // which is ordinary usage, not an early stop. Folding it into
-        // `stopped_by` would misreport every selective launch.
+        // EXCLUDED on purpose, but not for the reason #2274 gave — that
+        // issue blamed this on deselected units (`--param units=`/
+        // `limit=`) getting folded in, and was closed as stale: that
+        // mechanism no longer exists (`select_units`/`crawl_launch.rs`
+        // were deleted in #2301/#2313). With deselection gone,
+        // `units_not_run` today means genuinely unreached. A branch for
+        // it is #2573's job, deliberately not folded into `stopped_by`
+        // here.
         units_not_run: _,
         // The "nothing wrong" bucket — not a stop cause by definition.
         units_completed: _,

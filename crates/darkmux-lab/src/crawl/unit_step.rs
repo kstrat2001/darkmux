@@ -1893,10 +1893,17 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         //
         // Two of `CrawlSummary`'s other terminal-state counters are
         // deliberately NOT consulted here, and that is not an oversight:
-        // `units_not_run` also counts units the operator never selected
-        // in the first place (`--param units=`/`limit=`, #2274) — folding
-        // it in would misreport an ordinary partial-selection launch as a
-        // stopped run. `units_budget_exhausted` is a PER-UNIT outcome (one
+        // `units_not_run` is left out, but NOT for the reason an earlier
+        // version of this comment gave — deselection (`--param units=`/
+        // `limit=`) doesn't exist any more (`select_units` and
+        // `src/crawl_launch.rs` were both deleted in #2301/#2313, and
+        // `crawl.json` declares no `units`/`limit` input), so #2274,
+        // which blamed this exclusion on deselected units getting folded
+        // in, was closed as stale. With deselection gone, `units_not_run`
+        // today counts only units that genuinely never got a row. It is
+        // still not consulted here, on purpose: giving `stopped_by` a
+        // branch for it is #2573's job, deliberately not folded into
+        // this fix. `units_budget_exhausted` is a PER-UNIT outcome (one
         // unit ran out of its own turn/token budget); it does not halt the
         // crawl — the next unit still runs — so it answers a different
         // question than "why is the RUN shorter than planned".

@@ -1143,8 +1143,13 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.45.0";
 //           reason. Nothing in the viewer switches on its value today.
 //
 //   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2569: `stopped_by`
-//           gains a fifth value, `"interrupted"`, for the same reason
-//           `"thermal"` did — `units_interrupted` (counting steps the
+//           gains `"interrupted"` back, for the same reason `"thermal"`
+//           came back in #2454 — it is not a new value. The retired
+//           literal launcher already wrote `stopped_by: "interrupted"`
+//           on a clean SIGINT stop (see `darkmux_types::interrupt`'s
+//           module doc, #1959 packet 2); this fix restores that meaning
+//           to the field after the generic-launch rewrite (#2301/#2313)
+//           dropped it. `units_interrupted` (counting steps the
 //           scheduler reconciled to `Abandoned` on a graceful `mission
 //           abort` or a SIGINT mid-dispatch) already existed on
 //           `CrawlSummary` but was never consulted by `stopped_by`, so a
