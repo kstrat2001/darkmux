@@ -2129,6 +2129,131 @@
         );
     }
 
+    // ─── #2162: --resume-from validation must run BEFORE model selection ──
+
+    /// **This is the ORDER test, not just a refusal test.** #2162 found
+    /// `dispatch()` validated `--resume-from` only after model selection
+    /// (a real LMStudio residency reconcile) and after workspace/`host_out`
+    /// creation — so a resume that was always going to be refused paid for
+    /// a full model evict+load first. Checking the error TEXT alone can't
+    /// tell the two orderings apart (both orderings eventually return an
+    /// error), so this drives the REAL `dispatch()` with TWO independent,
+    /// distinguishable failure triggers armed at once:
+    ///
+    ///   - `resume_from` names a dir with NO `checkpoint.json` → fails with
+    ///     "RESUME CHECKPOINT NOT FOUND" if the resume gate runs at all.
+    ///   - `config_path` names a profiles registry that does not exist →
+    ///     fails with "model selection failed" if model selection is
+    ///     REACHED (`resolve_dispatch_model_internal` hard-stops on a
+    ///     missing registry file, same trick
+    ///     `dispatch_appends_the_no_git_note_at_the_call_site` above uses —
+    ///     this never touches a real LMStudio instance either way).
+    ///
+    /// Only ONE of these can be the error that surfaces, and which one it
+    /// is says which step ran FIRST. If the resume-checkpoint hoist were
+    /// ever reverted (the call moved back to its pre-#2162 spot, after
+    /// model selection), this test goes red: the error becomes "model
+    /// selection failed" instead, because model selection would run to
+    /// completion (well, failure) before the resume gate ever got a turn.
+    /// A test asserting only "dispatch() returns an error" — or only that
+    /// the error mentions resume — cannot catch that regression; this one
+    /// can, because it names the SPECIFIC error that only the correct
+    /// ordering produces.
+    ///
+    /// **What this test's discriminating power RESTS ON — read before
+    /// touching either.** The whole thing hinges on the nonexistent
+    /// `config_path` being a HARD STOP at model selection. It is today:
+    /// `resolve_selected_profile_model` turns a registry-load failure into
+    /// `Ok(None)`, and the container path's `resolve_dispatch_model_internal`
+    /// then raises the loud #1269 hard stop with the file named. If that
+    /// ever softens into a FALLBACK (probe whatever LMStudio has loaded,
+    /// use a built-in default profile), this test goes SILENTLY VACUOUS —
+    /// model selection would then SUCCEED under either ordering, the second
+    /// assertion could never fire, and a reverted hoist would sail through
+    /// green. It would also start touching the operator's real LMStudio,
+    /// which is the other reason the arming matters. Keep the hard stop, or
+    /// re-arm this test against whatever replaces it.
+    ///
+    /// Both workspace shapes are covered, because they are validated
+    /// against DIFFERENT paths (see `auto_workspace_path`'s doc): the
+    /// no-`--workdir` case passes a derived auto-tempdir name, the
+    /// `--workdir` case passes the canonicalized operator path. Ordering is
+    /// the property under test in both, and `--workdir` is the one that
+    /// matters operationally — a no-`--workdir` resume can never succeed at
+    /// all, so it is the `--workdir` ordering a real operator relies on.
+    #[test]
+    #[serial]
+    fn dispatch_internal_resume_from_validates_before_model_selection() {
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        // No checkpoint.json written in either resume dir — `validate_
+        // resume_checkpoint` refuses with RESUME CHECKPOINT NOT FOUND the
+        // instant it is given the chance to run.
+        let resume_from = TempDir::new().unwrap();
+        // Canonicalized so `validate_workdir`'s symlink check has nothing
+        // to object to (macOS puts TempDirs under /var, a firmlink).
+        let workdir = TempDir::new().unwrap();
+        let workdir_path = workdir.path().canonicalize().unwrap();
+
+        let run = |workdir: Option<std::path::PathBuf>| {
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.role_id = "coder".to_string(); // a real built-in role
+            opts.resume_from = Some(resume_from.path().to_path_buf());
+            opts.workdir = workdir;
+            // Armed but must never be reached: a registry path that doesn't
+            // exist would fail model selection with "model selection failed"
+            // — the tell that model selection ran before the resume gate did.
+            opts.config_path = Some(
+                home.path()
+                    .join("no-such-profiles-2162.json")
+                    .display()
+                    .to_string(),
+            );
+            let err = dispatch(opts).expect_err("a --resume-from with no checkpoint must refuse");
+            format!("{err:#}")
+        };
+
+        let auto_tempdir_case = run(None);
+        let workdir_case = run(Some(workdir_path));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        for (case, msg) in [
+            ("no --workdir (auto tempdir workspace)", &auto_tempdir_case),
+            ("--workdir (operator-named workspace)", &workdir_case),
+        ] {
+            // POSITIVE: the error is the checkpoint gate's, named — both
+            // the gate's own greppable text and the context `dispatch()`
+            // wraps that call in, so a same-worded error raised from some
+            // OTHER call site could not satisfy this.
+            assert!(
+                msg.contains("RESUME CHECKPOINT NOT FOUND"),
+                "[{case}] the resume gate must be the thing that refuses — it never got a \
+                 turn: {msg}"
+            );
+            assert!(
+                msg.contains("darkmux dispatch --resume-from"),
+                "[{case}] the refusal must come from dispatch()'s own --resume-from gate, \
+                 identified by the context it wraps that call in: {msg}"
+            );
+            // NEGATIVE: and the armed model-selection failure never fired,
+            // which is what pins the ORDER rather than merely the refusal.
+            assert!(
+                !msg.contains("model selection failed"),
+                "[{case}] model selection must never run for a resume that was always going \
+                 to be refused (this is exactly the residency-shuffle-before-refusal bug \
+                 #2162 filed): {msg}"
+            );
+        }
+    }
+
     /// Opts that reach `dispatch()`'s workdir preflight and then bail: a
     /// role id no manifest declares, and `skip_preflight` so no Docker
     /// daemon is contacted on the way.
@@ -3219,6 +3344,33 @@
     /// workspace gate specifically) don't have to hand-roll the JSON.
     fn write_origin(dir: &std::path::Path, workspace: &str, read_only: bool) {
         write_resume_origin_meta(dir, std::path::Path::new(workspace), read_only);
+    }
+
+    /// (#2162) Test-only composition mirroring the OLD (pre-#2162)
+    /// single-call `stage_resume_checkpoint` shape: validate, then stage.
+    /// Production `dispatch()` no longer calls the two steps back-to-back
+    /// like this — it calls `validate_resume_checkpoint` early (before
+    /// model selection) and `write_staged_resume_checkpoint` later (once
+    /// `host_out` exists) — see `dispatch_internal.rs`'s #2162 comments on
+    /// the hoist and `dispatch_internal_resume_from_validates_before_model_
+    /// selection` below for the test that pins THAT ordering. This helper
+    /// exists purely so the validation-behavior coverage below (schema,
+    /// role, workspace, mount-mode gates) doesn't have to be duplicated
+    /// into two near-identical assertions per case.
+    fn stage_resume_checkpoint(
+        resume_from: &std::path::Path,
+        new_host_out: &std::path::Path,
+        expected_role_id: &str,
+        expected_workspace: &std::path::Path,
+        expected_workspace_read_only: bool,
+    ) -> anyhow::Result<()> {
+        let contents = validate_resume_checkpoint(
+            resume_from,
+            expected_role_id,
+            expected_workspace,
+            expected_workspace_read_only,
+        )?;
+        write_staged_resume_checkpoint(&contents, new_host_out)
     }
 
     #[test]

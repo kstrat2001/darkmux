@@ -423,16 +423,25 @@ pub struct DispatchOpts {
     /// `/darkmux-out` mount, `$TMPDIR/darkmux-out-<role>-<unix_micros>`)
     /// to resume from. `Some(dir)` is the trigger `resume_checkpoint`
     /// itself never was: `dispatch_internal::dispatch` verifies
-    /// `<dir>/checkpoint.json` exists and parses before doing anything
-    /// else, COPIES it into THIS dispatch's own (fresh) host out dir —
-    /// the old dir is left untouched as evidence, this dispatch gets its
-    /// own trajectory/run record — then sets
+    /// `<dir>/checkpoint.json` exists and parses — since #2162 that check
+    /// runs before model selection and before the workspace/host-out dirs
+    /// exist, so a refused resume costs no model load, no eviction, no
+    /// directory materialization and no `dispatch.start` flow record
+    /// (NOT "before anything else": the licensed-adjacent ack gate, the
+    /// remote-endpoint early return, and the Docker preflight still run
+    /// ahead of it) — then, once this dispatch's own fresh host out dir
+    /// exists, WRITES the already-validated checkpoint bytes into it — the
+    /// old dir is left untouched as evidence, this dispatch gets its own
+    /// trajectory/run record — then sets
     /// `DockerRunConfig::resume_checkpoint = true` so `--resume` reaches
     /// the container. `None` (every existing caller) preserves the
-    /// fresh-start behavior exactly. See `dispatch_internal`'s
-    /// `stage_resume_checkpoint` for the validate-then-copy mechanics and
-    /// the `resumed_from` provenance this stamps into the dispatch's flow
-    /// records.
+    /// fresh-start behavior exactly. A remote-endpoint dispatch never
+    /// reaches the gate at all and ignores `resume_from` outright — a known
+    /// bypass, filed as #2561. See `dispatch_internal`'s
+    /// `validate_resume_checkpoint` (the early gate) and
+    /// `write_staged_resume_checkpoint` (the later write) for the
+    /// validate-then-stage mechanics and the `resumed_from` provenance
+    /// this stamps into the dispatch's flow records.
     pub resume_from: Option<PathBuf>,
     /// (#2153) Caller-named host out dir (the `/darkmux-out` mount) to use
     /// for THIS dispatch, instead of letting `dispatch_internal::dispatch`

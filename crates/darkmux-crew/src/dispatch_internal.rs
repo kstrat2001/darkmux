@@ -529,21 +529,90 @@ const RESUME_CHECKPOINT_CONTAINER_PATH: &str = "/darkmux-out/checkpoint.json";
 /// without re-typing the literal.
 pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 
-/// (#2114 follow-up) `DispatchOpts::resume_from`'s host-side mechanics: this
-/// is what actually TRIGGERS a resume — the checkpoint-carrying `--resume`
-/// argv flag has existed since #2114 finding 3, but nothing constructed a
-/// `DockerRunConfig` with `resume_checkpoint: true` until this landed.
+/// (#2162) The no-`--workdir` auto-tempdir path `dispatch()` will mount as
+/// `workspace` — computed WITHOUT creating it, so a `--resume-from`
+/// checkpoint can be validated ahead of the residency and filesystem work:
+/// no model load, no eviction, no directory materialization, no
+/// `dispatch.start` flow record. NOT "before any side effect" — three
+/// things still run earlier in `dispatch()` and are unaffected by this
+/// hoist: the licensed-adjacent ack gate (an interactive stdin prompt that
+/// can `create_dir_all` + write an ack file), the remote-endpoint fork
+/// (which early-returns through `dispatch_remote`, a real HTTP call and a
+/// real token spend, so on that path this gate is never reached at all —
+/// #2561), and `check_docker_preflight` (a `docker pull` of the runtime
+/// image on a cold cache; every production call site passes
+/// `skip_preflight: false`, so it is live on real dispatches).
 ///
-/// Validates that `resume_from` (a PRIOR dispatch's `host_out`) names a
-/// real, parseable checkpoint, then COPIES it into `new_host_out` — THIS
-/// dispatch's own fresh out dir — so the container's `--resume
-/// /darkmux-out/checkpoint.json` mount (bound at `new_host_out` via
-/// `apply_volume_mounts`) finds it. Never reuses `resume_from` as the
-/// mount source directly: this dispatch is a NEW run record with its own
-/// trajectory, and `resume_from` stays untouched as forensic evidence
-/// (matches the "host_out is never cleaned, even on error" contract —
-/// see `AutoWorkspaceCleanup`'s own doc for the sibling `workspace`
-/// cleanup this does NOT extend to).
+/// `dispatch()` calls this once, early (before model selection), and reuses
+/// the returned path both for that early validation and for the actual
+/// `create_dir_exclusive_unique_0700` call at workspace-resolution time —
+/// one place decides the name, so the two can't drift apart.
+///
+/// **Collision semantics, and the direction of error.** The `--workdir`
+/// case is exact: `validate_workdir` canonicalized the path above,
+/// workspace resolution reuses that same canonical `PathBuf`, and nothing
+/// creates it — the path validated is the path mounted. The no-`--workdir`
+/// case is not exact. This name is a `<role_id>-<unix_micros>` wall-clock
+/// derivation (the same naming `resolve_host_out`'s `None` branch uses),
+/// and on a collision `create_dir_exclusive_unique_0700` falls through to a
+/// suffixed name rather than reusing the occupied one — see its doc for why
+/// that fallback exists — so the dispatch would mount a path the resume
+/// gate never saw.
+///
+/// That is a NEW inversion introduced by #2162, not a pre-existing gap.
+/// Before the hoist the gate ran AFTER the exclusive create and was handed
+/// the REAL, post-suffix `workspace`: a collision made the two paths
+/// mismatch and the resume was REFUSED. Now the gate is handed the
+/// pre-suffix intended name, so a collision PASSES and the dispatch mounts
+/// a freshly created empty directory that is not the tree the checkpoint
+/// was recorded against. For a consent-style gate, erring toward accepting
+/// is the wrong direction, and the hoist also WIDENS the derive-to-create
+/// window from microseconds to the whole of model selection — minutes, when
+/// a model has to load.
+///
+/// It is left as-is regardless, because the branch is unreachable: a
+/// no-`--workdir` resume can never succeed at all, collision or not. The
+/// gate compares this dispatch's workspace path against the `workspace`
+/// string the PRIOR run stamped into its own `RESUME_ORIGIN_FILENAME`, and
+/// that prior auto-tempdir carries the PRIOR run's `unix_micros` — never
+/// this one's — so every no-`--workdir` resume ends in RESUME WORKSPACE
+/// MISMATCH. `--resume-from` is therefore usable only alongside `--workdir`,
+/// which is the exact case. Revisit if the auto-tempdir path ever gains a
+/// way to name a prior run's workspace.
+fn auto_workspace_path(role_id: &str, unix_micros: u128) -> PathBuf {
+    std::env::temp_dir().join(format!("darkmux-dispatch-{role_id}-{unix_micros}"))
+}
+
+/// (#2114 follow-up / #2162) `DispatchOpts::resume_from`'s host-side
+/// validation. This is what refuses an invalid resume — the checkpoint-
+/// carrying `--resume` argv flag has existed since #2114 finding 3, but
+/// nothing constructed a `DockerRunConfig` with `resume_checkpoint: true`
+/// until this landed.
+///
+/// **#2162: called early, before model selection.** Before #2162, this
+/// validation ran only as part of a single `stage_resume_checkpoint` call
+/// positioned AFTER model selection and AFTER the workspace/`host_out`
+/// dirs were created — so a resume that was always going to be refused
+/// had already paid for a full LMStudio residency reconcile (evict + load)
+/// and materialized a workspace dir first. `dispatch()` now calls this
+/// function immediately after `--workdir` validation: a refused resume now
+/// fails with no model load, no eviction, no directory materialization and
+/// no `dispatch.start` flow record. It is NOT the first thing `dispatch()`
+/// does — the licensed-adjacent ack gate, the remote-endpoint early return,
+/// and the Docker preflight all still precede it; `auto_workspace_path`'s
+/// own doc names each and what it costs. It does
+/// everything the checkpoint gate needs to do EXCEPT the final copy into
+/// the fresh dispatch's `host_out` — that step needs `host_out` to exist,
+/// which isn't true yet this early — so it returns the checkpoint's raw
+/// (already read, already validated) file contents; the caller lands them
+/// once `host_out` exists via [`write_staged_resume_checkpoint`], with no
+/// second read/reparse and nothing able to change under the checkpoint in
+/// between. Never reuses `resume_from` as the mount source directly either
+/// way: this dispatch is a NEW run record with its own trajectory, and
+/// `resume_from` stays untouched as forensic evidence (matches the
+/// "host_out is never cleaned, even on error" contract — see
+/// `AutoWorkspaceCleanup`'s own doc for the sibling `workspace` cleanup
+/// this does NOT extend to).
 ///
 /// Deliberately does NOT deserialize into `runtime::checkpoint::RunCheckpoint`
 /// — `runtime/` is a separate crate, built into the Docker image and NOT
@@ -603,14 +672,22 @@ pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 /// OWN `host_out` at creation time (`RESUME_ORIGIN_FILENAME`); this reads
 /// it back from `resume_from` and refuses — never guesses — when it's
 /// missing, unparseable, names a different workspace path, or would
-/// upgrade a read-only origin to read-write.
-pub(crate) fn stage_resume_checkpoint(
+/// upgrade a read-only origin to read-write. `dispatch()` passes
+/// `intended_workspace` here (the NOT-YET-CREATED path `workspace`
+/// resolution will materialize a moment later) rather than the real,
+/// already-mounted `workspace` the pre-#2162 call site passed. That is an
+/// exact match in the `--workdir` case; in the no-`--workdir` case it
+/// INVERTS the direction of error on a name collision (the old call site
+/// refused, this one accepts) — a NEW behavior in #2162, not a pre-existing
+/// one, and unreachable because a no-`--workdir` resume cannot match its
+/// origin's workspace regardless. `auto_workspace_path`'s own doc spells
+/// out both cases; read it before changing what is passed here.
+pub(crate) fn validate_resume_checkpoint(
     resume_from: &Path,
-    new_host_out: &Path,
     expected_role_id: &str,
     expected_workspace: &Path,
     expected_workspace_read_only: bool,
-) -> Result<()> {
+) -> Result<String> {
     let src = resume_from.join(CHECKPOINT_FILENAME);
     if !src.is_file() {
         bail!(
@@ -742,21 +819,26 @@ pub(crate) fn stage_resume_checkpoint(
             src.display()
         );
     }
+    Ok(contents)
+}
+
+/// (#2162 hoist) The staging half of what used to be a single
+/// `stage_resume_checkpoint` call — writes an ALREADY-VALIDATED checkpoint
+/// (the string [`validate_resume_checkpoint`] returned) into `new_host_out`.
+/// Never call this on unvalidated content; it does no schema/role/workspace
+/// checking of its own. Split out purely so `dispatch()` can run the real
+/// validation before model selection and the workspace/`host_out` dirs
+/// exist, then land the file once `new_host_out` is actually there.
+pub(crate) fn write_staged_resume_checkpoint(contents: &str, new_host_out: &Path) -> Result<()> {
     let dest = new_host_out.join(CHECKPOINT_FILENAME);
-    fs::copy(&src, &dest).with_context(|| {
-        format!(
-            "copying resume checkpoint from {} to {}",
-            src.display(),
-            dest.display()
-        )
-    })?;
-    Ok(())
+    fs::write(&dest, contents)
+        .with_context(|| format!("writing staged resume checkpoint to {}", dest.display()))
 }
 
 /// (Security audit, #2114 resume follow-up) Filename `write_resume_origin_meta`
 /// writes into EVERY dispatch's `host_out` at creation time, naming the
 /// workspace path + mount mode THIS run used — the host-held record
-/// `stage_resume_checkpoint` reads back from `resume_from` on a LATER
+/// `validate_resume_checkpoint` reads back from `resume_from` on a LATER
 /// resume attempt, so it never has to guess. Lives alongside
 /// `checkpoint.json` in the same out-dir (never copied forward into a
 /// resumed dispatch's own fresh `host_out` — only read in place from the
@@ -829,7 +911,7 @@ use crate::exclusive_fs::{create_dir_exclusive_0700, create_dir_exclusive_unique
 ///
 /// Plain-argument signature (not `&DispatchOpts`) so tests can exercise it
 /// without constructing a whole `DispatchOpts` — same pattern as
-/// `apply_volume_mounts`/`stage_resume_checkpoint`/`write_resume_origin_meta`
+/// `apply_volume_mounts`/`validate_resume_checkpoint`/`write_resume_origin_meta`
 /// above.
 fn resolve_host_out(host_out_override: Option<&Path>, role_id: &str, unix_micros: u128) -> Result<PathBuf> {
     match host_out_override {
@@ -1467,7 +1549,7 @@ pub struct DockerRunConfig {
     /// (Security audit, #2114 resume follow-up) The role id this dispatch
     /// runs as — passed to the container as `--role-id`, unconditionally,
     /// on EVERY dispatch (not just a resumed one), so the runtime can stamp
-    /// it into every `checkpoint.json` write. `stage_resume_checkpoint`
+    /// it into every `checkpoint.json` write. `validate_resume_checkpoint`
     /// reads it back on a LATER `--resume-from` to refuse resuming a
     /// checkpoint recorded under a different role — before the container
     /// even spawns. Not secret (already visible in the container name and
@@ -4230,6 +4312,64 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         None => None,
     };
 
+    // (#2162) Moved up from what used to be "3. Resolve session id" below —
+    // this timestamp is a pure `SystemTime::now()` read with no dependency
+    // on anything computed after it, and the resume-checkpoint hoist just
+    // below needs it (to name the intended no-`--workdir` workspace path)
+    // before model selection runs.
+    let unix_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+
+    // (#2162) `--resume-from` validation, hoisted ahead of model selection
+    // and workspace/host_out materialization. #2162 found `stage_resume_
+    // checkpoint` ran only after model selection (a full LMStudio residency
+    // reconcile — evict + load) and after the workspace/host_out dirs were
+    // created, so a resume that was always going to be refused paid for a
+    // full residency shuffle first. `validate_resume_checkpoint` is the
+    // validation HALF of that function (everything except the final copy,
+    // which needs `host_out` to exist) — see its own doc. Refusing here
+    // means: no model load, no eviction, no directory materialization, no
+    // `dispatch.start` flow record. It does NOT mean "before anything at
+    // all" — the licensed-adjacent ack gate, the `dispatch_remote` early
+    // return (#2561), and `check_docker_preflight` all ran above.
+    //
+    // `intended_workspace` mirrors, without creating it, whatever step 4
+    // below will actually resolve `workspace` to: the operator's own
+    // `--workdir` (canonicalized above and reused verbatim by step 4, so
+    // this is exact), or the deterministic no-`--workdir` auto-tempdir name
+    // (role_id + this unix_micros).
+    //
+    // The auto-tempdir case carries a known, deliberate wart introduced BY
+    // this hoist: on a same-role/same-microsecond collision, step 4's
+    // `create_dir_exclusive_unique_0700` falls through to a SUFFIXED name,
+    // so the dir mounted is not the one validated here. The pre-#2162 call
+    // site was handed the post-suffix path and REFUSED on that mismatch;
+    // this one is handed the pre-suffix name and ACCEPTS. Erring toward
+    // accepting is the wrong direction for a consent gate, and the hoist
+    // widens the derive-to-create window from microseconds to all of model
+    // selection. Kept anyway because the branch is unreachable: a
+    // no-`--workdir` resume always fails the workspace check regardless,
+    // since the origin file records the PRIOR run's unix_micros. Full
+    // reasoning in `auto_workspace_path`'s own doc.
+    let intended_workspace: PathBuf = match validated_workdir.as_ref() {
+        Some(validated) => validated.clone(),
+        None => auto_workspace_path(&opts.role_id, unix_micros),
+    };
+    let resume_checkpoint_contents: Option<String> = match opts.resume_from.as_ref() {
+        Some(resume_from) => Some(
+            validate_resume_checkpoint(
+                resume_from,
+                &opts.role_id,
+                &intended_workspace,
+                opts.workspace_read_only,
+            )
+            .context("darkmux dispatch --resume-from")?,
+        ),
+        None => None,
+    };
+
     // 2. Resolve the model. (#450 / #590) `select_model(role, profile,
     //    skill_lookup)` capability-scores the role's requested vector against
     //    the profile's candidate models; with no offer vectors it falls back
@@ -4286,11 +4426,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .unwrap_or_default()
     );
 
-    // 3. Resolve session id.
-    let unix_micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros())
-        .unwrap_or(0);
+    // 3. Resolve session id. (`unix_micros` computed earlier, above — see
+    // the #2162 comment on the resume-checkpoint hoist for why.)
     let session_id = opts.session_id.clone().unwrap_or_else(|| {
         format!(
             "crew-dispatch-{}-{unix_micros}-internal",
@@ -4414,17 +4551,20 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // operator-explicit and intentionally out of scope.
         Some(validated) => validated,
         None => {
-            let auto = std::env::temp_dir().join(format!(
-                "darkmux-dispatch-{}-{unix_micros}",
-                opts.role_id
-            ));
+            // (#2162) Reuses `intended_workspace` computed above (before
+            // model selection) rather than re-deriving the format string
+            // here — one place decides the name, so the resume-checkpoint
+            // hoist's early validation and this actual creation can never
+            // drift apart.
+            //
             // (#2158) Same predictable-name-under-temp_dir() shape as
             // `resolve_host_out`'s `None` branch — route through the same
             // exclusive-create guard rather than `create_dir_all`, which
             // would silently succeed on (and mount) a pre-planted symlink
             // or leftover dir.
-            create_dir_exclusive_unique_0700(&auto)
-                .with_context(|| format!("creating dispatch workspace: {}", auto.display()))?
+            create_dir_exclusive_unique_0700(&intended_workspace).with_context(|| {
+                format!("creating dispatch workspace: {}", intended_workspace.display())
+            })?
         }
     };
     let workspace_source = if opts.workdir.is_some() {
@@ -4476,22 +4616,20 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // guessing. See `write_resume_origin_meta`'s own doc.
     write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only);
 
-    // (#2114 follow-up) `--resume-from <dir>` trigger: validate + stage the
-    // PRIOR dispatch's checkpoint into THIS dispatch's fresh `host_out`
-    // before anything else touches it. Fails loud (never silently starts
-    // fresh) — see `stage_resume_checkpoint`'s own doc.
-    if let Some(resume_from) = opts.resume_from.as_ref() {
-        stage_resume_checkpoint(
-            resume_from,
-            &host_out,
-            &opts.role_id,
-            &workspace,
-            opts.workspace_read_only,
-        )
-        .context("darkmux dispatch --resume-from")?;
+    // (#2114 follow-up / #2162) `--resume-from <dir>` trigger: the checkpoint
+    // was already validated — see the `validate_resume_checkpoint` call
+    // hoisted before model selection, above — so all that remains here is
+    // landing the already-read, already-validated contents into THIS
+    // dispatch's fresh `host_out`. A resume that was going to be refused
+    // never reaches this point at all.
+    if let Some(contents) = resume_checkpoint_contents.as_deref() {
+        write_staged_resume_checkpoint(contents, &host_out)
+            .context("darkmux dispatch --resume-from")?;
+        // `opts.resume_from` is `Some` whenever `resume_checkpoint_contents`
+        // is (they're set together, above) — `.unwrap()` is safe here.
         eprintln!(
             "darkmux dispatch: resuming from checkpoint at {} (staged into {})",
-            resume_from.display(),
+            opts.resume_from.as_deref().unwrap().display(),
             host_out.display()
         );
     }
@@ -4783,10 +4921,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // runtime.thermal.max_pause_ms exists — see max_pause_ms_env's own
         // doc.
         max_pause_ms_env: Some(darkmux_types::config_access::thermal_max_pause_ms()),
-        // (#2114 follow-up) The trigger: `stage_resume_checkpoint` above
-        // already verified + staged the checkpoint into `host_out` when
-        // `opts.resume_from` is `Some` — this just tells the container to
-        // reload it.
+        // (#2114 follow-up / #2162) The trigger: `validate_resume_checkpoint`
+        // (before model selection) and `write_staged_resume_checkpoint`
+        // (once `host_out` exists) above already verified + staged the
+        // checkpoint into `host_out` when `opts.resume_from` is `Some` —
+        // this just tells the container to reload it.
         resume_checkpoint: opts.resume_from.is_some(),
         remote_chat_url: agentic_pm
             .as_ref()
@@ -6623,16 +6762,20 @@ fn build_dispatch_complete_payload(
 /// `pace.json` in this dispatch's out-dir, called BEFORE
 /// `run_telemetry_sampler`'s loop starts. `host_out` is ALWAYS a fresh
 /// per-dispatch tempdir — including for a resumed dispatch (`--resume-from`,
-/// #2114 follow-up): `stage_resume_checkpoint` copies ONLY `checkpoint.json`
-/// from the PRIOR dispatch's out-dir into this dispatch's own fresh one; it
-/// never reuses the prior dir itself and never copies `pace.json`. So this
-/// is a no-op on every path today, resumed or not — kept as a defensive
-/// guard in case a future change ever lets a dispatch attach to an
-/// existing `host_out` directly (which #2114's actual `--resume-from`
-/// design deliberately does NOT do — see `stage_resume_checkpoint`'s own
-/// doc for why: a resumed dispatch is a NEW run record with its own
-/// trajectory, and the prior dir stays untouched as forensic evidence). An
-/// absent file (the common, and today the ONLY, case) is not an error.
+/// #2114 follow-up): the only thing a resume lands in this dispatch's own
+/// fresh out-dir is `checkpoint.json`, which `write_staged_resume_checkpoint`
+/// WRITES from the bytes `validate_resume_checkpoint` already read (it never
+/// touches the prior dir at all — that read happened earlier, from
+/// `resume_from`). Nothing reuses the prior dir itself and nothing carries
+/// `pace.json` forward. So this is a no-op on every path today, resumed or
+/// not —
+/// kept as a defensive guard in case a future change ever lets a dispatch
+/// attach to an existing `host_out` directly (which #2114's actual
+/// `--resume-from` design deliberately does NOT do — see
+/// `validate_resume_checkpoint`'s own doc for why: a resumed dispatch is a
+/// NEW run record with its own trajectory, and the prior dir stays
+/// untouched as forensic evidence). An absent file (the common, and today
+/// the ONLY, case) is not an error.
 fn clear_stale_pace_file(host_out: &Path) {
     let _ = std::fs::remove_file(crate::thermal_governor::pace_file_path(host_out));
 }
