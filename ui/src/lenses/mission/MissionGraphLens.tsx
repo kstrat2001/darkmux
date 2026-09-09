@@ -242,10 +242,19 @@ function useIsMobile(): boolean {
 }
 
 function legendDots() {
+  // (#2343, post-review) The legend is the only place a reader can learn
+  // this vocabulary, so it must list every word the graph can actually
+  // paint. `waiting` (#2343 — admitted to a wave, not yet dispatching) and
+  // `degraded` (#2406 — a phase whose tasks ended in a MIX of complete and
+  // errored/abandoned) were both shipped as statuses without ever reaching
+  // this list. Each swatch is the color that status's own CSS rule paints
+  // (`.mnode.s-waiting`/`.phasegroup.s-degraded` in `styles.css`).
   const entries: Array<[string, string]> = [
     ["var(--dim)", "planned"],
+    ["var(--dim)", "waiting"],
     ["var(--ml-run)", "running"],
     ["var(--good)", "complete"],
+    ["var(--warn)", "degraded"],
     ["var(--bad)", "error"],
     ["var(--dim)", "abandoned"],
   ];

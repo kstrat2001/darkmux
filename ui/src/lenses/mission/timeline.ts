@@ -90,7 +90,16 @@ export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number
     turns += d.turns;
     if (d.cloud) cloud = true;
     const running = s.status === "running";
-    if (running) generating = true;
+    // (#2343, post-review) The task card's pulse must mean what the step
+    // row's means. `stepMeterFor` (graph.ts) refines the RAW `status ===
+    // "running"` with the step's own `startedTs` plus the liveness window;
+    // this aggregate read the raw status instead, so a task whose step was
+    // ADMITTED to a wave but never dispatched rendered `.tltask.s-waiting`
+    // — the honest word this fix introduces — around a beating accent dot
+    // and a running clock. One fact, two looks, which is exactly what the
+    // shared-indicator doctrine exists to prevent. Reuse the ONE
+    // derivation; do not re-derive a second, weaker one here.
+    if (stepMeterFor(s, metrics, now).generating) generating = true;
     // (#2269) EVERY started step contributes to the task's duration — the
     // old code read the start only off RUNNING steps, so a sequential
     // task's timer restarted with each step and disappeared at the end.

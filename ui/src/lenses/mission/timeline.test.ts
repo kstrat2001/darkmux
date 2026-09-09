@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { groupTimeline, initMinimap, isNarrowViewport, persistMinimap, taskAggMetrics, timelineActive } from "./timeline";
+import { STEP_LIVENESS_WINDOW_MS } from "./graph";
 import type { GraphEdge, GraphNode, MetricsMap } from "./graph";
 
 const PHASE: GraphNode = { id: "p1", label: "Investigate", kind: "phase", status: "complete", depth: 0 };
@@ -224,5 +225,37 @@ describe("taskAggMetrics task-level duration (#2269)", () => {
     expect(agg.spanMs).toBe(0);
     expect(agg.sumMs).toBe(0);
     expect(agg.elapsedMs).toBe(0);
+  });
+
+  it("(#2343) an ADMITTED-but-never-dispatched step does not make the task card generate", () => {
+    // `run_step_graph` flips every ready step in a wave to `running` at
+    // ADMISSION; `startedTs` is stamped only once a step actually starts.
+    // The server now derives such a task as `waiting`
+    // (`mission_graph.rs::derive_task_status`), so the card renders
+    // `.tltask.s-waiting` — and this aggregate must agree, or the card says
+    // WAITING while beating an accent dot and ticking a clock. `stepMeterFor`
+    // returns `generating:false` for this same step; the two must not
+    // disagree about one fact.
+    const task: GraphNode = {
+      id: "t",
+      label: "unit-0",
+      kind: "task",
+      status: "waiting",
+      depth: 1,
+      steps: [{ id: "s", label: "unit-0-collect", kind: "dispatch.internal", status: "running" }],
+    };
+    const agg = taskAggMetrics(task, {}, T0 + 3_600_000);
+    expect(agg.generating).toBe(false);
+    expect(agg.elapsedMs).toBe(0);
+  });
+
+  it("(#2343) a step whose last signal is long stale does not keep the task card generating", () => {
+    // Same refinement, the freshness half: `stepMeterFor` drops
+    // `generating` once nothing has been heard inside
+    // `STEP_LIVENESS_WINDOW_MS`. The aggregate followed the raw status
+    // instead, so a dead step kept the card pulsing indefinitely.
+    const task = seq({ startedTs: T0, completedTs: T0 + 60_000 }, { startedTs: T0 + 61_000 });
+    expect(taskAggMetrics(task, {}, T0 + 100_000).generating).toBe(true);
+    expect(taskAggMetrics(task, {}, T0 + 61_000 + STEP_LIVENESS_WINDOW_MS + 1_000).generating).toBe(false);
   });
 });

@@ -15,6 +15,7 @@ import {
   hhmmss,
   indexGraph,
   isAiKind,
+  isUnknownStatus,
   keepPageStatus,
   mergeGraphs,
   missionTotals,
@@ -216,6 +217,20 @@ describe("statusRank / keepPageStatus", () => {
     expect(keepPageStatus("degraded", "complete")).toBe(true);
   });
 
+  it("(#2343) waiting is ranked, not unknown — it is the running point in the lifecycle told honestly", () => {
+    // Left out of STATUS_RANK, `isUnknownStatus("waiting")` flips true,
+    // `keepPageStatus` returns false in BOTH directions, and the next
+    // `"phase start"` record — emitted at WAVE ADMISSION, the exact
+    // instant `waiting` exists to describe — laundered it straight back
+    // to `running`. See `STATUS_RANK`'s own comment.
+    expect(isUnknownStatus("waiting")).toBe(false);
+    expect(statusRank("waiting")).toBe(statusRank("running"));
+  });
+
+  it("(#2343) a held waiting status survives an incoming phase-start record", () => {
+    expect(keepPageStatus("waiting", "running")).toBe(true);
+  });
+
   it("normalizes the pre-rename 'closed' spelling to 'finalized'", () => {
     expect(normalizeMissionStatus("closed")).toBe("finalized");
     expect(normalizeMissionStatus("finalized")).toBe("finalized");
@@ -329,6 +344,23 @@ describe("foldFlowRecords snapshot-recency gate (#2518)", () => {
       "m1",
     );
     expect(g.nodes[0].status).toBe("running");
+  });
+
+  it("(#2343) a LIVE phase-start record does not launder a snapshot's waiting back to running", () => {
+    // The wired path, not `mergeGraphs` (which has no production callers,
+    // #2527). `run_step_graph` emits `"phase start"` when it ADMITS a
+    // wave, so a record newer than the snapshot always exists for exactly
+    // the phase the server has just derived as `waiting` — before the rank
+    // entry this rendered `RUNNING` beside a `"7 waiting"` status note
+    // until the next reconcile poll.
+    const idx = indexGraph(baseGraph());
+    const g = foldFlowRecords(
+      snapshotWithPhase("waiting"),
+      [rec({ ts: "2026-08-19T00:00:10Z", action: "phase start", handle: "p1" })],
+      idx,
+      "m1",
+    );
+    expect(g.nodes[0].status).toBe("waiting");
   });
 
   it("with no generated_at_ms on the snapshot, every record folds unfiltered (lenient default, pre-#2518 behavior)", () => {

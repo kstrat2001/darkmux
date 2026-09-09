@@ -5015,6 +5015,122 @@
         assert!(note.contains("4 running"), "note: {note}");
     }
 
+    /// (#2343) THE end-to-end reproduction, at the wire boundary — not just
+    /// `derive_task_status`/`phase_task_rollup`/`phase_display_status`
+    /// returning the right enum in isolation, but the actual
+    /// `/mission/{id}/graph.json` JSON a client reads. Pins the CALL SITE
+    /// (`build_mission_graph`'s per-task rollup) that threads a step's
+    /// `started_ts` into the derivation, not just the helper.
+    ///
+    /// Fixture: a single task whose first step (`unit-0-map`) is
+    /// `Complete`, and whose second step (`unit-0-collect`) was ADMITTED
+    /// to a wave (`NodeStatus::Running`, per `run_step_graph`'s
+    /// admission-time flip) but never actually got a turn on its
+    /// concurrency-capped track — `started_ts: None`, exactly the shape
+    /// `run_step_graph`'s job closure leaves behind for a step still
+    /// queued behind `remote_cap`/`dispatch_free_cap`. Before this fix the
+    /// task read `running` (any `NodeStatus::Running` step won,
+    /// unconditionally) for as long as that queueing lasted — the issue's
+    /// own "RUNNING for an hour with nothing running". It must now read
+    /// `waiting`, and — since this is the phase's ONLY task and the
+    /// persisted phase status is `Running` (`minimal_phase`'s default,
+    /// same shape the #2343 tie-break exception targets) — the phase node
+    /// must ALSO read `waiting`, not launder back to `running` on the
+    /// persisted-status tie.
+    #[tokio::test]
+    // (#2343, post-review) `CrewDirGuard` sets a PROCESS-GLOBAL env var, and
+    // `serial_test` only serializes tests that carry the attribute — every
+    // other `CrewDirGuard::new()` test in this file has it. Without it here,
+    // this test raced its own siblings' guards: measured 18/25 failures under
+    // `--test-threads=32` with load (some runs failing twice, poisoning a
+    // sibling), 0/25 with the attribute.
+    #[serial_test::serial]
+    async fn mission_graph_json_admitted_not_dispatched_task_reads_waiting_not_running() {
+        let _guard = CrewDirGuard::new();
+        let mission_id = "waiting-2343";
+        let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
+        save_test_mission(&mission);
+        save_test_phase(&minimal_phase("p1", mission_id));
+
+        let task = darkmux_crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
+            id: "unit-0".to_string(),
+            phase_id: "p1".to_string(),
+            description: "unit-0".to_string(),
+            display_name: None,
+            step_ids: vec!["unit-0-map".to_string(), "unit-0-collect".to_string()],
+            depends_on: vec![],
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
+
+        let map_step = darkmux_crew::types::Step {
+            id: "unit-0-map".to_string(),
+            task_id: "unit-0".to_string(),
+            gate: None,
+            kind: "dispatch.map".to_string(),
+            status: darkmux_crew::types::NodeStatus::Complete,
+            config: serde_json::Value::Null,
+            started_ts: Some(1),
+            completed_ts: Some(2),
+            output: None,
+        };
+        darkmux_crew::lifecycle::save_step(mission_id, "p1", &map_step).unwrap();
+
+        // Admitted to a wave (`Running`) but never actually dispatched —
+        // `started_ts: None` is the whole point of this fixture.
+        let collect_step = darkmux_crew::types::Step {
+            id: "unit-0-collect".to_string(),
+            task_id: "unit-0".to_string(),
+            gate: None,
+            kind: "review.probe-collect".to_string(),
+            status: darkmux_crew::types::NodeStatus::Running,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        darkmux_crew::lifecycle::save_step(mission_id, "p1", &collect_step).unwrap();
+
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mission/{mission_id}/graph.json"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let nodes = json["nodes"].as_array().unwrap();
+        let task_node = nodes
+            .iter()
+            .find(|n| n["id"] == "unit-0")
+            .unwrap_or_else(|| panic!("missing task node unit-0: {nodes:?}"));
+        assert_eq!(
+            task_node["status"], "waiting",
+            "admitted-but-not-dispatched must read `waiting`, not `running`: {task_node:?}"
+        );
+
+        let phase_node = nodes
+            .iter()
+            .find(|n| n["id"] == "p1")
+            .unwrap_or_else(|| panic!("missing phase node p1: {nodes:?}"));
+        assert_eq!(
+            phase_node["status"], "waiting",
+            "the phase's ONLY task is waiting, nothing is genuinely running — the phase must not \
+             launder back to `running` on the persisted-status tie (#2343): {phase_node:?}"
+        );
+    }
+
     /// (review-gate MF2a) The three production graph runners persist Step
     /// JSONs only AFTER `run_step_graph` returns — so a page opened DURING
     /// a run sees tasks whose `step_ids` name steps with no file on disk.
