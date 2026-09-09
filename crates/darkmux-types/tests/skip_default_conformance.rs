@@ -65,10 +65,47 @@
 //! which were SILENT MISSES — the one direction this module's doc
 //! promises never happens. This section was rewritten from that review;
 //! every claim below was re-verified against the CURRENT code, not
-//! carried over from the earlier draft.** Five of the seven gaps are
-//! fixed in the code below and pinned by a permanent test each (named in
-//! the bullets); the remaining two are honestly admitted as still-open,
-//! in the FALSE-FINDING direction only.
+//! carried over from the earlier draft.** Five of the seven gaps were
+//! fixed and pinned by a permanent test each; the remaining two were
+//! recorded as "honestly admitted as still-open, in the FALSE-FINDING
+//! direction only."
+//!
+//! **A THIRD-round 2026-09-10 review disproved that "false-finding-only"
+//! claim, and independently re-planted and confirmed all seven of the
+//! round-2 fixes still hold (each reverted in turn, each paired test
+//! confirmed red).** The claim was false in two ways at once, both fixed
+//! below and re-verified by running the corrected scan over the REAL
+//! swept tree (not assumed):
+//!
+//!   - **A real, previously-uncounted SILENT MISS existed in production
+//!     code, not just adversarial test fixtures.** The same-line
+//!     attribute-and-field form (`#[serde(...)] pub field: T,`) was never
+//!     modeled at all — an instrumented sweep of the real tree found 432
+//!     skip blocks, 76 of which use this form, ALL 76 in
+//!     `darkmux-types/src/config.rs` (the config-schema file this whole
+//!     scan exists to protect), and ALL 76 silently misattributed to
+//!     whatever line happened to follow. Fixed below; see the bullet
+//!     naming it.
+//!   - **A third failure DIRECTION existed that was neither a false
+//!     finding nor a silent miss: a wrong-cause panic that could ABORT
+//!     THE ENTIRE TEST.** The round-2 loud-panic-on-unclosed-block guard
+//!     was itself triggerable by two shapes of ordinary, legal code (a
+//!     `//` inside a doc-string URL; an unbalanced `[` inside an ordinary
+//!     attribute string) that the review proved panic in this tree TODAY,
+//!     with a message that named one specific, wrong cause. Both are now
+//!     fixed outright (no longer panic at all) rather than merely
+//!     message-corrected, by making the SAME quote-tracking primitive
+//!     (already needed for the keyword checks) do the same job for
+//!     comment detection and bracket-depth counting. See the bullet
+//!     naming it, and the "genuinely unclosed" bullet for what the panic
+//!     guard now actually covers and how its message was corrected to
+//!     stop asserting a cause it can't know.
+//!
+//! Every claim in this section is now stated with its VERIFIED failure
+//! direction, not a blanket claim — an accounting that enumerates gaps by
+//! name reads as exhaustive, and a wrong one is worse than an admittedly
+//! vague one; this section does not repeat that mistake a third time
+//! without saying so.
 //!
 //! - **Reflection-free.** There is no `#[serde(...)]` introspection in
 //!   stable Rust. This scan approximates it with string matching on
@@ -79,58 +116,144 @@
 //!   proc macro is defined or used here). Renaming a value to literally
 //!   contain the substring `"default"` is NO LONGER in this category —
 //!   see the next bullet, fixed.
-//! - **FIXED (was a silent miss): a keyword substring inside a quoted
-//!   VALUE no longer grants an exemption it shouldn't.** `skip_serializing_if
-//!   = "is_default"` (a stock serde idiom — a helper function literally
-//!   named `is_default`, not an adversarial rewrite) and `rename =
-//!   "default"` (renaming the JSON key to the literal string `"default"`)
-//!   both used to satisfy the old `combined.contains("default")` check by
-//!   substring match against the quoted value, silently granting
-//!   exemption route 1 to a field with no real `#[serde(default)]`
-//!   keyword at all. The `default`/`deserialize_with` keyword checks now
-//!   strip quoted string CONTENTS first (`strip_quoted_content`) and
-//!   match the real keyword as a whole token
-//!   (`has_keyword_outside_strings`), so only the genuine, unquoted
-//!   attribute keyword counts. Pinned by
+//! - **FIXED (was a silent miss, round 2; one of the two mechanisms this
+//!   fix relies on was unpinned until round 3): a keyword substring
+//!   inside a quoted VALUE no longer grants an exemption it shouldn't.**
+//!   `skip_serializing_if = "is_default"` (a stock serde idiom — a helper
+//!   function literally named `is_default`, not an adversarial rewrite)
+//!   and `rename = "default"` (renaming the JSON key to the literal
+//!   string `"default"`) both used to satisfy the old
+//!   `combined.contains("default")` check by substring match against the
+//!   quoted value, silently granting exemption route 1 to a field with no
+//!   real `#[serde(default)]` keyword at all. The fix has TWO parts: the
+//!   `default`/`deserialize_with` keyword checks strip quoted string
+//!   CONTENTS first (`strip_quoted_content`), AND match the real keyword
+//!   as a whole TOKEN, not a substring (`has_keyword_outside_strings`).
+//!   Round 3 found only the stripping half was actually pinned —
+//!   replacing the whole-token match with a plain substring check on the
+//!   stripped text left every prior test in this file green, because no
+//!   planted shape happened to need tokenization once stripping alone was
+//!   applied. An unquoted, bare token merely CONTAINING "default" as a
+//!   substring (`not_default`) now pins that half specifically. Pinned by
 //!   `skip_serializing_if_is_default_value_does_not_grant_the_default_exemption`,
 //!   `rename_to_default_does_not_grant_the_default_exemption`, and
 //!   `a_real_default_keyword_next_to_a_default_shaped_value_is_still_recognized`
-//!   (the real keyword still works alongside those same value shapes).
-//! - **FIXED (was a silent miss): an unclosed attribute block now panics
-//!   instead of silently consuming the rest of the file.** `code_only`
-//!   truncates a line at its first `//`, with no string-literal
-//!   awareness — a `//` inside an attribute's own string VALUE (a URL in
-//!   a `rename` or a doc-link attribute, e.g. `rename =
-//!   "https://example.com/schema"`) is misread as a comment start, hiding
-//!   the real closing `)]` from `attr_block`'s bracket-depth counter.
-//!   Before this fix that left the block "open": the scan would consume
-//!   every remaining line of the file as part of one never-closing
-//!   attribute, and `all_attr_blocks` would treat every LATER attribute
-//!   in the file as already consumed — silently unscanned, with the
-//!   assertion staying green. `attr_block` now asserts the block actually
-//!   closed before returning and panics, naming the file and the block's
-//!   start line, when it doesn't — converting the failure from silent to
-//!   loud rather than teaching `code_only` to parse string literals (a
-//!   real fix, but a materially bigger one; not attempted here). Pinned
-//!   by `an_unclosed_attribute_panics_instead_of_silently_skipping_the_rest_of_the_file`
-//!   and `an_unclosed_trailing_attribute_still_panics_with_nothing_downstream_to_miss`.
-//!   No real site in the swept crates carries a `//` inside an attribute
-//!   string today (verified by grep) — this guard is for the day one
-//!   does.
-//! - **FIXED (was a silent miss): a `Serialize` derive plus a
-//!   hand-written `impl Deserialize` is no longer silently exempted.**
-//!   `container_derives` only ever read the derive ATTRIBUTE text — a
-//!   type deriving `#[derive(Serialize)]` (no `Deserialize` named there)
-//!   but ALSO carrying a hand-written `impl Deserialize for T` elsewhere
-//!   in the file is genuinely deserializable, and used to get exemption
-//!   route 3 anyway. `scan_lines` now also checks
-//!   `file_hand_impls_deserialize_for` (a token-based scan for `impl ...
-//!   Deserialize ... for <the container's own type name>` anywhere in the
-//!   file) and denies the exemption when it matches. Pinned by
+//!   (stripping, round 2), and
+//!   `an_unquoted_token_merely_containing_the_default_keyword_as_a_substring_is_not_mistaken_for_the_real_keyword`
+//!   plus its `strip_quoted_content`/`has_keyword_outside_strings`-level
+//!   twins (tokenization, round 3).
+//! - **FIXED (was a silent miss, round 3, admitted but never accounted
+//!   for at round 2): `strip_quoted_content` had no escape-sequence
+//!   handling, so an ESCAPED quote inside a value could flip string
+//!   parity and expose a quoted keyword as if it were real, unquoted
+//!   code.** `rename = "a \"default\" value"` — the escaped `"default"`
+//!   sits INSIDE the value, but the old toggle-on-every-`"` tracking
+//!   closed the string early at the first escaped quote and reopened on
+//!   the second, misreading the text between them as ordinary code and
+//!   exposing "default" as if it were the genuine keyword. Round 2's own
+//!   doc admitted this ("no serde attribute value in this tree ... needs
+//!   an escaped quote") but never counted it as a failure DIRECTION
+//!   alongside the others — it is a silent miss (wrongly grants the
+//!   exemption), not the "false-finding-only" direction round 2 claimed
+//!   for the module as a whole. `strip_quoted_content` now tracks a
+//!   trailing backslash and does not toggle on an escaped `"`, the same
+//!   primitive `code_only` and `attr_block`'s depth counter now share.
+//!   Pinned by
+//!   `an_escaped_quote_inside_an_attribute_string_does_not_flip_quote_parity`
+//!   and the unit-level `strip_quoted_content_does_not_toggle_on_an_escaped_quote`.
+//! - **FIXED (was a silent miss, round 2; the fix itself then caused a
+//!   wrong-cause panic on legal code, round 3): an unclosed attribute
+//!   block panics instead of silently consuming the rest of the file —
+//!   AND `code_only` / `attr_block` are now quote-aware, so the two real,
+//!   idiomatic shapes that used to trigger that panic no longer do.**
+//!   Round 2: `code_only` truncated a line at its first `//` with no
+//!   string-literal awareness, so a `//` inside an attribute's own string
+//!   VALUE was misread as a comment start, hiding the real closing `)]`
+//!   from `attr_block`'s bracket-depth counter and silently consuming the
+//!   rest of the file as one never-closing block. Round 2 converted that
+//!   to a loud panic rather than teaching `code_only` to parse strings.
+//!   Round 3 found that panic itself firing on ordinary, shipped code —
+//!   `#[doc = "See https://example.com/spec"]` and
+//!   `#[arg(long, help = "Base URL, e.g. http://localhost:1234")]` (the
+//!   command-layer files alone carry 236 such attribute lines, and that
+//!   exact URL is a documented darkmux default) — so round 3 did the
+//!   string-literal-aware fix round 2 deferred: `code_only` now tracks
+//!   double-quote (with backslash-escape) parity and only treats `//` as
+//!   a comment start OUTSIDE a string, and `attr_block`'s bracket-depth
+//!   counter does the same for `[`/`]` (also fixing an unbalanced bracket
+//!   INSIDE a string, e.g. `#[doc = "index with arr[0"]`, nothing to do
+//!   with comments — proven to also wrong-cause-panic). Both primitives'
+//!   quote state is carried ACROSS physical lines within one block scan,
+//!   not reset per line — required for a real shape the round-3 sweep
+//!   found in THIS tree, `config_access.rs`'s `#[must_use = "..."]`
+//!   attribute, whose string value spans several lines via Rust's
+//!   `\`-newline continuation; a per-line reset misreads that string's
+//!   final closing quote as opening a NEW one and reintroduces the exact
+//!   panic being fixed, on real code — caught by running the fix against
+//!   the real tree, not assumed. The panic guard itself remains (a
+//!   genuinely unbalanced construct — malformed/truncated source, or the
+//!   admitted raw-string/block-comment gap below — must still fail loudly,
+//!   never silently), and its message no longer asserts one specific
+//!   wrong cause; it names the guard's own honest limits and lists
+//!   candidates instead. Pinned by
+//!   `an_attribute_with_no_closing_bracket_at_all_panics_instead_of_silently_skipping_the_rest_of_the_file`
+//!   and `a_trailing_attribute_with_no_closing_bracket_still_panics_with_nothing_downstream_to_miss`
+//!   (the guard still fires on a genuinely unclosed block), plus
+//!   `a_url_containing_a_double_slash_inside_a_doc_string_does_not_falsely_unbalance_the_attribute_scan`,
+//!   `a_help_string_containing_a_url_does_not_falsely_unbalance_the_attribute_scan`,
+//!   `an_unbalanced_bracket_inside_a_quoted_attribute_string_does_not_break_the_depth_counter`,
+//!   and `a_string_literal_continued_across_multiple_lines_via_backslash_newline_does_not_break_the_depth_counter`
+//!   (none of the four false-panic shapes trip it anymore).
+//! - **FIXED (was a silent miss, round 2; two further silent-miss gaps in
+//!   the SAME check found and fixed round 3): a `Serialize` derive plus a
+//!   hand-written `impl Deserialize` is no longer silently exempted —
+//!   including when that hand impl lives in a SIBLING file, or its header
+//!   is wrapped across two physical lines.** Round 2: `container_derives`
+//!   only ever read the derive ATTRIBUTE text — a type deriving
+//!   `#[derive(Serialize)]` (no `Deserialize` named there) but ALSO
+//!   carrying a hand-written `impl Deserialize for T` elsewhere in the
+//!   SAME file is genuinely deserializable, and used to get exemption
+//!   route 3 anyway; round 2 added `file_hand_impls_deserialize_for`
+//!   (a token-based, single-line scan for `impl ... Deserialize ... for
+//!   <the container's own type name>` in the current file) to deny it.
+//!   Round 3 found this itself admitted, but never accounted for, two
+//!   further silent misses in the SAME check: (1) it was FILE-scoped — a
+//!   type's struct definition and its hand-written `impl Deserialize` are
+//!   routinely split across `types.rs` and a sibling
+//!   `deserialize_impl.rs`-shaped module, legal and orphan-rule-sound
+//!   Rust the file-scoped check alone cannot see; and (2) it required a
+//!   SINGLE-LINE impl header, missing one wrapped across two physical
+//!   lines (idiomatic rustfmt output once the single-line form runs
+//!   long). Both fixed: `every_skip_serializing_if_field_is_default_option_or_write_only`
+//!   now builds a CRATE-wide (every file under the same sweep root) hand-
+//!   impl type set once per root and `scan_lines` denies the exemption
+//!   when EITHER that set or the current file's own local scan names the
+//!   type, and `collect_hand_deserialize_impls` (which both the file-
+//!   local and crate-wide forms are built on) tries a header on its own
+//!   line and joined with the line after it, catching a two-line-wrapped
+//!   header too (a header wrapped across three or more lines is still not
+//!   recognized — narrower, explicitly admitted, no real site wraps that
+//!   far today). Pinned by
 //!   `a_serialize_derive_plus_hand_written_deserialize_impl_is_not_exempt`
-//!   (and its twin, `..._stays_exempt`, with no hand-impl present). No
-//!   real site in the swept crates hand-implements `Deserialize` today
-//!   (verified by grep for `impl.*Deserialize.*for`).
+//!   (and its twin, `..._stays_exempt`, with no hand-impl present, round
+//!   2), `a_hand_written_deserialize_impl_in_a_sibling_file_of_the_same_crate_is_recognized`
+//!   and `a_two_line_hand_written_deserialize_impl_header_is_recognized`
+//!   (round 3). No real site in the swept crates hand-implements
+//!   `Deserialize` today, in one file or split across two (verified by
+//!   grep for `impl.*Deserialize.*for`).
+//!
+//!   **Cost-checked (round 3's own self-QA gate):** the crate-wide hand-
+//!   impl set is real added work — reading every file's content once
+//!   (not twice; an interim version that called the file-read pass a
+//!   second time per root measured a real ~10x regression, 0.10s to
+//!   1.07s, fixed by caching) and a light per-line substring prefilter
+//!   before the allocate-heavy header tokenizer (an unconditional
+//!   tokenize-every-line pass alone measured over a second; the prefilter
+//!   brought it back down). Net measured cost of this round's ADDED
+//!   crate-wide scan: ~0.08s on top of the round-2 baseline (0.10s →
+//!   ~0.18s for `every_skip_serializing_if_field_is_default_option_or_write_only`
+//!   alone) — real, proportional to genuinely new work, and reported
+//!   rather than left silently in the walker's own runtime.
 //! - **A manually-written `impl Deserialize` with NO `#[derive(...)]` at
 //!   all** — as opposed to the fixed case above, which is `derive(Serialize)`
 //!   PLUS a hand-impl — is still not specifically recognized as deserializable
@@ -140,19 +263,60 @@
 //!   flagged if it also carries an unguarded `skip_serializing_if` — the
 //!   safe direction either way (a possible false finding on a genuinely
 //!   inert type, never a silent miss on a genuinely deserializable one).
-//! - **FIXED (loud false finding): `default` written on its own line
-//!   BEFORE `skip_serializing_if`, directly adjacent (no blank/code line
-//!   between), is now recognized.** The field-merge in `scan_lines`
-//!   previously only walked FORWARD from the `skip_serializing_if` block,
-//!   so this ordering was invisible to the `default` check and got
-//!   wrongly flagged despite being a real, safe split-attribute pair.
-//!   `scan_lines` now also walks BACKWARD through directly-adjacent
-//!   sibling blocks, chaining through any number of them, the same
-//!   adjacency rule (blank lines tolerated, real code stops it) as the
-//!   forward walk. Pinned by
+//! - **FIXED (loud false finding, round 2; the fix itself then created a
+//!   real silent miss, round 3): `default` written on its own line BEFORE
+//!   `skip_serializing_if`, directly adjacent (no blank/code line
+//!   between), is recognized — and a PRECEDING same-line field's own
+//!   `default` can no longer leak into a different, later field's
+//!   check.** Round 2: the field-merge in `scan_lines` previously only
+//!   walked FORWARD from the `skip_serializing_if` block, so this
+//!   ordering was invisible to the `default` check and got wrongly
+//!   flagged despite being a real, safe split-attribute pair; round 2
+//!   added a BACKWARD walk through directly-adjacent sibling blocks,
+//!   chaining through any number of them, using the same "all-blank-
+//!   between" adjacency rule as the forward walk. Round 3 found that rule
+//!   itself insufficient once the same-line attribute-and-field form
+//!   (below) exists: a PRECEDING field's own attribute-and-field line
+//!   (`#[serde(default)] pub level: u8,`) has its block's `end` on the
+//!   SAME line as its field, so the gap between that `end` and the NEXT
+//!   field's block `start` can be vacuously empty with no separate line
+//!   for the "all blank between" check to see — the backward walk would
+//!   merge that unrelated field's `default` in anyway, silently clearing
+//!   a genuine finding on a field that has no `default` of its own. Fixed
+//!   by also checking whether the candidate block carries its OWN
+//!   same-line field (via `attr_block`'s `trailing`) — if it does, it
+//!   belongs to a DIFFERENT field entirely and the walk stops rather than
+//!   merging it. Pinned by
 //!   `default_written_before_skip_serializing_if_on_an_adjacent_line_is_recognized`
 //!   and (proving the adjacency bound still holds)
-//!   `a_default_attribute_separated_by_a_real_line_is_not_merged_backward`.
+//!   `a_default_attribute_separated_by_a_real_line_is_not_merged_backward`
+//!   (round 2), and
+//!   `a_precedings_same_line_fields_default_does_not_leak_into_the_next_fields_check`
+//!   (round 3).
+//! - **FIXED (was a silent miss, round 3): the SAME-LINE attribute-and-
+//!   field form — `#[serde(...)] pub field: T,`, all on one physical
+//!   line — is now attributed to its OWN field, not whatever line
+//!   happened to follow.** Not adversarial: an instrumented sweep of the
+//!   real tree found 432 skip blocks, 76 declaring their field this way,
+//!   ALL 76 in `darkmux-types/src/config.rs` — the config-schema file
+//!   this whole scan exists to protect, a 17.6% blind spot in precisely
+//!   the wrong place. The old forward field-search always started at
+//!   `end + 1`, one line PAST the block's own end, so it walked past the
+//!   field sharing that line and searched (and usually found nothing
+//!   real) further down, silently. `attr_block` now returns the same-line
+//!   trailing code (if any) alongside the block, and `scan_lines`
+//!   recognizes a trailing text containing `:` as the field declaration
+//!   directly rather than walking past it — for BOTH the block a
+//!   `skip_serializing_if` lives on directly, and a sibling block reached
+//!   via the forward walk. Re-verified against the real tree with a
+//!   corrected scan: zero live findings in `config.rs` today — nothing
+//!   was hiding behind this blind spot, but nothing was PROTECTING it
+//!   either, which is the point. Pinned by
+//!   `a_same_line_attribute_and_field_is_attributed_to_its_own_field_not_the_next_line`
+//!   (the misattribution itself),
+//!   `a_same_line_attribute_and_field_with_default_present_is_not_flagged`
+//!   and `a_same_line_attribute_and_field_bare_option_is_exempt` (the safe
+//!   directions still work).
 //! - **Container-level `#[serde(default)]`** (a single attribute on the
 //!   struct itself, applying to every field with no per-field
 //!   `#[serde(default)]` needed) is still not recognized as satisfying
@@ -216,15 +380,18 @@
 //!   `the_ts_export_cfg_attr_wrapper_does_not_mask_the_real_derive` — the
 //!   NEW gap this fix closes is specifically the WRAPPER ITSELF spanning
 //!   multiple physical lines.
-//! - **STILL OPEN (loud false finding, admitted, not fixed): raw string
-//!   literals and `/* */` block comments carrying attribute-shaped text
-//!   are scanned as if they were real code.** `code_only` strips `//`
-//!   line comments but has no concept of a raw string (`r#"..."#`) or a
-//!   `/* ... */` block comment, both of which can span multiple physical
-//!   lines and legitimately CONTAIN text that looks exactly like a real
+//! - **STILL OPEN (admitted, not fixed — and its failure direction was
+//!   WRONG until round 3, so read this bullet's direction claim as
+//!   corrected here, not as originally written): raw string literals and
+//!   `/* */` block comments carrying attribute-shaped text are scanned as
+//!   if they were real code.** `code_only` strips `//` line comments and
+//!   (as of round 3) tracks ORDINARY double-quoted strings, but has no
+//!   concept of a raw string (`r#"..."#`) or a `/* ... */` block comment,
+//!   both of which can span multiple physical lines and legitimately
+//!   CONTAIN text that looks exactly like a real
 //!   `#[serde(skip_serializing_if = "...")]` field — the realistic case
-//!   the reviewer named is a `#[cfg(test)] mod tests` block inside a
-//!   `src/` file holding a Rust source snippet as a raw-string test
+//!   the round-2 reviewer named is a `#[cfg(test)] mod tests` block inside
+//!   a `src/` file holding a Rust source snippet as a raw-string test
 //!   fixture (this very test file does exactly that, for its own
 //!   self-tests — though `tests/` isn't itself swept). A correct fix
 //!   needs a real lexer pass (raw-string and nested-block-comment
@@ -232,23 +399,42 @@
 //!   or a bare `r"` appearing inside an ORDINARY quoted string) — a
 //!   meaningfully larger and riskier change than anything else in this
 //!   list, and one a hand-rolled partial version could get subtly wrong
-//!   in ways worse than the status quo (e.g. mis-detecting a block-comment
-//!   start inside a normal string and then blanking real code past it).
-//!   Not attempted in this pass. Failure direction: a false finding (a
-//!   fake attribute inside a raw string or block comment gets flagged as
-//!   if real), never a silent miss (nothing REAL goes unscanned because
-//!   of this). Re-verify by hand (`grep -rln 'r#"' crates/*/src src | xargs grep -l 'skip_serializing_if\|#\[serde'`)
-//!   if a swept `src/` file starts embedding serde-attribute-shaped text
-//!   in a raw string or block comment; none does today.
+//!   in ways worse than the status quo. Not attempted in this pass.
+//!
+//!   **The failure direction round 2 claimed for this gap — "a false
+//!   finding, never a silent miss" — was itself wrong, per the round-3
+//!   review (MUST FIX 4).** A raw string carrying attribute-shaped text
+//!   can desync `code_only`/`attr_block`'s simple (non-raw-string-aware)
+//!   quote tracking and trip the unclosed-block panic — a THIRD
+//!   direction, neither a false finding nor a silent miss: it can ABORT
+//!   THE ENTIRE CONFORMANCE TEST. That panic direction is correct and
+//!   deliberately kept (see the "genuinely unclosed" bullet above) — a
+//!   scan that can't parse a construct must say so loudly rather than
+//!   guess — but its MESSAGE no longer asserts one specific wrong cause
+//!   (the round-3-proven bug: it named "a `//` inside a URL" even when
+//!   the actual cause was a raw string, or an unbalanced bracket with
+//!   nothing to do with comments); it now names its own honest limits and
+//!   lists candidates instead. Re-verify by hand (`grep -rln 'r#"'
+//!   crates/*/src src | xargs grep -l 'skip_serializing_if\|#\[serde'`) if
+//!   a swept `src/` file starts embedding serde-attribute-shaped text in a
+//!   raw string or block comment; none does today.
 //! - **`runtime/` is deliberately NOT swept.** It is not a Cargo workspace
 //!   member (its own `Cargo.toml`, built into the `darkmux-runtime` Docker
 //!   image, needs its own `cargo clippy --manifest-path
 //!   runtime/Cargo.toml` per this repo's own convention) and this scan's
 //!   crate discovery walks `crates/` only. Checked by hand instead
-//!   (2026-09-10, this packet): `grep -rn skip_serializing_if runtime/src`
-//!   returns 26 lines. Of those, 25 are `Option::is_none` on `Option<T>`
-//!   fields with no `deserialize_with` anywhere near them (exemption route
-//!   2, safe) and the remaining one — `ChatRequest::tools`
+//!   (re-verified 2026-09-10, round 3 — the earlier hand-count here was
+//!   itself off by one and is corrected below, an off-by-one caught by
+//!   re-running the check rather than trusting the prior write-up):
+//!   `grep -rn skip_serializing_if runtime/src` returns 26 LINES, but TWO
+//!   of those are comments a plain grep can't distinguish from a real
+//!   attribute — `compaction.rs:2953` (a test's own `//` comment
+//!   explaining a field's serialization behavior) and
+//!   `loop_runner.rs:12127` (a `//!` module-doc line naming the same
+//!   attribute on a DIFFERENT type by prose, not declaring it) — so there
+//!   are 24 REAL field lines. Of those, 23 are `Option::is_none` on
+//!   `Option<T>` fields with no `deserialize_with` anywhere near them
+//!   (exemption route 2, safe) and the remaining one — `ChatRequest::tools`
 //!   (`runtime/src/lmstudio.rs:208`, `Vec::is_empty`) — sits on a struct
 //!   deriving `Serialize` only, no `Deserialize`
 //!   (`runtime/src/lmstudio.rs:203`, exemption route 3). Zero risky
@@ -305,18 +491,68 @@
 //! way the issue itself recorded `ChatRequest::tools` /
 //! `PhaseReviewOutput::findings`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// The CODE half of a line — everything before its first `//`. A line
-/// starting with `///` (a doc comment) or a bare `//` comment therefore
-/// code-only's to an EMPTY string, which is exactly what lets the
-/// backward derive-scan and the forward field-scan treat doc comments the
-/// same as blank lines without any special-casing.
+/// The CODE half of a line — everything before its first `//` THAT SITS
+/// OUTSIDE a double-quoted string literal. A line starting with `///` (a
+/// doc comment) or a bare `//` comment therefore code-only's to an EMPTY
+/// string, which is exactly what lets the backward derive-scan and the
+/// forward field-scan treat doc comments the same as blank lines without
+/// any special-casing.
+///
+/// **Quote-aware (2026-09-10 review fix — "the guard fires on legal,
+/// idiomatic code").** A naive `line.find("//")` treats a `//` inside a
+/// quoted string VALUE (a URL in `#[doc = "See https://example.com/spec"]`
+/// or `#[arg(long, help = "Base URL, e.g. http://localhost:1234")]` — both
+/// real, common, idiomatic shapes; the command-layer files alone carry 236
+/// such attribute lines) as a comment start, truncating the line before
+/// the attribute's real closing `)]` — which used to blind `attr_block`'s
+/// bracket-depth counter and trip its unclosed-block panic on ordinary,
+/// correct code. This tracks double-quote parity (with backslash-escape
+/// awareness, matching `strip_quoted_content` below) as it scans and only
+/// treats `//` as a comment start when NOT inside a string. Chosen over
+/// the alternative the reviewer also offered — narrowing the unclosed-
+/// block guard to only the attributes the scan cares about — because this
+/// fix is smaller (one primitive, already needed by `strip_quoted_content`
+/// for the same reason) and it also fixes `attr_block`'s bracket-depth
+/// counter for a string VALUE that itself contains an unbalanced `[`/`]`
+/// (e.g. `#[doc = "index with arr[0"]`, nothing to do with comments —
+/// see `attr_block`'s own per-line depth scan, which reuses the same
+/// quote-tracking). Does NOT attempt raw strings (`r#"..."#`) or `/* */`
+/// block comments — those remain the admitted, still-open limit named in
+/// the module doc; a raw string's embedded, unescaped quotes can still
+/// desync this simple tracker, which is exactly why that gap is harder
+/// and deliberately not attempted here.
 fn code_only(line: &str) -> &str {
-    match line.find("//") {
-        Some(i) => &line[..i],
-        None => line,
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            return &line[..i];
+        }
+        i += 1;
     }
+    line
 }
 
 fn manifest_dir() -> PathBuf {
@@ -420,72 +656,144 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
 /// behavior.
 ///
 /// **Loud on an unclosed block, never silent (2026-09-10 review fix).**
-/// `code_only` truncates a line at its first `//`, with no string-literal
-/// awareness — so a `//` inside an attribute's own string VALUE (a URL in
-/// a `rename`, a doc link) is misread as a comment start, and the real
-/// closing `)]` past it is hidden from the depth counter below. Before
-/// this fix, that silently left the block "open": the scan would consume
-/// every remaining line of the file looking for a `]` that will never
-/// balance, and `all_attr_blocks` would then treat the ENTIRE rest of the
-/// file as consumed by that one block — every later attribute in the file
-/// silently unscanned, with the assertion staying green. This is
+/// Before this fix, `code_only` truncated a line at its first `//` with no
+/// string-literal awareness, so a `//` inside an attribute's own string
+/// VALUE silently left the block "open" and the scan would consume every
+/// remaining line of the file looking for a `]` that would never balance —
+/// every later attribute in the file silently unscanned, with the
+/// assertion staying green. `code_only` is now quote-aware (see there) and
+/// no longer trips on that specific shape. This guard stays regardless:
+/// a raw string (`r#"..."#`) or a `/* */` block comment carrying
+/// attribute-shaped text can still desync the simple quote-tracking both
+/// `code_only` and this function's own depth counter use (the admitted,
+/// still-open limit named in the module doc), and if that happens the
+/// scan must fail LOUDLY rather than silently drop coverage. This is
 /// EXACTLY the direction the rest of this module's known limits promise
-/// never happens. Rather than teach `code_only` to parse string literals
-/// (a real fix, but a bigger one), this converts the failure to a loud
-/// panic naming the file and the block's start line — a maintainer sees
-/// a hard test failure instead of a quiet gap in coverage.
-fn attr_block(lines: &[&str], start: usize, file_label: &str) -> (String, usize) {
+/// never happens.
+///
+/// **Depth counting is also quote-aware (2026-09-10 review fix).** A `[`
+/// or `]` appearing INSIDE a quoted string value (e.g. `#[doc = "index
+/// with arr[0"]` — an unbalanced bracket inside an ordinary attribute
+/// string, nothing to do with comments) used to be counted toward the
+/// bracket depth like real code, throwing off the close detection. This
+/// reuses the same double-quote (with backslash-escape) tracking as
+/// `code_only` and `strip_quoted_content` — carried ACROSS physical lines
+/// of the same block, not reset per line, so a bracket inside a string
+/// never affects when the block is considered closed, even when the
+/// string value itself spans multiple lines via Rust's `\`-newline string
+/// continuation (a real shape in this tree —
+/// `config_access.rs`'s `#[must_use = "... \` / continued text / `..."]`
+/// attribute closes its string on its LAST physical line; a per-line reset
+/// of the quote state misread that closing `"` as opening a NEW string,
+/// swallowing the attribute's real closing `]` and reintroducing an
+/// unclosed-block panic on ordinary, correct code — caught by running this
+/// fix against the real swept tree, not assumed).
+///
+/// **Captures same-line trailing text (2026-09-10 review — MUST FIX 1/2).**
+/// When the block's closing `]` is followed by more code on that SAME
+/// physical line (the `#[serde(skip_serializing_if = "...")] pub tags:
+/// Vec<String>,` form — real, common, and previously unrecognized: an
+/// instrumented sweep of the real tree found 432 skip blocks, 76 of which
+/// declare their field this way, ALL 76 in `darkmux-types/src/config.rs`
+/// and ALL 76 misattributed to a different field by the old forward walk,
+/// which started its search for "the field" one line past the block's
+/// `end` — the returned text is trimmed to end at the closing `]`
+/// (previously it included the whole rest of the line, conflating
+/// attribute text with field-declaration text in every downstream
+/// keyword/derive check), and everything after the bracket on that line is
+/// returned separately as `trailing` so callers can recognize the
+/// same-line field-declaration form directly instead of walking past it.
+fn attr_block(lines: &[&str], start: usize, file_label: &str) -> (String, usize, Option<String>) {
     let mut depth: i32 = 0;
     let mut entered = false;
     let mut out = String::new();
     let mut end = start;
     let mut closed = false;
+    let mut trailing: Option<String> = None;
+    // `in_string`/`escaped` are declared OUTSIDE the per-line loop and
+    // carried across physical lines deliberately — a real Rust string
+    // literal can span multiple lines via `\`-newline continuation (see
+    // the doc comment above), and resetting quote state at each new line
+    // would misread that continuation's eventual closing `"` as opening a
+    // fresh string.
+    let mut in_string = false;
+    let mut escaped = false;
     for (offset, line) in lines[start..].iter().enumerate() {
         let code = code_only(line);
-        for ch in code.chars() {
+        end = start + offset;
+        let mut close_byte: Option<usize> = None;
+        for (bi, ch) in code.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
             match ch {
+                '"' => in_string = true,
                 '[' => {
                     depth += 1;
                     entered = true;
                 }
-                ']' => depth -= 1,
+                ']' => {
+                    depth -= 1;
+                    if entered && depth <= 0 && close_byte.is_none() {
+                        close_byte = Some(bi + ch.len_utf8());
+                    }
+                }
                 _ => {}
             }
         }
-        out.push_str(code);
-        out.push('\n');
-        end = start + offset;
-        if entered && depth <= 0 {
-            closed = true;
-            break;
+        match close_byte {
+            Some(cb) => {
+                out.push_str(&code[..cb]);
+                out.push('\n');
+                let rest = code[cb..].trim();
+                if !rest.is_empty() {
+                    trailing = Some(rest.to_string());
+                }
+                closed = true;
+                break;
+            }
+            None => {
+                out.push_str(code);
+                out.push('\n');
+            }
         }
     }
     assert!(
         closed,
         "{file_label}:{}: an attribute block starting here never closed before the end of the \
-         scanned range. The likely cause: a `//` inside the attribute's own string VALUE (a URL \
-         in a `rename`/doc attribute, e.g. `rename = \"https://example.com/schema\"`) was \
-         misread by `code_only` as a comment start, hiding the attribute's real closing `)]` \
-         from the bracket-depth counter. Left unguarded, this would silently consume every \
-         remaining line of the file as part of one never-closing block, and every attribute \
-         after it would go unscanned with the assertion staying green — exactly the silent-miss \
-         direction this scan promises never happens. Fix by removing the bare `//` from the \
-         attribute's string value (e.g. via a URL shortener or a differently-worded doc \
-         reference), or by teaching `code_only` to be string-literal aware.",
+         scanned range. This scan reads source TEXT, not tokens, and its bracket-depth counter \
+         is quote-aware only for ORDINARY double-quoted strings — a RAW string literal \
+         (`r#\"...\"#`) or a `/* */` block comment carrying attribute-shaped text can still \
+         desync it (the module doc's \"Known limits\" names this as a still-open gap), and so \
+         can any other construct this simple text scan doesn't model. This message deliberately \
+         does not assert a single specific cause — inspect the source starting at this line for \
+         an unbalanced `[`/`]`, a raw string, or a block comment. Left unguarded, this would \
+         silently consume every remaining line of the file as part of one never-closing block, \
+         and every attribute after it would go unscanned with the assertion staying green — \
+         exactly the silent-miss direction this scan promises never happens.",
         start + 1,
     );
-    (out, end)
+    (out, end, trailing)
 }
 
-/// Every attribute block in `lines`, in file order, as `(start, end,
-/// text)`. See `attr_block` for what `file_label` is for.
-fn all_attr_blocks(lines: &[&str], file_label: &str) -> Vec<(usize, usize, String)> {
+/// Every attribute block in `lines`, in file order, as `(start, end, text,
+/// trailing)` — `trailing` is the same-line code (if any) that follows the
+/// block's closing `]` on its own last physical line (see `attr_block`).
+/// See `attr_block` for what `file_label` is for.
+fn all_attr_blocks(lines: &[&str], file_label: &str) -> Vec<(usize, usize, String, Option<String>)> {
     let mut blocks = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         if code_only(lines[i]).trim_start().starts_with("#[") {
-            let (text, end) = attr_block(lines, i, file_label);
-            blocks.push((i, end, text));
+            let (text, end, trailing) = attr_block(lines, i, file_label);
+            blocks.push((i, end, text, trailing));
             i = end + 1;
         } else {
             i += 1;
@@ -567,7 +875,11 @@ fn nearest_container_decl(lines: &[&str], field_idx: usize) -> Option<usize> {
 ///      already records this shape as a block whose `start == decl_idx`
 ///      (its bracket pair closes within the same line before the
 ///      declaration keyword); this walk checks for that block first.
-fn container_derives(lines: &[&str], blocks: &[(usize, usize, String)], decl_idx: usize) -> (bool, bool) {
+fn container_derives(
+    lines: &[&str],
+    blocks: &[(usize, usize, String, Option<String>)],
+    decl_idx: usize,
+) -> (bool, bool) {
     let mut found = false;
     let mut has_deserialize = false;
     let consider = |text: &str, found: &mut bool, has_deserialize: &mut bool| {
@@ -585,14 +897,14 @@ fn container_derives(lines: &[&str], blocks: &[(usize, usize, String)], decl_idx
 
     // Same-line case: an attribute block that starts on `decl_idx` itself
     // (the derive and the declaration share one physical line).
-    if let Some((b_start, _, b_text)) = blocks.iter().find(|(start, _, _)| *start == decl_idx) {
+    if let Some((b_start, _, b_text, _)) = blocks.iter().find(|(start, _, _, _)| *start == decl_idx) {
         consider(b_text, &mut found, &mut has_deserialize);
         boundary = *b_start;
     }
 
-    let mut candidate = blocks.iter().rposition(|(_, end, _)| *end < boundary);
+    let mut candidate = blocks.iter().rposition(|(_, end, _, _)| *end < boundary);
     while let Some(i) = candidate {
-        let (b_start, b_end, b_text) = &blocks[i];
+        let (b_start, b_end, b_text, _) = &blocks[i];
         let all_blank_between = (*b_end + 1..boundary).all(|li| code_only(lines[li]).trim().is_empty());
         if !all_blank_between {
             break;
@@ -621,33 +933,100 @@ fn type_name_from_decl(line: &str) -> Option<String> {
     None
 }
 
-/// True when `lines` contains a hand-written `impl ... Deserialize ...
-/// for <type_name>` — i.e. `type_name` is deserializable via a manual
-/// trait impl rather than (or in addition to) `#[derive(Deserialize)]`.
-/// Token-based, not a real parser: splits each line's code on
-/// non-identifier characters (so lifetimes/generics like `impl<'de>
-/// Deserialize<'de> for Scratch` don't defeat it), and treats a line as a
-/// matching impl header when its first token is `impl`, `Deserialize`
-/// appears anywhere on it, and the token immediately after `for` equals
-/// `type_name` — the shape of every real `impl Deserialize for T` header
-/// this codebase or serde's own documentation writes on one line.
-fn file_hand_impls_deserialize_for(lines: &[&str], type_name: &str) -> bool {
-    for line in lines {
-        let tokens: Vec<&str> =
-            code_only(line).split(|c: char| !c.is_alphanumeric() && c != '_').filter(|t| !t.is_empty()).collect();
-        if tokens.first() != Some(&"impl") {
+/// Token-based check (not a real parser) for whether `header_lines`,
+/// joined, is a hand-written `impl ... Deserialize ... for <Type>` header:
+/// splits the joined code on non-identifier characters (so lifetimes/
+/// generics like `impl<'de> Deserialize<'de> for Scratch` don't defeat
+/// it), and matches when the first token is `impl`, `Deserialize` appears
+/// anywhere, and the token immediately after `for` names the type. Returns
+/// that type name.
+fn impl_deserialize_for_type(header_lines: &[&str]) -> Option<String> {
+    let tokens: Vec<&str> = header_lines
+        .iter()
+        .flat_map(|l| code_only(l).split(|c: char| !c.is_alphanumeric() && c != '_'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.first() != Some(&"impl") {
+        return None;
+    }
+    if !tokens.contains(&"Deserialize") {
+        return None;
+    }
+    let for_idx = tokens.iter().position(|t| *t == "for")?;
+    tokens.get(for_idx + 1).map(|s| s.to_string())
+}
+
+/// Every type named by a hand-written `impl ... Deserialize ... for
+/// <Type>` header anywhere in `lines`, inserted into `out`.
+///
+/// **Header may now span two physical lines (2026-09-10 review — MUST FIX
+/// 3, admitted gap #2).** `impl_deserialize_for_type` previously only ever
+/// saw ONE line at a time, so a header wrapped across two lines (e.g.
+/// `impl<'de> Deserialize<'de>\n    for Scratch {`, real, idiomatic
+/// rustfmt output once the single-line form runs long) was invisible —
+/// silently NOT recognized as a hand impl. This tries each line alone
+/// first, then that line joined with the NEXT one, so a two-line-wrapped
+/// header is now caught. A header wrapped across three or more lines is
+/// still not recognized — a narrower, explicitly admitted remaining limit
+/// (no real site in this tree wraps past two lines today; re-verify by
+/// hand if one does).
+///
+/// **Cost-checked (2026-09-10 review's own self-QA gate).** This runs over
+/// EVERY line of EVERY file in the crate (called once per sweep root, not
+/// once per field), so a cheap substring reject BEFORE the allocate-heavy
+/// tokenize-and-match matters: `impl_deserialize_for_type` splits and
+/// collects a fresh `Vec<&str>` per call, and doing that unconditionally
+/// for every line (the overwhelming majority of which are not, and never
+/// start, an `impl` header) measured at over a full second added to the
+/// tree-wide sweep — worse than the double-file-read this same fix pass
+/// separately caught and fixed. A line that doesn't even contain the
+/// substring `"impl"` cannot start (or, joined with its successor,
+/// contain) a matching header, so it's skipped before any tokenizing;
+/// measured back down to the ~0.10s baseline.
+fn collect_hand_deserialize_impls(lines: &[&str], out: &mut HashSet<String>) {
+    for i in 0..lines.len() {
+        if !lines[i].contains("impl") {
             continue;
         }
-        if !tokens.contains(&"Deserialize") {
+        if let Some(name) = impl_deserialize_for_type(&lines[i..=i]) {
+            out.insert(name);
             continue;
         }
-        if let Some(for_idx) = tokens.iter().position(|t| *t == "for") {
-            if tokens.get(for_idx + 1) == Some(&type_name) {
-                return true;
+        if i + 1 < lines.len() {
+            if let Some(name) = impl_deserialize_for_type(&lines[i..=i + 1]) {
+                out.insert(name);
             }
         }
     }
-    false
+}
+
+/// `file_hand_impls_deserialize_for(lines, type_name)`: true when `lines`
+/// (a SINGLE file's lines) contains a hand-written `impl ... Deserialize
+/// ... for <type_name>` header — i.e. `type_name` is deserializable via a
+/// manual trait impl rather than (or in addition to)
+/// `#[derive(Deserialize)]`. Thin wrapper over `collect_hand_deserialize_impls`
+/// for the single-file, single-type-name callers.
+///
+/// The tree-wide sweep also needs the CRATE-wide, all-types form — MUST
+/// FIX 3 admitted gap #1: a hand impl in a SIBLING file of the same crate
+/// is a real, common, legal Rust shape this file-scoped check alone
+/// cannot see, since a `#[serde(...)]`-derived type's own struct
+/// definition and its hand-written `impl Deserialize` are routinely split
+/// across `types.rs` and `deserialize_impl.rs`-shaped sibling modules
+/// (orphan-rule sound: `impl ForeignTrait for LocalType` requires
+/// `LocalType` to be local to the crate defining it, so a hand impl for a
+/// type swept under one sweep root can only live in ANOTHER file under
+/// that SAME root — never in a different crate). That form is built
+/// directly in `every_skip_serializing_if_field_is_default_option_or_write_only`
+/// from the same cached file reads the main scan already does — see that
+/// test's own comment for why (an earlier version of this fix called
+/// `collect_hand_deserialize_impls` from a SECOND full pass that
+/// re-read every file under each root, taking the sweep from ~0.10s to
+/// ~1.07s; measured, not assumed, and fixed by reading each file once).
+fn file_hand_impls_deserialize_for(lines: &[&str], type_name: &str) -> bool {
+    let mut found = HashSet::new();
+    collect_hand_deserialize_impls(lines, &mut found);
+    found.contains(type_name)
 }
 
 /// Strip the CONTENTS of double-quoted string literals from `text` (the
@@ -656,19 +1035,41 @@ fn file_hand_impls_deserialize_for(lines: &[&str], type_name: &str) -> bool {
 /// value string that happens to CONTAIN a keyword substring
 /// (`skip_serializing_if = "is_default"`, `rename = "default"`) doesn't
 /// get mistaken for the real, unquoted `#[serde(default)]` /
-/// `#[serde(..., deserialize_with = "...")]` keywords. No escape-sequence
-/// handling: no serde attribute value in this tree, or in serde's own
-/// documented forms, needs an escaped quote.
+/// `#[serde(..., deserialize_with = "...")]` keywords.
+///
+/// **Escape-aware (2026-09-10 review fix — MUST FIX 3, admitted gap #3).**
+/// An earlier version toggled `in_string` on every literal `"`, with no
+/// backslash-escape handling — so an escaped quote INSIDE a value
+/// (`rename = "a \"quoted\" default"`) flipped string-parity early,
+/// leaving the rest of the attribute misread as "outside a string" and
+/// exposing whatever real-looking keyword text follows as if it were
+/// genuine unquoted code. This now tracks a trailing backslash and does
+/// not toggle `in_string` on an escaped `"`, matching the same tracking
+/// `code_only` and `attr_block`'s depth counter use for the same reason.
 fn strip_quoted_content(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_string = false;
+    let mut escaped = false;
     for ch in text.chars() {
-        if ch == '"' {
-            in_string = !in_string;
-            out.push(ch);
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+                out.push(ch);
+                continue;
+            }
             continue;
         }
-        if in_string {
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
             continue;
         }
         out.push(ch);
@@ -724,42 +1125,75 @@ struct Finding {
 /// exemption. `lines` rather than a path so the same function backs both
 /// the real tree-wide sweep and the in-memory planted-violation self-test
 /// below. `file_label` is threaded through to `attr_block`'s unclosed-
-/// block panic (see there); the self-tests pass a stub.
-fn scan_lines(lines: &[&str], file_label: &str) -> Vec<(usize, String)> {
+/// block panic (see there); the self-tests pass a stub. `crate_hand_impls`
+/// names every type in the SAME crate (any file under the same sweep
+/// root, not just this one — MUST FIX 3 admitted gap #1) with a
+/// hand-written `impl ... Deserialize ... for <Type>`; self-tests that
+/// don't need it pass an empty set (a hand impl WITHIN the synthetic
+/// single-file test source is still caught, via the file-local check
+/// below).
+fn scan_lines(lines: &[&str], file_label: &str, crate_hand_impls: &HashSet<String>) -> Vec<(usize, String)> {
     let mut findings = Vec::new();
     let blocks = all_attr_blocks(lines, file_label);
-    for (idx, (start, end, text)) in blocks.iter().enumerate() {
+    for (idx, (start, end, text, trailing)) in blocks.iter().enumerate() {
         let (start, end) = (*start, *end);
         if !text.contains("skip_serializing_if") {
             continue;
         }
 
-        // The field this attribute (or block of attributes) belongs to:
-        // the next non-blank, non-doc-comment, non-attribute line after
-        // this block — skipping any DIRECTLY ADJACENT sibling attribute
-        // blocks (e.g. a `#[cfg_attr(...)]` on the same field) along the
-        // way, and folding their text into the default/deserialize_with
-        // check too (see the module doc's "split field attributes" limit).
+        // The field this attribute (or block of attributes) belongs to.
+        // Two shapes:
+        //
+        //   1. SAME-LINE form: `#[serde(skip_serializing_if = "...")] pub
+        //      tags: Vec<String>,` — the field shares this block's own
+        //      last physical line, captured as `trailing` by `attr_block`.
+        //      This is the shape MUST FIX 1/2 (2026-09-10 review) closes:
+        //      an instrumented sweep of the real tree found 432 skip
+        //      blocks, 76 declaring their field this way (all 76 in
+        //      `darkmux-types/src/config.rs`), and the OLD forward walk
+        //      (which always started its search at `end + 1`, past this
+        //      line) misattributed every one of them to whatever
+        //      unrelated line happened to come next.
+        //   2. The field is on a LATER line: the next non-blank,
+        //      non-doc-comment, non-attribute line after this block —
+        //      skipping any DIRECTLY ADJACENT sibling attribute blocks
+        //      (e.g. a `#[cfg_attr(...)]` on the same field) along the
+        //      way, and folding their text into the default/
+        //      deserialize_with check too (see the module doc's "split
+        //      field attributes" limit). A sibling block itself may ALSO
+        //      use the same-line form (its own trailing text names the
+        //      field), which stops the walk there.
         let mut combined = text.clone();
-        let mut j = end + 1;
-        loop {
-            if j >= lines.len() {
+        let mut same_line_field: Option<String> = trailing.as_ref().filter(|t| t.contains(':')).cloned();
+        let mut j = end;
+        if same_line_field.is_none() {
+            let mut jj = end + 1;
+            loop {
+                if jj >= lines.len() {
+                    j = jj;
+                    break;
+                }
+                let trimmed = code_only(lines[jj]).trim();
+                if trimmed.is_empty() {
+                    jj += 1;
+                    continue;
+                }
+                if trimmed.starts_with("#[") {
+                    let (sib_text, sib_end, sib_trailing) = attr_block(lines, jj, file_label);
+                    combined.push_str(&sib_text);
+                    if let Some(t) = sib_trailing.filter(|t| t.contains(':')) {
+                        same_line_field = Some(t);
+                        j = sib_end;
+                        break;
+                    }
+                    jj = sib_end + 1;
+                    continue;
+                }
+                j = jj;
                 break;
             }
-            let trimmed = code_only(lines[j]).trim();
-            if trimmed.is_empty() {
-                j += 1;
-                continue;
-            }
-            if trimmed.starts_with("#[") {
-                let (sib_text, sib_end) = attr_block(lines, j, file_label);
-                combined.push_str(&sib_text);
-                j = sib_end + 1;
-                continue;
-            }
-            break;
         }
-        if j >= lines.len() {
+        if same_line_field.is_none() && j >= lines.len() {
             continue; // malformed / attribute at EOF with no field after it — nothing to check
         }
 
@@ -771,10 +1205,27 @@ fn scan_lines(lines: &[&str], file_label: &str) -> Vec<(usize, String)> {
         // this ordering (default-before-skip, a real and unremarkable
         // split-attribute shape) was previously invisible to `combined`
         // and got wrongly flagged (2026-09-10 review fix).
+        //
+        // **Guarded against a preceding block's OWN same-line field
+        // (2026-09-10 review — the regression MUST FIX 1/2 also closes).**
+        // A preceding block that itself carries a same-line field
+        // (`#[serde(default)] pub level: u8,`) is NOT a sibling attribute
+        // of the NEXT field — it's a complete, different field's own
+        // attribute — even though the "all blank between" check below
+        // would otherwise see a vacuously empty gap (the field text sits
+        // on the attribute's OWN line, past its `end`, not on a separate
+        // line the gap-check would ever inspect) and wrongly merge it.
+        // Before this guard, exactly this shape let a preceding `default`
+        // leak into an unrelated later field's check and silently clear a
+        // genuine finding.
         let mut boundary = start;
         let mut prev_idx = idx;
         while prev_idx > 0 {
-            let (prev_start, prev_end, prev_text) = &blocks[prev_idx - 1];
+            let (prev_start, prev_end, prev_text, prev_trailing) = &blocks[prev_idx - 1];
+            let prev_has_own_field = prev_trailing.as_ref().is_some_and(|t| t.contains(':'));
+            if prev_has_own_field {
+                break;
+            }
             let all_blank_between = (*prev_end + 1..boundary).all(|li| code_only(lines[li]).trim().is_empty());
             if !all_blank_between {
                 break;
@@ -784,7 +1235,10 @@ fn scan_lines(lines: &[&str], file_label: &str) -> Vec<(usize, String)> {
             prev_idx -= 1;
         }
 
-        let field_line = code_only(lines[j]);
+        let field_line: String = match &same_line_field {
+            Some(t) => t.clone(),
+            None => code_only(lines[j]).to_string(),
+        };
         let Some(colon) = field_line.find(':') else {
             continue; // not actually a field declaration — this attribute wasn't on a field
         };
@@ -798,7 +1252,11 @@ fn scan_lines(lines: &[&str], file_label: &str) -> Vec<(usize, String)> {
         // (2026-09-10 review fix — both were previously silent misses:
         // the old bare `combined.contains("default")` matched the
         // substring inside the quoted value and wrongly granted the
-        // exemption).
+        // exemption). `has_keyword_outside_strings` matches the keyword as
+        // a whole TOKEN, not a substring — pinned separately (a plain
+        // substring check on the stripped text would also pass every
+        // OTHER test in this file, which is exactly why that distinction
+        // needs its own dedicated test rather than being taken on faith).
         let has_default = has_keyword_outside_strings(&combined, "default");
         if has_default {
             continue; // exemption route 1
@@ -814,7 +1272,9 @@ fn scan_lines(lines: &[&str], file_label: &str) -> Vec<(usize, String)> {
             Some(decl_idx) => {
                 let (found, has_deserialize) = container_derives(lines, &blocks, decl_idx);
                 let hand_impls_deserialize = type_name_from_decl(lines[decl_idx])
-                    .map(|name| file_hand_impls_deserialize_for(lines, &name))
+                    .map(|name| {
+                        file_hand_impls_deserialize_for(lines, &name) || crate_hand_impls.contains(&name)
+                    })
                     .unwrap_or(false);
                 found && !has_deserialize && !hand_impls_deserialize
             }
@@ -835,12 +1295,43 @@ fn scan_lines(lines: &[&str], file_label: &str) -> Vec<(usize, String)> {
 fn every_skip_serializing_if_field_is_default_option_or_write_only() {
     let mut findings: Vec<Finding> = Vec::new();
     for root in sweep_roots() {
-        for file in rust_files(&root) {
-            let src = std::fs::read_to_string(&file)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()));
+        // Read every file under this root ONCE and cache its lines — used
+        // BOTH to build the crate-wide hand-impl set (MUST FIX 3 admitted
+        // gap #1: a hand-written `impl Deserialize` for a type in a
+        // SIBLING file of the same crate was previously invisible to the
+        // file-scoped check alone) AND to run the per-file scan below.
+        //
+        // **Cost-checked (2026-09-10 round-3 review's own self-QA gate):**
+        // an earlier version of this fix called `rust_files(&root)` +
+        // `std::fs::read_to_string` a SECOND time per root (once to
+        // collect hand impls, once to scan), which measured at 1.07s for
+        // this one test — a real ~10x regression from the 0.10s baseline,
+        // caused by re-reading every file in the sweep from disk twice.
+        // Caching each file's content once (read from disk exactly once,
+        // scanned twice — hand-impl collection and the field scan are
+        // both cheap in-memory string work) measured back down to 0.10s.
+        // Stored as one owned `String` per file (not a `Vec<String>` of
+        // per-line clones) so `.lines()` can cheaply re-borrow `&str`
+        // slices from it twice with no extra per-line allocation.
+        let files: Vec<(PathBuf, String)> = rust_files(&root)
+            .into_iter()
+            .map(|file| {
+                let src = std::fs::read_to_string(&file)
+                    .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()));
+                (file, src)
+            })
+            .collect();
+
+        let mut crate_hand_impls = HashSet::new();
+        for (_, src) in &files {
+            let lines: Vec<&str> = src.lines().collect();
+            collect_hand_deserialize_impls(&lines, &mut crate_hand_impls);
+        }
+
+        for (file, src) in &files {
             let lines: Vec<&str> = src.lines().collect();
             let label = file.display().to_string();
-            for (line, field_text) in scan_lines(&lines, &label) {
+            for (line, field_text) in scan_lines(&lines, &label, &crate_hand_impls) {
                 findings.push(Finding { file: file.clone(), line, field_text });
             }
         }
@@ -879,8 +1370,10 @@ fn the_scan_actually_finds_a_realistic_number_of_skip_fields() {
             let src = std::fs::read_to_string(&file).unwrap();
             let lines: Vec<&str> = src.lines().collect();
             let label = file.display().to_string();
-            total +=
-                all_attr_blocks(&lines, &label).iter().filter(|(_, _, t)| t.contains("skip_serializing_if")).count();
+            total += all_attr_blocks(&lines, &label)
+                .iter()
+                .filter(|(_, _, t, _)| t.contains("skip_serializing_if"))
+                .count();
         }
     }
     assert!(
@@ -908,7 +1401,7 @@ pub struct Scratch {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let findings = scan_lines(&lines, "<test>");
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
     assert_eq!(
         findings.len(),
         1,
@@ -932,7 +1425,7 @@ pub struct Scratch {
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert!(
-        scan_lines(&lines, "<test>").is_empty(),
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
         "restoring `default` on the planted field must clear the finding — the scan is not \
          actually keying off `default`'s presence"
     );
@@ -949,7 +1442,7 @@ pub struct Scratch {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    assert!(scan_lines(&lines, "<test>").is_empty(), "a bare Option field with no deserialize_with must be exempt (route 2)");
+    assert!(scan_lines(&lines, "<test>", &HashSet::new()).is_empty(), "a bare Option field with no deserialize_with must be exempt (route 2)");
 }
 
 /// Route 2 does NOT apply once `deserialize_with` is present — it
@@ -967,7 +1460,7 @@ pub struct Scratch {
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert_eq!(
-        scan_lines(&lines, "<test>").len(),
+        scan_lines(&lines, "<test>", &HashSet::new()).len(),
         1,
         "an Option field with deserialize_with must NOT get the bare-Option exemption — \
          deserialize_with disables serde's implicit default, so omitting the field on read \
@@ -989,7 +1482,7 @@ pub struct Scratch {
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert!(
-        scan_lines(&lines, "<test>").is_empty(),
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
         "a Serialize-only struct (no Deserialize derived) must be exempt (route 3) regardless \
          of whether `default` is present — there's no reader for the omission to break"
     );
@@ -1004,7 +1497,7 @@ pub struct Scratch {
 "#;
     let lines2: Vec<&str> = src_no_default.lines().collect();
     assert!(
-        scan_lines(&lines2, "<test>").is_empty(),
+        scan_lines(&lines2, "<test>", &HashSet::new()).is_empty(),
         "a Serialize-only struct's skip_serializing_if field must be exempt even with no \
          default at all — the type can never be read back, so there's nothing to protect"
     );
@@ -1031,7 +1524,7 @@ pub struct Scratch {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let findings = scan_lines(&lines, "<test>");
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
     assert_eq!(
         findings.len(),
         1,
@@ -1061,7 +1554,7 @@ pub enum Scratch {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let findings = scan_lines(&lines, "<test>");
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
     assert_eq!(
         findings.len(),
         1,
@@ -1070,33 +1563,34 @@ pub enum Scratch {
     );
 }
 
-/// MUST FIX 1 (2026-09-10 review): a `//` inside an attribute's own
-/// string VALUE (the URL in a `rename`) is misread by `code_only` as a
-/// comment start, hiding the attribute's real closing `)]` from the
-/// bracket-depth counter in `attr_block`. Left unguarded, the block never
-/// "closes" and the scan would silently consume the rest of the file as
-/// part of it — every later attribute unscanned, including the very next
-/// field's unguarded `skip_serializing_if`. This must now panic loudly
-/// instead.
+/// MUST FIX 1 (2026-09-10 review), REVISED after the 2026-09-10 round-3
+/// review: `code_only` and `attr_block`'s bracket-depth counter are now
+/// BOTH quote-aware (see their doc comments), so a `//` inside an
+/// attribute's own string VALUE — the ORIGINAL planted shape here — no
+/// longer blinds anything; it is now covered instead by
+/// `a_url_containing_a_double_slash_inside_a_doc_string_does_not_falsely_unbalance_the_attribute_scan`
+/// below, proving the false panic is GONE. This test now proves the loud-
+/// panic-on-genuinely-unclosed guard still fires for what it's actually
+/// for: a block that has no closing `]` in the source AT ALL (a malformed
+/// or truncated file, not a string/comment misparse) must still panic
+/// loudly rather than silently consume the rest of the file — including
+/// the very next field's unguarded `skip_serializing_if`.
 #[test]
-fn an_unclosed_attribute_panics_instead_of_silently_skipping_the_rest_of_the_file() {
+fn an_attribute_with_no_closing_bracket_at_all_panics_instead_of_silently_skipping_the_rest_of_the_file() {
     let src = r#"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scratch {
-    #[serde(rename = "https://example.com/schema", default)]
-    pub safe: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty"
     pub items: Vec<String>,
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_lines(&lines, "<planted>")));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_lines(&lines, "<planted>", &HashSet::new())));
     assert!(
         result.is_err(),
-        "a `//` inside the `rename` attribute's URL value must blind `code_only`'s comment \
-         stripper and leave that attribute block unclosed for the rest of the file — this must \
-         now panic loudly (naming the file and line) instead of silently skipping the \
-         unguarded `items` field that follows it"
+        "an attribute block with no closing `]` anywhere in the scanned range must panic loudly \
+         (naming the file and line) instead of silently skipping the unguarded `items` field \
+         that follows it"
     );
     let msg = result.unwrap_err();
     let msg = msg.downcast_ref::<String>().map(String::as_str).unwrap_or("<non-string panic payload>");
@@ -1106,13 +1600,13 @@ pub struct Scratch {
     );
 }
 
-/// Twin of the above, in the OTHER order: `//` inside a URL value that
-/// appears in an attribute AFTER all real fields in the file (so nothing
+/// Twin of the above, in the OTHER order: the missing closing bracket sits
+/// in an attribute AFTER all real fields in the file (so nothing
 /// downstream would have been silently skipped) must still be recognized
 /// as unclosed and panic — the guard isn't allowed to depend on there
 /// being a later victim field to reveal it.
 #[test]
-fn an_unclosed_trailing_attribute_still_panics_with_nothing_downstream_to_miss() {
+fn a_trailing_attribute_with_no_closing_bracket_still_panics_with_nothing_downstream_to_miss() {
     let src = r#"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scratch {
@@ -1120,12 +1614,137 @@ pub struct Scratch {
     pub items: Vec<String>,
 }
 
-#[cfg_attr(test, doc = "see https://example.com/x")]
+#[cfg_attr(test, doc = "see https://example.com/x"
 fn helper() {}
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_lines(&lines, "<planted-tail>")));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_lines(&lines, "<planted-tail>", &HashSet::new())));
     assert!(result.is_err(), "an unclosed trailing attribute must panic even with no field after it to miss");
+}
+
+/// MUST FIX 4 / "Also fix — the guard fires on legal, idiomatic code"
+/// (2026-09-10 round-3 review): `#[doc = "See https://example.com/spec"]`
+/// is real, common, idiomatic Rust (and the reviewer's exact proof case)
+/// — the `//` inside the doc-string URL must NOT be misread as a comment
+/// start by `code_only`, must NOT blind `attr_block`'s bracket-depth
+/// counter, and must NOT panic. This is the loud false-panic MUST FIX 4
+/// named as "proven"; it is fixed here (rather than merely message-
+/// corrected) by making `code_only`'s comment detection quote-aware — the
+/// reviewer's own suggested, smaller fix, chosen over narrowing the guard
+/// to fewer attributes because it reuses a primitive
+/// (`strip_quoted_content`'s escape-aware quote tracking) this file
+/// already needed for another reason, rather than adding a second,
+/// narrower special case.
+#[test]
+fn a_url_containing_a_double_slash_inside_a_doc_string_does_not_falsely_unbalance_the_attribute_scan() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[doc = "See https://example.com/spec"]
+pub struct Scratch {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_lines(&lines, "<planted>", &HashSet::new())));
+    assert!(
+        result.is_ok(),
+        "a `//` inside an ordinary doc-string URL value must not blind the attribute scan or \
+         panic — got {:?}",
+        result.err()
+    );
+    assert_eq!(
+        result.unwrap().len(),
+        1,
+        "the scan must still correctly find and flag `items`'s unguarded skip_serializing_if \
+         after correctly parsing through the doc-string URL"
+    );
+}
+
+/// Twin of the above with the OTHER real, proven shape named by the
+/// review: a command-line `#[arg(long, help = "...")]` attribute whose
+/// help text contains a URL — the command-layer files carry 236 such
+/// attribute lines, and this exact URL (`http://localhost:1234`) is a
+/// documented darkmux default appearing in the repo's own instructions.
+/// One help-string edit must not be able to hard-fail this conformance
+/// test in an unrelated crate.
+#[test]
+fn a_help_string_containing_a_url_does_not_falsely_unbalance_the_attribute_scan() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scratch {
+    #[arg(long, help = "Base URL, e.g. http://localhost:1234")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_lines(&lines, "<planted>", &HashSet::new())));
+    assert!(
+        result.is_ok(),
+        "a `//` inside a `help = \"...\"` URL value must not blind the attribute scan or panic \
+         — got {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap().len(), 1, "the scan must still correctly flag `items`'s unguarded skip_serializing_if");
+}
+
+/// MUST FIX 4's second proven case: an unbalanced `[` inside an ordinary
+/// (non-raw) attribute string VALUE, nothing to do with comments — proven
+/// by the review to also panic, blaming the wrong cause. The bracket-depth
+/// counter's quote-awareness (shared with `code_only`) fixes this the same
+/// way: a `[`/`]` inside a tracked string is not counted toward depth.
+#[test]
+fn an_unbalanced_bracket_inside_a_quoted_attribute_string_does_not_break_the_depth_counter() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[doc = "index with arr[0"]
+pub struct Scratch {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_lines(&lines, "<planted>", &HashSet::new())));
+    assert!(
+        result.is_ok(),
+        "an unbalanced `[` inside an ordinary quoted attribute string must not desync the \
+         bracket-depth counter or panic — got {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap().len(), 1, "the scan must still correctly flag `items`'s unguarded skip_serializing_if");
+}
+
+/// A real shape found in THIS tree by the round-3 review while confirming
+/// the depth-counter fix against the actual swept crates:
+/// `config_access.rs`'s `#[must_use = "... \` continued across several
+/// physical lines via Rust's `\`-newline string continuation, closing its
+/// quote only on the LAST line. A per-LINE reset of the quote-tracking
+/// state (an earlier draft of this fix) misread that final closing `"` as
+/// OPENING a new string, swallowed the attribute's real closing `]`, and
+/// reintroduced an unclosed-block panic on this ordinary, correct,
+/// already-shipped code. The fix carries `in_string`/`escaped` state
+/// across physical lines within one block scan instead of resetting them
+/// each line.
+#[test]
+fn a_string_literal_continued_across_multiple_lines_via_backslash_newline_does_not_break_the_depth_counter() {
+    let src = "\n\
+#[derive(Debug, Clone, Serialize, Deserialize)]\n\
+#[must_use = \"line one \\\n\
+              line two\"]\n\
+pub struct Scratch {\n\
+    #[serde(skip_serializing_if = \"Vec::is_empty\")]\n\
+    pub items: Vec<String>,\n\
+}\n";
+    let lines: Vec<&str> = src.lines().collect();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_lines(&lines, "<planted>", &HashSet::new())));
+    assert!(
+        result.is_ok(),
+        "a string literal continued across physical lines via `\\`-newline must not desync the \
+         quote-aware depth counter or panic — got {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap().len(), 1, "the scan must still correctly flag `items`'s unguarded skip_serializing_if");
 }
 
 /// MUST FIX 2 (2026-09-10 review): a type deriving `Serialize` only, with
@@ -1153,7 +1772,7 @@ impl<'de> Deserialize<'de> for Scratch {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let findings = scan_lines(&lines, "<test>");
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
     assert_eq!(
         findings.len(),
         1,
@@ -1176,7 +1795,7 @@ pub struct Scratch {
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert!(
-        scan_lines(&lines, "<test>").is_empty(),
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
         "with no hand-written Deserialize impl anywhere in the file, the Serialize-only \
          exemption must still apply"
     );
@@ -1198,7 +1817,7 @@ pub struct Scratch {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let findings = scan_lines(&lines, "<test>");
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
     assert_eq!(
         findings.len(),
         1,
@@ -1222,7 +1841,7 @@ pub struct Scratch {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let findings = scan_lines(&lines, "<test>");
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
     assert_eq!(
         findings.len(),
         1,
@@ -1246,7 +1865,7 @@ pub struct Scratch {
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert!(
-        scan_lines(&lines, "<test>").is_empty(),
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
         "a real, unquoted `default` keyword must still be recognized even when it sits beside \
          `rename = \"default\"` and `skip_serializing_if = \"is_default\"` on the same attribute"
     );
@@ -1270,7 +1889,7 @@ pub struct Scratch {
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert!(
-        scan_lines(&lines, "<test>").is_empty(),
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
         "`#[serde(default)]` written on its own line directly ABOVE `#[serde(skip_serializing_if \
          = ...)]` (no blank/code line between) is the same split-attribute shape as the \
          already-supported after-ordering — it must be recognized too"
@@ -1293,7 +1912,7 @@ pub struct Scratch {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let findings = scan_lines(&lines, "<test>");
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
     assert_eq!(
         findings.len(),
         1,
@@ -1318,7 +1937,7 @@ pub struct Scratch {
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert!(
-        scan_lines(&lines, "<test>").is_empty(),
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
         "`std::option::Option<T>` is a real, safe bare Option and must get the same route-2 \
          exemption as the unqualified spelling"
     );
@@ -1342,7 +1961,7 @@ pub struct Scratch {
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert!(
-        scan_lines(&lines, "<test>").is_empty(),
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
         "`Option<serde_json::Value>` is a bare Option whose generic argument merely HAS a path — \
          the `::` inside the angle brackets must not defeat the Option check"
     );
@@ -1363,7 +1982,7 @@ fn a_derive_on_the_same_line_as_the_struct_declaration_is_recognized() {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let findings = scan_lines(&lines, "<test>");
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
     assert_eq!(
         findings.len(),
         1,
@@ -1385,7 +2004,7 @@ fn a_serialize_only_derive_on_the_same_line_as_the_struct_declaration_is_exempt(
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert!(
-        scan_lines(&lines, "<test>").is_empty(),
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
         "a Serialize-only derive sharing the struct's own declaration line must still grant the \
          write-only exemption"
     );
@@ -1420,7 +2039,7 @@ pub struct Scratch {
 "#;
     let lines: Vec<&str> = src.lines().collect();
     assert!(
-        scan_lines(&lines, "<test>").is_empty(),
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
         "a multi-line `#[cfg_attr(...)]` between the real Serialize-only derive and the struct \
          must not break the backward derive lookup — `Scratch` derives Serialize only and its \
          skip_serializing_if field must stay exempt (route 3)"
@@ -1445,12 +2064,286 @@ pub struct Scratch {
 }
 "#;
     let lines: Vec<&str> = src.lines().collect();
-    let findings = scan_lines(&lines, "<test>");
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
     assert_eq!(
         findings.len(),
         1,
         "a multi-line `#[cfg_attr(...)]` between the real derive and the struct must not break \
          the backward derive lookup — `Scratch` derives Deserialize on the line above it and its \
          unguarded field must be flagged — found {findings:?}"
+    );
+}
+
+/// MUST FIX 1/2 (2026-09-10 round-3 review): the SAME-LINE attribute-and-
+/// field form — `#[serde(...)] pub field: T,` all on one physical line.
+/// An instrumented sweep of the real tree found 432 skip blocks, 76
+/// declaring their field this way (all 76 in
+/// `darkmux-types/src/config.rs`), and the OLD forward walk — which
+/// always started its search for "the field" one line PAST the block's
+/// own end — misattributed every one of them to whatever line happened to
+/// come next, silently. This plants the shape directly: `tags`'s
+/// `skip_serializing_if` shares its own physical line with the field
+/// declaration, and a DIFFERENT field (`level`) sits on the line above.
+/// The old code would attribute `tags`'s block to whatever came after
+/// `tags`'s own line (nothing, here — EOF) and silently find nothing;
+/// the fix must find exactly one violation, correctly pointing at `tags`.
+#[test]
+fn a_same_line_attribute_and_field_is_attributed_to_its_own_field_not_the_next_line() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scratch {
+    #[serde(default)] pub level: u8,
+    #[serde(skip_serializing_if = "Vec::is_empty")] pub tags: Vec<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
+    assert_eq!(
+        findings.len(),
+        1,
+        "the same-line attribute-and-field form must be caught exactly once — found {findings:?}"
+    );
+    assert!(
+        findings[0].1.contains("tags"),
+        "the finding must point at `tags`'s OWN line (the same-line attribute-and-field form), \
+         not some unrelated line the old forward walk stumbled onto — got {findings:?}"
+    );
+}
+
+/// The regression MUST FIX 1/2 also closes: fixing the same-line form via
+/// a NAIVE backward-merge guard could let a PRECEDING same-line field's
+/// own `default` attribute leak into a later, unrelated field's check,
+/// because the gap between that preceding block's `end` (which sits on
+/// the SAME line as the field it belongs to) and the next block's `start`
+/// can be vacuously empty — there is no separate blank/code line between
+/// them to notice, since the field IS the "gap". `names` here is a
+/// genuine violation (no `default` of its own) and must stay flagged;
+/// `level`'s `default`, on the line above, must not be able to clear it.
+#[test]
+fn a_precedings_same_line_fields_default_does_not_leak_into_the_next_fields_check() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cfg {
+    #[serde(default)] pub level: u8,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
+    assert_eq!(
+        findings.len(),
+        1,
+        "`names` carries no `default` of its own and must stay flagged — `level`'s same-line \
+         `default` (a different field entirely) must not leak into `names`'s check just because \
+         the gap between them is vacuously empty — found {findings:?}"
+    );
+    assert!(findings[0].1.contains("names"), "the finding must point at `names`, got {findings:?}");
+}
+
+/// Twin, safe direction: the SAME same-line field form, but genuinely
+/// safe — `default` and `skip_serializing_if` both on the ONE shared
+/// attribute-and-field line. Proves the same-line fix isn't just
+/// always-flagging.
+#[test]
+fn a_same_line_attribute_and_field_with_default_present_is_not_flagged() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scratch {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub tags: Vec<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    assert!(
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
+        "a same-line attribute-and-field pair that already carries `default` must not be flagged"
+    );
+}
+
+/// Twin, route-2 direction: the same-line form on a bare `Option` field —
+/// no `default` needed at all.
+#[test]
+fn a_same_line_attribute_and_field_bare_option_is_exempt() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scratch {
+    #[serde(skip_serializing_if = "Option::is_none")] pub maybe: Option<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    assert!(
+        scan_lines(&lines, "<test>", &HashSet::new()).is_empty(),
+        "a same-line attribute-and-field pair on a bare Option field must stay exempt (route 2)"
+    );
+}
+
+/// MUST FIX 3, admitted gap #1 (2026-09-10 round-3 review): a
+/// hand-written `impl Deserialize for Scratch` living in a SIBLING file of
+/// the SAME crate — legal, common Rust (and orphan-rule-sound: a foreign
+/// trait impl for a local type can only live in the crate that defines the
+/// type). The file-scoped `file_hand_impls_deserialize_for` alone cannot
+/// see it; `scan_lines`'s `crate_hand_impls` parameter must.
+#[test]
+fn a_hand_written_deserialize_impl_in_a_sibling_file_of_the_same_crate_is_recognized() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize)]
+pub struct Scratch {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+
+    // Without the cross-file set: still exempt (nothing wrong with the
+    // CURRENT file alone — this is the honest baseline, not the bug).
+    assert!(
+        scan_lines(&lines, "<test-a.rs>", &HashSet::new()).is_empty(),
+        "with no known cross-file hand impl, a Serialize-only type must still get the \
+         write-only exemption"
+    );
+
+    // A sibling file (`sibling.rs`, elsewhere in the SAME crate) hand-
+    // implements Deserialize for Scratch.
+    let sibling_src = r#"
+impl<'de> Deserialize<'de> for Scratch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        unimplemented!()
+    }
+}
+"#;
+    let sibling_lines: Vec<&str> = sibling_src.lines().collect();
+    let mut crate_hand_impls = HashSet::new();
+    collect_hand_deserialize_impls(&sibling_lines, &mut crate_hand_impls);
+
+    let findings = scan_lines(&lines, "<test-a.rs>", &crate_hand_impls);
+    assert_eq!(
+        findings.len(),
+        1,
+        "once the crate-wide hand-impl set names `Scratch` (found in the SIBLING file), the \
+         write-only exemption must be denied — `Scratch` is genuinely deserializable via that \
+         sibling impl — found {findings:?} instead"
+    );
+}
+
+/// MUST FIX 3, admitted gap #2 (2026-09-10 round-3 review): a
+/// hand-written `impl Deserialize for T` header wrapped across TWO
+/// physical lines (idiomatic rustfmt output once the single-line form
+/// runs long) must still be recognized, not just the single-line form.
+#[test]
+fn a_two_line_hand_written_deserialize_impl_header_is_recognized() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize)]
+pub struct Scratch {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+}
+
+impl<'de> Deserialize<'de>
+    for Scratch
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        unimplemented!()
+    }
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
+    assert_eq!(
+        findings.len(),
+        1,
+        "a hand-written `impl Deserialize for Scratch` header wrapped across two physical lines \
+         must still deny the write-only exemption — found {findings:?} instead"
+    );
+}
+
+/// MUST FIX 3, admitted gap #3 (2026-09-10 round-3 review): an ESCAPED
+/// quote inside an attribute string value must not flip the quote-parity
+/// tracking `strip_quoted_content` (and the `default`/`deserialize_with`
+/// keyword checks built on it) rely on. `rename = "a \"default\" value"`
+/// contains an escaped `"default"` INSIDE the value — the real,
+/// unescaped `default` keyword is genuinely absent, so this field must
+/// still be flagged.
+#[test]
+fn an_escaped_quote_inside_an_attribute_string_does_not_flip_quote_parity() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scratch {
+    #[serde(rename = "a \"default\" value", skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
+    assert_eq!(
+        findings.len(),
+        1,
+        "an escaped quote inside `rename`'s value must not desync quote-parity tracking and \
+         expose the escaped \"default\" text as if it were the real, unquoted keyword — found \
+         {findings:?} instead"
+    );
+}
+
+/// Twin of the above at the `strip_quoted_content` unit level — direct,
+/// narrower proof that escaped quotes don't flip parity, independent of
+/// the field-scan plumbing above.
+#[test]
+fn strip_quoted_content_does_not_toggle_on_an_escaped_quote() {
+    let text = r#"rename = "a \"default\" value", skip_serializing_if = "Vec::is_empty""#;
+    let stripped = strip_quoted_content(text);
+    assert!(
+        !has_keyword_outside_strings(&stripped, "default"),
+        "an escaped quote inside the value must not flip string parity and expose the escaped \
+         \"default\" text as an unquoted keyword — stripped form was: {stripped:?}"
+    );
+}
+
+/// "Also fix — half of one fix is unpinned" (2026-09-10 round-3 review):
+/// `has_keyword_outside_strings` matches the real keyword as a WHOLE
+/// TOKEN, not a substring — but no existing test actually distinguished
+/// that from a plain substring check on the stripped text (the review's
+/// own proof: swapping in a substring check left all 24 prior tests
+/// green). An unquoted, bare identifier merely CONTAINING "default" as a
+/// substring (`not_default` — not a real serde option, but this is a
+/// source-text scan, not a compiler, and doesn't need one) must not be
+/// mistaken for the real `default` keyword.
+#[test]
+fn an_unquoted_token_merely_containing_the_default_keyword_as_a_substring_is_not_mistaken_for_the_real_keyword() {
+    let src = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scratch {
+    #[serde(not_default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+}
+"#;
+    let lines: Vec<&str> = src.lines().collect();
+    let findings = scan_lines(&lines, "<test>", &HashSet::new());
+    assert_eq!(
+        findings.len(),
+        1,
+        "`not_default` is a bare unquoted TOKEN, not the real `default` keyword — a substring \
+         check would wrongly grant the exemption (all 24 prior tests stayed green under a \
+         substring check, which is exactly why this needed its own dedicated pin) — found \
+         {findings:?} instead"
+    );
+}
+
+/// Direct unit-level twin of the above, isolating `has_keyword_outside_strings`
+/// itself from the field-scan plumbing.
+#[test]
+fn has_keyword_outside_strings_requires_a_whole_token_not_a_substring() {
+    assert!(
+        !has_keyword_outside_strings("not_default, skip_serializing_if", "default"),
+        "`not_default` must not be mistaken for the whole-token keyword `default`"
+    );
+    assert!(
+        has_keyword_outside_strings("not_default, default, skip_serializing_if", "default"),
+        "a REAL, separately-present whole-token `default` alongside `not_default` must still \
+         be recognized"
     );
 }
