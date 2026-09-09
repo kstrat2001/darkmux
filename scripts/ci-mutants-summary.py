@@ -96,6 +96,7 @@ What GATES is tool integrity: the tool did not run, or it ran and reported
 numbers we cannot reconcile. That distinction is the whole of #1716.
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -105,6 +106,14 @@ from pathlib import Path
 try:
     import tomllib  # Python 3.11+, standard library
 except ModuleNotFoundError:  # pragma: no cover — pre-3.11 interpreter
+    tomllib = None
+
+if os.environ.get("_CI_MUTANTS_SUMMARY_FORCE_NO_TOMLLIB"):
+    # (#2602 round 2) Self-test-only escape hatch: simulates a pre-3.11
+    # interpreter (`tomllib` unimportable) without needing one installed, so
+    # `parse_workspace_exclude`'s hard-failure path on an unavailable parser
+    # can be red-proved as a real subprocess run rather than only unit-tested
+    # against the function in isolation. Never set by `quality.yml` itself.
     tomllib = None
 
 # The only exit codes that mean "cargo-mutants actually tested mutants".
@@ -485,28 +494,44 @@ def _test_module_ranges(path: Path) -> list[tuple[int, int]] | None:
 # lives under.
 #
 # (#2602) The array is parsed with the standard library's TOML parser
-# (`tomllib`, Python 3.11+ — confirmed present on the runner) rather than a
-# hand-rolled regex. The regex version handed the whole `exclude = [...]`
-# array BODY to a bare quoted-string finder with no notion of a TOML
-# comment: `exclude = ["runtime", # keeps "src" out? no - just prose\n
-# "tools/darkmux-mock-model"]` picked up the quoted words inside the
-# comment as a THIRD excluded path (`"src"`), and that is exactly the kind
-# of edit this feature's own commit message invites — a future exclusion
-# added or annotated without touching this script. On the real root
-# manifest that dropped the floor for an ordinary `src/` diff from 2 to 0,
-# with no error and no warning: the gate that exists to catch a diff
-# structurally invisible to its own invocation went silently blind on the
-# most ordinary kind of edit. A real parser does not have this failure
-# mode — a `#` inside a TOML comment is never data, regardless of what
-# looks quoted next to it. `tomllib` is used first; a regex fallback
-# remains for a pre-3.11 interpreter, and is used (with a stderr warning)
-# if the manifest fails to parse as TOML at all.
+# (`tomllib`, Python 3.11+ — confirmed present on the runner), never a
+# hand-rolled regex. A first version of this fix used `tomllib` when
+# available and fell back to a regex extractor otherwise — that regex handed
+# the whole `exclude = [...]` array BODY to a bare quoted-string finder with
+# no notion of a TOML comment: `exclude = ["runtime", # keeps "src" out?
+# no - just prose\n "tools/darkmux-mock-model"]` picked up the quoted words
+# inside the comment as a THIRD excluded path (`"src"`), and that is exactly
+# the kind of edit this feature's own commit message invites. Frontier
+# re-review of THAT fix (round 2) found the fallback itself was the same
+# class of bug wearing a different trigger: on a manifest `tomllib` cannot
+# parse — a BOM at the top of the file is enough — the regex silently
+# recovered a WRONG exclusion set from the very same runtime manifest this
+# feature was built to cover (its `[workspace]` table sits behind a comment
+# block, exactly the shape a decode-miss defeats), same false-clean shape,
+# different cause. A parser that can be WRONG about what it excludes is
+# strictly worse than one that excludes nothing: excluding nothing fails
+# OPEN (more code counted, the floor stays armed); a wrong exclusion set
+# fails CLOSED (code the floor should see silently vanishes). So there is no
+# fallback any more. `tomllib` unavailable (a pre-3.11 interpreter) is a hard
+# failure (exit 2) rather than a silent downgrade to the parser this feature
+# replaced — see `TomlParserUnavailableError`. A manifest that fails to
+# parse as TOML at all warns on stderr and fails OPEN (nothing excluded)
+# instead of guessing. The manifest is also read with a byte-order-mark-
+# tolerant encoding, so the BOM shape that triggered the fallback bug in the
+# first place is a non-event rather than a decode failure to recover from.
 # ---------------------------------------------------------------------------
 
-_WORKSPACE_TABLE_RE = re.compile(r"^\[workspace\]\s*$", re.MULTILINE)
-_ANY_TABLE_HEADER_RE = re.compile(r"^\[[^\]]*\]\s*$", re.MULTILINE)
-_EXCLUDE_ARRAY_RE = re.compile(r"^\s*exclude\s*=\s*\[(.*?)\]", re.DOTALL | re.MULTILINE)
-_QUOTED_STRING_RE = re.compile(r'"([^"]*)"')
+
+class TomlParserUnavailableError(RuntimeError):
+    """Raised by `parse_workspace_exclude` when `tomllib` (Python 3.11+) is
+    not importable. (#2602 round 2) There is no regex fallback to reach for
+    here any more — a hand-rolled TOML reader is a KNOWN-lossy way to read
+    this exact array (see the module comment above `TomlParserUnavailableError`
+    two lines up), so silently reusing it would reintroduce the over-match
+    bug #2602 exists to prevent, with zero warning. `count_changed_lines_main`
+    turns this into the same exit-2 hard failure an unreadable
+    `--manifest-path` already gets — a gate that cannot parse its own scope
+    input must not quietly downgrade to the parser it just replaced."""
 
 
 def _normalize_exclude_entry(raw: str) -> str:
@@ -536,55 +561,43 @@ def _normalize_exclude_entry(raw: str) -> str:
     return entry.rstrip("/")
 
 
-def _parse_workspace_exclude_regex(manifest_text: str) -> list[str]:
-    """Fallback extraction used only when `tomllib` is unavailable (a
-    pre-3.11 interpreter) or the manifest could not be parsed as TOML at
-    all. Not a TOML parser — a small, targeted regex, good enough for this
-    manifest's actual shape (a single- or multi-line quoted-string array)
-    but, unlike `tomllib`, unable to tell a `#` comment from array
-    content — callers that reach this path print a warning explaining
-    why. Returns `[]` (fails open) for anything it does not recognize,
-    including a manifest with no `[workspace]` table, or a `[workspace]`
-    table with no `exclude` key."""
-    m = _WORKSPACE_TABLE_RE.search(manifest_text)
-    if not m:
-        return []
-    next_header = _ANY_TABLE_HEADER_RE.search(manifest_text, m.end())
-    body = manifest_text[m.end() : next_header.start() if next_header else len(manifest_text)]
-    em = _EXCLUDE_ARRAY_RE.search(body)
-    if not em:
-        return []
-    return [_normalize_exclude_entry(s) for s in _QUOTED_STRING_RE.findall(em.group(1))]
-
-
 def parse_workspace_exclude(manifest_text: str) -> list[str]:
     """Extract the `[workspace] exclude = [...]` array's string values from
     a Cargo.toml's raw text, normalized (see `_normalize_exclude_entry`).
 
-    Parsed as real TOML via `tomllib` when available (#2602) — a `#`
-    sharing a line with array content is unambiguously a comment, not
-    data, the same as it is to `cargo` itself. Fails open silently (`[]`,
-    no warning) for the two LEGITIMATE no-exclusion shapes: no
-    `[workspace]` table at all, or a `[workspace]` table that deliberately
-    carries no `exclude` key (e.g. `runtime/Cargo.toml`'s own empty
-    `[workspace]`). Warns on stderr — the parser genuinely gave up,
-    distinct from those two deliberate shapes — when the manifest fails to
-    parse as TOML at all (falls back to the regex extractor), or when an
-    `exclude` key is present but is not a list of strings; either way the
-    floor still fails open (`[]` / whatever the fallback recovers) rather
-    than raising, since a manifest a human wrote and CI still needs to run
-    against must not hard-fail the job over its shape."""
+    Parsed as real TOML via `tomllib` — a `#` sharing a line with array
+    content is unambiguously a comment, not data, the same as it is to
+    `cargo` itself. Fails open silently (`[]`, no warning) for the two
+    LEGITIMATE no-exclusion shapes: no `[workspace]` table at all, or a
+    `[workspace]` table that deliberately carries no `exclude` key (e.g.
+    `runtime/Cargo.toml`'s own empty `[workspace]`).
+
+    Raises `TomlParserUnavailableError` (#2602 round 2) if `tomllib` itself
+    is not importable — this is a HARD failure, not a silent downgrade; see
+    that exception's docstring and the module comment above it for why
+    there is no fallback parser any more. Warns on stderr and fails open
+    (`[]`, nothing excluded) — never guesses — when the manifest fails to
+    parse as TOML at all, or when an `exclude` key is present but is not a
+    list of strings: a manifest a human wrote and CI still needs to run
+    against must not hard-fail the job over its shape, but a parser that
+    cannot read the array must not pretend it read an empty one silently,
+    either."""
     if tomllib is None:
-        return _parse_workspace_exclude_regex(manifest_text)
+        raise TomlParserUnavailableError(
+            "no `tomllib` (Python 3.11+ standard library) available to parse "
+            "[workspace] exclude as real TOML"
+        )
     try:
         data = tomllib.loads(manifest_text)
     except tomllib.TOMLDecodeError as exc:
         print(
             f"parse_workspace_exclude: manifest did not parse as TOML ({exc}); "
-            "falling back to regex extraction of [workspace] exclude",
+            "failing open (nothing excluded) rather than risk a wrong exclusion "
+            "set from a non-TOML reader — see the module comment above "
+            "TomlParserUnavailableError",
             file=sys.stderr,
         )
-        return _parse_workspace_exclude_regex(manifest_text)
+        return []
     workspace = data.get("workspace")
     if not isinstance(workspace, dict):
         return []  # no [workspace] table at all — legitimately nothing to exclude
@@ -617,8 +630,16 @@ def manifest_scope(manifest_path: Path) -> tuple[str, list[str]]:
     failure as the unreadable-manifest case just one step further along,
     so it gets the same hard-failure treatment rather than a quiet empty
     scope. The caller decides whether either is a hard failure (an
-    explicit `--manifest-path`) or should fail open (no flag given)."""
-    text = manifest_path.read_text()
+    explicit `--manifest-path`) or should fail open (no flag given).
+
+    Read with `utf-8-sig` (#2602 round 2): a byte-order mark at the top of
+    the file is otherwise a literal `﻿` character `tomllib` cannot
+    parse past — a real divergence from `cargo`, which accepts a
+    BOM-prefixed manifest. `utf-8-sig` strips a BOM if present and behaves
+    exactly like `utf-8` if not, so this manifest shape is a non-event
+    instead of a decode failure `parse_workspace_exclude` has to recover
+    from."""
+    text = manifest_path.read_text(encoding="utf-8-sig")
     manifest_dir = manifest_path.parent.as_posix()
     if manifest_dir == ".":
         manifest_dir = ""
@@ -754,7 +775,11 @@ def count_changed_lines_main(args: list[str]) -> int:
     is not repository-root-relative (#2602 — an absolute path or a `..`
     parent segment; see `manifest_scope`), is a hard failure (exit 2), the
     same as an unreadable diff — a typo'd or malformed flag must not
-    silently narrow the floor to a directory nothing lives under."""
+    silently narrow the floor to a directory nothing lives under. A
+    `tomllib`-unavailable interpreter (#2602 round 2 — see
+    `TomlParserUnavailableError`) is the same hard failure, for the same
+    reason: this gate must not quietly downgrade to a parser known to
+    mis-read its own scope input."""
     args = list(args)
     reachable = None
     if "--manifest-path" in args:
@@ -771,6 +796,9 @@ def count_changed_lines_main(args: list[str]) -> int:
             return 2
         except ValueError as exc:
             print(f"--manifest-path {manifest_arg} is invalid: {exc}", file=sys.stderr)
+            return 2
+        except TomlParserUnavailableError as exc:
+            print(f"--manifest-path {manifest_arg}: {exc}", file=sys.stderr)
             return 2
         reachable = reachable_predicate(manifest_dir, excluded_prefixes)
 
@@ -1056,12 +1084,20 @@ SELF_TEST_CASES = [
         "must_not_contain": ["No surviving mutants", "nothing to mutate"],
     },
     {
-        "name": "an empty exit_code (the step output never got set) fails",
+        # (#2602 round 2) The message must say the step DID NOT RUN, not
+        # that the reader received a malformed integer — an empty output is
+        # what a skipped-or-cancelled upstream step looks like, not garbage
+        # from a step that ran.
+        "name": "an empty exit_code (the step output never got set) fails, honestly",
         "argv": ["", "diff", "T"],
         "files": None,
         "expect_exit": 2,
-        "must_contain": ["exit_code must be an integer"],
-        "must_not_contain": ["No surviving mutants", "nothing to mutate"],
+        "must_contain": ["exit_code is empty", "did not run"],
+        "must_not_contain": [
+            "No surviving mutants",
+            "nothing to mutate",
+            "exit_code must be an integer",
+        ],
     },
     {
         "name": "exit 2 with real survivors lists them (advisory pass)",
@@ -1617,14 +1653,38 @@ _DIFF_TOOLS_MOCK_ONLY = (
     "+    1 + 1\n+}\n"
 )
 
-# Invalid TOML (a duplicate `exclude` key in the same table) that still
-# leaves the `[workspace]` header and the FIRST `exclude = [...]` intact, so
-# the regex fallback can still recover something — proving the fallback path
-# actually engages (and warns) rather than only existing in theory.
+# Invalid TOML (a duplicate `exclude` key in the same table — `cargo`'s own
+# TOML reader rejects this too, so there is no manifest shape here a lossy
+# regex fallback could have "recovered" that would have been worth trusting;
+# see the module comment above `TomlParserUnavailableError`). Proves the
+# decode-error path actually engages (warns, fails OPEN) rather than only
+# existing in theory.
 _MALFORMED_MANIFEST_DUPLICATE_KEY = (
     "[workspace]\n"
     'exclude = ["runtime"]\n'
     'exclude = ["oops-this-is-invalid-toml"]\n'
+    "\n"
+    "[package]\n"
+    'name = "darkmux"\n'
+)
+
+# The reviewer's second reproduction (round 2): a byte-order mark ahead of
+# the SAME comment-bearing array above. `tomllib` cannot parse past a literal
+# BOM character read as plain `utf-8`; `cargo` accepts a BOM-prefixed
+# manifest without complaint. Before the `utf-8-sig` fix, this decode failure
+# would have gone through the now-deleted regex fallback, which would have
+# re-triggered the ORIGINAL #2602 bug (the comment's `"src"` picked up as a
+# third exclusion) on this exact array shape — a BOM defeating the strict
+# parser and quietly resurrecting the bug the strict parser was built to
+# fix. `utf-8-sig` strips the BOM before it ever reaches `tomllib`, so this
+# is a non-event: no decode error, no warning, correct exclusions.
+_BOM_MANIFEST_WITH_ARRAY_COMMENT = "\ufeff" + (
+    "[workspace]\n"
+    'members = [".", "crates/darkmux-types"]\n'
+    "exclude = [\n"
+    '  "runtime",           # keeps "src" out of the parent build? no - just prose\n'
+    '  "tools/darkmux-mock-model",\n'
+    "]\n"
     "\n"
     "[package]\n"
     'name = "darkmux"\n'
@@ -1719,17 +1779,58 @@ MANIFEST_PARSE_SELF_TEST_CASES = [
         "expect_stderr_contains": ["is invalid", "repository-root-relative"],
     },
     {
-        # A manifest that fails to parse as TOML at all warns on stderr and
-        # falls back to the regex extractor, rather than silently returning
-        # an empty exclusion list with no hint the parser gave up.
-        "name": "#2602: a manifest that fails to parse as TOML warns and falls back",
+        # (#2602 round 2) A manifest that fails to parse as TOML at all now
+        # warns and FAILS OPEN — no regex fallback to reach for any more.
+        # `_MALFORMED_MANIFEST_DUPLICATE_KEY` invalidates the FIRST
+        # `exclude = ["runtime"]`, so `runtime/`'s real exclusion is lost:
+        # correct behavior is for the runtime-only diff to count as real,
+        # uncovered code (2, gate armed), not the old regex fallback's
+        # (accidentally correct here, but not always — see MUST FIX 2)
+        # recovery of 0.
+        "name": "#2602 round 2: a manifest that fails to parse as TOML warns and fails open (never mis-parses)",
         "diff": _DIFF_RUNTIME_ONLY,
         "manifest_path": "Cargo.toml",
         "manifest_content": _MALFORMED_MANIFEST_DUPLICATE_KEY,
         "manifest_arg": "Cargo.toml",
+        "expect_count": 2,
+        "expect_gate": 1,
+        "expect_stderr_contains": ["did not parse as TOML", "failing open"],
+        "expect_stderr_not_contains": ["falling back to regex"],
+    },
+    {
+        # THE MUST-FIX-1 REPRODUCTION. `tomllib` unavailable (a pre-3.11
+        # interpreter, forced here via the self-test-only env hatch) is a
+        # HARD failure — exit 2, not a silent downgrade to the deleted regex
+        # extractor. Without the fix, this manifest+diff pair would have
+        # silently reproduced the ORIGINAL #2602 bug: `"src"` inside the
+        # comment picked up as a bogus third exclusion, dropping this
+        # `src/`-only diff's count from 2 to 0 with no warning at all — the
+        # exact "the fallback is worse than having no fallback" finding.
+        "name": "#2602 round 2: an unavailable TOML parser is a hard failure, not a silent fallback",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _ROOT_MANIFEST_WITH_ARRAY_COMMENT,
+        "manifest_arg": "Cargo.toml",
+        "env": {"_CI_MUTANTS_SUMMARY_FORCE_NO_TOMLLIB": "1"},
+        "expect_exit": 2,
+        "expect_stderr_contains": ["tomllib", "available to parse"],
+    },
+    {
+        # THE MUST-FIX-2 REPRODUCTION. A byte-order mark ahead of the SAME
+        # comment-bearing array that motivated the original #2602 fix. Read
+        # with a BOM-tolerant encoding, this is a non-event: `tomllib` parses
+        # it cleanly, `runtime/`'s real exclusion applies, and NO warning is
+        # printed — proving the manifest is read correctly rather than
+        # merely "handled" via a fail-open/fallback path that happens to
+        # land on the same number.
+        "name": "#2602 round 2: a byte-order mark on a comment-bearing manifest still parses (and excludes) correctly",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _BOM_MANIFEST_WITH_ARRAY_COMMENT,
+        "manifest_arg": "Cargo.toml",
         "expect_count": 0,
         "expect_gate": 0,
-        "expect_stderr_contains": ["did not parse as TOML", "falling back to regex"],
+        "expect_stderr_not_contains": ["did not parse as TOML", "failing open"],
     },
     {
         # A `[workspace]` table found with an `exclude` key that parses as
@@ -1749,12 +1850,24 @@ MANIFEST_PARSE_SELF_TEST_CASES = [
 COUNT_SELF_TEST_CASES += MANIFEST_PARSE_SELF_TEST_CASES
 
 
-def _run_self(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
+def _run_self(
+    argv: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    env = None
+    if extra_env:
+        # (#2602 round 2) Merged on top of the REAL environment, not a
+        # replacement — the subprocess still needs `PATH` etc. to launch
+        # `sys.executable` at all. Used to force the
+        # `_CI_MUTANTS_SUMMARY_FORCE_NO_TOMLLIB` escape hatch for the
+        # unavailable-parser self-test case without needing a pre-3.11
+        # interpreter installed.
+        env = {**os.environ, **extra_env}
     return subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), *argv],
         capture_output=True,
         text=True,
         cwd=cwd,
+        env=env,
     )
 
 
@@ -1807,7 +1920,7 @@ def count_self_test() -> list[str]:
             expect_exit = case.get("expect_exit", 0)
             problems = []
 
-            proc = _run_self(count_argv, cwd=tmp_path)
+            proc = _run_self(count_argv, cwd=tmp_path, extra_env=case.get("env"))
             got = proc.stdout.strip()
             if proc.returncode != expect_exit:
                 problems.append(
@@ -1827,6 +1940,15 @@ def count_self_test() -> list[str]:
             for needle in case.get("expect_stderr_contains", []):
                 if needle not in proc.stderr:
                     problems.append(f"stderr is missing {needle!r}: {proc.stderr.strip()}")
+
+            # (#2602 round 2) The inverse assertion — proving a clean parse
+            # stays QUIET. Without this, a case like the BOM-tolerance one
+            # below could pass on count/gate alone while silently regressing
+            # to "parses, but with a spurious warning" and nobody would
+            # notice.
+            for needle in case.get("expect_stderr_not_contains", []):
+                if needle in proc.stderr:
+                    problems.append(f"stderr wrongly contains {needle!r}: {proc.stderr.strip()}")
 
             # Hand the count straight to the floor, the way the workflow does:
             # exit 0, no output directory, i.e. "ran and mutated nothing".
@@ -1932,6 +2054,22 @@ if __name__ == "__main__":
 
     if len(args) < 3:
         print(USAGE, file=sys.stderr)
+        sys.exit(2)
+    # (#2602 round 2) An EMPTY exit_code (`""`) is a distinct case from a
+    # malformed one: it is what a GitHub Actions step output reads as when
+    # the step that was meant to set it never ran at all — skipped by an
+    # `if:` condition, an earlier failure, or cancellation — not a step that
+    # ran and produced garbage. `int("")` raises the same ValueError as any
+    # other unparseable string, so without this check the caller sees
+    # "exit_code must be an integer, got ''" — technically true, but it
+    # reads as if THIS script received bad input, when the honest report is
+    # that the mutation step upstream never executed.
+    if args[0] == "":
+        print(
+            "exit_code is empty — the mutation step did not run (skipped by an "
+            "earlier failure or a cancelled job), not that it ran and failed",
+            file=sys.stderr,
+        )
         sys.exit(2)
     try:
         code = int(args[0])

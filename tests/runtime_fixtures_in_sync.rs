@@ -39,8 +39,46 @@
 //! holds fixtures that were never vendored from the repo root at all
 //! (`README.md`, the `compactor_*` prompt fixtures, `cycle-traces/`,
 //! `promoter-emissions/`), and those have no canonical copy to drift from.
+//!
+//! (#2602 round 2) The walk's own vacuity check — "did we find at least the
+//! two known pairs" — was a COUNT, not a presence check: `checked.len() >=
+//! 2` passes the moment ANY two same-named vendored/canonical pairs match,
+//! including two that have nothing to do with the wire fixtures this guard
+//! exists to protect. If both real pairs (`create_mod_wire.json`,
+//! `finding_key_cases.json`) were ever renamed or removed on both sides
+//! while two unrelated same-named files happened to sit in both
+//! directories, this test would report "found 2, expected >= 2" and pass —
+//! green while checking zero real vendored copies, the same silent-vacuity
+//! shape #1716's own summary-script self-test exists to catch elsewhere in
+//! this repo. `check_known_fixtures_present` below asserts the NAMED
+//! fixtures are present, matching what the panic message already claimed.
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
+
+/// The two vendored wire fixtures this guard exists to protect (#2544).
+/// Named once so the presence check and its panic message can never name a
+/// fixture the check doesn't actually look for, or vice versa.
+const KNOWN_VENDORED_FIXTURES: &[&str] = &["create_mod_wire.json", "finding_key_cases.json"];
+
+/// (#2602 round 2) Pure presence check, split out of the main test so it can
+/// be red-proved directly against a fabricated `checked` list with no
+/// filesystem I/O involved. Returns `Err` naming the first missing fixture
+/// unless every name in `KNOWN_VENDORED_FIXTURES` is actually present in
+/// `checked` — NOT just `checked.len() >= KNOWN_VENDORED_FIXTURES.len()`,
+/// which is the vacuous version this replaces (see the module doc comment).
+fn check_known_fixtures_present(checked: &[OsString]) -> Result<(), String> {
+    for name in KNOWN_VENDORED_FIXTURES {
+        if !checked.iter().any(|c| c.as_os_str() == OsStr::new(name)) {
+            return Err(format!(
+                "expected {name} among the vendored wire fixtures actually found under \
+                 runtime/tests/fixtures/; found {checked:?} — did the vendored copy get \
+                 renamed or removed, or did tests/fixtures/ itself move?"
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn runtime_vendored_wire_fixtures_match_the_canonical_copies() {
@@ -78,16 +116,49 @@ fn runtime_vendored_wire_fixtures_match_the_canonical_copies() {
         checked.push(name);
     }
 
-    // A glob that silently matched nothing would be a WORSE guard than the
-    // hardcoded list it replaced — prove it actually found the two known
-    // vendored fixtures, not just that it ran without error.
+    // (#2602 round 2) Assert the SPECIFIC known fixtures were found, not
+    // merely that at least as many pairs matched as the list is long — see
+    // `check_known_fixtures_present`'s doc comment for the vacuity this
+    // closes, and the two unit tests below for the red-prove.
+    if let Err(msg) = check_known_fixtures_present(&checked) {
+        panic!("{msg}");
+    }
+}
+
+#[test]
+fn known_fixture_check_rejects_two_unrelated_same_named_matches() {
+    // The reviewer's exact vacuity proof: both real vendored pairs gone,
+    // replaced by two unrelated same-named files present on both sides of
+    // the vendored/canonical split. The OLD `checked.len() >= 2` threshold
+    // would have passed this; the presence check must reject it.
+    let checked = vec![
+        OsString::from("unrelated_a.json"),
+        OsString::from("unrelated_b.json"),
+    ];
     assert!(
-        checked.len() >= 2,
-        "expected at least the two known vendored wire fixtures \
-         (create_mod_wire.json, finding_key_cases.json) under {}; found {} ({:?}) — \
-         did the vendored copies get renamed, removed, or did tests/fixtures/ itself move?",
-        vendored_dir.display(),
-        checked.len(),
-        checked,
+        check_known_fixtures_present(&checked).is_err(),
+        "a checked list missing both real vendored fixtures must be rejected, \
+         even though it has >= 2 entries from unrelated same-named files"
     );
+}
+
+#[test]
+fn known_fixture_check_rejects_one_of_the_two_missing() {
+    // Half the same vacuity: one real fixture present, the other silently
+    // renamed or removed. `checked.len() >= 2` (satisfied here too, via one
+    // real fixture plus one unrelated same-named file) would also pass this.
+    let checked = vec![
+        OsString::from(KNOWN_VENDORED_FIXTURES[0]),
+        OsString::from("unrelated.json"),
+    ];
+    assert!(check_known_fixtures_present(&checked).is_err());
+}
+
+#[test]
+fn known_fixture_check_accepts_the_real_pair() {
+    let checked = vec![
+        OsString::from(KNOWN_VENDORED_FIXTURES[0]),
+        OsString::from(KNOWN_VENDORED_FIXTURES[1]),
+    ];
+    assert!(check_known_fixtures_present(&checked).is_ok());
 }

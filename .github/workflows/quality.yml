@@ -374,15 +374,24 @@ jobs:
       # (e.g. the root "Mutate"/"Report survivors" steps above) — but
       # "Report survivors (runtime/)" below already carries its own
       # `always()` (it must, to report a failed root run at all) and reads
-      # `steps.mutants_runtime.outputs.exit_code`. With this step skipped,
-      # that output is empty, and the summary script tries to parse "" as
-      # an integer — a confusing integer-parse error stacked on top of the
-      # job already being red, on the exact path where someone is already
-      # debugging a failure. The job is already correctly failing either
-      # way; this only removes the noise.
+      # `steps.mutants_runtime.outputs.exit_code`.
+      #
+      # (#2602 round 2) `always()` -> `!cancelled()`: `always()` means "run
+      # unconditionally, including when the job is CANCELLED" — not merely
+      # "run even if an earlier step failed", which is `!cancelled()`'s own
+      # actual meaning. Under the old `always()`, a cancelled run still
+      # dispatched this invocation's full baseline-plus-mutation pass (the
+      # same job whose own comment above says a single file can consume the
+      # whole 60-minute budget) for a result nobody would ever read.
+      # `!cancelled()` keeps the original intent — this invocation is
+      # independent of the root one and should still run if root failed —
+      # while actually honoring a cancellation. "Report survivors (runtime/)"
+      # below carries the identical `!cancelled()` so the two steps can never
+      # drift out of lockstep and reproduce the empty-`exit_code` integer-
+      # parse error the original `always()` fix was closing.
       - name: Mutate runtime/ only what this PR touched
         id: mutants_runtime
-        if: always() && steps.diff.outputs.runtime_changed_lines != '0'
+        if: ${{ !cancelled() && steps.diff.outputs.runtime_changed_lines != '0' }}
         run: |
           # Same exit-code capture discipline as the root invocation above —
           # no `|| true`, the real code goes to the "Report survivors
@@ -419,7 +428,16 @@ jobs:
           exit 0
 
       - name: Report survivors (runtime/)
-        if: always() && steps.diff.outputs.runtime_changed_lines != '0'
+        # (#2602 round 2) `!cancelled()`, matching "Mutate runtime/..."
+        # above — must stay identical to it or a cancellation skips one but
+        # not the other, reproducing the empty-`exit_code` integer-parse
+        # error the original `always()` fix existed to prevent (see that
+        # step's comment). Also (#2602 round 2): a genuinely empty
+        # `exit_code` — the mutation step above legitimately skipped, or
+        # failed to run for a reason other than cancellation — now reads as
+        # an honest "did not run" from the summary script rather than a
+        # confusing integer-parse error either way.
+        if: ${{ !cancelled() && steps.diff.outputs.runtime_changed_lines != '0' }}
         run: |
           python3 scripts/ci-mutants-summary.py \
             "${{ steps.mutants_runtime.outputs.exit_code }}" diff \
@@ -453,15 +471,12 @@ jobs:
       # (#2544) THE THIRD invocation — see the comment on `bundler_changed_lines`
       # above for why this project, specifically, was chosen to cover rather
       # than just document. Same shape as the runtime block above throughout,
-      # including the (#2602) `always() &&` — see that comment on `mutants_runtime`
-      # for why: without it, a failure in an earlier step (root's own Mutate/
-      # Report survivors) skips this step while "Report survivors
-      # (plugins/darkmux-bundler-rust/)" below still runs (`always()`) and reads
-      # its empty `exit_code` output, producing a confusing integer-parse
-      # error on top of a job that is already correctly red.
+      # including the (#2602 round 2) `!cancelled()` — see that condition's
+      # comment on `mutants_runtime` for why `always()` (which also runs on a
+      # CANCELLED job, not merely "an earlier step failed") was replaced.
       - name: Mutate plugins/darkmux-bundler-rust/ only what this PR touched
         id: mutants_bundler
-        if: always() && steps.diff.outputs.bundler_changed_lines != '0'
+        if: ${{ !cancelled() && steps.diff.outputs.bundler_changed_lines != '0' }}
         run: |
           set +e
           cargo mutants --manifest-path plugins/darkmux-bundler-rust/Cargo.toml --in-diff /tmp/pr-bundler.diff -j 4 --timeout 300 \
@@ -472,7 +487,9 @@ jobs:
           exit 0
 
       - name: Report survivors (plugins/darkmux-bundler-rust/)
-        if: always() && steps.diff.outputs.bundler_changed_lines != '0'
+        # Must stay identical to "Mutate plugins/darkmux-bundler-rust/..."
+        # above's own condition — see that step's comment.
+        if: ${{ !cancelled() && steps.diff.outputs.bundler_changed_lines != '0' }}
         run: |
           python3 scripts/ci-mutants-summary.py \
             "${{ steps.mutants_bundler.outputs.exit_code }}" diff \
