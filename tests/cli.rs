@@ -8167,6 +8167,219 @@ fn the_wait_command_completes_with_found_false_when_no_mod_appears_within_the_bo
     assert!(stderr.contains("3s"), "and the bound it waited: {stderr}");
 }
 
+/// Run the shipped wait command with `DARKMUX_BIN` overridden — for tests
+/// that need the `mod list` call itself to fail, rather than the real
+/// binary under test.
+fn run_wait_command_with_bin(
+    home: &std::path::Path,
+    command: &str,
+    darkmux_bin: &str,
+) -> std::process::Output {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("HOME", isolated_roots().0)
+        .env("DARKMUX_HOME", home)
+        .env("DARKMUX_BIN", darkmux_bin)
+        .output()
+        .expect("the wait command runs")
+}
+
+/// (#2552) `mod list` never runs at all — the binary the step calls back
+/// into does not exist (a worktree build not yet installed, a `PATH` a
+/// launcher forgot to carry). Before the fix, this poll's own `if ... |
+/// grep -q '"key"'` collapsed a 127 (command not found) into the same
+/// branch as "no mod yet" — silently discarded by `2>/dev/null` — and the
+/// step polled for the FULL bound before reporting `found: false`, naming
+/// no cause. Now it must fail on the FIRST probe, naming the exit code and
+/// what the shell said, so an operator debugging a stuck wait is pointed at
+/// the binary rather than at the mod-writing step.
+///
+/// Red-proved: reverting this poll to the shipped
+/// `... 2>/dev/null | grep -q '"key"'` shape turns this red — the step
+/// exits 0 with `found:false` after burning the whole bound instead of
+/// failing on the first probe.
+#[test]
+fn the_wait_command_fails_fast_when_the_darkmux_binary_is_missing() {
+    let home = TempDir::new().unwrap();
+    let started = std::time::Instant::now();
+    let out = run_wait_command_with_bin(
+        home.path(),
+        &create_mod_wait_command("sess-nobinary/1", "60"),
+        "/nonexistent/path/darkmux",
+    );
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "a missing binary must fail the step, not report a clean no-mod outcome: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        stderr.contains("mod list failed"),
+        "the failure names WHICH command failed, not just that something did: {stderr}"
+    );
+    assert!(
+        stderr.contains("exit"),
+        "and the exit status, so a missing binary (127) reads differently from a real error: {stderr}"
+    );
+    // The word "exit" alone would still pass a regression to a flat
+    // `exit 1` with a generic message — assert the real shell "command not
+    // found" code the wait command's `exit "$rc"` actually propagates.
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "a missing binary is shell exit 127 (command not found), not a made-up 1: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        !stdout.contains("\"found\":false"),
+        "must not report the clean-decline shape for an infra failure: {stdout}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "a missing binary is diagnosable on the FIRST probe — it must not burn the 60s bound: {elapsed:?}"
+    );
+}
+
+/// (#2552) `mod list` runs and errors (here: a `--for` key that cannot
+/// address any finding, refused by `canonical_finding_key` before the
+/// store is even read) — a real infra/config failure, distinct from both
+/// "no mod yet" and "the binary is missing". Same collapse as the test
+/// above: the shipped poll's `2>/dev/null | grep -q` swallowed this error
+/// and treated it exactly like "not found yet", polling for the full bound.
+///
+/// Uses a STUB rather than the real `mod list` invocation, on purpose: the
+/// real anyhow-based failure for an invalid key happens to exit 1 — the
+/// SAME number a hardcoded `exit "$rc"` -> `exit 1` regression would also
+/// produce, so pinning `Some(1)` against the real invocation cannot tell a
+/// genuinely propagated code from a flattened one; both read as 1 (a
+/// frontier review of this file found exactly that: mutating the
+/// propagation to a literal `exit 1` left this test green, because 1 == 1
+/// by coincidence — only the missing-binary test's 127 caught it). The
+/// stub exits 42, a number nothing in this command's normal operation
+/// produces, so the assertion below can only pass if `$rc` genuinely
+/// reaches `exit "$rc"` unmodified.
+///
+/// Red-proved two ways: (1) reverting to the shipped `2>/dev/null | grep
+/// -q` shape turns this red (burns the full 60s bound instead of failing
+/// fast); (2) flattening `exit "$rc"` to a literal `exit 1` ALSO turns this
+/// red now (`Some(42)` != `Some(1)`) — the coincidence-pass window this
+/// test used to have is closed.
+#[test]
+fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
+    let home = TempDir::new().unwrap();
+    let stub_dir = TempDir::new().unwrap();
+    let stub = stub_dir.path().join("fake-darkmux");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'not a finding key: \"not-a-valid-key\" (expected <dispatch>/<seq>, e.g. sess-abc/1)\\n' >&2\nexit 42\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    // Not `<dispatch>/<seq>` — real `mods::canonical_finding_key` would
+    // refuse this before the store is even read; the stub mirrors that
+    // shape with a distinctive exit code instead of the real one (see doc
+    // comment above for why).
+    let out = run_wait_command_with_bin(
+        home.path(),
+        &create_mod_wait_command("not-a-valid-key", "60"),
+        &stub.to_string_lossy(),
+    );
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "a real `mod list` error must fail the step: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        stderr.contains("mod list failed"),
+        "the failure names WHICH command failed: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a finding key") || stderr.contains("not-a-valid-key"),
+        "and carries the real command's own error text, not a generic message: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "the stub's distinctive exit code must reach here unmodified — a hardcoded `exit 1` \
+         regression would report 1, not 42, and this is the assertion that would catch it: \
+         stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        !stdout.contains("\"found\":false"),
+        "must not report the clean-decline shape for a real error: {stdout}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "a config/infra error is diagnosable on the FIRST probe — it must not burn the 60s bound: {elapsed:?}"
+    );
+}
+
+/// A `mod list --for` that exits 0 with an empty `{"mods": []}` on stdout
+/// but happens to write a line containing the five bytes `"key"` to
+/// stderr (a wrapper's startup warning, loader noise — `DARKMUX_BIN` is
+/// not guaranteed to be darkmux itself, see `builtins.rs`'s
+/// `current_exe()` default) must NOT be reported as `found: true`. The
+/// probe now redirects `mod list`'s stderr to a temp file and greps only
+/// stdout — before that fix the probe merged stderr into the string it
+/// grepped (`2>&1`), so this exact stub produced `found: true` with
+/// nothing ever generated.
+///
+/// Red-proved: reverting the probe's `2>"$errf"` back to `2>&1` (and the
+/// grepped variable back to the merged one) turns this red — the stub's
+/// stderr line satisfies the `grep -q '"key"'` check on the FIRST probe.
+#[test]
+fn the_wait_command_does_not_false_positive_on_key_text_in_mod_list_stderr() {
+    let home = TempDir::new().unwrap();
+    let stub_dir = TempDir::new().unwrap();
+    let stub = stub_dir.path().join("fake-darkmux");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'warning: unrecognized \"key\" in config\\n' >&2\nprintf '{\"mods\": []}\\n'\nexit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let out = run_wait_command_with_bin(
+        home.path(),
+        &create_mod_wait_command("sess-falsepos/1", "3"),
+        &stub.to_string_lossy(),
+    );
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "an exit-0 mod list, however noisy on stderr, is not a step failure: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        !stdout.contains("\"found\":true"),
+        "nothing was generated — `\"key\"` landing on stderr must not read as a match: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        stdout.contains("\"found\":false"),
+        "the honest outcome for an empty store is the clean decline: {stdout}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(3) && elapsed < std::time::Duration::from_secs(15),
+        "the poll burns its full 3s bound rather than false-matching on the first probe: {elapsed:?}"
+    );
+}
+
 /// (#2310 P4e, operator refinement) `mod_wait_seconds=0` — the DEFAULT, and
 /// the unattended path's behavior — is "do not wait", not "wait zero
 /// seconds and then check". It completes immediately with an honest output
