@@ -146,19 +146,6 @@ docker argv vector; nothing ever constructed and ran the real `Command`, so the
 break sailed through four releases of green CI. One dogfood dispatch would have
 caught it on the first try.
 
-**The automated half of this guard: `mock-dispatch-proof` in `ci.yml`** (#2486).
-`tests/mock_dispatch_proof.rs` is the only test in the tree that builds and runs
-a real `docker run` against a standalone mock-model process — a real,
-LMStudio-free proof of the exact #975 class above. It was `#[ignore]`d, needed
-Docker, and nothing in `ci.yml`'s PR/push triggers ever ran it — so it rotted
-red and unwatched for at least a release before #2486 caught it. It now runs
-nightly on `ci.yml`'s existing `schedule` cron, and can be run against the
-release commit by hand — `gh workflow run ci.yml --ref vNEW` (or the commit
-SHA before tagging) — as this step's CI-side complement. It does not replace
-the real-AI dogfood above: it proves the container-construction path and the
-`dispatch.start`/`dispatch.complete` flow records, not that any feature's
-*behavior* is correct.
-
 ## 3. Tag + GitHub release
 
 ```bash

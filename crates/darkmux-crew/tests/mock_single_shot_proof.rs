@@ -60,6 +60,15 @@ fn write_mock_profiles_registry(dir: &Path) -> std::path::PathBuf {
 }
 
 #[test]
+// Prophylactic, not a fix for an observed race: this is the only test in
+// this file today, so DARKMUX_FLOWS_DIR isn't actually contested yet. But
+// mock_dispatch_proof.rs in this same directory just shipped the exact
+// failure mode a second test added to THIS file would reproduce — a
+// process-wide env var mutated by two tests with no `#[ignore]` gate to
+// hide the race behind (#2486). Serializing now is cheap and means the
+// next person who adds a second test here inherits safety instead of
+// inheriting the bug.
+#[serial_test::serial]
 fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_server() {
     let server = MockServer::start();
     // The exact request-body SHAPE this path sends (local dialect:

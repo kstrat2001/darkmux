@@ -41,6 +41,39 @@ use std::time::Duration;
 
 use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts};
 
+/// Restores a process-wide env var to its prior value on drop — the
+/// clean-by-construction sibling of `brief_refs_graph_proof.rs`'s
+/// `EnvGuard` in this same directory, duplicated here rather than shared
+/// (each `tests/*.rs` file compiles as its own binary; no `tests/common/`
+/// module exists yet, and one ten-line struct isn't worth inventing one
+/// for). Panic-safe where a manual save/restore pair is not: a `dispatch()`
+/// panic (not just an `Err`) still runs `Drop` and restores the var.
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let prev = std::env::var(key).ok();
+        // SAFETY: matches the pattern `darkmux-flow`'s own tests use for
+        // this exact env var — every caller of this guard in this file
+        // carries `#[serial_test::serial]`, so only one test ever holds
+        // `key` at a time.
+        unsafe { std::env::set_var(key, value) };
+        EnvVarGuard { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => unsafe { std::env::set_var(self.key, v) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
 /// Repo root, resolved from this crate's own manifest dir at compile time —
 /// `crates/darkmux-crew` → repo root is two levels up.
 fn repo_root() -> PathBuf {
@@ -180,21 +213,22 @@ fn run_mock_dispatch(
     let registry_dir = tempfile::tempdir().expect("tempdir for profiles registry");
     let profiles_path = write_mock_profiles_registry(registry_dir.path());
 
-    // SAFETY (matches the pattern `darkmux-flow`'s own tests use for this
-    // exact env var): both callers of this helper carry `#[serial_test::serial]`
-    // (below), so only one of this file's tests ever holds DARKMUX_FLOWS_DIR
-    // at a time — `#[ignore]` alone does NOT guarantee that: the documented
-    // invocation (`cargo test ... -- --ignored`, no `--test-threads=1`) runs
-    // both `#[ignore]`d tests in this file concurrently by default, and two
+    // Both callers of this helper carry `#[serial_test::serial]` (below), so
+    // only one of this file's tests ever holds DARKMUX_FLOWS_DIR at a time —
+    // `#[ignore]` alone does NOT guarantee that: the documented invocation
+    // (`cargo test ... -- --ignored`, no `--test-threads=1`) runs both
+    // `#[ignore]`d tests in this file concurrently by default, and two
     // threads racing `set_var`/`remove_var` on the same process-wide
     // DARKMUX_FLOWS_DIR is exactly what made this session's `dispatch.start`
     // (or `dispatch.complete`) land in the OTHER test's isolated flows dir —
     // see `real_container_dispatch_round_trips_through_a_standalone_mock_model_process`'s
     // own history (#2486): the container path and the flow-record emitter
-    // were never at fault, the missing-record symptom was 100% reproducible
-    // under the default parallel invocation and 100% absent once serialized.
-    let prev_flows_dir = std::env::var("DARKMUX_FLOWS_DIR").ok();
-    unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path()) };
+    // were never at fault. This is a wide-window race, not a deterministic
+    // failure — measured at 5 red out of 6 runs under the default parallel
+    // invocation, and 0 red out of several once serialized. A future green
+    // run at default parallelism is the expected occasional outcome of a
+    // race, not evidence the diagnosis was wrong.
+    let flows_dir_guard = EnvVarGuard::set("DARKMUX_FLOWS_DIR", flows_dir.path());
 
     let session_id = format!("mock-model-proof-{}-{}", std::process::id(), port);
     let opts = DispatchOpts {
@@ -228,16 +262,15 @@ fn run_mock_dispatch(
 
     let result = dispatch(opts);
 
+    // Restore DARKMUX_FLOWS_DIR as soon as the dispatch itself is done —
+    // same point the old manual restore ran, before mock teardown / the
+    // caller's own assertions.
+    drop(flows_dir_guard);
+
     // Tear the mock-model process down regardless of dispatch outcome — a
     // failed assertion in the caller must not leak the child.
     let _ = mock.kill();
     let _ = mock.wait();
-
-    if let Some(prev) = prev_flows_dir {
-        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", prev) };
-    } else {
-        unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR") };
-    }
 
     let result = result.expect("dispatch() must return Ok — the container path ran to completion");
     eprintln!("--- dispatch stdout ---\n{}", result.stdout);
