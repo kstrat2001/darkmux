@@ -2673,8 +2673,13 @@ impl StepKind for DispatchMapStepKind {
 }
 
 /// Runs a shell command from `Step.config`. Required: `command`
-/// (string, passed to `sh -c`). Optional: `cwd` (string). Every
-/// dependency's output is exposed as an env var
+/// (string, passed to `sh -c`). Optional: `cwd` (string) — see
+/// [`resolve_shell_cwd`] for the full resolution order, which also reads
+/// the shared `workdir` vocabulary (`Task.workdir`, then a step config
+/// `workdir` — the same tier order `dispatch_opts_for` uses for that key)
+/// and refuses the step rather than silently inheriting a process working
+/// directory that has been removed (#2532). Every dependency's output is
+/// exposed as an env var
 /// `DARKMUX_STEP_INPUT_<SANITIZED-DEP-ID>` (non-alphanumeric bytes in
 /// the dependency id become `_`) so a shell step can consume prior
 /// output without darkmux having to parse the command's own
@@ -2683,6 +2688,138 @@ impl StepKind for DispatchMapStepKind {
 /// darkmux back. A non-zero exit is a loud `Err` carrying stdout
 /// + stderr, never a silently-`Ok` failed command.
 pub struct ProceduralShellStepKind;
+
+/// (#2532) Resolve the directory a `procedural.shell` command runs in.
+///
+/// Priority, most specific first:
+/// 1. `Step.config.cwd` — this kind's OWN key, and the only one of the
+///    three that has no counterpart anywhere else: there is no
+///    `Task.cwd`, so nothing can outrank it and its pre-#2532 behavior
+///    ("an explicit `cwd` on the step is where the command runs") is
+///    preserved exactly. `src/acp_panel.rs`'s `apply_default_cwd` writes
+///    this key, so the panel's session directory lands here.
+/// 2. `Task.workdir` — the mission's own tree root (e.g. a coder-phase
+///    worktree).
+/// 3. `Step.config.workdir` — the shared `workdir` vocabulary's
+///    step-level tier.
+/// 4. The process's own ambient working directory, IF it still exists.
+///    Unset `cwd` on a `Command` inherits this already, so returning
+///    `None` here is a no-op change for every step that has one of
+///    these — which is most of them: `curl`/`sysctl`/`vm_stat`/`git
+///    --version`-shaped commands never needed a real cwd, and refusing
+///    them here would be a regression with no bug behind it.
+///
+/// **Tiers 2 and 3 are in THAT order deliberately, and it is pinned**
+/// (`procedural_shell_task_workdir_outranks_a_step_config_workdir`).
+/// `workdir` is shared vocabulary, so it has to mean one thing across
+/// kinds: `dispatch_opts_for` resolves it `task.workdir.clone()
+/// .or_else(|| config_str(step, "workdir"))` — Task first — and
+/// `step_kinds::types`'s `StepKind` doc states the same contract ("a
+/// dispatch-shaped step kind sources its assignment from THESE fields
+/// first, falling back to `Step.config` only when the Task leaves a field
+/// unset"). A step-config-first order here would have made one key mean
+/// two different things depending on which kind read it. (That doc's next
+/// sentence — "purely-procedural step kinds ignore `task` entirely" — is
+/// what #2532 changes, and it is updated in place; this kind now reads
+/// exactly one Task field, `workdir`, and nothing else.)
+///
+/// Nothing shipped changes tier today: the only production `workdir` on a
+/// `procedural.shell` step is the one `review.json`'s `create-mod` task
+/// GROWS into every step's config (`grow.config`'s keys are merged into
+/// each step's config — see `mission_config::grow`), and no launcher sets
+/// a `Task.workdir` on that task (`build_launch_params` only overrides the
+/// tasks declaring `mission.coder`/`mission.verify`), so tier 3 is what
+/// that step resolves through either way.
+///
+/// **Validation is the shared one, not a local `is_dir()`.**
+/// `darkmux_types::workdir::validate_workdir` is where every other
+/// operator-supplied workdir in darkmux is checked (#2302 — its own doc
+/// names "the step's `config.workdir`" as one of its inputs). It refuses a
+/// path traversing an operator-named symlink, distinguishes "does not
+/// exist" from "cannot be resolved" (a bare `is_dir()` reports a
+/// permissions error as absence), and returns the CANONICAL path, which is
+/// what is handed to `Command::current_dir` so the directory the command
+/// runs in is the explicit one that was validated.
+///
+/// The one case that changes for a step with no config at all: when NONE
+/// of the above names a directory AND the ambient directory has been
+/// removed (routine here, since the whole workflow is worktrees that get
+/// deleted — #2532), this refuses the step with a clear reason instead of
+/// handing `sh` a working directory that no longer exists. Measured before
+/// this fix: a plain command still exits 0 but writes `shell-init: error
+/// retrieving current directory` to stderr (which some panels in this
+/// project render as failure), while `git status` exits 128 and a relative
+/// `ls` exits 1 — three different silent-ish failure shapes for what is
+/// really one config problem.
+///
+/// **A missing workdir is an ERROR here, not a skip — deliberately, and
+/// the sibling kind in the same task disagrees on purpose.** `mods.gate`
+/// treats a missing/unresolvable `config.workdir` as a named
+/// `gate_skipped_reason` (its module doc, MUST FIX B: an operator reading
+/// a mod's gate must be able to tell "the change is bad" from "the gate
+/// itself couldn't run" at a glance). That distinction exists because
+/// `mods.gate` writes a per-mod VERDICT that a reader would otherwise
+/// misread as a judgment about the change. `procedural.shell` writes no
+/// verdict — it has one outcome, its command's, and a command that never
+/// ran because its directory was gone has no honest success to report. So
+/// the two kinds legitimately differ: gate skips are DATA about a mod;
+/// a shell step's missing directory is a config error about the step.
+/// (In `review.json`'s `create-mod` task both kinds read the same grown
+/// `workdir` and the shell step runs FIRST, so this error means the gate
+/// never runs — the loud step error, naming the directory, is the signal;
+/// a silent skip there would be the worse outcome.)
+fn resolve_shell_cwd(step: &Step, task: &Task) -> Result<Option<std::path::PathBuf>> {
+    if let Some(explicit) = config_str(step, "cwd") {
+        return Ok(Some(validated_shell_cwd(step, "step config `cwd`", std::path::Path::new(explicit))?));
+    }
+    if let Some(path) = task.workdir.as_deref() {
+        return Ok(Some(validated_shell_cwd(step, "the owning task's `workdir`", path)?));
+    }
+    if let Some(explicit) = config_str(step, "workdir") {
+        return Ok(Some(validated_shell_cwd(step, "step config `workdir`", std::path::Path::new(explicit))?));
+    }
+    match std::env::current_dir() {
+        // Already valid — `Command::current_dir` untouched inherits the
+        // exact same directory, so this is behavior-identical to before
+        // #2532 for every step that reaches here.
+        //
+        // Every TEST that reaches this branch reads a process-global, so
+        // every one of them must be `#[serial_test::serial]` — see
+        // `CwdGuard`'s doc in this file's test module for why reading is as
+        // much a participation as writing.
+        Ok(_) => Ok(None),
+        Err(e) => bail!(
+            "step `{}`: no `cwd`/`workdir` configured on the step or its task, and the \
+             process's own working directory no longer exists ({e}) — routine when darkmux \
+             was started from a worktree a later step in this workflow deleted. Set `cwd` \
+             (or `workdir`) on the step, or a `workdir` on the owning task.",
+            step.id
+        ),
+    }
+}
+
+/// Validate one resolved [`resolve_shell_cwd`] candidate through the SHARED
+/// workdir validator, naming which tier it came from.
+///
+/// `source` is the operator-facing name of the key ("step config `cwd`"),
+/// so a refusal says which of the three places to go fix — the validator's
+/// own message names the workdir but cannot know which tier supplied it.
+fn validated_shell_cwd(step: &Step, source: &str, raw: &std::path::Path) -> Result<std::path::PathBuf> {
+    // An empty string is a config defect with its own message: routed
+    // through the validator it renders as ``workdir path does not exist:
+    // `` — empty backticks, which read as a darkmux bug rather than the
+    // unfilled placeholder (a `grow.config` value that resolved to nothing)
+    // it almost always is.
+    if raw.as_os_str().is_empty() {
+        bail!(
+            "step `{}`: {source} is set but empty — name a directory, or remove the key \
+             to run from the process's own working directory",
+            step.id
+        );
+    }
+    darkmux_types::workdir::validate_workdir(raw)
+        .with_context(|| format!("step `{}`: resolving {source} ({})", step.id, raw.display()))
+}
 
 impl StepKind for ProceduralShellStepKind {
     /// (#2394) [`SeatClaim::NoModel`] — this kind runs an operator-supplied shell command and
@@ -2736,13 +2873,13 @@ impl StepKind for ProceduralShellStepKind {
     }
 
 
-    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let command = require_config_str(step, self.id(), "command")?;
-        let cwd = config_str(step, "cwd");
+        let cwd = resolve_shell_cwd(step, task)?;
 
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg(command);
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);
         }
         for (dep_id, output) in input {
@@ -2817,8 +2954,20 @@ impl StepKind for ProceduralShellStepKind {
                 "step `{}`: interrupted before the command finished; the child was killed",
                 step.id
             ),
+            // (#2532) The resolved working directory is NAMED here. A spawn
+            // that fails because the directory vanished between resolution
+            // and `fork` renders `No such file or directory` — byte-identical
+            // to `sh` itself being missing, which is exactly the confusion
+            // this change exists to end. `<inherited>` when nothing was set
+            // (the ambient tier), so the message never implies a `cwd` the
+            // step did not have.
             crate::bounded_command::Bounded::SpawnFailed(e) => {
-                Err(anyhow::Error::new(e)).with_context(|| format!("step `{}`: spawning shell command", step.id))
+                let where_ = cwd
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<inherited from the process>".to_string());
+                Err(anyhow::Error::new(e))
+                    .with_context(|| format!("step `{}`: spawning shell command in {where_}", step.id))
             }
         }
     }
@@ -3055,6 +3204,10 @@ mod tests {
     }
 
     #[test]
+    // (#2532) `#[serial_test::serial]`: this step names no `cwd`/`workdir`,
+    // so it READS the process cwd through `resolve_shell_cwd`'s ambient tier.
+    // See `CwdGuard`'s doc — a reader participates in that global too.
+    #[serial_test::serial]
     fn procedural_shell_runs_and_captures_stdout() {
         let s = step("s1", "procedural.shell", json!({"command": "echo hello-shell"}));
         let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
@@ -3062,6 +3215,10 @@ mod tests {
     }
 
     #[test]
+    // (#2532) `#[serial_test::serial]`: this step names no `cwd`/`workdir`,
+    // so it READS the process cwd through `resolve_shell_cwd`'s ambient tier.
+    // See `CwdGuard`'s doc — a reader participates in that global too.
+    #[serial_test::serial]
     fn procedural_shell_nonzero_exit_is_an_error() {
         let s = step("s1", "procedural.shell", json!({"command": "exit 3"}));
         let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
@@ -3076,7 +3233,10 @@ mod tests {
     /// gate skip), a `procedural.shell` step that outran its bound has no
     /// output to hand on — it is a step ERROR naming the bound.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS
+    // scopes DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS — AND (#2532) this step
+    // names no `cwd`/`workdir`, so it reads the process cwd through
+    // `resolve_shell_cwd`'s ambient tier. See `CwdGuard`'s doc.
+    #[serial_test::serial]
     fn procedural_shell_past_the_deadline_is_killed_and_errors_with_the_bound() {
         let k = "DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS";
         let prev = std::env::var(k).ok();
@@ -3096,6 +3256,10 @@ mod tests {
     }
 
     #[test]
+    // (#2532) `#[serial_test::serial]`: this step names no `cwd`/`workdir`,
+    // so it READS the process cwd through `resolve_shell_cwd`'s ambient tier.
+    // See `CwdGuard`'s doc — a reader participates in that global too.
+    #[serial_test::serial]
     fn procedural_shell_exposes_dependency_output_as_env_var() {
         let mut input = BTreeMap::new();
         input.insert("upstream-step".to_string(), "value-from-upstream".to_string());
@@ -3113,6 +3277,10 @@ mod tests {
     /// deleting the `cmd.env("DARKMUX_BIN", …)` line: the command then
     /// prints the empty string and the `is_absolute` assertion fails.
     #[test]
+    // (#2532) `#[serial_test::serial]`: this step names no `cwd`/`workdir`,
+    // so it READS the process cwd through `resolve_shell_cwd`'s ambient tier.
+    // See `CwdGuard`'s doc — a reader participates in that global too.
+    #[serial_test::serial]
     fn procedural_shell_exports_the_running_darkmux_binarys_path() {
         let s = step("s1", "procedural.shell", json!({"command": "printf %s \"${DARKMUX_BIN:-}\""}));
         let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
@@ -3127,6 +3295,263 @@ mod tests {
             std::env::current_exe().unwrap(),
             "and it must be THIS process's binary, never a PATH lookup"
         );
+    }
+
+    /// RAII guard that changes the process cwd for the test's duration and
+    /// restores it on drop. (Same pattern as `mission_config::load`'s
+    /// `CwdGuard`; not shared across modules because it is test-only and
+    /// this module has its own test mod.)
+    ///
+    /// **Every test that WRITES the process cwd must be
+    /// `#[serial_test::serial]` — and so must every test that READS it.**
+    /// Reading a process-global is as much a participation as writing it,
+    /// and `serial_test` excludes only other ANNOTATED tests (see
+    /// `host_sampler_lock.rs`'s own note saying exactly this), so an
+    /// unannotated reader runs concurrently with this guard by default.
+    /// This guard is the sharpest case in the crate: one of its callers
+    /// DELETES the directory while standing in it, so for that window
+    /// `getcwd()` fails process-wide and any concurrent test reading it
+    /// sees a "no longer exists" refusal in a shell step that has nothing
+    /// to do with cwd — a product-bug-shaped intermittent.
+    ///
+    /// The readers, found by mutation (panic in `resolve_shell_cwd`'s
+    /// ambient branch, then run `-p darkmux-crew`; the failures ARE the
+    /// list) rather than by grep, and all annotated:
+    /// `procedural_shell_runs_and_captures_stdout`,
+    /// `procedural_shell_nonzero_exit_is_an_error`,
+    /// `procedural_shell_exposes_dependency_output_as_env_var`,
+    /// `procedural_shell_past_the_deadline_is_killed_and_errors_with_the_bound`,
+    /// `procedural_shell_exports_the_running_darkmux_binarys_path`,
+    /// `procedural_shell_valid_ambient_cwd_still_works_with_no_config`, and
+    /// `scheduler::tests::dispatch_free_siblings_do_not_serialize_behind_the_remote_cap`
+    /// (which runs shell steps on scheduler worker THREADS — same process,
+    /// same global). Re-run that mutation after adding any
+    /// `procedural.shell` test with no `cwd`/`workdir`.
+    struct CwdGuard {
+        prev: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &std::path::Path) -> Self {
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        /// A FAILED restore is fatal, not ignored: the process would be left
+        /// standing in a deleted directory and every later test in this
+        /// binary that reads cwd would fail for a reason that has nothing to
+        /// do with it. `std::thread::panicking()` keeps a genuine test
+        /// failure's own message intact instead of aborting the process on a
+        /// double panic.
+        fn drop(&mut self) {
+            if let Err(e) = std::env::set_current_dir(&self.prev) {
+                let msg = format!("CwdGuard could not restore the process cwd to {}: {e}", self.prev.display());
+                if std::thread::panicking() {
+                    eprintln!("{msg}");
+                } else {
+                    panic!("{msg}");
+                }
+            }
+        }
+    }
+
+    /// (#2532) THE regression test. A step with no `cwd`/`workdir` and a
+    /// Task with no `workdir` used to inherit the process's own ambient
+    /// directory unconditionally — fine when that directory still exists,
+    /// but the whole point of this repo's worktree workflow is that it
+    /// routinely does not. Measured before the fix (see this test's sibling
+    /// assertions in the PR description): a bare command still exited 0
+    /// with `shell-init: error retrieving current directory` on stderr,
+    /// `git status` exited 128, and a relative `ls` exited 1 — three
+    /// different not-quite-clean outcomes for one config problem. This
+    /// asserts the step now refuses loudly instead, BEFORE `sh` ever
+    /// starts, naming the reason.
+    #[test]
+    #[serial_test::serial]
+    fn procedural_shell_removed_ambient_cwd_is_refused_not_inherited() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = CwdGuard::enter(dir.path());
+        std::fs::remove_dir(dir.path()).unwrap();
+        // getcwd() now fails (ENOENT) even though nothing has chdir'd away.
+
+        let s = step("s1", "procedural.shell", json!({"command": "echo should-not-run"}));
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("no longer exists"),
+            "expected a refusal naming the missing directory, got: {err}"
+        );
+    }
+
+    /// A step with no configured `cwd`/`workdir` and no task workdir keeps
+    /// working exactly as before when the ambient directory is valid — the
+    /// fix must not turn every ordinary context-free command (`date`,
+    /// `curl`, `sysctl`) into a required-`cwd` step.
+    #[test]
+    // (#2532) Reads the process cwd by construction — that IS the tier under
+    // test — so it must be serialized against the guard that deletes it.
+    #[serial_test::serial]
+    fn procedural_shell_valid_ambient_cwd_still_works_with_no_config() {
+        let s = step("s1", "procedural.shell", json!({"command": "echo still-fine"}));
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        assert!(out.output.contains("still-fine"));
+    }
+
+    /// (#2532) `templates/builtin/mission-configs/review.json`'s
+    /// `create-mod` task grows `"workdir": "{{item.tree_root}}"` into every
+    /// step's config (`grow.config`'s merge), including its
+    /// `wait-for-mod-step` — never `"cwd"`. Before this fix
+    /// `procedural.shell` only ever read the `cwd` key, so that grown value
+    /// was silently ignored. This proves the step-config `workdir` key (the
+    /// shared spelling `dispatch_opts_for` reads) now actually sets the
+    /// shell's cwd.
+    ///
+    /// **What this does NOT claim** (#2532 review, retracted): that
+    /// honoring the key fixes that shipped step. Read its command — it runs
+    /// `"${DARKMUX_BIN:-darkmux}" mod list --for "$key"`, an ABSOLUTE
+    /// binary path from `current_exe()` against a store under
+    /// `~/.darkmux`. It has no working-directory dependency at all, so
+    /// nothing observable there changes. What DOES change for it is the
+    /// other half of this fix: a `tree_root` that no longer exists now
+    /// hard-errors a step that previously ignored it.
+    #[test]
+    fn procedural_shell_step_config_workdir_key_sets_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = step(
+            "s1",
+            "procedural.shell",
+            json!({"command": "pwd", "workdir": dir.path().to_str().unwrap()}),
+        );
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(out.output.trim()).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    /// The owning Task's `workdir` (e.g. a coder-phase worktree — "the
+    /// mission's own tree root") is honored when the step itself names no
+    /// `cwd`/`workdir`, matching the same fallback `dispatch.internal`
+    /// already uses (`dispatch_opts_for`'s `task.workdir.clone().or_else(...)`).
+    #[test]
+    fn procedural_shell_task_workdir_is_the_default_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = empty_task();
+        task.workdir = Some(dir.path().to_path_buf());
+        let s = step("s1", "procedural.shell", json!({"command": "pwd"}));
+        let out = ProceduralShellStepKind.run(&s, &task, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(out.output.trim()).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    /// (#2532) **The tier order between the two spellings of the SHARED
+    /// `workdir` key, pinned.** `workdir` means one thing across kinds:
+    /// `dispatch_opts_for` resolves it `task.workdir.clone().or_else(||
+    /// config_str(step, "workdir"))` — Task first — and `StepKind`'s own
+    /// doc states the same contract. Before this test, hoisting either
+    /// branch above the other built clean and left the whole crate green,
+    /// so nothing pinned it in either direction. Red-proved by swapping the
+    /// `task.workdir` and `config_str(step, "workdir")` branches in
+    /// `resolve_shell_cwd`: this test then reports the step's directory.
+    #[test]
+    fn procedural_shell_task_workdir_outranks_a_step_config_workdir() {
+        let task_dir = tempfile::tempdir().unwrap();
+        let step_dir = tempfile::tempdir().unwrap();
+        let mut task = empty_task();
+        task.workdir = Some(task_dir.path().to_path_buf());
+        let s = step(
+            "s1",
+            "procedural.shell",
+            json!({"command": "pwd", "workdir": step_dir.path().to_str().unwrap()}),
+        );
+        let out = ProceduralShellStepKind.run(&s, &task, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(out.output.trim()).unwrap(),
+            std::fs::canonicalize(task_dir.path()).unwrap(),
+            "the Task's `workdir` outranks a step config `workdir`, matching `dispatch_opts_for`"
+        );
+    }
+
+    /// (#2532) …and this kind's OWN `cwd` key outranks BOTH, which is the
+    /// one place it deliberately differs from the shared vocabulary: there
+    /// is no `Task.cwd`, so nothing can outrank `cwd`, and its pre-#2532
+    /// meaning ("an explicit `cwd` on the step is where the command runs")
+    /// is preserved exactly. `src/acp_panel.rs`'s `apply_default_cwd`
+    /// depends on this — it injects the panel session's directory as `cwd`.
+    #[test]
+    fn procedural_shell_step_cwd_outranks_the_task_workdir() {
+        let task_dir = tempfile::tempdir().unwrap();
+        let step_dir = tempfile::tempdir().unwrap();
+        let mut task = empty_task();
+        task.workdir = Some(task_dir.path().to_path_buf());
+        let s = step(
+            "s1",
+            "procedural.shell",
+            json!({"command": "pwd", "cwd": step_dir.path().to_str().unwrap()}),
+        );
+        let out = ProceduralShellStepKind.run(&s, &task, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(out.output.trim()).unwrap(),
+            std::fs::canonicalize(step_dir.path()).unwrap()
+        );
+    }
+
+    /// An explicit `cwd` (or `workdir`) that itself names a directory which
+    /// does not exist is refused loudly at config-resolution time, rather
+    /// than handed to `sh` to fail on its own — the same "refuse loudly"
+    /// posture as the no-config case above, applied to a plain typo'd path.
+    #[test]
+    fn procedural_shell_explicit_cwd_that_does_not_exist_is_refused() {
+        let s = step(
+            "s1",
+            "procedural.shell",
+            json!({"command": "echo hi", "cwd": "/definitely/not/a/real/darkmux/path/2532"}),
+        );
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("does not exist"), "{rendered}");
+        assert!(rendered.contains("step config `cwd`"), "the refusal must name WHICH tier: {rendered}");
+    }
+
+    /// (#2532 review) A configured working directory goes through the
+    /// SHARED validator (`darkmux_types::workdir::validate_workdir`), not a
+    /// bare `is_dir()`. `is_dir()` FOLLOWS symlinks, so before this the step
+    /// would happily run `sh -c` inside a link target the operator never
+    /// named — the exact case that validator exists to refuse (#227/#2302).
+    /// Red-proved by restoring the `path.is_dir()` check: the step then
+    /// succeeds and prints the target's path.
+    #[test]
+    fn procedural_shell_cwd_through_a_symlink_is_refused_by_the_shared_validator() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let s = step("s1", "procedural.shell", json!({"command": "pwd", "cwd": link.to_str().unwrap()}));
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("symlink"),
+            "the shared validator's symlink refusal must be what surfaces: {rendered}"
+        );
+    }
+
+    /// (#2532 review) An EMPTY `cwd` gets its own message. Routed through
+    /// the validator it renders as ``workdir path does not exist: `` —
+    /// loud, but the empty backticks read as a darkmux bug rather than the
+    /// unfilled config value (a `grow.config` placeholder that resolved to
+    /// nothing) it almost always is.
+    #[test]
+    fn procedural_shell_empty_cwd_says_the_key_is_empty() {
+        let s = step("s1", "procedural.shell", json!({"command": "echo hi", "cwd": ""}));
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("is set but empty"), "{rendered}");
     }
 
     #[test]

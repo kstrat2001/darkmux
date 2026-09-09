@@ -59,6 +59,17 @@
 //!   than one source checkout, or the scratch copy/command could not even
 //!   be spawned → a workdir/infra reason naming what failed
 //!
+//! **(#2532) The sibling kind reading the same key disagrees on purpose.**
+//! `procedural.shell` — which in `review.json`'s `create-mod` task reads the
+//! very same grown `config.workdir` and runs BEFORE this kind — treats a
+//! missing workdir as a step ERROR, not a skip. The two are not drifting:
+//! a SKIP here is DATA about one mod, and exists precisely so a reader can
+//! tell "the change is bad" from "the gate couldn't run"; a shell step
+//! writes no verdict, so it has no honest success to report for a command
+//! that never ran. The consequence is stated where the decision is
+//! recorded (`builtins::resolve_shell_cwd`): that error means this gate
+//! never runs, which is the loud signal, not a silent one.
+//!
 //! A kit that DOES apply and whose `test_command` DOES run is the only
 //! path that ever produces a real `GateOutcome` — `passed: true` (the
 //! patched checkout's own test run exited 0) or `passed: false` (kit
