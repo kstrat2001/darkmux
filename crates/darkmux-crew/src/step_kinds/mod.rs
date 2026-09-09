@@ -62,6 +62,14 @@ mod records_gather;
 mod registry;
 mod types;
 
+/// (#2344) Contract #2 (dispatch liveness) conformance — the registry walk
+/// + entry-point roster that makes a model-bearing path with no
+/// session-presence beat fail the suite instead of shipping. Test-only; see
+/// the module's own doc for what it proves and what it deliberately does
+/// not.
+#[cfg(test)]
+mod liveness_conformance;
+
 /// (#1610 / #1617 review) Smallest grant [`RemoteBudget::admit_reserve`]
 /// will hand a single `dispatch.map` item — the floor this module's own
 /// callers (the `bucket_group` fan-out in `builtins.rs`; the shared-group
