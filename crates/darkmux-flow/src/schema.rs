@@ -1141,6 +1141,16 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.45.0";
 //           `"limit"` and `"kill_file"`), and the generated
 //           `CrawlSummary.ts` types it as a bare `string` for exactly this
 //           reason. Nothing in the viewer switches on its value today.
+//
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2569: `stopped_by`
+//           gains a fifth value, `"interrupted"`, for the same reason
+//           `"thermal"` did — `units_interrupted` (counting steps the
+//           scheduler reconciled to `Abandoned` on a graceful `mission
+//           abort` or a SIGINT mid-dispatch) already existed on
+//           `CrawlSummary` but was never consulted by `stopped_by`, so a
+//           run the operator deliberately stopped, with no thermal event
+//           and no genuine error, read as `"done"` — a clean finish. Same
+//           VALUE-RANGE correction as #2454: no wire shape changed.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
