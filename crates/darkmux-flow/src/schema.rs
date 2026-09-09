@@ -77,8 +77,53 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.43.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.44.0";
 // Version history:
+//   1.44.0 (#1444) — additive payload keys `reasoning_tokens` /
+//           `cached_tokens` on every token-telemetry payload that already
+//           carries `prompt_tokens`/`completion_tokens`/`total_tokens`:
+//           `telemetry.tokens` (the per-turn record #795/#782, the
+//           `dispatch.map` per-item record, and the hosted
+//           `dispatch.single_shot` step's record), and the `dispatch
+//           complete` record's own totals (the internal-runtime path and
+//           BOTH "direct" paths — `dispatch_remote` and
+//           `dispatch_local_single_shot`).
+//           Parses `usage.completion_tokens_details.reasoning_tokens` /
+//           `usage.prompt_tokens_details.cached_tokens` from a provider's
+//           response when present — billed reasoning burn that was
+//           previously invisible in darkmux's own telemetry (every
+//           non-null value was zero across a 59-PR production corpus,
+//           per the issue).
+//
+//           NO ARITHMETIC RELATION between `reasoning_tokens` and
+//           `completion_tokens` is asserted by this contract, deliberately.
+//           It is PROVIDER-SCOPED: OpenAI and Azure document
+//           `completion_tokens_details` as a breakdown of
+//           `completion_tokens`, but other OpenAI-compatible layers do
+//           not — 284 usage blocks in this operator's own recorded corpus
+//           (`gemini-3.1-pro-preview` 219, `gemini-2.5-flash` 35,
+//           `grok-4.3` 30 of 30) report a `total_tokens` GREATER than
+//           prompt + completion, i.e. a third token class outside
+//           `completion_tokens` entirely. A consumer must therefore never
+//           derive one of these fields from another, and never recompute
+//           `total_tokens` as `prompt + completion`: every producer of
+//           these payloads prefers the provider's OWN reported total and
+//           falls back to the sum only when the provider sent none. (An
+//           earlier draft of this entry asserted the subset relation
+//           universally. That was wrong; it is corrected here rather than
+//           left standing, because this entry is the versioned contract a
+//           future reader treats as authoritative.)
+//
+//           Both fields are provider-optional and mean "the provider
+//           didn't say" when unreported — never a fabricated `0`. Two
+//           encodings of that absence coexist in the family, both valid
+//           and both meaning the same thing: the runtime-side producers
+//           render an explicit JSON `null`, while the `dispatch.map`
+//           per-item emitter OMITS the key (its pre-existing convention,
+//           shared with the `prompt_tokens`/`completion_tokens` split it
+//           sits beside). Minor + additive: a reader that doesn't know the
+//           keys ignores them exactly like any other unrecognized payload
+//           field; no existing key changed shape or meaning.
 //   1.43.0 — `session_id::task`/`session_id::step` (the scheduler's own
 //           step-lifecycle default and `dispatch.internal`'s unconfigured
 //           default) now compose the emitting run's own mission id into

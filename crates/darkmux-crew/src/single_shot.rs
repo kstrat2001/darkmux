@@ -56,6 +56,28 @@ pub struct SingleShotReply {
     /// `completion_tokens` fields, not just the total).
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    /// (#1444) `usage.completion_tokens_details.reasoning_tokens`.
+    ///
+    /// Whether this is a SUBSET of `completion_tokens` above or a third
+    /// token class outside it is PROVIDER-SCOPED: OpenAI and Azure document
+    /// `completion_tokens_details` as a breakdown of `completion_tokens`,
+    /// but other OpenAI-compatible layers do not, and 284 blocks in this
+    /// machine's own recorded corpus — spanning `gemini-3.1-pro-preview`,
+    /// `gemini-2.5-flash` and `grok-4.3`, all reachable from
+    /// `~/.darkmux/profiles.json` today — report a `total_tokens` GREATER
+    /// than prompt + completion. (Full evidence table: the runtime crate's
+    /// `lmstudio::CompletionTokensDetails::reasoning_tokens` doc.) Never
+    /// derive one of these fields from the other, in either direction.
+    ///
+    /// `None` when the endpoint's response carries no details object, or the
+    /// object is present but doesn't name the field — never a fabricated
+    /// zero. Populated on both the local and hosted dialects (the same
+    /// shared [`extract_reply`]); LMStudio (local) never sends this key
+    /// today, so a local call's value is always `None` in practice.
+    pub reasoning_tokens: Option<u64>,
+    /// (#1444) `usage.prompt_tokens_details.cached_tokens`. Same tri-state
+    /// contract as `reasoning_tokens` above.
+    pub cached_tokens: Option<u64>,
     pub model: Option<String>,
 }
 
@@ -252,6 +274,16 @@ fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
     let total_tokens = resp.pointer("/usage/total_tokens").and_then(|v| v.as_u64());
     let prompt_tokens = resp.pointer("/usage/prompt_tokens").and_then(|v| v.as_u64());
     let completion_tokens = resp.pointer("/usage/completion_tokens").and_then(|v| v.as_u64());
+    // (#1444) Same tri-state contract as the fields above — `.pointer()`
+    // returns `None` for a missing intermediate object (no
+    // `completion_tokens_details` at all) exactly the same way it does
+    // for a missing leaf, so no extra branching is needed to distinguish
+    // "object absent" from "field absent inside a present object": both
+    // collapse to `None` here, and both mean "the endpoint didn't say".
+    let reasoning_tokens =
+        resp.pointer("/usage/completion_tokens_details/reasoning_tokens").and_then(|v| v.as_u64());
+    let cached_tokens =
+        resp.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(|v| v.as_u64());
     let model = resp
         .get("model")
         .and_then(|m| m.as_str())
@@ -261,6 +293,8 @@ fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
         total_tokens,
         prompt_tokens,
         completion_tokens,
+        reasoning_tokens,
+        cached_tokens,
         model,
     }
 }
@@ -648,7 +682,91 @@ mod tests {
         assert_eq!(reply.total_tokens, None);
         assert_eq!(reply.prompt_tokens, None);
         assert_eq!(reply.completion_tokens, None);
+        assert_eq!(reply.reasoning_tokens, None);
+        assert_eq!(reply.cached_tokens, None);
         assert_eq!(reply.model, None);
+    }
+
+    // ─── extract_reply: reasoning_tokens / cached_tokens (#1444) ──────
+
+    #[test]
+    fn extract_reply_reasoning_and_cached_tokens_absent_when_usage_present_but_details_missing() {
+        // `usage` itself is present (prompt/completion/total all report)
+        // but carries no `completion_tokens_details`/`prompt_tokens_details`
+        // at all — the ordinary LMStudio-local shape. Must be `None`, not
+        // a fabricated `0`.
+        let resp = parse_hosted_response(
+            br#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":30,"completion_tokens":12,"total_tokens":42}}"#,
+        )
+        .expect("well-formed body without details objects classifies as Ok");
+        let reply = extract_reply(&resp);
+        assert_eq!(reply.reasoning_tokens, None);
+        assert_eq!(reply.cached_tokens, None);
+    }
+
+    #[test]
+    fn extract_reply_reasoning_and_cached_tokens_present() {
+        // The Azure Foundry / OpenAI GPT-5.1-class shape this issue was
+        // filed against. On THAT provider family reasoning_tokens is a
+        // subset of completion_tokens (1024 <= 1186) — asserted below as a
+        // property of this fixture, NOT as a universal invariant; see
+        // `extract_reply_total_tokens_may_exceed_prompt_plus_completion`.
+        let resp = parse_hosted_response(
+            br#"{"choices":[{"message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":75,"completion_tokens":1186,"total_tokens":1261,
+                "completion_tokens_details":{"reasoning_tokens":1024},
+                "prompt_tokens_details":{"cached_tokens":64}}}"#,
+        )
+        .expect("well-formed hosted-reasoning body classifies as Ok");
+        let reply = extract_reply(&resp);
+        assert_eq!(reply.reasoning_tokens, Some(1024));
+        assert_eq!(reply.cached_tokens, Some(64));
+        assert!(reply.reasoning_tokens.unwrap() <= reply.completion_tokens.unwrap());
+    }
+
+    /// (#1444 review) The counter-shape, with numbers lifted verbatim from
+    /// this machine's recorded corpus (`~/.darkmux/flows/2026-07-05.jsonl`,
+    /// `gemini-2.5-flash` via `openai:generativelanguage.googleapis.com`):
+    /// the endpoint's own `total_tokens` EXCEEDS prompt + completion by
+    /// 1500. `extract_reply` must carry the provider's number through
+    /// untouched — a consumer that recomputes `prompt + completion`
+    /// understates this call's real burn by that whole third addend.
+    #[test]
+    fn extract_reply_total_tokens_may_exceed_prompt_plus_completion() {
+        let resp = parse_hosted_response(
+            br#"{"choices":[{"message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":9970,"completion_tokens":128,"total_tokens":11598}}"#,
+        )
+        .expect("a provider total exceeding prompt+completion classifies as Ok");
+        let reply = extract_reply(&resp);
+        assert_eq!(
+            reply.total_tokens,
+            Some(11598),
+            "the endpoint's own total must survive verbatim, never be recomputed"
+        );
+        assert!(
+            reply.total_tokens.unwrap()
+                > reply.prompt_tokens.unwrap() + reply.completion_tokens.unwrap()
+        );
+        // This provider named no details object, so both stay honestly silent.
+        assert_eq!(reply.reasoning_tokens, None);
+        assert_eq!(reply.cached_tokens, None);
+    }
+
+    #[test]
+    fn extract_reply_reasoning_tokens_true_zero_is_some_zero_not_none() {
+        let resp = parse_hosted_response(
+            br#"{"choices":[{"message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":30,"completion_tokens":12,"total_tokens":42,
+                "completion_tokens_details":{"reasoning_tokens":0}}}"#,
+        )
+        .expect("well-formed body with explicit zero reasoning_tokens classifies as Ok");
+        let reply = extract_reply(&resp);
+        assert_eq!(
+            reply.reasoning_tokens,
+            Some(0),
+            "a reported zero must stay Some(0), distinguishable from a never-reported None"
+        );
     }
 
     #[test]

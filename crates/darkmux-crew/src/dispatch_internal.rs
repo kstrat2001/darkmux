@@ -2470,6 +2470,101 @@ fn build_remote_record(
     )
 }
 
+/// (#1444 review) The token figures [`dispatch_remote`] reads out of a
+/// hosted endpoint's `usage` object, extracted as a pure function so the
+/// mapping is unit-testable.
+///
+/// It used to be an inline run of five `let` bindings in the middle of
+/// `dispatch_remote`, which performs real HTTP and is therefore never
+/// executed by the suite — so replacing `reasoning` with `None` there left
+/// all 1503 crew tests green while the field silently stopped being
+/// recorded on the one path that actually reports it.
+pub(crate) struct RemoteUsage {
+    pub prompt: u64,
+    pub completion: u64,
+    /// The endpoint's OWN `total_tokens`, falling back to
+    /// `prompt + completion` only when the endpoint reported none.
+    ///
+    /// The precedence is load-bearing, not defensive: 284 usage blocks in
+    /// this operator's recorded corpus (`gemini-3.1-pro-preview`,
+    /// `gemini-2.5-flash`, `grok-4.3`) report a total GREATER than the sum,
+    /// so recomputing it would understate those dispatches by the whole
+    /// third addend — up to ~4.9k tokens on a single recorded call.
+    pub total: u64,
+    /// Tri-state: `None` when the endpoint's response carries no
+    /// `completion_tokens_details`/`prompt_tokens_details` object, or the
+    /// object is present but doesn't name the field — never a fabricated
+    /// `0`. NOT necessarily a subset of `completion`: that relation is
+    /// provider-scoped (see the runtime crate's
+    /// `lmstudio::CompletionTokensDetails::reasoning_tokens`).
+    pub reasoning: Option<u64>,
+    pub cached: Option<u64>,
+}
+
+/// (#1444 review) The five token keys EVERY `runtime: "direct"` dispatch
+/// completion record carries, written into the payload from ONE place so
+/// the two producers — [`dispatch_remote`] and `dispatch_local_single_shot`
+/// — cannot drift apart on the key SET again.
+///
+/// They already had: #1444's first pass added `reasoning_tokens`/
+/// `cached_tokens` to the remote producer and missed the local one, so a
+/// consumer reading `runtime: "direct"` got an explicit `null` from one and
+/// a MISSING KEY from the other. Both mean "unreported", but a consumer that
+/// distinguishes them — which is the entire point of the tri-state this
+/// change exists to protect — sees two different answers to the same
+/// question depending on which arm answered. The absent-vs-zero problem,
+/// reintroduced one level up.
+///
+/// Each producer keeps its own honest convention for the first three:
+/// `dispatch_remote` reads a hosted `usage` object and degrades a missing
+/// count to `0` (its pre-existing behavior), while the local arm forwards
+/// `SingleShotReply`'s `Option`s untouched so an unreported count stays
+/// `null`. This helper legislates the KEY SET, never the values.
+pub(crate) fn insert_direct_token_keys(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    prompt: Option<u64>,
+    completion: Option<u64>,
+    total: Option<u64>,
+    reasoning: Option<u64>,
+    cached: Option<u64>,
+) {
+    for (key, value) in
+        DIRECT_TOKEN_KEYS.iter().zip([prompt, completion, total, reasoning, cached])
+    {
+        obj.insert((*key).to_string(), serde_json::json!(value));
+    }
+}
+
+/// The keys [`insert_direct_token_keys`] writes, in order — the parity
+/// contract both `runtime: "direct"` producers are held to. Load-bearing,
+/// not documentation: the writer above iterates this array, so the contract
+/// and the emission cannot disagree.
+pub(crate) const DIRECT_TOKEN_KEYS: [&str; 5] = [
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "reasoning_tokens",
+    "cached_tokens",
+];
+
+pub(crate) fn remote_usage_tokens(usage: &serde_json::Value) -> RemoteUsage {
+    let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let completion = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| prompt.saturating_add(completion));
+    RemoteUsage {
+        prompt,
+        completion,
+        total,
+        reasoning: usage
+            .pointer("/completion_tokens_details/reasoning_tokens")
+            .and_then(|v| v.as_u64()),
+        cached: usage.pointer("/prompt_tokens_details/cached_tokens").and_then(|v| v.as_u64()),
+    }
+}
+
 /// The hosted single-shot dispatch (#1177). Precondition: `pm.endpoint` is remote.
 fn dispatch_remote(
     opts: &DispatchOpts,
@@ -2600,15 +2695,39 @@ fn dispatch_remote(
         .unwrap_or("")
         .to_string();
     let usage = resp.get("usage").cloned().unwrap_or(serde_json::Value::Null);
-    let ptok = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let ctok = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let ttok = usage
-        .get("total_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(ptok + ctok);
+    let RemoteUsage {
+        prompt: ptok,
+        completion: ctok,
+        total: ttok,
+        reasoning: reasoning_tok,
+        cached: cached_tok,
+    } = remote_usage_tokens(&usage);
+
+    let mut complete_payload = serde_json::json!({
+        "result_class": "ok",
+        "exit_code": 0,
+        "runtime": "direct",
+        "endpoint": label,
+        "total_turns": 1,
+        "total_tools": 0,
+        "total_compactions": 0,
+        "wall_ms": wall_ms,
+        "stdout_chars": content.len(),
+    });
+    // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0; key set owned
+    // by `insert_direct_token_keys` so this producer and the local-single-
+    // shot one cannot drift apart again.) This arm degrades a count the
+    // endpoint never sent to `0`, its pre-existing behavior — but
+    // `reasoning`/`cached` stay tri-state, because a `0` there would be the
+    // fabrication this whole change exists to prevent.
+    insert_direct_token_keys(
+        complete_payload.as_object_mut().expect("json! built an object"),
+        Some(ptok),
+        Some(ctok),
+        Some(ttok),
+        reasoning_tok,
+        cached_tok,
+    );
 
     bookend.close(
         "dispatch",
@@ -2618,20 +2737,7 @@ fn dispatch_remote(
             &pm.id,
             phase,
             "dispatch complete",
-            serde_json::json!({
-                "result_class": "ok",
-                "exit_code": 0,
-                "runtime": "direct",
-                "endpoint": label,
-                "prompt_tokens": ptok,
-                "completion_tokens": ctok,
-                "total_tokens": ttok,
-                "total_turns": 1,
-                "total_tools": 0,
-                "total_compactions": 0,
-                "wall_ms": wall_ms,
-                "stdout_chars": content.len(),
-            }),
+            complete_payload,
         ),
     );
 
@@ -2643,6 +2749,8 @@ fn dispatch_remote(
                 "model": pm.id, "endpoint": label, "runtime": "direct",
                 "wall_ms": wall_ms, "turns": 1,
                 "prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ttok,
+                // (#1444) Provider-reported; see the tri-state note above.
+                "reasoning_tokens": reasoning_tok, "cached_tokens": cached_tok,
             },
         }))
         .unwrap_or_else(|_| content.clone())
@@ -2896,6 +3004,36 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         }
     };
 
+    let mut complete_payload = serde_json::json!({
+        "result_class": "ok",
+        "exit_code": 0,
+        "runtime": "direct",
+        "total_turns": 1,
+        "total_tools": 0,
+        "total_compactions": 0,
+        "wall_ms": wall_ms,
+        "stdout_chars": reply.content.len(),
+    });
+    // (#1444 review) This producer was MISSED by #1444's first pass: its
+    // sibling `dispatch_remote` emitted the two new keys and this one did
+    // not, so a consumer reading `runtime: "direct"` got an explicit `null`
+    // from one arm and a MISSING KEY from the other — the absent-vs-zero
+    // ambiguity this change exists to remove, reintroduced one level up.
+    // Shape-only today (this arm dispatches to LMStudio, which never sends
+    // a details object), but the two producers must agree on their key set
+    // regardless of what the values happen to be — which is now enforced by
+    // both routing through `insert_direct_token_keys`. Unlike the remote
+    // arm, this one forwards `SingleShotReply`'s `Option`s untouched, so an
+    // unreported count stays `null` rather than degrading to `0`.
+    insert_direct_token_keys(
+        complete_payload.as_object_mut().expect("json! built an object"),
+        reply.prompt_tokens,
+        reply.completion_tokens,
+        reply.total_tokens,
+        reply.reasoning_tokens,
+        reply.cached_tokens,
+    );
+
     bookend.close(
         "dispatch",
         build_remote_record(
@@ -2904,19 +3042,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             &model_id,
             phase,
             "dispatch complete",
-            serde_json::json!({
-                "result_class": "ok",
-                "exit_code": 0,
-                "runtime": "direct",
-                "prompt_tokens": reply.prompt_tokens,
-                "completion_tokens": reply.completion_tokens,
-                "total_tokens": reply.total_tokens,
-                "total_turns": 1,
-                "total_tools": 0,
-                "total_compactions": 0,
-                "wall_ms": wall_ms,
-                "stdout_chars": reply.content.len(),
-            }),
+            complete_payload,
         ),
     );
 
@@ -5239,6 +5365,17 @@ impl TrajectorySummary {
 pub struct TokenTotals {
     pub prompt: u32,
     pub completion: u32,
+    /// (#1444) `None` when the runtime never wrote the field (metrics.json
+    /// predates #1444) OR no turn this dispatch ever reported it (local
+    /// LMStudio, or a hosted non-reasoning model). Never a fabricated zero.
+    ///
+    /// (#1444 review) Whether this is a SUBSET of `completion` above is
+    /// PROVIDER-SCOPED, not universal — see the runtime crate's
+    /// `lmstudio::CompletionTokensDetails::reasoning_tokens` doc for the
+    /// recorded counter-evidence. Do not derive either field from the other.
+    pub reasoning: Option<u32>,
+    /// (#1444) Same tri-state contract as `reasoning` above.
+    pub cached: Option<u32>,
 }
 
 impl TokenTotals {
@@ -5265,6 +5402,12 @@ pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
     TokenTotals {
         prompt: v.get("total_prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
         completion: v.get("total_completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+        // (#1444) `.and_then(as_u64)` already returns `None` for both an
+        // absent key and a `null` value — matching the runtime's own
+        // "absent means unknown, never a fabricated zero" contract with no
+        // extra branching needed here.
+        reasoning: v.get("total_reasoning_tokens").and_then(|n| n.as_u64()).map(|n| n as u32),
+        cached: v.get("total_cached_tokens").and_then(|n| n.as_u64()).map(|n| n as u32),
     }
 }
 
@@ -5815,6 +5958,13 @@ fn build_dispatch_complete_payload(
         "prompt_tokens": tokens.prompt,
         "completion_tokens": tokens.completion,
         "total_tokens": tokens.total(),
+        // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0) `null`
+        // when the field was never reported for this dispatch (every
+        // local LMStudio dispatch today) — never a fabricated `0`. Whether
+        // it sits inside `completion_tokens` above is provider-scoped
+        // (#1444 review); consumers must not derive one from the other.
+        "reasoning_tokens": tokens.reasoning,
+        "cached_tokens": tokens.cached,
     });
     // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
     // parity with `dispatch_remote`'s completion record, and needed by any
@@ -7295,15 +7445,45 @@ impl TailerState {
 /// dispatch's metrics totals exactly. Absent token counts inside a
 /// present `usage` object degrade to 0 (defensive; the runtime always
 /// writes both fields).
+///
+/// (#1444 review) `total_tokens` PREFERS the provider's own reported total
+/// and only falls back to `prompt + completion`. It used to compute the sum
+/// unconditionally, discarding the number the provider actually sent — which
+/// understates the headline on every provider that bills a third token class
+/// outside `completion_tokens`. 284 blocks in this machine's recorded corpus
+/// do exactly that (`gemini-3.1-pro-preview`, `gemini-2.5-flash`,
+/// `grok-4.3`; e.g. `prompt=9970 completion=128 total=11598` — 1500 tokens
+/// the sum never sees), and `grok-4.3` does it on 30 of 30 recorded calls.
+/// The fallback stays for the runtime's older `model.completed` events,
+/// which have always written all three keys anyway.
 fn turn_tokens_payload(event: &serde_json::Value) -> Option<serde_json::Value> {
     let usage = event.get("usage").filter(|u| u.is_object())?;
     let prompt = usage.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
     let completion = usage.get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
+    // (#1444 review) The provider's own number wins; the sum is the fallback,
+    // never the override. Same precedence `dispatch_remote`'s `ttok` uses.
+    let total = usage
+        .get("total_tokens")
+        .and_then(|n| n.as_u64())
+        .unwrap_or_else(|| prompt.saturating_add(completion));
+    // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0) Unlike
+    // `prompt`/`completion` (which degrade a truly-absent field to `0`
+    // because the runtime always writes them), these two stay tri-state:
+    // `event["usage"]["reasoning_tokens"]` is JSON `null` when the
+    // provider never reported it, and `.and_then(as_u64)` already maps
+    // both an absent key and an explicit `null` to `None` — so this reads
+    // exactly the same absence the runtime's `Usage::reasoning_tokens`
+    // observed, with no extra branching. Whether the reasoning figure sits
+    // inside `completion_tokens` is provider-scoped; nothing here assumes it.
+    let reasoning_tokens = usage.get("reasoning_tokens").and_then(|n| n.as_u64());
+    let cached_tokens = usage.get("cached_tokens").and_then(|n| n.as_u64());
     Some(serde_json::json!({
         "turn_seq": event.get("seq"),
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "total_tokens": prompt.saturating_add(completion),
+        "total_tokens": total,
+        "reasoning_tokens": reasoning_tokens,
+        "cached_tokens": cached_tokens,
     }))
 }
 

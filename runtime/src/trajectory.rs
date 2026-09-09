@@ -90,6 +90,20 @@ pub struct Metrics {
     pub compactions: u32,
     pub total_prompt_tokens: u32,
     pub total_completion_tokens: u32,
+    /// (#1444) Sum of every turn's reported reasoning tokens. Whether they
+    /// are a SUBSET of `total_completion_tokens` above or a third class
+    /// outside it is PROVIDER-SPECIFIC — OpenAI and Azure document the
+    /// subset relation; other OpenAI-compatible layers do not, and 284
+    /// blocks in this machine's recorded corpus report a `total_tokens`
+    /// exceeding prompt + completion (see
+    /// `lmstudio::CompletionTokensDetails::reasoning_tokens`). `None` when
+    /// no turn this dispatch ever reported the field (a local LMStudio
+    /// dispatch, or a hosted non-reasoning model); serializes as JSON
+    /// `null`, distinct from a fabricated `0`.
+    pub total_reasoning_tokens: Option<u32>,
+    /// (#1444) Sum of every turn's reported cached prompt tokens. Same
+    /// tri-state contract as `total_reasoning_tokens` above.
+    pub total_cached_tokens: Option<u32>,
     pub total_messages: usize,
     pub max_turns_reached: bool,
     /// (#2094) Sum of every inter-turn rest this dispatch took, in
@@ -183,6 +197,24 @@ impl Trajectory {
                 "prompt_tokens": u.prompt_tokens,
                 "completion_tokens": u.completion_tokens,
                 "total_tokens": u.total_tokens,
+                // (#1444) `null` — not a fabricated `0` — when the provider
+                // didn't report a details object/field at all. Present on
+                // hosted reasoning-family models (Azure/OpenAI o-series,
+                // GPT-5.1-class); always `null` for LMStudio-local calls
+                // today. Whether `reasoning_tokens` sits INSIDE
+                // `completion_tokens` or outside it is provider-specific —
+                // see `Usage::reasoning_tokens`'s doc; do not derive one
+                // from the other here or downstream.
+                //
+                // This writer is the ONLY producer of these two keys in the
+                // trajectory, and the host's `turn_tokens_payload` reads
+                // them straight back out — so
+                // `model_completed_usage_carries_reasoning_and_cached_tokens`
+                // below pins them here rather than relying on the host-side
+                // test, which feeds a hand-written fixture and would stay
+                // green forever if this emission were deleted.
+                "reasoning_tokens": u.reasoning_tokens(),
+                "cached_tokens": u.cached_tokens(),
             })
         });
         let tool_calls_json = tool_calls.map(|calls| {
@@ -1096,6 +1128,56 @@ mod tests {
         }
     }
 
+    /// (#1444 review) Pins `append_model_completed`'s reasoning/cached
+    /// emission. This writer is the ONLY producer of the two keys the host's
+    /// `turn_tokens_payload` reads back, and the host-side test feeds a
+    /// hand-written fixture — so without this assertion, deleting both keys
+    /// here leaves the whole runtime suite green while every `telemetry.tokens`
+    /// record silently loses the field. Red-proven by nulling both keys at
+    /// the emission site.
+    #[test]
+    fn model_completed_usage_carries_reasoning_and_cached_tokens() {
+        use crate::lmstudio::{CompletionTokensDetails, PromptTokensDetails};
+        let ws = tempfile::Builder::new().prefix("traj-reasoning").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 600,
+            total_tokens: 700,
+            completion_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: Some(500),
+            }),
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(20) }),
+        };
+        t.append_model_completed(1, "stop", Some(&usage), None);
+
+        // A second turn whose provider reported NO details object at all —
+        // both keys must be JSON `null`, never a fabricated `0`.
+        let bare = Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, ..Default::default() };
+        t.append_model_completed(2, "stop", Some(&bare), None);
+        drop(t);
+
+        let body =
+            fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["type"], "model.completed");
+        assert_eq!(
+            first["usage"]["reasoning_tokens"], 500,
+            "the reported reasoning tokens must reach the trajectory — this is the only producer"
+        );
+        assert_eq!(first["usage"]["cached_tokens"], 20);
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(
+            second["usage"]["reasoning_tokens"].is_null(),
+            "a provider that named no details object must serialize null, never 0"
+        );
+        assert!(second["usage"]["cached_tokens"].is_null());
+        // The provider's own total must survive verbatim alongside them.
+        assert_eq!(first["usage"]["total_tokens"], 700);
+    }
+
     #[test]
     fn append_rest_writes_runtime_rest_event_with_ms() {
         // (#2094) One event per turn-delay rest; `ms` is the actual
@@ -1348,6 +1430,8 @@ mod tests {
             compactions: 0,
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
+            total_reasoning_tokens: None,
+            total_cached_tokens: None,
             total_messages: 0,
             max_turns_reached: false,
             rest_ms: 1000,
@@ -1386,6 +1470,8 @@ mod tests {
             compactions: 0,
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
+            total_reasoning_tokens: None,
+            total_cached_tokens: None,
             total_messages: 0,
             max_turns_reached: false,
             rest_ms: 0,
