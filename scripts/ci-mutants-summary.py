@@ -480,6 +480,21 @@ def _test_module_ranges(path: Path) -> list[tuple[int, int]] | None:
         if stripped.startswith("#[cfg(test)]"):
             pending_attr = True
             continue
+        if pending_attr and stripped.startswith("#["):
+            # (#2606) A STACKED attribute — e.g. `#[cfg(test)]` followed by
+            # `#[path = "..."]` before the item itself (the real shape of
+            # `runtime/src/loop_runner.rs`'s own `#[cfg(test)] #[path = "..."]
+            # mod budget_request_tests;`, #2605's fixture). Without this
+            # branch the SECOND attribute line was mistaken for the item:
+            # its own (0, 0) brace delta closed a single-line "range" over
+            # itself, `pending_attr` reset to False, and the real item line
+            # right after it (the `mod ...;` declaration, plain code, no
+            # `#[cfg(test)]` of its own) fell through to ordinary counting —
+            # reproduced end to end: a diff adding exactly this 3-line
+            # stacked declaration counted 1 where a real `cargo mutants`
+            # run mutates nothing. Stay pending through every additional
+            # attribute line; only a non-attribute line ends the wait.
+            continue
         if pending_attr:
             pending_attr = False
             if opens > closes:
@@ -769,7 +784,27 @@ def parse_mutants_list(list_text: str) -> set[str]:
     addition (a new mutant kind with no per-file span, say) must not turn
     this into a hard failure for every PR the day it ships — the same
     per-key resilience `load_outcomes_totals` already applies to
-    `outcomes.json`."""
+    `outcomes.json`.
+
+    (#2606 MUST FIX) That per-entry leniency has a floor: a NON-EMPTY list
+    whose entries collectively yield an EMPTY file set is not a plausible
+    "a few new mutant kinds have no file span yet" — it means the whole
+    schema this parser reads (the `"file"` key itself) no longer matches
+    what `cargo mutants --list --json` emits, whether because every entry
+    now carries a differently-named key or because `"file"` was renamed
+    outright. Silently returning an empty set here is indistinguishable
+    from a GENUINELY empty listing (`[]`, handled below) once it reaches
+    `mutated_predicate` — every file in every diff would then read as
+    "not named by the listing" and the floor would disarm on every PR,
+    with nothing in the log to say why. Raised as the SAME `ValueError`
+    class as the not-an-array branch above, so it gets the SAME hard
+    failure (exit 2) from the caller: an operator/workflow input we were
+    explicitly handed cannot be silently trusted just because it happened
+    to parse as JSON. A truly empty list (`data == []`) does not hit this
+    branch at all — `files` is legitimately empty there too, but for a
+    reason this function cannot mistake for a schema break; the caller
+    warns on that shape instead of failing (see
+    `count_changed_lines_main`)."""
     data = json.loads(list_text)
     if not isinstance(data, list):
         raise ValueError(
@@ -779,6 +814,13 @@ def parse_mutants_list(list_text: str) -> set[str]:
     for entry in data:
         if isinstance(entry, dict) and isinstance(entry.get("file"), str):
             files.add(Path(entry["file"]).as_posix())
+    if data and not files:
+        raise ValueError(
+            f"got {len(data)} entries from `cargo mutants --list --json` but none had a "
+            'usable "file" string key — the listing schema may have changed (a renamed '
+            "or differently-shaped key), which would otherwise silently disarm every "
+            "predicate this listing feeds"
+        )
     return files
 
 
@@ -931,9 +973,31 @@ def count_changed_lines_main(args: list[str]) -> int:
     step must not silently pass through as "nothing excluded". A workflow
     that could not produce a listing at all should not pass this flag —
     that is the fail-open path, and it is the workflow's call to make, not
-    this script's (see `quality.yml`'s own comment on the listing step)."""
+    this script's (see `quality.yml`'s own comment on the listing step).
+
+    (#2606 MUST FIX) A `--mutants-list` that parses (exit 0 from
+    `parse_mutants_list`) but resolves to a GENUINELY empty file set — a
+    real `[]`, the one shape `parse_mutants_list` does not itself treat as
+    a schema break — is a legitimate answer ("this invocation reaches no
+    mutants anywhere") but is INDISTINGUISHABLE, once it reaches
+    `mutated_predicate`, from every file in every diff silently reading as
+    "not named by the listing". Forcing it to a hard failure would make a
+    genuinely-empty-scope manifest (the bundler's own trimmed tree, say)
+    permanently red, so this stays non-fatal — but if THIS SAME
+    invocation's own diff, scoped no further than `--manifest-path`
+    already scopes it, has any countable-looking added line at all, that
+    combination (empty listing, non-empty in-scope diff) is exactly the
+    "listing narrowed the floor to nothing, silently" shape the MUST-FIX
+    table names. A `::warning::` GitHub Actions annotation is emitted —
+    loud in the job log, same class as the workflow's own `--list` failure
+    warnings above it — without failing the step, since an empty listing
+    against a genuinely-empty scope must stay quiet (see the self-test's
+    own no-warning case)."""
     args = list(args)
     manifest_dir = ""
+    manifest_predicate = None
+    mutants_list_arg: str | None = None
+    mutated_files: set[str] | None = None
     predicates = []
     if "--manifest-path" in args:
         mi = args.index("--manifest-path")
@@ -953,7 +1017,8 @@ def count_changed_lines_main(args: list[str]) -> int:
         except TomlParserUnavailableError as exc:
             print(f"--manifest-path {manifest_arg}: {exc}", file=sys.stderr)
             return 2
-        predicates.append(reachable_predicate(manifest_dir, excluded_prefixes))
+        manifest_predicate = reachable_predicate(manifest_dir, excluded_prefixes)
+        predicates.append(manifest_predicate)
 
     if "--mutants-list" in args:
         li = args.index("--mutants-list")
@@ -963,20 +1028,20 @@ def count_changed_lines_main(args: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
-        list_arg = args[li + 1]
+        mutants_list_arg = args[li + 1]
         del args[li : li + 2]
         try:
-            list_text = Path(list_arg).read_text(errors="replace")
+            list_text = Path(mutants_list_arg).read_text(errors="replace")
         except OSError as exc:
-            print(f"--mutants-list could not read {list_arg}: {exc}", file=sys.stderr)
+            print(f"--mutants-list could not read {mutants_list_arg}: {exc}", file=sys.stderr)
             return 2
         try:
             mutated_files = parse_mutants_list(list_text)
         except json.JSONDecodeError as exc:
-            print(f"--mutants-list {list_arg} is not valid JSON: {exc}", file=sys.stderr)
+            print(f"--mutants-list {mutants_list_arg} is not valid JSON: {exc}", file=sys.stderr)
             return 2
         except ValueError as exc:
-            print(f"--mutants-list {list_arg}: {exc}", file=sys.stderr)
+            print(f"--mutants-list {mutants_list_arg}: {exc}", file=sys.stderr)
             return 2
         predicates.append(mutated_predicate(manifest_dir, mutated_files))
 
@@ -997,11 +1062,51 @@ def count_changed_lines_main(args: list[str]) -> int:
         print(f"--count-changed-lines could not read {path}: {exc}", file=sys.stderr)
         return 2
     added, countable = count_added_lines(text, reachable=reachable)
+
+    # (#2606) Re-run with progressively less scoping so the breakdown below
+    # can NAME which mechanism dropped a given added line, instead of
+    # lumping structure-only exclusion, `--manifest-path`'s own scoping
+    # (#2544), and `--mutants-list`'s listing-based narrowing (#2605) into
+    # one opaque "outside this invocation's mutation scope" bucket — a
+    # human reading the job log could not previously tell a listing-excluded
+    # file from a manifest-excluded one. `countable_unscoped` is structure
+    # exclusion alone (no `reachable` at all); `countable_manifest` adds
+    # `--manifest-path`'s own scoping back in (or equals `countable_unscoped`
+    # when no manifest was given); the gap between that and the final
+    # `countable` is what the listing alone excluded. Each of these is also
+    # what the MUST-FIX empty-listing warning below tests against — the
+    # diff's own in-scope countable total, ignoring the listing entirely.
+    _, countable_unscoped = count_added_lines(text, reachable=None)
+    if manifest_predicate is not None:
+        _, countable_manifest = count_added_lines(text, reachable=manifest_predicate)
+    else:
+        countable_manifest = countable_unscoped
+    structure_excluded = added - countable_unscoped
+    manifest_excluded = countable_unscoped - countable_manifest
+    listing_excluded = countable_manifest - countable
+
+    if mutated_files is not None and not mutated_files and countable_manifest > 0:
+        # (#2606 MUST FIX) An empty listing that disarmed real, in-scope,
+        # countable-looking lines — see the docstring above.
+        print(
+            f"::warning::--mutants-list {mutants_list_arg} named zero files, but "
+            f"{countable_manifest} countable added Rust line(s) sit in this "
+            "invocation's own scope — every predicate this listing feeds is "
+            "disarmed for this run. If this is unexpected, check the listing "
+            "step's own job log (see quality.yml's own comment on that step).",
+            file=sys.stderr,
+        )
+
+    breakdown = f"{structure_excluded} blank / structure-only / comment-only / attribute-only"
+    if manifest_predicate is not None:
+        breakdown += f", {manifest_excluded} outside this invocation's manifest scope"
+    if mutated_files is not None:
+        breakdown += f", {listing_excluded} not named by the cargo-mutants listing"
+
     print(countable)
     print(
         f"{added} added Rust line(s) in scope; {countable} could plausibly produce a "
-        f"mutant ({added - countable} blank / structure-only / comment-only / "
-        "attribute-only / outside this invocation's mutation scope)",
+        f"mutant ({breakdown})",
         file=sys.stderr,
     )
     return 0
@@ -1610,6 +1715,33 @@ _DIFF_PROD_ONLY = (
     "+}\n"
 )
 
+# (#2606) The post-diff content of a file declaring a test-support module via
+# a STACKED attribute pair — `#[cfg(test)]` then `#[path = "..."]` — before
+# the `mod` statement itself, reproducing `runtime/src/checkpoint_regression_
+# tests.rs`'s own real sibling declaration.
+_STACKED_ATTR_MOD_SOURCE = (
+    "pub fn helper() -> usize {\n"
+    "    1 + 1\n"
+    "}\n"
+    "\n"
+    "#[cfg(test)]\n"
+    '#[path = "budget_request_tests.rs"]\n'
+    "mod budget_request_tests;\n"
+)
+
+_DIFF_STACKED_ATTR_MOD = (
+    "--- a/crates/fake/src/lib.rs\n"
+    "+++ b/crates/fake/src/lib.rs\n"
+    "@@ -1,3 +1,7 @@\n"
+    " pub fn helper() -> usize {\n"
+    "     1 + 1\n"
+    " }\n"
+    "+\n"
+    "+#[cfg(test)]\n"
+    '+#[path = "budget_request_tests.rs"]\n'
+    "+mod budget_request_tests;\n"
+)
+
 TEST_MODULE_SELF_TEST_CASES = [
     {
         # This is the reproduction of #2582 / PR #2579 itself: a diff whose
@@ -1667,6 +1799,32 @@ TEST_MODULE_SELF_TEST_CASES = [
             "+    assert_eq!(2 + 2, 4);\n"
             "+}\n"
         ),
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # (#2606 also-fix) THE STACKED-ATTRIBUTE REPRODUCTION: a
+        # `#[cfg(test)]` `mod` DECLARATION carrying a second attribute
+        # BETWEEN the `#[cfg(test)]` line and the item itself — the real
+        # shape of `runtime/src/checkpoint_regression_tests.rs`'s own
+        # sibling declaration, `#[cfg(test)] #[path = "..."] mod ...;`.
+        # Before the fix, `_test_module_ranges` mistook the SECOND
+        # attribute line (`#[path = "..."]`) for the item: its own (0, 0)
+        # brace delta closed a bogus single-line "range" over itself,
+        # `pending_attr` reset early, and the REAL item — the `mod ...;`
+        # declaration right after it, plain code with no `#[cfg(test)]` of
+        # its own — fell through to ordinary counting. Reproduced end to
+        # end in a scratch crate: a real `cargo mutants` run against this
+        # exact 3-line addition mutates nothing (a `#[cfg(test)]`-gated
+        # declaration is invisible outside a test build), while the OLD
+        # counter returned 1 for the `mod ...;` line — a false red for any
+        # PR that introduces a new cross-file test-support module this way.
+        # Both attribute lines are independently excluded by
+        # `added_line_is_countable` regardless (single-line, balanced
+        # brackets) — only the `mod` line depended on this fix.
+        "name": "#2606: a stacked #[cfg(test)] + #[path] mod declaration counts zero",
+        "diff": _DIFF_STACKED_ATTR_MOD,
+        "source_files": {"crates/fake/src/lib.rs": _STACKED_ATTR_MOD_SOURCE},
         "expect_count": 0,
         "expect_gate": 0,
     },
@@ -2234,9 +2392,16 @@ MUTANTS_LIST_SELF_TEST_CASES = [
     {
         # A genuinely empty listing (`[]`) is a LEGITIMATE answer — a real
         # `cargo mutants --list --json` invocation that found nothing to
-        # mutate anywhere in scope — and is parsed without a warning,
-        # distinct from the malformed shapes below.
-        "name": "#2605: a genuinely empty listing excludes everything, without warning",
+        # mutate anywhere in scope — so it parses cleanly and stays
+        # NON-FATAL, distinct from the malformed shapes below. But (#2606
+        # MUST FIX) this diff DOES have real, in-scope, countable-looking
+        # added lines (`_DIFF_RUNTIME_ONLY` against `runtime/Cargo.toml` —
+        # the same diff that counts 2 everywhere else in this file), so an
+        # empty listing silently zeroing it out is exactly the
+        # listing-disarmed-the-floor shape the MUST-FIX table names — this
+        # now WARNS (a `::warning::` annotation, same class as the
+        # workflow's own `--list`-failure warnings) while staying green.
+        "name": "#2606 MUST FIX: a genuinely empty listing over a non-empty scope warns, but stays non-fatal",
         "diff": _DIFF_RUNTIME_ONLY,
         "manifest_path": "runtime/Cargo.toml",
         "manifest_content": _RUNTIME_MANIFEST,
@@ -2246,6 +2411,82 @@ MUTANTS_LIST_SELF_TEST_CASES = [
         "expect_count": 0,
         "expect_gate": 0,
         "expect_stderr_not_contains": ["not valid JSON", "expected a JSON array"],
+        "expect_stderr_contains": ["::warning::", "named zero files"],
+    },
+    {
+        # The companion case proving the warning above is not spurious noise
+        # on every empty listing: when the SCOPE ITSELF is legitimately
+        # empty (this diff is entirely under `src/`, invisible to a
+        # `runtime/Cargo.toml`-scoped invocation regardless of any listing),
+        # an empty listing stays QUIET — there was nothing here for the
+        # listing to have disarmed.
+        "name": "#2606: a genuinely empty listing over an ALSO-empty scope stays quiet",
+        "diff": _DIFF_ROOT_SRC_ONLY,  # src/mission_status.rs — outside runtime/
+        "manifest_path": "runtime/Cargo.toml",
+        "manifest_content": _RUNTIME_MANIFEST,
+        "manifest_arg": "runtime/Cargo.toml",
+        "mutants_list_content": "[]",
+        "mutants_list_arg": "mutlist.json",
+        "expect_count": 0,
+        "expect_gate": 0,
+        "expect_stderr_not_contains": ["::warning::", "named zero files"],
+    },
+    {
+        # THE #2606 MUST-FIX REPRODUCTION, shape one: a NON-EMPTY listing —
+        # cargo-mutants genuinely found mutants and said so — whose entries
+        # all carry a DIFFERENT key than `"file"` (a hypothetical future
+        # `cargo mutants --list --json` field rename). Every entry is
+        # skipped by the per-entry leniency `parse_mutants_list` documents,
+        # so without this fix the resulting file set is silently empty —
+        # indistinguishable from the legitimate `[]` case above, except this
+        # one is NOT legitimate: cargo-mutants found 2 real mutants and the
+        # parser threw both away. Must be a HARD failure (exit 2), not a
+        # warning — the difference from the case above is exactly "was the
+        # raw listing itself empty", which only `parse_mutants_list` can
+        # see.
+        "name": "#2606 MUST FIX: a non-empty listing whose entries use a different key than 'file' fails loudly",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "mutants_list_content": json.dumps(
+            [{"path": "src/mission_status.rs"}, {"path": "src/other.rs"}]
+        ),
+        "mutants_list_arg": "mutlist.json",
+        "expect_exit": 2,
+        "expect_stderr_contains": ["--mutants-list", "schema may have changed"],
+    },
+    {
+        # THE #2606 MUST-FIX REPRODUCTION, shape two: the SAME failure via a
+        # single outright RENAMED key (`"mutant"` in place of `"file"`) —
+        # the literal shape the MUST-FIX table calls out as its own row,
+        # distinct from "a different key" above only in which name shows up,
+        # proving the guard is not keyed to one specific wrong string.
+        "name": "#2606 MUST FIX: a non-empty listing whose 'file' key was renamed fails loudly",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "mutants_list_content": json.dumps(
+            [{"mutant": "src/mission_status.rs:10:1: replace"}]
+        ),
+        "mutants_list_arg": "mutlist.json",
+        "expect_exit": 2,
+        "expect_stderr_contains": ["--mutants-list", "schema may have changed"],
+    },
+    {
+        # (#2606) Exercises `mutants_list_path` for real: every case above
+        # writes the fixture at the default `mutlist.json` and passes that
+        # SAME bare relative name as `--mutants-list`, which never proves
+        # anything about how the flag is READ — only that a relative name
+        # matching `_run_self`'s `cwd=tmp_path` resolves. The real workflow
+        # never does this: `quality.yml` always writes to, and passes, an
+        # ABSOLUTE path (`/tmp/mutlist-root.json`). Here the fixture is
+        # written at `mutants_list_path` (relative, so the write itself does
+        # not need the tempdir's path yet) and the flag is resolved to that
+        # SAME file's absolute path at run time — the one case in this file
+        # that actually matches production's own invocation shape.
+        "name": "#2606: --mutants-list works with an absolute path, the real workflow's own shape",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "mutants_list_content": json.dumps([{"file": "src/mission_status.rs"}]),
+        "mutants_list_path": "abs/mutlist.json",
+        "mutants_list_arg_absolute": "abs/mutlist.json",
+        "expect_count": 2,
+        "expect_gate": 1,
     },
     {
         # An entry missing the `"file"` key is skipped, not fatal — a
@@ -2384,6 +2625,25 @@ def count_self_test() -> list[str]:
                 ]
             if "mutants_list_arg" in case:
                 count_argv += ["--mutants-list", case["mutants_list_arg"]]
+            elif "mutants_list_arg_absolute" in case:
+                # (#2606) An ABSOLUTE path, computed at run time — the SAME
+                # shape the real workflow actually passes (`/tmp/mutlist-
+                # root.json`, an absolute path, never a cwd-relative one;
+                # see `quality.yml`'s own listing step). Every other case
+                # above exercises `--mutants-list` with a bare relative
+                # filename resolved against `_run_self`'s `cwd=tmp_path` —
+                # which proves the flag is read at all, but never proves it
+                # works the way production actually invokes it. This is
+                # `mutants_list_path`'s reason to exist as a knob separate
+                # from `mutants_list_arg`: the fixture is written at
+                # `mutants_list_path` (relative, so the write itself doesn't
+                # need the tempdir's path yet), and the CLI argument is
+                # resolved to that SAME file's absolute path only once the
+                # tempdir exists.
+                count_argv += [
+                    "--mutants-list",
+                    str(tmp_path / case["mutants_list_arg_absolute"]),
+                ]
             expect_exit = case.get("expect_exit", 0)
             problems = []
 
