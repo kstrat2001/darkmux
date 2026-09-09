@@ -137,6 +137,23 @@ async function liveRecordCount(page) {
  * not a harness one, reproducible on `origin/main` (1 fail in 10) and filed
  * separately. Do not read this guard as its fix.
  *
+ * (#2512, fixed) `eventFilters.ts`'s `resolveActivitySet` now backstops the
+ * exact "curated default matches nothing the corpus offers" case this
+ * describes — a fresh session over this lifecycle-only corpus now shows
+ * all 952 records instead of hiding all of them. The dedicated regression
+ * coverage for that fix is `tests/e2e/event-log-filters-lifecycle-only.spec.js`
+ * (a from-scratch load, no seeded storage, over a small all-lifecycle
+ * fixture) plus `ui/src/lib/eventFilters.test.ts`'s "#2512" describe block —
+ * NOT this suite. The `beforeEach` seed below stays: removing it does not
+ * reproduce #2512 any more (confirmed by hand, five runs, all landing on a
+ * real 952 baseline instead of a stuck 0), but it DOES break this suite for
+ * an unrelated, correct reason — the SSE-delivered `flow.note` record this
+ * suite injects is a value `absorbNewFacetValues` has never seen before,
+ * and #2416's own (deliberate, separately tested) policy is that a brand
+ * new activity value absorbs OFF, not on. That is #2416's contract working
+ * as designed, not #2512 recurring, and this suite exists to grade RENDER
+ * PARITY, not re-litigate the filter default — hence the seed.
+ *
  * The guard weakens nothing — the only caller asserts `> 0` on the very next
  * line, so a genuinely-zero run still fails, now with an honest message
  * instead of a wrong accusation.

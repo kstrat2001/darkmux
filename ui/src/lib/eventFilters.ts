@@ -130,6 +130,48 @@ function isDefaultOn(key: keyof Facets, value: string): boolean {
   return DEFAULT_ACTIVITIES.has(value) || looksLikeFailureActivity(value);
 }
 
+/** (#2512) Construction-level backstop for the `act` facet only — the one
+ * facet with a curated, hand-enumerated default (`DEFAULT_ACTIVITIES`
+ * above). An enumerated allowlist WILL drift as the record vocabulary
+ * grows, and it already has: a corpus of nothing but lifecycle/telemetry
+ * records (`dispatch start`, `mission start`, `step complete`, `host
+ * telemetry`, ...) matches none of `DEFAULT_ACTIVITIES` and no failure
+ * suffix, so the naive per-value fold below produces an EMPTY set — every
+ * record loaded, every record hidden, permanently, with nothing in the UI
+ * to recover from it (`isDefaultOn`'s "act" branch never reconsiders a
+ * value once `absorbNewFacetValues`'s `seen` ledger has recorded it, see
+ * that function's own doc). That is the exact defect reported in #2512.
+ *
+ * Rather than replace the curated allowlist with a fully-derived rule (an
+ * exclude-list of "known noisy" values would drift too, just in the other
+ * direction — a new high-cadence telemetry kind would default ON instead
+ * of off, reintroducing the "I uncheck this every single load" complaint
+ * `DEFAULT_ACTIVITIES` exists to fix), this keeps the curated list AND
+ * makes the specific failure mode — the curated list matching NOTHING the
+ * corpus offers — structurally impossible: if the per-value fold leaves
+ * the set empty while the corpus actually has activity values, fall back
+ * to showing all of them.
+ *
+ * This only fires when the operator has NO opinion at all recorded for
+ * this facet (`picks.include` and `picks.exclude` both empty) — the literal
+ * "never touched it" state, true both for `defaultFilterState` (which never
+ * sees stored picks) and for a from-scratch session's `applyStoredPicks`
+ * call (`createStoredPicks()`'s picks). An operator who has explicitly
+ * recorded even one include/exclude for `act` gets no override here — this
+ * function's job is "what does the DEFAULT alone produce," not "second-
+ * guess a deliberate choice." */
+function resolveActivitySet(values: string[], picks: { include: Set<string>; exclude: Set<string> }): Set<string> {
+  const out = new Set<string>();
+  for (const v of values) {
+    if (picks.exclude.has(v)) continue;
+    if (picks.include.has(v) || isDefaultOn("act", v)) out.add(v);
+  }
+  if (out.size === 0 && values.length > 0 && picks.include.size === 0 && picks.exclude.size === 0) {
+    for (const v of values) out.add(v);
+  }
+  return out;
+}
+
 /** (#2416) The "model only" quick filter's underlying vocabulary — what
  * counts as the model itself doing something, as opposed to the harness
  * bookkeeping around it.
@@ -330,8 +372,13 @@ export function defaultFilterState(facets: Facets): FilterState {
   // error anywhere. Routed through `isDefaultOn` for every facet (a no-op
   // change for `cat`/`tier`/`src`, which it already returns `true` for
   // unconditionally) so there is exactly one place this decision is made.
+  //
+  // (#2512) `act` is routed through `resolveActivitySet` rather than a
+  // plain `isDefaultOn` filter — see that function's doc for why a naive
+  // fold can legitimately produce an empty set for a real corpus, and why
+  // that must never reach the UI as "0 events, everything hidden."
   return {
-    act: new Set(facets.act.filter((v) => isDefaultOn("act", v))),
+    act: resolveActivitySet(facets.act, { include: new Set(), exclude: new Set() }),
     cat: new Set(facets.cat.filter((v) => isDefaultOn("cat", v))),
     tier: new Set(facets.tier.filter((v) => isDefaultOn("tier", v))),
     src: new Set(facets.src.filter((v) => isDefaultOn("src", v))),
@@ -630,10 +677,17 @@ export function storedFilterPicks(
  * This is the piece `absorbNewFacetValues` cannot do on its own — that
  * function's job is "a value never offered before", which only fires once
  * per value per mount; this is the FULL reconciliation used both by
- * `restoreFilterState` and by `EventLogColumn`'s first-real-facets effect. */
+ * `restoreFilterState` and by `EventLogColumn`'s first-real-facets effect.
+ *
+ * (#2512) This is the ACTUAL production path for a fresh session — even
+ * with no stored picks at all, `EventLogColumn` calls this with
+ * `createStoredPicks()`'s empty include/exclude sets, so `act` is routed
+ * through `resolveActivitySet` here too, not just in `defaultFilterState`. */
 export function applyStoredPicks(picks: StoredPicks, facets: Facets): FilterState {
   const out: FilterState = { act: new Set(), cat: new Set(), tier: new Set(), src: new Set(), q: picks.q };
+  out.act = resolveActivitySet(facets.act, picks.act);
   for (const k of FACET_KEYS) {
+    if (k === "act") continue;
     for (const v of facets[k]) {
       if (picks[k].exclude.has(v)) continue;
       if (picks[k].include.has(v) || isDefaultOn(k, v)) out[k].add(v);
