@@ -180,6 +180,7 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         resume_from: None,
         host_out: None,
         max_turns_override: None,
+        timeout_override_seconds: None, // (#2480)
         role_id: role.to_string(),
         message: prompt.to_string(),
         session_id: Some(session_id.to_string()),

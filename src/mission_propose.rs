@@ -289,6 +289,7 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         resume_from: None,
         host_out: None,
         max_turns_override: None,
+        timeout_override_seconds: None, // (#2480)
         role_id: "mission-compiler".to_string(),
         message,
         session_id: None,

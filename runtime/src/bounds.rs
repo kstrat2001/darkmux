@@ -84,8 +84,24 @@ impl BoundKind {
     }
 }
 
-/// Which tier of `env > config.json > built-in default` resolved a bound's
-/// value. Serializes to `"built-in"` | `"config"` | `"env"`.
+/// Which tier resolved a bound's value. Serializes to `"built-in"` |
+/// `"config"` | `"env"` | `"cli"`.
+///
+/// (#2480 review, finding 5) `Cli` is a fourth tier above `env > config >
+/// built-in`, for a bound the operator named at the point of dispatch —
+/// today only `darkmux dispatch --timeout <n>`, which overrides the
+/// inactivity budget for that one dispatch. It exists because without it a
+/// `--timeout 45` reached the operator's own warning text as "the
+/// inactivity timeout (env 45)", telling an operator whose env actually
+/// says 1200 that their env produced 45.
+///
+/// This is deliberately NOT the same enum as
+/// `darkmux_types::config_access::Source` — that one models the three
+/// tiers of the config-resolution contract and is matched exhaustively
+/// across the workspace (`darkmux-doctor` included), where a fourth tier
+/// that no config file can ever produce would be noise. This crate is not
+/// a workspace member and this enum's only job is rendering provenance the
+/// host already resolved, so the tier lands here.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum BoundSource {
@@ -93,6 +109,7 @@ pub enum BoundSource {
     BuiltIn,
     Config,
     Env,
+    Cli,
 }
 
 impl BoundSource {
@@ -101,6 +118,7 @@ impl BoundSource {
             BoundSource::BuiltIn => "built-in",
             BoundSource::Config => "config",
             BoundSource::Env => "env",
+            BoundSource::Cli => "cli",
         }
     }
 
@@ -109,10 +127,18 @@ impl BoundSource {
     /// the same "loud in doctor, lenient on read" posture the rest of
     /// darkmux's config surface takes; a malformed provenance hint should
     /// never abort a dispatch.
+    ///
+    /// (#2480 review, finding 5) That leniency also bounds the blast radius
+    /// of the `"cli"` tier against a STALE runtime image: an image built
+    /// before this arm existed renders a `--timeout`-sourced budget as
+    /// `(built-in 45)` — wrong about the tier, but no more wrong than the
+    /// `(env 45)` it printed before, and self-correcting the moment the
+    /// image is refreshed.
     pub fn from_cli_str(s: &str) -> Self {
         match s {
             "config" => BoundSource::Config,
             "env" => BoundSource::Env,
+            "cli" => BoundSource::Cli,
             _ => BoundSource::BuiltIn,
         }
     }
@@ -214,6 +240,9 @@ mod tests {
         assert_eq!(serde_json::to_value(BoundSource::BuiltIn).unwrap(), serde_json::json!("built-in"));
         assert_eq!(serde_json::to_value(BoundSource::Config).unwrap(), serde_json::json!("config"));
         assert_eq!(serde_json::to_value(BoundSource::Env).unwrap(), serde_json::json!("env"));
+        // (#2480 review, finding 5) The fourth tier — a bound the operator
+        // named at the point of dispatch (`dispatch --timeout <n>`).
+        assert_eq!(serde_json::to_value(BoundSource::Cli).unwrap(), serde_json::json!("cli"));
     }
 
     #[test]
@@ -221,8 +250,22 @@ mod tests {
         assert_eq!(BoundSource::from_cli_str("config"), BoundSource::Config);
         assert_eq!(BoundSource::from_cli_str("env"), BoundSource::Env);
         assert_eq!(BoundSource::from_cli_str("built-in"), BoundSource::BuiltIn);
+        // (#2480 review, finding 5) The host writes this string into
+        // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE` whenever `--timeout`
+        // set the budget; without this arm the value fell to the `_` catch-all
+        // and the operator's warning named a tier that did not decide it.
+        assert_eq!(BoundSource::from_cli_str("cli"), BoundSource::Cli);
         assert_eq!(BoundSource::from_cli_str("bogus"), BoundSource::BuiltIn);
         assert_eq!(BoundSource::from_cli_str(""), BoundSource::BuiltIn);
+    }
+
+    /// (#2480 review, finding 5) `describe()` is what gets spliced into the
+    /// runtime's operator-facing inactivity warning. A `--timeout 45` on a
+    /// machine whose env says 1200 must not read as "(env 45)".
+    #[test]
+    fn describe_names_the_cli_tier_for_a_per_dispatch_override() {
+        let b = BoundRef::new(BoundKind::InactivityTimeout, 45, BoundSource::Cli);
+        assert_eq!(b.describe(), "the inactivity timeout (cli 45)");
     }
 
     #[test]

@@ -195,6 +195,7 @@ fn run_mock_dispatch(
         resume_from: None,
         host_out: None,
         max_turns_override: None,
+        timeout_override_seconds: None, // (#2480)
         role_id: "analyst".to_string(),
         message: message.to_string(),
         session_id: Some(session_id.clone()),

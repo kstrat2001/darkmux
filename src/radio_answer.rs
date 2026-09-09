@@ -847,6 +847,7 @@ pub fn dispatch_answerer_call_with(user_message: &str, overrides: &AnswererOverr
         resume_from: None,
         host_out: None,
         max_turns_override: None,
+        timeout_override_seconds: None, // (#2480)
         role_id: "radio-host".to_string(),
         message: user_message.to_string(),
         session_id: None,

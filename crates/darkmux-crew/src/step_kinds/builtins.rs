@@ -346,6 +346,148 @@ fn task_or_config_str(task_field: Option<&String>, step: &Step, key: &str) -> Op
     task_field.cloned().or_else(|| config_str(step, key).map(str::to_string))
 }
 
+/// (#2480 review, blocker 2) The `Step` + `Task` + upstream-`input` ->
+/// [`DispatchOpts`] reconstruction, as a free function.
+///
+/// `DispatchInternalStepKind::run` used to build this inline, which made the
+/// whole reconstruction reachable only through a real `dispatch()` — i.e.
+/// only with Docker and a model. That is why `timeout_override_seconds`
+/// could sit here hardcoded to `None`, silently undoing `--timeout` on the
+/// only path a top-level `darkmux dispatch` takes, with the entire suite
+/// green. Extracted so the hop is exercisable by a plain unit test; the
+/// caller now has nothing left to drop.
+///
+/// Every field either comes off `task`/`step.config` or is a deliberate
+/// constant with its reason stated in place.
+pub(crate) fn dispatch_opts_for(
+    step: &Step,
+    task: &Task,
+    input: &BTreeMap<String, String>,
+) -> Result<crate::dispatch::DispatchOpts> {
+    use crate::dispatch::{CompactionDispatchArgs, DispatchOpts};
+
+    let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id").ok_or_else(|| {
+        // The kind id is spelled out rather than read off `self.id()` — this
+        // is a free function now, and the literal is the same constant that
+        // method returns, so the message is byte-identical to before.
+        anyhow!("step `{}`: `dispatch.internal` requires task.role_id or config.role_id", step.id)
+    })?;
+    let base_message = config_str(step, "message").unwrap_or_default();
+    let message = compose_message(base_message, input);
+    let timeout_seconds = step
+        .config
+        .get("timeout_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3600) as u32;
+    let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
+    let image = task_or_config_str(task.image.as_ref(), step, "image");
+    let config_path = config_str(step, "config_path").map(str::to_string);
+    let workdir = task
+        .workdir
+        .clone()
+        .or_else(|| config_str(step, "workdir").map(std::path::PathBuf::from));
+    // The owning Task names the phase for every step minted from a mission
+    // config; the step config's own `phase_id` (the crew-of-one's way of
+    // passing the CLI's `--phase`) wins when present. Without the task
+    // fallback a config-launched dispatch left with no phase and so no
+    // mission on its records: no drill link from the mission view, no
+    // events in the sheet, no token attribution (2026-09-04, the grown
+    // follow-on steps of a crawl).
+    let phase_id = config_str(step, "phase_id")
+        .map(str::to_string)
+        .or_else(|| (!task.phase_id.is_empty()).then(|| task.phase_id.clone()));
+    let session_id = config_str(step, "session_id")
+        .map(str::to_string)
+        .unwrap_or_else(|| darkmux_types::session_id::step(&step.id));
+    // (#1509) Additive, default-preserving config passthroughs — see
+    // `DispatchInternalStepKind`'s doc. Every existing caller (mission
+    // launch, coder-phase, review) never sets these keys, so each falls
+    // back to the exact literal the code used to hardcode here.
+    let skip_preflight = step
+        .config
+        .get("skip_preflight")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let json = step.config.get("json").and_then(|v| v.as_bool()).unwrap_or(true);
+    let max_completion_tokens = step
+        .config
+        .get("max_completion_tokens")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok());
+    // (#2114 follow-up) `--resume-from <dir>` threaded through the
+    // crew-of-one graph's step config (`DispatchAsCrewOfOne::build_graph`)
+    // — see that fn's own doc for why the CLI's `DispatchOpts` isn't
+    // forwarded wholesale.
+    let resume_from = config_str(step, "resume_from").map(std::path::PathBuf::from);
+    // (#2295) The finding / mod records the brief carries, read back off
+    // the step config. The step config is this list's HOME: the
+    // crew-of-one graph writes it from the CLI flags, and a mission graph
+    // writes it directly.
+    //
+    // (#2295 review, CRITICAL 1) Resolution and the APPEND happen HERE,
+    // not at the CLI — this is the one point every producer of the field
+    // converges on, and appending at the CLI meant a mission graph that
+    // set `config.brief_refs` got the read-only mount and the provenance
+    // stamp with NO block in its brief and no missing-key refusal. It runs
+    // before `dispatch` is called, so a key that addresses no stored
+    // record still fails the step before the ack gate and before any
+    // container work. The CANONICAL refs (the key as the record spells it)
+    // are what get stamped and mounted.
+    let brief_refs = crate::brief_refs::from_json(step.config.get("brief_refs"));
+    let (message, brief_refs) = crate::brief_refs::append_to_brief(
+        &message,
+        &brief_refs,
+        &crate::brief_refs::StoreDirs::resolved(),
+    )
+    .with_context(|| format!("step `{}`: resolving the brief's records", step.id))?;
+
+    let opts = DispatchOpts {
+        brief_refs,
+        workspace_read_only: false,
+        record_context: None,
+        role_id,
+        message,
+        session_id: Some(session_id),
+        timeout_seconds,
+        skip_preflight,
+        json,
+        workdir,
+        phase_id,
+        machine: None,
+        wait: true,
+        compaction: CompactionDispatchArgs::default(),
+        profile_name,
+        config_path,
+        force_container: false,
+        max_completion_tokens,
+        image,
+        model_base_url_override: None,
+        // (#1483) Stamp the step id so the tailer's live turn/tool/token
+        // records attribute to this seat even if `session_id` was
+        // config-overridden off the `step-<id>` default the viewer maps.
+        step_id: Some(step.id.clone()),
+        system_prompt_override: None,
+        resume_from,
+        // (#2153) `dispatch.internal` steps get a fresh tempdir, same
+        // as before — no crew-of-one graph step names an exact out
+        // dir today.
+        host_out: None,
+        max_turns_override: None,
+        // (#2480 review, blocker 1) `--timeout <n>`, read back off the
+        // step config the crew-of-one graph wrote it into. Hardcoding
+        // `None` here is what left the flag a no-op on the ONLY path a
+        // top-level `darkmux dispatch` takes. A mission/coder-phase/
+        // review step names no such key and still resolves `None`, so
+        // their standing `env > config > 600` budget is unchanged.
+        timeout_override_seconds: step
+            .config
+            .get("timeout_override_seconds")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok()),
+    };
+    Ok(opts)
+}
+
 impl StepKind for DispatchInternalStepKind {
     fn id(&self) -> &'static str {
         "dispatch.internal"
@@ -356,123 +498,24 @@ impl StepKind for DispatchInternalStepKind {
     }
 
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
-        use crate::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts};
+        use crate::dispatch::dispatch;
 
-        let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id").ok_or_else(|| {
-            anyhow!("step `{}`: `{}` requires task.role_id or config.role_id", step.id, self.id())
-        })?;
-        let base_message = config_str(step, "message").unwrap_or_default();
-        let message = compose_message(base_message, input);
-        let timeout_seconds = step
-            .config
-            .get("timeout_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3600) as u32;
-        let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
-        let image = task_or_config_str(task.image.as_ref(), step, "image");
-        let config_path = config_str(step, "config_path").map(str::to_string);
-        let workdir = task
-            .workdir
-            .clone()
-            .or_else(|| config_str(step, "workdir").map(std::path::PathBuf::from));
-        // The owning Task names the phase for every step minted from a mission
-        // config; the step config's own `phase_id` (the crew-of-one's way of
-        // passing the CLI's `--phase`) wins when present. Without the task
-        // fallback a config-launched dispatch left with no phase and so no
-        // mission on its records: no drill link from the mission view, no
-        // events in the sheet, no token attribution (2026-09-04, the grown
-        // follow-on steps of a crawl).
-        let phase_id = config_str(step, "phase_id")
-            .map(str::to_string)
-            .or_else(|| (!task.phase_id.is_empty()).then(|| task.phase_id.clone()));
-        let session_id = config_str(step, "session_id")
-            .map(str::to_string)
-            .unwrap_or_else(|| darkmux_types::session_id::step(&step.id));
         let parse_verifiers = step
             .config
             .get("parse_verifiers")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // (#1509) Additive, default-preserving config passthroughs — see
-        // `DispatchInternalStepKind`'s doc. Every existing caller (mission
-        // launch, coder-phase, review) never sets these keys, so each falls
-        // back to the exact literal the code used to hardcode here.
-        let skip_preflight = step
-            .config
-            .get("skip_preflight")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let json = step.config.get("json").and_then(|v| v.as_bool()).unwrap_or(true);
-        let max_completion_tokens = step
-            .config
-            .get("max_completion_tokens")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok());
         let preserve_dispatch_result = step
             .config
             .get("preserve_dispatch_result")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // (#2114 follow-up) `--resume-from <dir>` threaded through the
-        // crew-of-one graph's step config (`DispatchAsCrewOfOne::build_graph`)
-        // — see that fn's own doc for why the CLI's `DispatchOpts` isn't
-        // forwarded wholesale.
-        let resume_from = config_str(step, "resume_from").map(std::path::PathBuf::from);
-        // (#2295) The finding / mod records the brief carries, read back off
-        // the step config. The step config is this list's HOME: the
-        // crew-of-one graph writes it from the CLI flags, and a mission graph
-        // writes it directly.
-        //
-        // (#2295 review, CRITICAL 1) Resolution and the APPEND happen HERE,
-        // not at the CLI — this is the one point every producer of the field
-        // converges on, and appending at the CLI meant a mission graph that
-        // set `config.brief_refs` got the read-only mount and the provenance
-        // stamp with NO block in its brief and no missing-key refusal. It runs
-        // before `dispatch` is called, so a key that addresses no stored
-        // record still fails the step before the ack gate and before any
-        // container work. The CANONICAL refs (the key as the record spells it)
-        // are what get stamped and mounted.
-        let brief_refs = crate::brief_refs::from_json(step.config.get("brief_refs"));
-        let (message, brief_refs) = crate::brief_refs::append_to_brief(
-            &message,
-            &brief_refs,
-            &crate::brief_refs::StoreDirs::resolved(),
-        )
-        .with_context(|| format!("step `{}`: resolving the brief's records", step.id))?;
-
-        let opts = DispatchOpts {
-            brief_refs,
-            workspace_read_only: false,
-            record_context: None,
-            role_id,
-            message,
-            session_id: Some(session_id),
-            timeout_seconds,
-            skip_preflight,
-            json,
-            workdir,
-            phase_id,
-            machine: None,
-            wait: true,
-            compaction: CompactionDispatchArgs::default(),
-            profile_name,
-            config_path,
-            force_container: false,
-            max_completion_tokens,
-            image,
-            model_base_url_override: None,
-            // (#1483) Stamp the step id so the tailer's live turn/tool/token
-            // records attribute to this seat even if `session_id` was
-            // config-overridden off the `step-<id>` default the viewer maps.
-            step_id: Some(step.id.clone()),
-            system_prompt_override: None,
-            resume_from,
-            // (#2153) `dispatch.internal` steps get a fresh tempdir, same
-            // as before — no crew-of-one graph step names an exact out
-            // dir today.
-            host_out: None,
-            max_turns_override: None,
-        };
+        // (#2480 review, blocker 2) The whole `Step`/`Task` ->
+        // `DispatchOpts` reconstruction lives in `dispatch_opts_for`, a
+        // free function a unit test can call without Docker or a model —
+        // so a field can no longer be dropped on this hop while the suite
+        // stays green. Everything below is post-dispatch handling.
+        let opts = dispatch_opts_for(step, task, input)?;
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;
 

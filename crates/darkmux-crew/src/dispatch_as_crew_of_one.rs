@@ -372,6 +372,23 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Miss
     if let Some(resume_from) = &opts.resume_from {
         config["resume_from"] = serde_json::Value::String(resume_from.display().to_string());
     }
+    // (#2480 review, blocker 1) `--timeout <n>`'s inactivity-budget override.
+    // This one hop is what made the whole flag a no-op a second time: #2480
+    // wired `DispatchOpts::timeout_override_seconds` end to end through
+    // `dispatch_internal::dispatch`, but `darkmux dispatch` has not called
+    // that primitive directly since #1509 — it comes through THIS graph, and
+    // a field not copied here is dropped exactly as the block above warns.
+    // Read back by `step_kinds::builtins::dispatch_opts_for`, and asserted
+    // AGAINST that reader — the real one the step kind runs, not a
+    // test-local re-read — in
+    // `build_graph_step_config_carries_the_cli_flags` below, so the two
+    // halves of the hand-off are pinned to each other, not separately.
+    //
+    // Only set when present, so a step config naming no override reads back
+    // `None` and the standing `env > config > 600` resolution stands.
+    if let Some(secs) = opts.timeout_override_seconds {
+        config["timeout_override_seconds"] = serde_json::Value::from(secs);
+    }
 
     let step = Step {
         id: step_id,
@@ -466,6 +483,7 @@ mod tests {
             resume_from: None,
             host_out: None,
             max_turns_override: None,
+            timeout_override_seconds: None, // (#2480)
             role_id: role.to_string(),
             message: message.to_string(),
             session_id: None,
@@ -693,6 +711,16 @@ mod tests {
         assert_eq!(task.image.as_deref(), Some("rust:slim"));
     }
 
+    /// (#2480 review, blockers 1+2) Run the graph's Step/Task back through
+    /// the REAL reconstruction the `dispatch.internal` step kind uses, so a
+    /// hand-off assertion cannot be satisfied by a test-local re-read of the
+    /// config. Needs no Docker and no model — everything after this function
+    /// is what needs a container.
+    fn rebuilt_opts(task: &crate::types::Task, step: &crate::types::Step) -> DispatchOpts {
+        crate::step_kinds::builtins::dispatch_opts_for(step, task, &BTreeMap::new())
+            .expect("reconstructing DispatchOpts from the crew-of-one step")
+    }
+
     #[test]
     fn build_graph_step_config_carries_the_cli_flags() {
         let mut opts = test_opts("coder", "hello there");
@@ -700,7 +728,7 @@ mod tests {
         opts.skip_preflight = true;
         opts.json = false;
         opts.max_completion_tokens = Some(2048);
-        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-frozen-1");
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-frozen-1");
 
         assert_eq!(step.config["message"], "hello there");
         assert_eq!(step.config["timeout_seconds"], 120);
@@ -712,6 +740,46 @@ mod tests {
         // doc — every existing mission/coder-phase/review caller never sets
         // this key; the crew-of-one graph always does.
         assert_eq!(step.config["preserve_dispatch_result"], true);
+        // (#2480 review, blocker 1) `--timeout <n>` — the END-TO-END pin, and
+        // the one this test was missing when #2480 first landed: the field was
+        // added to `test_opts` with no assertion here, so the flag stayed a
+        // no-op on the only path `darkmux dispatch` takes.
+        //
+        // Absent first: an omitted `--timeout` must write NO key, so the step
+        // kind reads `None` and the operator's standing
+        // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` / `config.runtime.
+        // inactivity_timeout_seconds` budget survives. Writing a literal 600
+        // here would silently clamp every ordinary dispatch back to the old
+        // clap default — the worse bug #2480's `u32` -> `Option<u32>` change
+        // exists to avoid.
+        assert!(
+            step.config.get("timeout_override_seconds").is_none(),
+            "no key at all, not a null, when `--timeout` wasn't given: {:?}",
+            step.config
+        );
+        assert_eq!(
+            rebuilt_opts(&task, &step).timeout_override_seconds,
+            None,
+            "and the step kind's own reconstruction must agree it is absent — \
+             an omitted flag must not become a 600s clamp"
+        );
+        opts.timeout_override_seconds = Some(45);
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-frozen-1");
+        assert_eq!(step.config["timeout_override_seconds"], 45);
+        // The READER half, asserted against the writer half rather than
+        // separately, and through the SAME function the step kind runs
+        // (`step_kinds::builtins::dispatch_opts_for`) rather than a
+        // test-local re-read. This is the assertion a path that never carries
+        // the value cannot satisfy, which is what makes it a pin on the whole
+        // SEGMENT — `DispatchOpts` -> step config -> `DispatchOpts` — and not
+        // on either end of it. `dispatch_internal::dispatch` takes the field
+        // from here, and its own tests cover everything downstream.
+        assert_eq!(
+            rebuilt_opts(&task, &step).timeout_override_seconds,
+            opts.timeout_override_seconds,
+            "`--timeout` must survive the crew-of-one graph round trip — \
+             the exact hop that made #2480's fix inert"
+        );
         // (#2295) `--finding` / `--mod` refs ride the config too. A field on
         // `DispatchOpts` that is not copied HERE is dropped on the only path
         // `darkmux dispatch` takes, which is what left the flow record's ref
