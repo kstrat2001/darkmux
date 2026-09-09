@@ -40,8 +40,45 @@
 //!   disconnect/drop notification at the protocol level). A client that
 //!   never sends it (or predates the capability) still gets the
 //!   process-level backstop already in place: `idle_self_exit_loop` (#1698
-//!   Packet B2 scope G2) exits the whole process — map included — once
-//!   nothing has been in flight for `acp_idle_exit_minutes`.
+//!   Packet B2 scope G2) exits the whole process once nothing has been in
+//!   flight for `acp_idle_exit_minutes` — but see the #1781 fix directly
+//!   below, which is what actually makes that backstop safe to leave
+//!   running underneath a real editor session.
+//! - (#1781 — RESOLVED) The backstop above used to be unconditional: it
+//!   fired purely off elapsed idle time and the `in_flight` command count,
+//!   with no regard for whether a client still had a session open. A Zed
+//!   panel left idle (no prompt sent) for `acp_idle_exit_minutes` — the
+//!   ordinary case for a session someone is reading, not actively typing
+//!   into — got its whole process killed out from under it, and there is no
+//!   ACP reconnect: the panel stayed broken until the IDE itself restarted.
+//!   `idle_self_exit_loop` is now two-tiered, keyed on a latch
+//!   ([`IdleState`]) set the first time a client attaches a session
+//!   (`session/new` or `session/load`) and NEVER cleared:
+//!
+//!   - Nothing ever attached — a spawned-but-unused process, the orphan
+//!     case the backstop exists for. Still reclaimed at
+//!     `acp_idle_exit_minutes`.
+//!   - Something attached at some point — a real editor session. Reclaimed
+//!     only after the week-scale hard ceiling ([`hard_idle_threshold`])
+//!     with no byte from the client, so the disclosed orphan leak is
+//!     BOUNDED rather than merely rare, without the bound ever landing
+//!     inside ordinary use. Stated plainly, since it is the one case where
+//!     this loop can still close a panel: a process whose client has been
+//!     silent for a week of uptime is reclaimed, and a client that comes
+//!     back after that gets the same `Incoming transport closed` — the
+//!     ceiling's own doc explains why a week is where that trade was
+//!     drawn.
+//!
+//!   The predicate is "has a session EVER attached", not "is one attached
+//!   right now" (i.e. NOT `sessions.is_empty()`), because the latter
+//!   reopens this same bug on a second path: `session/close` prunes the map
+//!   (#1684, above), so a client that closes one thread and opens another
+//!   minutes later empties the map in between while its transport and
+//!   workspace stay live — and a currently-empty test exits under it,
+//!   producing the reported `Incoming transport closed` verbatim. #1781
+//!   names the ever-attached predicate itself, as its option 2. It also
+//!   removes any dependence on whether a given client sends `session/close`
+//!   at all.
 //! - (#1684 remainder — RESOLVED) Cancellation is wired. `session/cancel`
 //!   (`CancelNotification`) looks up the session's in-flight command in the
 //!   [`InFlight`] registry and calls `AbortHandle::abort()` on it. The
@@ -188,7 +225,7 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio as ProcStdio;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 
@@ -347,41 +384,259 @@ fn apply_config_option(overrides: &mut crate::radio_answer::AnswererOverrides, c
     }
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// (#1781) Everything [`idle_self_exit_loop`]'s decision reads, carried as
+/// ONE shared value: the never-cleared "a client has attached a session to
+/// this process" latch, the last-activity mark, and the count of commands
+/// currently executing.
+///
+/// **Bundled deliberately, not for tidiness.** [`should_idle_exit`] takes
+/// `&IdleState`, so the loop's call site cannot hand it a hand-written
+/// stand-in for any of the three. The shape this replaced took a bare
+/// `bool` for the session signal, and a review proved the whole fix could
+/// be reverted by passing a literal `true` at the one call site the tests
+/// never reached — `cargo build`, `cargo clippy -- -D warnings` and the
+/// whole acp suite stayed green. Typing the state does not make that revert
+/// impossible (a fresh `IdleState::new()` is unattached with
+/// `last_activity: 0`, which is the same literal wearing a constructor); it
+/// makes it CONSPICUOUS, and what actually catches it is
+/// [`idle_self_exit_loop_with`] — the seam that lets a wire test run the
+/// real loop against the real state a served connection is using.
+///
+/// **Time here is MONOTONIC** (seconds since `started`), never wall clock.
+/// The idleness this meters is "this process has been up with nothing to
+/// do", and on macOS `Instant` does not advance while the system is
+/// suspended — so a laptop closed over a weekend accrues no idleness. That
+/// only started mattering once the hard ceiling below could actually fire:
+/// on a wall clock, a suspend longer than the ceiling would kill an
+/// attached panel the moment the machine woke, which is #1781's own symptom
+/// with a longer fuse. (Should some platform's monotonic clock include
+/// suspend, the result is merely the wall-clock behavior we'd have had
+/// anyway — this choice can only be the more conservative of the two.)
+///
+/// **#2479 must not sweep this into `SystemTime`.** That issue proposes a
+/// project-wide `Instant` → `SystemTime` migration; applied here it would
+/// silently revert the paragraph above and reintroduce the wake-from-
+/// suspend kill. The clock choice is per-deadline, not per-project: a
+/// deadline metering THIS PROCESS's own activity wants a monotonic clock,
+/// a deadline metering the outside world wants a wall clock. This one is
+/// the former.
+struct IdleState {
+    started: std::time::Instant,
+    /// Monotonic seconds since `started` at the last observed client
+    /// traffic — see [`IdleState::record_activity`].
+    last_activity: AtomicU64,
+    /// Commands currently executing (`session/prompt`'s two spawn arms).
+    in_flight: AtomicI64,
+    /// (#1781) Set the first time a client attaches a session
+    /// (`session/new` or `session/load`) and **never cleared** — see
+    /// [`should_idle_exit`] for why "has one ever attached" is the
+    /// predicate and "is one attached right now" is not.
+    session_ever_attached: AtomicBool,
 }
 
-/// (#1698 Packet B2, scope G2) Background idle self-exit loop, spawned once
-/// per `serve()` call. Checks every 60s (a check-cadence far below any
-/// realistic idle threshold, so it never meaningfully delays the exit); on
-/// a MINUTES-scale idle threshold this coarseness is a non-issue. Exits the
-/// WHOLE PROCESS (`std::process::exit(0)`) — never returns an error, never
-/// tears down the connection gracefully first, because there is nothing
-/// left to tear down: zero sessions have done anything and zero commands
-/// are running, by construction of the check itself. `acp_idle_exit_minutes
-/// == 0` disables the loop entirely (checked once, up front — not on every
-/// tick, so a `0` config never even starts the sleep loop).
-async fn idle_self_exit_loop(last_activity_unix: Arc<AtomicU64>, in_flight: Arc<AtomicI64>) {
+impl IdleState {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            last_activity: AtomicU64::new(0),
+            in_flight: AtomicI64::new(0),
+            session_ever_attached: AtomicBool::new(false),
+        }
+    }
+
+    /// Monotonic seconds since this state was created — the clock
+    /// [`should_idle_exit`]'s `now_secs` is measured on.
+    fn elapsed_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    /// Record client traffic. Every request/notification the client sends
+    /// counts, including the ones that are not prompts — `session/close`
+    /// and `session/cancel` are bytes crossing the transport just as much
+    /// as a prompt is, and under a hard ceiling that distinction decides
+    /// when the ceiling starts counting.
+    fn record_activity(&self) {
+        self.last_activity.store(self.elapsed_secs(), Ordering::SeqCst);
+    }
+
+    /// (#1781) Latch the "a client attached a session" fact — `session/new`
+    /// and `session/load` are its only callers, and nothing ever clears it.
+    /// Also records activity, since attaching is itself client traffic.
+    fn record_session_attached(&self) {
+        self.session_ever_attached.store(true, Ordering::SeqCst);
+        self.record_activity();
+    }
+
+    fn command_started(&self) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Stamps activity on COMPLETION before dropping the count — otherwise
+    /// a long-running command (a multi-minute `/review`) drops `in_flight`
+    /// to 0 the instant it finishes while `last_activity` still holds the
+    /// RECEIPT mark from minutes ago, and the very next tick could see a
+    /// stale idle window while the operator is still reading the result.
+    fn command_finished(&self) {
+        self.record_activity();
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// (#1781) How many times the configured idle window an ATTACHED process
+/// gets before the backstop reclaims it anyway — see
+/// [`hard_idle_threshold`].
+const HARD_IDLE_MULTIPLIER: u64 = 48;
+
+/// (#1781) Floor under the hard ceiling — see [`hard_idle_threshold`] for
+/// why it is a WEEK and not a day.
+const HARD_IDLE_FLOOR_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// (#1781) The ceiling an ATTACHED process is measured against: 48× the
+/// configured soft window, never less than a week of *uptime* with no byte
+/// from the client.
+///
+/// **Why a week, when a day sounds like plenty.** The two costs this trades
+/// between are wildly asymmetric. An `darkmux acp` process that outlives its
+/// client holds no model weights — those live in LMStudio — so a leaked one
+/// costs a few MB of RSS and nothing else. A ceiling that fires under a
+/// panel someone is still using costs an IDE restart and IS the bug this
+/// issue is about, since ACP has no reconnect. Bounding the cheap failure
+/// must not risk the expensive one, and a day is inside ordinary use: an
+/// always-on machine with an editor open across a long weekend reaches 24 h
+/// of untouched uptime without anything unusual happening. A week does not
+/// — by then the editor has almost certainly been restarted anyway — while
+/// still turning "leaks forever" into "leaks for at most a week", which is
+/// the whole point of having a ceiling.
+///
+/// **Why a multiplier on top of the floor.** An operator who lengthens
+/// `acp_idle_exit_minutes` past ~3.5 h is stating a longer patience for
+/// this process; the ceiling scales with that rather than being pinned
+/// behind their back. Below that the floor governs — which is also what
+/// keeps an operator who SHORTENS the window (the knob's documented job is
+/// reclaiming spawned-but-unused processes faster) from unknowingly arming
+/// a short kill on the panel they are reading.
+fn hard_idle_threshold(idle_threshold_seconds: u64) -> u64 {
+    idle_threshold_seconds.saturating_mul(HARD_IDLE_MULTIPLIER).max(HARD_IDLE_FLOOR_SECONDS)
+}
+
+/// (#1781) The whole decision [`idle_self_exit_loop`] acts on, as a pure
+/// function of state it is HANDED — so it can be proven without going
+/// anywhere near `std::process::exit`, and so the loop cannot drift away
+/// from what the tests pin (see [`IdleState`]'s own note on the literal
+/// that reverted the previous shape).
+///
+/// Two tiers, keyed on the never-cleared latch:
+///
+/// - **Nothing has ever attached** — a spawned-but-unused process, the
+///   orphan case the backstop exists for. Reclaimed at the configured
+///   window.
+/// - **Something attached at some point** — a real editor session, whether
+///   or not it is open right now. Reclaimed only at
+///   [`hard_idle_threshold`].
+///
+/// The predicate is "has a session EVER attached", not "is one attached
+/// now", because the latter reopens #1781 on a second path: `session/close`
+/// removes the map entry, so a client that closes one thread and opens
+/// another minutes later empties the map in between while its transport and
+/// workspace stay live — and a "currently empty" test would exit under it,
+/// producing the reported `Incoming transport closed` verbatim. #1781 names
+/// this predicate itself, as its option 2 ("only fire when no session has
+/// ever been created, which is the actual orphan case").
+fn should_idle_exit(state: &IdleState, now_secs: u64, idle_threshold_seconds: u64) -> bool {
+    if state.in_flight.load(Ordering::SeqCst) > 0 {
+        return false;
+    }
+    let idle_for = now_secs.saturating_sub(state.last_activity.load(Ordering::SeqCst));
+    let threshold = if state.session_ever_attached.load(Ordering::SeqCst) {
+        hard_idle_threshold(idle_threshold_seconds)
+    } else {
+        idle_threshold_seconds
+    };
+    idle_for >= threshold
+}
+
+/// (#1698 Packet B2, scope G2; gated per #1781 — see [`should_idle_exit`])
+/// Background idle self-exit loop, spawned once per `serve()` call. Checks
+/// every 60s (a check-cadence far below any realistic idle threshold, so it
+/// never meaningfully delays the exit); on a MINUTES-scale idle threshold
+/// this coarseness is a non-issue. Exits the WHOLE PROCESS
+/// (`std::process::exit(0)`) — never returns an error, never tears down the
+/// connection gracefully first, because there is nothing left to tear down:
+/// zero commands are running, by construction of the check itself, and
+/// nothing has spoken to this process for at least a week if a session was
+/// ever attached. `acp_idle_exit_minutes == 0` disables the loop entirely
+/// (checked once, up front — not on every tick, so a `0` config never even
+/// starts the sleep loop).
+///
+/// The loop reads ATOMICS only — no mutex, so no lock this task could find
+/// poisoned by a panicking handler and then panic on itself, silently
+/// disabling the backstop in a process whose job is being observable. That
+/// failure mode is gone by construction rather than handled.
+///
+/// This function is deliberately nothing but config reading + wiring: the
+/// whole decision loop lives in [`idle_self_exit_loop_with`], which a test
+/// can run for real (see `the_real_loop_never_reclaims_an_attached_process`)
+/// because both of the things that make this one untestable — the config
+/// read and `std::process::exit` — are parameters there.
+async fn idle_self_exit_loop(idle: Arc<IdleState>) {
     let idle_minutes = darkmux_types::config_access::acp_idle_exit_minutes();
     if idle_minutes == 0 {
         return;
     }
-    let idle_seconds = idle_minutes * 60;
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        if in_flight.load(Ordering::SeqCst) > 0 {
-            continue;
-        }
-        let idle_for = now_unix().saturating_sub(last_activity_unix.load(Ordering::SeqCst));
-        if idle_for >= idle_seconds {
-            eprintln!(
-                "[darkmux-acp] idle for {idle_for}s (>= {idle_seconds}s configured) with zero \
-                 commands in flight — self-exiting"
-            );
+    idle_self_exit_loop_with(
+        idle,
+        idle_minutes.saturating_mul(60),
+        std::time::Duration::from_secs(60),
+        |message| {
+            eprintln!("{message}");
             std::process::exit(0);
+        },
+    )
+    .await;
+}
+
+/// (#1781) The idle self-exit loop itself, with its two untestable
+/// dependencies lifted into parameters: the check `tick` (60s in
+/// production, ~1ms under test, so a test never waits a minute to learn
+/// what the loop decides) and `on_exit`, which production wires to
+/// `eprintln!` + `std::process::exit(0)` and a test wires to a counter.
+///
+/// **This seam is the point, not a convenience.** With the loop's decision
+/// reachable only through [`idle_self_exit_loop`], the one call site that
+/// feeds [`should_idle_exit`] its state was unreachable by any test — and a
+/// review proved the entire #1781 fix could be reverted there, by passing a
+/// freshly-constructed `IdleState` (unattached, `last_activity: 0`, so
+/// every process falls into the orphan tier), with `cargo build`, `cargo
+/// clippy -- -D warnings` and the whole acp suite still green. Handing the
+/// loop the REAL state a served connection is wired to, and running it, is
+/// what makes that revert red.
+///
+/// Returns after `on_exit` so a test's callback doesn't spin; in production
+/// `on_exit` diverges and this never returns.
+async fn idle_self_exit_loop_with(
+    idle: Arc<IdleState>,
+    idle_seconds: u64,
+    tick: std::time::Duration,
+    on_exit: impl Fn(String),
+) {
+    loop {
+        tokio::time::sleep(tick).await;
+        let now_secs = idle.elapsed_secs();
+        if should_idle_exit(&idle, now_secs, idle_seconds) {
+            let idle_for = now_secs.saturating_sub(idle.last_activity.load(Ordering::SeqCst));
+            let reason = if idle.session_ever_attached.load(Ordering::SeqCst) {
+                format!(
+                    "no client traffic since the last session, past the {}s hard ceiling",
+                    hard_idle_threshold(idle_seconds)
+                )
+            } else {
+                format!("no session ever attached, past the {idle_seconds}s configured window")
+            };
+            on_exit(format!(
+                "[darkmux-acp] idle for {idle_for}s with zero commands in flight — {reason}; \
+                 self-exiting"
+            ));
+            return;
         }
     }
 }
@@ -447,7 +702,7 @@ pub fn run() -> Result<i32> {
     let router: RouterCall = Arc::new(crate::radio::dispatch_router_call);
     let answerer: AnswererCall = Arc::new(crate::radio_answer::dispatch_answerer_call_with);
     let scope: ScopeCall = Arc::new(crate::radio_answer::grounding_scope_for);
-    rt.block_on(serve(router, AnsweringSeat { call: answerer, scope }, AcpStdio::new()))?;
+    rt.block_on(serve(router, AnsweringSeat { call: answerer, scope }, Arc::new(IdleState::new()), AcpStdio::new()))?;
     Ok(0)
 }
 
@@ -457,23 +712,35 @@ pub fn run() -> Result<i32> {
 /// in-process `tokio::io::duplex`, so the SAME connection-handling code
 /// this function builds runs in both, never a second test-only copy of the
 /// handler chain.
+///
+/// `idle` is injectable for the same reason and by the same convention
+/// (#1781): the latch's SET sites live inside these handler closures, where
+/// no unit test can reach them, and a set-site that nothing observes is a
+/// set-site a mutation can delete for free. Production (`run()` above)
+/// hands in a fresh `IdleState`; the wire tests hand in one they keep a
+/// handle on, so `session/new`/`session/load` actually latching it is an
+/// asserted fact rather than an assumed one.
 async fn serve(
     router_call: RouterCall,
     seat: AnsweringSeat,
+    idle: Arc<IdleState>,
     transport: impl agent_client_protocol::ConnectTo<Agent> + 'static,
 ) -> Result<()> {
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     let next_session_ordinal = Arc::new(AtomicU64::new(1));
 
-    // (#1698 Packet B2, scope G2 — idle self-exit) `last_activity_unix`
-    // updates on every `session/new` + `session/prompt`; `in_flight` counts
-    // commands/routes currently executing. The background loop spawned
-    // below self-exits the process once BOTH are quiet for
-    // `acp_idle_exit_minutes` — "most swaps find no process running" (the
-    // issue's session-hygiene addendum).
-    let last_activity_unix = Arc::new(AtomicU64::new(now_unix()));
-    let in_flight = Arc::new(AtomicI64::new(0));
-    tokio::spawn(idle_self_exit_loop(last_activity_unix.clone(), in_flight.clone()));
+    // (#1698 Packet B2, scope G2 — idle self-exit; gated on the
+    // ever-attached latch per #1781) `IdleState` carries the three things
+    // the loop below decides on: activity (stamped by every handler that
+    // sees client traffic), the in-flight command count, and the
+    // never-cleared "a client attached a session here" latch. The loop
+    // reclaims a spawned-but-unused process at `acp_idle_exit_minutes`
+    // ("most swaps find no process running" — the issue's session-hygiene
+    // addendum) and a once-attached one only at the week-scale hard ceiling.
+    // See `IdleState`'s and `should_idle_exit`'s own docs. The state
+    // itself is a parameter (see this function's own doc) so a wire test
+    // can observe the latch these handlers set.
+    tokio::spawn(idle_self_exit_loop(idle.clone()));
 
     // (#1684 remainder) The abort-handle registry `session/cancel` and
     // `session/close` both drive — see [`InFlight`]'s own doc. Distinct from
@@ -489,11 +756,12 @@ async fn serve(
     let sessions_for_load = sessions.clone();
     let sessions_for_config = sessions.clone();
     let sessions_for_close = sessions.clone();
-    let activity_for_new = last_activity_unix.clone();
-    let activity_for_prompt = last_activity_unix.clone();
-    let activity_for_load = last_activity_unix.clone();
-    let activity_for_config = last_activity_unix.clone();
-    let in_flight_for_prompt = in_flight.clone();
+    let idle_for_new = idle.clone();
+    let idle_for_prompt = idle.clone();
+    let idle_for_load = idle.clone();
+    let idle_for_config = idle.clone();
+    let idle_for_cancel = idle.clone();
+    let idle_for_close = idle.clone();
     let in_flight_tasks_for_prompt = in_flight_tasks.clone();
     let in_flight_tasks_for_cancel = in_flight_tasks.clone();
     let in_flight_tasks_for_close = in_flight_tasks.clone();
@@ -539,7 +807,9 @@ async fn serve(
         )
         .on_receive_request(
             async move |request: NewSessionRequest, responder, cx: ConnectionTo<Client>| {
-                activity_for_new.store(now_unix(), Ordering::SeqCst);
+                // (#1781) Latches the ever-attached flag — from here on,
+                // this process is only reclaimable at the hard ceiling.
+                idle_for_new.record_session_attached();
                 let ordinal = ordinal_for_new.fetch_add(1, Ordering::Relaxed);
                 let session_id = SessionId::new(format!("darkmux-acp-{ordinal}"));
                 let overrides = crate::radio_answer::AnswererOverrides::default();
@@ -589,7 +859,7 @@ async fn serve(
         )
         .on_receive_request(
             async move |request: PromptRequest, responder, cx: ConnectionTo<Client>| {
-                activity_for_prompt.store(now_unix(), Ordering::SeqCst);
+                idle_for_prompt.record_activity();
                 let session_id = request.session_id.clone();
                 let text = extract_text(&request.prompt);
                 let trimmed = text.trim();
@@ -685,9 +955,8 @@ async fn serve(
                     // loop from handling other sessions/notifications either.
                     let cx_task = cx.clone();
                     let sessions_for_task = sessions_for_prompt.clone();
-                    let in_flight_for_task = in_flight_for_prompt.clone();
+                    let idle_for_task = idle_for_prompt.clone();
                     let in_flight_tasks_for_task = in_flight_tasks_for_prompt.clone();
-                    let activity_for_task = activity_for_prompt.clone();
                     return cx.spawn(async move {
                         // (#1698 Packet B2, scope G2) Incremented HERE, as
                         // the future's own first action, not before
@@ -696,7 +965,7 @@ async fn serve(
                         // all, so incrementing before the call would leak a
                         // count nothing ever decrements, disabling idle
                         // self-exit for the rest of the process's life.
-                        in_flight_for_task.fetch_add(1, Ordering::SeqCst);
+                        idle_for_task.command_started();
                         // Robustness rule (see the task brief): NOTHING from
                         // here down may panic or propagate a hard error across
                         // the protocol boundary. A crashed-looking agent in
@@ -730,16 +999,11 @@ async fn serve(
                             },
                         )
                         .await;
-                        // Stamped on COMPLETION, not just on receipt (the
-                        // top of the handler) — otherwise a long-running
-                        // command (a multi-minute `/review`) drops
-                        // `in_flight` to 0 the instant it finishes while
-                        // `last_activity_unix` still holds the RECEIPT
-                        // timestamp from minutes ago, and the very next
-                        // idle-loop tick sees a stale idle window and exits
-                        // while the operator is still reading the result.
-                        activity_for_task.store(now_unix(), Ordering::SeqCst);
-                        in_flight_for_task.fetch_sub(1, Ordering::SeqCst);
+                        // Stamps activity on COMPLETION before dropping
+                        // the count, not just on receipt at the top of the
+                        // handler — see `IdleState::command_finished`'s own
+                        // doc for why receipt-only stamping is wrong.
+                        idle_for_task.command_finished();
 
                         responder.respond(PromptResponse::new(stop_reason))
                     });
@@ -759,14 +1023,13 @@ async fn serve(
                 let router_for_task = router_for_prompt.clone();
                 let seat_for_task = seat_for_prompt.clone();
                 let sessions_for_task = sessions_for_prompt.clone();
-                let in_flight_for_task = in_flight_for_prompt.clone();
+                let idle_for_task = idle_for_prompt.clone();
                 let in_flight_tasks_for_task = in_flight_tasks_for_prompt.clone();
-                let activity_for_task = activity_for_prompt.clone();
                 cx.spawn(async move {
                     // (#1698 Packet B2, scope G2) See the slash-path arm's
                     // own comment on why this increments HERE, inside the
                     // future, rather than before `cx.spawn`.
-                    in_flight_for_task.fetch_add(1, Ordering::SeqCst);
+                    idle_for_task.command_started();
                     // (#1684 remainder — cancellation) Same `run_cancellable`
                     // wrapping as the slash path above — see its own doc.
                     let work_session_id = session_id.clone();
@@ -792,10 +1055,10 @@ async fn serve(
                         },
                     )
                     .await;
-                    // Stamped on completion — see the slash-path arm's own
-                    // comment on why receipt-only stamping is wrong.
-                    activity_for_task.store(now_unix(), Ordering::SeqCst);
-                    in_flight_for_task.fetch_sub(1, Ordering::SeqCst);
+                    // Stamped on completion — see
+                    // `IdleState::command_finished`'s own doc on why
+                    // receipt-only stamping is wrong.
+                    idle_for_task.command_finished();
                     responder.respond(PromptResponse::new(stop_reason))
                 })
             },
@@ -812,7 +1075,9 @@ async fn serve(
         // the vendored v1 schema (`Default`-derived, every field optional).
         .on_receive_request(
             async move |request: LoadSessionRequest, responder, cx: ConnectionTo<Client>| {
-                activity_for_load.store(now_unix(), Ordering::SeqCst);
+                // (#1781) A resume attaches a session just as `session/new`
+                // does — same latch, for the same reason.
+                idle_for_load.record_session_attached();
                 eprintln!(
                     "[darkmux-acp] session/load: {} cwd={}",
                     request.session_id,
@@ -877,7 +1142,7 @@ async fn serve(
                 // have the process exit under them — the one interaction
                 // that proves someone is at the keyboard would be the one
                 // interaction that doesn't count as being at the keyboard.
-                activity_for_config.store(now_unix(), Ordering::SeqCst);
+                idle_for_config.record_activity();
                 // (#1698 Packet B2 review finding) `get_mut`, NOT
                 // `entry(...).or_default()` — the wire-supplied session id
                 // is untrusted input; materializing a `SessionState` for an
@@ -932,6 +1197,10 @@ async fn serve(
         // error.
         .on_receive_notification(
             async move |cancel: CancelNotification, _cx| {
+                // (#1781) A stop-button press is client traffic — somebody
+                // is at the keyboard. Without this stamp the hard ceiling
+                // would keep counting from before the cancel.
+                idle_for_cancel.record_activity();
                 let mut guard =
                     in_flight_tasks_for_cancel.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
                 match guard.remove(&cancel.session_id) {
@@ -985,6 +1254,12 @@ async fn serve(
         // the wire level by this file's own tests).
         .on_receive_request(
             async move |request: CloseSessionRequest, responder, _cx| {
+                // (#1781) Closing a thread is client traffic too. The
+                // ever-attached latch is what keeps this from re-arming the
+                // reported bug (a close no longer makes the process look
+                // never-used), and this stamp is what keeps the hard
+                // ceiling honest about when the client last spoke.
+                idle_for_close.record_activity();
                 if let Some(InFlightSlot::Running(handle)) = in_flight_tasks_for_close
                     .lock()
                     .expect("darkmux acp: in-flight tasks mutex poisoned")
@@ -1854,6 +2129,139 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+    /// (#1781) Build an `IdleState` whose activity mark is a KNOWN zero, so
+    /// the `now_secs` a test hands `should_idle_exit` IS the idle duration —
+    /// never a function of how long the test itself took to reach the
+    /// assertion. (`IdleState::new` already starts at zero; the explicit
+    /// store is what keeps that true after a `record_*` call.)
+    fn idle_state_idle_since_zero() -> IdleState {
+        let state = IdleState::new();
+        state.last_activity.store(0, Ordering::SeqCst);
+        state
+    }
+
+    /// (#1781) `should_idle_exit` is the whole decision `idle_self_exit_loop`
+    /// acts on, taking the REAL `IdleState` the loop hands it — so these
+    /// prove it without touching `std::process::exit`, and so the loop
+    /// cannot be reverted past them by passing a stand-in (see
+    /// `IdleState`'s own doc on the literal that reverted the previous
+    /// shape).
+    ///
+    /// The case the issue is actually about: a session left open but idle
+    /// past the configured window must NOT trigger the exit — that is what
+    /// bricked the Zed panel, because the loop used to look only at elapsed
+    /// time and the in-flight count.
+    #[test]
+    fn should_idle_exit_never_fires_once_a_session_has_attached() {
+        let state = idle_state_idle_since_zero();
+        state.record_session_attached();
+        state.last_activity.store(0, Ordering::SeqCst);
+        // Idle time and in-flight are BOTH in the "would exit" shape for
+        // the CONFIGURED window — only the attached latch holds it back.
+        assert!(
+            !should_idle_exit(&state, 3600, 1800),
+            "an attached (merely idle) session must never be killed at the configured window"
+        );
+    }
+
+    /// (#1781, the predicate's whole point) `session/close` prunes the
+    /// session from the map, so "no session open right now" goes true again
+    /// while the client, its transport and its workspace are all still
+    /// live — close a thread, wait out the window, open a new one and the
+    /// reported `Incoming transport closed` comes back verbatim on a second
+    /// path. The latch is set by attaching and is never cleared by
+    /// anything, close included (which only records activity and prunes the
+    /// map), so that path is closed by construction.
+    #[test]
+    fn a_closed_session_keeps_the_latch_so_the_reported_bug_cannot_recur() {
+        let state = idle_state_idle_since_zero();
+        state.record_session_attached();
+        // Everything `session/close` does to this state: record the
+        // traffic. (Pruning happens in the `sessions` map, which this
+        // decision deliberately no longer reads.)
+        state.record_activity();
+        state.last_activity.store(0, Ordering::SeqCst);
+        assert!(
+            !should_idle_exit(&state, 3600, 1800),
+            "a process whose only session was closed must still not be reclaimed at the \
+             configured window — that is the #1781 symptom on a second path"
+        );
+    }
+
+    /// The command-in-flight guard, which `should_idle_exit` now evaluates
+    /// itself rather than relying on the loop to short-circuit ahead of it —
+    /// so this pins the LIVE guard, not a branch the loop never reaches.
+    /// Set up in the strongest "would exit" shape available: never
+    /// attached, idle window long past.
+    #[test]
+    fn should_idle_exit_never_fires_with_a_command_in_flight() {
+        let state = idle_state_idle_since_zero();
+        state.command_started();
+        assert!(!should_idle_exit(&state, 3600, 1800));
+    }
+
+    /// Idle time under the configured threshold must not fire even with
+    /// everything else in the "would exit" shape — the loop is time-gated,
+    /// not just presence-gated.
+    #[test]
+    fn should_idle_exit_never_fires_before_the_threshold() {
+        let state = idle_state_idle_since_zero();
+        assert!(!should_idle_exit(&state, 1799, 1800));
+    }
+
+    /// The one case the backstop actually exists for (module doc's #1781
+    /// note): nothing ever attached a session to this process, nothing is
+    /// running, and it has sat idle past the configured window. This is the
+    /// reclaim case — removing it entirely (rather than gating it) was
+    /// rejected because a spawned-and-abandoned process would otherwise
+    /// never exit.
+    #[test]
+    fn should_idle_exit_reclaims_a_process_no_session_ever_attached() {
+        let state = idle_state_idle_since_zero();
+        assert!(should_idle_exit(&state, 1800, 1800));
+        assert!(should_idle_exit(&state, 3600, 1800));
+    }
+
+    /// (#1781) The leak is BOUNDED, not merely accepted: a process that was
+    /// attached once and has heard nothing since is still reclaimed — just
+    /// at the week-scale hard ceiling rather than the configured window, far
+    /// past any plausible "I'll come back to that panel".
+    #[test]
+    fn should_idle_exit_reclaims_an_attached_process_at_the_hard_ceiling() {
+        let state = idle_state_idle_since_zero();
+        state.record_session_attached();
+        state.last_activity.store(0, Ordering::SeqCst);
+        let hard = hard_idle_threshold(1800);
+        assert!(
+            !should_idle_exit(&state, hard - 1, 1800),
+            "one second under the ceiling must still not fire"
+        );
+        assert!(
+            should_idle_exit(&state, hard, 1800),
+            "at the ceiling the orphan is finally reclaimed"
+        );
+    }
+
+    /// (#1781) The ceiling's floor is what keeps an operator who shortens
+    /// the reclaim window — the knob's documented purpose is
+    /// spawned-but-unused processes — from also arming a short kill on the
+    /// panel they are reading, and what keeps the shipped default well
+    /// clear of ordinary use. See `hard_idle_threshold`'s own doc for why
+    /// the floor is a week rather than a day.
+    #[test]
+    fn hard_idle_threshold_never_drops_below_a_week() {
+        const WEEK: u64 = 7 * 24 * 60 * 60;
+        assert_eq!(hard_idle_threshold(30 * 60), WEEK, "the shipped 30-minute default lands on the floor");
+        assert_eq!(hard_idle_threshold(60), WEEK, "a one-minute window still gets a full week");
+        assert_eq!(hard_idle_threshold(0), WEEK, "and the floor holds even at zero");
+        assert_eq!(
+            hard_idle_threshold(8 * 60 * 60),
+            8 * 60 * 60 * HARD_IDLE_MULTIPLIER,
+            "above the floor the multiplier is what applies"
+        );
+        assert_eq!(hard_idle_threshold(u64::MAX), u64::MAX, "and the multiply saturates rather than wrapping");
+    }
+
     /// RAII env-var guard — isolates `DARKMUX_CREW_DIR`/`DARKMUX_FLOWS_DIR`
     /// to a fresh tempdir for one test, restoring the prior value on
     /// `Drop` (including on panic/early-return, unlike the manual
@@ -1959,6 +2367,19 @@ mod tests {
         router: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
         answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync + 'static,
     ) -> (DuplexStream, BufReader<DuplexStream>) {
+        let (writer, reader, _idle) = spawn_test_agent_observing_idle(router, answerer);
+        (writer, reader)
+    }
+
+    /// (#1781) Same spawn, additionally handing back the `IdleState` the
+    /// served connection is wired to — the seam that lets a wire test
+    /// assert the ever-attached latch is actually SET by `session/new` /
+    /// `session/load`, rather than only that `should_idle_exit` would
+    /// respect it if it were.
+    fn spawn_test_agent_observing_idle(
+        router: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
+        answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync + 'static,
+    ) -> (DuplexStream, BufReader<DuplexStream>, Arc<IdleState>) {
         let (test_writer, agent_reader) = tokio::io::duplex(64 * 1024);
         let (agent_writer, test_reader) = tokio::io::duplex(64 * 1024);
         let router_call: RouterCall = Arc::new(router);
@@ -1967,10 +2388,18 @@ mod tests {
         // WIRE, not the data boundary — see `ScopeCall`'s own doc.
         let scope_call: ScopeCall = Arc::new(|_| crate::radio_answer::GroundingScope::Full);
         let transport = ByteStreams::new(agent_writer.compat_write(), agent_reader.compat());
+        let idle = Arc::new(IdleState::new());
+        let idle_for_serve = idle.clone();
         tokio::spawn(async move {
-            let _ = serve(router_call, AnsweringSeat { call: answerer_call, scope: scope_call }, transport).await;
+            let _ = serve(
+                router_call,
+                AnsweringSeat { call: answerer_call, scope: scope_call },
+                idle_for_serve,
+                transport,
+            )
+            .await;
         });
-        (test_writer, BufReader::new(test_reader))
+        (test_writer, BufReader::new(test_reader), idle)
     }
 
     /// The default answerer for tests that never expect the answering seat
@@ -2603,6 +3032,312 @@ mod tests {
             chunk_text(&no_cwd).contains("no working directory recorded"),
             "a prompt on a CLOSED session must find its cwd entry pruned: {}",
             chunk_text(&no_cwd)
+        );
+    }
+
+    /// (#1781) The set-site test the unit tests structurally cannot be:
+    /// `should_idle_exit`'s own tests construct an `IdleState` by hand, so
+    /// they would all stay green if `session/new` simply stopped latching
+    /// it. This drives the REAL handler chain over the wire and asserts the
+    /// flag on the state `serve()` is actually using.
+    ///
+    /// It also pins the reported bug's second path end to end: close the
+    /// only session — which empties the `sessions` map, the predicate this
+    /// fix replaced — and the process must STILL not be reclaimable at the
+    /// configured window, because the latch is never cleared.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_new_latches_ever_attached_and_close_never_clears_it() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+
+        let router = |_msg: &str| -> Result<String> {
+            panic!("this scenario never prompts, so the router must never be reached");
+        };
+        let (mut writer, mut reader, idle) = spawn_test_agent_observing_idle(router, never_answer);
+
+        assert!(
+            !idle.session_ever_attached.load(Ordering::SeqCst),
+            "a freshly served process has had nothing attached to it yet"
+        );
+
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+        assert!(
+            idle.session_ever_attached.load(Ordering::SeqCst),
+            "session/new must latch the ever-attached flag"
+        );
+
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 99, "method": "session/close",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
+        let close_response = recv_json(&mut reader).await;
+        assert!(close_response.get("result").is_some(), "session/close must succeed: {close_response}");
+
+        assert!(
+            idle.session_ever_attached.load(Ordering::SeqCst),
+            "session/close prunes the sessions map but must never clear the latch — that is \
+             exactly the path #1781 would recur on"
+        );
+        idle.last_activity.store(0, Ordering::SeqCst);
+        assert!(
+            !should_idle_exit(&idle, 3600, 1800),
+            "an hour after closing its only session, this process must still not self-exit at \
+             the configured window"
+        );
+    }
+
+    /// (#1781) The LOOP itself, run for real against the real `IdleState` a
+    /// served connection is wired to — the assertion `should_idle_exit`'s
+    /// own unit tests structurally cannot make. Those hand-build a state, so
+    /// they all stay green if the loop's call site stops passing the state
+    /// it actually has; a review proved exactly that revert
+    /// (`should_idle_exit(&IdleState::new(), ..)`) built clean, passed
+    /// `clippy -D warnings` and left the whole suite green while defeating
+    /// the entire fix. `idle_self_exit_loop_with` exists so this test can
+    /// exercise that call site with a 1ms tick instead of the production 60s
+    /// one.
+    ///
+    /// Two halves, and BOTH are load-bearing. The negative half is the fix
+    /// (an attached process is not reclaimed even at a 0-second configured
+    /// window, because the ceiling governs it). The positive half is the
+    /// control that keeps the negative one from passing vacuously — the
+    /// same loop, same tick, same threshold, against a state nothing ever
+    /// attached to, MUST reclaim.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_real_loop_never_reclaims_an_attached_process() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+
+        let router = |_msg: &str| -> Result<String> {
+            panic!("this scenario never prompts, so the router must never be reached");
+        };
+        let (mut writer, mut reader, idle) = spawn_test_agent_observing_idle(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let _session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        // A 0-second configured window is the most hostile setting the
+        // orphan tier can have: every tick sees `idle_for >= 0`. The
+        // attached tier must still be governed by `hard_idle_threshold(0)`
+        // — the week-scale floor — so this loop must never fire.
+        let exits = Arc::new(AtomicUsize::new(0));
+        let exits_for_loop = exits.clone();
+        let attached_loop = idle_self_exit_loop_with(
+            idle.clone(),
+            0,
+            std::time::Duration::from_millis(1),
+            move |_message| {
+                exits_for_loop.fetch_add(1, AtomicOrdering::SeqCst);
+            },
+        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(250), attached_loop).await;
+        assert!(
+            outcome.is_err(),
+            "the loop must keep running against an attached process, never decide to exit"
+        );
+        assert_eq!(
+            exits.load(AtomicOrdering::SeqCst),
+            0,
+            "a process a client attached a session to must never be reclaimed by the idle loop, \
+             however short the configured window"
+        );
+
+        // The control: the SAME loop, tick and threshold, against a state
+        // nothing ever attached to. If this doesn't fire, the assertion
+        // above proves nothing.
+        let orphan = Arc::new(IdleState::new());
+        let orphan_exits = Arc::new(AtomicUsize::new(0));
+        let orphan_exits_for_loop = orphan_exits.clone();
+        let orphan_loop = idle_self_exit_loop_with(
+            orphan,
+            0,
+            std::time::Duration::from_millis(1),
+            move |_message| {
+                orphan_exits_for_loop.fetch_add(1, AtomicOrdering::SeqCst);
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(250), orphan_loop)
+            .await
+            .expect("the loop must reclaim a process no session ever attached to");
+        assert_eq!(
+            orphan_exits.load(AtomicOrdering::SeqCst),
+            1,
+            "the orphan control must have exited exactly once"
+        );
+    }
+
+    /// (#1781) EVERY handler that sees client traffic stamps
+    /// `last_activity` — asserted per handler, over the wire, against the
+    /// real state `serve()` is using.
+    ///
+    /// Without this, all four stamps are deletable with the whole suite
+    /// green, and the production failure is invisible to CI forever: with
+    /// them gone `last_activity` freezes at session attach, so the hard
+    /// ceiling counts from ATTACH rather than from the client's last byte,
+    /// and a panel in continuous daily use on an always-on machine dies at
+    /// exactly 7 days of uptime — #1781 recurring on a 7-day fuse.
+    ///
+    /// Each handler is driven after storing a SENTINEL, and the assertion
+    /// is that the sentinel is gone. Not "the value grew": `elapsed_secs`
+    /// has 1-second granularity and this whole test runs in milliseconds,
+    /// so a real stamp writes ~0. Overwriting the sentinel is the
+    /// observable fact, and it is exactly the one a deleted stamp loses.
+    ///
+    /// The prompt half sends WHITESPACE deliberately. A prompt that
+    /// executes also stamps on completion (`IdleState::command_finished`),
+    /// which would mask the receipt-time stamp; the empty-text arm returns
+    /// without ever spawning a command, so only the handler's own stamp can
+    /// clear the sentinel.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn every_client_facing_handler_stamps_activity() {
+        const SENTINEL: u64 = 9_999_999;
+
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+
+        let router = |_msg: &str| -> Result<String> {
+            panic!("this scenario never routes, so the router must never be reached");
+        };
+        let (mut writer, mut reader, idle) = spawn_test_agent_observing_idle(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        // session/prompt — the whitespace arm, so no command spawns and
+        // `command_finished`'s own stamp can't stand in for this one.
+        idle.last_activity.store(SENTINEL, Ordering::SeqCst);
+        send_prompt(&mut writer, &session_id, "   ").await;
+        let _not_a_command = recv_json(&mut reader).await;
+        let prompt_response = recv_json(&mut reader).await;
+        assert_end_turn(&prompt_response);
+        assert_ne!(
+            idle.last_activity.load(Ordering::SeqCst),
+            SENTINEL,
+            "session/prompt must stamp activity on receipt"
+        );
+
+        // session/set_config_option — adjusting a picker is somebody at the
+        // keyboard.
+        idle.last_activity.store(SENTINEL, Ordering::SeqCst);
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 4, "method": "session/set_config_option",
+                "params": {"sessionId": session_id, "configId": "humor", "value": "90"}
+            }),
+        )
+        .await;
+        let set_response = recv_json(&mut reader).await;
+        assert!(set_response.get("result").is_some(), "{set_response}");
+        assert_ne!(
+            idle.last_activity.load(Ordering::SeqCst),
+            SENTINEL,
+            "session/set_config_option must stamp activity"
+        );
+
+        // session/cancel — a notification, so there is no response to wait
+        // on; poll the stamp instead rather than assuming the handler has
+        // already run.
+        idle.last_activity.store(SENTINEL, Ordering::SeqCst);
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
+        assert!(
+            await_stamp(&idle, SENTINEL).await,
+            "session/cancel must stamp activity — a stop-button press is client traffic"
+        );
+
+        // session/close — closing a thread is client traffic too, and the
+        // stamp is what keeps the hard ceiling counting from the close
+        // rather than from before it.
+        idle.last_activity.store(SENTINEL, Ordering::SeqCst);
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 5, "method": "session/close",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
+        let close_response = recv_json(&mut reader).await;
+        assert!(close_response.get("result").is_some(), "{close_response}");
+        assert_ne!(
+            idle.last_activity.load(Ordering::SeqCst),
+            SENTINEL,
+            "session/close must stamp activity"
+        );
+    }
+
+    /// Wait (bounded) for `last_activity` to stop being `sentinel` —
+    /// the synchronization a NOTIFICATION handler needs, since it sends no
+    /// response a test could await. Returns whether the stamp landed.
+    async fn await_stamp(idle: &Arc<IdleState>, sentinel: u64) -> bool {
+        for _ in 0..400 {
+            if idle.last_activity.load(Ordering::SeqCst) != sentinel {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// (#1781) `session/load` — a resume against a process that never
+    /// minted the id itself (the binary-swap case scope G1 exists for) —
+    /// attaches a session just as `session/new` does, and must latch the
+    /// same flag. Without this, a resumed panel is one that "never had a
+    /// session attached" as far as the backstop is concerned.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_load_latches_ever_attached() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+
+        let router = |_msg: &str| -> Result<String> {
+            panic!("this scenario never prompts, so the router must never be reached");
+        };
+        let (mut writer, mut reader, idle) = spawn_test_agent_observing_idle(router, never_answer);
+
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
+        let _init_response = recv_json(&mut reader).await;
+        assert!(
+            !idle.session_ever_attached.load(Ordering::SeqCst),
+            "initialize alone attaches no session"
+        );
+
+        let cwd = std::env::temp_dir();
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/load",
+                "params": {"sessionId": "darkmux-acp-from-a-previous-process", "cwd": cwd.to_string_lossy(), "mcpServers": []}
+            }),
+        )
+        .await;
+        let load_response = recv_json(&mut reader).await;
+        assert!(load_response.get("result").is_some(), "session/load must succeed: {load_response}");
+        let _available_commands_update = recv_json(&mut reader).await;
+
+        assert!(
+            idle.session_ever_attached.load(Ordering::SeqCst),
+            "session/load must latch the ever-attached flag"
         );
     }
 
