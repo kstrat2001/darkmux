@@ -9742,13 +9742,20 @@ fn ensure_utility_resident(
 /// identifier_opt_out_and_diverge_with_one` pins both halves. Collapsing them
 /// into one shared helper is #2537's concern, not this fix's.
 ///
-/// (#2571, out of scope) This closes the shape where `internal.utility` IS
-/// bound. When it is UNSET the host skips the residency block entirely
-/// (`compaction.compactor_model` is `None`) and the runtime falls back to its
-/// own `DEFAULT_COMPACTOR_MODEL` — itself already namespaced
-/// (`darkmux:qwen3-4b-instruct-2507`, `runtime/src/compaction.rs`) — so
-/// compaction addresses a darkmux instance nothing on the host ever loaded.
-/// Pre-existing and unchanged by #2536; filed as #2571.
+/// (#2571) This function closes the shape where `internal.utility` IS
+/// bound. When it is UNSET the host skips the residency block entirely and
+/// leaves `compaction.compactor_model` as `None` — the container then
+/// receives no `--compactor-model` flag at all
+/// (`apply_compaction_flags`'s `if let Some(model) = &compaction.
+/// compactor_model`). Pre-#2571 the RUNTIME independently filled that gap
+/// with its own hardcoded `DEFAULT_COMPACTOR_MODEL` fallback, addressing a
+/// darkmux instance nothing on the host ever loaded — the #2571 fix is
+/// entirely on the runtime side (`runtime/src/compaction.rs`:
+/// `CompactionConfig.compactor_model` is `Option<String>` now, and
+/// `needs_compaction` refuses whenever it's `None`), so the host's own
+/// behavior here — correctly reporting "nothing loaded" by omitting the
+/// flag — needed no change at all. Host and runtime now agree by
+/// construction: no flag in, no compaction attempted.
 pub(crate) fn compactor_wire_model_id(compactor_id: &str) -> String {
     darkmux_gestalt::namespaced_identifier(bare_model_key(compactor_id), None)
 }

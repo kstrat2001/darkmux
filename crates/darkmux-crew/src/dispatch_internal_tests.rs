@@ -10048,14 +10048,23 @@
 
     // ── (#2536 / #2537 / #2570) The two derived wire-id computations ────────
     //
-    // FOUR production sites put a model id on a dispatch WIRE. Two DERIVE the
-    // darkmux-namespaced identifier: `dispatch_wire_model_id` (the main
-    // dispatch model, #2240) and `compactor_wire_model_id` (the compactor,
-    // #2536). The other two pass a config string through VERBATIM while their
-    // own `seat()` derives the namespaced identifier for the LOAD —
-    // `dispatch.single_shot` (`step_kinds/builtins.rs`) and `dispatch.map` —
-    // i.e. the same load/wire split this fix closes, still open there and
-    // filed as #2570. This test speaks only for the two derived ones.
+    // FOUR production sites put a model id on a dispatch WIRE, and as of
+    // #2570 all four DERIVE the darkmux-namespaced identifier rather than
+    // passing a config string through verbatim: `dispatch_wire_model_id`
+    // (the main dispatch model, #2240), `compactor_wire_model_id` (the
+    // compactor, #2536), and `dispatch.single_shot` / `dispatch.map`
+    // (`step_kinds::builtins::local_dispatch_wire_model_id`, #2570 — the
+    // one function both of THOSE kinds' `seat()`s and both kinds' local
+    // dispatch now share, closing the split where `seat()` derived the
+    // namespaced identifier for the LOAD but `run`/`run_map` put the bare
+    // `config.model` string on the wire, unconditionally). This test
+    // speaks only for the two `Profile`-resolved ones below; the
+    // `step_kinds::builtins` pair has its own agreement tests
+    // (`local_dispatch_wire_model_id_matches_what_seat_claims_without_an_override`
+    // and its `_honors_an_explicit_identifier_override` sibling) because
+    // they resolve against a `Step.config` string, not a `Profile.models[]`
+    // lookup — collapsing all four behind one shared helper despite that
+    // shape difference is #2537's concern, not this one's.
     //
     // It pins BOTH halves of their relationship, because they are not simply
     // "in agreement" (#2536 review, finding 2): with no `identifier` opt-out
