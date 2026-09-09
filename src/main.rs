@@ -1384,7 +1384,7 @@ struct DispatchInvocation {
     mod_key: Vec<String>,
     profile: Option<String>,
     session_id: Option<String>,
-    timeout: u32,
+    timeout: Option<u32>,
     workdir: Option<std::path::PathBuf>,
     phase_id: Option<String>,
     skip_preflight: bool,
@@ -1530,7 +1530,13 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         message,
         brief_refs,
         session_id,
-        timeout_seconds: timeout,
+        // (#2480) `timeout_seconds` bounds ONLY the tool-less single-call
+        // paths (remote/hosted dispatch, the RADIO single-shot path) —
+        // unchanged behavior, same default as before the CLI flag became
+        // `Option`. `timeout_override_seconds` (below) is the NEW knob:
+        // the container-agentic path's per-invocation inactivity-budget
+        // override, which is what #2480 was actually filed against.
+        timeout_seconds: timeout.unwrap_or(600),
         skip_preflight,
         json,
         workdir,
@@ -1574,6 +1580,9 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // sets this today.
         host_out: None,
         max_turns_override: None,
+        // (#2480) The CLI's only wiring site for this field — every other
+        // `DispatchOpts` construction in the workspace passes `None`.
+        timeout_override_seconds: timeout,
     };
     // (#2262) A bare `dispatch` installed no signal handling at all — the
     // same gap #2131 closed for every `mission launch` launcher, never

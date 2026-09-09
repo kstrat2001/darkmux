@@ -142,9 +142,49 @@ pub(crate) enum Cmd {
         /// another's context).
         #[arg(long)]
         session_id: Option<String>,
-        /// Timeout in seconds (default: 600).
-        #[arg(long, default_value = "600")]
-        timeout: u32,
+        /// (#2480) Per-invocation timeout override, in seconds — what it
+        /// bounds depends on which dispatch path the role resolves to.
+        ///
+        /// Container path (a tool-granting role on a local profile, or any
+        /// role with --image — what `darkmux dispatch <role>` runs by
+        /// default): overrides this dispatch's INACTIVITY budget, normally
+        /// resolved from DARKMUX_INACTIVITY_TIMEOUT_SECONDS or
+        /// config.runtime.inactivity_timeout_seconds (default 600). The
+        /// host-side watchdog's hard kill and the runtime's soft warning
+        /// both run on this value for this one dispatch; neither the env
+        /// var nor the config file is changed. It is NOT a wall-clock cap:
+        /// the budget resets on every proof-of-work signal (any completed
+        /// tool call, any compaction), so a dispatch that keeps making
+        /// progress runs well past this many seconds.
+        ///
+        /// Remote path (a tool-less role resolved to a hosted endpoint, or
+        /// the RADIO answering seat): a genuine wall-clock cap on that one
+        /// blocking HTTP call.
+        ///
+        /// Local dispatch only: ignored on a cross-machine --machine
+        /// dispatch, which does not carry the value across the queue.
+        ///
+        /// Omit to use each path's own default (600 either way; from
+        /// env/config for the container path).
+        //
+        // (#2480 review, blocker 3) `verbatim_doc_comment` because clap
+        // otherwise re-wraps this text as one flowed paragraph per
+        // paragraph, which broke `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` and
+        // `config.runtime.inactivity_timeout_seconds` across a line each —
+        // rendering identifiers an operator cannot copy — and collapsed the
+        // markdown bullets this used to use into a run-on paragraph with
+        // literal `**` in it. The first paragraph is one self-contained
+        // sentence because clap uses it verbatim as the `-h` short help;
+        // the previous text ended there on a dangling "resolves to:".
+        //
+        // (#2480 review, blocker 6) `range(1..)` because `0` meant opposite
+        // things on the two paths: an already-elapsed inactivity deadline on
+        // the container path (killed at the watchdog's first poll) versus
+        // NO limit at all on the remote path (`curl -m 0`). Same flag, same
+        // value, opposite behavior, decided by routing the operator cannot
+        // see — refuse it at the parser instead.
+        #[arg(long, verbatim_doc_comment, value_parser = clap::value_parser!(u32).range(1..))]
+        timeout: Option<u32>,
         /// Explicit working directory override (#143). When set, the
         /// internal runtime mounts this path into the container as the
         /// workspace, so the agent operates against the operator-named

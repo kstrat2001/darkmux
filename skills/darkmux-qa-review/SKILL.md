@@ -38,6 +38,15 @@ If empty, stop and report "no reviewable changes."
 
 ## Step 2 — Dispatch the review
 
+No `--timeout` here, deliberately (#2480). `code-reviewer` grants tools, so this
+runs the container path, where `--timeout` sets the dispatch's inactivity budget
+and **outranks** the operator's own `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` /
+`config.runtime.inactivity_timeout_seconds`. The `--timeout 600` this step used
+to pass was written while the flag was inert on that path — it echoed the old
+clap default and did nothing. Now that it works, passing it would clamp every
+skill-driven review to 600s on a machine configured for longer, with nothing on
+screen to explain why. Omitted, the operator's own setting stands.
+
 ```bash
 DIFF=$(git diff "$MERGE_BASE" HEAD 2>/dev/null | head -300)
 RUN_ID="darkmux-qa-review-$(date +%s)-$$"
@@ -45,7 +54,6 @@ RUN_ID="darkmux-qa-review-$(date +%s)-$$"
 OUTPUT=$(darkmux dispatch code-reviewer \
   --json \
   --session-id "$RUN_ID" \
-  --timeout 600 \
   "QA review request.
 
 Repo: $REPO

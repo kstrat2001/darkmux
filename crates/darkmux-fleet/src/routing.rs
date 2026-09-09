@@ -839,6 +839,7 @@ mod tests {
             resume_from: None,
             host_out: None,
             max_turns_override: None,
+            timeout_override_seconds: None, // (#2480)
             role_id: role_id.to_string(),
             message: "hi".to_string(),
             session_id: None,

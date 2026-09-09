@@ -79,7 +79,9 @@ pub(crate) fn arm() {
 /// watchdog like this one, `arm()` alone converts "SIGTERM kills the
 /// process outright" into "SIGTERM sets a flag nothing ever reads for
 /// that path" — the dispatch would hang until curl's own `-m
-/// <timeout_seconds>` bound expired (up to `--timeout`'s default 600s),
+/// <timeout_seconds>` bound expired (`--timeout`, or 600s when it is
+/// omitted — #2480 removed the flag's clap default, but this path's own
+/// `unwrap_or(600)` fallback in `main.rs` is unchanged),
 /// not "responds within a poll tick" the way every other signal-aware
 /// path in this codebase does.
 ///

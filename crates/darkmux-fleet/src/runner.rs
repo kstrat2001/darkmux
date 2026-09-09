@@ -318,6 +318,19 @@ impl WorkJob {
             resume_from: None,
             host_out: None,
             max_turns_override: None,
+            // (#2480 review, finding 7) `--timeout` does NOT cross the fleet
+            // queue: `WorkJob` carries no field for it (adding one is a real
+            // wire break — the struct is `deny_unknown_fields` under a
+            // versioned `WORK_JOB_SCHEMA_VERSION`), so a cross-machine
+            // dispatch runs on the RUNNER's own
+            // `env > config > 600` inactivity budget. Disclosed in the flag's
+            // own `--help` ("Local dispatch only: ignored on a cross-machine
+            // --machine dispatch"), the same way `--image` and
+            // `--max-completion-tokens` state their own cross-machine limits.
+            // `self.timeout_seconds` below still crosses and still bounds the
+            // tool-less hosted path's `curl -m`; only the container path's
+            // inactivity override stops here.
+            timeout_override_seconds: None,
             role_id: self.role_id,
             message: self.message,
             session_id: Some(self.session_id),

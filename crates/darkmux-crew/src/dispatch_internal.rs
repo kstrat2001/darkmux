@@ -948,6 +948,99 @@ fn effective_max_turns(max_turns_override: Option<u32>) -> Option<u32> {
     max_turns_override.or(configured)
 }
 
+/// Default **inactivity** timeout — kills the dispatch if no compaction
+/// signal lands within this many seconds. RESETS each time a compaction
+/// event fires in the trajectory, because a successful compaction is
+/// observable proof the dispatch isn't pathologically hung (compactor
+/// model ran, primary accepted new state, turns continued).
+///
+/// **600s** (the `config_access` default) is the same value the prior
+/// absolute deadline used. Under inactivity-reset semantics it bounds the
+/// time between progress signals rather than total dispatch wall-clock —
+/// dispatches making compactions every ~5-10 min stay alive indefinitely
+/// up to the runtime's other bounds (per-call token cap, cumulative-tokens
+/// cap, MAX_TURNS).
+///
+/// (#457) Renamed from `DEFAULT_DISPATCH_DEADLINE_SECS` /
+/// `DARKMUX_RUNTIME_DEADLINE_SECONDS`. The prior absolute-deadline
+/// semantics killed dispatches making observable progress (Beat 53b: 88
+/// passing tests, killed at 600s with the model still iterating).
+/// Progress-signal-based limits trust empirical evidence; absolute caps
+/// embed a guess about how long good work should take.
+///
+/// (#2480) Resolve the inactivity budget THIS dispatch actually runs
+/// under, folding in `DispatchOpts::timeout_override_seconds`
+/// (`darkmux dispatch --timeout <n>`).
+///
+/// Deliberately the OPPOSITE precedence from `effective_max_turns` above:
+/// that override is caller-DERIVED (a fallback that only fills a gap the
+/// operator left open), so an operator's own `env`/`config` setting wins
+/// over it. `timeout_override_seconds` is direct operator input typed at
+/// the point of dispatch — strictly more specific than a standing
+/// `env`/`config` setting — so when `Some`, it wins outright: it is the
+/// literal answer to "what should THIS dispatch's inactivity budget be."
+///
+/// (#2480 review, finding 5) The returned source names the `Cli` tier for
+/// the override case, and it is NOT `config_access::Source` — that enum
+/// models the three tiers of the config-resolution contract and is matched
+/// exhaustively across the workspace (`darkmux-doctor` included), where a
+/// fourth tier no config file can produce would be noise. The earlier shape
+/// reused `Source::Env` for a `--timeout` value, which is what reached the
+/// operator's own warning text as "the inactivity timeout (env 45)" on a
+/// machine whose env said 1200 — the operator-sovereignty failure
+/// `CLAUDE.md` names ("the operator never has to wonder where a decision
+/// came from"). `runtime/src/bounds.rs`'s `BoundSource` gained a matching
+/// `Cli` arm, so the container renders `(cli 45)`; a stale runtime image
+/// falls to its `_ => BuiltIn` catch-all and renders `(built-in 45)`, no
+/// worse than the `(env 45)` it printed before and self-correcting on the
+/// next image refresh.
+///
+/// `resolved_runtime_bounds_json` (the operator-facing bounds JSON on the
+/// flow record + envelope) still does NOT reuse this helper — it hand-rolls
+/// its own `"cli"`-labeled block, the same way it hand-rolls `"launcher"`
+/// and `"forced-agentic-remote"`. The two spell the same tier the same way.
+fn effective_inactivity_timeout_seconds(
+    timeout_override_seconds: Option<u32>,
+) -> (u64, InactivityBudgetSource) {
+    match timeout_override_seconds {
+        Some(n) => (n as u64, InactivityBudgetSource::Cli),
+        None => {
+            let (secs, source) =
+                darkmux_types::config_access::inactivity_timeout_seconds_with_source();
+            (secs, InactivityBudgetSource::Resolved(source))
+        }
+    }
+}
+
+/// (#2480 review, finding 5) Where THIS dispatch's inactivity budget came
+/// from, including the one tier `darkmux_types::config_access::Source`
+/// deliberately does not model: `darkmux dispatch --timeout <n>`, typed at
+/// the point of dispatch and outranking `env`/`config`/built-in for that
+/// one dispatch.
+///
+/// Kept local to the container-dispatch path rather than added to the
+/// shared enum — see `effective_inactivity_timeout_seconds`'s doc. The
+/// wire strings match `runtime/src/bounds.rs`'s `BoundSource::from_cli_str`
+/// exactly; that parser is the only consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InactivityBudgetSource {
+    /// `darkmux dispatch --timeout <n>`.
+    Cli,
+    /// The standing `env > config.json > built-in` resolution.
+    Resolved(darkmux_types::config_access::Source),
+}
+
+impl InactivityBudgetSource {
+    /// The wire string forwarded as
+    /// `DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InactivityBudgetSource::Cli => "cli",
+            InactivityBudgetSource::Resolved(s) => s.as_str(),
+        }
+    }
+}
+
 /// (#457 Changes 2+3) Apply operator-opt-in per-dispatch caps.
 /// Reads two env vars on host side; passes them to the runtime via
 /// `--max-turns` / `--max-tokens` CLI flags. Both default unlimited;
@@ -1140,7 +1233,11 @@ pub struct DockerRunConfig {
     /// site it reads the value (`runtime/src/loop_runner.rs`'s
     /// `inactivity_bound`) so its soft-warning stderr line and the
     /// inactivity-approach signal can name the tier, not just the number.
-    pub inactivity_timeout_seconds_source: darkmux_types::config_access::Source,
+    ///
+    /// (#2480 review, finding 5) Typed as `InactivityBudgetSource`, not
+    /// `config_access::Source`, so a `--timeout`-set budget can say so —
+    /// see that enum's own doc.
+    pub inactivity_timeout_seconds_source: InactivityBudgetSource,
     /// (#2114 finding 4, resolved #2110/#2109) Forwarded into the
     /// container as `-e DARKMUX_MAX_PAUSE_MS=<n>` so the runtime's own
     /// staleness ceiling (`runtime/src/pace.rs::max_pause_ms`) agrees with
@@ -1468,33 +1565,6 @@ fn warn_if_unparseable_u32(var: &str) {
             );
         }
     }
-}
-
-/// Default **inactivity** timeout — kills the dispatch if no
-/// compaction signal lands within this many seconds. RESETS each
-/// time a compaction event fires in the trajectory, because a
-/// successful compaction is observable proof the dispatch isn't
-/// pathologically hung (compactor model ran, primary accepted new
-/// state, turns continued).
-///
-/// **600s** (the `config_access` default) is the same value the prior
-/// absolute deadline used. Under inactivity-reset semantics it bounds the
-/// time between progress signals rather than total dispatch wall-clock —
-/// dispatches making compactions every ~5-10 min stay alive
-/// indefinitely up to the runtime's other bounds (per-call token
-/// cap, cumulative-tokens cap, MAX_TURNS).
-///
-/// Resolution (#661 Slice 4): `env(DARKMUX_INACTIVITY_TIMEOUT_SECONDS) >
-/// config.runtime.inactivity_timeout_seconds > 600`.
-///
-/// (#457) Renamed from `DEFAULT_DISPATCH_DEADLINE_SECS` /
-/// `DARKMUX_RUNTIME_DEADLINE_SECONDS`. The prior absolute-deadline
-/// semantics killed dispatches making observable progress (Beat 53b:
-/// 88 passing tests, killed at 600s with the model still iterating).
-/// Progress-signal-based limits trust empirical evidence; absolute
-/// caps embed a guess about how long good work should take.
-fn inactivity_timeout_seconds() -> u64 {
-    darkmux_types::config_access::inactivity_timeout_seconds()
 }
 
 /// (#717, unified onto `darkmux_flow::BookendGuard` in #1230 Packet 0)
@@ -3293,9 +3363,17 @@ fn kill_container_persistently(container_name: &str, base_backoff: Duration) -> 
 /// false in precisely the case that matters. Only `KillDisposition::Confirmed`
 /// may claim a kill happened; the other two say what actually happened
 /// instead of telling the operator a comforting thing that is not true.
+///
+/// (#2480 review, finding 5) `source` is the same reason: the closing
+/// sentence used to advise `DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<N>`
+/// unconditionally, which on a dispatch whose budget came from
+/// `--timeout 45` pointed the operator at a knob that would NOT have
+/// changed the number they just watched expire — `--timeout` outranks it.
+/// The remedy has to name the mechanism that actually set the value.
 fn inactivity_timeout_stderr(
     container_name: &str,
     inactivity_secs: u64,
+    source: InactivityBudgetSource,
     kill: KillDisposition,
     stderr: &str,
 ) -> String {
@@ -3317,14 +3395,38 @@ fn inactivity_timeout_stderr(
              may still be running and holding its model load; check `docker ps`"
         ),
     };
+    // (#2480 review, finding 5) Name the knob that set THIS budget, and say
+    // where it came from — an operator told to raise an env var they already
+    // set to 1200 has been sent to the wrong place.
+    let remedy = match source {
+        InactivityBudgetSource::Cli => {
+            "This dispatch's budget came from `--timeout`; pass a larger \
+             `--timeout <N>` (it outranks DARKMUX_INACTIVITY_TIMEOUT_SECONDS \
+             and config.runtime.inactivity_timeout_seconds for this one \
+             dispatch)"
+        }
+        InactivityBudgetSource::Resolved(darkmux_types::config_access::Source::Env) => {
+            "This dispatch's budget came from DARKMUX_INACTIVITY_TIMEOUT_SECONDS; \
+             raise it, or pass `--timeout <N>` for one dispatch"
+        }
+        InactivityBudgetSource::Resolved(darkmux_types::config_access::Source::Config) => {
+            "This dispatch's budget came from config.runtime.inactivity_timeout_seconds; \
+             raise it with `darkmux config set`, or pass `--timeout <N>` for one dispatch"
+        }
+        InactivityBudgetSource::Resolved(darkmux_types::config_access::Source::BuiltIn) => {
+            "Override the built-in default with DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<N>, \
+             `darkmux config set runtime.inactivity_timeout_seconds <N>`, or `--timeout <N>` \
+             for one dispatch"
+        }
+    };
     format!(
         "{INACTIVITY_TIMEOUT_MARKER} — no proof-of-work signal in {inactivity_secs}s — \
          {disposition}. The inactivity timer resets on each successful tool call (read / bash / \
          edit / write) and on each compaction event. Genuine thinking-mode hangs and total \
          stalls trigger this; productive dispatches making any tool calls stay alive. \
          Pathological tool patterns are caught by their dedicated detectors (cycle / cascade / \
-         cadence-drift) so the deadline can trust activity. Override the default with \
-         DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<N>. (#363, #457, #464, #2232)\n{stderr}"
+         cadence-drift) so the deadline can trust activity. \
+         {remedy}. (#363, #457, #464, #2232, #2480)\n{stderr}"
     )
 }
 
@@ -3832,6 +3934,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &workspace,
         agentic_pm.is_some(),
         opts.max_turns_override,
+        opts.timeout_override_seconds,
         allowed_tools.as_deref(),
         &opts.brief_refs,
     );
@@ -4007,6 +4110,30 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let cache_dir = darkmux_types::config_access::cache_dir();
     let _ = fs::create_dir_all(&cache_dir);
 
+    // (#2480) Resolved ONCE here, and reused by all three consumers — the
+    // container-forwarded `DARKMUX_INACTIVITY_TIMEOUT_SECONDS*` env vars
+    // below, the host watchdog deadline further down, and the timeout stderr
+    // the watchdog prepends — so no two of them can disagree about the
+    // budget or about where it came from. See
+    // `effective_inactivity_timeout_seconds`'s own doc for the precedence.
+    //
+    // (#2480 review, blocker 2 — DISCLOSED, not fixed) This one line is NOT
+    // covered by any fast test: mutating it to `effective_inactivity_
+    // timeout_seconds(None)` compiles and leaves the whole crate suite
+    // green. It sits inside `dispatch()`, past the point where a real
+    // `docker run` is required, and the two consumers below take ~30
+    // resolved locals between them, so pinning it means either a container
+    // run or an `argv_config_for(...)` extraction with a worse signature
+    // than the literal it replaces. What IS pinned is the segment that was
+    // actually broken — `DispatchOpts` -> crew-of-one step config ->
+    // `DispatchOpts` (`build_graph_step_config_carries_the_cli_flags`,
+    // mutation-proven on both halves) — plus
+    // `effective_inactivity_timeout_seconds` itself and
+    // `DockerRunConfig.inactivity_timeout_seconds` -> argv (the golden).
+    // The gap is the single assignment joining them.
+    let (inactivity_timeout_seconds, inactivity_timeout_seconds_source) =
+        effective_inactivity_timeout_seconds(opts.timeout_override_seconds);
+
     let argv_config = DockerRunConfig {
         container_name: container_name.clone(),
         workspace: workspace.clone(),
@@ -4052,9 +4179,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             darkmux_types::config_access::turn_delay_ms(),
             agentic_pm.is_some(),
         ),
-        inactivity_timeout_seconds: darkmux_types::config_access::inactivity_timeout_seconds(),
-        inactivity_timeout_seconds_source:
-            darkmux_types::config_access::inactivity_timeout_seconds_with_source().1,
+        inactivity_timeout_seconds,
+        inactivity_timeout_seconds_source,
         // (#2110/#2109) Resolved through config_access now that
         // runtime.thermal.max_pause_ms exists — see max_pause_ms_env's own
         // doc.
@@ -4183,7 +4309,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // resets it forward. A dispatch that never compacts hits the
     // initial deadline. A dispatch making compactions every ~5-10 min
     // stays alive indefinitely (bounded by the other runtime caps).
-    let inactivity_secs = inactivity_timeout_seconds();
+    // (#2480) Host-side watchdog deadline — reuses the SAME resolved value
+    // forwarded into the container above (`DockerRunConfig.
+    // inactivity_timeout_seconds`) rather than re-resolving, so both sides
+    // can't disagree about the budget when `--timeout` overrides it.
+    let inactivity_secs = inactivity_timeout_seconds;
     let inactivity_deadline = Arc::new(Mutex::new(
         Instant::now() + Duration::from_secs(inactivity_secs),
     ));
@@ -4582,6 +4712,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         stderr = inactivity_timeout_stderr(
             &container_name,
             inactivity_secs,
+            // (#2480 review, finding 5) The SAME resolved pair the container
+            // and the watchdog ran on — so the remedy sentence names the knob
+            // that actually produced `inactivity_secs`.
+            inactivity_timeout_seconds_source,
             KillDisposition::from_code(kill_disposition.load(Ordering::SeqCst)),
             &stderr,
         );
@@ -4605,7 +4739,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &host_stats,
         &host_extras,
         &host_out,
-        resolved_runtime_bounds_json(agentic_pm.is_some(), opts.max_turns_override),
+        resolved_runtime_bounds_json(
+            agentic_pm.is_some(),
+            opts.max_turns_override,
+            opts.timeout_override_seconds,
+        ),
     );
 
     // (#782) Read the runtime's token totals from metrics.json now the
@@ -4779,6 +4917,7 @@ fn dispatch_start_payload_json(
     workspace: &std::path::Path,
     is_agentic_remote: bool,
     max_turns_override: Option<u32>,
+    timeout_override_seconds: Option<u32>,
     tools_requested: Option<&[String]>,
     brief_refs: &[crate::brief_refs::BriefRef],
 ) -> serde_json::Value {
@@ -4825,7 +4964,11 @@ fn dispatch_start_payload_json(
         // `enrich_envelope_with_summary`) — one producer, so a remote
         // reader watching the flow stream and an operator reading the
         // finished envelope can't disagree about what governed this run.
-        "bounds": resolved_runtime_bounds_json(is_agentic_remote, max_turns_override),
+        "bounds": resolved_runtime_bounds_json(
+            is_agentic_remote,
+            max_turns_override,
+            timeout_override_seconds,
+        ),
     })
 }
 
@@ -4858,7 +5001,11 @@ fn dispatch_start_payload_json(
 /// value` carries what the operator's own knob resolved to (with ITS real
 /// source, nested) so the row stays self-explaining instead of just going
 /// silent about the configured value.
-fn resolved_runtime_bounds_json(is_agentic_remote: bool, max_turns_override: Option<u32>) -> serde_json::Value {
+fn resolved_runtime_bounds_json(
+    is_agentic_remote: bool,
+    max_turns_override: Option<u32>,
+    timeout_override_seconds: Option<u32>,
+) -> serde_json::Value {
     fn vs(value: Option<serde_json::Value>, source: darkmux_types::config_access::Source) -> serde_json::Value {
         serde_json::json!({
             "value": value.unwrap_or(serde_json::Value::Null),
@@ -4895,10 +5042,22 @@ fn resolved_runtime_bounds_json(is_agentic_remote: bool, max_turns_override: Opt
     } else {
         vs(max_turns.map(Into::into), s_turns)
     };
+    // (#2480) Opposite precedence from `max_turns_block` above, on purpose
+    // — see `effective_inactivity_timeout_seconds`'s doc for why an
+    // explicit `--timeout` wins outright rather than only filling a gap.
+    // Hand-rolled with its own `"cli"` tier (not `Source::Env`) for the
+    // SAME reason `max_turns_block` hand-rolls `"launcher"`: this JSON is
+    // operator-facing, so it names the real provenance rather than
+    // borrowing the nearest enum variant — unlike the container's env-var
+    // wire format, this one has no fixed vocabulary to round-trip through.
+    let inactivity_timeout_block = match timeout_override_seconds {
+        Some(n) => serde_json::json!({ "value": n, "source": "cli" }),
+        None => vs(Some(inactivity_timeout_seconds.into()), s_inact),
+    };
     serde_json::json!({
         "max_tokens_per_call": vs(max_tokens_per_call.map(Into::into), s_mtpc),
         "reasoning_checkpoint_interval_tokens": vs(reasoning_checkpoint_interval_tokens.map(Into::into), s_rci),
-        "inactivity_timeout_seconds": vs(Some(inactivity_timeout_seconds.into()), s_inact),
+        "inactivity_timeout_seconds": inactivity_timeout_block,
         "max_turns": max_turns_block,
         "max_tokens": vs(max_tokens.map(Into::into), s_tokens),
         "turn_delay_ms": turn_delay_block,

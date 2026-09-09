@@ -1353,6 +1353,7 @@ impl StepKind for CrawlUnitStepKind {
                 // now, not this kind's own parameter — see the issue.
                 resume_from: None,
                 max_turns_override: Some(default_unit_max_turns(unit)),
+                timeout_override_seconds: None, // (#2480) no per-unit surface yet
                 // Provenance the runtime cannot know — merged by the host
                 // tailer under `payload.context` on every record this unit's
                 // dispatch produces.

@@ -36,7 +36,15 @@
 //! module doc for the full three-tier picture and `CLAUDE.md`'s "StepKind
 //! tiering" section for the doctrine this physical layout enforces.
 
-mod builtins;
+// (#2480 review, blockers 1+2) `pub(crate)` rather than private so
+// `dispatch_as_crew_of_one`'s tests can run its graph's Step/Task back
+// through `builtins::dispatch_opts_for` — the REAL reconstruction the
+// `dispatch.internal` kind runs — instead of asserting each end of that
+// hand-off separately against a test-local re-read. That gap is what let
+// `--timeout` be written into the step config nowhere and still leave the
+// whole suite green. The named re-exports below stay the route for
+// everything production code uses.
+pub(crate) mod builtins;
 /// `deliver.github_review` (#2310 P4b) — Tier 1 by classification (a fixed,
 /// config-driven render, no caller-supplied strategy), physically its own
 /// file rather than added to `builtins.rs` (already ~4200 lines) or folded

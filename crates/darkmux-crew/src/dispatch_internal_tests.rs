@@ -956,6 +956,7 @@
             false,
             None,
             None,
+            None,
             &[],
         );
 
@@ -1000,6 +1001,7 @@
             true,
             None,
             None,
+            None,
             &[],
         );
         assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
@@ -1031,7 +1033,7 @@
         ] {
             unsafe { std::env::remove_var(k) };
         }
-        let bounds = resolved_runtime_bounds_json(false, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None);
         assert_eq!(
             bounds["max_tokens_per_call"],
             serde_json::json!({"value": null, "source": "built-in"}),
@@ -1063,7 +1065,7 @@
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "4000") };
         unsafe { std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", "500") };
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "120") };
-        let bounds = resolved_runtime_bounds_json(false, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None);
         assert_eq!(bounds["max_tokens_per_call"], serde_json::json!({"value": 4000, "source": "env"}));
         assert_eq!(
             bounds["reasoning_checkpoint_interval_tokens"],
@@ -1109,7 +1111,7 @@
     #[serial]
     fn resolved_runtime_bounds_json_max_turns_names_launcher_when_the_override_wins() {
         unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
-        let bounds = resolved_runtime_bounds_json(false, Some(15));
+        let bounds = resolved_runtime_bounds_json(false, Some(15), None);
         assert_eq!(bounds["max_turns"], serde_json::json!({"value": 15, "source": "launcher"}));
     }
 
@@ -1117,7 +1119,7 @@
     #[serial]
     fn resolved_runtime_bounds_json_max_turns_names_env_when_the_operator_set_one() {
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TURNS", "5") };
-        let bounds = resolved_runtime_bounds_json(false, Some(15));
+        let bounds = resolved_runtime_bounds_json(false, Some(15), None);
         assert_eq!(
             bounds["max_turns"],
             serde_json::json!({"value": 5, "source": "env"}),
@@ -1126,12 +1128,124 @@
         unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
     }
 
+    // ─── #2480: effective_inactivity_timeout_seconds /
+    //     resolved_runtime_bounds_json's inactivity_timeout_seconds block —
+    //     `darkmux dispatch --timeout <n>` wins OUTRIGHT (opposite
+    //     precedence from max_turns above — see the function's own doc for
+    //     why: this override is direct operator input at the point of
+    //     dispatch, not a caller-derived fallback) ──
+
+    #[test]
+    #[serial]
+    fn effective_inactivity_timeout_seconds_uses_the_default_when_nothing_is_set() {
+        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
+        assert_eq!(
+            effective_inactivity_timeout_seconds(None),
+            (
+                600,
+                crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                    darkmux_types::config_access::Source::BuiltIn,
+                ),
+            )
+        );
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn effective_inactivity_timeout_seconds_applies_the_cli_override_when_nothing_else_is_set() {
+        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
+        assert_eq!(
+            effective_inactivity_timeout_seconds(Some(45)),
+            (45, crate::dispatch_internal::InactivityBudgetSource::Cli),
+            "an explicit --timeout must actually take effect on the container path — \
+             this is the exact bug #2480 was filed against, and (#2480 review, \
+             finding 5) the tier it reports must be `cli`, not a borrowed `env`"
+        );
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn effective_inactivity_timeout_seconds_cli_override_wins_over_a_configured_env_value() {
+        // The productive-40-minute-dispatch case from #2480's own brief: an
+        // operator who configured a longer budget, then explicitly asks for
+        // a SHORTER one on this one dispatch, must get the shorter one —
+        // and the reverse (asking for longer than the standing config) must
+        // also win, since this is a genuine per-call override, not a
+        // fallback that only fills a gap (contrast effective_max_turns).
+        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "1200") };
+        assert_eq!(
+            effective_inactivity_timeout_seconds(Some(30)),
+            (30, crate::dispatch_internal::InactivityBudgetSource::Cli)
+        );
+        assert_eq!(
+            effective_inactivity_timeout_seconds(None),
+            (
+                1200,
+                crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                    darkmux_types::config_access::Source::Env,
+                ),
+            ),
+            "no override ⇒ the operator's own configured value is untouched, and it \
+             still reports as `env` — the tier that actually decided it"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_inactivity_timeout_names_cli_when_the_override_wins() {
+        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "1200") };
+        let bounds = resolved_runtime_bounds_json(false, None, Some(30));
+        assert_eq!(
+            bounds["inactivity_timeout_seconds"],
+            serde_json::json!({"value": 30, "source": "cli"}),
+            "the operator-facing bounds block must show the number that ACTUALLY \
+             governed the dispatch, not the configured value it overrode: {bounds}"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_inactivity_timeout_passes_through_with_no_override() {
+        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
+        let bounds = resolved_runtime_bounds_json(false, None, None);
+        assert_eq!(
+            bounds["inactivity_timeout_seconds"],
+            serde_json::json!({"value": 600, "source": "built-in"})
+        );
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
+        }
+    }
+
     #[test]
     #[serial]
     fn resolved_runtime_bounds_json_turn_delay_ms_passes_through_for_a_local_dispatch() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "3000") };
-        let bounds = resolved_runtime_bounds_json(false, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None);
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({"value": 3000, "source": "env"}),
@@ -1162,7 +1276,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_is_self_explaining_when_forced_agentic_remote() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "5000") };
-        let bounds = resolved_runtime_bounds_json(true, None);
+        let bounds = resolved_runtime_bounds_json(true, None, None);
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({
@@ -1189,7 +1303,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_forced_shape_holds_even_at_the_default() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
-        let bounds = resolved_runtime_bounds_json(true, None);
+        let bounds = resolved_runtime_bounds_json(true, None, None);
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({
@@ -1989,7 +2103,9 @@
             // complete-vector assertion below pins the forwarded
             // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
             inactivity_timeout_seconds: 900,
-            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::Config,
+            inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::Config,
+            ),
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -2204,7 +2320,9 @@
             feedback_injection: false,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
-            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
+            inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::BuiltIn,
+            ),
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -2325,7 +2443,9 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
-            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
+            inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::BuiltIn,
+            ),
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -2380,7 +2500,9 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
-            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
+            inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::BuiltIn,
+            ),
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -2388,6 +2510,32 @@
             workspace_read_only: false,
             resume_checkpoint: false,
         }
+    }
+
+    /// (#2480 review, finding 5) `--timeout` reaches the container as a
+    /// value AND a tier, and the tier has to be the one that actually
+    /// decided it. Before this, a `--timeout 45` was forwarded as
+    /// `..._SOURCE=env`, which the runtime rendered into the operator's own
+    /// warning as "the inactivity timeout (env 45)" on a machine whose env
+    /// said 1200. The `"cli"` string here is the exact token
+    /// `runtime/src/bounds.rs`'s `BoundSource::from_cli_str` parses.
+    #[test]
+    fn build_docker_run_argv_forwards_the_cli_tier_for_a_timeout_override() {
+        let mut config = base_argv_config();
+        config.inactivity_timeout_seconds = 45;
+        config.inactivity_timeout_seconds_source =
+            crate::dispatch_internal::InactivityBudgetSource::Cli;
+        let argv = build_docker_run_argv(&config);
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=45"),
+            "expected the overridden budget on the wire: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=cli"),
+            "expected the `cli` tier on the wire, not a borrowed `env`: {argv:?}"
+        );
     }
 
     /// (#1959 packet 2) The full-argv wiring: `workspace_read_only: true`
@@ -3160,7 +3308,9 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
-            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
+            inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::BuiltIn,
+            ),
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -3875,7 +4025,7 @@
         // Saved + restored — tests share process env, so be polite.
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
-        assert_eq!(inactivity_timeout_seconds(), 600); // the config_access default
+        assert_eq!(darkmux_types::config_access::inactivity_timeout_seconds(), 600); // the config_access default
         if let Some(v) = prev {
             unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
         }
@@ -3886,7 +4036,7 @@
     fn inactivity_timeout_reads_env_override() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "30") };
-        assert_eq!(inactivity_timeout_seconds(), 30);
+        assert_eq!(darkmux_types::config_access::inactivity_timeout_seconds(), 30);
         unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
         if let Some(v) = prev {
             unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
@@ -3898,7 +4048,7 @@
     fn inactivity_timeout_falls_back_on_garbage_env() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "not-a-number") };
-        assert_eq!(inactivity_timeout_seconds(), 600); // the config_access default
+        assert_eq!(darkmux_types::config_access::inactivity_timeout_seconds(), 600); // the config_access default
         unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
         if let Some(v) = prev {
             unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
@@ -5424,7 +5574,7 @@
             crate::brief_refs::BriefRef::mod_("mod-1-aaa"),
         ];
         let with = dispatch_start_payload_json(
-            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, &refs,
+            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &refs,
         );
         assert_eq!(
             with["brief_refs"],
@@ -5436,7 +5586,7 @@
         // Every other dispatch carries the field EMPTY rather than absent — an
         // absent key would be indistinguishable from an older writer's record.
         let without = dispatch_start_payload_json(
-            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, &[],
+            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &[],
         );
         assert_eq!(without["brief_refs"], serde_json::json!([]));
     }
@@ -9721,6 +9871,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let marker = inactivity_timeout_stderr(
             "darkmux-dispatch-absent-2232",
             600,
+            builtin_budget_source(),
             outcome.disposition(),
             "boom",
         );
@@ -9776,6 +9927,70 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
+    /// The un-overridden budget the disposition tests are about — they
+    /// assert WHICH kill story the text tells, not where the number came
+    /// from (that is
+    /// `inactivity_timeout_stderr_names_the_knob_that_set_the_budget`).
+    fn builtin_budget_source() -> crate::dispatch_internal::InactivityBudgetSource {
+        crate::dispatch_internal::InactivityBudgetSource::Resolved(
+            darkmux_types::config_access::Source::BuiltIn,
+        )
+    }
+
+    /// (#2480 review, finding 5) The remedy sentence has to name the knob
+    /// that actually set THIS dispatch's budget. It used to advise
+    /// `DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<N>` unconditionally — which on a
+    /// `--timeout 45` dispatch points the operator at a setting `--timeout`
+    /// outranks, so following the advice would not have changed the number
+    /// they just watched expire.
+    #[test]
+    fn inactivity_timeout_stderr_names_the_knob_that_set_the_budget() {
+        let from_cli = inactivity_timeout_stderr(
+            "darkmux-test-container-2480",
+            45,
+            crate::dispatch_internal::InactivityBudgetSource::Cli,
+            KillDisposition::Confirmed,
+            "boom",
+        );
+        assert!(
+            from_cli.contains("`--timeout`"),
+            "a --timeout-set budget must send the operator back to --timeout: {from_cli}"
+        );
+        assert!(
+            from_cli.contains("outranks"),
+            "…and say why raising the env var would not have helped: {from_cli}"
+        );
+
+        let from_env = inactivity_timeout_stderr(
+            "darkmux-test-container-2480",
+            1200,
+            crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::Env,
+            ),
+            KillDisposition::Confirmed,
+            "boom",
+        );
+        assert!(
+            from_env.contains("came from DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            "an env-set budget must name the env var as the SOURCE, not merely as a \
+             remedy: {from_env}"
+        );
+
+        let from_config = inactivity_timeout_stderr(
+            "darkmux-test-container-2480",
+            900,
+            crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::Config,
+            ),
+            KillDisposition::Confirmed,
+            "boom",
+        );
+        assert!(
+            from_config.contains("config.runtime.inactivity_timeout_seconds"),
+            "a config-set budget must name the config field: {from_config}"
+        );
+    }
+
     #[test]
     fn inactivity_timeout_stderr_admits_when_the_container_was_not_confirmed_stopped() {
         // (#2232) The marker used to assert flatly that the container "was
@@ -9785,6 +10000,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let confirmed = inactivity_timeout_stderr(
             "darkmux-test-container-2232-x",
             600,
+            builtin_budget_source(),
             KillDisposition::Confirmed,
             "boom",
         );
@@ -9798,6 +10014,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let unconfirmed = inactivity_timeout_stderr(
             "darkmux-test-container-2232-x",
             600,
+            builtin_budget_source(),
             KillDisposition::Unconfirmed,
             "boom",
         );
@@ -9815,6 +10032,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let absent = inactivity_timeout_stderr(
             "darkmux-test-container-2232-x",
             600,
+            builtin_budget_source(),
             KillDisposition::Absent,
             "boom",
         );
@@ -10202,6 +10420,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             false,
             None,
             None,
+            None,
             &[],
         );
         assert!(none["tools_requested"].is_null(), "{}", none);
@@ -10212,6 +10431,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "sys",
             std::path::Path::new("/tmp/ws"),
             false,
+            None,
             None,
             Some(&names),
             &[],

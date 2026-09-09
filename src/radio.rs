@@ -503,6 +503,7 @@ pub fn dispatch_router_call(message: &str) -> Result<String> {
         resume_from: None,
         host_out: None,
         max_turns_override: None,
+        timeout_override_seconds: None, // (#2480)
         role_id: "radio-router".to_string(),
         message: message.to_string(),
         session_id: None,

@@ -248,6 +248,16 @@ pub struct DispatchOpts {
     /// Empty on every other path.
     pub brief_refs: Vec<crate::brief_refs::BriefRef>,
     pub session_id: Option<String>,
+    /// (#2480) Despite the name, this bounds ONLY the tool-less single-call
+    /// paths: `dispatch_remote`'s `curl -m <n>` on a hosted-endpoint call,
+    /// and `dispatch_local_single_shot`'s equivalent (the RADIO answering
+    /// seat). The container-agentic path (`dispatch_internal::dispatch`,
+    /// what `darkmux dispatch <role>` runs by default) never reads this
+    /// field — that path has no single blocking call to bound; it has a
+    /// multi-turn agent loop, bounded instead by the inactivity budget
+    /// (`config.runtime.inactivity_timeout_seconds` /
+    /// `DARKMUX_INACTIVITY_TIMEOUT_SECONDS`). See `timeout_override_seconds`
+    /// below for the container path's per-invocation knob.
     pub timeout_seconds: u32,
     /// Skip the pre-flight checks. Use only when explicitly debugging.
     pub skip_preflight: bool,
@@ -459,7 +469,41 @@ pub struct DispatchOpts {
     /// `resolved_max_turns_block` in `dispatch_internal.rs`. `None` (every
     /// caller but the crawl launcher) preserves today's behavior exactly:
     /// uncapped unless the operator opted in globally.
+    ///
+    /// (#2480 review) **Read this together with
+    /// `timeout_override_seconds` below: the two are adjacent
+    /// `Option<u32>` "override" fields that resolve in OPPOSITE
+    /// directions, and the difference is not visible from either name.**
+    /// THIS one is a caller-derived FALLBACK — it loses to an operator's
+    /// `env`/`config` setting. That one is direct operator input at the
+    /// point of dispatch — it BEATS `env`/`config`. The split is
+    /// deliberate (who typed the number decides who wins), but a reader
+    /// who assumes one from the other will be wrong half the time.
     pub max_turns_override: Option<u32>,
+    /// (#2480) `darkmux dispatch --timeout <n>`'s per-invocation override of
+    /// the CONTAINER path's inactivity budget — the piece that was missing
+    /// entirely before this field existed: `--timeout` was documented as
+    /// "Timeout in seconds (default: 600)" but the container-agentic
+    /// dispatch (`dispatch_internal::dispatch`, the default path for
+    /// `darkmux dispatch <role>`) never read it at all, silently.
+    ///
+    /// (#2480 review) **Deliberately the OPPOSITE precedence from its
+    /// neighbor `max_turns_override` above — two adjacent `Option<u32>`
+    /// "override" fields that resolve in opposite directions.** That field
+    /// is a caller-DERIVED fallback (the crawl launcher's
+    /// own estimate) that only fills a gap the operator left open, so an
+    /// explicit `env`/`config` setting always beats it. This field is
+    /// direct operator input typed at the point of dispatch — more
+    /// specific than a standing env var or config file, the same way a CLI
+    /// flag outranks a config default everywhere else in darkmux
+    /// (`--profile` over `default_profile`, etc.) — so when `Some`, it wins
+    /// outright over `env(DARKMUX_INACTIVITY_TIMEOUT_SECONDS)` and
+    /// `config.runtime.inactivity_timeout_seconds` for THIS dispatch only;
+    /// it never mutates the standing config. See
+    /// `dispatch_internal::effective_inactivity_timeout_seconds`. `None`
+    /// (every caller but the CLI's `dispatch` verb) preserves the existing
+    /// `env > config > 600` resolution exactly.
+    pub timeout_override_seconds: Option<u32>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime
