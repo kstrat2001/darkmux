@@ -102,6 +102,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+try:
+    import tomllib  # Python 3.11+, standard library
+except ModuleNotFoundError:  # pragma: no cover — pre-3.11 interpreter
+    tomllib = None
+
 # The only exit codes that mean "cargo-mutants actually tested mutants".
 OK_CODES = {0, 2, 3}
 
@@ -478,6 +483,24 @@ def _test_module_ranges(path: Path) -> list[tuple[int, int]] | None:
 # rather than printing 0 — so `count_changed_lines_main` raises that as a
 # hard failure instead of silently scoping the floor to a directory nothing
 # lives under.
+#
+# (#2602) The array is parsed with the standard library's TOML parser
+# (`tomllib`, Python 3.11+ — confirmed present on the runner) rather than a
+# hand-rolled regex. The regex version handed the whole `exclude = [...]`
+# array BODY to a bare quoted-string finder with no notion of a TOML
+# comment: `exclude = ["runtime", # keeps "src" out? no - just prose\n
+# "tools/darkmux-mock-model"]` picked up the quoted words inside the
+# comment as a THIRD excluded path (`"src"`), and that is exactly the kind
+# of edit this feature's own commit message invites — a future exclusion
+# added or annotated without touching this script. On the real root
+# manifest that dropped the floor for an ordinary `src/` diff from 2 to 0,
+# with no error and no warning: the gate that exists to catch a diff
+# structurally invisible to its own invocation went silently blind on the
+# most ordinary kind of edit. A real parser does not have this failure
+# mode — a `#` inside a TOML comment is never data, regardless of what
+# looks quoted next to it. `tomllib` is used first; a regex fallback
+# remains for a pre-3.11 interpreter, and is used (with a stderr warning)
+# if the manifest fails to parse as TOML at all.
 # ---------------------------------------------------------------------------
 
 _WORKSPACE_TABLE_RE = re.compile(r"^\[workspace\]\s*$", re.MULTILINE)
@@ -486,14 +509,43 @@ _EXCLUDE_ARRAY_RE = re.compile(r"^\s*exclude\s*=\s*\[(.*?)\]", re.DOTALL | re.MU
 _QUOTED_STRING_RE = re.compile(r'"([^"]*)"')
 
 
-def parse_workspace_exclude(manifest_text: str) -> list[str]:
-    """Extract the `[workspace] exclude = [...]` array's string values from a
-    Cargo.toml's raw text. Not a TOML parser — a small, targeted regex, in
-    the same spirit as the rest of this file's diff handling: good enough
-    for this manifest's actual shape (a single- or multi-line quoted-string
-    array), and returns `[]` (fails open) for anything else, including a
-    manifest with no `[workspace]` table, or a `[workspace]` table with no
-    `exclude` key."""
+def _normalize_exclude_entry(raw: str) -> str:
+    """Normalize one `[workspace] exclude` array entry to the bare
+    manifest-relative directory prefix `reachable_predicate` compares
+    against. (#2602) Cargo's own exclude matching, and a plausible future
+    hand-edit of this array, both write forms that name the exact same
+    directory as the bare form but do not compare EQUAL to it: a trailing
+    slash (`"runtime/"`), a leading `./` (`"./runtime"`), or a trailing
+    glob marking "everything under this directory" (`"runtime/*"` or
+    `"runtime/**"`). Compared literally, each of those matches nothing —
+    `reachable_predicate` reports every path under the intended directory
+    as reachable, the silent-disarm TWIN of the comment bug above: the
+    array parses cleanly, the entry is real, and the exclusion still does
+    nothing. This fails SAFE (more code counted, matching the rest of this
+    file's fail-open posture) rather than green, but it defeats the "the
+    floor is derived from the manifest, not hand-maintained" claim on the
+    very next edit that writes one of these forms — so normalize instead
+    of documenting the gap."""
+    entry = raw.strip()
+    if entry.startswith("./"):
+        entry = entry[2:]
+    if entry.endswith("/**"):
+        entry = entry[:-3]
+    elif entry.endswith("/*"):
+        entry = entry[:-2]
+    return entry.rstrip("/")
+
+
+def _parse_workspace_exclude_regex(manifest_text: str) -> list[str]:
+    """Fallback extraction used only when `tomllib` is unavailable (a
+    pre-3.11 interpreter) or the manifest could not be parsed as TOML at
+    all. Not a TOML parser — a small, targeted regex, good enough for this
+    manifest's actual shape (a single- or multi-line quoted-string array)
+    but, unlike `tomllib`, unable to tell a `#` comment from array
+    content — callers that reach this path print a warning explaining
+    why. Returns `[]` (fails open) for anything it does not recognize,
+    including a manifest with no `[workspace]` table, or a `[workspace]`
+    table with no `exclude` key."""
     m = _WORKSPACE_TABLE_RE.search(manifest_text)
     if not m:
         return []
@@ -502,7 +554,51 @@ def parse_workspace_exclude(manifest_text: str) -> list[str]:
     em = _EXCLUDE_ARRAY_RE.search(body)
     if not em:
         return []
-    return _QUOTED_STRING_RE.findall(em.group(1))
+    return [_normalize_exclude_entry(s) for s in _QUOTED_STRING_RE.findall(em.group(1))]
+
+
+def parse_workspace_exclude(manifest_text: str) -> list[str]:
+    """Extract the `[workspace] exclude = [...]` array's string values from
+    a Cargo.toml's raw text, normalized (see `_normalize_exclude_entry`).
+
+    Parsed as real TOML via `tomllib` when available (#2602) — a `#`
+    sharing a line with array content is unambiguously a comment, not
+    data, the same as it is to `cargo` itself. Fails open silently (`[]`,
+    no warning) for the two LEGITIMATE no-exclusion shapes: no
+    `[workspace]` table at all, or a `[workspace]` table that deliberately
+    carries no `exclude` key (e.g. `runtime/Cargo.toml`'s own empty
+    `[workspace]`). Warns on stderr — the parser genuinely gave up,
+    distinct from those two deliberate shapes — when the manifest fails to
+    parse as TOML at all (falls back to the regex extractor), or when an
+    `exclude` key is present but is not a list of strings; either way the
+    floor still fails open (`[]` / whatever the fallback recovers) rather
+    than raising, since a manifest a human wrote and CI still needs to run
+    against must not hard-fail the job over its shape."""
+    if tomllib is None:
+        return _parse_workspace_exclude_regex(manifest_text)
+    try:
+        data = tomllib.loads(manifest_text)
+    except tomllib.TOMLDecodeError as exc:
+        print(
+            f"parse_workspace_exclude: manifest did not parse as TOML ({exc}); "
+            "falling back to regex extraction of [workspace] exclude",
+            file=sys.stderr,
+        )
+        return _parse_workspace_exclude_regex(manifest_text)
+    workspace = data.get("workspace")
+    if not isinstance(workspace, dict):
+        return []  # no [workspace] table at all — legitimately nothing to exclude
+    if "exclude" not in workspace:
+        return []  # a real [workspace] table that deliberately carries no exclude
+    exclude = workspace["exclude"]
+    if isinstance(exclude, list) and all(isinstance(x, str) for x in exclude):
+        return [_normalize_exclude_entry(s) for s in exclude]
+    print(
+        "parse_workspace_exclude: [workspace] table found but its `exclude` "
+        f"key is not a list of strings ({exclude!r}); ignoring it",
+        file=sys.stderr,
+    )
+    return []
 
 
 def manifest_scope(manifest_path: Path) -> tuple[str, list[str]]:
@@ -511,12 +607,28 @@ def manifest_scope(manifest_path: Path) -> tuple[str, list[str]]:
     relative to the repo root (`""` for a root `Cargo.toml`);
     `excluded_prefixes` are the paths its own `[workspace] exclude` array
     names, relative to `manifest_dir`. Raises `OSError` if the file cannot
-    be read — the caller decides whether that is a hard failure (an
+    be read, and `ValueError` if `manifest_path`'s directory is not
+    repository-root-relative — either an absolute path or one containing a
+    `..` parent segment (#2602). `reachable_predicate` below only ever
+    compares `manifest_dir` as a PREFIX of a diff's own repo-root-relative
+    `+++ b/<path>` header; a directory that isn't repo-root-relative can
+    never be that prefix, so every line silently reads as unreachable and
+    the floor drops to zero with nothing to catch it — the same class of
+    failure as the unreadable-manifest case just one step further along,
+    so it gets the same hard-failure treatment rather than a quiet empty
+    scope. The caller decides whether either is a hard failure (an
     explicit `--manifest-path`) or should fail open (no flag given)."""
     text = manifest_path.read_text()
     manifest_dir = manifest_path.parent.as_posix()
     if manifest_dir == ".":
         manifest_dir = ""
+    if manifest_path.is_absolute() or ".." in Path(manifest_dir).parts:
+        raise ValueError(
+            f"manifest directory {manifest_dir!r} (from {manifest_path}) is not "
+            "repository-root-relative — it can never prefix a diff's own "
+            "repo-root-relative path, so every line would silently read as "
+            "unreachable"
+        )
     return manifest_dir, parse_workspace_exclude(text)
 
 
@@ -638,9 +750,11 @@ def count_changed_lines_main(args: list[str]) -> int:
     `cargo mutants` invocation can reach (#2544) — see the module comment
     above `parse_workspace_exclude`. Omitted entirely, behavior is unchanged
     from before #2544: every added line counts, regardless of path. An
-    UNREADABLE `--manifest-path` is a hard failure (exit 2), the same as an
-    unreadable diff — a typo'd flag must not silently narrow the floor to a
-    directory nothing lives under."""
+    UNREADABLE `--manifest-path`, or one that resolves to a directory that
+    is not repository-root-relative (#2602 — an absolute path or a `..`
+    parent segment; see `manifest_scope`), is a hard failure (exit 2), the
+    same as an unreadable diff — a typo'd or malformed flag must not
+    silently narrow the floor to a directory nothing lives under."""
     args = list(args)
     reachable = None
     if "--manifest-path" in args:
@@ -654,6 +768,9 @@ def count_changed_lines_main(args: list[str]) -> int:
             manifest_dir, excluded_prefixes = manifest_scope(Path(manifest_arg))
         except OSError as exc:
             print(f"--manifest-path could not read {manifest_arg}: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"--manifest-path {manifest_arg} is invalid: {exc}", file=sys.stderr)
             return 2
         reachable = reachable_predicate(manifest_dir, excluded_prefixes)
 
@@ -1446,6 +1563,192 @@ MANIFEST_SCOPE_SELF_TEST_CASES = [
 COUNT_SELF_TEST_CASES += MANIFEST_SCOPE_SELF_TEST_CASES
 
 
+# ---------------------------------------------------------------------------
+# (#2602) The frontier-review follow-up half: the exact reproduction of the
+# comment-inside-the-exclude-array bug (the one that turns a real red into a
+# false green), the manifest-directory validation, and the exclude-entry
+# normalization forms.
+# ---------------------------------------------------------------------------
+
+# The reviewer's exact reproduction: a `#` comment sharing a line with an
+# exclude array's own quoted content. The old regex-based extraction handed
+# this whole bracketed body to a bare quoted-string finder with no notion of
+# a TOML comment, so `"src"` inside the prose was picked up as a THIRD
+# excluded path — dropping the root floor for an ordinary `src/` diff from 2
+# to 0, silently.
+_ROOT_MANIFEST_WITH_ARRAY_COMMENT = (
+    "[workspace]\n"
+    'members = [".", "crates/darkmux-types"]\n'
+    "exclude = [\n"
+    '  "runtime",           # keeps "src" out of the parent build? no - just prose\n'
+    '  "tools/darkmux-mock-model",\n'
+    "]\n"
+    "\n"
+    "[package]\n"
+    'name = "darkmux"\n'
+)
+
+# The three normalization forms named by the review, all on one manifest:
+# a trailing slash, a leading `./`, and a trailing glob.
+_NORMALIZE_MANIFEST = (
+    "[workspace]\n"
+    'members = ["."]\n'
+    'exclude = ["runtime/", "./plugins/bundler", "tools/mock/*"]\n'
+    "\n"
+    "[package]\n"
+    'name = "darkmux"\n'
+)
+
+_DIFF_PLUGINS_BUNDLER_ONLY = (
+    "--- a/plugins/bundler/src/lib.rs\n"
+    "+++ b/plugins/bundler/src/lib.rs\n"
+    "@@ -10,3 +10,6 @@\n"
+    "+\n"
+    "+pub fn helper() -> usize {\n"
+    "+    1 + 1\n+}\n"
+)
+
+_DIFF_TOOLS_MOCK_ONLY = (
+    "--- a/tools/mock/src/lib.rs\n"
+    "+++ b/tools/mock/src/lib.rs\n"
+    "@@ -10,3 +10,6 @@\n"
+    "+\n"
+    "+pub fn helper() -> usize {\n"
+    "+    1 + 1\n+}\n"
+)
+
+# Invalid TOML (a duplicate `exclude` key in the same table) that still
+# leaves the `[workspace]` header and the FIRST `exclude = [...]` intact, so
+# the regex fallback can still recover something — proving the fallback path
+# actually engages (and warns) rather than only existing in theory.
+_MALFORMED_MANIFEST_DUPLICATE_KEY = (
+    "[workspace]\n"
+    'exclude = ["runtime"]\n'
+    'exclude = ["oops-this-is-invalid-toml"]\n'
+    "\n"
+    "[package]\n"
+    'name = "darkmux"\n'
+)
+
+# Valid TOML, but `exclude` is not an array of strings — a shape `tomllib`
+# parses cleanly but this script cannot use.
+_BAD_EXCLUDE_TYPE_MANIFEST = (
+    "[workspace]\n"
+    "exclude = true\n"
+    "\n"
+    "[package]\n"
+    'name = "darkmux"\n'
+)
+
+MANIFEST_PARSE_SELF_TEST_CASES = [
+    {
+        # THE MUST-FIX REPRODUCTION. Without the fix, `"src"` inside the
+        # comment is parsed as a real exclusion and this diff (entirely
+        # under `src/`, nowhere near the comment) reads as 0 instead of 2 —
+        # the root floor going silently blind on an ordinary source diff, in
+        # the exact repository that comments this array heavily.
+        "name": "#2602: a comment inside the exclude array's own text is not parsed as an exclusion",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _ROOT_MANIFEST_WITH_ARRAY_COMMENT,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
+    {
+        # The other half of the same manifest: the two REAL exclusions
+        # (`runtime`, `tools/darkmux-mock-model`) still work — the fix isn't
+        # just "ignore the array", it is "parse it correctly".
+        "name": "#2602: the same comment-bearing manifest still excludes its real entries",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _ROOT_MANIFEST_WITH_ARRAY_COMMENT,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        "name": "#2602: a trailing slash on an exclude entry still excludes it",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _NORMALIZE_MANIFEST,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        "name": "#2602: a leading ./ on an exclude entry still excludes it",
+        "diff": _DIFF_PLUGINS_BUNDLER_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _NORMALIZE_MANIFEST,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        "name": "#2602: a trailing glob on an exclude entry still excludes it",
+        "diff": _DIFF_TOOLS_MOCK_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _NORMALIZE_MANIFEST,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # An absolute --manifest-path is rejected before it can silently
+        # zero the floor: its directory can never prefix a diff's own
+        # repo-root-relative path, so every line would read as unreachable.
+        "name": "#2602: an absolute --manifest-path is rejected, not silently scoped to nothing",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "manifest_path": "sub/Cargo.toml",
+        "manifest_content": _ROOT_MANIFEST,
+        "manifest_arg_absolute": "sub/Cargo.toml",
+        "expect_exit": 2,
+        "expect_stderr_contains": ["is invalid", "repository-root-relative"],
+    },
+    {
+        # A --manifest-path containing a `..` parent segment is rejected the
+        # same way, even when the file it names is perfectly readable.
+        "name": "#2602: a --manifest-path with a parent (..) segment is rejected",
+        "diff": _DIFF_ROOT_SRC_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _ROOT_MANIFEST,
+        "manifest_arg": "sub/../Cargo.toml",
+        "source_files": {"sub/.keep": ""},
+        "expect_exit": 2,
+        "expect_stderr_contains": ["is invalid", "repository-root-relative"],
+    },
+    {
+        # A manifest that fails to parse as TOML at all warns on stderr and
+        # falls back to the regex extractor, rather than silently returning
+        # an empty exclusion list with no hint the parser gave up.
+        "name": "#2602: a manifest that fails to parse as TOML warns and falls back",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _MALFORMED_MANIFEST_DUPLICATE_KEY,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 0,
+        "expect_gate": 0,
+        "expect_stderr_contains": ["did not parse as TOML", "falling back to regex"],
+    },
+    {
+        # A `[workspace]` table found with an `exclude` key that parses as
+        # TOML but is not a list of strings warns and fails open (nothing
+        # excluded), rather than crashing or silently doing nothing.
+        "name": "#2602: an exclude key that isn't a list of strings warns and fails open",
+        "diff": _DIFF_RUNTIME_ONLY,
+        "manifest_path": "Cargo.toml",
+        "manifest_content": _BAD_EXCLUDE_TYPE_MANIFEST,
+        "manifest_arg": "Cargo.toml",
+        "expect_count": 2,
+        "expect_gate": 1,
+        "expect_stderr_contains": ["is not a list of strings"],
+    },
+]
+
+COUNT_SELF_TEST_CASES += MANIFEST_PARSE_SELF_TEST_CASES
+
+
 def _run_self(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), *argv],
@@ -1492,6 +1795,15 @@ def count_self_test() -> list[str]:
             count_argv = ["--count-changed-lines", str(diff_path)]
             if "manifest_arg" in case:
                 count_argv += ["--manifest-path", case["manifest_arg"]]
+            elif "manifest_arg_absolute" in case:
+                # (#2602) An ABSOLUTE path, computed at run time — the
+                # rejection under test depends on the argument genuinely
+                # being absolute, which a hardcoded case dict cannot express
+                # since the tempdir's own path isn't known until now.
+                count_argv += [
+                    "--manifest-path",
+                    str(tmp_path / case["manifest_arg_absolute"]),
+                ]
             expect_exit = case.get("expect_exit", 0)
             problems = []
 
@@ -1506,6 +1818,15 @@ def count_self_test() -> list[str]:
                 pass  # a deliberate hard failure — no count/gate to check
             elif got != str(case["expect_count"]):
                 problems.append(f"counted {got!r}, expected {case['expect_count']}")
+
+            # (#2602) Optional stderr-substring assertions — for the
+            # warn-on-stderr cases (a manifest that fails to parse as TOML,
+            # an `exclude` key of the wrong shape, an invalid --manifest-path)
+            # a passing exit code / count alone would not prove the operator
+            # is actually shown a hint the parser gave up.
+            for needle in case.get("expect_stderr_contains", []):
+                if needle not in proc.stderr:
+                    problems.append(f"stderr is missing {needle!r}: {proc.stderr.strip()}")
 
             # Hand the count straight to the floor, the way the workflow does:
             # exit 0, no output directory, i.e. "ran and mutated nothing".

@@ -67,17 +67,43 @@ jobs:
     # test — it re-runs the crate's whole 667-test suite per mutant, same as
     # any single-package cargo-mutants baseline) and its mutant-testing
     # throughput on a real sample (21 mutants, `src/compaction.rs`) was
-    # ~17s/mutant amortized under `-j 4` — a heavy runtime-touching diff on
-    # the order of that ONE file's full mutant count (126) would alone cost
-    # roughly 126×17s ≈ 36 minutes beyond its own baseline, which can
-    # exceed this job's ENTIRE budget by itself on a big diff — the same
-    # per-invocation version of the large-diff timeout #2550 already
-    # documents for the root invocation. `plugins/darkmux-bundler-rust/` is
-    # comparatively free (baseline ~6s, ~0.8s/mutant amortized — a 28-mutant
-    # sample completed in 29s total). 60 minutes gives real headroom for a
-    # TYPICAL diff (the common case touches far less than a whole file);
-    # sharding either invocation the way #2499/#2550 already call for is the
-    # real fix for a genuinely large one, and is explicitly NOT attempted
+    # ~17s/mutant amortized under `-j 4`.
+    #
+    # (#2602) That 17s/mutant figure is a LOCAL rate on the fastest hardware
+    # in play, and citing it here understates the real ceiling: frontier
+    # review independently sampled a DIFFERENT runtime file and measured
+    # ~21s/mutant, still on local hardware — one file alone already beats
+    # the 17s figure before the CI runner is even accounted for. Applying
+    # the SAME macos-latest-vs-M5-Max ratio the nightly sweep's own
+    # measurement already establishes below (~21.4s/mutant real CI rate vs
+    # ~17s/mutant local sample, ~1.26x) to that more conservative 21s/mutant
+    # local sample projects a real CI rate of roughly 26-27s/mutant. A heavy
+    # runtime-touching diff on the order of `src/compaction.rs`'s own full
+    # mutant count (126) would then cost roughly 126×26.5s ≈ 56 minutes of
+    # mutant testing alone, plus its own ~70s baseline — call it ~55-57
+    # minutes total, which is not merely "can exceed" this job's 60-minute
+    # budget, it consumes essentially the ENTIRE budget by itself, on a
+    # SINGLE file — the same per-invocation version of the large-diff
+    # timeout #2550 already documents for the root invocation.
+    # `plugins/darkmux-bundler-rust/` is comparatively free (baseline ~6s,
+    # ~0.8s/mutant amortized — a 28-mutant sample completed in 29s total).
+    #
+    # Two things keep this from being pure downside on every PR, not one:
+    # first, a PR touching NEITHER `runtime/` nor
+    # `plugins/darkmux-bundler-rust/` (the common case) pays ZERO extra
+    # minutes for either — both "Mutate ... only what this PR touched"
+    # steps below are skipped outright (`if: steps.diff.outputs.*_changed_
+    # lines != '0'`), and the matching "Note ... skipped" step just writes
+    # one line to the summary. Second, the ROOT invocation's own "Report
+    # survivors" step runs and posts to the job summary BEFORE either added
+    # invocation starts — so even a `runtime/`-touching diff big enough to
+    # burn the whole remaining budget (and time out) still leaves the root
+    # finding recorded, not lost with the rest of the job.
+    #
+    # 60 minutes gives real headroom for a TYPICAL diff (the common case
+    # touches far less than a whole file); sharding either invocation the
+    # way #2499/#2550 already call for is the real fix for a genuinely
+    # large one, and is explicitly NOT attempted
     # here — see the `mutants-full` job's own comment for why a full sweep
     # of `runtime/` specifically needs that before it can run at all.
     timeout-minutes: 60
@@ -342,9 +368,21 @@ jobs:
       # invocation alone). Paying that baseline cost on every PR regardless
       # of whether it touched `runtime/` would make an already-tight budget
       # worse for no signal.
+      #
+      # (#2602) `always() &&` added: without it, GitHub's implicit success
+      # gate skips this step the moment an earlier step in the job fails
+      # (e.g. the root "Mutate"/"Report survivors" steps above) — but
+      # "Report survivors (runtime/)" below already carries its own
+      # `always()` (it must, to report a failed root run at all) and reads
+      # `steps.mutants_runtime.outputs.exit_code`. With this step skipped,
+      # that output is empty, and the summary script tries to parse "" as
+      # an integer — a confusing integer-parse error stacked on top of the
+      # job already being red, on the exact path where someone is already
+      # debugging a failure. The job is already correctly failing either
+      # way; this only removes the noise.
       - name: Mutate runtime/ only what this PR touched
         id: mutants_runtime
-        if: steps.diff.outputs.runtime_changed_lines != '0'
+        if: always() && steps.diff.outputs.runtime_changed_lines != '0'
         run: |
           # Same exit-code capture discipline as the root invocation above —
           # no `|| true`, the real code goes to the "Report survivors
@@ -414,10 +452,16 @@ jobs:
 
       # (#2544) THE THIRD invocation — see the comment on `bundler_changed_lines`
       # above for why this project, specifically, was chosen to cover rather
-      # than just document. Same shape as the runtime block above throughout.
+      # than just document. Same shape as the runtime block above throughout,
+      # including the (#2602) `always() &&` — see that comment on `mutants_runtime`
+      # for why: without it, a failure in an earlier step (root's own Mutate/
+      # Report survivors) skips this step while "Report survivors
+      # (plugins/darkmux-bundler-rust/)" below still runs (`always()`) and reads
+      # its empty `exit_code` output, producing a confusing integer-parse
+      # error on top of a job that is already correctly red.
       - name: Mutate plugins/darkmux-bundler-rust/ only what this PR touched
         id: mutants_bundler
-        if: steps.diff.outputs.bundler_changed_lines != '0'
+        if: always() && steps.diff.outputs.bundler_changed_lines != '0'
         run: |
           set +e
           cargo mutants --manifest-path plugins/darkmux-bundler-rust/Cargo.toml --in-diff /tmp/pr-bundler.diff -j 4 --timeout 300 \
