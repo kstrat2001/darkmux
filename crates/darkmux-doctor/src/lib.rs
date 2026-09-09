@@ -1873,9 +1873,12 @@ struct StrayOutbox {
 
 /// Sibling sidecar suffixes a stray outbox's key can carry — see
 /// `darkmux_flow::hooks`'s per-rule file layout (`outbox_paths`,
-/// `last_status_path`, `dropped_appends_path`, `drain_lock_path`,
-/// `quarantine_path`).
-const HOOK_SIDECAR_SUFFIXES: &[&str] = &[".cursor", ".last", ".dropped", ".drain.lock", ".outbox.jsonl.quarantine"];
+/// `last_status_path`, `dropped_appends_path`, `receiver_rejected_path`,
+/// `drain_lock_path`, `quarantine_path`). This list is what an operator
+/// deciding "safe to delete?" reads, so a NEW per-rule sidecar belongs
+/// here in the same change that introduces it.
+const HOOK_SIDECAR_SUFFIXES: &[&str] =
+    &[".cursor", ".last", ".dropped", ".rejected", ".drain.lock", ".outbox.jsonl.quarantine"];
 
 fn stray_outbox_files(rules: &[darkmux_types::config::HookRule], outbox_dir: &std::path::Path) -> Vec<StrayOutbox> {
     // (#2183) Reuse `summarize_configured_rules`'s OWN key derivation
@@ -2007,6 +2010,44 @@ fn build_hooks_check(
         // never redelivered — worth naming, same as a dropped append.
         if s.quarantined_lines > 0 {
             flags.push(format!("{} line(s) quarantined (invalid JSON — never redelivered)", s.quarantined_lines));
+            if rule_status == Status::Pass {
+                rule_status = Status::Warn;
+            }
+        }
+        // (#2273) The receiver accepted a delivery's HTTP request (2xx)
+        // but its own response body reported it rejected some or all of
+        // the record(s) inside it — a THIRD outcome, distinct from a
+        // transport failure and a clean accept. darkmux never retries
+        // this: a receiver-side content rejection is (per
+        // `DeliveryOutcome::Success`'s own doc) usually permanent, so
+        // retrying would just repeat it forever — the line is consumed
+        // same as a clean delivery. This is where an operator who missed
+        // the `hook.fired` flow record (now emitted at Warn, not Info,
+        // for exactly this case) still finds out it happened.
+        //
+        // (#2273 fix-round finding 1) Keyed on the CUMULATIVE
+        // `receiver_rejected_total`, never on `last_receiver_rejected`.
+        // The latter lives on the `.last` sidecar, which every terminal
+        // outcome truncate-replaces in full — so 400 rejections followed
+        // by ONE clean delivery leaves it `None`, and a check keyed on it
+        // reports the rule clean seconds after those losses. The total is
+        // a counter sidecar of its own (`<key>.rejected`), never reset —
+        // the same substrate `dropped_appends` uses, for the same reason.
+        // The last delivery's own count is still named when present, as
+        // context.
+        //
+        // Describing only, per this project's stance: names the count and
+        // the actor, never characterizes the receiver as misconfigured.
+        if s.receiver_rejected_total > 0 {
+            let last_clause = match s.last_receiver_rejected {
+                Some(n) => format!("; {n} on the last delivery"),
+                None => String::new(),
+            };
+            flags.push(format!(
+                "{} record(s) reported rejected by the receiver so far (request accepted, content \
+                 rejected — consumed, not retried){last_clause}",
+                s.receiver_rejected_total
+            ));
             if rule_status == Status::Pass {
                 rule_status = Status::Warn;
             }
@@ -6746,6 +6787,108 @@ mod tests {
         );
     }
 
+    /// One `HookRule` plus its `rule_key`, for the receiver-rejection
+    /// fixtures below — all three stage sidecar files by hand under a
+    /// tempdir standing in for the outbox dir.
+    fn rejection_fixture_rule() -> (darkmux_types::config::HookRule, String) {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let url = "http://127.0.0.1:8790/events".to_string();
+        let key = darkmux_flow::hooks::rule_key(&m, &url);
+        (
+            HookRule {
+                r#match: Some(m),
+                http: Some(url),
+                signing_secret_keychain_item: None,
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
+                extras: Default::default(),
+            },
+            key,
+        )
+    }
+
+    /// (#2273) A receiver that answered 2xx but reported it rejected
+    /// content must surface as a Warn on the rule's own check row — this
+    /// is the doctor-side half of the fix, since the `hook.fired` flow
+    /// record that first reported it is a point-in-time event on the
+    /// stream, not something a separate `darkmux doctor` invocation can
+    /// see after the fact.
+    #[test]
+    fn hooks_check_warns_on_receiver_rejected_last_delivery() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (rule_cfg, key) = rejection_fixture_rule();
+        let rules = vec![rule_cfg];
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            r#"{"ts":"2026-01-01T00:00:00Z","ok":true,"last_receiver_rejected":3}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
+
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(rule.status, Status::Warn, "{}", rule.message);
+        assert!(rule.message.contains("3 record(s) reported rejected by the receiver"), "{}", rule.message);
+        assert!(rule.message.contains("3 on the last delivery"), "{}", rule.message);
+    }
+
+    /// (#2273 fix-round finding 1) The BLOCKER: `last_receiver_rejected`
+    /// lives on the `.last` sidecar, which every terminal outcome
+    /// truncate-replaces in full — so a clean delivery lands `ok: true`
+    /// with NO rejection field and, if the check keyed on that field,
+    /// erased the signal. On a live rule that is seconds after the loss.
+    ///
+    /// The fixture is the exact post-erasure state: many rejections
+    /// counted, and a `.last` document from the clean delivery that
+    /// followed them. `doctor` must still warn.
+    #[test]
+    fn hooks_check_still_warns_after_a_later_clean_delivery_erased_the_last_value() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (rule_cfg, key) = rejection_fixture_rule();
+        let rules = vec![rule_cfg];
+        // What one clean delivery leaves behind after 400 rejected ones.
+        std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "400").unwrap();
+
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(
+            rule.status,
+            Status::Warn,
+            "400 rejections must not be erased by the one clean delivery that followed them: {}",
+            rule.message
+        );
+        assert!(rule.message.contains("400 record(s) reported rejected by the receiver"), "{}", rule.message);
+        assert!(
+            !rule.message.contains("on the last delivery"),
+            "the last delivery was clean — the message must not claim otherwise: {}",
+            rule.message
+        );
+    }
+
+    /// (#2273 inverted case) A rule that has never seen a rejection
+    /// (`ok: true`, no rejection field, no counter sidecar) must NOT warn
+    /// — the guard has to key on a count actually being non-zero, never
+    /// on the rule merely having a delivery history at all. Without this,
+    /// a red-prove of the warn guard by deleting its condition entirely
+    /// could pass by accident if every fixture in the suite happened to
+    /// carry a rejection.
+    #[test]
+    fn hooks_check_stays_quiet_when_last_delivery_was_cleanly_accepted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (rule_cfg, key) = rejection_fixture_rule();
+        let rules = vec![rule_cfg];
+        std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
+
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
+        assert!(!rule.message.contains("rejected"), "{}", rule.message);
+    }
+
     /// (#2093 merge-gate finding 15) A `*.outbox.jsonl` file that belongs
     /// to no CURRENTLY-configured rule — the artifact of a rule since
     /// removed (or, before content-hash keying, silently reassigned by a
@@ -6768,10 +6911,17 @@ mod tests {
         // config — its key can't match any CURRENT rule's `rule_key`.
         std::fs::write(tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.outbox.jsonl"), "").unwrap();
 
+        // (#2273 fix-round finding 1) The new per-rule counter sidecar is
+        // one of the files an operator deciding "safe to delete?" has to
+        // be shown — a sidecar missing from `HOOK_SIDECAR_SUFFIXES` is
+        // silently left behind by whoever acts on this listing.
+        std::fs::write(tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.rejected"), "5").unwrap();
+
         let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
         let stray = checks.iter().find(|c| c.name == "hooks.stray").expect("a stray-file check must be present");
         assert_eq!(stray.status, Status::Warn, "{}", stray.message);
         assert!(stray.message.contains("127.0.0.1-9999-deadbeefdeadbeef"), "{}", stray.message);
+        assert!(stray.message.contains("127.0.0.1-9999-deadbeefdeadbeef.rejected"), "{}", stray.message);
     }
 
     #[test]

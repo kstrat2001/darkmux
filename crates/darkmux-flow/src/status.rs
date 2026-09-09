@@ -675,6 +675,17 @@ pub fn format_status_human(status: &FlowStatus) -> String {
             if r.quarantined_lines > 0 {
                 let _ = writeln!(out, "      quarantined: {} (invalid JSON — never redelivered)", r.quarantined_lines);
             }
+            // (#2273 fix-round finding 3) `flow status` is the natural
+            // verb for "did my hook deliver?" — a rule whose receiver
+            // reported rejecting records must not print clean here.
+            // Cumulative and never reset, same as `dropped:` above.
+            if r.receiver_rejected_total > 0 {
+                let _ = writeln!(
+                    out,
+                    "      rejected by receiver: {} (request accepted, content rejected — consumed, not retried)",
+                    r.receiver_rejected_total
+                );
+            }
             if r.stalled {
                 let _ = writeln!(
                     out,
@@ -728,6 +739,15 @@ pub struct HookRuleStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_drainer_heartbeat: Option<String>,
     pub quarantined_lines: usize,
+    /// (#2273 fix-round finding 3) CUMULATIVE count of records this
+    /// rule's receiver reported rejecting inside requests it answered
+    /// 2xx to — read from the persisted `<key>.rejected` counter
+    /// sidecar, so it survives both a later clean delivery and a process
+    /// restart. `0` for a rule that has never seen one. Additive to this
+    /// shape; `#[serde(default)]` so a consumer holding a document
+    /// written by an older binary still deserializes.
+    #[serde(default)]
+    pub receiver_rejected_total: u64,
 }
 
 /// The flow-record hook sink's status — folded into `FlowStatus` (#1959;
@@ -775,6 +795,7 @@ pub fn build_hooks_status(
                 stalled: s.stalled,
                 last_drainer_heartbeat: s.last_drainer_heartbeat,
                 quarantined_lines: s.quarantined_lines,
+                receiver_rejected_total: s.receiver_rejected_total,
             })
             .collect(),
     }
@@ -990,5 +1011,92 @@ mod hooks_status_tests {
         assert!(rendered.contains("crawl.*"), "{rendered}");
         assert!(rendered.contains("http://127.0.0.1:8790/events"), "{rendered}");
         assert!(rendered.contains("undelivered: 0"), "{rendered}");
+    }
+
+    /// (#2273 fix-round finding 3) `flow status` is the natural verb for
+    /// "did my hook deliver?" — before this fix it mapped
+    /// `HookRuleSummary` -> `HookRuleStatus` field by field and dropped
+    /// the receiver-rejection count on the floor, printing a rule clean
+    /// while its receiver had rejected records. Both halves are pinned:
+    /// the serialized field (what `--json` consumers read) and the human
+    /// renderer's line.
+    #[test]
+    fn flow_status_surfaces_the_receiver_rejection_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let url = "http://127.0.0.1:8790/events".to_string();
+        let rules = vec![HookRule {
+            r#match: Some(m.clone()),
+            http: Some(url.clone()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let key = crate::hooks::rule_key(&m, &url);
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "7").unwrap();
+
+        let hooks = build_hooks_status(true, tmp.path(), &rules);
+        assert_eq!(hooks.rules[0].receiver_rejected_total, 7);
+        let json = serde_json::to_value(&hooks).unwrap();
+        assert_eq!(json["rules"][0]["receiver_rejected_total"], serde_json::json!(7));
+
+        let status = FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        };
+        let rendered = format_status_human(&status);
+        assert!(rendered.contains("rejected by receiver: 7"), "{rendered}");
+    }
+
+    /// (#2273 fix-round finding 3, inverted case) A rule that has never
+    /// seen a rejection prints no rejection line at all — so a renderer
+    /// that unconditionally emitted the row could not pass the test above
+    /// by accident.
+    #[test]
+    fn flow_status_prints_no_rejection_line_when_there_are_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let hooks = build_hooks_status(true, tmp.path(), &rules);
+        assert_eq!(hooks.rules[0].receiver_rejected_total, 0);
+        let status = FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        };
+        let rendered = format_status_human(&status);
+        assert!(!rendered.contains("rejected by receiver"), "{rendered}");
     }
 }

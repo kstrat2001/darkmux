@@ -520,47 +520,92 @@ fn dropped_appends_path(outbox_dir: &Path, key: &str) -> PathBuf {
     outbox_dir.join(format!("{key}.dropped"))
 }
 
-fn read_dropped_appends(path: &Path) -> u64 {
+/// (#2273 fix-round finding 1) Sibling of `dropped_appends_path` — where
+/// the CUMULATIVE count of records this rule's receiver reported
+/// rejecting is persisted.
+///
+/// Deliberately its OWN file rather than a field on the `.last` sidecar.
+/// `.last` is a LAST-VALUE document: `write_last_status` derives a
+/// complete fresh `LastStatus` from `RuleRuntime`'s own atomics and
+/// truncate-replaces the whole file on every terminal outcome, so a
+/// rejection recorded there is erased by the very next clean delivery —
+/// seconds later, on a live rule. That shape is right for `stalled`
+/// (genuinely CURRENT state, read live from an atomic) and wrong for a
+/// rejection, which is a historical EVENT. `dropped_appends` and
+/// `quarantined_lines` are the honest neighbors: both accumulate on
+/// substrates nothing wholesale-overwrites (this file's sibling, and the
+/// quarantine file's own line count), and this counter follows
+/// `dropped_appends` exactly. `LastStatus::last_receiver_rejected` is
+/// kept alongside it, but only as last-delivery CONTEXT — the signal
+/// `darkmux doctor` keys on is this total.
+fn receiver_rejected_path(outbox_dir: &Path, key: &str) -> PathBuf {
+    outbox_dir.join(format!("{key}.rejected"))
+}
+
+/// Read one of the plain-text cumulative counter sidecars
+/// (`<key>.dropped`, `<key>.rejected`). Absent or unparseable -> 0, so a
+/// read-only reporting caller never fails on a rule that has never
+/// counted one.
+fn read_counter_sidecar(path: &Path) -> u64 {
     fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
 /// Write via a sibling temp file + atomic `rename(2)` — same shape as
-/// `write_cursor` — so a concurrent `read_dropped_appends` never observes
+/// `write_cursor` — so a concurrent `read_counter_sidecar` never observes
 /// the sidecar mid-truncate.
-fn write_dropped_appends_atomic(path: &Path, count: u64) -> Result<()> {
+fn write_counter_sidecar_atomic(path: &Path, count: u64) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
     }
-    let tmp_path = path.with_extension("dropped.tmp");
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
     fs::write(&tmp_path, count.to_string()).with_context(|| format!("writing {}", tmp_path.display()))?;
     fs::rename(&tmp_path, path).with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))
 }
 
-/// (fix-round finding 2) Cross-process read-modify-write increment of the
-/// persisted `dropped_appends` sidecar, under the SAME `flock` an append
-/// to `outbox_path` takes (`append_outbox_line`/`with_locked_file`) — so
-/// two `HookSink` instances (two darkmux processes racing the same
-/// outbox) can never both read the sidecar's stale value and each write
-/// back their own single-process count, clobbering one another. Returns
-/// the new persisted total (best-effort: on a lock/IO failure, falls back
-/// to a `+1` off whatever was last read, so the return value is never
+/// (fix-round finding 2) Cross-process read-modify-write of one of the
+/// cumulative counter sidecars, under the SAME `flock` an append to
+/// `outbox_path` takes (`append_outbox_line`/`with_locked_file`) — so two
+/// `HookSink` instances (two darkmux processes racing the same outbox)
+/// can never both read the sidecar's stale value and each write back
+/// their own single-process count, clobbering one another. Returns the
+/// new persisted total (best-effort: on a lock/IO failure, falls back to
+/// `+delta` off whatever was last read, so the return value is never
 /// worse than the pre-fix single-process behavior).
-fn increment_dropped_appends(outbox_path: &Path, dropped_appends_path: &Path) -> u64 {
+///
+/// The lock is taken on `outbox_path`, NOT on the counter file itself,
+/// and that is load-bearing rather than incidental: this function
+/// replaces the counter file's inode (temp + `rename`) on every write, so
+/// locking it by its own path would leave two writers holding locks on
+/// two DIFFERENT inodes the moment one of them renamed. `outbox_path` is
+/// the stable per-rule file every other writer of this rule already
+/// contends on.
+fn add_counter_sidecar(outbox_path: &Path, counter_path: &Path, delta: u64, label: &str) -> u64 {
     let result = darkmux_types::flock::with_locked_file(outbox_path, |_file| {
-        let count = read_dropped_appends(dropped_appends_path) + 1;
-        write_dropped_appends_atomic(dropped_appends_path, count)?;
+        let count = read_counter_sidecar(counter_path) + delta;
+        write_counter_sidecar_atomic(counter_path, count)?;
         Ok(count)
     });
     match result {
         Ok(count) => count,
         Err(e) => {
-            eprintln!(
-                "flow::HookSink: failed to persist dropped-appends count to {}: {e:#}",
-                dropped_appends_path.display()
-            );
-            read_dropped_appends(dropped_appends_path) + 1
+            eprintln!("flow::HookSink: failed to persist {label} count to {}: {e:#}", counter_path.display());
+            read_counter_sidecar(counter_path) + delta
         }
     }
+}
+
+/// [`add_counter_sidecar`] for the `dropped_appends` counter — one
+/// refused write at a time.
+fn increment_dropped_appends(outbox_path: &Path, dropped_appends_path: &Path) -> u64 {
+    add_counter_sidecar(outbox_path, dropped_appends_path, 1, "dropped-appends")
+}
+
+/// (#2273 fix-round finding 1) [`add_counter_sidecar`] for the cumulative
+/// receiver-rejection counter — `n` is the count the receiver itself
+/// reported for THIS delivery, so the running total counts records
+/// reported rejected, not deliveries that carried a rejection.
+fn add_receiver_rejected(outbox_path: &Path, receiver_rejected_path: &Path, n: u64) -> u64 {
+    add_counter_sidecar(outbox_path, receiver_rejected_path, n, "receiver-rejected")
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -583,6 +628,18 @@ struct LastStatus {
     /// writability probe against the cursor file succeeds again.
     #[serde(default, skip_serializing_if = "is_false")]
     stalled: bool,
+    /// (#2273) The receiver's own per-record rejection count from the
+    /// LAST successful (2xx) delivery — `None` when that delivery was
+    /// cleanly accepted, or when the last terminal outcome wasn't a
+    /// success at all (a `ClientError`/`RedirectRefused`/quarantine has
+    /// no receiver-rejection concept, so it's never set on those paths).
+    /// This is what makes a receiver rejection visible to a SEPARATE
+    /// `darkmux doctor` invocation after the fact — the `hook.fired` flow
+    /// record it rode in on is a point-in-time event on the stream, not
+    /// durable per-rule state. Lenient-on-read: absent in a sidecar
+    /// written before this field existed, defaults to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_receiver_rejected: Option<u64>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -646,13 +703,29 @@ fn write_status_sidecar_locked(path: &Path, json: &[u8]) -> Result<()> {
 /// (finding 1) — the two can legitimately coexist: the POST succeeded
 /// (this call reports `ok: true`) even though the cursor write that was
 /// supposed to record it durably is currently failing.
+///
+/// (#2273) Thin wrapper over [`write_last_status_full`] that always
+/// writes `last_receiver_rejected: None` — every call site except the
+/// `DeliveryOutcome::Success` one has no receiver-rejection outcome to
+/// report (a give-up, a redirect refusal, or a quarantine never got a
+/// 2xx response body to read one from).
 fn write_last_status(rt: &RuleRuntime, ok: bool, error: Option<&str>) {
+    write_last_status_full(rt, ok, error, None)
+}
+
+/// (#2273) Full form of [`write_last_status`] — takes the receiver's
+/// per-record rejection count from the delivery this call reports on, so
+/// it survives into the `.last` sidecar for a later `darkmux doctor` run
+/// to surface, not just the `hook.fired` flow record the delivery already
+/// emitted.
+fn write_last_status_full(rt: &RuleRuntime, ok: bool, error: Option<&str>, last_receiver_rejected: Option<u64>) {
     let status = LastStatus {
         ts: schema::ts_utc_now(),
         ok,
         error: error.map(str::to_string),
         cursor_write_failures: rt.cursor_write_failures.load(Ordering::Acquire),
         stalled: rt.stalled.load(Ordering::Acquire),
+        last_receiver_rejected,
     };
     if let Ok(json) = serde_json::to_string(&status) {
         // (#2453) Locked on the sidecar's own path — see
@@ -709,6 +782,7 @@ fn write_cursor_write_status(path: &Path, cursor_write_failures: u64, stalled: b
             error: None,
             cursor_write_failures: 0,
             stalled: false,
+            last_receiver_rejected: None,
         });
         // (#2453 red-prove seam) Widens the read-to-write window on
         // demand for the concurrency test — see
@@ -792,6 +866,10 @@ pub struct ResolvedRule {
     /// (#2093 merge-gate finding 9) Where the live `dropped_appends`
     /// counter is persisted — see `dropped_appends_path`'s doc.
     pub dropped_appends_path: PathBuf,
+    /// (#2273 fix-round finding 1) Where the CUMULATIVE receiver-rejection
+    /// count is persisted — see `receiver_rejected_path`'s doc for why it
+    /// is a counter sidecar and not a `.last` field.
+    pub receiver_rejected_path: PathBuf,
     /// (#2135 option 2) Which URL policy this rule's target satisfied —
     /// re-validated (not merely cached) at every POST, same reasoning as
     /// `try_post`'s existing loopback re-validation. (#2183) `None` for a
@@ -876,6 +954,7 @@ pub fn resolve_one_rule(index: usize, r: &HookRule, outbox_dir: &Path) -> Result
     let last_status_path = last_status_path(outbox_dir, &key);
     let drain_lock_path = drain_lock_path(outbox_dir, &key);
     let dropped_appends_path = dropped_appends_path(outbox_dir, &key);
+    let receiver_rejected_path = receiver_rejected_path(outbox_dir, &key);
     let signing_secret = crate::hook_signing_secret(index, r.signing_secret_keychain_item.as_deref());
     let transform = match &r.transform {
         Some(name) if !name.trim().is_empty() => {
@@ -906,6 +985,7 @@ pub fn resolve_one_rule(index: usize, r: &HookRule, outbox_dir: &Path) -> Result
         last_status_path,
         drain_lock_path,
         dropped_appends_path,
+        receiver_rejected_path,
         target_kind,
         signing_secret,
         file_dir,
@@ -998,6 +1078,29 @@ pub struct HookRuleSummary {
     /// toward `undelivered`, so this is the only place they're visible
     /// short of reading the `.outbox.jsonl.quarantine` file by hand.
     pub quarantined_lines: usize,
+    /// (#2273) The receiver's own per-record rejection count from the
+    /// LAST successful delivery — read from the PERSISTED `.last`
+    /// sidecar, cross-process visible same as `cursor_write_failures`.
+    /// `None` when the last delivery was cleanly accepted, or before any
+    /// successful delivery has happened yet.
+    ///
+    /// CONTEXT ONLY — never the signal a reporting surface keys on. The
+    /// `.last` sidecar is wholesale-overwritten by every terminal
+    /// outcome, so this field self-erases on the next clean delivery:
+    /// 400 rejections followed by one clean accept reads `None` here.
+    /// `receiver_rejected_total` is the durable count.
+    pub last_receiver_rejected: Option<u64>,
+    /// (#2273 fix-round finding 1) CUMULATIVE count of records this
+    /// rule's receiver reported rejecting, across every delivery and
+    /// every process — read from the persisted `<key>.rejected` counter
+    /// sidecar, exactly like `dropped_appends` reads `<key>.dropped`.
+    /// Never reset by a later clean delivery, which is what makes it the
+    /// field `darkmux doctor` and `darkmux flow status` key on. The
+    /// records are still consumed either way (retrying a receiver-side
+    /// content rejection would just repeat it forever); this is what
+    /// keeps the rejection visible after the `hook.fired` flow record
+    /// that first reported it has scrolled off the stream.
+    pub receiver_rejected_total: u64,
     /// (#2093 merge-gate finding 15) This rule's stable filename key —
     /// see `rule_key`'s doc. Exposed so a caller (`darkmux doctor`) can
     /// diff the set of CURRENT rules' keys against what's actually on
@@ -1092,7 +1195,8 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
             let cursor = read_cursor(&cursor_path);
             let undelivered = undelivered_line_count(&outbox_path, cursor);
             let last = read_last_status(&last_status_path(outbox_dir, &key));
-            let dropped_appends = read_dropped_appends(&dropped_appends_path(outbox_dir, &key));
+            let dropped_appends = read_counter_sidecar(&dropped_appends_path(outbox_dir, &key));
+            let receiver_rejected_total = read_counter_sidecar(&receiver_rejected_path(outbox_dir, &key));
             let last_drainer_heartbeat = fs::read_to_string(heartbeat_path(&cursor_path)).ok();
             let quarantined_lines = undelivered_line_count(&quarantine_path(&outbox_path), 0);
             let transform_name = r.transform.clone().filter(|s| !s.trim().is_empty());
@@ -1121,6 +1225,8 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
                 stalled: last.as_ref().map(|s| s.stalled).unwrap_or(false),
                 last_drainer_heartbeat,
                 quarantined_lines,
+                last_receiver_rejected: last.as_ref().and_then(|s| s.last_receiver_rejected),
+                receiver_rejected_total,
                 key,
                 is_file,
                 transform_name,
@@ -2163,14 +2269,33 @@ fn emit_hook_record_with(
     if let Some(e) = error {
         payload["error"] = serde_json::Value::String(e.to_string());
     }
-    if let Some(n) = receiver_rejected.filter(|n| *n > 0) {
+    let rejected_count = receiver_rejected.filter(|n| *n > 0);
+    if let Some(n) = rejected_count {
         payload["receiver_rejected"] = serde_json::Value::from(n);
     }
 
     let action = if success { "hook.fired" } else { "hook.failed" };
+    // (#2273) Three outcomes, not two: transport FAILURE (`Error`),
+    // transport success with a clean receiver accept (`Info`), and
+    // transport success where the receiver's own response body reported
+    // it rejected some or all of the delivered content (`Warn`). Folding
+    // the third into the second — as this used to do by keying only on
+    // the transport-level `success` bool — logged a receiver rejection at
+    // the SAME level as a routine delivery, so it silently scrolled past
+    // anyone watching the stream for problems. The record is still
+    // consumed either way (see the `DeliveryOutcome::Success` call site's
+    // doc for why retry would be wrong here), so this is the loud half of
+    // that decision.
+    let level = if !success {
+        Level::Error
+    } else if rejected_count.is_some() {
+        Level::Warn
+    } else {
+        Level::Info
+    };
     let rec = FlowRecord {
         ts: schema::ts_utc_now(),
-        level: if success { Level::Info } else { Level::Error },
+        level,
         category: Category::Machinery,
         tier: Tier::Local,
         stage: Stage::Ship,
@@ -2565,10 +2690,24 @@ fn drainer_loop(
                         *c
                     };
                     advance_cursor(rt, new_cursor);
-                    write_last_status(rt, true, None);
-                    if let Some(n) = receiver_rejected.filter(|n| *n > 0) {
+                    // (#2273) Persist the rejection count durably (not
+                    // just onto the `hook.fired` flow record) so a later
+                    // `darkmux doctor` invocation can still see it after
+                    // the flow event itself has scrolled past. TWO
+                    // writes, deliberately: the `.last` sidecar carries
+                    // the LAST delivery's count as context (and is
+                    // wholesale-overwritten by the next delivery, clean
+                    // or not), while the `<key>.rejected` counter sidecar
+                    // ACCUMULATES and is never reset — that one is what
+                    // doctor / `flow status` key on, so one clean
+                    // delivery seconds later cannot erase the signal.
+                    let rejected_for_status = receiver_rejected.filter(|n| *n > 0);
+                    write_last_status_full(rt, true, None, rejected_for_status);
+                    if let Some(n) = rejected_for_status {
+                        let total =
+                            add_receiver_rejected(&rt.rule.outbox_path, &rt.rule.receiver_rejected_path, n);
                         eprintln!(
-                            "flow::HookSink: receiver at {} accepted the request but rejected {n} record(s) inside it — see hook.fired.receiver_rejected",
+                            "flow::HookSink: receiver at {} accepted the request but rejected {n} record(s) inside it ({total} so far) — see hook.fired.receiver_rejected",
                             rt.rule.url
                         );
                     }
@@ -3019,6 +3158,16 @@ pub mod test_receiver {
         pub fn with_response_body(self, body: &str) -> Self {
             *self.response_body.lock().unwrap() = Some(body.to_string());
             self
+        }
+
+        /// (#2273 fix-round finding 1) Swap the 2xx response body
+        /// mid-test, so ONE receiver can answer a per-record rejection
+        /// first and a clean accept afterwards. That sequence — rejections
+        /// followed by a clean delivery — is precisely what a last-value
+        /// status field silently erases, and it cannot be staged with the
+        /// consuming `with_response_body` builder alone.
+        pub fn set_response_body(&self, body: Option<&str>) {
+            *self.response_body.lock().unwrap() = body.map(str::to_string);
         }
 
         pub fn with_redirect_location(self, location: &str) -> Self {
@@ -5584,6 +5733,146 @@ mod tests {
         let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
         let rejected = fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).and_then(|v| v.as_u64());
         assert_eq!(rejected, Some(1), "{fired:?}");
+        // (#2273) A receiver rejection is a THIRD outcome, distinct from
+        // both a routine delivery (Info) and a transport failure
+        // (Error) — it must log loud enough to stand out from the
+        // routine `hook.fired` traffic around it, or it reads as a
+        // clean delivery to anyone scanning the stream by level.
+        assert_eq!(level_wire(fired.level), "warn", "{fired:?}");
+        // (#2273) Also persisted into the `.last` sidecar — not just the
+        // flow record — so a SEPARATE `darkmux doctor` invocation can
+        // still see the rejection after this event has scrolled off the
+        // stream.
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last = read_last_status(&last_status_path(tmp.path(), &key)).expect("`.last` sidecar must exist");
+        assert_eq!(last.last_receiver_rejected, Some(1), "{last:?}");
+        // (#2273 fix-round finding 1) …and into the CUMULATIVE counter
+        // sidecar, which is the one `doctor` / `flow status` key on.
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 1, "{summary:?}");
+        drop(sink);
+    }
+
+    /// (#2273 inverted case) The companion to the test above: a receiver
+    /// that accepts EVERYTHING must stay quiet on both axes a
+    /// mutation-only red-prove could otherwise slip past — Info level
+    /// (not Warn) on the flow record, and no `last_receiver_rejected` in
+    /// the persisted sidecar. Without this, deleting the `rejected_count
+    /// = ... .filter(...)` guard and just always warning would still
+    /// pass the rejection test above.
+    #[test]
+    fn hook_fired_stays_info_and_quiet_when_receiver_accepts_cleanly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            Duration::from_secs(3)
+        ));
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            "a clean accept must never carry a receiver_rejected field: {fired:?}"
+        );
+        assert_eq!(level_wire(fired.level), "info", "{fired:?}");
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last = read_last_status(&last_status_path(tmp.path(), &key)).expect("`.last` sidecar must exist");
+        assert_eq!(last.last_receiver_rejected, None, "{last:?}");
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 0, "a clean accept must never count one: {summary:?}");
+        drop(sink);
+    }
+
+    /// (#2273 fix-round finding 1) The BLOCKER this round fixes: a
+    /// rejection recorded ONLY as a last-value field erases itself on the
+    /// next clean delivery, which on a live rule is seconds later — so
+    /// `darkmux doctor` reports the rule clean while records have in fact
+    /// been lost. Rejections must accumulate on a substrate no later
+    /// delivery overwrites.
+    ///
+    /// Sequence: one delivery the receiver reports rejecting, then one it
+    /// accepts cleanly. The `.last` sidecar's `last_receiver_rejected`
+    /// legitimately goes back to `None` (it is a LAST-value field and this
+    /// test pins that, so nobody "fixes" the erasure by making that field
+    /// sticky and calling it a cumulative count) — while
+    /// `receiver_rejected_total` must still read 1.
+    #[test]
+    fn receiver_rejected_total_survives_a_later_clean_delivery() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(r#"{"ok":true,"accepted":0,"rejected":1}"#);
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let url = receiver.url("/events");
+        let rules = vec![HookRule {
+            r#match: Some(m.clone()),
+            http: Some(url.clone()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let key = rule_key(&m, &url);
+        let last_path = last_status_path(tmp.path(), &key);
+
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(
+                || read_last_status(&last_path).and_then(|s| s.last_receiver_rejected) == Some(1),
+                Duration::from_secs(5)
+            ),
+            "the rejected delivery must land first"
+        );
+        assert_eq!(summarize_configured_rules(&rules, tmp.path())[0].receiver_rejected_total, 1);
+
+        // The receiver starts accepting cleanly, and one more record goes
+        // out. Waiting for `last_receiver_rejected` to go back to `None`
+        // is the rendezvous: it can only happen once the SECOND delivery's
+        // terminal status write has landed.
+        receiver.set_response_body(None);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(
+                || read_last_status(&last_path).is_some_and(|s| s.last_receiver_rejected.is_none()),
+                Duration::from_secs(5)
+            ),
+            "the clean delivery must land second"
+        );
+
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(
+            summary.receiver_rejected_total, 1,
+            "one clean delivery must not erase a recorded rejection — a `.last`-only signal does exactly \
+             that, seconds after the loss: {summary:?}"
+        );
         drop(sink);
     }
 
