@@ -716,6 +716,28 @@ COUNT_SELF_TEST_CASES = [
         "expect_count": 1,
         "expect_gate": 1,
     },
+    {
+        # (#2499) The workflow's diff pathspec widened from 'src/*.rs' to
+        # '*.rs' when `mutants-in-diff` started passing `--workspace`, so a
+        # `crates/**` diff now reaches this counter for the first time. The
+        # counter itself never looked at the path — `added_line_is_countable`
+        # only reads line CONTENT — so this is the same real-code shape as
+        # `_DIFF_REAL_CODE` above, just under a `crates/` path, proving that
+        # widening held rather than assuming it from the src/ cases alone.
+        "name": "a crates/ path (the newly in-scope tree) counts the same as src/",
+        "diff": (
+            "--- a/crates/darkmux-eureka/src/lib.rs\n"
+            "+++ b/crates/darkmux-eureka/src/lib.rs\n"
+            "@@ -380,3 +380,8 @@\n"
+            "+\n+/// doc comment: zero\n"
+            "+pub fn scratch_rule_count() -> usize {\n"
+            "+    all_rules().len()\n+}\n"
+        ),
+        # blank, doc comment, and the trailing `}` are excluded; the `pub fn`
+        # signature and the body line count.
+        "expect_count": 2,
+        "expect_gate": 1,
+    },
 ]
 
 
