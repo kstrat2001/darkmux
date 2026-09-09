@@ -50,9 +50,15 @@ on:
   push:
     branches: [main]
   # Daily advisory sweep: catches a newly-disclosed RUSTSEC advisory against an
-  # unchanged dependency without waiting for the next dep-touching PR.
+  # unchanged dependency without waiting for the next dep-touching PR. Also
+  # the trigger for `mock-dispatch-proof` below (#2486) — its own Docker
+  # daemon requirement rules it out of the pull_request/push gate.
   schedule:
     - cron: "17 6 * * *"
+  # (#2486) Lets an operator run `gh workflow run ci.yml --ref <sha>` by hand
+  # — e.g. against a release commit, as the CI-side half of the point-release
+  # skill's §2.5 dogfood gate — without waiting for the nightly cron.
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -281,6 +287,58 @@ jobs:
       - name: No runtime-relevant changes — pipeline skipped
         if: steps.filter.outputs.runtime != 'true'
         run: echo "No runtime/ changes detected; test+lint skipped (reports green)."
+
+  mock-dispatch-proof:
+    name: mock dispatch proof (ubuntu-latest, real docker, nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # (#2486) `tests/mock_dispatch_proof.rs` is the ONLY test in the tree
+    # that constructs and runs a real `docker run` — the guard against
+    # #975's class of bug (`docker docker run`, exit 125, which shipped
+    # through four releases because every test asserted the docker argv
+    # vector and nothing ever built and ran the real `Command`). It has
+    # ALWAYS been `#[ignore]`d (needs Docker + the runtime image), and
+    # nothing in this file's `pull_request`/`push` triggers ever passes
+    # `-- --ignored` — so it rotted red and unwatched for at least a
+    # release before anyone noticed (#2486). It cannot become a
+    # pull_request/push gate: `runtime-test-lint` above already notes macOS
+    # runners don't ship a working Docker daemon, so it needs its own
+    # ubuntu-latest job rather than a step bolted onto one of the macOS
+    # ones — and a container-construction proof cannot run on every PR
+    # anyway (the image build alone costs real minutes). It runs on the
+    # existing daily `schedule` cron (so nobody has to remember to invoke
+    # it — the exact discipline this issue's own root cause argues for:
+    # #2486 traced the miss to nothing ever running `-- --ignored`, not to
+    # a broken emitter) and on `workflow_dispatch`, so an operator can also
+    # `gh workflow run ci.yml --ref <release-sha>` as the CI-side half of
+    # the `darkmux-point-release` skill's §2.5 dogfood gate.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mock-dispatch-proof
+
+      # Built fresh from THIS commit's runtime/ (not pulled) — the released
+      # GHCR image only publishes *at* release, so a pre-release/nightly run
+      # against main has no versioned tag to pull anyway. Mirrors the
+      # `darkmux-point-release` skill's own "build fresh if runtime/
+      # changed" step.
+      - name: Build darkmux-runtime:latest from this commit's runtime/
+        run: docker build -t darkmux-runtime:latest runtime/
+
+      # `tests/mock_dispatch_proof.rs` builds `tools/darkmux-mock-model`
+      # itself (a `cargo build` shell-out inside the test) — no separate
+      # build step needed here. Zero LMStudio, zero GPU, zero real AI: the
+      # only thing standing in for "the model" is that standalone mock
+      # process (see the test file's own module doc).
+      - name: Real container dispatch proof (mock-model harness)
+        run: cargo test -p darkmux-crew --test mock_dispatch_proof -- --ignored --nocapture
 
   cargo-audit:
     name: cargo audit (RUSTSEC advisories)

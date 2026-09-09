@@ -181,9 +181,18 @@ fn run_mock_dispatch(
     let profiles_path = write_mock_profiles_registry(registry_dir.path());
 
     // SAFETY (matches the pattern `darkmux-flow`'s own tests use for this
-    // exact env var): these tests are `#[ignore]`d and run one at a time by
-    // hand (`cargo test ... -- --ignored`), so there's no cross-test race
-    // over DARKMUX_FLOWS_DIR here.
+    // exact env var): both callers of this helper carry `#[serial_test::serial]`
+    // (below), so only one of this file's tests ever holds DARKMUX_FLOWS_DIR
+    // at a time — `#[ignore]` alone does NOT guarantee that: the documented
+    // invocation (`cargo test ... -- --ignored`, no `--test-threads=1`) runs
+    // both `#[ignore]`d tests in this file concurrently by default, and two
+    // threads racing `set_var`/`remove_var` on the same process-wide
+    // DARKMUX_FLOWS_DIR is exactly what made this session's `dispatch.start`
+    // (or `dispatch.complete`) land in the OTHER test's isolated flows dir —
+    // see `real_container_dispatch_round_trips_through_a_standalone_mock_model_process`'s
+    // own history (#2486): the container path and the flow-record emitter
+    // were never at fault, the missing-record symptom was 100% reproducible
+    // under the default parallel invocation and 100% absent once serialized.
     let prev_flows_dir = std::env::var("DARKMUX_FLOWS_DIR").ok();
     unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path()) };
 
@@ -238,6 +247,7 @@ fn run_mock_dispatch(
 
 #[test]
 #[ignore = "requires Docker + a local darkmux-runtime:latest image"]
+#[serial_test::serial] // env-scoped DARKMUX_FLOWS_DIR, like its neighbor below (#2486)
 fn real_container_dispatch_round_trips_through_a_standalone_mock_model_process() {
     let bin = build_mock_model_binary();
     let (result, flows_dir, session_id) = run_mock_dispatch(
@@ -293,6 +303,7 @@ fn real_container_dispatch_round_trips_through_a_standalone_mock_model_process()
 /// during development.
 #[test]
 #[ignore = "requires Docker + a local darkmux-runtime:latest image"]
+#[serial_test::serial] // env-scoped DARKMUX_FLOWS_DIR, like its neighbor above (#2486)
 fn real_container_dispatch_executes_a_scripted_multi_turn_tool_call_sequence() {
     let bin = build_mock_model_binary();
 
