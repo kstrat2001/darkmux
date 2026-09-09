@@ -100,13 +100,55 @@ describe("taskAggMetrics", () => {
 });
 
 describe("groupTimeline", () => {
-  it("groups tasks under their phase, sorted by depth, with per-task wait labels", () => {
+  it("groups tasks under their phase, sorted by depth", () => {
     const groups = groupTimeline([PHASE, TASK_A, TASK_B], EDGES, {}, 0);
     expect(groups).toHaveLength(1);
     expect(groups[0].phase.id).toBe("p1");
     expect(groups[0].tasks.map((t) => t.task.id)).toEqual(["a", "b"]);
-    expect(groups[0].tasks[1].waitsOn).toEqual(["bundle"]);
     expect(groups[0].tasks[0].waitsOn).toEqual([]);
+  });
+
+  // (#2315/#2343) `waitsOn` used to list a `depends_on` source's label
+  // unconditionally — a task kept reading "waits on: <X>" long after X
+  // finished. The dependency line exists to explain why a task hasn't
+  // started; once the named task is Complete it is no longer a reason, so
+  // it must drop out of the list entirely (the card then renders no
+  // `.tlt-waits` line at all, matching how `MissionTimelineView` guards on
+  // `waitsOn.length`).
+  it("drops a dependency from waitsOn once its source task reads complete", () => {
+    // TASK_A ("bundle") is `status: "complete"` and TASK_B depends on it —
+    // the dependency is satisfied, so it must not appear.
+    const groups = groupTimeline([PHASE, TASK_A, TASK_B], EDGES, {}, 0);
+    expect(groups[0].tasks[1].task.id).toBe("b");
+    expect(groups[0].tasks[1].waitsOn).toEqual([]);
+  });
+
+  // The inverted case: a genuinely-incomplete dependency must still show,
+  // so the fix is a real filter and not "always empty".
+  it("keeps a dependency in waitsOn while its source task is still running or planned", () => {
+    const runningSource: GraphNode = { ...TASK_A, id: "a-running", label: "still-going", status: "running" };
+    const plannedSource: GraphNode = { ...TASK_A, id: "a-planned", label: "not-started", status: "planned" };
+    const dependent: GraphNode = { ...TASK_B, id: "dep" };
+    const edges: GraphEdge[] = [
+      { id: "e1", source: "a-running", target: "dep", kind: "depends_on" },
+      { id: "e2", source: "a-planned", target: "dep", kind: "depends_on" },
+    ];
+    const groups = groupTimeline([PHASE, runningSource, plannedSource, dependent], edges, {}, 0);
+    const depTask = groups[0].tasks.find((t) => t.task.id === "dep")!;
+    expect(depTask.waitsOn.sort()).toEqual(["not-started", "still-going"]);
+  });
+
+  it("filters per-edge: a task with one complete and one incomplete dependency shows only the incomplete one", () => {
+    const doneSource: GraphNode = { ...TASK_A, id: "a-done", label: "finished", status: "complete" };
+    const pendingSource: GraphNode = { ...TASK_A, id: "a-pending", label: "pending", status: "running" };
+    const dependent: GraphNode = { ...TASK_B, id: "dep2" };
+    const edges: GraphEdge[] = [
+      { id: "e1", source: "a-done", target: "dep2", kind: "depends_on" },
+      { id: "e2", source: "a-pending", target: "dep2", kind: "depends_on" },
+    ];
+    const groups = groupTimeline([PHASE, doneSource, pendingSource, dependent], edges, {}, 0);
+    const depTask = groups[0].tasks.find((t) => t.task.id === "dep2")!;
+    expect(depTask.waitsOn).toEqual(["pending"]);
   });
 
   it("attaches a per-step meter to every step row", () => {
