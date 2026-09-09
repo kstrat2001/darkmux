@@ -2288,6 +2288,111 @@
         }
     }
 
+    // ─── #2561: --resume-from on the remote single-shot path must refuse
+    //     BEFORE the HTTP call, not silently ignore the flag ──────────────
+
+    /// **This is the ORDER test, not just a refusal test** — the same
+    /// discipline as `dispatch_internal_resume_from_validates_before_
+    /// model_selection` above, for a different bypass of the same promise.
+    /// #2561 found that a tool-less role resolving to a remote endpoint
+    /// (the `dispatch_remote` single-shot fork) returned from `dispatch()`
+    /// at the routing `if`/`else` — before EVER reaching the `--resume-from`
+    /// gate a few lines further down the SAME function. `dispatch_remote`'s
+    /// body contains the substring "resume" zero times: no checkpoint
+    /// check, no refusal, just a fresh hosted call that spends real tokens
+    /// and reports success.
+    ///
+    /// Asserting only that `dispatch()` returns an error whose text
+    /// mentions "resume" cannot tell "refused before the call" apart from
+    /// "the mock server itself returned an error body containing that
+    /// word" — both produce an `Err` with matching text. So this proves
+    /// ORDER directly, the same way the #2162 test above proves it for
+    /// model selection: a real loopback HTTP server stands in for the
+    /// remote endpoint (`one_shot_http_mock`, already used by the
+    /// `probe_remote_endpoint` tests below), and its `rx` channel only
+    /// fires once the mock has ACCEPTED A CONNECTION and read a complete
+    /// request. If the refusal check were ever deleted, or moved to run
+    /// only after `dispatch_remote`'s HTTP call, the call would reach the
+    /// mock and `rx.recv_timeout` would return the captured request
+    /// instead of timing out — redding this test.
+    #[test]
+    #[serial]
+    fn dispatch_remote_refuses_resume_from_before_the_http_call() {
+        let (base_url, rx) =
+            one_shot_http_mock(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        // A profiles registry whose default (and only) profile resolves to a
+        // REMOTE endpoint pointed at the mock server above — the same shape
+        // `resolve_context_window_internal_unaffected_by_invalid_sibling_crew`
+        // uses for a "cloud" profile, but here it's the DEFAULT so
+        // `try_resolve_remote_target` actually routes onto it.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            format!(
+                r#"{{"profiles":{{"cloud":{{"models":[
+                        {{"id":"gpt-remote","n_ctx":100000,
+                         "endpoint":{{"url":"{base_url}"}}}}
+                    ]}}}},
+                    "default_profile":"cloud"}}"#
+            ),
+        )
+        .unwrap();
+
+        // No checkpoint.json written in this dir — deliberately irrelevant:
+        // the fix must refuse on the FLAG alone, before ever reading it.
+        let resume_from = TempDir::new().unwrap();
+
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string(); // real built-in, tool-less
+        opts.resume_from = Some(resume_from.path().to_path_buf());
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+
+        let err = dispatch(opts).expect_err(
+            "--resume-from on a dispatch that resolves to the remote single-shot path must refuse",
+        );
+        let msg = format!("{err:#}");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        // POSITIVE: the refusal names the remote single-shot path as the
+        // reason, and carries the same promise the container-path gate
+        // states — this makes that promise true here too.
+        assert!(
+            msg.contains("not supported on the remote single-shot dispatch path"),
+            "must name the remote single-shot path as the reason: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "darkmux never silently starts a dispatch fresh under a name that looked \
+                 like a resume"
+            ),
+            "must carry the same promise the container-path gate states: {msg}"
+        );
+
+        // ORDER, not just refusal: the mock must never have been contacted.
+        // A regression that deleted the check (or left it running only
+        // after `dispatch_remote`'s HTTP call) would let this recv succeed
+        // with the captured request instead of timing out.
+        match rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(request) => panic!(
+                "the remote HTTP call must never happen for a refused resume, but the mock \
+                 received a request: {request}"
+            ),
+            Err(e) => panic!("unexpected mock channel state: {e:?}"),
+        }
+    }
+
     // ── the message itself: three shapes, three remedies ───────────────
 
     #[test]
