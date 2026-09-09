@@ -604,6 +604,76 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
   });
 });
 
+// ── #2512: the default must never hide every activity a real corpus
+// actually contains ──────────────────────────────────────────────────────
+describe("#2512 — the act default never turns on nothing for a corpus that has records", () => {
+  // The exact 14 activity values #2512 measured from the real parity
+  // corpus — every one lifecycle/telemetry, none in `DEFAULT_ACTIVITIES`,
+  // none failure-shaped. Before the fix this produced an empty `act` set:
+  // every record loaded, every record hidden, "0 events · N hidden"
+  // forever.
+  const LIFECYCLE_ONLY_ACTIONS = [
+    "dispatch.start",
+    "dispatch.complete",
+    "machine.online",
+    "machine.offline",
+    "mission.start",
+    "phase.begin",
+  ];
+
+  it("defaultFilterState: a corpus with no DEFAULT_ACTIVITIES member still shows something", () => {
+    const facets = computeFacets(LIFECYCLE_ONLY_ACTIONS.map((action) => rec({ action })));
+    // Sanity: confirm none of this corpus's activity values is in the
+    // curated allowlist and none reads as a failure — this is exactly the
+    // condition the naive fold cannot handle.
+    for (const v of facets.act) {
+      expect(DEFAULT_ACTIVITIES.has(v)).toBe(false);
+    }
+    const filters = defaultFilterState(facets);
+    expect(filters.act.size).toBeGreaterThan(0);
+    // The backstop shows everything the corpus offers, not a partial pick.
+    expect(filters.act.size).toBe(facets.act.length);
+  });
+
+  it("applyStoredPicks with a fresh (empty) StoredPicks — the real EventLogColumn mount path — also shows something", () => {
+    const facets = computeFacets(LIFECYCLE_ONLY_ACTIONS.map((action) => rec({ action })));
+    const state = applyStoredPicks(createStoredPicks(), facets);
+    expect(state.act.size).toBeGreaterThan(0);
+    expect(state.act.size).toBe(facets.act.length);
+  });
+
+  it("does not disturb the curated allowlist when the corpus actually contains a DEFAULT_ACTIVITIES member", () => {
+    // Same lifecycle-only noise, PLUS one real model activity — the normal
+    // "busy fleet" shape #2416 was written for. The backstop must not
+    // fire here: the curated denoise (hide the lifecycle tail, show the
+    // model signal) is the whole point of #2416 and must survive.
+    const facets = computeFacets([...LIFECYCLE_ONLY_ACTIONS, "dispatch.reasoning"].map((action) => rec({ action })));
+    const filters = defaultFilterState(facets);
+    expect(filters.act.has("reasoning")).toBe(true);
+    expect(filters.act.has("dispatch start")).toBe(false);
+    expect(filters.act.has("machine online")).toBe(false);
+    expect(filters.act.size).toBe(1);
+  });
+
+  it("does not override a deliberate operator choice to exclude everything", () => {
+    // This is NOT the "no opinion" state the backstop is scoped to — the
+    // operator has an explicit exclude recorded for every value the corpus
+    // offers, so an empty result here is a real choice, not a default gone
+    // wrong, and must stay empty.
+    const facets = computeFacets(LIFECYCLE_ONLY_ACTIONS.map((action) => rec({ action })));
+    const picks = createStoredPicks();
+    for (const v of facets.act) picks.act.exclude.add(v);
+    const state = applyStoredPicks(picks, facets);
+    expect(state.act.size).toBe(0);
+  });
+
+  it("an empty corpus (no records) stays an empty act set — nothing to backstop", () => {
+    const facets = computeFacets([]);
+    const filters = defaultFilterState(facets);
+    expect(filters.act.size).toBe(0);
+  });
+});
+
 // ── operator finding (2026-09-06): activity facet sections replace
 // "model only" / "clear all" with per-section header toggles ────────────
 describe("activitySectionOf / groupActivitiesBySections (#2450-ish, filter panel sections)", () => {

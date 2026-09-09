@@ -74,6 +74,24 @@ const SERVED_VIEWER = path.join('crates', 'darkmux-serve', 'assets', 'next.html'
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'filters-default-flow.jsonl'), 'utf8')
   );
 
+  // (#2512) A corpus with NO model activity at all — every record is
+  // lifecycle/telemetry (dispatch/mission/phase/step bookends, machine
+  // online/offline, host telemetry), the exact shape the parity corpus that
+  // surfaced #2512 had. None of these values is in `DEFAULT_ACTIVITIES`
+  // and none is failure-shaped, so the curated allowlist alone would show
+  // NOTHING here — this harness, with NO seeded sessionStorage, proves the
+  // real browser+component wiring falls back to showing every record
+  // rather than reading "0 events · N hidden" forever.
+  const filtersLifecycleOnly = viewer.replace(
+    '<head>',
+    '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./filters-lifecycle-only-flow.jsonl">'
+  );
+  fs.writeFileSync(path.join(SERVED, 'index-filters-lifecycle-only.html'), filtersLifecycleOnly);
+  fs.writeFileSync(
+    path.join(SERVED, 'filters-lifecycle-only-flow.jsonl'),
+    fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'filters-lifecycle-only-flow.jsonl'), 'utf8')
+  );
+
   // (#2417 round 3, MF-A) A busy fixture (1101 records: 900 heartbeat + 200
   // reasoning) whose chip text is LONG once the hidden-count suffix lands
   // ("50 of 200 events · 900 hidden") — long enough to overflow the phone
