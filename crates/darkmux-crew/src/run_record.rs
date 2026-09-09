@@ -683,4 +683,146 @@ mod tests {
         assert_eq!(value["verify"]["name"], serde_json::json!("example-verify"));
         assert_eq!(value["verify"]["model"], serde_json::json!(seat_identifier(&verify.pm)));
     }
+
+    /// (#2540) The READ-side twin every WRITE-side golden above is missing.
+    /// `member_record_serializes_with_the_pre_move_shape` and
+    /// `staffing_snapshot_serializes_with_the_pre_move_shape` both pin that
+    /// `MemberRecord::remote` / `SeatStaffingSnapshot::remote` /
+    /// `StaffingSnapshot::request_changes` are OMITTED at their default —
+    /// but neither, nor anything else in this module, ever deserializes a
+    /// document that omits them. All three pair `#[serde(default)]` with
+    /// `skip_serializing_if`, the exact shape #2540 names: the serializer
+    /// guarantees the field is USUALLY absent (every local-only run, every
+    /// non-blocking review), so a future edit dropping `default` while
+    /// keeping `skip_serializing_if` would leave every test in this file
+    /// green while a real recorded envelope — which also omits these
+    /// fields on the common path — failed to deserialize.
+    ///
+    /// **Proved failing first** (2026-09-09, this packet): commenting out
+    /// `default` on `MemberRecord::remote`, `SeatStaffingSnapshot::remote`,
+    /// and `StaffingSnapshot::request_changes` in turn, rebuilding
+    /// (`cargo build -p darkmux-crew --tests`, confirmed exit 0 each time),
+    /// and running `cargo test -p darkmux-crew --lib` left **every other
+    /// test in this crate green** — 1552 passed, 0 failed — proving those
+    /// three fields carried zero coverage of their own in the crate that
+    /// defines them. (A downstream crate's fixture — `darkmux-lab`'s
+    /// `lab::review` recorded-envelope tests — happened to catch all three
+    /// accidentally, which is what makes it easy to miss that the owning
+    /// crate has none.) Restored before writing this test.
+    #[test]
+    fn member_record_and_staffing_snapshot_round_trip_through_every_omitted_default() {
+        let local_member = MemberRecord {
+            model: "darkmux:probe-a".into(),
+            seat: "example-probe".into(),
+            draws: 2,
+            wall_ms: 1500,
+            total_tokens: 4200,
+            ..Default::default()
+        };
+        let member_value = serde_json::to_value(&local_member).unwrap();
+        assert!(
+            member_value.get("remote").is_none(),
+            "std::ops::Not::not should have skipped MemberRecord::remote"
+        );
+        let member_back: MemberRecord = serde_json::from_value(member_value)
+            .unwrap_or_else(|e| panic!("a MemberRecord with remote omitted must still deserialize: {e}"));
+        assert_eq!(local_member, member_back);
+
+        // A local judge, no verify seat, no request_changes — the common
+        // case every real non-blocking local-only run's snapshot takes,
+        // and the one where every skip_serializing_if-guarded field on
+        // this whole type actually fires.
+        let probes = vec![staffing("example-probe-high", "probe-model", 1)];
+        let judge = staffing("example-judge", "judge-model", 1);
+        let snap = staffing_snapshot(&probes, &judge, None, false);
+
+        let snap_value = serde_json::to_value(&snap).unwrap();
+        assert!(
+            snap_value["probes"][0].get("remote").is_none(),
+            "std::ops::Not::not should have skipped SeatStaffingSnapshot::remote on the probe"
+        );
+        assert!(
+            snap_value["judge"].get("remote").is_none(),
+            "std::ops::Not::not should have skipped SeatStaffingSnapshot::remote on the judge"
+        );
+        assert!(
+            snap_value.get("request_changes").is_none(),
+            "std::ops::Not::not should have skipped StaffingSnapshot::request_changes"
+        );
+
+        // The mutation-sensitive step: this is exactly what breaks with
+        // "missing field" if `#[serde(default)]` is dropped from
+        // `remote` on either seat type, or from `request_changes`, while
+        // `skip_serializing_if` stays.
+        let snap_back: StaffingSnapshot = serde_json::from_value(snap_value)
+            .unwrap_or_else(|e| panic!("a StaffingSnapshot with every default omitted must still deserialize: {e}"));
+        assert_eq!(snap, snap_back);
+    }
+
+    /// (#2540) Serialize `value`, then read the result back into its own
+    /// type and re-serialize. Anything the writer SKIPPED must survive the
+    /// reader: a field pairing `skip_serializing_if` with a missing
+    /// `#[serde(default)]` fails here with `missing field`, which is the
+    /// whole bug class. JSON equality rather than `PartialEq` is the
+    /// stand-in so the same helper covers types that don't derive it (the
+    /// crawl-plan twin of this test does exactly that) — the field-level
+    /// tests above already assert struct equality where it exists.
+    fn assert_omitted_defaults_read_back<T>(label: &str, value: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let written = serde_json::to_value(value).unwrap_or_else(|e| panic!("{label} must serialize: {e}"));
+        let read_back: T = serde_json::from_value(written.clone()).unwrap_or_else(|e| {
+            panic!("{label}: every field its own skip_serializing_if omitted must read back — add #[serde(default)] to the one this names: {e}")
+        });
+        let rewritten = serde_json::to_value(&read_back).unwrap_or_else(|e| panic!("{label} must re-serialize: {e}"));
+        assert_eq!(written, rewritten, "{label} did not survive the round trip unchanged");
+    }
+
+    /// (#2540) The TYPE-level twin of
+    /// `member_record_and_staffing_snapshot_round_trip_through_every_omitted_default`
+    /// above — one line per TYPE rather than one line per FIELD, so a new
+    /// `#[serde(default, skip_serializing_if = ...)]` field on any type
+    /// listed here is covered the moment it is added, with no test edit.
+    ///
+    /// This is the closest thing to the generic conformance test #2540 asks
+    /// for that stable Rust actually expresses: there is no reflection over
+    /// `#[serde(...)]` attributes, but a type list rots far slower than a
+    /// field list, and each entry auto-covers its own type's future fields.
+    ///
+    /// Its one blind spot, stated plainly so nobody reads more into a green
+    /// run than is there: a new field whose `Default` value does NOT satisfy
+    /// its own `skip_serializing_if` predicate is written out rather than
+    /// skipped, so it round-trips vacuously here. Give such a field a
+    /// non-default instance in the field-level test above.
+    #[test]
+    fn every_run_record_type_reads_back_what_it_omits() {
+        assert_omitted_defaults_read_back("MemberRecord", &MemberRecord::default());
+        assert_omitted_defaults_read_back("StaffingSnapshot", &StaffingSnapshot::default());
+
+        // `SeatStaffingSnapshot` and `StepRecord` derive no `Default`, so
+        // each gets one minimal instance. Both are built by exhaustive
+        // struct literals (`staffing_snapshot`'s inner `one`, and the
+        // literal below), so a new field on either is a COMPILE error here
+        // before it can be a silent gap.
+        let probes = vec![staffing("example-probe", "probe-model", 1)];
+        let judge = staffing("example-judge", "judge-model", 1);
+        let seat = staffing_snapshot(&probes, &judge, None, false)
+            .probes
+            .into_iter()
+            .next()
+            .expect("staffing_snapshot must carry the probe seat it was handed");
+        assert_omitted_defaults_read_back("SeatStaffingSnapshot", &seat);
+
+        assert_omitted_defaults_read_back(
+            "StepRecord",
+            &StepRecord {
+                step_id: "dispatch.internal-step".into(),
+                kind: "dispatch.internal".into(),
+                items_in: None,
+                items_out: None,
+                wall_ms: 4_200,
+            },
+        );
+    }
 }

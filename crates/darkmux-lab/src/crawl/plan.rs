@@ -2951,6 +2951,171 @@ line two
         assert_eq!(plan.units.len(), 3, "expected the sites-cap split AND the tokens-cap split to both fire: {:?}", plan.units.iter().map(|u| u.id()).collect::<Vec<_>>());
     }
 
+    /// (#2540) The READ-side twin of `golden_tree_source_plan_matches_
+    /// committed_fixture` above. That test only pins what `plan()`/`plan_
+    /// with_params` WRITE; it says nothing about whether the exact same
+    /// committed golden still DESERIALIZES — which is the half that broke.
+    /// `crawl.plan` (`plan_step.rs`) writes `plan.json` to
+    /// `<darkmux root>/missions/<id>/plan/<rule>.json`; `crawl.unit`
+    /// (`unit_step.rs`) reads it back. This is that reader, standing in
+    /// for the real one.
+    ///
+    /// Deliberately loads the committed golden rather than constructing a
+    /// `Plan` in memory: an in-memory round trip only proves the CURRENT
+    /// field values happen to satisfy the current derive, which is exactly
+    /// what stayed green for a `root_override`-shaped field while a real
+    /// on-disk plan started failing "missing field". The golden is the
+    /// exact shape production writes.
+    #[test]
+    fn golden_plan_still_deserializes() {
+        let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/crawl-plan-golden/tree-source-site-rule.json");
+        let raw = fs::read_to_string(&golden_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", golden_path.display()));
+        let golden_value: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("golden at {} is not valid JSON: {e}", golden_path.display()));
+
+        // Not a vacuous test: confirm the golden actually OMITS the
+        // default+skip_serializing_if fields this test exists to guard, or
+        // a passing deserialize would prove nothing about the omission
+        // path.
+        assert!(
+            golden_value.get("source_kind").is_none(),
+            "golden must omit Plan::source_kind (default None) or this test proves nothing about the omission path"
+        );
+        let by_rule = golden_value["totals"]["by_rule"]["swallowed-error"]
+            .as_object()
+            .expect("golden must have totals.by_rule.swallowed-error");
+        assert!(
+            !by_rule.contains_key("shared"),
+            "golden must omit RuleTotal::shared (default false) or this test proves nothing about the omission path"
+        );
+
+        let plan: Plan = serde_json::from_value(golden_value)
+            .unwrap_or_else(|e| panic!("a real on-disk plan.json must deserialize: {e}"));
+        assert!(plan.source_kind.is_none());
+        assert!(!plan.totals.by_rule["swallowed-error"].shared);
+    }
+
+    /// (#2540) The class-conformance test the issue asks for, covering the
+    /// crawl schema's whole `Plan` tree in one shot: every field on `Plan`
+    /// and `RuleTotal` that pairs `#[serde(default)]` with
+    /// `skip_serializing_if` — `Plan::rules`, `Plan::params`,
+    /// `Plan::source_kind`, `RuleTotal::shared` — set to the value its own
+    /// `skip_serializing_if` predicate omits, round-tripped through the
+    /// exact on-disk JSON shape production writes.
+    ///
+    /// `golden_plan_still_deserializes` (above) pins the real committed
+    /// golden, but that golden happens to carry non-empty `rules`/`params`
+    /// (a plan minted with `--param rules=` set), so it never exercises
+    /// `Plan::rules`'s own omission path — a genuinely 1.0-era plan (before
+    /// `rules` existed, per that field's own "Lenient on read" doc) omits
+    /// it. This test constructs that minimal shape directly rather than
+    /// depending on a second committed fixture, so the whole class stays
+    /// covered by one assertion regardless of which fields any one real
+    /// fixture happens to omit.
+    ///
+    /// A future field added to `Plan` or `RuleTotal` with this same
+    /// pairing is NOT automatically covered — there's no generic
+    /// reflection over `#[serde(...)]` attributes in stable Rust, so a
+    /// fully-enumerable version isn't attempted here. A new field of this
+    /// shape should extend `minimal` below, the same way
+    /// `rules`/`params`/`source_kind` were added to it.
+    #[test]
+    fn minimal_plan_round_trips_through_every_omitted_default() {
+        let minimal = Plan {
+            schema_version: PLAN_SCHEMA_VERSION.to_string(),
+            workspace: "w".to_string(),
+            planned_at: "2026-01-01T00:00:00Z".to_string(),
+            sources: Vec::new(),
+            units: Vec::new(),
+            totals: Totals {
+                units: 0,
+                est_tokens: 0,
+                by_rule: {
+                    let mut m = BTreeMap::new();
+                    m.insert("swallowed-error".to_string(), RuleTotal::default());
+                    m
+                },
+                skipped: Vec::new(),
+                edges: Vec::new(),
+            },
+            rules: Vec::new(),   // skip_serializing_if = Vec::is_empty
+            params: None,        // skip_serializing_if = Option::is_none
+            source_kind: None,   // skip_serializing_if = Option::is_none
+        };
+
+        let value = serde_json::to_value(&minimal).unwrap();
+        // Confirm every guarded field actually got skipped — a false pass
+        // here (the field present after all) would make the round trip
+        // below prove nothing about the omission path.
+        assert!(value.get("rules").is_none(), "Vec::is_empty should have skipped Plan::rules");
+        assert!(value.get("params").is_none(), "Option::is_none should have skipped Plan::params");
+        assert!(value.get("source_kind").is_none(), "Option::is_none should have skipped Plan::source_kind");
+        let rule_total = &value["totals"]["by_rule"]["swallowed-error"];
+        assert!(
+            rule_total.get("shared").is_none(),
+            "std::ops::Not::not should have skipped RuleTotal::shared"
+        );
+
+        // The mutation-sensitive step: this is exactly what breaks with
+        // "missing field" if `#[serde(default)]` is dropped from any of
+        // the four fields above while `skip_serializing_if` stays.
+        let round_tripped: Plan = serde_json::from_value(value.clone())
+            .unwrap_or_else(|e| panic!("a Plan with every default omitted must still deserialize: {e}"));
+
+        // Round-trip fidelity, not just "it parsed": re-serializing the
+        // parsed value must reproduce the same JSON (`Plan` has no
+        // `PartialEq`, so this is the struct-equality stand-in).
+        let round_tripped_value = serde_json::to_value(&round_tripped).unwrap();
+        assert_eq!(value, round_tripped_value);
+    }
+
+    /// (#2540) Serialize `value`, read the result back into its own type,
+    /// re-serialize. Anything the writer SKIPPED must survive the reader: a
+    /// field pairing `skip_serializing_if` with a missing `#[serde(default)]`
+    /// fails here with `missing field`. JSON equality is the struct-equality
+    /// stand-in — none of the crawl-plan types derive `PartialEq`.
+    fn assert_omitted_defaults_read_back<T>(label: &str, value: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let written = serde_json::to_value(value).unwrap_or_else(|e| panic!("{label} must serialize: {e}"));
+        let read_back: T = serde_json::from_value(written.clone()).unwrap_or_else(|e| {
+            panic!("{label}: every field its own skip_serializing_if omitted must read back — add #[serde(default)] to the one this names: {e}")
+        });
+        let rewritten = serde_json::to_value(&read_back).unwrap_or_else(|e| panic!("{label} must re-serialize: {e}"));
+        assert_eq!(written, rewritten, "{label} did not survive the round trip unchanged");
+    }
+
+    /// (#2540) The TYPE-level twin of
+    /// `minimal_plan_round_trips_through_every_omitted_default` above — one
+    /// line per TYPE rather than one line per FIELD, so a new
+    /// `#[serde(default, skip_serializing_if = ...)]` field on any type
+    /// listed here is covered the moment it is added, with no test edit.
+    ///
+    /// This is the closest thing to the generic conformance test #2540 asks
+    /// for that stable Rust actually expresses: there is no reflection over
+    /// `#[serde(...)]` attributes, but a type list rots far slower than a
+    /// field list, and each entry auto-covers its own type's future fields.
+    ///
+    /// `Plan` derives no `Default`, so it stays hand-constructed in
+    /// `minimal_plan_round_trips_through_every_omitted_default` — where its
+    /// exhaustive struct literal makes a new field a COMPILE error rather
+    /// than a silent gap. `RuleTotal` is listed separately from `Totals`
+    /// because a default `Totals` has an EMPTY `by_rule`, so it never
+    /// reaches a `RuleTotal` at all.
+    ///
+    /// Its one blind spot, stated plainly: a new field whose `Default` value
+    /// does NOT satisfy its own `skip_serializing_if` predicate is written
+    /// out rather than skipped, so it round-trips vacuously here. Give such
+    /// a field a non-default instance in the field-level test above.
+    #[test]
+    fn every_crawl_plan_type_reads_back_what_it_omits() {
+        assert_omitted_defaults_read_back("RuleTotal", &RuleTotal::default());
+        assert_omitted_defaults_read_back("Totals", &Totals::default());
+    }
+
     #[test]
     fn read_rule_groups_whole_files_and_splits_oversized_file() {
         let dir = TempDir::new().unwrap();
