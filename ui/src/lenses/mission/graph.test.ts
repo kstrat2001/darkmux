@@ -106,6 +106,48 @@ describe("computeLayout", () => {
     expect(layout.boxes["p1"].w).toBeGreaterThan(0);
     expect(layout.boxes["p1"].h).toBeGreaterThan(0);
   });
+
+  // (#2376) The phone layout: `fitView` is width-bound on a portrait pane
+  // because the desktop layout spreads a phase's tasks across side-by-side
+  // depth columns (TASK_A at depth 0, TASK_B at depth 1 land in DIFFERENT
+  // columns below). `narrow: true` stacks them in one column instead,
+  // trading that width for height so the fit becomes height-bound and lands
+  // at a legible scale on a tall, narrow pane. See `MissionCanvas`'s own
+  // `useIsMobile()` call for what decides `narrow` at runtime.
+  describe("narrow (phone) layout (#2376)", () => {
+    it("stacks a phase's tasks in ONE column instead of side-by-side depth columns", () => {
+      const wide = computeLayout([PHASE, TASK_A, TASK_B]);
+      // The desktop default: different depths land in different columns.
+      expect(wide.positions["a"].x).not.toBe(wide.positions["b"].x);
+
+      const narrow = computeLayout([PHASE, TASK_A, TASK_B], true);
+      // Narrow: every task in the phase shares the same column regardless
+      // of depth — only the row (y) differs.
+      expect(narrow.positions["a"].x).toBe(narrow.positions["b"].x);
+      expect(narrow.positions["b"].y).toBeGreaterThan(narrow.positions["a"].y);
+    });
+
+    it("trades width for height: the narrow band is narrower AND taller than the desktop band for the same graph", () => {
+      const wide = computeLayout([PHASE, TASK_A, TASK_B]);
+      const narrow = computeLayout([PHASE, TASK_A, TASK_B], true);
+      expect(narrow.boxes["p1"].w).toBeLessThan(wide.boxes["p1"].w);
+      expect(narrow.boxes["p1"].h).toBeGreaterThan(wide.boxes["p1"].h);
+    });
+
+    it("orders a narrow column by depth even when the graph doesn't list tasks in that order", () => {
+      // TASK_B (depth 1) is listed BEFORE TASK_A (depth 0) here — the
+      // narrow column must still put A above B (dependency order top to
+      // bottom), not graph-array order.
+      const narrow = computeLayout([PHASE, TASK_B, TASK_A], true);
+      expect(narrow.positions["a"].y).toBeLessThan(narrow.positions["b"].y);
+    });
+
+    it("is a no-op for the caller who never passes it — the default stays the desktop layout", () => {
+      const explicit = computeLayout([PHASE, TASK_A, TASK_B], false);
+      const implicit = computeLayout([PHASE, TASK_A, TASK_B]);
+      expect(implicit).toEqual(explicit);
+    });
+  });
 });
 
 // (#2104) The canvas painted step rows past the task card's right edge and

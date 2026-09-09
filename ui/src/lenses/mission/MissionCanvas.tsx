@@ -9,7 +9,7 @@
  * the SAME goldens `mission-graph-goldens.spec.ts` captured from the
  * standalone page, and the e2e behavioral specs assert on these classes too.
  */
-import { useCallback, useLayoutEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import ReactFlow, {
   Background,
   Controls,
@@ -18,6 +18,8 @@ import ReactFlow, {
   Position,
   MarkerType,
   ReactFlowProvider,
+  useReactFlow,
+  useStore,
   type Edge,
   type Node,
   type NodeMouseHandler,
@@ -27,6 +29,7 @@ import ReactFlow, {
 import "reactflow/dist/style.css";
 import { StepRow } from "./StepRow";
 import { WorkStatus } from "../../components/WorkStatus";
+import { useIsMobile } from "../../hooks/useIsMobile";
 import {
   recordDimensions,
   withMeasuredDimensions,
@@ -127,6 +130,37 @@ function PhaseGroup({
 }
 
 const nodeTypes = { missionNode: MissionNode, phaseGroup: PhaseGroup };
+
+/**
+ * (#2376) React Flow's `fitView` boolean prop only fires once, at mount —
+ * rotating a phone (390×844 portrait → 844×390 landscape) grows the pane
+ * from 358px to ~812px wide, but the zoom transform stays pinned at the
+ * portrait-fit scale because nothing ever asks React Flow to recompute it.
+ * `useStore`'s `width`/`height` selectors read the SAME numbers `fitView()`
+ * itself resolves against (`@reactflow/core`'s `useResizeHandler` writes
+ * them into the store from its own `ResizeObserver` on the renderer node,
+ * and `fitView()` reads them straight back out) — reacting to a change
+ * there, rather than guessing with a `requestAnimationFrame` after our own
+ * resize handler runs, means this only ever fires once React Flow's own
+ * measurement has actually caught up with the new pane size. The very
+ * first firing (mount) is skipped: `MissionCanvas`'s `fitView` prop already
+ * covers that one, and this component's job is only the recompute an
+ * ALREADY-mounted canvas needs on a later resize.
+ */
+function RefitOnResize() {
+  const { fitView } = useReactFlow();
+  const width = useStore((s) => s.width);
+  const height = useStore((s) => s.height);
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true;
+      return;
+    }
+    fitView();
+  }, [width, height, fitView]);
+  return null;
+}
 
 function toRfNodes(
   graphNodes: GraphNode[],
@@ -277,7 +311,12 @@ export function MissionCanvas({
       ro?.disconnect();
     };
   }, []);
-  const layout = useMemo(() => computeLayout(graphNodes), [graphNodes]);
+  // (#2376) `useIsMobile` (see its own doc) is the SAME phone/desktop test
+  // `MachineDrawer`/`App.tsx` already make — including its landscape-phone
+  // fallback, so a phone rotated to a >768px-wide landscape still gets the
+  // narrow layout rather than flipping back to the desktop's wide columns.
+  const isMobile = useIsMobile();
+  const layout = useMemo(() => computeLayout(graphNodes, isMobile), [graphNodes, isMobile]);
   // (#2325) React Flow measures each node once and keeps the result in its own
   // store — but a CONTROLLED `nodes` update throws that measurement away, and
   // an unmeasured node renders `visibility: hidden`. Since this canvas rebuilds
@@ -337,6 +376,7 @@ export function MissionCanvas({
           <Background color="#1f1f24" gap={24} />
           <Controls />
           {minimapOn ? <MiniMap pannable zoomable style={{ background: "#131316" }} /> : null}
+          <RefitOnResize />
         </ReactFlow>
       </ReactFlowProvider>
     </div>
