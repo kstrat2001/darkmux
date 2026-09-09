@@ -2065,6 +2065,21 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
 /// folds into that bucket the same way it did before #2573 split
 /// `"not_run"` out — the COUNT for this case is unchanged from
 /// pre-#2573 behavior; only the per-row `result` name is more honest now.
+///
+/// That leftover placement is a DELIBERATE asymmetry with `units_skipped`
+/// / `units_not_run_named` in [`summarize_mission`], which ARE subtracted
+/// out of `units_errored` for the "did not genuinely break" reason
+/// `"empty"` arguably shares too — a unit that ran to completion and
+/// recorded nothing did not break either. It stays in `units_errored`
+/// anyway because moving it is a COUNT change, not a naming one: it has
+/// its own blast radius (every reader of `units_errored` as a number —
+/// dashboards, `stopped_by`'s threshold checks, this module's own
+/// partition-invariant test) and its own review, separate from the bug
+/// this fix closes, which is that the ROW read as `"not_run"` when it
+/// should not have. This fix moves only the label; widening the bucket
+/// split is a real follow-up, not an oversight — revisit the same way
+/// `units_skipped` earned its own counter in #2454, if `"empty"` turns
+/// out to need one.
 fn errored_row(step: &Step) -> UnitOutcome {
     let unit = step
         .config

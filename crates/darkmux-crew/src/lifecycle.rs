@@ -2310,7 +2310,7 @@ mod tests {
                 "units_completed": 8,
                 "units_errored": 0,
                 "units_skipped": 0,
-                "units_not_run": 4,
+                "units_not_run": 0,
                 "findings": 3,
                 "stopped_by": "done",
                 "model": "darkmux:qwen3.6",

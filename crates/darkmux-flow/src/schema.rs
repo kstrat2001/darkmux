@@ -1175,6 +1175,26 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.45.0";
 //           #2454/#2569: `stopped_by` stays a plain `String`, no wire
 //           shape changed, still true that nothing in the viewer switches
 //           on its value today.
+//
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2603 review: a crawl's
+//           `mission close` payload carries a `units` list (`CrawlSummary.
+//           units`, one row per unit, in the same free-form payload
+//           object 1.39.0(b) documents above), and each row's `result`
+//           gains a fourth summary-built value, `"empty"` — alongside
+//           that field's existing `"interrupted"`/`"not_run"` (both
+//           summary-built the same way, undocumented here for the same
+//           reason this entry now closes: they are values inside an
+//           existing free-form key, not a struct/field change). `"empty"`
+//           names a step whose kind reached `Complete` but recorded no
+//           `UnitOutcome` at all — `errored_row`'s previous catch-all
+//           named that case `"not_run"`, indistinguishable from a step
+//           that never got the chance to run, which could let a
+//           completed-but-empty row outrank a genuine operator interrupt
+//           in `stopped_by` (see `errored_row`'s own doc for the full
+//           account). Same VALUE-RANGE correction as #2454/#2569/#2573
+//           above: no wire shape changed, `result` stays a plain `String`,
+//           and the row still folds into `units_errored`'s leftover
+//           exactly as it did before this fix — only the name changed.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
