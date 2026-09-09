@@ -1331,6 +1331,14 @@ impl StepKind for CrawlUnitStepKind {
                 role_id: role_id.clone(),
                 message: message.clone(),
                 session_id: Some(draw_session_id.clone()),
+                // (#2542) This field bounds ONLY the tool-less single-call
+                // paths (`dispatch_remote`'s `curl -m`, the single-shot
+                // path) — see `DispatchOpts::timeout_seconds`'s own doc.
+                // Crawl units always run a tool-granting role in a
+                // container, the ONE path that field never reaches, so it
+                // is set here only for parity with every other caller's
+                // convention of filling the required `u32`; the real bound
+                // is `timeout_override_seconds` below.
                 timeout_seconds: cfg.timeout_seconds.unwrap_or(600),
                 skip_preflight: false,
                 json: true,
@@ -1370,7 +1378,19 @@ impl StepKind for CrawlUnitStepKind {
                 // now, not this kind's own parameter — see the issue.
                 resume_from: None,
                 max_turns_override: Some(default_unit_max_turns(unit)),
-                timeout_override_seconds: None, // (#2480) no per-unit surface yet
+                // (#2542) The real per-unit bound: `DispatchOpts::
+                // timeout_override_seconds` is the ONLY field the
+                // container-agentic path reads (it feeds the inactivity
+                // budget `dispatch_internal::effective_inactivity_
+                // timeout_seconds` resolves), so `config.timeout_seconds`
+                // has to route HERE, not into `timeout_seconds` above, or
+                // the knob a mission-config author sets bounds nothing —
+                // #2480's bug one abstraction layer up. A step that never
+                // set `timeout_seconds` stays `None`, so the standing
+                // `env(DARKMUX_INACTIVITY_TIMEOUT_SECONDS)` / `config.
+                // runtime.inactivity_timeout_seconds` / 600 resolution is
+                // unchanged from before this fix.
+                timeout_override_seconds: cfg.timeout_seconds,
                 // Provenance the runtime cannot know — merged by the host
                 // tailer under `payload.context` on every record this unit's
                 // dispatch produces.

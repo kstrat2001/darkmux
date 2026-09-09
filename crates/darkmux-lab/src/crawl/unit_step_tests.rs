@@ -225,6 +225,89 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     assert_eq!(first["rule"], serde_json::json!("unnamed-predicate"));
 }
 
+/// (#2542) `config.timeout_seconds` must reach the ONE `DispatchOpts` field
+/// the container-agentic path actually reads. Crawl units always run a
+/// tool-granting role in a container, so `DispatchOpts::timeout_seconds`
+/// (the tool-less single-call paths' field — `curl -m`, the single-shot
+/// path) never bounds this dispatch at all; `timeout_override_seconds` is
+/// what feeds the inactivity budget on this path. Before this fix, the
+/// config key was silently routed into the dead field and
+/// `timeout_override_seconds` was a hardcoded `None`, so a mission-config
+/// author's `timeout_seconds` bounded nothing — #2480's bug one
+/// abstraction layer up. This is the end-to-end pin #2480's own review
+/// named as the pattern to reuse: read the value out of the SAME
+/// `DispatchOpts` the step kind actually constructs, not a re-derivation.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn config_timeout_seconds_routes_into_the_container_paths_override_field() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 0, 0);
+
+    let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let out_for_dispatch = out.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+        *captured.lock().unwrap() = Some(opts);
+        ok_result(envelope("stop", 10, 5, 1_000), out_for_dispatch.clone())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate",
+        "timeout_seconds": 45
+    }));
+    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+
+    let opts = seen.lock().unwrap().take().unwrap();
+    assert_eq!(
+        opts.timeout_override_seconds,
+        Some(45),
+        "an explicit config.timeout_seconds must land in the field the \
+         container-agentic path actually reads — the fix for #2542"
+    );
+}
+
+/// (#2542) The absent-key half of the pin above: a unit step that never
+/// sets `timeout_seconds` must leave `timeout_override_seconds` at `None`,
+/// so the standing `env(DARKMUX_INACTIVITY_TIMEOUT_SECONDS)` / `config.
+/// runtime.inactivity_timeout_seconds` / 600 resolution is unchanged —
+/// writing a literal default here would silently clamp every crawl unit
+/// that never opted into a bound, the same failure #2480's own
+/// `Option<u32>` (rather than a bare `u32` default) exists to avoid.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn omitted_config_timeout_seconds_leaves_the_override_field_absent() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 0, 0);
+
+    let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let out_for_dispatch = out.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+        *captured.lock().unwrap() = Some(opts);
+        ok_result(envelope("stop", 10, 5, 1_000), out_for_dispatch.clone())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+
+    let opts = seen.lock().unwrap().take().unwrap();
+    assert_eq!(
+        opts.timeout_override_seconds, None,
+        "an omitted config.timeout_seconds must write no override — the operator's \
+         standing inactivity-budget resolution must survive unclamped"
+    );
+}
+
 /// (#2454) The thermal breaker's between-units gate: a `STOP` file present
 /// at the mission-relative path `thermal_governor::
 /// stop_file_path_from_record_context` derives (`<darkmux root>/crawl/
