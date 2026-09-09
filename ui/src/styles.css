@@ -5478,6 +5478,21 @@ body {
   background: var(--ml-run);
   animation: var(--beat);
 }
+/* (#2343) ADMITTED to a wave, not yet dispatching. The IDLE family on
+   purpose — `--dim`, no beat, no accent — which is exactly what the shared
+   `WorkStatus` chip already gives it (`waiting` is not in `KIND`, so it
+   falls to `is-idle`), and this keeps the card and the chip telling one
+   story. It is NOT the bare `--border` that `planned` gets: `waiting` means
+   the mission is actively working this unit, so it reads a step louder than
+   "nothing has happened", and a waiting card is no longer pixel-identical
+   to a planned one. Deliberately no new color token and no new keyframe for
+   a concept the idle palette already covers. */
+.missionlens .mnode.s-waiting {
+  border-color: var(--dim);
+}
+.missionlens .mnode.s-waiting .mn-kind {
+  color: var(--dim);
+}
 .missionlens .mnode.s-complete {
   border-color: var(--good);
 }
@@ -5613,6 +5628,10 @@ body {
 }
 .missionlens .phasegroup.s-running .pg-name {
   color: var(--ml-run);
+}
+/* (#2343) See `.mnode.s-waiting` above — the idle family, one level up. */
+.missionlens .phasegroup.s-waiting {
+  border-color: var(--dim);
 }
 .missionlens .phasegroup.s-complete {
   border-color: var(--good-soft);
@@ -5926,6 +5945,11 @@ body {
   background: var(--ml-run);
   animation: var(--beat);
 }
+/* (#2343) See `.mnode.s-waiting` — a solid dim dot, and pointedly NOT
+   `var(--beat)`: nothing is executing, so nothing pulses. */
+.missionlens .tlphase.s-waiting .tlph-dot {
+  background: var(--dim);
+}
 .missionlens .tlphase.s-complete .tlph-dot {
   background: var(--good);
 }
@@ -6023,6 +6047,15 @@ body {
 }
 .missionlens .tltask.s-running .tlt-name {
   color: var(--ml-run);
+}
+/* (#2343) See `.mnode.s-waiting`. The task card renders no status WORD of
+   its own (unlike the phase header, which carries a `WorkStatus` chip), so
+   without this rule a waiting task was pixel-identical to a planned one. */
+.missionlens .tltask.s-waiting {
+  border-color: var(--dim);
+}
+.missionlens .tltask.s-waiting .tlt-dot {
+  background: var(--dim);
 }
 .missionlens .tltask.s-complete {
   border-color: var(--good);

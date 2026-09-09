@@ -269,6 +269,19 @@ const STATUS_RANK: Record<string, number> = {
   // overwrite it back to `complete`, regressing the exact signal this
   // status exists to carry, client-side, on every SSE tick.
   degraded: 2,
+  // (#2343) A task/phase ADMITTED to a wave but not yet dispatched
+  // (`mission_graph.rs::derive_task_status`). Ranks WITH `running`/`active`
+  // — it is the same point in the lifecycle, told honestly — for the same
+  // reason `degraded` above is in this table at all: left out, `statusRank`
+  // treats it as "unknown", `keepPageStatus` returns false in BOTH
+  // directions, and the very next `"phase start"` flow record newer than
+  // the snapshot (emitted at WAVE ADMISSION — the exact instant this status
+  // exists to describe) overwrites `waiting` back to `running`, so the chip
+  // reads `RUNNING · 7 waiting` until the next reconcile poll. Measured
+  // against the LIVE fold (`foldFlowRecords`, the wired path — note
+  // `mergeGraphs`'s monotone ratchet is NOT a safety net here: it has no
+  // production callers, #2527).
+  waiting: 1,
   active: 1,
   finalized: 2,
   closed: 2,
