@@ -8249,15 +8249,48 @@ fn the_wait_command_fails_fast_when_the_darkmux_binary_is_missing() {
 /// above: the shipped poll's `2>/dev/null | grep -q` swallowed this error
 /// and treated it exactly like "not found yet", polling for the full bound.
 ///
-/// Red-proved the same way: reverting to the shipped `grep -q` shape turns
-/// this red.
+/// Uses a STUB rather than the real `mod list` invocation, on purpose: the
+/// real anyhow-based failure for an invalid key happens to exit 1 — the
+/// SAME number a hardcoded `exit "$rc"` -> `exit 1` regression would also
+/// produce, so pinning `Some(1)` against the real invocation cannot tell a
+/// genuinely propagated code from a flattened one; both read as 1 (a
+/// frontier review of this file found exactly that: mutating the
+/// propagation to a literal `exit 1` left this test green, because 1 == 1
+/// by coincidence — only the missing-binary test's 127 caught it). The
+/// stub exits 42, a number nothing in this command's normal operation
+/// produces, so the assertion below can only pass if `$rc` genuinely
+/// reaches `exit "$rc"` unmodified.
+///
+/// Red-proved two ways: (1) reverting to the shipped `2>/dev/null | grep
+/// -q` shape turns this red (burns the full 60s bound instead of failing
+/// fast); (2) flattening `exit "$rc"` to a literal `exit 1` ALSO turns this
+/// red now (`Some(42)` != `Some(1)`) — the coincidence-pass window this
+/// test used to have is closed.
 #[test]
 fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
     let home = TempDir::new().unwrap();
+    let stub_dir = TempDir::new().unwrap();
+    let stub = stub_dir.path().join("fake-darkmux");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'not a finding key: \"not-a-valid-key\" (expected <dispatch>/<seq>, e.g. sess-abc/1)\\n' >&2\nexit 42\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     let started = std::time::Instant::now();
-    // Not `<dispatch>/<seq>` — `mods::canonical_finding_key` refuses it,
-    // so `mod list --for` errors before it ever reads the store.
-    let out = run_wait_command(home.path(), &create_mod_wait_command("not-a-valid-key", "60"));
+    // Not `<dispatch>/<seq>` — real `mods::canonical_finding_key` would
+    // refuse this before the store is even read; the stub mirrors that
+    // shape with a distinctive exit code instead of the real one (see doc
+    // comment above for why).
+    let out = run_wait_command_with_bin(
+        home.path(),
+        &create_mod_wait_command("not-a-valid-key", "60"),
+        &stub.to_string_lossy(),
+    );
     let elapsed = started.elapsed();
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -8274,15 +8307,12 @@ fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
         stderr.contains("not a finding key") || stderr.contains("not-a-valid-key"),
         "and carries the real command's own error text, not a generic message: {stderr}"
     );
-    // Same regression window as the missing-binary test above: a flat
-    // `exit 1` with a generic message keeps every `assert!` above green.
-    // `mod list --for <invalid key>` exits 1 (anyhow's default failure
-    // code via `main`'s `?`, not clap's usage-error 2) — pin that number,
-    // not just "some" nonzero status.
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "the real `mod list` exit code for an unaddressable key must reach here unmodified: stdout {stdout}\nstderr {stderr}"
+        Some(42),
+        "the stub's distinctive exit code must reach here unmodified — a hardcoded `exit 1` \
+         regression would report 1, not 42, and this is the assertion that would catch it: \
+         stdout {stdout}\nstderr {stderr}"
     );
     assert!(
         !stdout.contains("\"found\":false"),
