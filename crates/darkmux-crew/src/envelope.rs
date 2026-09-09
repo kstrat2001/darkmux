@@ -163,7 +163,34 @@ use serde::{Deserialize, Serialize};
 /// bump, not major. `finalize_mission_with_payload` always populates the
 /// field going forward (never leaves it `None` on a NEWLY finalized
 /// envelope, even on a miss — see `records_emitted::RecordsEmitted`'s doc).
-pub const MISSION_ENVELOPE_SCHEMA: &str = "1.3";
+///
+/// **1.3 -> 1.4 (#2406):** [`PhaseOutcomeKind`] gains `Degraded` — a phase
+/// whose steps are all terminal but a MIX of `Complete` and `Error`/
+/// `Abandoned` (some real output shipped, some did not). Before this, the
+/// per-phase finalizer (`src/mission_launch.rs::phase_finalization`)
+/// collapsed that exact mix into `Abandoned`, which is what let a
+/// 1-errored/11-completed phase's debrief read "abandoned" — the same "any
+/// Error wins" over-collapse this packet's issue names for the display
+/// side (`crates/darkmux-serve/src/mission_graph.rs`). `Degraded` matches
+/// [`MissionOutcomeStatus::Degraded`]'s existing spelling/semantics at the
+/// run level exactly (same word, same "real output, something was lost"
+/// meaning) rather than inventing a parallel concept. Additive per the
+/// documented rule — but an OLD reader that has never heard of `Degraded`
+/// would otherwise fail to deserialize `PhaseOutcomeKind` entirely (no
+/// `#[serde(other)]` catch-all existed on this enum before now), which
+/// would fail the WHOLE `PhaseOutcome` struct, which would fail the WHOLE
+/// `MissionEnvelope` document — turning one Degraded phase into a totally
+/// unreadable envelope for any binary that hasn't upgraded yet. This
+/// closes that gap the same way #1881 closed it for `MissionOutcomeStatus`:
+/// `PhaseOutcomeKind` now ALSO carries a `#[serde(other)]` catch-all
+/// (`PhaseOutcomeKind::Unknown`), so an unrecognized outcome degrades ONE
+/// phase's outcome to `Unknown` rather than failing the whole parse —
+/// verified by
+/// `an_unrecognized_phase_outcome_degrades_to_unknown_and_the_rest_of_the_envelope_still_parses`
+/// (below). Genuinely a MINOR bump either way (new variant + new
+/// catch-all are both additive), not major — no existing field renamed or
+/// retyped.
+pub const MISSION_ENVELOPE_SCHEMA: &str = "1.4";
 
 /// The overall outcome a mission's run reached — see the module doc's
 /// "Status decision" section for how each value is decided and consumed.
@@ -278,13 +305,40 @@ impl MissionOutcomeStatus {
 
 /// The terminal `PhaseStatus` a phase reaches under [`finalize_mission`] —
 /// a narrower enum than `crate::types::PhaseStatus` (only the two terminal
-/// values finalization ever drives a phase to; `Planned`/`Running` are not
-/// finalization outcomes).
+/// LIFECYCLE values finalization ever drives a phase to; `Planned`/
+/// `Running` are not finalization outcomes). `Degraded` (#2406) is NOT a
+/// third lifecycle terminal — `crate::types::PhaseStatus` still has only
+/// `Complete`/`Abandoned` as terminals, and [`finalize_mission_with_payload`]
+/// drives a `Degraded` phase through `lifecycle::phase_complete` (same as
+/// `Complete`) for exactly the reason [`MissionOutcomeStatus::phase_outcome`]
+/// already documents at the run level: a degraded run still posted real
+/// output, so it is NOT a lesser Clean for lifecycle-transition purposes.
+/// `Degraded` exists so the ENVELOPE — read by the mission board, the
+/// debrief, and a future graph lens — can tell "every step of this phase
+/// completed" apart from "the phase finished but a mix of its steps
+/// errored/abandoned", which the coarser persisted `PhaseStatus` structurally
+/// cannot represent and was never meant to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PhaseOutcomeKind {
     Complete,
     Abandoned,
+    /// (#2406) Terminal, but a genuine MIX of `Complete` and `Error`/
+    /// `Abandoned` among the phase's own steps — some real output shipped,
+    /// some did not. See [`MISSION_ENVELOPE_SCHEMA`]'s 1.3 -> 1.4 changelog
+    /// entry for the full rationale and the forward-compat story.
+    Degraded,
+    /// (#2406) An outcome value this binary does not recognize — a
+    /// `#[serde(other)]` catch-all, same shape and same reason as
+    /// [`MissionOutcomeStatus::Unknown`] (#1881): lets ONE phase's outcome
+    /// degrade to "I don't know" on read rather than failing the WHOLE
+    /// `MissionEnvelope` document. Never constructed on purpose by any
+    /// writer in this codebase — every producer of a `PhaseOutcome`
+    /// (`derive_phase_outcomes`, `MissionOutcomeStatus::phase_outcome`,
+    /// `src/coder_phase.rs`) builds a freshly-computed value, never one
+    /// round-tripped through deserialize first.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One phase's declared finalization outcome — see [`MissionEnvelope::phases`].
@@ -495,7 +549,12 @@ fn classify_phase_refusal(
 ) -> FinalizeRefusal {
     let already_terminal = matches!(
         (outcome, current),
-        (PhaseOutcomeKind::Complete, Some(PhaseStatus::Complete))
+        // (#2406) `Degraded` drives the SAME lifecycle transition `Complete`
+        // does (`lifecycle::phase_complete` — see `PhaseOutcomeKind`'s own
+        // doc), so a reopen re-finalizing an already-`Complete` phase with a
+        // freshly-derived `Degraded` outcome is the same benign idempotent
+        // no-op `Complete` -> `Complete` already is, not drift.
+        (PhaseOutcomeKind::Complete | PhaseOutcomeKind::Degraded, Some(PhaseStatus::Complete))
             | (PhaseOutcomeKind::Abandoned, Some(PhaseStatus::Abandoned))
     );
     if already_terminal {
@@ -556,8 +615,20 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
     let mut envelope = envelope.clone();
     for phase in &envelope.phases {
         let result = match phase.outcome {
-            PhaseOutcomeKind::Complete => lifecycle::phase_complete(&phase.phase_id),
-            PhaseOutcomeKind::Abandoned => lifecycle::phase_abandon(&phase.phase_id),
+            // (#2406) `Degraded` drives the phase to the SAME lifecycle
+            // terminal `Complete` does — see `PhaseOutcomeKind`'s own doc.
+            // `crate::types::PhaseStatus` has no third terminal to drive it
+            // to; the finer "mix, not clean" signal lives ONLY in this
+            // envelope's `PhaseOutcome::outcome`, which is what the board/
+            // debrief/graph-lens consumers read.
+            PhaseOutcomeKind::Complete | PhaseOutcomeKind::Degraded => lifecycle::phase_complete(&phase.phase_id),
+            // (#2406) `Unknown` (the `#[serde(other)]` catch-all) is
+            // unreachable in practice — see its own doc — but exhaustive on
+            // purpose. Abandoned is the conservative default, matching
+            // `MissionOutcomeStatus::phase_outcome`'s own `Unknown` arm: a
+            // status this binary can't interpret must never be assumed to
+            // have completed.
+            PhaseOutcomeKind::Abandoned | PhaseOutcomeKind::Unknown => lifecycle::phase_abandon(&phase.phase_id),
         };
         if let Err(e) = result {
             let current = lifecycle::load_phase_by_id(&phase.phase_id).map(|p| p.status).ok();
@@ -670,6 +741,20 @@ mod tests {
         );
         assert_eq!(
             classify_phase_refusal(PhaseOutcomeKind::Abandoned, Some(PhaseStatus::Abandoned)),
+            FinalizeRefusal::Benign
+        );
+    }
+
+    #[test]
+    fn phase_refusal_quiet_for_degraded_against_a_persisted_complete_phase() {
+        // (#2406) `Degraded` drives the SAME lifecycle transition `Complete`
+        // does (`crate::types::PhaseStatus` has no third terminal — see
+        // `PhaseOutcomeKind`'s own doc), so a reopen re-finalizing a phase
+        // already `Complete` on disk with a freshly-derived `Degraded`
+        // outcome is the same benign idempotent no-op `Complete` -> `Complete`
+        // already is — NOT drift.
+        assert_eq!(
+            classify_phase_refusal(PhaseOutcomeKind::Degraded, Some(PhaseStatus::Complete)),
             FinalizeRefusal::Benign
         );
     }
@@ -913,6 +998,41 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
+    fn finalize_mission_drives_a_degraded_phase_to_complete_on_disk() {
+        // (#2406) `Degraded` is not a third `PhaseStatus` terminal —
+        // `finalize_mission_with_payload` must drive it through
+        // `lifecycle::phase_complete`, same as a plain `Complete` outcome
+        // (see `PhaseOutcomeKind`'s own doc). Before the `finalize_mission_
+        // with_payload` match gained an explicit `Degraded` arm, this was a
+        // compile error (the match was exhaustive over two variants); this
+        // test proves the NEW arm's actual runtime behavior, not just that
+        // it compiles.
+        let _g = CrewGuard::new();
+        seed_mission("m6d");
+        seed_phase("m6d", "p1");
+
+        let envelope = MissionEnvelope {
+            phases: vec![PhaseOutcome {
+                phase_id: "p1".to_string(),
+                outcome: PhaseOutcomeKind::Degraded,
+                reason: Some("11 of 12 step(s) completed, 1 errored, 0 abandoned".to_string()),
+            }],
+            ..MissionEnvelope::new("m6d", MissionOutcomeStatus::Degraded, &[])
+        };
+        finalize_mission(&envelope);
+
+        let phase = lifecycle::load_phase_by_id("p1").expect("phase p1 must load");
+        assert_eq!(
+            phase.status,
+            PhaseStatus::Complete,
+            "a Degraded phase outcome drives the SAME lifecycle terminal a Complete one does"
+        );
+        let persisted = lifecycle::load_envelope("m6d").unwrap().expect("envelope.json persisted");
+        assert_eq!(persisted.phases[0].outcome, PhaseOutcomeKind::Degraded, "the envelope itself still says Degraded");
+    }
+
+    #[serial_test::serial]
+    #[test]
     fn load_envelope_returns_none_when_no_envelope_json_exists_yet() {
         let _g = CrewGuard::new();
         seed_mission("m7");
@@ -1104,6 +1224,46 @@ mod tests {
             serde_json::from_str(json).expect("an unrecognized status value must degrade, not fail the whole parse");
         assert_eq!(envelope.status, MissionOutcomeStatus::Unknown);
         assert_eq!(envelope.mission_id, "m2");
+    }
+
+    // ── PhaseOutcomeKind (#2406) ──────────────────────────────────────────
+
+    #[test]
+    fn phase_outcome_kind_degraded_round_trips_through_json() {
+        assert_eq!(serde_json::to_string(&PhaseOutcomeKind::Degraded).unwrap(), "\"degraded\"");
+        assert_eq!(
+            serde_json::from_str::<PhaseOutcomeKind>("\"degraded\"").unwrap(),
+            PhaseOutcomeKind::Degraded
+        );
+    }
+
+    /// (#2406) The `PhaseOutcomeKind` analog of
+    /// `an_unrecognized_outcome_variant_degrades_to_unknown_and_the_rest_of_the_document_still_parses`
+    /// above — proves the NEW `#[serde(other)]` catch-all this packet adds.
+    /// Before this catch-all, a `PhaseOutcome.outcome` value this binary
+    /// doesn't recognize (e.g. a value written by a newer darkmux carrying
+    /// `Degraded`, read by an older binary that predates this packet) would
+    /// fail to deserialize `PhaseOutcomeKind` at all — which fails the
+    /// whole `PhaseOutcome` struct, which fails the whole `phases` vec,
+    /// which fails the WHOLE `MissionEnvelope` document. One phase's
+    /// outcome degrading to `Unknown` instead is the fix.
+    #[test]
+    fn an_unrecognized_phase_outcome_degrades_to_unknown_and_the_rest_of_the_envelope_still_parses() {
+        let json = r#"{
+            "mission_id": "m3",
+            "schema_version": "1.3",
+            "status": "clean",
+            "phases": [
+                {"phase_id": "p1", "outcome": "complete"},
+                {"phase_id": "p2", "outcome": "some-future-value"}
+            ]
+        }"#;
+        let envelope: MissionEnvelope = serde_json::from_str(json)
+            .expect("an unrecognized PhaseOutcomeKind value must degrade ONE phase, not fail the whole parse");
+        assert_eq!(envelope.mission_id, "m3");
+        assert_eq!(envelope.phases.len(), 2, "both phases still present, not dropped");
+        assert_eq!(envelope.phases[0].outcome, PhaseOutcomeKind::Complete);
+        assert_eq!(envelope.phases[1].outcome, PhaseOutcomeKind::Unknown);
     }
 
     // ── records_emitted (#2421) ──────────────────────────────────────────

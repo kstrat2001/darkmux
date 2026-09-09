@@ -36,7 +36,23 @@ struct Drift {
 struct MissionView<'a> {
     m: &'a Mission,
     total: usize,
+    /// Phases that are `Complete` on disk AND clean — a degraded one is
+    /// EXCLUDED here and counted in [`MissionView::degraded`] instead
+    /// (#2406). See that field for why the two are separable at all.
     complete: usize,
+    /// (#2406) Phases the envelope calls `Degraded`: terminal, real output
+    /// shipped, some of it did not.
+    ///
+    /// These are `PhaseStatus::Complete` ON DISK and always will be —
+    /// `Degraded` deliberately drives `lifecycle::phase_complete` (a
+    /// degraded phase IS terminal-and-produced-output, and `PhaseStatus`
+    /// has no third terminal to drive it to). So the fact lives only in
+    /// the mission's `envelope.json` (`PhaseOutcome::outcome`), which is
+    /// where [`degraded_phase_ids`] reads it from. Without this split the
+    /// board reported a phase with 2 completed and 2 cascade-abandoned
+    /// steps as plainly `complete`: #2406's display fix moved that phase
+    /// from wrong-and-loud (`abandoned`) to wrong-and-quiet.
+    degraded: usize,
     running: usize,
     planned: usize,
     abandoned: usize,
@@ -47,8 +63,39 @@ struct MissionView<'a> {
     graph: Option<crew::mission_config::prune::PruneReport>,
 }
 
+impl MissionView<'_> {
+    /// (#2406) Phases that FINISHED AND PRODUCED — the progress column's
+    /// numerator. A degraded phase belongs here: it is terminal and it
+    /// shipped real output. The mix line beside it is what distinguishes
+    /// the two; the bar is a "how far along" reading and must not regress
+    /// when a phase turns out to be mixed.
+    fn done(&self) -> usize {
+        self.complete + self.degraded
+    }
+}
+
 fn is_terminal(s: PhaseStatus) -> bool {
     matches!(s, PhaseStatus::Complete | PhaseStatus::Abandoned)
+}
+
+/// (#2406) The phase ids this mission's `envelope.json` records as
+/// `Degraded`. Best-effort by design, exactly like `load_graph_report`
+/// beside it in `run()`: a mission with no envelope yet (never finalized),
+/// an unreadable one, or one written before `PhaseOutcomeKind::Degraded`
+/// existed all yield an empty set, and the board reports what disk says —
+/// never an error, never a fabricated bucket.
+fn degraded_phase_ids(mission_id: &str) -> std::collections::BTreeSet<String> {
+    crew::lifecycle::load_envelope(mission_id)
+        .ok()
+        .flatten()
+        .map(|env| {
+            env.phases
+                .iter()
+                .filter(|p| p.outcome == crew::envelope::PhaseOutcomeKind::Degraded)
+                .map(|p| p.phase_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// (#1569 packet A) The daemon URL a mission id links to.
@@ -626,9 +673,24 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         .iter()
         .map(|m| {
             let ss: Vec<&Phase> = by_mission.get(m.id.as_str()).cloned().unwrap_or_default();
+            // (#2406) The envelope's degraded set, applied ONLY over a
+            // phase that disk agrees is `Complete` — the same
+            // monotone-authority shape the graph lens uses
+            // (`mission_graph.rs::phase_display_status`): the envelope may
+            // refine a persisted `Complete` into `Degraded`, and may never
+            // overwrite any other persisted terminal. Keeps a stale or
+            // hand-edited envelope from inventing a bucket disk disagrees
+            // with, and keeps the four display buckets summing to `total`.
+            let degraded_ids = degraded_phase_ids(&m.id);
+            let is_degraded =
+                |s: &&&Phase| s.status == PhaseStatus::Complete && degraded_ids.contains(&s.id);
             MissionView {
                 total: ss.len(),
-                complete: ss.iter().filter(|s| s.status == PhaseStatus::Complete).count(),
+                complete: ss
+                    .iter()
+                    .filter(|s| s.status == PhaseStatus::Complete && !is_degraded(s))
+                    .count(),
+                degraded: ss.iter().filter(is_degraded).count(),
                 running: ss.iter().filter(|s| s.status == PhaseStatus::Running).count(),
                 planned: ss.iter().filter(|s| s.status == PhaseStatus::Planned).count(),
                 abandoned: ss.iter().filter(|s| s.status == PhaseStatus::Abandoned).count(),
@@ -756,8 +818,13 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             style::dim(&format!("{} ({})", status_word(*group).to_uppercase(), g.len()))
         );
         for v in g.iter().take(shown) {
-            let prog = format!("{}/{}", v.complete, v.total);
-            let bar = progress_bar(v.complete, v.total);
+            // (#2406) The progress numerator is `done()` — complete PLUS
+            // degraded. A degraded phase is terminal and produced output;
+            // dropping it out of the bar would make a mixed run look less
+            // far along than it is. The mix line beside it is what names
+            // the difference.
+            let prog = format!("{}/{}", v.done(), v.total);
+            let bar = progress_bar(v.done(), v.total);
             let name = ellipsize(&display_label_cached(v.m, &mut config_name_cache), layout.name_width);
             // (#1569 packet A) Pad BEFORE linking, and by the VISIBLE width:
             // `{:<width$}` counts the OSC 8 escape bytes, so formatting a
@@ -1071,8 +1138,16 @@ fn board_json(views: &[MissionView]) -> serde_json::Value {
                 "status": status_word(v.m.status),
                 "ticket": v.m.ticket,
                 "phases": {
-                    "total": v.total, "complete": v.complete, "running": v.running,
-                    "planned": v.planned, "abandoned": v.abandoned,
+                    // (#2406) `degraded` is a SIBLING bucket, and `complete`
+                    // no longer includes it. Safe because nothing parses
+                    // `phases.complete`: the only `mission status --json`
+                    // consumers in the tree are two `tests/cli.rs` assertions
+                    // that read `missions[].drift` and nothing else (enumerated
+                    // before the change). The four terminal/live buckets still
+                    // sum to `total`, which is the invariant a reader can rely
+                    // on.
+                    "total": v.total, "complete": v.complete, "degraded": v.degraded,
+                    "running": v.running, "planned": v.planned, "abandoned": v.abandoned,
                 },
                 // (#2299) present only for a config-launched run: what the
                 // config declared, what was minted, and what was pruned + why.
@@ -1373,6 +1448,10 @@ fn phase_mix(v: &MissionView) -> String {
     }
     let mut parts = Vec::new();
     if v.complete > 0 { parts.push(format!("{} complete", v.complete)); }
+    // (#2406) Between complete and running on purpose: a degraded phase is
+    // terminal-and-productive, so it reads next to `complete`, not down
+    // beside `abandoned`.
+    if v.degraded > 0 { parts.push(format!("{} degraded", v.degraded)); }
     if v.running > 0 { parts.push(format!("{} running", v.running)); }
     if v.planned > 0 { parts.push(format!("{} planned", v.planned)); }
     if v.abandoned > 0 { parts.push(format!("{} abandoned", v.abandoned)); }
@@ -1444,12 +1523,25 @@ mod tests {
             m,
             total: complete + running,
             complete,
+            degraded: 0,
             running,
             planned: 0,
             abandoned: 0,
             drifts: Vec::new(),
             graph: None,
         }
+    }
+
+    /// (#2406) `view` plus a degraded bucket. A separate constructor rather
+    /// than a fourth positional `usize` on `view` — every existing layout
+    /// test reads better without a `, 0` it does not care about.
+    fn view_with_degraded<'a>(
+        m: &'a Mission,
+        complete: usize,
+        degraded: usize,
+        running: usize,
+    ) -> MissionView<'a> {
+        MissionView { total: complete + degraded + running, degraded, ..view(m, complete, running) }
     }
 
     #[test]
@@ -1633,8 +1725,8 @@ mod tests {
     /// recomputes the same budget it is checking will agree with a wrong one —
     /// which is how a 2-column undercount survived its own unit test.
     fn render_row(v: &MissionView, layout: &Layout) -> String {
-        let prog = format!("{}/{}", v.complete, v.total);
-        let bar = progress_bar(v.complete, v.total);
+        let prog = format!("{}/{}", v.done(), v.total);
+        let bar = progress_bar(v.done(), v.total);
         let name = ellipsize(&display_label(v.m), layout.name_width);
         let handle = if layout.show_handle {
             let h = short_handle(&v.m.id).unwrap_or("");
@@ -2779,5 +2871,60 @@ mod tests {
         // The minted mission carries drift (via `drifted`) — `--json` must
         // never hide an actionable item behind the display-only filter.
         assert_eq!(payload["summary"]["needs_attention"], 1);
+    }
+
+    // ─── #2406: the board can say `degraded` ────────────────────────────
+
+    #[test]
+    fn phase_mix_names_a_degraded_phase_instead_of_folding_it_into_complete() {
+        // (#2406) The defect this fixes: a degraded phase is
+        // `PhaseStatus::Complete` ON DISK (Degraded drives
+        // `lifecycle::phase_complete` deliberately — see `MissionView::
+        // degraded`), so before the split the board printed "3 complete"
+        // for a mission where one of those three shipped only part of its
+        // work. The #2406 display fix had moved that phase from
+        // wrong-and-loud (`abandoned`) to wrong-and-quiet.
+        let m = mission("m1", MissionStatus::Finalized);
+        let v = view_with_degraded(&m, 2, 1, 0);
+        assert_eq!(phase_mix(&v), "2 complete · 1 degraded");
+
+        // And a board with none reads exactly as it always did — no empty
+        // bucket appears on a clean mission.
+        assert_eq!(phase_mix(&view(&m, 3, 0)), "3 complete");
+    }
+
+    #[test]
+    fn a_degraded_phase_still_counts_as_progress() {
+        // (#2406) The other half of the split: a degraded phase is
+        // TERMINAL and PRODUCED OUTPUT, so the progress column must keep
+        // counting it. Splitting the bucket without this makes a mixed run
+        // look less far along than it is — a second wrong reading traded
+        // for the first.
+        let m = mission("m1", MissionStatus::Finalized);
+        let v = view_with_degraded(&m, 2, 1, 0);
+        assert_eq!(v.done(), 3, "2 clean + 1 degraded = 3 phases that finished and produced");
+        assert_eq!(v.total, 3);
+        assert_eq!(progress_bar(v.done(), v.total), "▓▓▓▓", "a fully-terminal mission reads full");
+    }
+
+    #[test]
+    fn board_json_carries_degraded_as_its_own_bucket_and_still_sums_to_total() {
+        // (#2406) `--json` is part of the contract — the defect was pulled
+        // straight out of `mission status --json --all`. `degraded` is a
+        // NEW SIBLING key and `complete` no longer includes it; the four
+        // buckets still sum to `total`, which is the invariant a reader
+        // can rely on.
+        let m = mission("m1", MissionStatus::Finalized);
+        let v = view_with_degraded(&m, 2, 1, 0);
+        let payload = board_json(std::slice::from_ref(&v));
+        let phases = &payload["missions"][0]["phases"];
+        assert_eq!(phases["complete"], 2, "the degraded phase must NOT be folded in here");
+        assert_eq!(phases["degraded"], 1);
+        assert_eq!(phases["total"], 3);
+        let sum = ["complete", "degraded", "running", "planned", "abandoned"]
+            .iter()
+            .map(|k| phases[*k].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(sum, phases["total"].as_u64().unwrap(), "the buckets must partition `total`");
     }
 }

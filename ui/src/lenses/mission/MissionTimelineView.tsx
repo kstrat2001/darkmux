@@ -118,6 +118,16 @@ export function MissionTimelineView({
               {phase.label}
             </span>
             <WorkStatus status={phase.status} className="tlph-tag" />
+            {/* (#2406, post-review) The counts breakdown ("7 complete · 1
+               errored · 4 running") renders as REAL TEXT, not a `title=`:
+               tooltips do not exist on touch and this viewer is driven from
+               a phone, and a bare DEGRADED is the same word for "11 of 12
+               shipped" and "1 of 12 shipped". It wraps onto its own line
+               inside the header (see `.tlph-note`), so the phone layout
+               never has to fit it beside the name. Present only for
+               `running`/`degraded` — see
+               `mission_graph.rs::phase_status_note`. */}
+            {phase.statusNote ? <span className="tlph-note">{phase.statusNote}</span> : null}
           </div>
           <div className="tltasks">
             {tasks.length ? (

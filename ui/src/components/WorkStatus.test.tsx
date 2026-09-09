@@ -6,7 +6,7 @@ import { WorkStatus, workStatusKind } from "./WorkStatus";
 // mission shows a non-pulsing green ACTIVE … meant to mean the same thing at
 // a different scope level … prefer re-usable and consistent indicators." One
 // chip, one vocabulary, one pulse — every scope's raw status maps into it.
-describe("workStatusKind — every raw status the app has maps into five kinds", () => {
+describe("workStatusKind — every raw status the app has maps into six kinds", () => {
   it.each([
     ["running", "running"],
     ["active", "running"],
@@ -18,6 +18,9 @@ describe("workStatusKind — every raw status the app has maps into five kinds",
     ["error", "error"],
     ["errored", "error"],
     ["killed", "error"],
+    // (#2406) A mixed terminal — real output shipped, some of it did not.
+    // Its own kind, distinct from `stopped` even though they share a color.
+    ["degraded", "degraded"],
     ["aborted", "stopped"],
     ["abandoned", "stopped"],
     ["canceled", "stopped"],
@@ -62,5 +65,17 @@ describe("<WorkStatus>", () => {
   it("extra classes ride along, so a call site keeps its layout hook without a second style source", () => {
     const el = render(<WorkStatus status="error" className="labbadge" />).container.firstElementChild!;
     expect(el).toHaveClass("wstatus", "is-error", "labbadge");
+  });
+  it("a degraded chip is its own kind, distinct from stopped, and stays non-pulsing", () => {
+    const el = render(<WorkStatus status="degraded" />).container.firstElementChild!;
+    expect(el.textContent).toBe("degraded");
+    expect(el).toHaveClass("wstatus", "is-degraded", "s-degraded");
+    expect(el).not.toHaveClass("is-stopped", "is-running", "is-error", "is-done");
+    expect(el.getAttribute("data-live")).toBeNull();
+  });
+  it("(#2406) the title prop carries the counts breakdown through to the DOM", () => {
+    const el = render(<WorkStatus status="degraded" title="7 complete · 1 errored · 4 running" />).container
+      .firstElementChild!;
+    expect(el.getAttribute("title")).toBe("7 complete · 1 errored · 4 running");
   });
 });

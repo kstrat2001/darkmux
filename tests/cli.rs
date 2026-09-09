@@ -7007,8 +7007,17 @@ fn fail_probe_terminal_mission_has_no_non_terminal_step_and_envelope_matches_dis
     for phase in envelope["phases"].as_array().unwrap() {
         let real_id = phase["phase_id"].as_str().unwrap();
         let short = real_id.rsplit('-').next().unwrap().to_string();
+        // (#2406) `Degraded` drives the SAME lifecycle terminal `Complete`
+        // does — `PhaseStatus` has no third terminal to persist it as (see
+        // `crew::envelope::PhaseOutcomeKind`'s own doc). Before #2406 this
+        // match only knew Complete/else-Abandoned, which is exactly the
+        // over-collapse the fixture below caught: p2 has a genuine mix (2
+        // of 4 steps completed, 2 cascade-abandoned) that the pre-#2406
+        // rule read straight to Abandoned on disk — this real end-to-end
+        // fixture is independent proof the bug was reachable outside the
+        // review pipeline too.
         let want = match phase["outcome"].as_str().unwrap() {
-            "Complete" | "complete" => "complete",
+            "Complete" | "complete" | "Degraded" | "degraded" => "complete",
             _ => "abandoned",
         };
         assert_eq!(
@@ -7018,9 +7027,26 @@ fn fail_probe_terminal_mission_has_no_non_terminal_step_and_envelope_matches_dis
             phases.get(&short)
         );
     }
-    // p1 errored and p2's default chain was abandoned: neither is Complete.
+    // p1 errored with nothing else completing in it: Abandoned, unchanged
+    // by #2406 (the "nothing complete" case).
     assert_eq!(phases.get("p1").map(String::as_str), Some("abandoned"), "{phases:#?}");
-    assert_eq!(phases.get("p2").map(String::as_str), Some("abandoned"), "{phases:#?}");
+    // (#2406) p2's default `run_on` chain cascade-abandoned TWO steps, but
+    // TWO OTHER steps in the same phase completed for real
+    // (`s-chain-err`/`s-deliver` — see the envelope's own `payload.
+    // completed_steps`) — a genuine terminal mix. Before #2406 this read
+    // "abandoned" on disk, discarding the fact real work shipped; the
+    // envelope's own per-phase outcome is the more precise assertion (it
+    // must say `degraded`, not merely "not abandoned"), and the disk
+    // status is its lifecycle-terminal consequence.
+    let p2_outcome = envelope["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["phase_id"].as_str().unwrap().ends_with("-p2"))
+        .and_then(|p| p["outcome"].as_str())
+        .unwrap();
+    assert_eq!(p2_outcome, "degraded", "p2 has 2 complete + 2 abandoned steps — a mix, not a clean abandon");
+    assert_eq!(phases.get("p2").map(String::as_str), Some("complete"), "{phases:#?}");
 
     // …and the BOARD agrees. `mission status` reported "board is clean,
     // drift: []" through the whole S4-1/S4-2 class because every rule
@@ -8146,4 +8172,71 @@ fn a_supplied_mod_wait_seconds_beats_the_documents_default() {
         .expect("mission launch review --dry-run runs");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(stdout.contains("mod_wait_seconds = 45"), "{stdout}");
+}
+
+/// (#2406) END-TO-END: a phase that ships some tasks and cascade-abandons
+/// others reaches the OPERATOR's board as `degraded`, not silently folded
+/// into `complete`.
+///
+/// The fail-probe's p2 is exactly the shape the finding names — `t-dep2`
+/// and `t-chain-err` run and complete (`run_on: ["complete","error"]`),
+/// while `t-dep` and `t-chain` cascade-abandon off the errored `t-fail`.
+/// Two completed tasks, two abandoned ones, all terminal.
+///
+/// This covers the wiring no unit test can: launcher → `envelope.json` →
+/// `mission_status::degraded_phase_ids`'s real disk read → the `--json`
+/// payload. `Degraded` drives `lifecycle::phase_complete` on purpose, so
+/// disk says `complete` for this phase and always will — the board can only
+/// tell the difference by reading the envelope back.
+#[test]
+fn fail_probe_board_reports_the_mixed_phase_as_degraded_not_complete() {
+    let (home, flows) = fail_probe_fixture("true");
+    let _ = launch_fail_probe(&home, &flows);
+
+    let dir = one_mission_dir(&home);
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("envelope.json")).unwrap()).unwrap();
+    let p2_outcome = envelope["phases"]
+        .as_array()
+        .expect("phases")
+        .iter()
+        .find(|p| p["phase_id"].as_str().is_some_and(|id| id.ends_with("-p2")))
+        .expect("p2 in the envelope")
+        .clone();
+    assert_eq!(
+        p2_outcome["outcome"],
+        serde_json::json!("degraded"),
+        "2 completed tasks + 2 cascade-abandoned ones is a MIX: {envelope}"
+    );
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--json", "--all"])
+        .output()
+        .unwrap();
+    let board: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let phases = &board["missions"][0]["phases"];
+    assert_eq!(
+        phases["degraded"], 1,
+        "the mixed phase must land in its OWN bucket, not inside `complete`: {phases}"
+    );
+    assert_eq!(
+        phases["complete"], 1,
+        "three phases: p1 abandoned, p2 degraded, p3 complete — so exactly ONE clean: {phases}"
+    );
+    assert_eq!(phases["abandoned"], 1, "{phases}");
+    assert_eq!(phases["total"], 3, "{phases}");
+
+    // …and the human board says the word, not just the JSON.
+    let human = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--all"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("degraded"), "the board never says `degraded`:\n{text}");
 }

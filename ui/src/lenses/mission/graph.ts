@@ -48,6 +48,10 @@ export interface GraphNode {
   label: string;
   kind: "phase" | "task";
   status: string;
+  /** (#2406) A phase node's task-count breakdown ("7 complete · 1 errored ·
+   *  4 running") — present only when `status` is `running` or `degraded`.
+   *  Always absent on a task node. See `mission_graph.rs::phase_status_note`. */
+  statusNote?: string;
   parentId?: string;
   startedTs?: number;
   completedTs?: number;
@@ -212,6 +216,15 @@ const STATUS_RANK: Record<string, number> = {
   complete: 2,
   error: 2,
   abandoned: 2,
+  // (#2406) A phase-only terminal — a genuine MIX of complete and
+  // errored/abandoned tasks. MUST rank alongside the other terminals: left
+  // out of this table, `statusRank`/`isUnknownStatus` would treat it as
+  // "unknown", and `keepPageStatus`'s own doc says unknown "never wins once
+  // HELD" — a live `"phase complete"` flow record (rank 2) arriving after
+  // the initial snapshot already rendered `degraded` would then silently
+  // overwrite it back to `complete`, regressing the exact signal this
+  // status exists to carry, client-side, on every SSE tick.
+  degraded: 2,
   active: 1,
   finalized: 2,
   closed: 2,

@@ -107,17 +107,57 @@ async function liveRecordCount(page) {
  * consecutive samples before treating it as the real baseline — the same
  * shape as this repo's other `toPass`-based settle-waits (see
  * `next-parity-console.spec.ts`'s `waitLoadedUnderFrozenClock`), just
- * polling a number instead of a locator. */
+ * polling a number instead of a locator.
+ *
+ * ZERO IS NOT SETTLED. "Two equal consecutive samples" is satisfied by
+ * `0 === 0`, so this used to return a stable `0` and the caller failed on it
+ * ("must produce a real baseline count") with a message accusing the CORPUS.
+ * The `> 0` condition below is a BETTER FAILURE MESSAGE AND NOTHING MORE.
+ * Saying so plainly matters: an earlier version of this comment claimed the
+ * zero was a boot-time race that a positive-sample requirement "removes",
+ * and instrumenting an actual failure disproved that.
+ *
+ * What a failing run really does (40 samples, 200ms apart, #2406 re-review):
+ * the chip reads `0 events · 952 hidden` at t=286ms and STILL reads it at
+ * t=8318ms. Every record has loaded; the event pane's curated default filter
+ * is hiding all 952 of them, permanently, and no amount of waiting moves it.
+ * A passing run on the same corpus goes `0 events · 952 hidden` -> `50 of 942
+ * events · 10 hidden` by t=290ms.
+ *
+ * WHY that stuck state is reachable at all — reproduced DETERMINISTICALLY by
+ * deleting the seed below: none of this corpus's 14 activity values is in
+ * `DEFAULT_ACTIVITIES` (`ui/src/lib/eventFilters.ts`); they are all
+ * lifecycle/telemetry (`dispatch start`, `step complete`, `host telemetry`,
+ * ...). With no stored picks the curated default turns on NOTHING and the chip
+ * reads exactly `0 events · 952 hidden`, forever. The only thing between this
+ * suite and that state is the `beforeEach` below seeding a show-everything
+ * payload; a failing run is one where those picks did not reach the pane, and
+ * the pane has no recovery from it, because `absorbNewFacetValues` only ever
+ * reconsiders a value its `seen` ledger has never recorded. A PRODUCT defect,
+ * not a harness one, reproducible on `origin/main` (1 fail in 10) and filed
+ * separately. Do not read this guard as its fix.
+ *
+ * The guard weakens nothing — the only caller asserts `> 0` on the very next
+ * line, so a genuinely-zero run still fails, now with an honest message
+ * instead of a wrong accusation.
+ *
+ * Bundle size changes how OFTEN it fires. Measured back-to-back on one
+ * machine: this branch's bundle (619,414 B) failed 4 of 12 runs, and
+ * `origin/main`'s (618,188 B) 1 of 16. The ~1.2KB this branch adds does not
+ * cause the defect; it does make it likelier to be seen. */
 async function waitForStableRecordCount(page, { attempts = 30, intervalMs = 200 } = {}) {
   let last = null;
   for (let i = 0; i < attempts; i++) {
     const now = await liveRecordCount(page);
-    if (now !== null && now === last) return now;
+    if (now !== null && now > 0 && now === last) return now;
     last = now;
     // eslint-disable-next-line no-await-in-loop -- deliberately sequential: each sample must see the PREVIOUS one's result.
     await page.waitForTimeout(intervalMs);
   }
-  throw new Error(`meta record count never stabilized (last sample: ${last})`);
+  throw new Error(
+    `meta record count never stabilized at a positive value (last sample: ${last}) — ` +
+      `either the corpus's /flow fixtures are empty or the app never finished its day-window fetches`,
+  );
 }
 
 /** Registers a stream-path override that NEVER resolves — see the module

@@ -2073,6 +2073,13 @@ body {
 .wstatus.is-running { color: var(--accent); border-color: var(--accent); }
 .wstatus.is-done { color: var(--good); border-color: var(--good); }
 .wstatus.is-error { color: var(--bad); border-color: var(--bad); }
+/* (#2406) Same `--warn` token `.is-stopped` and `.fleet-strip--degraded`
+   already use for "a caution, not a failure" — a mixed terminal is a
+   caution, not a failure, same as an operator/budget stop. Reusing the
+   existing warn palette on purpose (no new color for an existing concept);
+   `degraded` stays its own KIND so the raw status word, not the color,
+   tells it apart from `stopped`. */
+.wstatus.is-degraded { color: var(--warn); border-color: var(--warn); }
 .wstatus.is-stopped { color: var(--warn); border-color: var(--warn); }
 .wstatus.is-idle { color: var(--dim); border-color: var(--border); }
 
@@ -5521,10 +5528,26 @@ body {
   pointer-events: none;
   position: relative;
 }
+/* (#2406, post-review round 2) The label block is ABSOLUTELY positioned, so
+   by default nothing about the band bounds its width — it is shrink-to-fit
+   against an infinite available width. Harmless while it read `PHASE` + a
+   short name; not harmless once the status chip and the counts joined the
+   line. Measured before this bound: a three-part note ran 85px past the
+   band's right edge and a five-part one 309px, clipped mid-word by the events
+   pane, so the counts this line exists to expose were unreadable.
+   The items inside already shrink into this bound on their own: `.pg-name` and
+   `.pg-note` both set `overflow: hidden`, which is exactly the condition under
+   which a flex item's automatic minimum size resolves to zero, so their
+   `text-overflow: ellipsis` fires as soon as anything actually constrains the
+   line. Bounding the block is what was missing — but it needs the companion
+   below (`.pg-note`'s shrink factor) to decide WHICH item gives.
+   Guard: `tests/e2e/mission-lens-layout-geometry.spec.js`'s "the phase label
+   never escapes its own band". */
 .missionlens .phasegroup .pg-label {
   position: absolute;
   top: 10px;
   left: 14px;
+  max-width: calc(100% - 28px);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -5541,6 +5564,50 @@ body {
   color: var(--fg);
   opacity: 0.85;
 }
+/* (#2406, post-review) The phase box's own status LINE. Before this the box
+   carried no status word at all — a degraded phase was conveyed purely by
+   border color, and the counts existed only as a `title=`, which touch
+   devices have no way to show. Both are real text now: the shared
+   `WorkStatus` chip (no snowflake indicator) plus, for running/degraded
+   phases only, the count breakdown beside it.
+   The name, chip and counts share ONE line deliberately — the label block
+   is absolutely positioned at the box's top-left with only `BAND_PAD`
+   (56px, `graph.ts`) of clearance before the first task card, and a third
+   stacked line renders underneath that card. */
+.missionlens .phasegroup .pg-state {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+.missionlens .phasegroup .pg-state .pg-name {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.missionlens .phasegroup .pg-state .pg-tag {
+  flex: 0 0 auto;
+  align-self: center;
+  font-size: calc(9px * var(--fs-scale));
+  padding: 1px 5px;
+}
+/* The counts absorb the shrink, not the name. Both items carry
+   `overflow: hidden`, so both already have an automatic minimum size of zero
+   and both CAN ellipsize — and with equal shrink factors they ellipsized
+   TOGETHER, so bounding the label (above) turned `investigate` into `invest…`
+   to make room for counts nobody can read anyway. Shrink is distributed
+   proportionally to factor x base size, so a large factor here makes the note
+   give up nearly all of it first; the name still shrinks rather than
+   overflowing once even a zero-width note is not enough. */
+.missionlens .phasegroup .pg-note {
+  flex: 0 999 auto;
+  font: calc(10px * var(--fs-scale))/1.1 var(--font-mono);
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .missionlens .phasegroup.s-running {
   border-color: var(--ml-run);
 }
@@ -5555,6 +5622,18 @@ body {
 }
 .missionlens .phasegroup.s-error .pg-name {
   color: var(--bad);
+}
+/* (#2406) Mixed terminal — real output shipped, some of it did not. Same
+   `--warn` token the timeline/`WorkStatus` chip use for this concept
+   (see `.wstatus.is-degraded`'s own comment); full opacity and a solid
+   border, deliberately NOT the dashed/muted `.s-abandoned` treatment
+   below — a degraded phase produced real work and should not read as
+   de-emphasized the way a fully abandoned one does. */
+.missionlens .phasegroup.s-degraded {
+  border-color: var(--warn);
+}
+.missionlens .phasegroup.s-degraded .pg-name {
+  color: var(--warn);
 }
 .missionlens .phasegroup.s-abandoned {
   border-style: dashed;
@@ -5853,6 +5932,11 @@ body {
 .missionlens .tlphase.s-error .tlph-dot {
   background: var(--bad);
 }
+/* (#2406) Same reasoning as `.phasegroup.s-degraded` above: warn color,
+   full opacity — a degraded phase shipped real output. */
+.missionlens .tlphase.s-degraded .tlph-dot {
+  background: var(--warn);
+}
 .missionlens .tlphase.s-abandoned {
   opacity: 0.6;
 }
@@ -5868,6 +5952,21 @@ body {
   font: calc(10px * var(--fs-scale))/1 var(--font-mono);
   text-transform: uppercase;
   letter-spacing: 0.06em;
+  color: var(--dim);
+}
+/* (#2406, post-review) The task-count breakdown, as REAL TEXT rather than
+   a `title=` — tooltips do not exist on touch, and this viewer is driven
+   from a phone. It takes a full row of its own inside the (now wrapping)
+   header, so the phone layout never has to squeeze it beside the phase
+   name; on wide screens it reads as a caption under the name. Rendered
+   only for running/degraded phases, so no other status gains a row. */
+.missionlens .tlphase .tlph-hd {
+  flex-wrap: wrap;
+}
+.missionlens .tlphase .tlph-hd .tlph-note {
+  flex: 1 0 100%;
+  margin-top: 4px;
+  font: calc(10px * var(--fs-scale))/1.35 var(--font-mono);
   color: var(--dim);
 }
 .missionlens .tltasks {

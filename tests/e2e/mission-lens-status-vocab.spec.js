@@ -187,3 +187,55 @@ test('the graph lens never scrolls sideways on a phone', async ({ page }) => {
   expect(over.body, 'the body scrolls sideways').toBeLessThanOrEqual(0);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
+
+// (#2406, post-review) The counts behind a phase's status must be READABLE,
+// not hover-only. Both renderers are covered because the lens swaps between
+// them at ~700px: the React Flow canvas above it, the vertical timeline
+// below — and the phone, where a tooltip cannot be produced at all, only
+// ever sees the timeline.
+function degradedGraph() {
+  return {
+    mission_id: MISSION_ID,
+    mission_status: 'finalized',
+    nodes: [
+      {
+        id: 'pa', kind: 'phase', label: 'Adjudicate', status: 'degraded', depth: 0, steps: [],
+        statusNote: '1 complete · 11 errored',
+      },
+      { id: 'ta', kind: 'task', label: 'Judge', parentId: 'pa', status: 'complete', depth: 0, steps: [] },
+      { id: 'tb', kind: 'task', label: 'Judge 2', parentId: 'pa', status: 'error', depth: 1, steps: [] },
+    ],
+    edges: [],
+    generated_at_ms: 0,
+  };
+}
+
+test('a degraded phase says so in TEXT, with its counts, on the canvas and on a phone (#2406)', async ({ page }) => {
+  const { errors } = await open(page, [degradedGraph()]);
+
+  // Canvas (desktop). Before this fix `PhaseGroup` rendered only "PHASE" +
+  // the label: the status was carried by border color alone, and the
+  // counts existed only as a `title=`.
+  const box = page.locator('.missionlens .phasegroup').first();
+  await expect(box).toBeVisible();
+  await expect(box.locator('.wstatus')).toHaveText(/degraded/i);
+  await expect(
+    box.locator('.pg-note'),
+    'DEGRADED alone is the same word for "11 of 12 shipped" and "1 of 12 shipped"'
+  ).toHaveText('1 complete · 11 errored');
+
+  // Phone. `title=` does not exist on touch, so the counts have to be real
+  // text here or they are not reachable at all.
+  await page.setViewportSize({ width: 390, height: 844 });
+  const phase = page.locator('.missionlens .tlphase').first();
+  await expect(phase).toBeVisible();
+  await expect(phase.locator('.tlph-tag')).toHaveText(/degraded/i);
+  await expect(phase.locator('.tlph-note')).toHaveText('1 complete · 11 errored');
+  await expect(phase.locator('.tlph-note')).toBeInViewport();
+
+  const over = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  expect(over, `the counts row pushed the page ${over}px sideways`).toBeLessThanOrEqual(0);
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});

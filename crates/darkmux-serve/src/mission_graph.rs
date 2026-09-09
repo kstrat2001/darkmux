@@ -93,6 +93,17 @@ pub struct GraphNode {
     /// look up.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepRow>,
+    /// (#2406) A phase node's task-count breakdown, e.g. `"7 complete · 1
+    /// errored · 4 running"` — populated ONLY for a phase node whose
+    /// rolled-up status is `running` or `degraded` (the two cases where a
+    /// bare status word hides a real mix; see [`phase_task_rollup`]). The
+    /// page renders this as the status chip's tooltip/sub-label so the
+    /// operator's first read of a live or degraded phase carries the
+    /// counts, not just the one word. `None` for every task/step node, and
+    /// for a phase node whose tasks are uniform (all-complete, all-planned,
+    /// …) — a breakdown of a uniform set adds nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_note: Option<String>,
 }
 
 /// One row inside a Task node's card (#1401). Same `camelCase` wire
@@ -249,20 +260,6 @@ fn phase_status_to_node(s: PhaseStatus) -> NodeStatus {
     }
 }
 
-/// (#1472) How advanced a node status is, mirroring the mission-graph
-/// lens's own `statusRank` (`ui/src/lenses/mission/graph.ts`, #1868):
-/// `planned` < `running` < any terminal state (`complete` / `error` /
-/// `abandoned` share the top rank).
-/// Used by the phase rollup's monotone-authority rule so a persisted
-/// terminal phase status is never regressed by a lower-ranked task rollup.
-fn node_status_rank(s: NodeStatus) -> u8 {
-    match s {
-        NodeStatus::Planned => 0,
-        NodeStatus::Running => 1,
-        NodeStatus::Complete | NodeStatus::Error | NodeStatus::Abandoned => 2,
-    }
-}
-
 fn node_status_str(s: NodeStatus) -> &'static str {
     match s {
         NodeStatus::Planned => "planned",
@@ -331,34 +328,258 @@ fn derive_task_status(step_statuses: &[NodeStatus]) -> NodeStatus {
     NodeStatus::Planned
 }
 
-/// (#1472) Derive a Phase's DISPLAY status from its Tasks' derived statuses,
-/// symmetric with how a Task derives from its Steps — the same rollup rule
-/// (`derive_task_status` generalizes over any child-status list: error >
-/// running > all-complete > abandoned > planned) applied one level up.
+/// (#2406) A phase's DISPLAY status — a superset of `NodeStatus` at the
+/// PHASE level only, adding `Degraded`. Deliberately its OWN type rather
+/// than a new `NodeStatus` variant: `NodeStatus` is the SCHEDULER's own
+/// step/task lifecycle type (`NodeStatus::next_variant`/`ALL` drive real
+/// state-machine transitions), and a phase's rolled-up "how is this SET of
+/// independent tasks doing" never drives one — it is read-only display
+/// derived fresh from current task statuses on every graph build. Giving
+/// `NodeStatus` a `Degraded` a task could never legitimately reach (task
+/// level keeps "any Error wins" unchanged, see `derive_task_status`) would
+/// widen the scheduler's own vocabulary for a concept that only exists one
+/// level up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhaseDisplayStatus {
+    Planned,
+    Running,
+    Complete,
+    /// (#2406) Terminal, but a genuine MIX of `Complete` and `Error`/
+    /// `Abandoned` among the phase's own tasks. Matches
+    /// `crew::envelope::PhaseOutcomeKind::Degraded`'s spelling and
+    /// semantics exactly (see that type's own doc) — this is the SAME
+    /// concept, read from live task data instead of the persisted
+    /// envelope.
+    Degraded,
+    Error,
+    Abandoned,
+}
+
+impl PhaseDisplayStatus {
+    /// Mirrors the mission-graph lens's own `statusRank` lattice
+    /// (`ui/src/lenses/mission/graph.ts`, #1868) — `Planned` < `Running` <
+    /// any terminal (all four terminals, `Degraded` included, share the
+    /// top rank; see [`phase_display_status`]'s own tie-break for how a
+    /// `Degraded`/`Complete` TIE at this rank is resolved).
+    fn rank(self) -> u8 {
+        match self {
+            PhaseDisplayStatus::Planned => 0,
+            PhaseDisplayStatus::Running => 1,
+            PhaseDisplayStatus::Complete
+            | PhaseDisplayStatus::Degraded
+            | PhaseDisplayStatus::Error
+            | PhaseDisplayStatus::Abandoned => 2,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            PhaseDisplayStatus::Planned => "planned",
+            PhaseDisplayStatus::Running => "running",
+            PhaseDisplayStatus::Complete => "complete",
+            PhaseDisplayStatus::Degraded => "degraded",
+            PhaseDisplayStatus::Error => "error",
+            PhaseDisplayStatus::Abandoned => "abandoned",
+        }
+    }
+
+    fn from_node_status(s: NodeStatus) -> Self {
+        match s {
+            NodeStatus::Planned => PhaseDisplayStatus::Planned,
+            NodeStatus::Running => PhaseDisplayStatus::Running,
+            NodeStatus::Complete => PhaseDisplayStatus::Complete,
+            NodeStatus::Abandoned => PhaseDisplayStatus::Abandoned,
+            NodeStatus::Error => PhaseDisplayStatus::Error,
+        }
+    }
+}
+
+/// (#2406) Per-task-status counts for one phase, plus the query helpers
+/// [`phase_task_rollup`]/[`phase_status_note`] need. Every count is a task
+/// DERIVED status (`derive_task_status` already collapsed each task's own
+/// steps down to one `NodeStatus`, task level unchanged) — never a raw
+/// step count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PhaseTaskCounts {
+    complete: usize,
+    errored: usize,
+    running: usize,
+    planned: usize,
+    abandoned: usize,
+}
+
+impl PhaseTaskCounts {
+    fn from_task_statuses(statuses: &[NodeStatus]) -> Self {
+        let mut c = PhaseTaskCounts::default();
+        for s in statuses {
+            match s {
+                NodeStatus::Complete => c.complete += 1,
+                NodeStatus::Error => c.errored += 1,
+                NodeStatus::Running => c.running += 1,
+                NodeStatus::Planned => c.planned += 1,
+                NodeStatus::Abandoned => c.abandoned += 1,
+            }
+        }
+        c
+    }
+
+    fn total(&self) -> usize {
+        self.complete + self.errored + self.running + self.planned + self.abandoned
+    }
+
+    /// Any task has REACHED a terminal (good or bad) — distinct from
+    /// "every task is terminal"; used to tell "hasn't started yet"
+    /// (all-`Planned`) apart from "in progress, some already finished"
+    /// (a `Planned`/`Running` mix alongside real terminal work).
+    fn any_terminal(&self) -> bool {
+        self.complete + self.errored + self.abandoned > 0
+    }
+}
+
+/// (#2406) Roll a phase's own tasks up into a DISPLAY verdict + the counts
+/// behind it — the fix for the bug #2406 names: a phase is a SET of
+/// INDEPENDENT tasks, so this does NOT reuse `derive_task_status`'s "any
+/// Error wins" rule (that rule is right ONE level down, task-from-steps,
+/// where a task genuinely is a single unit of work; #1472 applied it a
+/// second time, one level too high, which is what let one errored unit
+/// out of twelve read the whole phase as `error`/get read as terminal
+/// while eleven others were still running).
 ///
-/// Then apply the MONOTONE-AUTHORITY rule against the phase's PERSISTED
-/// lifecycle status: for a finalized/aborted mission the persisted phase
-/// status is the lifecycle-authoritative terminal, so the task-derived
-/// status wins ONLY when STRICTLY more advanced (by `node_status_rank`,
-/// mirroring the mission-graph lens's `statusRank` merge in
-/// `ui/src/lenses/mission/graph.ts`, #1868).
+/// The rule (BEFORE persisted-status monotone authority — see
+/// [`phase_display_status`]):
+///
+/// - no tasks at all → `Planned`
+/// - any task `Running`, OR any task still `Planned` while at least one
+///   OTHER task has already reached a terminal → `Running` — the phase is
+///   not over. This is the live #2406 case: 7 complete + 1 errored + 4
+///   running/planned reads `Running`, not `Error`, while work remains.
+///   (A phase where EVERY task is `Planned` and nothing has started yet
+///   stays `Planned`, not `Running` — no work is in flight.)
+/// - every task terminal, all `Complete` → `Complete`
+/// - every task terminal, a mix of `Complete` and `Error`/`Abandoned` →
+///   `Degraded` — real output was produced, something was lost
+/// - every task terminal, nothing `Complete`, some `Error` → `Error`
+/// - every task terminal, nothing `Complete`, nothing `Error` (all
+///   `Abandoned`) → `Abandoned`
+fn phase_task_rollup(task_statuses: &[NodeStatus]) -> (PhaseDisplayStatus, PhaseTaskCounts) {
+    let counts = PhaseTaskCounts::from_task_statuses(task_statuses);
+    let live = counts.running > 0 || (counts.planned > 0 && counts.any_terminal());
+    let status = if live {
+        PhaseDisplayStatus::Running
+    } else if counts.total() == 0 || counts.planned == counts.total() {
+        PhaseDisplayStatus::Planned
+    } else if counts.complete == counts.total() {
+        PhaseDisplayStatus::Complete
+    } else if counts.complete > 0 {
+        PhaseDisplayStatus::Degraded
+    } else if counts.errored > 0 {
+        PhaseDisplayStatus::Error
+    } else {
+        PhaseDisplayStatus::Abandoned
+    };
+    (status, counts)
+}
+
+/// (#2406) A human breakdown for the status chip's tooltip/sub-label —
+/// `"7 complete · 1 errored · 4 running"` — populated only when the
+/// rolled-up status is `Running` or `Degraded` (the two cases where a bare
+/// status word hides a real mix worth naming; a uniform phase's count
+/// breakdown would just restate its own status word). `None` otherwise.
+fn phase_status_note(status: PhaseDisplayStatus, counts: &PhaseTaskCounts) -> Option<String> {
+    if !matches!(status, PhaseDisplayStatus::Running | PhaseDisplayStatus::Degraded) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if counts.complete > 0 {
+        parts.push(format!("{} complete", counts.complete));
+    }
+    if counts.errored > 0 {
+        parts.push(format!("{} errored", counts.errored));
+    }
+    if counts.abandoned > 0 {
+        parts.push(format!("{} abandoned", counts.abandoned));
+    }
+    if counts.running > 0 {
+        parts.push(format!("{} running", counts.running));
+    }
+    if counts.planned > 0 {
+        parts.push(format!("{} planned", counts.planned));
+    }
+    if parts.is_empty() { None } else { Some(parts.join(" · ")) }
+}
+
+/// (#1472, revised #2406) Derive a Phase's DISPLAY status from its Tasks'
+/// derived statuses via [`phase_task_rollup`] (task-level `Error`
+/// unchanged — see that function's own doc for why this does NOT reuse
+/// `derive_task_status`), then apply the MONOTONE-AUTHORITY rule against
+/// the phase's PERSISTED lifecycle status: for a finalized/aborted mission
+/// the persisted phase status is the lifecycle-authoritative terminal, so
+/// the task-derived status wins ONLY when STRICTLY more advanced (by
+/// [`PhaseDisplayStatus::rank`], mirroring the mission-graph lens's own
+/// `statusRank` merge in `ui/src/lenses/mission/graph.ts`, #1868) — WITH
+/// ONE NAMED EXCEPTION:
+///
+/// **A `Degraded` derivation wins a RANK TIE against a persisted
+/// `Complete` (#2406).** `crate::types::PhaseStatus` has only `Complete`/`Abandoned`
+/// as terminals — it structurally CANNOT represent "terminal, but a mix"
+/// (see `crew::envelope::PhaseOutcomeKind`'s own doc: a `Degraded` phase's
+/// persisted lifecycle status is driven to `Complete`, same as a clean
+/// `Complete`, because `PhaseStatus` has no third terminal to drive it
+/// to). Without this exception, a FINALIZED degraded phase would tie
+/// `Degraded`(rank 2) against persisted `Complete`(rank 2) and the
+/// ordinary tie-break ("persisted wins ties") would silently regress the
+/// operator-visible signal straight back to plain `complete` the moment
+/// the mission finalizes — reintroducing the exact information loss this
+/// packet exists to fix, just moved to a different trigger. Every OTHER
+/// rank-2 combination keeps the ordinary tie-break (persisted wins) —
+/// this exception is narrowly for `Degraded` AGAINST A PERSISTED
+/// `Complete`, the one pairing where the persisted enum genuinely cannot
+/// express what the tasks say.
+///
+/// **The `persisted == Complete` half of that gate is load-bearing.**
+/// `Complete` is the only persisted terminal a degraded phase is ever
+/// driven to, so it is the only one that can launder a mix back into a
+/// clean word. A persisted `Abandoned` is a DIFFERENT fact — the
+/// operator ran `mission abort` — and it must keep winning the tie:
+/// ungated, a phase with one complete and one errored task rendered
+/// `degraded` after the abort, so the operator's own deliberate stop
+/// went invisible and the phase read "finished with a mix" instead of
+/// "you stopped this".
 ///
 /// - Mid-run: persisted=`Running`, derived=`Complete` → `Complete` (the
 ///   live #1472 case — the review launcher only advances persisted phase
 ///   status to `Complete` at mission finalization, so a phase whose tasks
 ///   are all done kept reading `running` until the whole mission finalized).
-/// - Any task `Running` → phase `Running`; any task `Error` → phase `Error`.
-/// - Aborted mission: persisted=`Abandoned` (rank 2) outranks a mixed
-///   task rollup that derives lower — the persisted terminal wins.
+/// - Any task `Running`/`Planned`-while-others-terminal → phase `Running`.
+/// - Aborted mission: persisted=`Abandoned` (rank 2) outranks ANY task
+///   rollup that does not strictly outrank it — a lower-ranked one (e.g.
+///   still-`Planned` tasks) and a rank-2 `Degraded` alike. The operator's
+///   abort is the authoritative terminal; the named exception above does
+///   not apply to it.
 /// - A phase with all-`Planned` tasks (and persisted `Planned`) → `Planned`.
-fn phase_display_status(persisted: PhaseStatus, task_statuses: &[NodeStatus]) -> NodeStatus {
-    let derived = derive_task_status(task_statuses);
-    let persisted = phase_status_to_node(persisted);
-    if node_status_rank(derived) > node_status_rank(persisted) {
+fn phase_display_status(
+    persisted: PhaseStatus,
+    task_statuses: &[NodeStatus],
+) -> (PhaseDisplayStatus, PhaseTaskCounts) {
+    let (derived, counts) = phase_task_rollup(task_statuses);
+    let persisted_status = PhaseDisplayStatus::from_node_status(phase_status_to_node(persisted));
+    // `derived == Degraded` against a persisted `Complete` is the named
+    // tie-break exception (see this fn's own doc); `derived.rank() >
+    // persisted_status.rank()` is the ordinary monotone-authority rule.
+    // Combined with `||` rather than written as two `if` arms that both
+    // return `derived` (clippy `if_same_then_else` correctly flags that
+    // shape as a dead branch). The `persisted_status == Complete`
+    // conjunct is what keeps an operator's `mission abort` (persisted
+    // `Abandoned`) from losing the tie to a mixed rollup.
+    let winner = if (derived == PhaseDisplayStatus::Degraded
+        && persisted_status == PhaseDisplayStatus::Complete)
+        || derived.rank() > persisted_status.rank()
+    {
         derived
     } else {
-        persisted
-    }
+        persisted_status
+    };
+    (winner, counts)
 }
 
 /// Topological longest-path depth over a set of Tasks connected by
@@ -1199,6 +1420,10 @@ pub fn build_mission_graph(
                 depth: *task_depth.get(&task.id).unwrap_or(&0),
                 description: description_or_none(&task.description),
                 steps: step_rows,
+                // (#2406) Task-level status keeps "any Error wins"
+                // (`derive_task_status`, unchanged) — a task genuinely IS
+                // one unit of work, so there is no mix to name here.
+                status_note: None,
             });
 
             // (#1401) Cross-task dependency edges connect TASK nodes
@@ -1221,18 +1446,25 @@ pub fn build_mission_graph(
             }
         }
 
-        // (#1472) Roll the phase's DISPLAY status up from its tasks, applying
-        // the monotone-authority rule against the persisted phase status
-        // (see `phase_display_status`). This is what fixes the live case —
-        // Investigate showed `running` while all its tasks were complete.
-        let phase_display = phase_display_status(phase.status, &task_statuses);
-        // (#1472) A phase that now derives Complete should carry a truthful
-        // `completed_ts` — the max of its tasks' — when the persisted phase
-        // record doesn't already have one (it won't mid-run, since the
-        // launcher stamps it only at finalization). Never fabricated: left
-        // None if genuinely unknown (no complete tasks with a timestamp).
+        // (#1472, revised #2406) Roll the phase's DISPLAY status up from its
+        // tasks, applying the monotone-authority rule against the persisted
+        // phase status (see `phase_display_status`). This is what fixes the
+        // live case — Investigate showed `running` while all its tasks were
+        // complete — AND, per #2406, what stops a phase with mostly-complete
+        // tasks and one errored one from reading `error` while the rest are
+        // still running, or `abandoned` once finalized.
+        let (phase_display, phase_counts) = phase_display_status(phase.status, &task_statuses);
+        // (#1472, #2406) A phase that now derives Complete OR Degraded
+        // should carry a truthful `completed_ts` — the max of its tasks' —
+        // when the persisted phase record doesn't already have one (it
+        // won't mid-run, since the launcher stamps it only at
+        // finalization). Degraded is terminal too (real output was
+        // produced, something was lost) — leaving its `completed_ts` `None`
+        // would be as dishonest as leaving a Complete phase's blank. Never
+        // fabricated: left `None` if genuinely unknown (no complete tasks
+        // with a timestamp).
         let phase_completed_ts = phase.completed_ts.or_else(|| {
-            if phase_display == NodeStatus::Complete {
+            if matches!(phase_display, PhaseDisplayStatus::Complete | PhaseDisplayStatus::Degraded) {
                 task_completed_ts.iter().flatten().copied().max()
             } else {
                 None
@@ -1243,13 +1475,16 @@ pub fn build_mission_graph(
             id: phase.id.clone(),
             label: phase.display_name.clone().unwrap_or_else(|| phase.id.clone()),
             kind: "phase",
-            status: node_status_str(phase_display),
+            status: phase_display.as_str(),
             parent_id: None,
             started_ts: phase.started_ts,
             completed_ts: phase_completed_ts,
             depth: phase_index,
             description: description_or_none(&phase.description),
             steps: Vec::new(),
+            // (#2406) Only `running`/`degraded` phases get a note — see
+            // `phase_status_note`'s own doc.
+            status_note: phase_status_note(phase_display, &phase_counts),
         });
         nodes.extend(task_nodes);
     }
@@ -1831,7 +2066,109 @@ mod tests {
         );
     }
 
-    // ─── phase_display_status (#1472) ───────────────────────────────────
+    // ─── phase_task_rollup (#2406) — table-driven, every combination ────
+
+    #[test]
+    fn phase_task_rollup_table_every_combination() {
+        use NodeStatus::*;
+        // (task statuses, expected PhaseDisplayStatus, expected counts as
+        // [complete, errored, running, planned, abandoned], human name) —
+        // every reachable combination of task-derived statuses a phase's
+        // task list can carry. The brief asks for the roll-up table
+        // explicitly; this is that table. The counts column is asserted
+        // too: they are what the badge's note renders, so a table that
+        // only pinned the WORD would leave the operator-visible numbers
+        // uncovered.
+        let cases: Vec<(Vec<NodeStatus>, PhaseDisplayStatus, [usize; 5], &str)> = vec![
+            // no tasks at all
+            (vec![], PhaseDisplayStatus::Planned, [0, 0, 0, 0, 0], "no tasks"),
+            // nothing has started
+            (vec![Planned], PhaseDisplayStatus::Planned, [0, 0, 0, 1, 0], "single planned"),
+            (vec![Planned, Planned], PhaseDisplayStatus::Planned, [0, 0, 0, 2, 0], "all planned"),
+            // genuinely live: something running, nothing terminal yet
+            (vec![Running], PhaseDisplayStatus::Running, [0, 0, 1, 0, 0], "single running"),
+            (vec![Running, Planned], PhaseDisplayStatus::Running, [0, 0, 1, 1, 0], "running + planned, nothing terminal yet"),
+            // live: a mix of terminal work and still-running/queued work —
+            // the #2406 shape (issue's own 7/1/4 scenario is a bigger
+            // instance of this same row)
+            (vec![Complete, Running], PhaseDisplayStatus::Running, [1, 0, 1, 0, 0], "complete + running"),
+            (vec![Complete, Planned], PhaseDisplayStatus::Running, [1, 0, 0, 1, 0], "complete + queued (not started yet, but phase is live)"),
+            (vec![Complete, Error, Running], PhaseDisplayStatus::Running, [1, 1, 1, 0, 0], "complete + error + running, THE #2406 shape"),
+            // ── The SOFTENING rows: a BAD terminal beside live work still
+            // reads `Running`, with NOTHING complete. This is deliberate —
+            // the phase is not over, and #2406's whole point is that a
+            // phase is a set of independent tasks — but it is the most
+            // aggressive thing this rollup does (an `error` task is
+            // displayed as a `running` phase), so it gets its own rows on
+            // the record rather than being left implicit. The counts are
+            // what keeps it honest: the errored/abandoned task is still
+            // named in the note the badge renders.
+            (vec![Error, Running], PhaseDisplayStatus::Running, [0, 1, 1, 0, 0], "errored + running, nothing complete — phase still reads running"),
+            (vec![Abandoned, Running], PhaseDisplayStatus::Running, [0, 0, 1, 0, 1], "abandoned + running, nothing complete"),
+            (vec![Error, Planned], PhaseDisplayStatus::Running, [0, 1, 0, 1, 0], "errored + queued, nothing complete — the terminal makes the phase live, not planned"),
+            (vec![Abandoned, Planned], PhaseDisplayStatus::Running, [0, 0, 0, 1, 1], "abandoned + queued, nothing complete"),
+            // all terminal, all complete
+            (vec![Complete], PhaseDisplayStatus::Complete, [1, 0, 0, 0, 0], "single complete"),
+            (vec![Complete, Complete], PhaseDisplayStatus::Complete, [2, 0, 0, 0, 0], "all complete"),
+            // all terminal, nothing complete
+            (vec![Error], PhaseDisplayStatus::Error, [0, 1, 0, 0, 0], "single error, nothing complete"),
+            (vec![Error, Error], PhaseDisplayStatus::Error, [0, 2, 0, 0, 0], "all errored"),
+            (vec![Error, Abandoned], PhaseDisplayStatus::Error, [0, 1, 0, 0, 1], "errored + abandoned, nothing complete"),
+            (vec![Abandoned], PhaseDisplayStatus::Abandoned, [0, 0, 0, 0, 1], "single abandoned, nothing complete, nothing errored"),
+            (vec![Abandoned, Abandoned], PhaseDisplayStatus::Abandoned, [0, 0, 0, 0, 2], "all abandoned"),
+            // ── #2406's fix: all terminal, SOME complete + SOME error/abandoned ──
+            (vec![Complete, Error], PhaseDisplayStatus::Degraded, [1, 1, 0, 0, 0], "complete + error (THE #2406 bug shape, terminal)"),
+            (vec![Complete, Abandoned], PhaseDisplayStatus::Degraded, [1, 0, 0, 0, 1], "complete + abandoned, terminal"),
+            (
+                vec![Complete, Complete, Error, Abandoned],
+                PhaseDisplayStatus::Degraded,
+                [2, 1, 0, 0, 1],
+                "complete + error + abandoned, all mixed, terminal",
+            ),
+        ];
+        for (statuses, expected, expected_counts, name) in cases {
+            let (status, counts) = phase_task_rollup(&statuses);
+            assert_eq!(status, expected, "case `{name}`: statuses {statuses:?}");
+            let [complete, errored, running, planned, abandoned] = expected_counts;
+            assert_eq!(
+                counts,
+                PhaseTaskCounts { complete, errored, running, planned, abandoned },
+                "case `{name}`: counts for {statuses:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_task_rollup_the_2406_scenario_produces_the_named_counts() {
+        // (#2406) The issue's own numbers, verbatim: 7 complete, 1 errored,
+        // 4 running.
+        let mut statuses = vec![NodeStatus::Complete; 7];
+        statuses.push(NodeStatus::Error);
+        statuses.extend([NodeStatus::Running; 4]);
+        let (status, counts) = phase_task_rollup(&statuses);
+        assert_eq!(status, PhaseDisplayStatus::Running, "the phase is not over");
+        assert_eq!(counts, PhaseTaskCounts { complete: 7, errored: 1, running: 4, planned: 0, abandoned: 0 });
+        assert_eq!(
+            phase_status_note(status, &counts).as_deref(),
+            Some("7 complete · 1 errored · 4 running"),
+            "the badge sub/tooltip carries the counts, in this order"
+        );
+    }
+
+    #[test]
+    fn phase_status_note_is_none_for_a_uniform_terminal_or_planned_phase() {
+        // (#2406) A note is only informative for the two MIXED-derivation
+        // statuses (Running/Degraded) — a uniform phase's breakdown would
+        // just restate its own status word, so it stays absent for
+        // Complete/Error/Abandoned/Planned regardless of the counts passed.
+        let counts = PhaseTaskCounts { complete: 3, errored: 0, running: 0, planned: 0, abandoned: 0 };
+        assert_eq!(phase_status_note(PhaseDisplayStatus::Complete, &counts), None);
+        assert_eq!(phase_status_note(PhaseDisplayStatus::Error, &counts), None);
+        assert_eq!(phase_status_note(PhaseDisplayStatus::Abandoned, &counts), None);
+        assert_eq!(phase_status_note(PhaseDisplayStatus::Planned, &counts), None);
+    }
+
+    // ─── phase_display_status (#1472, revised #2406) ────────────────────
 
     #[test]
     fn phase_display_all_tasks_complete_derives_complete_over_persisted_running() {
@@ -1843,8 +2180,9 @@ mod tests {
             phase_display_status(
                 PhaseStatus::Running,
                 &[NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Complete]
-            ),
-            NodeStatus::Complete
+            )
+            .0,
+            PhaseDisplayStatus::Complete
         );
     }
 
@@ -1854,17 +2192,34 @@ mod tests {
             phase_display_status(
                 PhaseStatus::Running,
                 &[NodeStatus::Complete, NodeStatus::Running]
-            ),
-            NodeStatus::Running
+            )
+            .0,
+            PhaseDisplayStatus::Running
         );
     }
 
     #[test]
-    fn phase_display_any_task_error_derives_error() {
-        // Error outranks a persisted Running (rank 2 > 1).
+    fn phase_display_mixed_complete_and_error_derives_degraded_not_error() {
+        // (#2406) THIS TEST USED TO ASSERT `NodeStatus::Error` — that was
+        // pinning the exact bug the issue reports: a phase with SOME
+        // complete tasks and SOME errored ones (all terminal) is not a
+        // failed phase, it's a MIXED one. Real output shipped; something
+        // was lost. Fixed: Degraded, not Error.
         assert_eq!(
-            phase_display_status(PhaseStatus::Running, &[NodeStatus::Complete, NodeStatus::Error]),
-            NodeStatus::Error
+            phase_display_status(PhaseStatus::Running, &[NodeStatus::Complete, NodeStatus::Error]).0,
+            PhaseDisplayStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn phase_display_all_errored_nothing_complete_stays_error_not_degraded() {
+        // Inverted case: task-level Error is UNCHANGED — a phase where
+        // NOTHING completed still reads Error (the #2406 fix is narrowly
+        // the mixed-with-some-complete case above), and Error still
+        // outranks a persisted Running (rank 2 > 1).
+        assert_eq!(
+            phase_display_status(PhaseStatus::Running, &[NodeStatus::Error, NodeStatus::Error]).0,
+            PhaseDisplayStatus::Error
         );
     }
 
@@ -1872,26 +2227,125 @@ mod tests {
     fn phase_display_persisted_abandoned_wins_over_mixed_tasks() {
         // Monotone authority: an aborted mission's persisted Abandoned
         // (rank 2) is the lifecycle terminal — a lower-ranked task rollup
-        // (here Planned, rank 0) never regresses it.
+        // (here Running, since Complete+Planned reads live/rank 1) never
+        // regresses it.
         assert_eq!(
             phase_display_status(
                 PhaseStatus::Abandoned,
                 &[NodeStatus::Complete, NodeStatus::Planned]
-            ),
-            NodeStatus::Abandoned
+            )
+            .0,
+            PhaseDisplayStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn phase_display_persisted_abandoned_beats_a_degraded_derivation() {
+        // (#2406, post-review) The case the test ABOVE does NOT reach: its
+        // `[Complete, Planned]` input derives `Running` (rank 1), so the
+        // ORDINARY rank rule settles it and the `Degraded` tie-break
+        // exception never fires. This input derives `Degraded` (rank 2)
+        // and therefore actually exercises the exception.
+        //
+        // A persisted `Abandoned` is an operator's own `mission abort`.
+        // The exception is narrowly for a persisted `Complete` (the only
+        // terminal a degraded phase is DRIVEN to, and so the only one
+        // that can launder a mix back into a clean word) — ungated, the
+        // abort lost the tie and the phase rendered `degraded`, making
+        // the operator's deliberate stop invisible.
+        assert_eq!(
+            phase_display_status(PhaseStatus::Abandoned, &[NodeStatus::Complete, NodeStatus::Error]).0,
+            PhaseDisplayStatus::Abandoned,
+            "an operator's abort is the authoritative terminal — a mixed rollup never overwrites it"
         );
     }
 
     #[test]
     fn phase_display_persisted_complete_stays_complete() {
         // A finalized phase stays Complete even if a task rollup would tie
-        // or fall lower — persisted terminal wins on a rank tie.
+        // or fall lower — persisted terminal wins on a rank tie (the
+        // ORDINARY tie-break; `Degraded` is the one named exception, see
+        // the next test).
         assert_eq!(
             phase_display_status(
                 PhaseStatus::Complete,
                 &[NodeStatus::Complete, NodeStatus::Complete]
-            ),
-            NodeStatus::Complete
+            )
+            .0,
+            PhaseDisplayStatus::Complete
+        );
+    }
+
+    #[test]
+    fn phase_display_degraded_wins_a_rank_tie_against_persisted_complete() {
+        // (#2406) THE critical tie-break case: once a mission finalizes, a
+        // Degraded phase's PERSISTED lifecycle status is driven to
+        // `Complete` (`PhaseStatus` has no third terminal — see
+        // `crew::envelope::PhaseOutcomeKind`'s own doc). Without the named
+        // exception in `phase_display_status`, this would tie
+        // Degraded(rank 2) against persisted Complete(rank 2), and the
+        // ORDINARY tie-break ("persisted wins ties") would silently
+        // regress the phase back to plain `complete` the moment the
+        // mission finalizes — reintroducing the exact bug this packet
+        // fixes, just moved to a different trigger (page load AFTER
+        // finalize instead of a live SSE record). Degraded must win.
+        assert_eq!(
+            phase_display_status(PhaseStatus::Complete, &[NodeStatus::Complete, NodeStatus::Error]).0,
+            PhaseDisplayStatus::Degraded,
+            "a persisted Complete must never launder a genuinely mixed phase back to plain complete"
+        );
+    }
+
+    #[test]
+    fn phase_display_of_a_single_task_with_mixed_steps_agrees_with_the_envelope() {
+        // (#2406, post-review) The TWIN of
+        // `src/mission_launch.rs::phase_finalization_collapses_a_multi_step_task_before_the_mix_rule`.
+        // Same fixture shape, asserted on the DISPLAY side, so the two
+        // cannot drift apart again without one of them going red.
+        //
+        // A phase holding ONE task whose steps are [Complete, Abandoned] —
+        // what a multi-step task terminalized BETWEEN its steps leaves
+        // behind (`darkmux-crew`'s `cascade_abandon` skips a dependent only
+        // when `task_status(dep) != Planned`, and `[Complete, Planned]`
+        // derives `Planned`, so the leftover step is abandoned rather than
+        // stepped over). NOT the `fail-probe` fixture, which an earlier
+        // version of this comment wrongly cited: `s-fail` runs `exit 3`, so
+        // `t-fail` is `[Error, Abandoned]` and collapses to `Abandoned`
+        // under the old step-grain rule and the new task-grain one alike.
+        // `derive_task_status` collapses it to `Abandoned` —
+        // the completed step was a STAGE of the one unit that did not
+        // land, not an independent deliverable — and the phase rollup then
+        // sees a single abandoned task, NOT a mix. The envelope now says
+        // `Abandoned` for the same input; before the post-review fix it
+        // said `Degraded` and drove disk to `complete`, so one phase wore
+        // three different words.
+        let task = derive_task_status(&[NodeStatus::Complete, NodeStatus::Abandoned]);
+        assert_eq!(task, NodeStatus::Abandoned, "one unit of work, not two independent ones");
+        assert_eq!(
+            phase_display_status(PhaseStatus::Running, &[task]).0,
+            PhaseDisplayStatus::Abandoned,
+            "a single-task phase can never be a phase-level MIX — the mix rule is a level up"
+        );
+
+        // Same shape with an errored step: the task is `Error`, so the
+        // phase is `Error`. The envelope spells that terminal `Abandoned`
+        // (`PhaseOutcomeKind` has no `Error` variant — documented and
+        // unchanged by #2406); that one vocabulary difference is
+        // pre-existing, not a #2406 divergence.
+        let task = derive_task_status(&[NodeStatus::Complete, NodeStatus::Error]);
+        assert_eq!(task, NodeStatus::Error);
+        assert_eq!(
+            phase_display_status(PhaseStatus::Running, &[task]).0,
+            PhaseDisplayStatus::Error
+        );
+
+        // And the collapse does not swallow #2406's fix: two tasks, one
+        // clean and one failed, IS a phase-level mix on both sides.
+        let ok = derive_task_status(&[NodeStatus::Complete, NodeStatus::Complete]);
+        let bad = derive_task_status(&[NodeStatus::Complete, NodeStatus::Error]);
+        assert_eq!(
+            phase_display_status(PhaseStatus::Running, &[ok, bad]).0,
+            PhaseDisplayStatus::Degraded
         );
     }
 
@@ -1901,8 +2355,9 @@ mod tests {
             phase_display_status(
                 PhaseStatus::Planned,
                 &[NodeStatus::Planned, NodeStatus::Planned]
-            ),
-            NodeStatus::Planned
+            )
+            .0,
+            PhaseDisplayStatus::Planned
         );
     }
 
