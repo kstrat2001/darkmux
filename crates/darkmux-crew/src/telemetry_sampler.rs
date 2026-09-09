@@ -96,6 +96,70 @@ pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Va
     out
 }
 
+/// (#1934) Which SEAT loaded `model_id`, relative to THIS dispatch's own
+/// declared staffing — tags each `telemetry.lms` `load`/`unload` payload so
+/// the viewer's `jit-model-swap` detector can tell "the primary changed"
+/// from "the compactor/utility went resident, exactly as staffed."
+///
+/// `"primary"` when `model_id` is the dispatch's own model; `"compactor"` /
+/// `"utility"` when it matches the profile's declared compactor / utility
+/// model id (either may be absent — a short dispatch may run no
+/// compaction, and utility-model resolution can come back empty);
+/// `"resident"` otherwise — a model this dispatch did not declare at all
+/// (a leftover from an earlier session, or the operator's own unrelated
+/// LMStudio use). Checked in that order, so a profile that (unusually)
+/// reuses the SAME model id for two seats still gets one unambiguous
+/// answer rather than a tag that depends on iteration order.
+///
+/// **Every operand is [`crate::dispatch_internal::bare_model_key`]-normalized
+/// before comparison, on BOTH sides.** An earlier revision of this function
+/// compared with a plain `==` and a doc claiming all four ids already arrive
+/// bare. That was false on all three seats, and the bug it produced was
+/// #1934 verbatim:
+///
+/// - **Primary.** Since #2240 `resolve_dispatch_model_internal` returns the
+///   dispatch's WIRE id — `darkmux:<key>`, because the wire now carries the
+///   darkmux IDENTIFIER so a vanished instance fails loudly instead of
+///   JIT-reloading. `lms ps` still reports `modelKey=<key>`, bare. So the
+///   run's own primary classified as `"resident"`, and every mid-run
+///   re-observation of it read as a swap.
+/// - **Compactor / utility.** `internal.utility` explicitly accepts a
+///   namespaced IDENTIFIER where a key belongs (#1615) — this crate's own
+///   regression test fixture is literally `"darkmux:util-4b"`. A namespaced
+///   utility binding tagged its JIT load `"resident"`, which neither the
+///   seat exclusion nor the baseline exclusion catches, so the detector
+///   fired on exactly the correct staffing #1934 exists to stop firing on.
+///
+/// The one case normalization cannot reach is the documented `identifier`
+/// OPT-OUT: an operator who names an arbitrary alias in their profile puts
+/// that alias on the wire, and no rule recovers a model key from it. That
+/// seat falls through to `"resident"` — honest (the seat genuinely cannot be
+/// identified from the record) rather than guessed.
+///
+/// Deliberately NEVER infers a seat from model size or name shape — see
+/// #1934's own finding: *"Never infer utility-vs-specialist from model
+/// size — the 4B/35B split here is a coincidence of this staffing, not a
+/// rule."* The only signal honored is which id THIS dispatch actually
+/// declared for which seat.
+pub fn role_for_load(
+    model_id: &str,
+    primary: &str,
+    compactor: Option<&str>,
+    utility: Option<&str>,
+) -> &'static str {
+    let bare = crate::dispatch_internal::bare_model_key;
+    let key = bare(model_id);
+    if key == bare(primary) {
+        "primary"
+    } else if compactor.is_some_and(|c| bare(c) == key) {
+        "compactor"
+    } else if utility.is_some_and(|u| bare(u) == key) {
+        "utility"
+    } else {
+        "resident"
+    }
+}
+
 /// Parse the integer-GB size out of a `LoadedModel::size` string. The
 /// loaded-model wrapper formats sizes as decimal GB (e.g. `"21.00 GB"`,
 /// `"4.50 GB"`); we take the leading float token and round to the nearest
@@ -437,7 +501,114 @@ mod tests {
         assert!(models.contains("primary") && models.contains("compactor"));
     }
 
+    // (#1934) `role_for_load` — the seat classifier the jit-model-swap fix
+    // keys on. Each case names the seat it proves, since the whole point of
+    // the fix is that a WRONG classification here (e.g. a compactor read as
+    // a swap) reproduces the exact bug #1934 reported.
 
+    #[test]
+    fn role_for_load_tags_the_primary() {
+        assert_eq!(
+            role_for_load("qwen3.6-35b-a3b", "qwen3.6-35b-a3b", Some("qwen3-4b"), None),
+            "primary"
+        );
+    }
+
+    #[test]
+    fn role_for_load_tags_the_compactor_not_a_swap() {
+        // The exact shape of the live #1934 report: primary is one model,
+        // the DEFAULT_COMPACTOR_MODEL another. The compactor's own load
+        // must never read as "primary".
+        assert_eq!(
+            role_for_load("qwen3-4b-instruct-2507", "qwen3.6-35b-a3b-turboquant-mlx", Some("qwen3-4b-instruct-2507"), None),
+            "compactor"
+        );
+    }
+
+    #[test]
+    fn role_for_load_tags_the_utility_model() {
+        assert_eq!(role_for_load("util-4b", "primary-35b", None, Some("util-4b")), "utility");
+    }
+
+    #[test]
+    fn role_for_load_tags_an_unstaffed_resident() {
+        // Not the primary, not the compactor, not the utility model — a
+        // model this dispatch never declared (a leftover from an earlier
+        // session, or the operator's own unrelated LMStudio use).
+        assert_eq!(
+            role_for_load("leftover-from-earlier-session", "primary-35b", Some("compactor-4b"), Some("util-4b")),
+            "resident"
+        );
+    }
+
+    #[test]
+    fn role_for_load_resolves_a_shared_id_to_primary_first() {
+        // An unusual profile that reuses the SAME model id for two seats
+        // still gets one unambiguous answer — primary wins over compactor
+        // and utility, checked in that fixed order, rather than depending
+        // on which branch happens to run first.
+        assert_eq!(role_for_load("shared", "shared", Some("shared"), Some("shared")), "primary");
+    }
+
+    #[test]
+    fn role_for_load_never_infers_from_size_or_name_shape() {
+        // #1934's own finding: "the 4B/35B split here is a coincidence of
+        // this staffing, not a rule." A model whose NAME looks like a small
+        // utility model, but was never declared as one, is still "resident"
+        // — the classifier reads the declared ids, never the string shape.
+        assert_eq!(role_for_load("qwen3-4b-lookalike", "primary-35b", None, None), "resident");
+    }
+
+    // (#1934, review round 2) The NAMESPACE half, one case per seat. `lms ps`
+    // reports `modelKey` bare; the ids this dispatch declares can each arrive
+    // carrying `darkmux:` — the primary ALWAYS does since #2240 (the wire id
+    // is the darkmux identifier), and the compactor/utility can because
+    // `internal.utility` accepts either spelling (#1615). A plain `==` here
+    // reproduced #1934 verbatim for those configurations, so each seat gets
+    // its own case rather than one combined smoke.
+
+    #[test]
+    fn role_for_load_matches_a_namespaced_primary_against_a_bare_lms_key() {
+        // The #2240 shape: `resolve_dispatch_model_internal` hands the sampler
+        // `darkmux:<key>` (the wire id), while the load being classified came
+        // from `lms ps`'s bare `modelKey`. Without normalization this returned
+        // "resident" — the run's own primary, unrecognized.
+        assert_eq!(
+            role_for_load("qwen3.6-35b-a3b", "darkmux:qwen3.6-35b-a3b", Some("qwen3-4b"), None),
+            "primary"
+        );
+    }
+
+    #[test]
+    fn role_for_load_matches_a_namespaced_compactor_against_a_bare_lms_key() {
+        assert_eq!(
+            role_for_load("qwen3-4b-instruct-2507", "primary-35b", Some("darkmux:qwen3-4b-instruct-2507"), None),
+            "compactor"
+        );
+    }
+
+    #[test]
+    fn role_for_load_matches_a_namespaced_utility_against_a_bare_lms_key() {
+        // `internal.utility` accepts a namespaced IDENTIFIER where a model KEY
+        // belongs — the regression this crate already documents in
+        // `dispatch_internal_tests.rs`, arriving here through a second door.
+        assert_eq!(
+            role_for_load("qwen3-4b-instruct-2507", "primary-35b", None, Some("darkmux:qwen3-4b-instruct-2507")),
+            "utility"
+        );
+    }
+
+    #[test]
+    fn role_for_load_matches_a_namespaced_load_against_bare_declarations() {
+        // The mirror direction: a LOAD observed under the namespaced spelling
+        // (a caller reading `identifier` rather than `modelKey`) against
+        // declarations that are bare. Normalizing only one side would leave
+        // this half broken.
+        assert_eq!(
+            role_for_load("darkmux:util-4b", "primary-35b", None, Some("util-4b")),
+            "utility"
+        );
+    }
 
     #[test]
     fn mem_percent_from_vm_stat_computes_pressure() {

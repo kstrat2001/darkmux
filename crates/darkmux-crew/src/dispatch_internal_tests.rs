@@ -9168,6 +9168,174 @@ fn bare_model_key_strips_only_the_namespace() {
     assert_eq!(super::bare_model_key(once), once);
 }
 
+// ── (#1934) `tag_lms_role` — the `telemetry.lms` payload stamper ────────
+
+/// A load payload gets both `role` (delegated to `role_for_load`, already
+/// unit-tested on its own in `telemetry_sampler.rs`) and, when the caller
+/// says so, `baseline: true` — the field the viewer's jit-model-swap
+/// detector reads to tell "the starting lineup" from "something that
+/// happened during this attempt".
+#[test]
+fn tag_lms_role_stamps_role_and_baseline_on_a_load() {
+    let payload = serde_json::json!({"event": "load", "model": "primary-35b", "gb": 20});
+    let tagged = super::tag_lms_role(payload, "primary-35b", Some("compactor-4b"), None, true);
+    assert_eq!(tagged["role"], "primary");
+    assert_eq!(tagged["baseline"], true);
+}
+
+/// `baseline` is OMITTED (never written as `false`) when the caller says
+/// this load wasn't the seed — so a reader can treat mere PRESENCE of the
+/// field as "was this the seed" without also handling an explicit `false`.
+#[test]
+fn tag_lms_role_omits_baseline_when_not_the_seed() {
+    let payload = serde_json::json!({"event": "load", "model": "compactor-4b", "gb": 2});
+    let tagged = super::tag_lms_role(payload, "primary-35b", Some("compactor-4b"), None, false);
+    assert_eq!(tagged["role"], "compactor");
+    assert!(tagged.get("baseline").is_none(), "baseline must be ABSENT, not `false`: {tagged:?}");
+}
+
+/// An unload gets the SAME role classification as its matching load did —
+/// the seat a model was evicted FROM is exactly as meaningful as the seat
+/// it was loaded INTO.
+#[test]
+fn tag_lms_role_tags_an_unload_by_the_same_rule_as_a_load() {
+    let payload = serde_json::json!({"event": "unload", "model": "utility-4b"});
+    let tagged = super::tag_lms_role(payload, "primary-35b", None, Some("utility-4b"), false);
+    assert_eq!(tagged["role"], "utility");
+}
+
+// ── (#1934, review round 2) `LmsTelemetryTracker` — the PRODUCER seam ────
+//
+// The tests above pin the pure stamper. They do NOT pin that the sampler
+// CALLS it, that `baseline` is confined to the seed tick, or that the seed
+// branch is one-shot — and two mutations proved that gap was real, each
+// building clean and leaving the whole crate green: stamping
+// `baseline: true` on every tick (which permanently silences the viewer's
+// detector — no specialist load can ever fire again), and deleting the
+// `tag_lms_role` calls outright (reverting the producer half of #1934).
+// These drive the tracker across a seed tick and a later tick with both
+// effects injected, and assert the emitted payload SEQUENCE.
+
+/// A capturing `emit` sink plus a scripted `list_loaded`: drive `tick` once
+/// per snapshot in `ticks` and return every payload emitted, in order.
+fn drive_lms_tracker(
+    primary: &str,
+    compactor: Option<&str>,
+    utility: Option<&str>,
+    ticks: Vec<Vec<darkmux_types::LoadedModel>>,
+) -> Vec<serde_json::Value> {
+    use std::cell::RefCell;
+    let emitted: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
+    let mut tracker = super::LmsTelemetryTracker::new(
+        primary.to_string(),
+        compactor.map(str::to_string),
+        utility.map(str::to_string),
+    );
+    for snapshot in ticks {
+        let snapshot = RefCell::new(Some(snapshot));
+        tracker.tick(
+            &|| Ok(snapshot.borrow_mut().take().expect("list_loaded called twice in one tick")),
+            &|p| emitted.borrow_mut().push(p),
+        );
+    }
+    emitted.into_inner()
+}
+
+fn loaded(model: &str, gb: &str) -> darkmux_types::LoadedModel {
+    darkmux_types::LoadedModel {
+        identifier: format!("darkmux:{model}"),
+        model: model.to_string(),
+        status: "loaded".to_string(),
+        size: format!("{gb} GB"),
+        context: 65536,
+    }
+}
+
+/// The seed tick emits every already-resident model as a `load`, each tagged
+/// with its seat AND with `baseline: true` — the starting lineup.
+#[test]
+fn lms_tracker_seed_tick_tags_every_resident_as_a_baseline_load() {
+    let emitted = drive_lms_tracker(
+        "darkmux:primary-35b",
+        Some("compactor-4b"),
+        None,
+        vec![vec![loaded("primary-35b", "20.00"), loaded("compactor-4b", "2.00")]],
+    );
+    assert_eq!(emitted.len(), 2, "one payload per resident model: {emitted:?}");
+    let by_model = |m: &str| emitted.iter().find(|p| p["model"] == m).unwrap_or_else(|| panic!("no payload for {m}: {emitted:?}"));
+    // The namespaced primary (the #2240 wire id) must still classify as the
+    // primary against `lms ps`'s bare `modelKey`.
+    assert_eq!(by_model("primary-35b")["role"], "primary");
+    assert_eq!(by_model("primary-35b")["baseline"], true);
+    assert_eq!(by_model("compactor-4b")["role"], "compactor");
+    assert_eq!(by_model("compactor-4b")["baseline"], true);
+}
+
+/// The seed branch is ONE-SHOT. A model that goes resident on a LATER tick is
+/// emitted WITHOUT `baseline` — which is the whole load-bearing distinction
+/// the viewer's detector reads. (Mutation: stamping `baseline: true` on every
+/// tick reds here, and only here.)
+#[test]
+fn lms_tracker_later_loads_are_not_baseline() {
+    let emitted = drive_lms_tracker(
+        "primary-35b",
+        None,
+        None,
+        vec![
+            vec![loaded("primary-35b", "20.00")],
+            vec![loaded("primary-35b", "20.00"), loaded("other-specialist-14b", "14.00")],
+        ],
+    );
+    assert_eq!(emitted.len(), 2, "seed load + one later load: {emitted:?}");
+    assert_eq!(emitted[0]["model"], "primary-35b");
+    assert_eq!(emitted[0]["baseline"], true);
+    assert_eq!(emitted[1]["model"], "other-specialist-14b");
+    assert_eq!(emitted[1]["role"], "resident");
+    assert!(
+        emitted[1].get("baseline").is_none(),
+        "a load after the seed tick must carry NO baseline: {emitted:?}"
+    );
+}
+
+/// An unload emitted on a later tick carries the seat it was evicted FROM.
+/// (Mutation: deleting the `tag_lms_role` call reds here — the payload keeps
+/// its `event`/`model` and loses `role`.)
+#[test]
+fn lms_tracker_tags_an_unload_with_its_seat() {
+    let emitted = drive_lms_tracker(
+        "primary-35b",
+        Some("compactor-4b"),
+        None,
+        vec![
+            vec![loaded("primary-35b", "20.00"), loaded("compactor-4b", "2.00")],
+            vec![loaded("primary-35b", "20.00")],
+        ],
+    );
+    assert_eq!(emitted.len(), 3, "two seed loads + one unload: {emitted:?}");
+    let unload = emitted.iter().find(|p| p["event"] == "unload").unwrap_or_else(|| panic!("no unload: {emitted:?}"));
+    assert_eq!(unload["model"], "compactor-4b");
+    assert_eq!(unload["role"], "compactor");
+    assert!(unload.get("baseline").is_none(), "an unload is never the baseline: {unload:?}");
+}
+
+/// A FAILED probe emits nothing and leaves `prev` intact — so a transient
+/// `lms` hiccup can't be read as "everything unloaded, then everything
+/// reloaded". It also must not consume the one-shot seed: the next
+/// successful probe is still the baseline tick.
+#[test]
+fn lms_tracker_skips_a_failed_probe_without_consuming_the_seed() {
+    use std::cell::RefCell;
+    let emitted: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
+    let mut tracker = super::LmsTelemetryTracker::new("primary-35b".to_string(), None, None);
+    tracker.tick(&|| anyhow::bail!("lms ps timed out"), &|p| emitted.borrow_mut().push(p));
+    assert!(emitted.borrow().is_empty(), "a failed probe emits nothing: {:?}", emitted.borrow());
+    let snapshot = RefCell::new(Some(vec![loaded("primary-35b", "20.00")]));
+    tracker.tick(&|| Ok(snapshot.borrow_mut().take().unwrap()), &|p| emitted.borrow_mut().push(p));
+    let out = emitted.into_inner();
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0]["baseline"], true, "the first SUCCESSFUL probe is still the seed tick: {out:?}");
+}
+
 /// The regression. `internal.utility` accepts a namespaced IDENTIFIER
 /// (`darkmux:qwen3-4b-instruct-2507`) where a model KEY belongs, and `lms ps`
 /// reports the resident as `modelKey=qwen3-4b-instruct-2507`. Comparing the

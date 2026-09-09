@@ -3075,7 +3075,16 @@ mod tests {
         //           relation is provider-scoped. See `schema.rs`'s own
         //           history entry for the full explanation and the
         //           recorded evidence.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.44.0");
+        //   1.45.0: additive `role`/`baseline` payload keys on every
+        //           `telemetry.lms` load/unload (#1934) — which SEAT a
+        //           loaded model serves, and whether the load was the
+        //           sampler's first tick. A minor bump, not a
+        //           "payload-additive means no bump": the viewer's
+        //           jit-model-swap detector READS a different shape when
+        //           the keys are present, so a fleet mixing tagged and
+        //           untagged emitters is a real divergence and must show
+        //           as skew. See `schema.rs`'s own history entry.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.45.0");
     }
 
     #[test]
