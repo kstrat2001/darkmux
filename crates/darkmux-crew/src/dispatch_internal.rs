@@ -3373,6 +3373,30 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     // check above already ruled out the one case `dispatch()` would force
     // through the container for a remote target.
     if let Some((remote_role, system_prompt, pm)) = try_resolve_remote_target(&opts)? {
+        // (#2580 follow-up, same class as `dispatch()`'s own guard a few
+        // hundred lines below) `dispatch_remote` never reads `resume_from`
+        // — no checkpoint, no container, nothing to resume INTO. This
+        // container-free primitive is `dispatch_routed_via`'s
+        // substitutable `local_dispatch` seam (see this function's own
+        // doc), not just radio's private helper, so a future caller that
+        // passes `resume_from` through unexamined would hit the exact
+        // #2561 bypass this refuses before `dispatch_remote` is ever
+        // called: no HTTP request, no `dispatch.start` record, no tokens
+        // spent.
+        if opts.resume_from.is_some() {
+            bail!(
+                "darkmux dispatch: --resume-from is not supported on the \
+                 remote single-shot dispatch path (role `{}` resolved to a \
+                 bare hosted chat-completions call via the container-free \
+                 single-shot primitive — no Docker, no container, no \
+                 checkpoint). darkmux never silently starts a dispatch \
+                 fresh under a name that looked like a resume: resume \
+                 needs the container path (the ordinary `dispatch()` entry \
+                 point with a tool-granting role) — or drop --resume-from \
+                 to start this role fresh on purpose.",
+                opts.role_id
+            );
+        }
         return dispatch_remote(&opts, &remote_role, &system_prompt, &pm);
     }
 
@@ -4164,6 +4188,36 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         if container_path_required(&role, opts.force_container) {
             agentic_pm = Some(pm);
         } else {
+            // (#2561) `dispatch_remote` never reads `resume_from` — it has
+            // no checkpoint, no container, nothing to resume INTO. Before
+            // #2561 this fell straight through to the HTTP call below,
+            // silently starting a fresh single-shot dispatch (real token
+            // spend, success exit) under a flag that looked like it would
+            // resume. Refuse HERE, before `dispatch_remote` is even
+            // called — no HTTP request goes out, no `dispatch.start`
+            // record is emitted, no tokens spend. This is the same
+            // promise `validate_resume_checkpoint` states for the container
+            // path ("darkmux never silently starts a dispatch fresh under
+            // a name that looked like a resume"); this is what makes it
+            // true here too. Supporting resume on this path is a design
+            // question, not a bug fix — the checkpoint records a
+            // CONTAINER workspace, and this path has none — so it is
+            // deliberately NOT built; the fix is refusal.
+            if opts.resume_from.is_some() {
+                bail!(
+                    "darkmux dispatch: --resume-from is not supported on the \
+                     remote single-shot dispatch path (role `{}` grants no \
+                     tools, so this dispatch resolved to a bare hosted \
+                     chat-completions call — no Docker, no container, no \
+                     checkpoint). darkmux never silently starts a dispatch \
+                     fresh under a name that looked like a resume: resume \
+                     needs the container path, which a tool-granting role \
+                     (e.g. a coder or reviewer role with a non-empty \
+                     tool_palette) resolves to — or drop --resume-from to \
+                     start this role fresh on purpose.",
+                    opts.role_id
+                );
+            }
             return dispatch_remote(&opts, &role, &system_prompt, &pm);
         }
     }
