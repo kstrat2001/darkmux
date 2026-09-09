@@ -3,6 +3,14 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { useDay } from "./useDay";
+import { normalizeRecords } from "../lib/flow";
+
+// (#2377) Spy on the real implementation so other tests in this file keep
+// their actual behavior; only the call count is observed.
+vi.mock("../lib/flow", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/flow")>();
+  return { ...actual, normalizeRecords: vi.fn(actual.normalizeRecords) };
+});
 
 function wrapper() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
@@ -90,5 +98,29 @@ describe("useDay", () => {
     const runtime = (rs: { source?: string }[] | null) => (rs ?? []).filter((r) => r.source === "runtime").length;
     expect(runtime(result.current.raw)).toBe(0);
     expect(runtime(result.current.records)).toBe(1);
+  });
+
+  it("does not re-normalize or return a new `records` array on a render the day did not change (#2377)", async () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    injectMeta("darkmux-flow-date", "2026-08-26");
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response('{"ts":"2026-08-26T01:00:00Z","action":"dispatch.start","session_id":"s1"}\n', { status: 200 }))));
+
+    const { result, rerender } = renderHook(() => useDay(null), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    const callsAfterLoad = vi.mocked(normalizeRecords).mock.calls.length;
+    const recordsAfterLoad = result.current.records;
+    expect(callsAfterLoad).toBeGreaterThan(0);
+
+    // Three unrelated re-renders — nothing about the requested day changed.
+    // `getSource()` returns a fresh object literal each call (by design —
+    // see lib/source.ts), so a memo that depends on that object recomputes
+    // on every one of these instead of only when the day changes.
+    rerender();
+    rerender();
+    rerender();
+
+    expect(vi.mocked(normalizeRecords).mock.calls.length).toBe(callsAfterLoad);
+    expect(result.current.records).toBe(recordsAfterLoad);
   });
 });
