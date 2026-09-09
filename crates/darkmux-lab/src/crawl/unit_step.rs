@@ -1907,8 +1907,27 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
     // below — a unit the thermal breaker skipped before it ever dispatched
     // did not "genuinely break" and must not read as one.
     let units_skipped = count(THERMAL_STOP);
-    let units_errored =
-        rows.len() - units_completed - units_budget_exhausted - units_interrupted - units_skipped;
+    // (#2573) `errored_row` names a still-`Planned`/`Running` step's row
+    // `"not_run"` — a grown step that never got the chance to succeed or
+    // fail. Counted here in its OWN bucket, subtracted out of
+    // `units_errored` below, for the same reason `units_skipped` is: a unit
+    // that never ran did not "genuinely break" and must not read as one.
+    let units_not_run_named = count("not_run");
+    let units_errored = rows.len()
+        - units_completed
+        - units_budget_exhausted
+        - units_interrupted
+        - units_skipped
+        - units_not_run_named;
+    // (#2573) The two sets that make up "never ran" are disjoint by
+    // construction, so summing them cannot double-count: `units_not_run_named`
+    // is a unit that WAS grown into a step (it has a row) but never settled;
+    // `units_in_plan.saturating_sub(rows.len())` is a unit that was never
+    // even grown into a step at all (it has no row to name it anything).
+    // Before this fix, only the second half was counted here — the first
+    // half's row existed but was silently absorbed into the `units_errored`
+    // leftover instead, which is the bug this issue is about.
+    let units_not_run = units_not_run_named + units_in_plan.saturating_sub(rows.len());
 
     Ok(CrawlSummary {
         schema_version: CRAWL_SUMMARY_SCHEMA_VERSION.to_string(),
@@ -1916,7 +1935,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         workspace,
         units_in_plan,
         units_selected: units_in_plan,
-        units_not_run: units_in_plan.saturating_sub(rows.len()),
+        units_not_run,
         units_completed,
         units_errored,
         units_interrupted,
@@ -1938,7 +1957,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         // `stopped_by != "error"` as "nothing errored" — `units_errored` is
         // the field that answers THAT, and it stays exact.
         //
-        // (#2569) `"interrupted"` is named SECOND, ahead of `"error"` for
+        // (#2569) `"interrupted"` was named SECOND, ahead of `"error"` for
         // the identical reason `"thermal"` is named first: a unit the
         // operator abandoned (`mission abort`, or a SIGINT that lands the
         // in-flight step at `Abandoned`) is also a thing that ENDED the
@@ -1954,26 +1973,46 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         // whatever merely happened along the way" precedent #2454 set,
         // applied to a second cause.
         //
-        // Two of `CrawlSummary`'s other terminal-state counters are
+        // (#2573) `"not_run"` is named THIRD — ahead of `"error"`, same as
+        // `"interrupted"`, but now also ahead of `"interrupted"` itself.
+        // The mechanism (see `errored_row`) is a unit whose step never
+        // settled: still `Planned`/`Running` at summary time, because the
+        // mission that was growing/dispatching it died before either the
+        // scheduler finished with it OR the phase-abandon reconciliation
+        // that turns an in-flight step into `Abandoned` (`"interrupted"`)
+        // ever ran on it — a crash, a `kill -9`, or a race the mission lost
+        // against its own reconciliation. That is a DIFFERENT thing ending
+        // the run than a clean interrupt: an interrupt is the system
+        // successfully recording "the operator stopped this on purpose";
+        // a not-run unit is the system failing to record ANYTHING for it,
+        // which means whatever `"interrupted"`/`"thermal"` rows exist
+        // alongside it are only a PARTIAL account of why the run is short —
+        // the reconciliation that would have explained the rest never
+        // finished. So when both fire together, `"not_run"` is the more
+        // honest headline: it says the run's own bookkeeping is
+        // incomplete, not just that the operator meant to stop it. Ranked
+        // BEHIND `"thermal"`, not ahead of it, for the same reason
+        // `"interrupted"` is: the breaker is an attributed, self-recording
+        // cause the same way an interrupt is, and if it already fired, the
+        // hardware constraint is still the more useful thing to surface —
+        // a not-run tail after a thermal stop is the breaker's aftermath,
+        // not a separate story. `units_errored` and `units_interrupted`
+        // both stay exact regardless of which name `stopped_by` carries;
+        // this is a precedence choice about the label, never a change to
+        // the counts.
+        //
+        // One of `CrawlSummary`'s other terminal-state counters is
         // deliberately NOT consulted here, and that is not an oversight:
-        // `units_not_run` is left out, but NOT for the reason an earlier
-        // version of this comment gave — deselection (`--param units=`/
-        // `limit=`) doesn't exist any more (`select_units` and
-        // `src/crawl_launch.rs` were both deleted in #2301/#2313, and
-        // `crawl.json` declares no `units`/`limit` input), so #2274,
-        // which blamed this exclusion on deselected units getting folded
-        // in, was closed as stale. With deselection gone, `units_not_run`
-        // today counts only units that genuinely never got a row. It is
-        // still not consulted here, on purpose: giving `stopped_by` a
-        // branch for it is #2573's job, deliberately not folded into
-        // this fix. `units_budget_exhausted` is a PER-UNIT outcome (one
-        // unit ran out of its own turn/token budget); it does not halt the
-        // crawl — the next unit still runs — so it answers a different
-        // question than "why is the RUN shorter than planned".
+        // `units_budget_exhausted` is a PER-UNIT outcome (one unit ran out
+        // of its own turn/token budget); it does not halt the crawl — the
+        // next unit still runs — so it answers a different question than
+        // "why is the RUN shorter than planned".
         // `tests::every_terminal_state_counter_on_the_summary_is_
         // accounted_for_in_stopped_by` pins this enumeration structurally.
         stopped_by: if units_skipped > 0 {
             "thermal".into()
+        } else if units_not_run > 0 {
+            "not_run".into()
         } else if units_interrupted > 0 {
             "interrupted".into()
         } else if units_errored > 0 {

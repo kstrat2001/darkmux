@@ -1156,6 +1156,25 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.45.0";
 //           run the operator deliberately stopped, with no thermal event
 //           and no genuine error, read as `"done"` — a clean finish. Same
 //           VALUE-RANGE correction as #2454: no wire shape changed.
+//
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2573: `stopped_by`
+//           gains `"not_run"`. Unlike `"thermal"` (#2454) and
+//           `"interrupted"` (#2569), this one is NOT a restoration — the
+//           retired literal launcher's sequential loop and #2124's polled
+//           SIGTERM/SIGHUP both needed a live process to notice a signal
+//           and record a reason, so neither ever wrote a value for the one
+//           case where the process itself stops existing (a crash, a
+//           `kill -9`, or a race the mission loses against its own
+//           `Abandoned`-reconciliation) before recording anything at all.
+//           `errored_row` already named a still-`Planned`/`Running` step's
+//           row `"not_run"` for exactly that case; `stopped_by` simply
+//           never consulted `units_not_run` to say so at the run level, so
+//           a truncated run fell through to whatever the leftover
+//           `units_errored` bucket happened to compute (see #2573's own
+//           issue for the measured shape). Same VALUE-RANGE correction as
+//           #2454/#2569: `stopped_by` stays a plain `String`, no wire
+//           shape changed, still true that nothing in the viewer switches
+//           on its value today.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
