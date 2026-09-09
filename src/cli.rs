@@ -712,11 +712,17 @@ pub(crate) enum MissionCmd {
     /// ships the git work by hand (commit/push/PR/merge), then `mission
     /// finalize` closes it out; `mission abort` tears it down (#1463). Launch
     /// never auto-closes past the gate. `review` (#1284 Packet 4b — the
-    /// retired `pr-review run`) is dispatched through its OWN dedicated
-    /// launcher instead: bundle → probe → dedup → judge → verify →
-    /// synthesis, with no operator sign-off gate — its mission/phase
-    /// envelope finalizes generically once the run completes, and the old
-    /// CLI flags map one-to-one onto `--param key=value` (see
+    /// retired `pr-review run`) runs through this SAME generic launcher,
+    /// not a launcher of its own — #2310 P4d deleted the bespoke launcher
+    /// and its ten Tier-3 `review.*` step kinds. A `plan-<rule>` task
+    /// mints one `plan.sites` task per enabled rule; a `unit-<rule>` task
+    /// GROWS one `crawl.unit` dispatch per planned site onto a single
+    /// `reviewer` seat; `summarize` totals the run; `create-mods` waits
+    /// (bounded) for a frontier-written mod per finding; `deliver` renders
+    /// the GitHub review payload. No operator sign-off gate — its
+    /// mission/phase envelope finalizes generically once the run
+    /// completes, and the old CLI flags map one-to-one onto
+    /// `--param key=value` (see
     /// `templates/builtin/mission-configs/review.json`'s own `inputs` doc
     /// for the mapping table). The run id is ALWAYS minted fresh — never
     /// derived from config+inputs (#1503): two launches of the same config
@@ -756,13 +762,16 @@ pub(crate) enum MissionCmd {
         #[arg(long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
         /// Per-dispatch timeout (seconds), for a config whose graph
-        /// executes a dispatch. The default when omitted is PER CONFIG:
-        /// coder-phase (and gate-less generic graphs) default 600;
-        /// `review` defaults 3600 — the retired `pr-review run`'s own
-        /// per-call default, preserved so a long judge pass doesn't newly
-        /// time out (#1284 Packet 4b review gate, must-fix 1); `crawl`
-        /// defaults 600 (per-unit dispatch timeout — the same 600s every
-        /// other config-less-graph default uses).
+        /// executes a dispatch. The default when omitted is `600` for
+        /// every config — coder-phase, `crawl` (per-unit dispatch
+        /// timeout), and `review` alike. `review` no longer gets its own
+        /// 3600s default: before the funnel deletion (#2310 P4d) the
+        /// retired `pr-review run`'s dedicated launcher resolved `None` ->
+        /// 3600 so a long judge pass wouldn't time out (#1284 Packet 4b
+        /// review gate, must-fix 1); `review` now runs the same generic
+        /// path as every other config and gets the same 600s default. A
+        /// review whose seats need longer than that should pass
+        /// `--timeout` explicitly.
         #[arg(long)]
         timeout: Option<u32>,
         /// (#1959) Resolve config + inputs, mint NOTHING, emit NO flow
@@ -770,13 +779,12 @@ pub(crate) enum MissionCmd {
         /// (#2301) `crawl` prints its task/step graph like any other
         /// config — including which rule tracks `--param rules=` left out;
         /// the retired launcher's in-process plan table and
-        /// `--param plan_out=` are gone with it. `review`
-        /// prints resolved inputs and, when the source is a local
-        /// worktree, the bundle count (a GitHub source says the count
-        /// isn't computed in dry-run — that would cost a network fetch
-        /// per changed file); every other config prints its task/step
-        /// graph after the same input validation a real launch runs, so
-        /// a missing required input still bails exactly as it would
+        /// `--param plan_out=` are gone with it. `review` (#2310 P4d)
+        /// prints the same way — resolved inputs, then its task/step
+        /// graph — with no bundle-count special case of its own any more:
+        /// every config, `review` included, prints its task/step graph
+        /// after the same input validation a real launch runs, so a
+        /// missing required input still bails exactly as it would
         /// without `--dry-run`.
         #[arg(long = "dry-run")]
         dry_run: bool,
