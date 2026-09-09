@@ -1,5 +1,35 @@
 //! Load workload manifests by id from any of several known locations.
 //! Search order: user dir → on-disk built-in template dirs → binary-embedded built-ins.
+//!
+//! **(#2553) The on-disk tier is NOT cwd-sensitive.** It used to
+//! unconditionally search `<shell's cwd>/templates/builtin/workloads/` ahead
+//! of the embedded tier, unscoped by anything the operator declared — the
+//! sibling of #2432's mission-config fix, left unfixed there deliberately
+//! and closed here. `darkmux lab run <id>` picked a different document
+//! depending on which of an operator's several worktrees the shell happened
+//! to be standing in, and — worse than the mission-config case — there was
+//! no way to even TELL: `WorkloadSource` folded on-disk and embedded into a
+//! single `Builtin` variant, so a workload resolving from cwd was
+//! indistinguishable from the binary-embedded one. Closing #2553 is
+//! therefore two changes: this file drops the cwd search (see
+//! `builtin_dirs`), and `WorkloadSource` (`workloads::types`) now has
+//! distinct `OnDisk`/`Embedded` variants so a resolution can actually be
+//! reported — `lab::run::lab_run`'s per-run banner names the tier that won,
+//! same as `mission launch`'s banner does for mission configs. The
+//! sanctioned explicit path is unaffected: `DARKMUX_TEMPLATES_DIR` (or
+//! `config.dirs.templates`) already sits at the TOP of `builtin_dirs` via
+//! `darkmux_types::config_access::templates_override_dirs`, so "run this
+//! checkout's templates" is one env var away, deliberately, rather than an
+//! accident of `pwd`.
+//!
+//! **This is the on-disk (`builtin_dirs`) tier only — it does NOT make the
+//! USER tier above it cwd-insensitive too.** `lab::run::lab_run` resolves
+//! that tier via `paths::resolve(ResolveScope::Auto)`, which still returns
+//! `<cwd>/.darkmux` when the shell happens to be standing inside a directory
+//! that has one, so a workload can still resolve differently by cwd through
+//! that tier. `mission_config::load` avoids this on its own user tier via
+//! `ResolveScope::ForceUser` (#1012); doing the same here is tracked
+//! separately as #2590, deliberately out of scope for this fix.
 
 use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource};
 use anyhow::{Context, Result, anyhow, bail};
@@ -68,14 +98,37 @@ fn find_embedded(id: &str) -> Option<&'static str> {
 
 /// Built-in template directories, in priority order. Override candidates come
 /// from `env(DARKMUX_TEMPLATES_DIR)` then `config.dirs.templates` (#661 Slice 3),
-/// prepended ahead of cwd/home/system.
+/// prepended ahead of home/system.
+///
+/// **(#2553) This ON-DISK tier is deliberately NOT cwd-sensitive.** An
+/// earlier version of this function also pushed
+/// `<cwd>/templates/builtin/workloads`, so the document that won depended on
+/// which directory the shell happened to be in when `darkmux` ran —
+/// invisible to an operator who didn't already know to suspect it, and
+/// dangerous specifically when the cwd's document shares the binary's schema
+/// but has DIFFERENT content (a stale or half-edited worktree), because that
+/// case parses cleanly with no error to catch it. Same reasoning as
+/// `mission_config::load::builtin_dirs` (#2432). The explicit
+/// `templates_override_dirs()` tier above already gives an operator who
+/// wants "this checkout's templates" exactly that, on purpose:
+/// `DARKMUX_TEMPLATES_DIR=$PWD/templates/builtin`.
+///
+/// **This does NOT make workload resolution as a whole cwd-insensitive —
+/// only this one tier.** The USER tier (searched by [`load`] before this
+/// function ever runs) still comes from `lab::run::lab_run`'s
+/// `paths::resolve(ResolveScope::Auto)`, which resolves to `<cwd>/.darkmux`
+/// whenever that directory exists — so a `./.darkmux/workloads/<id>.json`
+/// sitting in the shell's cwd still wins over every tier this function
+/// searches, same as it always did. `mission_config::load` closed that same
+/// gap on its own user tier by resolving through `ResolveScope::ForceUser`
+/// instead (#1012, `crate::loader::mission_configs_dir`); `lab_run`'s user
+/// tier was deliberately left on `Auto` here and stays cwd-sensitive by
+/// design, tracked separately as #2590.
 fn builtin_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for base in darkmux_types::config_access::templates_override_dirs() {
         dirs.push(base.join("workloads"));
     }
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    dirs.push(cwd.join("templates").join("builtin").join("workloads"));
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(".darkmux").join("templates").join("builtin").join("workloads"));
     }
@@ -92,7 +145,7 @@ pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> 
     }
     for d in builtin_dirs() {
         if let Some(p) = find_in_dir(&d, id) {
-            return parse(&p, WorkloadSource::Builtin);
+            return parse(&p, WorkloadSource::OnDisk);
         }
     }
     if let Some(json) = find_embedded(id) {
@@ -208,7 +261,7 @@ fn parse_str(raw: &str, id: &str) -> Result<LoadedWorkload> {
         manifest,
         manifest_path: base.join("workload.json"),
         base_dir: base,
-        source: WorkloadSource::Builtin,
+        source: WorkloadSource::Embedded,
     })
 }
 
@@ -226,6 +279,62 @@ mod tests {
         format!(
             r#"{{"workload":{{"id":"{id}","provider":"prompt","prompt":"hello world"}}}}"#
         )
+    }
+
+    /// RAII guard that changes the process cwd for the test's duration and
+    /// restores it on drop — mirrors `mission_config::load`'s test-only
+    /// `CwdGuard` (#2432). Every caller MUST be `#[serial_test::serial]` —
+    /// cwd is a process-global resource, and `serial_test` only coordinates
+    /// among ANNOTATED tests, not any unannotated test elsewhere in this
+    /// crate that happens to read/write cwd too. RAII (not manual
+    /// set/restore) matters here specifically because these tests assert on
+    /// the fix under test: an assertion panic mid-test must still restore
+    /// cwd, or a red-proof run (which is EXPECTED to panic when the fix is
+    /// reverted) leaks the temp cwd into every test that runs after it in
+    /// the same `cargo test` process.
+    struct CwdGuard {
+        prev: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(dir: &Path) -> Self {
+            let prev = env::current_dir().unwrap();
+            env::set_current_dir(dir).unwrap();
+            Self { prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.prev);
+        }
+    }
+
+    /// RAII guard for a single process env var: sets it for the test's
+    /// duration and restores the PRIOR value (or removes it) on drop, for
+    /// the same red-proof-must-still-clean-up reason as `CwdGuard`.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = env::var_os(key);
+            unsafe { env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => env::set_var(self.key, v),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
     }
 
     #[test]
@@ -369,8 +478,8 @@ mod tests {
         assert_eq!(loaded.manifest.workload.id, "hello");
         assert_eq!(loaded.manifest.workload.provider, "prompt");
         assert_eq!(loaded.manifest.workload.prompt.as_deref(), Some("hi"));
-        // Source is Builtin and the sentinel base_dir is the literal `<embedded>/<id>` form
-        assert_eq!(loaded.source, WorkloadSource::Builtin);
+        // Source is Embedded and the sentinel base_dir is the literal `<embedded>/<id>` form
+        assert_eq!(loaded.source, WorkloadSource::Embedded);
         assert_eq!(loaded.base_dir, PathBuf::from("<embedded>/hello"));
     }
 
@@ -489,7 +598,7 @@ mod tests {
         env::set_current_dir(prev).unwrap();
         let loaded = result.expect("quick-q should load from the embedded const");
         assert_eq!(loaded.manifest.workload.id, "quick-q");
-        assert_eq!(loaded.source, WorkloadSource::Builtin);
+        assert_eq!(loaded.source, WorkloadSource::Embedded);
     }
 
     /// (#1530) The ONBOARDING workload specifically — `skills/darkmux-lab-run`
@@ -515,12 +624,123 @@ mod tests {
              on a machine with no source checkout",
         );
         assert_eq!(loaded.manifest.workload.id, "demo-quickstart");
-        assert_eq!(loaded.source, WorkloadSource::Builtin);
+        assert_eq!(loaded.source, WorkloadSource::Embedded);
         // It binds the built-in fixture rather than a sandbox seed — the
         // property that makes it embeddable under `parse_str`'s rules.
         assert!(
             loaded.manifest.workload.sandbox_seed.is_none(),
             "demo-quickstart must not declare a sandboxSeed, or it can't be embedded"
+        );
+    }
+
+    // ─── #2553 — the on-disk tier must NOT be cwd-sensitive ──────────────
+    // Sibling of `mission_config::load`'s #2432 tests, same shape. Every
+    // test below isolates BOTH `$HOME` (so `dirs::home_dir()` can't pick up
+    // a real `~/.darkmux/templates/builtin/workloads/` on the operator's
+    // machine — never read or write the real one) and
+    // `DARKMUX_TEMPLATES_DIR` (so only the one tier under test is live).
+
+    /// The precedence claim itself, not just "something loaded". A valid
+    /// "quick-q" workload with DIFFERENT content sits at
+    /// `<cwd>/templates/builtin/workloads/quick-q.json` — the exact shape
+    /// of a stale worktree's checked-out templates — with no user-tier
+    /// copy and no `DARKMUX_TEMPLATES_DIR` override. `load("quick-q",
+    /// None)` must resolve the EMBEDDED built-in, not the cwd document.
+    /// Red-proved: reverting the #2553 fix (restoring the cwd push in
+    /// `builtin_dirs`) makes this resolve `WorkloadSource::OnDisk` with the
+    /// cwd document's prompt instead of the embedded one's.
+    #[test]
+    #[serial_test::serial]
+    fn on_disk_tier_ignores_cwd_templates() {
+        let home_tmp = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
+        let _templates_guard =
+            EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", home_tmp.path().join("nope"));
+
+        let cwd_tmp = TempDir::new().unwrap();
+        write(
+            &cwd_tmp.path().join("templates/builtin/workloads/quick-q.json"),
+            r#"{"workload":{"id":"quick-q","provider":"prompt","prompt":"cwd should never win"}}"#,
+        );
+        let _cwd_guard = CwdGuard::new(cwd_tmp.path());
+
+        let loaded =
+            load("quick-q", None).expect("quick-q must still resolve via the embedded tier");
+        assert_eq!(
+            loaded.source,
+            WorkloadSource::Embedded,
+            "a document sitting in cwd's templates/ must not outrank the embedded built-in"
+        );
+        assert_ne!(
+            loaded.manifest.workload.prompt.as_deref(),
+            Some("cwd should never win"),
+            "the cwd-local document's content must not win"
+        );
+    }
+
+    /// A synthetic id with NO user, embedded, or `DARKMUX_TEMPLATES_DIR`
+    /// counterpart, present ONLY under `<cwd>/templates/builtin/workloads/`
+    /// — the shape of a document that resolves purely because the shell
+    /// happens to be standing inside some worktree. `load()` must report it
+    /// not found, not silently resolve it from cwd.
+    #[test]
+    #[serial_test::serial]
+    fn on_disk_tier_does_not_resolve_a_cwd_only_id() {
+        let home_tmp = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
+        let _templates_guard =
+            EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", home_tmp.path().join("nope"));
+
+        let cwd_tmp = TempDir::new().unwrap();
+        write(
+            &cwd_tmp
+                .path()
+                .join("templates/builtin/workloads/cwd-only-2553.json"),
+            &manifest_json("cwd-only-2553"),
+        );
+        let _cwd_guard = CwdGuard::new(cwd_tmp.path());
+
+        let err = load("cwd-only-2553", None).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    /// The escape-hatch verification, by EXECUTION not by reading. This is
+    /// the fix's own justification for removing the cwd tier outright
+    /// rather than scoping it ("the explicit override already sits at the
+    /// top of `builtin_dirs`") — nothing else in this module proves the
+    /// override actually reaches workload resolution. `DARKMUX_TEMPLATES_DIR`
+    /// holds a "quick-q" document with DIFFERENT content than the embedded
+    /// built-in, no user-tier copy exists, and no cwd document is involved
+    /// at all — the override must still beat the embedded tier.
+    ///
+    /// Red-proved by hoisting the `find_embedded` check above the
+    /// `builtin_dirs()` loop in [`load`]: that mutation disables the
+    /// override outright (the embedded document wins over any
+    /// `DARKMUX_TEMPLATES_DIR` the operator sets), and this is the only
+    /// test in this module that goes red for it —
+    /// `user_dir_takes_priority_over_builtin` can't catch it (it never
+    /// exercises the on-disk tier at all), and neither cwd test above can
+    /// (their synthetic/embedded ids have no `DARKMUX_TEMPLATES_DIR`
+    /// counterpart to be shadowed by).
+    #[test]
+    #[serial_test::serial]
+    fn on_disk_override_beats_embedded_for_a_known_id() {
+        let home_tmp = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
+
+        let templates_tmp = TempDir::new().unwrap();
+        write(
+            &templates_tmp.path().join("workloads/quick-q.json"),
+            r#"{"workload":{"id":"quick-q","provider":"prompt","prompt":"on-disk override should win"}}"#,
+        );
+        let _templates_guard = EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", templates_tmp.path());
+
+        let loaded =
+            load("quick-q", None).expect("quick-q must resolve via the on-disk override");
+        assert_eq!(loaded.source, WorkloadSource::OnDisk);
+        assert_eq!(
+            loaded.manifest.workload.prompt.as_deref(),
+            Some("on-disk override should win")
         );
     }
 }

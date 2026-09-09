@@ -35,6 +35,6 @@ Surface the list to the user, then offer the natural next steps:
 
 ## Notes
 
-- The exact message is `(no workloads found — check templates/builtin/workloads/ or .darkmux/workloads/)` — neither the built-in templates nor any user-defined workloads were located. Check the darkmux installation. (Advanced: `DARKMUX_TEMPLATES_DIR` overrides where the built-in templates are read from, though the error itself doesn't name it.)
+- The list is never empty — a fixed set of workloads (`quick-q`, `long-agentic`, `crawl-error-discard`, `quick-coding`, `medium-coding`, `tool-bench`, `demo-quickstart`) is compiled into the binary itself, so it's always available even on a bare `cargo install`/brew install with no source checkout. (Advanced: `DARKMUX_TEMPLATES_DIR` overrides where on-disk built-in templates are read from, ahead of the embedded set.)
 - User-defined workloads under `.darkmux/workloads/<id>.json` (or `.darkmux/workloads/<id>/workload.json`) shadow built-ins of the same name.
 - Workload manifests follow the schema documented in the darkmux repo's `templates/builtin/workloads/` examples.

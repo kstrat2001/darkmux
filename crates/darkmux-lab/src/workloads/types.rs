@@ -152,10 +152,10 @@ pub(crate) struct WorkloadManifest {
 /// A loaded workload manifest, plus where it came from on disk so that
 /// providers can resolve relative paths (promptFile, sandboxSeed) correctly.
 ///
-/// `manifest_path` and `source` are reserved public-API surface — the
-/// existing providers consume `manifest` and `base_dir`; tools that
-/// want provenance metadata read from these. The dead-code lint sees
-/// no current callers.
+/// `manifest_path` is reserved public-API surface — the existing providers
+/// consume `manifest` and `base_dir`; tools that want the resolved path read
+/// from this field. `source` is consumed by `lab::run::lab_run`'s per-run
+/// banner (#2553) so an operator can tell which tier actually won.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedWorkload {
@@ -165,10 +165,47 @@ pub(crate) struct LoadedWorkload {
     pub source: WorkloadSource,
 }
 
+/// Which tier a loaded workload actually resolved from — the WINNING tier of
+/// the user → on-disk → embedded search order.
+///
+/// (#2553) Three DISTINCT variants, mirroring
+/// `mission_config::MissionConfigSource`. Before this, `OnDisk` and
+/// `Embedded` were folded into a single `Builtin` variant — which is exactly
+/// why a workload resolving from the shell's cwd was indistinguishable from
+/// the binary-embedded one: no field anywhere recorded which document had
+/// actually won, so no surface could report it. Splitting the variant is
+/// half of closing #2553; the other half is `workloads::load::builtin_dirs`
+/// no longer searching cwd at all (see that function's doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkloadSource {
-    Builtin,
+    /// `<user workloads dir>/<id>.json` (or nested `<id>/workload.json`) —
+    /// operator override.
     User,
+    /// A `templates/builtin/workloads/<id>.json` (or nested form) found on
+    /// disk — the explicit `DARKMUX_TEMPLATES_DIR`/`config.dirs.templates`
+    /// override, or the `~/.darkmux/templates/...` / `/usr/local/share/...`
+    /// candidates. (#2553) NOT the shell's cwd — see
+    /// `workloads::load::builtin_dirs`.
+    OnDisk,
+    /// Compiled into the binary (`EMBEDDED_WORKLOADS`) — always resolvable
+    /// even from a bare `cargo install`, no source tree needed.
+    Embedded,
+}
+
+impl WorkloadSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            WorkloadSource::User => "user",
+            WorkloadSource::OnDisk => "on-disk",
+            WorkloadSource::Embedded => "embedded",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkloadSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -321,8 +358,20 @@ mod tests {
 
     #[test]
     fn workload_source_equality() {
-        assert_eq!(WorkloadSource::Builtin, WorkloadSource::Builtin);
-        assert_ne!(WorkloadSource::Builtin, WorkloadSource::User);
+        assert_eq!(WorkloadSource::OnDisk, WorkloadSource::OnDisk);
+        assert_ne!(WorkloadSource::OnDisk, WorkloadSource::User);
+        assert_ne!(WorkloadSource::OnDisk, WorkloadSource::Embedded);
+        assert_ne!(WorkloadSource::Embedded, WorkloadSource::User);
+    }
+
+    #[test]
+    fn workload_source_label_and_display_agree() {
+        for src in [WorkloadSource::User, WorkloadSource::OnDisk, WorkloadSource::Embedded] {
+            assert_eq!(src.label(), src.to_string());
+        }
+        assert_eq!(WorkloadSource::User.label(), "user");
+        assert_eq!(WorkloadSource::OnDisk.label(), "on-disk");
+        assert_eq!(WorkloadSource::Embedded.label(), "embedded");
     }
 
     #[test]

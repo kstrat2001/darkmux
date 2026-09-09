@@ -32,7 +32,7 @@ darkmux lab run "$ARGUMENTS"
 The dispatch runs synchronously and prints per-run lines like:
 
 ```
-[lab] run 1/3 — workload=quick-q profile=deep → quick-q-deep-1730000000-1
+[lab] run 1/3 — workload=quick-q (embedded tier) profile=deep → quick-q-deep-1730000000-1
   provider=prompt | wall=12s | ok | verify=pass (all keyword checks passed)
 ```
 

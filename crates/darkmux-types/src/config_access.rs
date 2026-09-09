@@ -1588,9 +1588,10 @@ pub fn ack_dir_override() -> Option<std::path::PathBuf> {
 /// skills) — `env` first, then the config tier, each highest-priority entries a
 /// search caller prepends to its built-in candidate list (~/.darkmux/…,
 /// /usr/local/…, and — for callers that still search it — cwd). Not every
-/// caller's candidate tree matches: `mission_config::load::builtin_dirs`
-/// deliberately dropped cwd from its own list (#2432); `lab::workloads::
-/// load::builtin_dirs` still includes it. Unlike the single-value override
+/// caller's candidate tree matches: neither `mission_config::load::
+/// builtin_dirs` (#2432) nor `lab::workloads::load::builtin_dirs` (#2553)
+/// includes cwd any more; `skills::locate_on_disk_skills_source` still
+/// does. Unlike the single-value override
 /// accessors, BOTH tiers are
 /// returned (in precedence order) since a search path layers candidates rather
 /// than picking one. Empty when neither is set. Env is raw (shell-expanded);
@@ -1607,11 +1608,11 @@ fn override_dirs(env_value: Option<String>, cfg: Option<&str>) -> Vec<std::path:
 }
 
 /// Workload-templates override candidates (`env(DARKMUX_TEMPLATES_DIR)` then
-/// `config.dirs.templates`). Two callers, with different candidate trees:
-/// `lab::workloads::load::builtin_dirs` joins `workloads/` and prepends
-/// these ahead of cwd/home/system candidates; `mission_config::load::
-/// builtin_dirs` joins `mission-configs/` and prepends these ahead of
-/// home/system only — no cwd (#2432).
+/// `config.dirs.templates`). Two callers, both prepending these ahead of
+/// home/system only — neither searches cwd: `lab::workloads::load::
+/// builtin_dirs` joins `workloads/` (cwd dropped in #2553, the sibling fix
+/// to `mission_config::load::builtin_dirs` below); `mission_config::load::
+/// builtin_dirs` joins `mission-configs/` (#2432).
 pub fn templates_override_dirs() -> Vec<std::path::PathBuf> {
     override_dirs(
         env_str("DARKMUX_TEMPLATES_DIR"),
