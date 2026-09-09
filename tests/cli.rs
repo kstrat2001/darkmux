@@ -8167,6 +8167,115 @@ fn the_wait_command_completes_with_found_false_when_no_mod_appears_within_the_bo
     assert!(stderr.contains("3s"), "and the bound it waited: {stderr}");
 }
 
+/// Run the shipped wait command with `DARKMUX_BIN` overridden — for tests
+/// that need the `mod list` call itself to fail, rather than the real
+/// binary under test.
+fn run_wait_command_with_bin(
+    home: &std::path::Path,
+    command: &str,
+    darkmux_bin: &str,
+) -> std::process::Output {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("HOME", isolated_roots().0)
+        .env("DARKMUX_HOME", home)
+        .env("DARKMUX_BIN", darkmux_bin)
+        .output()
+        .expect("the wait command runs")
+}
+
+/// (#2552) `mod list` never runs at all — the binary the step calls back
+/// into does not exist (a worktree build not yet installed, a `PATH` a
+/// launcher forgot to carry). Before the fix, this poll's own `if ... |
+/// grep -q '"key"'` collapsed a 127 (command not found) into the same
+/// branch as "no mod yet" — silently discarded by `2>/dev/null` — and the
+/// step polled for the FULL bound before reporting `found: false`, naming
+/// no cause. Now it must fail on the FIRST probe, naming the exit code and
+/// what the shell said, so an operator debugging a stuck wait is pointed at
+/// the binary rather than at the mod-writing step.
+///
+/// Red-proved: reverting this poll to the shipped
+/// `... 2>/dev/null | grep -q '"key"'` shape turns this red — the step
+/// exits 0 with `found:false` after burning the whole bound instead of
+/// failing on the first probe.
+#[test]
+fn the_wait_command_fails_fast_when_the_darkmux_binary_is_missing() {
+    let home = TempDir::new().unwrap();
+    let started = std::time::Instant::now();
+    let out = run_wait_command_with_bin(
+        home.path(),
+        &create_mod_wait_command("sess-nobinary/1", "60"),
+        "/nonexistent/path/darkmux",
+    );
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "a missing binary must fail the step, not report a clean no-mod outcome: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        stderr.contains("mod list failed"),
+        "the failure names WHICH command failed, not just that something did: {stderr}"
+    );
+    assert!(
+        stderr.contains("exit"),
+        "and the exit status, so a missing binary (127) reads differently from a real error: {stderr}"
+    );
+    assert!(
+        !stdout.contains("\"found\":false"),
+        "must not report the clean-decline shape for an infra failure: {stdout}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "a missing binary is diagnosable on the FIRST probe — it must not burn the 60s bound: {elapsed:?}"
+    );
+}
+
+/// (#2552) `mod list` runs and errors (here: a `--for` key that cannot
+/// address any finding, refused by `canonical_finding_key` before the
+/// store is even read) — a real infra/config failure, distinct from both
+/// "no mod yet" and "the binary is missing". Same collapse as the test
+/// above: the shipped poll's `2>/dev/null | grep -q` swallowed this error
+/// and treated it exactly like "not found yet", polling for the full bound.
+///
+/// Red-proved the same way: reverting to the shipped `grep -q` shape turns
+/// this red.
+#[test]
+fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
+    let home = TempDir::new().unwrap();
+    let started = std::time::Instant::now();
+    // Not `<dispatch>/<seq>` — `mods::canonical_finding_key` refuses it,
+    // so `mod list --for` errors before it ever reads the store.
+    let out = run_wait_command(home.path(), &create_mod_wait_command("not-a-valid-key", "60"));
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "a real `mod list` error must fail the step: stdout {stdout}\nstderr {stderr}"
+    );
+    assert!(
+        stderr.contains("mod list failed"),
+        "the failure names WHICH command failed: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a finding key") || stderr.contains("not-a-valid-key"),
+        "and carries the real command's own error text, not a generic message: {stderr}"
+    );
+    assert!(
+        !stdout.contains("\"found\":false"),
+        "must not report the clean-decline shape for a real error: {stdout}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "a config/infra error is diagnosable on the FIRST probe — it must not burn the 60s bound: {elapsed:?}"
+    );
+}
+
 /// (#2310 P4e, operator refinement) `mod_wait_seconds=0` — the DEFAULT, and
 /// the unattended path's behavior — is "do not wait", not "wait zero
 /// seconds and then check". It completes immediately with an honest output
