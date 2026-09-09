@@ -54,6 +54,33 @@ fn explicit_error_records_the_reason() {
     );
 }
 
+/// (#2462) The explicit signal-interrupted path — distinct from BOTH
+/// `finish_error` (would misclassify a signal-caused failure as "the
+/// endpoint broke") and the bare `Drop` path (which knows a run didn't
+/// finish, but not why). `finish_interrupted` records the SAME status
+/// `Drop` would, but keeps the reason a caller already worked out.
+#[test]
+fn explicit_interrupted_records_the_reason() {
+    let tmp = TempDir::new().unwrap();
+    RunLifecycle::start(tmp.path(), "r", "w", "p")
+        .unwrap()
+        .finish_interrupted("hosted dispatch interrupted by an operator signal (SIGTERM)");
+
+    let rec = read(tmp.path()).unwrap();
+    assert_eq!(
+        rec.status,
+        LifecycleStatus::Interrupted,
+        "a signal-caused failure must not be archived as Error — that is precisely the \
+         evidence-pointing-at-the-wrong-cause bug #2462 is about"
+    );
+    assert_eq!(
+        rec.error.as_deref(),
+        Some("hosted dispatch interrupted by an operator signal (SIGTERM)"),
+        "the WHY must survive, same as finish_error"
+    );
+    assert!(rec.ended_at_ms.is_some());
+}
+
 // ── the paths nobody writes on purpose ────────────────────────────────────
 
 #[test]

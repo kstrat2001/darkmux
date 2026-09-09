@@ -57,22 +57,22 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 // tool-less hosted role/profile) orphaned. `lab::run::
                 // lab_run` already writes an explicit terminal
                 // `lifecycle.json` on ANY dispatch `Err` (see
-                // `RunLifecycle`'s own doc + the `lifecycle.finish_error`
-                // call in `run.rs`), and `dispatch_internal.rs`'s own
-                // `DispatchBookendGuard` already guarantees a
-                // `dispatch.error` liveness bookend — so the only two things
-                // actually missing are: (1) install the handlers so a
-                // signal becomes a flag instead of an outright kill, and (2)
-                // something to notice that flag and kill the blocked child.
-                // Armed ONCE, ahead of the whole (possibly `--runs N`)
-                // dispatch loop below — `is_set()` never resets, so one
-                // signal ends the whole invocation, matching every other
-                // launcher's shape. See `spawn_reap_watchdog`'s own doc for
-                // why the docker path is already self-killing and this
+                // `RunLifecycle`'s own doc + the `lifecycle.finish_error`/
+                // `finish_interrupted` calls in `run.rs`, #2462), and
+                // `dispatch_internal.rs`'s own `DispatchBookendGuard` already
+                // guarantees a `dispatch.error` liveness bookend — so the
+                // only two things actually missing are: (1) install the
+                // handlers so a signal becomes a flag instead of an outright
+                // kill, and (2) something to notice that flag and kill the
+                // blocked child. Armed ONCE, ahead of the whole (possibly
+                // `--runs N`) dispatch loop below — `is_set()` never resets,
+                // so one signal ends the whole invocation, matching every
+                // other launcher's shape. See `spawn_reap_watchdog`'s own doc
+                // for why the docker path is already self-killing and this
                 // watchdog exists for the curl-only remote path.
                 crate::launch_guard::arm();
                 let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
-                let outcomes = lab::run::lab_run(lab::run::RunOpts {
+                let outcomes = match lab::run::lab_run(lab::run::RunOpts {
                     workload_id,
                     profile_name: profile,
                     runs,
@@ -80,7 +80,35 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
                     quiet,
                     loop_override: None,
                     inject_context: None,
-                })?;
+                }) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        // (#2462) `lab_run`'s own terminal `lifecycle.json`
+                        // write is already durable by the time it returns
+                        // this `Err` (the RAII guard finalizes before
+                        // propagating — see `run.rs`'s match arm). Matching
+                        // `mission launch`'s own shape
+                        // (`reap_and_exit_on_signal`'s doc), a run a signal
+                        // actually ended now exits 130 instead of the
+                        // default-error 1 — so a wrapper script can tell
+                        // "the operator stopped this" from the exit code
+                        // alone, the same way it already can for `mission
+                        // launch`. A no-op (falls through to the ordinary
+                        // `Err` return below) when no signal was ever
+                        // observed.
+                        //
+                        // (#2462 review) `report_*`, NOT the bare
+                        // `reap_and_exit_on_signal`: the force-exit runs
+                        // before `main`'s own error printing, so a bare
+                        // call exits 130 having discarded the interrupt
+                        // message this change exists to produce. See that
+                        // function's doc for the measurement, and for why
+                        // this site keeps the hard exit where
+                        // `radio_cli.rs` dropped it.
+                        crate::launch_guard::report_reap_and_exit_on_signal(&e);
+                        return Err(e);
+                    }
+                };
                 if !quiet {
                     println!("\n{} run(s) complete:", outcomes.len());
                     for o in &outcomes {

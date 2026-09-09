@@ -2868,6 +2868,16 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     // helper's own documented escape: a later `.env` wins, so this test still
     // gets the specific roots it seeds and asserts against, while the DEFAULT
     // is isolation rather than a raw inherit.
+
+    // (#2462 review) stderr goes to a FILE, not `/dev/null` — the operator's
+    // whole diagnosis lives there, and sending it to the void is exactly why
+    // the first cut of this fix shipped a force-exit that discarded the
+    // message the fix exists to produce (see `launch_guard::
+    // report_reap_and_exit_on_signal`). A file rather than a pipe on
+    // purpose: this test polls `try_wait` instead of reading the child, so a
+    // pipe could fill and deadlock the very process it is timing.
+    let stderr_path = home.path().join("dispatch-stderr.log");
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
     let mut child = darkmux_std_cmd()
         .env("HOME", os_home.path())
         .env("DARKMUX_HOME", home.path())
@@ -2875,7 +2885,7 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
         .env("DARKMUX_PROFILES", &profiles_path)
         .args(["dispatch", "dialectic-judge", "hang please", "--timeout", "60"])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .expect("spawning darkmux dispatch dialectic-judge");
     let pid = child.id();
@@ -2905,6 +2915,22 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert!(!exit_status.success(), "a signal-interrupted dispatch must not exit 0");
+    // (#2462) The terminal mission record is already durable by the time
+    // `dispatch_as_crew_of_one::dispatch` returns its `Err` (asserted via
+    // `mission_json["status"]` below) — `main.rs`'s `cmd_dispatch` then
+    // calls `launch_guard::reap_and_exit_on_signal()` on that `Err`, which
+    // force-exits 130 (128 + SIGTERM's conventional 2), the SAME code
+    // `mission launch` already exits with on a caught signal. Before this
+    // fix, the `Err` just propagated up to the default error handler,
+    // which exits 1 — indistinguishable from a real endpoint failure to
+    // any wrapper script reading the exit code alone.
+    assert_eq!(
+        exit_status.code(),
+        Some(130),
+        "a signal-interrupted dispatch must exit 130 (like `mission launch`), not the generic \
+         error code 1 — a wrapper script can't otherwise tell an operator's Ctrl-C from a real \
+         failure: {exit_status:?}"
+    );
 
     assert!(
         stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
@@ -2933,6 +2959,43 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     assert_eq!(
         mission_json["status"], "finalized",
         "an interrupted dispatch must reach a terminal mission status, never stay active: {mission_json}"
+    );
+
+    // (#2462) `envelope.json`'s `reason` is what an operator actually reads
+    // to find out WHY a dispatch didn't finish. Before this fix it came
+    // straight from `describe_curl_failure`'s bare "chat request to ...
+    // failed (curl exit -1): " — no stderr (SIGKILL leaves none), reading
+    // exactly like the endpoint broke. It didn't; darkmux killed its own
+    // curl because the operator sent a signal.
+    let envelope_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(missions_dir.join(&mission_id).join("envelope.json")).unwrap())
+            .unwrap();
+    let reason = envelope_json["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("interrupted by an operator signal"),
+        "an interrupted dispatch's envelope reason must name the signal as the cause, not read \
+         as an endpoint failure: {reason:?}"
+    );
+
+    // (#2462 review) The record on disk being right is not enough — the
+    // OPERATOR'S SCREEN is the surface this fix is about, and the exit-130
+    // path force-exits before `main`'s own `Error: ...` printing ever runs.
+    // Measured on the real binary: with the bare `reap_and_exit_on_signal()`
+    // call, this file held the interrupt banner and nothing else. Both
+    // halves are asserted — that stderr names the signal, and that it does
+    // NOT read as an endpoint failure — because the pre-fix message
+    // (`describe_curl_failure`'s "chat request to ... failed (curl exit
+    // -1): ") would satisfy a looser "something was printed" check.
+    let stderr_text = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        stderr_text.contains("interrupted by an operator signal"),
+        "a signal-interrupted dispatch must PRINT why it stopped, not exit 130 in silence — the \
+         force-exit runs before `main`'s error printing, so the call site has to print first: \
+         {stderr_text:?}"
+    );
+    assert!(
+        !stderr_text.contains("curl exit -1"),
+        "stderr must not blame the endpoint for darkmux killing its own child: {stderr_text:?}"
     );
 }
 
@@ -2983,6 +3046,13 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
     // helper's own documented escape: a later `.env` wins, so this test still
     // gets the specific roots it seeds and asserts against, while the DEFAULT
     // is isolation rather than a raw inherit.
+
+    // (#2462 review) stderr to a FILE, not `/dev/null` — see the `dispatch`
+    // twin above for why (the force-exit runs before `main` prints the
+    // error, and `/dev/null` is what hid that) and for why a file rather
+    // than a pipe (this test polls `try_wait`; a full pipe would deadlock).
+    let stderr_path = home.path().join("lab-run-stderr.log");
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
     let mut child = darkmux_std_cmd()
         .env("HOME", os_home.path())
         .env("DARKMUX_HOME", home.path())
@@ -2991,7 +3061,7 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
         .args(["lab", "run", "sigterm-lab-hang-test", "--profile", "hang", "--profiles-file"])
         .arg(&profiles_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .expect("spawning darkmux lab run sigterm-lab-hang-test");
     let pid = child.id();
@@ -3021,6 +3091,20 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert!(!exit_status.success(), "a signal-interrupted lab run must not exit 0");
+    // (#2462) `lab_run`'s own `lifecycle.json` terminal write is already
+    // durable by the time it returns its `Err` (asserted via
+    // `lifecycle_json["status"]` below) — `lab_cli.rs`'s `cmd_lab` then
+    // calls `launch_guard::reap_and_exit_on_signal()` on that `Err`, which
+    // force-exits 130, the SAME code `mission launch`/`dispatch` exit with
+    // on a caught signal. Before this fix the `Err` just propagated to the
+    // default error handler (exit 1) — indistinguishable from a real
+    // failure to any wrapper script reading the exit code alone.
+    assert_eq!(
+        exit_status.code(),
+        Some(130),
+        "a signal-interrupted lab run must exit 130, not the generic error code 1 — a wrapper \
+         script can't otherwise tell an operator's Ctrl-C from a real failure: {exit_status:?}"
+    );
 
     assert!(
         stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
@@ -3047,6 +3131,39 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
         lifecycle_json["status"], "running",
         "an interrupted lab run must reach a terminal lifecycle status, never stay `running`: \
          {lifecycle_json}"
+    );
+    // (#2462) The whole point: a signal-caused failure must not be
+    // archived as `error` — that is the "the endpoint broke" misattribution
+    // the issue is about. It must read `interrupted`, and the `error` field
+    // must say WHY in terms of the signal, not `describe_curl_failure`'s
+    // bare "chat request to ... failed (curl exit -1): " (empty stderr,
+    // since SIGKILL leaves none).
+    assert_eq!(
+        lifecycle_json["status"], "interrupted",
+        "a signal-caused lab run failure must be archived as `interrupted`, not `error` — \
+         recording `error` here is exactly the wrong-cause bug #2462 is about: {lifecycle_json}"
+    );
+    let error = lifecycle_json["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("operator signal"),
+        "the lifecycle record's `error` must name the operator's signal as the cause, not an \
+         endpoint failure: {error:?}"
+    );
+
+    // (#2462 review) And the same message must reach the OPERATOR'S SCREEN,
+    // not only the archive. The exit-130 path force-exits before `main`'s
+    // own `Error: ...` printing runs, so a correct `lifecycle.json` next to
+    // a blank stderr is a real, measured failure mode — it is what the first
+    // cut of this fix actually shipped.
+    let stderr_text = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        stderr_text.contains("operator signal"),
+        "a signal-interrupted lab run must PRINT why it stopped, not exit 130 in silence: \
+         {stderr_text:?}"
+    );
+    assert!(
+        !stderr_text.contains("curl exit -1"),
+        "stderr must not blame the endpoint for darkmux killing its own child: {stderr_text:?}"
     );
 }
 

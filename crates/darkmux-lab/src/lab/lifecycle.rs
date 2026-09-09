@@ -67,7 +67,14 @@ pub enum LifecycleStatus {
     /// Ended with an error, and `error` says which.
     Error,
     /// The process exited without finishing the run — `Drop` fired on an
-    /// early return, a `?`, or an unwinding panic.
+    /// early return, a `?`, or an unwinding panic — OR the run's own error
+    /// path explicitly detected that a caught SIGINT/SIGTERM/SIGHUP was the
+    /// cause (`darkmux_types::interrupt::is_set()`) and called
+    /// [`RunLifecycle::finish_interrupted`] rather than
+    /// [`RunLifecycle::finish_error`] (#2462). The two entry paths share
+    /// this one status deliberately: both mean "did not finish on its
+    /// own" — the explicit path just also knows why, and records it in
+    /// `error` rather than leaving the field empty.
     Interrupted,
     /// A status this binary does not recognize, from a newer writer.
     #[serde(other)]
@@ -198,6 +205,30 @@ impl RunLifecycle {
     /// The run ended with an error.
     pub fn finish_error(mut self, error: impl std::fmt::Display) {
         self.terminate(LifecycleStatus::Error, Some(error.to_string()));
+    }
+
+    /// (#2462) The run ended because a caught SIGINT/SIGTERM/SIGHUP caused
+    /// darkmux's own reap watchdog to kill this run's in-flight child (the
+    /// container, or the hosted `curl`) — the `Err` this run's dispatch
+    /// returned is real, but its CAUSE was the operator's own signal, not
+    /// the endpoint or the model. Callers decide when this applies by
+    /// checking `darkmux_types::interrupt::is_set()` themselves; this
+    /// method just records the distinction once they have. Recording
+    /// `Error` here would archive an operator's Ctrl-C as "the endpoint
+    /// broke" — exactly the misattribution #2462 is about.
+    ///
+    /// Formats `error` with `{:#}` (alternate), not `{}` — unlike
+    /// `finish_error`'s plain `.to_string()`, this deliberately unwraps the
+    /// FULL `anyhow` cause chain. `run.rs`'s call site passes a
+    /// `.context("internal-runtime dispatch via lab harness")`-wrapped
+    /// error; a plain `{}` shows only that outer context and discards the
+    /// actual cause (`remote_chat_attempt`'s "hosted dispatch interrupted
+    /// by an operator signal..." message, which is the whole point of this
+    /// method existing) one level down. `finish_error` is left as `.to_
+    /// string()` deliberately — this is a targeted fix for the one field
+    /// #2462 is about, not a blanket change to every existing error record.
+    pub fn finish_interrupted(mut self, error: impl std::fmt::Display) {
+        self.terminate(LifecycleStatus::Interrupted, Some(format!("{error:#}")));
     }
 }
 

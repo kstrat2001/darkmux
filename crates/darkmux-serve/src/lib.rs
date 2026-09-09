@@ -1920,6 +1920,18 @@ pub(crate) struct LabRunSummary {
     /// artifact-and-staleness inference, so this is additive, not a migration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
+    /// (#2462 review) The lifecycle record's own `error` string, carried
+    /// alongside the status because the status ALONE cannot say which of
+    /// `Interrupted`'s two writers produced it. `finish_interrupted` (the
+    /// explicit signal path) always fills this in; `RunLifecycle::drop`
+    /// (the #1930 backstop, which fires on any early return, `?` or
+    /// unwinding panic and knows only that the run stopped) always leaves
+    /// it `None`. Downstream, `runs::lab_summary_to_run` is the consumer
+    /// that has to tell them apart — without this field it was claiming a
+    /// deliberate human teardown for every `Drop`-written record ever
+    /// archived.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lifecycle_error: Option<String>,
     pub(crate) has_funnels: bool,
     pub(crate) has_events: bool,
     /// (#1982) The session_id the run's OWN inner dispatch used, read back
@@ -2178,6 +2190,8 @@ fn build_lab_run_summary(
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string));
 
+    let lifecycle_record = darkmux_lab::lab::lifecycle::read(dir);
+
     Some(LabRunSummary {
         dir: rel,
         mtime_ms,
@@ -2196,8 +2210,12 @@ fn build_lab_run_summary(
         finished: has_scores,
         // Read once here rather than per-consumer: the scan already has the
         // directory in hand, and a status re-read at display time could
-        // disagree with the one the row was built from.
-        lifecycle_status: darkmux_lab::lab::lifecycle::read(dir).map(|r| r.status),
+        // disagree with the one the row was built from. (#2462 review) One
+        // read fills BOTH fields, for the same reason — a status and an
+        // `error` taken from two separate reads could describe two
+        // different terminal writes.
+        lifecycle_status: lifecycle_record.as_ref().map(|r| r.status),
+        lifecycle_error: lifecycle_record.and_then(|r| r.error),
         has_funnels,
         has_events,
         session_id,
