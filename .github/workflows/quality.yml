@@ -37,12 +37,14 @@ on:
   push:
     branches: [main]
   schedule:
-    # Nightly sweep. Measured locally on 2026-09-08 with cargo-mutants 27.1.0:
+    # Nightly sweep. Re-measured 2026-09-09 with cargo-mutants 27.1.0 (drifted
+    # slightly from the #2499 issue's 2026-09-08 numbers as the tree grew):
     # `cargo mutants --list` (the scope this job actually runs at — the root
-    # `darkmux` package only, see mutants-full's comment) finds 2,136 mutants,
-    # and `cargo mutants --workspace --list` finds 12,619. Either number is a
+    # `darkmux` package only, see mutants-full's comment) finds 2,176 mutants,
+    # and `cargo mutants --workspace --list` finds 12,764. Either number is a
     # build+test per mutant and does not belong in anyone's review loop; the PR
-    # job mutates only the diff, which is far smaller.
+    # job (#2499) now mutates `--workspace`, scoped to the diff, which is far
+    # smaller and whose baseline is scoped to only the touched packages.
     - cron: "23 7 * * *"
   workflow_dispatch:
 
@@ -54,7 +56,10 @@ jobs:
     name: mutation — tests that cannot fail (PR diff only)
     runs-on: macos-latest
     if: github.event_name == 'pull_request'
-    timeout-minutes: 30
+    # (#2499) 30 -> 45: the Mutate step's `--timeout` went 120 -> 300 (a
+    # larger per-mutant/baseline ceiling), so a slow mutant or a bigger diff
+    # needs more job-level headroom to match.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,20 +111,18 @@ jobs:
           # `--in-diff` whose paths don't resolve ("No mutants to filter", exit
           # 0) and an unparseable diff ("Diff file is empty", exit 0). That
           # assertion is only sound if the count and the mutation scope agree.
-          # They currently DON'T for the whole tree: this job mutates the root
-          # `darkmux` package only (see the Mutate step, and the follow-up
-          # issue #2499), so a PR touching only `crates/**` yields
-          # zero mutants LEGITIMATELY at this scope — counting those lines
-          # would fail a large share of honest PRs for a defect that is already
-          # documented and deferred.
           #
-          # `src/` is exactly the root package's mutable surface: measured
-          # 2026-09-08, all 2,136 of `cargo mutants --list`'s entries at this
-          # scope are under `src/`, and zero are under `crates/`. A git
-          # pathspec's `*` crosses `/`, so this covers any nesting.
-          #
-          # WHEN THE WORKSPACE-SCOPE FOLLOW-UP LANDS, widen this back to
-          # '*.rs' in the same change — the two are one setting in two places.
+          # (#2499) WIDENED to '*.rs': the Mutate step below now passes
+          # `--workspace`, so the mutation scope is the whole tree, not just
+          # the root `darkmux` package — a PR touching only `crates/**` now
+          # gets real coverage instead of the old "No mutants to filter"
+          # silent green, and this counter has to widen with it (this was
+          # previously 'src/*.rs' — see the capitalized comment that used to
+          # sit here — or a `crates/`-only PR would trip this floor for a
+          # defect that was already documented and merely deferred, not
+          # legitimate). A git pathspec's `*` crosses `/` (confirmed locally:
+          # `git diff -- '*.rs'` matches a `crates/**/*.rs` change; `git diff
+          # -- 'src/*.rs'` does not), so this covers any nesting.
           #
           # ADDED lines only, and not the `+++ b/path` file headers: a
           # deletion-only diff legitimately yields zero mutants, and counting
@@ -141,7 +144,7 @@ jobs:
           # itself off. As a plain command, a git failure fails the step — and
           # the counter likewise exits non-zero rather than printing 0 if it
           # cannot read the diff.
-          git diff "origin/${{ github.base_ref }}"...HEAD -- 'src/*.rs' > /tmp/pr-scope.diff
+          git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr-scope.diff
           CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines /tmp/pr-scope.diff)
           echo "changed Rust lines (in mutation scope, mutable-looking only): $CHANGED"
           echo "changed_lines=$CHANGED" >> "$GITHUB_OUTPUT"
@@ -165,26 +168,57 @@ jobs:
           # PR) by running those two tests against a copy with and without
           # `.git` — fails both ways without it, passes both ways with it.
           #
-          # KNOWN UNDER-SCOPING, deliberately NOT fixed here (see #2499). This repo's root `Cargo.toml` carries BOTH
-          # a `[workspace]` table AND a `[package]` (the `darkmux` bin), so
-          # cargo-mutants' auto package-filter — the same convention cargo
-          # itself uses — resolves to the ROOT package only when no
-          # `-p`/`--workspace` is given. Measured locally on 2026-09-08: a diff
-          # touching only `crates/darkmux-eureka/src/lib.rs` produces "No
-          # mutants to filter" at this scope and 5 real mutants with
-          # `--workspace`; `--list` finds 2,136 mutants at this scope against
-          # 12,619 with it. So every one of the ~12 library crates under
-          # `crates/` gets ZERO mutation-in-diff coverage today, and has for as
-          # long as this job has existed.
+          # (#2499) FIXED: `--workspace` added below. This repo's root
+          # `Cargo.toml` carries BOTH a `[workspace]` table AND a `[package]`
+          # (the `darkmux` bin), so cargo-mutants' auto package-filter — the
+          # same convention cargo itself uses — resolved to the ROOT package
+          # only when no `-p`/`--workspace` was given. Measured 2026-09-08: a
+          # diff touching only `crates/darkmux-eureka/src/lib.rs` produced "No
+          # mutants to filter" at root scope and 5 real mutants with
+          # `--workspace`. Re-confirmed locally 2026-09-09 (2 mutants for a
+          # smaller synthetic one-function diff, 0 without the flag): every
+          # one of the ~12 library crates under `crates/` got ZERO
+          # mutation-in-diff coverage for as long as this job existed, and a
+          # PR touching only `crates/**` passed this job green having tested
+          # nothing.
           #
-          # Adding `--workspace` here was tried and REVERTED, for the sizing
-          # reasons spelled out on the `mutants-full` Sweep step below (the two
-          # jobs share a scope, so they share the fix). Widening it is a real
-          # change with its own sizing work — sharding, timeout re-budgeting —
-          # and it does not ride along with the exit-code honesty fix; coupling
-          # them lands neither.
+          # This is the SAFE half of the workspace-scope widening (the
+          # `mutants-full` nightly's Sweep step is NOT changed — see its
+          # comment for why): `Lab::run_baseline` (cargo-mutants
+          # 27.1.0, src/lab.rs) scopes the baseline to
+          # `PackageSelection::Explicit(all_mutated_packages)` — only the
+          # packages that actually contain a mutant from this diff, not the
+          # whole workspace — so a PR touching one small crate still gets a
+          # small, fast baseline. Confirmed locally 2026-09-09: a diff
+          # touching only `darkmux-eureka` ran its baseline in 1s test time
+          # (vs the multi-hundred-second whole-workspace baseline the nightly
+          # would face), and the 2-mutant sweep for it completed in 17s total.
+          #
+          # `--timeout` RAISED 120 -> 300. `--timeout` bounds BOTH the
+          # baseline test phase and every mutant's test phase (cargo-mutants
+          # has no separate baseline timeout — confirmed by reading
+          # `Timeouts::for_baseline` in src/timeouts.rs, which reuses
+          # `options.test_timeout` verbatim). The 120s figure was already
+          # thin at root-only scope: two real PR-diff runs against root
+          # measured the baseline TEST phase (not build, which is unbounded
+          # during baseline) at 95s and 96s — see runs 34283477510 and
+          # 34256702344 on kstrat2001/darkmux, both root-only, both "Found 64
+          # mutants to test". Under `--workspace`, a PR that touches root
+          # `src/*.rs` AND a crate (say `darkmux-crew`, whose own suite ran
+          # 35s locally) stacks both packages' tests into ONE baseline test
+          # phase — measured locally 2026-09-09: darkmux-crew alone runs its
+          # unit tests in ~35s. Combined with root's ~95-96s that leaves
+          # single-digit percent headroom under 120s on a slower CI runner,
+          # for the single most common PR shape (touching both). 300s gives
+          # real margin without materially slowing typical mutants (most
+          # fail fast either way; a genuinely-hanging mutant now takes longer
+          # to be classified TIMEOUT instead of falsely tanking the baseline).
+          #
+          # `timeout-minutes` on this job RAISED 30 -> 45 to match: a larger
+          # per-mutant ceiling means a legitimately slow mutant (or a PR with
+          # many changed lines) needs more job-level headroom too.
           set +e
-          cargo mutants --in-diff /tmp/pr.diff -j 4 --timeout 120 \
+          cargo mutants --workspace --in-diff /tmp/pr.diff -j 4 --timeout 300 \
             --copy-vcs true --output mutants-out
           STATUS=$?
           set -e
@@ -349,21 +383,50 @@ jobs:
           # sweep" and it has never been one. Without `-p`/`--workspace`,
           # cargo-mutants (like plain `cargo test`) auto-scopes to the ROOT
           # package when the workspace root also carries a `[package]` table,
-          # which this repo's does (the `darkmux` bin). Measured locally on
-          # 2026-09-08 with cargo-mutants 27.1.0: `cargo mutants --list` finds
-          # 2,136 mutants at this scope; `--workspace --list` finds 12,619. The
-          # ~12 library crates under `crates/` — most of this codebase — have
-          # never been swept.
+          # which this repo's does (the `darkmux` bin). Re-measured 2026-09-09
+          # with cargo-mutants 27.1.0 (drifted slightly from the issue's
+          # 2026-09-08 numbers): `cargo mutants --list` finds 2,176 mutants at
+          # this scope; `--workspace --list` finds 12,764. The ~12 library
+          # crates under `crates/` — most of this codebase — have never been
+          # swept.
           #
-          # `--workspace` was tried here and REVERTED, on two sizing findings
-          # from the review of that attempt (their numbers, not re-measured
-          # here): projected ~33h of sweep against this job's 350-minute
-          # (5.83h) cap, and `--timeout 120` bounding the whole-workspace
-          # BASELINE too, which was measured at 154s — so the sweep would fail
-          # its own baseline before testing a single mutant. Widening the scope
-          # needs sharding and a timeout re-budget; that is the follow-up's
-          # work, not this fix's. Deliberately left under-scoped and
-          # DOCUMENTED rather than silently under-scoped.
+          # `--workspace` was tried here and reverted before #2499 was filed.
+          # #2499's own follow-up (2026-09-09) went further than re-measuring
+          # that attempt: it pulled the REAL run history for this job from
+          # `gh run view`/`gh api .../actions/jobs/<id>/logs`, because the
+          # first scheduled run after the exit-code-honesty fix (#2504,
+          # 2026-09-08T11:07Z) is the only nightly this job has EVER run to an
+          # honest conclusion — every run before it reported "success" off
+          # the old `wc -l`-style summary that could not distinguish a real
+          # sweep from an early exit. That one real run
+          # (github.com/kstrat2001/darkmux/actions/runs/34224570708, job
+          # 102055439077) is damning even at TODAY'S root-only scope: baseline
+          # passed (105s build + 68s test), then testing ran the full
+          # 350-minute budget and was CANCELLED having completed only 973 of
+          # 2,136 mutants (594 caught, 332 missed, 4 timeout, 43 unviable —
+          # counted from the uploaded `mutants-out` artifact's outcomes.json).
+          # That is 973 mutants in ~20,856s of testing = ~21.4s/mutant on the
+          # real macos-26-arm64 runner, which projects the ROOT-ONLY scope
+          # alone at ~12.7h to finish — already ~2.2x this job's 350-minute
+          # (5.83h) cap, before `--workspace` enters the picture at all.
+          # Flat-extrapolating that same rate across the 12,764 `--workspace`
+          # mutants (a real caveat: darkmux-types-style foundational crates
+          # rebuild much more of the graph per mutant than a leaf crate, so
+          # this is a rough single-rate model, not a per-crate one) projects
+          # ~76h for a full sweep — and GitHub-hosted runners hard-cap a
+          # single job at 6h of execution regardless of `timeout-minutes`
+          # (platform limit, not verifiable from this repo — stated here as a
+          # known constraint, not re-tested), so no `timeout-minutes` value
+          # can fix this even before sharding is designed. The earlier
+          # "~33h projected, --timeout 120 bounds the baseline too" framing
+          # from the reverted attempt undersold the problem: the real
+          # bottleneck isn't just the baseline timeout, it's that this job,
+          # even unchanged, no longer finishes within its own budget on the
+          # actual runner. Widening the scope needs a job-matrix shard design
+          # (`--shard i/k`) sized against these real numbers, which is
+          # follow-up work this fix deliberately does not carry — see #2499's
+          # continuation. Deliberately left under-scoped and DOCUMENTED
+          # rather than silently under-scoped or half-fixed.
           set +e
           cargo mutants -j 4 --timeout 120 --copy-vcs true --output mutants-out
           STATUS=$?
