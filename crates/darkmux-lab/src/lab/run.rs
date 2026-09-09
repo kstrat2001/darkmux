@@ -162,9 +162,13 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         let per_run_sandbox_dir = run_dir.join("sandbox");
 
         if !opts.quiet {
+            // (#2553) Names the WINNING tier, same as `mission launch`'s
+            // banner does for mission configs — the operator can no longer
+            // be left wondering whether a workload resolved from the
+            // embedded built-in, an on-disk override, or a user-tier copy.
             println!(
-                "[lab] run {i}/{runs} — workload={} profile={} → {}",
-                opts.workload_id, profile_name, run_id
+                "[lab] run {i}/{runs} — workload={} ({} tier) profile={} → {}",
+                opts.workload_id, loaded_workload.source, profile_name, run_id
             );
 
             // (#365/#544) Per-run envelope check. An `lms ps` failure is
@@ -607,7 +611,7 @@ mod tests {
             },
             manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
-            source: WorkloadSource::Builtin,
+            source: WorkloadSource::OnDisk,
         };
         let resolved = resolve_source_sandbox(&loaded, &paths).unwrap();
         assert_eq!(resolved, paths.sandboxes.join("demo"));
@@ -644,7 +648,7 @@ mod tests {
             },
             manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
-            source: WorkloadSource::Builtin,
+            source: WorkloadSource::OnDisk,
         };
         let err = resolve_source_sandbox(&loaded, &paths)
             .expect_err("a semver range operator should be rejected");
@@ -708,7 +712,7 @@ mod tests {
             },
             manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
-            source: WorkloadSource::Builtin,
+            source: WorkloadSource::OnDisk,
         };
 
         let resolved = resolve_source_sandbox(&loaded, &paths).unwrap();
@@ -768,7 +772,7 @@ mod tests {
             },
             manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
-            source: WorkloadSource::Builtin,
+            source: WorkloadSource::OnDisk,
         };
         let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
         let msg = format!("{err:#}");
@@ -810,7 +814,7 @@ mod tests {
             },
             manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
-            source: WorkloadSource::Builtin,
+            source: WorkloadSource::OnDisk,
         };
         let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
         let msg = format!("{err:#}");
@@ -1021,7 +1025,7 @@ mod tests {
             },
             manifest_path: tmp.path().join("w.json"),
             base_dir: tmp.path().to_path_buf(),
-            source: WorkloadSource::Builtin,
+            source: WorkloadSource::OnDisk,
         };
 
         // With context → prepended ahead of the original prompt.

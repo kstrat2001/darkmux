@@ -1516,7 +1516,7 @@ mod tests {
             manifest: WorkloadManifest { workload: spec },
             manifest_path: base_dir.join("workload.json"),
             base_dir,
-            source: WorkloadSource::Builtin,
+            source: WorkloadSource::OnDisk,
         }
     }
 
