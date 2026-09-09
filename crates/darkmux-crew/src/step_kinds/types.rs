@@ -301,6 +301,15 @@ pub struct StepRunCtx {
 pub enum WaveSignal {
     /// A live per-item flow record (from [`StepRunCtx::emit`]).
     Record(FlowRecord),
+    /// (#2517) THIS step's own dispatch is actually beginning — sent from
+    /// inside the job closure, on its own worker thread, the instant
+    /// before `kind.run_streaming(...)` is called. The main thread applies
+    /// it by stamping `Step::started_ts` and persisting — see that
+    /// field's own doc for why this can no longer happen at wave
+    /// admission (every step in a wave used to share ONE `now_unix()`
+    /// stamped before any of them had dispatched, #2517). Not a terminal
+    /// signal: `index` is NOT added to `applied` on receipt.
+    StepDispatching { index: usize, at: u64 },
     /// A step's terminal transition, keyed by its position in the wave's
     /// `ready_ids`. `at` is that step's own completion epoch (seconds);
     /// `result` is `Ok(output)` / `Err(message)`; `flow_records` are the
@@ -314,10 +323,10 @@ pub enum WaveSignal {
         /// timed with an `Instant` pair taken strictly around that one call
         /// inside the job closure that produced it — never derived from `at`
         /// (whole-second epoch, too coarse) and never from the step's
-        /// `started_ts` (set on the MAIN thread before the wave's jobs are
-        /// even built, so it would include queueing time behind
-        /// `remote_cap` when a wave has more ready steps than the
-        /// concurrency cap). This is what makes a per-step
+        /// `started_ts` (which, post-#2517, IS also taken right before this
+        /// same call — but as a whole-second `now_unix()` stamp, still too
+        /// coarse for a millisecond-accurate duration; this field stays its
+        /// own `Instant` pair regardless). This is what makes a per-step
         /// [`crate::run_record::StepRecord::wall_ms`] correct under
         /// concurrency: each sibling's duration reflects only its own
         /// dispatch, not the wave's.

@@ -835,12 +835,23 @@ pub fn run_step_graph(
             continue;
         }
 
-        let now = now_unix();
         let mut jobs = Vec::with_capacity(ready_ids.len());
         for id in &ready_ids {
             let step = steps.get_mut(id).expect("id came from `steps` itself");
             step.status = NodeStatus::Running;
-            step.started_ts = Some(now);
+            // (#2517) `started_ts` is deliberately NOT stamped here. This
+            // loop flips EVERY ready step in the wave to `Running` at once
+            // — that's still correct (see this field's own doc on `Step`
+            // for the status-vs-timestamp distinction #2517 draws) — but
+            // stamping a shared `now_unix()` here for every step is
+            // exactly the bug: a wave can hold more ready steps than the
+            // concurrency cap, so most of them don't actually dispatch
+            // until much later. `started_ts` is instead stamped from
+            // inside each step's own job closure, right before its
+            // `run_streaming` call (`WaveSignal::StepDispatching`, handled
+            // in this function's drain loop below) — the instant it
+            // genuinely starts, not the instant it was admitted.
+            //
             // (#2394) The `step start` record + `persist` moved DOWN into the
             // classification loop below, so the record can carry
             // `payload.seat_class` — what this step actually consumes. It is
@@ -973,13 +984,26 @@ pub fn run_step_graph(
             let term_tx = tx.clone();
             let job: crate::concurrent_dispatch::DispatchJob<StepJobResult> =
                 Box::new(move || {
+                    // (#2517) `Step::started_ts` is stamped from HERE — the
+                    // instant this job's own worker thread is actually
+                    // about to dispatch, queueing behind `remote_cap`
+                    // already resolved — never at wave admission on the
+                    // main thread (the old bug: every ready step in a wave
+                    // shared ONE `now_unix()` stamped before any of them
+                    // had dispatched). The main thread applies it on
+                    // receipt (see the drain loop's `StepDispatching` arm)
+                    // and persists, so a mid-run page load sees the real
+                    // dispatch instant, not an admission-time guess.
+                    let _ = term_tx.send(crate::step_kinds::WaveSignal::StepDispatching {
+                        index: idx,
+                        at: now_unix(),
+                    });
                     // (#1877 item 3) This step's OWN dispatch duration —
                     // timed strictly around its `run_streaming` call, on
                     // THIS job's own worker thread. Never derived from
-                    // `step.started_ts` (stamped on the main thread before
-                    // this wave's jobs are even built, so it would include
-                    // any time this job spent queued behind `remote_cap`)
-                    // and never a wall-clock around the whole wave — each
+                    // `step.started_ts` (a whole-second `now_unix()` stamp,
+                    // too coarse for a millisecond-accurate duration) and
+                    // never a wall-clock around the whole wave — each
                     // sibling gets its own `Instant` pair, so a fast step
                     // sharing a wave with a slow one reports its own real
                     // duration, not the wave's.
@@ -1067,6 +1091,26 @@ pub fn run_step_graph(
             for sig in rx.iter() {
                 match sig {
                     crate::step_kinds::WaveSignal::Record(rec) => emit(rec),
+                    // (#2517) The step's own dispatch is beginning right
+                    // now, on its own worker thread — apply the real
+                    // instant to the main thread's copy and persist it
+                    // immediately, so a mid-run page load (or a
+                    // freshly-opened graph snapshot) reflects it without
+                    // waiting for this step's terminal transition. Not
+                    // terminal: `index` is deliberately not added to
+                    // `applied` — the post-scope reconcile below still
+                    // needs to see this index if it never streams a
+                    // `StepTerminal` at all (a queued job whose local wave
+                    // was refused before its closure ever ran never
+                    // reaches this arm either, so its `started_ts` stays
+                    // honestly `None`).
+                    crate::step_kinds::WaveSignal::StepDispatching { index, at } => {
+                        let step = steps
+                            .get_mut(&ready_ids[index])
+                            .expect("index came from this wave's own ready_ids");
+                        step.started_ts = Some(at);
+                        persist(step);
+                    }
                     crate::step_kinds::WaveSignal::StepTerminal { index, at, wall_ms, result, flow_records } => {
                         apply_step_terminal(
                             steps,
@@ -3359,15 +3403,29 @@ mod tests {
         }
     }
 
-    /// (#1397) The scheduler persists each step's OWN post-flip state at
-    /// transition time — `Running` at dispatch, `Complete`/`Error` at
-    /// completion — not just at the end of the whole run. A `persist`
-    /// closure that snapshots the step it's handed (cloned, since the
-    /// real step keeps mutating after each call) proves this: by the time
-    /// `run_step_graph` returns, the FIRST recorded snapshot for this
-    /// step must already show `Running` (not `Planned`), matching what a
-    /// mid-run page-open would have read from disk before the run
-    /// finished.
+    /// (#1397, revised #2517) The scheduler persists each step's OWN
+    /// post-flip state at transition time — `Running` at wave admission,
+    /// `Running` again once its own dispatch actually begins (now carrying
+    /// `started_ts`, #2517), `Complete`/`Error` at completion — not just at
+    /// the end of the whole run. A `persist` closure that snapshots the
+    /// step it's handed (cloned, since the real step keeps mutating after
+    /// each call) proves this: by the time `run_step_graph` returns, the
+    /// FIRST recorded snapshot for this step must already show `Running`
+    /// (not `Planned`), matching what a mid-run page-open would have read
+    /// from disk before the run finished — and, per #2517, that FIRST
+    /// snapshot honestly carries no `started_ts` yet (admitted, not yet
+    /// dispatched); the SECOND snapshot is the one that gains it, taken
+    /// from inside the step's own job closure right before it actually
+    /// dispatches.
+    ///
+    /// **Revised for #2517**: this test used to assert exactly 2 persist
+    /// calls (`Running` with `started_ts` already set, then `Complete`) —
+    /// that pinned the very bug #2517 fixed: `started_ts` used to be
+    /// stamped in the SAME admission-time flip that produced this test's
+    /// first persisted snapshot, so a step's `started_ts` was set before
+    /// it had actually dispatched. Now there are 3: admission (`Running`,
+    /// no `started_ts`), dispatch (`Running`, `started_ts` set), then the
+    /// terminal transition.
     #[test]
     fn run_step_graph_persists_running_before_the_step_completes() {
         let (task_a, step_a) = task_and_step("a", &[]);
@@ -3393,11 +3451,21 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(persisted.len(), 2, "one persist call at Running, one at Complete: {persisted:?}");
+        assert_eq!(
+            persisted.len(),
+            3,
+            "one persist at admission (Running, no started_ts yet), one at actual dispatch \
+             (Running, started_ts set), one at Complete: {persisted:?}"
+        );
         assert_eq!(persisted[0].status, NodeStatus::Running, "first persisted snapshot must be Running, not Planned");
-        assert!(persisted[0].started_ts.is_some());
-        assert_eq!(persisted[1].status, NodeStatus::Complete);
-        assert!(persisted[1].completed_ts.is_some());
+        assert!(
+            persisted[0].started_ts.is_none(),
+            "admitted-but-not-yet-dispatched must not carry a started_ts (#2517)"
+        );
+        assert_eq!(persisted[1].status, NodeStatus::Running);
+        assert!(persisted[1].started_ts.is_some(), "the dispatch-time persist carries started_ts");
+        assert_eq!(persisted[2].status, NodeStatus::Complete);
+        assert!(persisted[2].completed_ts.is_some());
     }
 
     /// (#1397) An errored step is ALSO persisted at its transition — the
@@ -4061,6 +4129,61 @@ mod tests {
              remote_cap=1 — its record must reflect ITS OWN near-zero dispatch \
              duration, never the ~250ms it spent waiting for the shared slot — got {}ms",
             fast.wall_ms
+        );
+    }
+
+    /// (#2517) Two steps admitted into the SAME wave (both ready at once,
+    /// both flipped to `Running` together) but forced to DISPATCH at
+    /// genuinely different wall-clock instants (queued behind
+    /// `remote_cap: 1`) must not read the same `started_ts`. Before the
+    /// fix, `started_ts` was stamped ONCE for the whole wave at admission
+    /// (`scheduler.rs`'s wave loop, before either step's `run_streaming`
+    /// had even been called) — the shipped crawl config made this visible
+    /// as six/seven identical `started_ts` values while only one unit was
+    /// actually generating (#2517).
+    ///
+    /// `a-slow` sleeps 1.5s so its dispatch and `b-fast`'s dispatch (which
+    /// cannot begin until `a-slow` finishes, under `remote_cap: 1`) are
+    /// guaranteed to fall in different whole-second buckets of
+    /// `now_unix()` — a gap over 1 second always changes `floor(now)` by
+    /// at least one, regardless of where in its own second the wave
+    /// happened to start.
+    #[test]
+    fn wave_siblings_dispatched_at_different_times_get_different_started_ts() {
+        let kind = Arc::new(SleepKind);
+        let (ta, sa) = kinded_step("a-slow", "test.sleep", json!({ "sleep_ms": 1500 }), &[]);
+        let (tb, sb) = kinded_step("b-fast", "test.sleep", json!({ "sleep_ms": 0 }), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb)]);
+
+        let kinds = StepKindRegistry::new();
+        kinds.register(kind).unwrap();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            // (deliberately 1) — forces `b-fast` to queue behind `a-slow`
+            // rather than dispatching in the same instant.
+            1,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let a_start = steps["a-slow-step"].started_ts.expect("a-slow actually dispatched");
+        let b_start = steps["b-fast-step"].started_ts.expect("b-fast actually dispatched");
+        assert!(
+            b_start > a_start,
+            "b-fast queued ~1.5s behind a-slow under remote_cap=1 — its started_ts must \
+             reflect when IT actually dispatched, not the wave-admission instant it was \
+             made ready alongside a-slow (got a_start={a_start} b_start={b_start})"
         );
     }
 
