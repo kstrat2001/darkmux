@@ -129,7 +129,21 @@ export interface Layout {
   widths: Record<string, number>;
 }
 
-export function computeLayout(nodes: GraphNode[]): Layout {
+/**
+ * (#2376) `narrow` selects the phone layout: every phase's tasks stack in a
+ * SINGLE column (dependency order top-to-bottom) instead of the desktop's
+ * side-by-side depth columns. Measured on the real 8-task, 3-phase graph
+ * `mission-lens-layout-geometry.spec.js` uses as its fixture: the desktop
+ * layout lays that graph out ~1378 flow-px wide, which forces `fitView` to
+ * ~0.24 scale to fit a 358px-wide portrait pane (#2376's own reported
+ * number) while leaving most of the pane's HEIGHT empty. Stacking narrows
+ * the band to one card's width and trades the unused width for height, so
+ * the fit becomes height- rather than width-bound and lands at a legible
+ * scale instead. `narrow` is a caller-supplied flag (see `MissionCanvas`'s
+ * `useIsMobile()` call), not something this function infers — layout is
+ * pure and has no access to viewport state of its own.
+ */
+export function computeLayout(nodes: GraphNode[], narrow = false): Layout {
   const phases = nodes.filter((n) => n.kind === "phase").sort((a, b) => a.depth - b.depth);
   const tasksByPhase: Record<string, GraphNode[]> = {};
   for (const n of nodes) {
@@ -146,42 +160,61 @@ export function computeLayout(nodes: GraphNode[]): Layout {
 
   for (const phase of phaseList) {
     const tasks = tasksByPhase[phase.id] || [];
-    const byDepth: Record<number, GraphNode[]> = {};
-    let maxDepth = 0;
-    // Re-base each band to its own first column — see mission-graph.html's
-    // `computeLayout` for the fan-in/phase-order-arrow bug this rebasing
-    // fixes. Only the per-band OFFSET is dropped; relative depths (the
-    // intra-phase dependency order) are untouched.
-    let minDepth = Infinity;
-    for (const t of tasks) minDepth = Math.min(minDepth, t.depth || 0);
-    if (!isFinite(minDepth)) minDepth = 0;
-    for (const t of tasks) {
-      const d = Math.max(0, (t.depth || 0) - minDepth);
-      maxDepth = Math.max(maxDepth, d);
-      (byDepth[d] = byDepth[d] || []).push(t);
-    }
     let maxColumnHeight = 0;
     // (#2104) Column zero starts just past the phase label — it used to
     // start a full COL_W further right, which read as a layout step missing
     // (a half-empty phase box with the card parked on its right). Each
     // column is as wide as its widest card, and the next column starts past
     // it, so a card sized to its content never overlaps its neighbor.
-    let x = PHASE_LABEL_W + COL_GAP / 2;
+    const x = PHASE_LABEL_W + COL_GAP / 2;
     let rightEdge = x;
-    for (let d = 0; d <= maxDepth; d++) {
-      const atDepth = byDepth[d] || [];
+    if (narrow) {
+      // (#2376) One column, ordered by depth (ties keep the graph's own
+      // order — `Array.prototype.sort` is stable), stacked with the same
+      // `taskPitch` the desktop columns use.
       let colW = COL_W;
       let yCursor = bandTop + BAND_PAD;
-      for (const t of atDepth) {
+      const ordered = [...tasks].sort((a, b) => (a.depth || 0) - (b.depth || 0));
+      for (const t of ordered) {
         const w = taskWidth(t);
         widths[t.id] = w;
         colW = Math.max(colW, w);
         positions[t.id] = { x, y: yCursor };
         yCursor += taskPitch((t.steps || []).length);
       }
-      maxColumnHeight = Math.max(maxColumnHeight, yCursor - (bandTop + BAND_PAD));
+      maxColumnHeight = yCursor - (bandTop + BAND_PAD);
       rightEdge = x + colW;
-      x = rightEdge + COL_GAP;
+    } else {
+      const byDepth: Record<number, GraphNode[]> = {};
+      let maxDepth = 0;
+      // Re-base each band to its own first column — see mission-graph.html's
+      // `computeLayout` for the fan-in/phase-order-arrow bug this rebasing
+      // fixes. Only the per-band OFFSET is dropped; relative depths (the
+      // intra-phase dependency order) are untouched.
+      let minDepth = Infinity;
+      for (const t of tasks) minDepth = Math.min(minDepth, t.depth || 0);
+      if (!isFinite(minDepth)) minDepth = 0;
+      for (const t of tasks) {
+        const d = Math.max(0, (t.depth || 0) - minDepth);
+        maxDepth = Math.max(maxDepth, d);
+        (byDepth[d] = byDepth[d] || []).push(t);
+      }
+      let colX = x;
+      for (let d = 0; d <= maxDepth; d++) {
+        const atDepth = byDepth[d] || [];
+        let colW = COL_W;
+        let yCursor = bandTop + BAND_PAD;
+        for (const t of atDepth) {
+          const w = taskWidth(t);
+          widths[t.id] = w;
+          colW = Math.max(colW, w);
+          positions[t.id] = { x: colX, y: yCursor };
+          yCursor += taskPitch((t.steps || []).length);
+        }
+        maxColumnHeight = Math.max(maxColumnHeight, yCursor - (bandTop + BAND_PAD));
+        rightEdge = colX + colW;
+        colX = rightEdge + COL_GAP;
+      }
     }
     if (phase.id !== "__none__") {
       positions[phase.id] = { x: 0, y: bandTop + BAND_PAD };
