@@ -9,7 +9,7 @@
  * the SAME goldens `mission-graph-goldens.spec.ts` captured from the
  * standalone page, and the e2e behavioral specs assert on these classes too.
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactFlow, {
   Background,
   Controls,
@@ -146,11 +146,63 @@ const nodeTypes = { missionNode: MissionNode, phaseGroup: PhaseGroup };
  * first firing (mount) is skipped: `MissionCanvas`'s `fitView` prop already
  * covers that one, and this component's job is only the recompute an
  * ALREADY-mounted canvas needs on a later resize.
+ *
+ * `geometrySignature` closes a SECOND race that width/height alone
+ * missed — found by instrumenting a live rotate-BACK (portrait → landscape
+ * → portrait), not by reasoning about it up front. Two earlier attempts
+ * measurably failed the SAME manual repro (rotate twice, read the real
+ * `.react-flow__viewport` transform) before this one held:
+ *
+ * 1. Passing `MissionCanvas`'s own `narrow` boolean down as an extra
+ *    dependency. `narrow` flips the instant `MissionCanvas` re-renders, but
+ *    React Flow's OWN `StoreUpdater` component (`@reactflow/core`) applies
+ *    a changed `nodes` PROP into its internal store from its OWN
+ *    `useEffect` (`useStoreUpdater(nodes, setNodes)`) — logging both sides
+ *    showed THIS component's effect firing BEFORE that one in the same
+ *    commit. Reading `narrow` raced one cycle ahead of the store:
+ *    `s.getNodes()` still held the OLD positions at the exact moment this
+ *    effect used the NEW `narrow` value to decide whether to fire, and
+ *    `fitView()` read those stale positions right back out.
+ * 2. Depending on `useStore`'s own node X-positions (`max(x) - min(x)`
+ *    across measured nodes) instead — closer, but still measurably wrong
+ *    on the SAME repro. A phase-group box's rendered CSS width changes
+ *    between the narrow and wide layouts (`computeLayout`'s per-band
+ *    `box.w`), and React Flow re-measures a node's `width`/`height` via
+ *    its OWN per-node `ResizeObserver` (`NodeRenderer`, `@reactflow/core`)
+ *    — a real, browser-scheduled callback, independent of both React's
+ *    commit cycle AND the `StoreUpdater` effect above. Task positions had
+ *    already updated to the narrow column by the time this effect ran, but
+ *    the phase box's stale (wide) MEASURED width was still what
+ *    `getNodesBounds` summed into the fit — reproducing the exact same
+ *    wrong scale as the original bug, because a wide phase box dominates
+ *    the bounding width whether or not the tasks inside it are narrow.
+ *
+ * `geometrySignature` reads BOTH position and measured size for every
+ * node — the same inputs `getNodesBounds` itself sums — so it can only
+ * change in the render where `fitView()`'s actual inputs actually did,
+ * regardless of which of the three independent async sources (this
+ * component's own effect order, `StoreUpdater`'s effect, or a per-node
+ * `ResizeObserver`) is the one still catching up. It is deliberately NOT
+ * "did the `nodes` array change at all": `rfNodes` is rebuilt on every
+ * metrics/clock tick (see the `#2325` comment on `rfNodes` below), and
+ * depending on that reference directly would re-invoke `fitView()` every
+ * tick, fighting anyone trying to pan or zoom by hand. Rounding
+ * position/size to whole pixels keeps the signature stable across a tick
+ * that only touches `data.metrics`, which never moves or resizes a node.
  */
 function RefitOnResize() {
   const { fitView } = useReactFlow();
   const width = useStore((s) => s.width);
   const height = useStore((s) => s.height);
+  const geometrySignature = useStore((s) =>
+    s
+      .getNodes()
+      .map((n) => {
+        const p = n.positionAbsolute ?? n.position;
+        return `${n.id}:${Math.round(p.x)},${Math.round(p.y)},${n.width ?? "?"},${n.height ?? "?"}`;
+      })
+      .join("|"),
+  );
   const mountedRef = useRef(false);
   useEffect(() => {
     if (!mountedRef.current) {
@@ -158,7 +210,7 @@ function RefitOnResize() {
       return;
     }
     fitView();
-  }, [width, height, fitView]);
+  }, [width, height, geometrySignature, fitView]);
   return null;
 }
 
@@ -257,11 +309,22 @@ export function MissionCanvas({
   // height, so measure once and on resize: the distance from the canvas's
   // top to the window's bottom is exactly the height it may have.
   const canvasRef = useRef<HTMLDivElement | null>(null);
+  // (#2376) Whether the CANVAS's own rendered box is taller than it is
+  // wide — the input the phone layout branch below actually needs. Seeded
+  // from the window's own aspect so the very first render already guesses
+  // right in the common case (nothing has measured the real box yet); the
+  // `fit()` callback below corrects it from the real box on every
+  // measurement, so a header/inset that eats enough vertical space to flip
+  // the aspect wins over the window-level guess.
+  const [isPortraitPane, setIsPortraitPane] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.innerHeight > window.innerWidth : false,
+  );
   useLayoutEffect(() => {
     const el = canvasRef.current;
     if (!el) return;
     const fit = () => {
-      const top = el.getBoundingClientRect().top + window.scrollY;
+      const rect = el.getBoundingClientRect();
+      const top = rect.top + window.scrollY;
       // (operator, 2026-09-05) The viewport's bottom is not the CONTENT's
       // bottom on a phone: the last `--phone-drawer-closed-h` belong to the collapsed phone
       // drawer's tab bar, which is fixed. #2058 already knew the canvas must
@@ -284,6 +347,23 @@ export function MissionCanvas({
       const inset = shell ? parseFloat(getComputedStyle(shell).paddingBottom) || 0 : 0;
       const h = Math.max(240, window.innerHeight - top - inset);
       el.style.height = `${h}px`;
+      // (#2376) The ACTUAL rendered pane's aspect, not the window's — a
+      // landscape phone's canvas is short and wide even though `isMobile`
+      // (see below) correctly stays true through the rotation, and the
+      // wide-pane case wants the desktop's side-by-side columns, not a
+      // tall single one. `rect.width` is this element's CSS-driven width
+      // (this write only ever touches `height`, so it's unaffected by the
+      // line above); `h` is the exact number React Flow's own pane resolves
+      // to next, since this div is its immediate 100%-sized container. That
+      // makes this the real pane box `fitView` fits against — reading it
+      // here (rather than reaching for React Flow's own width/height store
+      // values) avoids a real architectural snag: this effect runs in the
+      // component that CREATES `<ReactFlowProvider>`, not one of its
+      // descendants, and the store isn't readable from outside its own
+      // context without restructuring the component tree to nest the
+      // layout computation inside the provider — this box is the same
+      // number without any of that.
+      setIsPortraitPane(h > rect.width);
     };
     fit();
     window.addEventListener("resize", fit);
@@ -311,12 +391,21 @@ export function MissionCanvas({
       ro?.disconnect();
     };
   }, []);
-  // (#2376) `useIsMobile` (see its own doc) is the SAME phone/desktop test
-  // `MachineDrawer`/`App.tsx` already make — including its landscape-phone
-  // fallback, so a phone rotated to a >768px-wide landscape still gets the
-  // narrow layout rather than flipping back to the desktop's wide columns.
+  // (#2376) Two DIFFERENT questions, deliberately kept separate. `isMobile`
+  // (see that hook's own doc) answers "is this phone chrome?" — including
+  // its landscape-phone coarse-pointer fallback, so a phone rotated to a
+  // >768px-wide landscape still counts as a phone rather than flipping back
+  // to desktop chrome. `isPortraitPane` (above) answers a different
+  // question: "does the RENDERED canvas want a tall layout?" A landscape
+  // phone is still a phone (isMobile stays true) but its canvas is short
+  // and wide, and stacking a phase's tasks into one tall column is exactly
+  // the wrong trade there — it's the desktop's side-by-side columns that
+  // suit a wide-short pane, regardless of which device drew it. `narrow`
+  // is the AND of both: phone chrome AND a pane that's actually taller
+  // than it is wide.
   const isMobile = useIsMobile();
-  const layout = useMemo(() => computeLayout(graphNodes, isMobile), [graphNodes, isMobile]);
+  const narrow = isMobile && isPortraitPane;
+  const layout = useMemo(() => computeLayout(graphNodes, narrow), [graphNodes, narrow]);
   // (#2325) React Flow measures each node once and keeps the result in its own
   // store — but a CONTROLLED `nodes` update throws that measurement away, and
   // an unmeasured node renders `visibility: hidden`. Since this canvas rebuilds

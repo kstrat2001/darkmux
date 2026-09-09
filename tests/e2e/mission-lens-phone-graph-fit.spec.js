@@ -4,11 +4,22 @@
 // rotation (`fitView` is an init-only boolean prop; nothing ever asked
 // React Flow to recompute it after the pane resized).
 //
-// jsdom cannot measure a real `transform: scale(...)`, so — same as
-// mission-lens-layout-geometry.spec.js — this lives here. Assertions read
-// the ACTUAL rendered scale off `.react-flow__viewport`'s transform, not
-// visibility: a graph can be "visible" while pinned at a stale, unreadable
-// scale, which is exactly the bug this spec exists to catch.
+// (Round 2, post-review) The first fix made EVERY phone viewport narrow
+// (single-column), regardless of orientation. That helped PORTRAIT (a tall,
+// narrow pane) but actively hurt LANDSCAPE (844×390 — wide, short): a phone
+// rotated sideways has plenty of width for the desktop's side-by-side
+// columns and only ~390px of height, so stacking into one tall column is
+// exactly the wrong trade there. `narrow` is now `isMobile && isPortraitPane`
+// — phone chrome gates WHETHER a phone layout applies at all, and the
+// canvas's own measured aspect (not the window's) decides WHICH one. See
+// `MissionCanvas.tsx`'s own doc on `isPortraitPane` and `RefitOnResize`.
+//
+// jsdom cannot measure a real `transform: scale(...)` or a rendered node's
+// flow-space position, so — same as mission-lens-layout-geometry.spec.js —
+// this lives here. Assertions read the ACTUAL rendered scale and node
+// positions off the DOM, not visibility: a graph can be "visible" while
+// pinned at a stale, unreadable scale or the wrong column shape, which is
+// exactly the bug (and the regression) this spec exists to catch.
 //
 // `hasTouch`/`isMobile` context options are required, not decoration:
 // `useIsMobile`'s landscape-phone fallback gates on
@@ -25,7 +36,9 @@ const MISSION_ID = 'phone-graph-fit';
 // The same 8-task, 3-phase graph mission-lens-layout-geometry.spec.js uses —
 // large enough that the desktop layout's side-by-side depth columns really
 // do run ~1378 flow-px wide, which is what forces the width-bound fit this
-// spec is checking for.
+// spec is checking for. `bundle` (depth 0) and `dedup` (depth 2) land in
+// DIFFERENT columns under the wide layout and the SAME column under the
+// narrow one — the geometry fact the layout-shape assertions below key on.
 function graphSnapshot() {
   const two = (id, label, parentId, depth) => ({
     id, kind: 'task', label, parentId, status: 'complete', depth,
@@ -105,7 +118,30 @@ async function getScale(page) {
   });
 }
 
-test('phone portrait: the graph is no longer width-bound to a near-zero scale', async ({ page }) => {
+// Reads a node's FLOW-space x (the `translate(Xpx, Ypx)` React Flow stamps
+// on `.react-flow__node` itself, in layout coordinates) rather than its
+// on-screen bounding box — the viewport's own pan/zoom transform sits on a
+// PARENT element, so this is unaffected by whatever scale `fitView` landed
+// on. `computeLayout`'s narrow branch puts every task in a phase at the
+// SAME x; the wide (desktop) branch spreads them across depth columns.
+async function getFlowX(page, nodeId) {
+  return page.evaluate((id) => {
+    const n = document.querySelector(`.react-flow__node[data-id="${id}"]`);
+    if (!n) return null;
+    const m = /translate\(([-\d.]+)px/.exec(n.style.transform || '');
+    return m ? parseFloat(m[1]) : null;
+  }, nodeId);
+}
+
+// True once `bundle` (depth 0) and `dedup` (depth 2) share a column — the
+// narrow (phone-portrait) layout's signature. False under the wide
+// (desktop / phone-landscape) layout, where they land in different columns.
+async function isNarrowLayout(page) {
+  const [bundleX, dedupX] = await Promise.all([getFlowX(page, 'bundle'), getFlowX(page, 'dedup')]);
+  return bundleX !== null && bundleX === dedupX;
+}
+
+test('phone portrait: the graph is no longer width-bound to a near-zero scale, and uses the narrow (single-column) layout', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await routeAll(page);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
@@ -120,6 +156,27 @@ test('phone portrait: the graph is no longer width-bound to a near-zero scale', 
   // below the old width-bound number — a regression back to the old
   // side-by-side desktop columns would land under 0.25 again.
   expect(scale, `portrait scale ${scale} is not meaningfully above the reported width-bound 0.236522`).toBeGreaterThan(0.3);
+  expect(await isNarrowLayout(page), 'portrait uses the narrow (single-column) layout').toBe(true);
+});
+
+test('phone landscape: uses the WIDE (desktop-style) layout, not narrow — no regression from the portrait fix', async ({ page }) => {
+  await page.setViewportSize({ width: 844, height: 390 });
+  await routeAll(page);
+  await page.goto(`/index-live.html#mission=${MISSION_ID}`);
+  await ensureCanvas(page);
+  await expect.poll(() => getScale(page), { timeout: 5000 }).not.toBeNull();
+  // The pane here is wide and short (isMobile stays true via the
+  // coarse-pointer landscape fallback, but the CANVAS itself is nothing
+  // like portrait's tall/narrow shape) — stacking into one tall column was
+  // measurably WORSE here (0.200535 -> 0.153218 on this exact fixture, an
+  // earlier round of this fix that a review caught before it shipped).
+  // `narrow` must stay false for this pane shape regardless of `isMobile`.
+  expect(await isNarrowLayout(page), 'landscape must NOT use the narrow layout').toBe(false);
+  const scale = await getScale(page);
+  // Measured on this exact fixture at this exact viewport, both BEFORE
+  // #2376 and after this (corrected) fix: 0.200535. The always-narrow
+  // regression measured 0.153218 here — well below this floor.
+  expect(scale, `landscape scale ${scale} regressed toward the narrow-everywhere number (0.153218)`).toBeGreaterThan(0.19);
 });
 
 test('desktop: the fit is unaffected (inverted case — the phone layout branch must be a no-op here)', async ({ page }) => {
@@ -133,15 +190,17 @@ test('desktop: the fit is unaffected (inverted case — the phone layout branch 
   // wrongly applied the narrow (phone) layout to desktop would collapse the
   // side-by-side columns and shrink this well below 0.45.
   expect(scale, `desktop scale ${scale} moved — the narrow layout branch leaked into desktop`).toBeGreaterThan(0.45);
+  expect(await isNarrowLayout(page), 'desktop must never use the narrow layout').toBe(false);
 });
 
-test('rotating a phone canvas RE-FITS instead of keeping the old scale (#2376)', async ({ page }) => {
+test('rotating a phone canvas RE-FITS and reshapes the LAYOUT each time, not just the scale (#2376)', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await routeAll(page);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
   await ensureCanvas(page);
   await expect.poll(() => getScale(page), { timeout: 5000 }).not.toBeNull();
   const portraitScale = await getScale(page);
+  expect(await isNarrowLayout(page), 'portrait starts narrow').toBe(true);
 
   // Rotate: 390x844 portrait -> 844x390 landscape. A phone rotated to
   // landscape is WIDER than the 768px breakpoint, which is exactly why
@@ -162,11 +221,25 @@ test('rotating a phone canvas RE-FITS instead of keeping the old scale (#2376)',
     .not.toBe(portraitScale);
   const landscapeScale = await getScale(page);
   expect(landscapeScale, 'landscape scale is a real number, not a stale/NaN transform').toBeGreaterThan(0);
+  // Not just a different NUMBER — a genuinely different LAYOUT SHAPE.
+  // Regressed once already (round 1 of this fix kept the narrow layout
+  // through rotation and only re-fit the scale around it); this is the
+  // assertion that catches that regression coming back.
+  await expect.poll(() => isNarrowLayout(page), { message: 'landscape reshapes to the wide layout' }).toBe(false);
 
-  // Rotate back — the re-fit isn't a one-way trip; it recomputes again for
-  // whatever the CURRENT pane is, every time.
+  // Rotate back — the re-fit isn't a one-way trip; it recomputes SCALE and
+  // LAYOUT again for whatever the CURRENT pane is, every time. This exact
+  // transition (landscape -> portrait) is where the original attempt at
+  // this fix broke: the scale got stuck re-fitting against the WIDE
+  // layout's bounds because of a real ordering race between this
+  // component's own effect and two independent React-Flow-internal ones
+  // (see `RefitOnResize`'s doc in `MissionCanvas.tsx` for the full account
+  // of what was actually racing and how `geometrySignature` closes it).
   await page.setViewportSize({ width: 390, height: 844 });
   await expect
-    .poll(() => getScale(page), { message: 'graph re-fits back on the return rotation', timeout: 5000 })
+    .poll(() => isNarrowLayout(page), { message: 'graph reshapes back to narrow on the return rotation' })
+    .toBe(true);
+  await expect
+    .poll(() => getScale(page), { message: 'graph re-fits back to the original portrait scale on the return rotation', timeout: 5000 })
     .toBeCloseTo(portraitScale, 5);
 });
