@@ -8700,7 +8700,16 @@ fn map_load_result(
 }
 
 fn probe_loaded_model_list() -> Result<Vec<String>> {
+    // (#1863) This spawn bypasses darkmux-profiles' `run_bounded` chokepoint
+    // entirely — it shells out to `lms` directly on the dispatch path — so it
+    // needs its own cwd pin. A daemon/dispatch process started from a git
+    // worktree that later gets deleted (routine in this project's own
+    // workflow) otherwise inherits a cwd that no longer exists, and spawning
+    // any child from it fails outright. `/` needs no resolution and is
+    // guaranteed to exist for the process's whole life; `lms` never reads or
+    // writes relative to cwd.
     let output = Command::new("lms")
+        .current_dir("/")
         .args(["ps", "--json"])
         .output()
         .context("running `lms ps --json` to enumerate loaded models")?;
