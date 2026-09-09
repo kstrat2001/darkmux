@@ -4858,9 +4858,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // fallback is named in the load message (operator sovereignty, #44) —
     // never silently substituted.
     //
-    // Best-effort (warn, don't abort — a compaction-less short dispatch still
-    // runs); skipped for the mock-model harness (no real LMStudio to load into,
-    // same gate as the dispatch model's residency).
+    // Warns rather than aborting; skipped for the mock-model harness (no real
+    // LMStudio to load into, same gate as the dispatch model's residency).
+    //
+    // (#2536) "Warn, don't abort" no longer means "degrade gracefully". A
+    // compaction-LESS dispatch still runs, but a dispatch that DOES compact now
+    // dies at its first compaction when this load failed — the wire carries the
+    // namespaced identifier, and there is no instance behind it. See
+    // `ensure_utility_resident`'s doc.
     if opts.model_base_url_override.is_none() {
         if let Some(compactor_id) = compaction.compactor_model.clone() {
             let compactor_n_ctx = resolve_compactor_n_ctx_internal(
@@ -4878,9 +4883,37 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                          ({window}) as a fallback. (#1616)"
                     );
                 }
-                if let Some(warning) = ensure_utility_resident(
-                    Some(compactor_id.as_str()),
-                    Some(window),
+                // (#2536) `apply_compactor_residency` both ensures residency
+                // (delegating to `ensure_utility_resident`, unchanged) AND
+                // WRITES `compaction.compactor_model` — the SAME darkmux-
+                // namespaced identifier the residency load just created (or
+                // reused) it under, mirroring `dispatch_wire_model_id`'s
+                // treatment of the main dispatch model (#2240). Pre-#2536, this
+                // field kept whatever spelling `internal.utility` used (#1615
+                // tolerates a bare key OR an already-namespaced identifier), so
+                // an operator who wrote the bare key got a compactor LOADED
+                // under `darkmux:<key>` but ADDRESSED as `<key>` on the wire —
+                // the exact split #2240 closed one binding over.
+                //
+                // (#2536 review, blocker 1) The ASSIGNMENT lives INSIDE that
+                // function deliberately. The first cut of this fix left it here
+                // as a bare `compaction.compactor_model = wire_id;` beside a
+                // helper that merely RETURNED the id — and neutering that one
+                // statement to `let _ = wire_id;` restored the pre-fix bug
+                // verbatim while all 1559 tests stayed green, because every test
+                // stopped at the helper's return value. Moving the write into
+                // the tested function is what makes the effect observable.
+                //
+                // Still NOT covered, stated plainly: deleting this whole call
+                // compiles and stays green. Everything past it crosses the
+                // docker-spawn boundary, so covering it needs a dispatch()-level
+                // integration test this crate does not have — and the mock-model
+                // harness cannot supply one, since the enclosing
+                // `model_base_url_override.is_none()` gate skips this block.
+                if let Some(warning) = apply_compactor_residency(
+                    &mut compaction,
+                    &compactor_id,
+                    window,
                     ensure_model_loaded_at_ctx,
                 ) {
                     eprintln!("{warning}");
@@ -9470,11 +9503,26 @@ fn utility_residency_pm(util_id: &str, context_window: u32) -> darkmux_types::Pr
 /// (#1280) Ensure the utility/compactor model is resident at the compaction
 /// context window via `load` (production: `ensure_model_loaded_at_ctx`, which
 /// loads under the `darkmux:` namespace with the bounded #1139 machinery).
-/// Returns `Some(warning)` on a load failure — WARN, never abort: a
-/// compaction-less short dispatch still runs; the warning names the risk
-/// (JIT-load at the model default, truncated summaries). `None` when there is
-/// no compactor, no window, or the load succeeded. Pure over the injected
-/// `load` so the warn-not-abort contract is unit-testable without LMStudio.
+/// Returns `Some(warning)` on a load failure. `None` when there is no
+/// compactor, no window, or the load succeeded. Pure over the injected `load`
+/// so the contract is unit-testable without LMStudio.
+///
+/// **This function warns rather than aborting, but since #2536 that no longer
+/// means the dispatch degrades gracefully.** Pre-#2536 the wire carried a bare
+/// model key, so a failed load left compaction to JIT-load a copy at
+/// LMStudio's own default context — degraded (truncated summaries) but
+/// completing, which is what "WARN, never abort" bought. The wire now carries
+/// the darkmux IDENTIFIER (`apply_compactor_residency`), which exists only
+/// while our instance is resident: after a failed load LMStudio answers with a
+/// hard 400 rather than loading anything, and the runtime propagates a
+/// compaction failure (`compaction::compact(..)?` in
+/// `runtime/src/loop_runner.rs`) — so the dispatch DIES at its first
+/// compaction, hours in, on exactly the long runs compaction exists to save.
+/// That is #2240's disclosed loud-over-silent trade inherited here, with one
+/// difference worth naming: #2240's version fails BEFORE the dispatch starts,
+/// this one fails mid-run. The warning below is therefore an
+/// early-abort-worthy signal, not a footnote; whether it should abort here
+/// instead is a live question, not a settled design.
 fn ensure_utility_resident(
     compactor_model: Option<&str>,
     context_window: Option<u32>,
@@ -9487,10 +9535,83 @@ fn ensure_utility_resident(
         Ok(()) => None,
         Err(e) => Some(format!(
             "darkmux dispatch: WARNING — utility/compactor model `{util_id}` could not be \
-             ensured resident at n_ctx={window}: {e:#}. Compaction may JIT-load it at the \
-             model default and truncate its summaries. (#1280)"
+             ensured resident at n_ctx={window}: {e:#}. This dispatch still starts, but \
+             compaction now addresses `{}` — darkmux's own instance, which this failed \
+             load did not create — so the FIRST compaction will fail and end the run. \
+             Fix the load (RAM, model id, LMStudio) before starting a long dispatch. \
+             (#1280/#2536)",
+            compactor_wire_model_id(util_id)
         )),
     }
+}
+
+/// (#2536) The wire `--compactor-model` id for a compactor darkmux actually
+/// ensured resident: the SAME darkmux-namespaced identifier `utility_
+/// residency_pm` / `ensure_model_loaded_at_ctx` load it under — the
+/// compactor's own instance of the split #2240 closed for the main dispatch
+/// model.
+///
+/// `internal.utility` accepts either spelling (#1615: a bare LMStudio key OR
+/// an already-namespaced `darkmux:<key>` identifier). `bare_model_key` strips
+/// a leading `darkmux:` if present before `namespaced_identifier` re-applies
+/// it, so both spellings converge on the identical wire id here — the same
+/// normalize-once shape `ensure_model_resident` and `resolve_compactor_n_ctx_
+/// internal` already apply to this same value.
+///
+/// Unlike `dispatch_wire_model_id` (the main dispatch model's sibling), there
+/// is no `profile.models[]` entry consulted for an explicit `identifier`
+/// opt-out: `utility_residency_pm` synthesizes the compactor's `ProfileModel`
+/// fresh with `identifier: None`, so the LOAD itself never honors one either
+/// — this mirrors that exactly rather than widening it. The two computations
+/// therefore AGREE on a bare key with no opt-out and DIVERGE the moment a
+/// profile entry names one; `wire_model_id_computations_agree_without_an_
+/// identifier_opt_out_and_diverge_with_one` pins both halves. Collapsing them
+/// into one shared helper is #2537's concern, not this fix's.
+///
+/// (#2571, out of scope) This closes the shape where `internal.utility` IS
+/// bound. When it is UNSET the host skips the residency block entirely
+/// (`compaction.compactor_model` is `None`) and the runtime falls back to its
+/// own `DEFAULT_COMPACTOR_MODEL` — itself already namespaced
+/// (`darkmux:qwen3-4b-instruct-2507`, `runtime/src/compaction.rs`) — so
+/// compaction addresses a darkmux instance nothing on the host ever loaded.
+/// Pre-existing and unchanged by #2536; filed as #2571.
+pub(crate) fn compactor_wire_model_id(compactor_id: &str) -> String {
+    darkmux_gestalt::namespaced_identifier(bare_model_key(compactor_id), None)
+}
+
+/// (#2536) Ensure the compactor is resident AND write the wire id it was made
+/// resident under onto `compaction.compactor_model` — the field that becomes
+/// the container's `--compactor-model` flag and then the `model` field of the
+/// compactor's own chat-completions request (`runtime/src/compaction.rs`).
+///
+/// The ensure and the WRITE are one function on purpose (#2536 review, blocker
+/// 1): a variant that only returned the id left the single assignment at the
+/// call site untested, so deleting it restored the bug with a green suite.
+/// Everything the call site still has to do is print the returned warning.
+///
+/// Both parameters are non-optional. The load's two preconditions — a
+/// configured compactor, and a window to load it at — are the caller's `if let
+/// Some(compactor_id)` and `if let Some(window)` guards, so an "ensured
+/// nothing, namespace nothing" arm inside here would be unreachable from the
+/// only call site (#2536 review, finding 2). When either guard fails, no load
+/// is attempted and this is simply not called: `compaction.compactor_model`
+/// keeps the configured spelling, exactly as pre-#2536.
+///
+/// A load FAILURE still writes the namespaced id (alongside the warning): the
+/// load was attempted under that identifier, and addressing a bare key instead
+/// would silently JIT-load at the wrong context (the #1135 ghost). See
+/// `ensure_utility_resident`'s doc for what that failure now costs — since
+/// this change the run dies at its first compaction rather than degrading.
+fn apply_compactor_residency(
+    compaction: &mut crate::dispatch::CompactionDispatchArgs,
+    compactor_id: &str,
+    context_window: u32,
+    ensure_resident: impl Fn(&darkmux_types::ProfileModel) -> Result<()>,
+) -> Option<String> {
+    let warning =
+        ensure_utility_resident(Some(compactor_id), Some(context_window), ensure_resident);
+    compaction.compactor_model = Some(compactor_wire_model_id(compactor_id));
+    warning
 }
 
 /// (#408) Whether a selected-vs-loaded model mismatch should be fatal.

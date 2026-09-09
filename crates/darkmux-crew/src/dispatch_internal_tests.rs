@@ -9002,9 +9002,14 @@
         assert_eq!(darkmux_profiles::swap::namespaced_identifier(&pm), "darkmux:util-4b");
     }
 
-    /// Warn, never abort: a failed utility load yields a warning naming the
-    /// model, the window, and the truncation risk — the dispatch proceeds
-    /// (a compaction-less short dispatch still runs).
+    /// Warn, don't abort HERE: a failed utility load yields a warning naming
+    /// the model, the window, and — since #2536 — the real consequence. The
+    /// dispatch still starts, but the wire now carries the namespaced
+    /// identifier this failed load did not create, so compaction gets a 400
+    /// and `runtime/src/loop_runner.rs` propagates it: the run ends at its
+    /// first compaction. The pre-#2536 text promised a JIT-load at the model
+    /// default and truncated summaries, which this fix made impossible — an
+    /// identifier is not a model key, so there is nothing to JIT-load.
     #[test]
     fn ensure_utility_resident_warns_and_does_not_abort_on_load_failure() {
         let warning = super::ensure_utility_resident(Some("util-4b"), Some(68_000), |_pm| {
@@ -9013,8 +9018,20 @@
         .expect("a failed load must produce a warning");
         assert!(warning.contains("util-4b"), "{warning}");
         assert!(warning.contains("68000"), "{warning}");
-        assert!(warning.contains("truncate"), "{warning}");
         assert!(warning.contains("WARNING"), "{warning}");
+        assert!(
+            warning.contains("darkmux:util-4b"),
+            "the warning must name the identifier compaction will actually address: {warning}"
+        );
+        assert!(
+            warning.contains("compaction will fail and end the run"),
+            "the warning must state the real post-#2536 consequence: {warning}"
+        );
+        assert!(
+            !warning.contains("JIT-load") && !warning.contains("truncate"),
+            "the pre-#2536 JIT-load/truncation claim is now false — an identifier is not a \
+             model key, so nothing JIT-loads: {warning}"
+        );
     }
 
     /// Success and not-configured are both silent (no warning): the load ran
@@ -9032,6 +9049,269 @@
 
         assert!(super::ensure_utility_resident(None, Some(68_000), |_| Ok(())).is_none());
         assert!(super::ensure_utility_resident(Some("util-4b"), None, |_| Ok(())).is_none());
+    }
+
+    // ── (#2536) The compactor's WIRE model id must be the namespaced identifier ──
+    //
+    // Same split #2240 closed for the main dispatch model, one binding over:
+    // `ensure_utility_resident` always LOADS the compactor under
+    // `darkmux:<bare-key>` (`utility_residency_pm` → `ensure_model_loaded_at_ctx`
+    // → `namespaced_identifier`), but pre-#2536 `dispatch()` left
+    // `compaction.compactor_model` — the value that becomes `--compactor-model`
+    // on the container and then `model` on the compactor's own chat-completions
+    // request (`runtime/src/compaction.rs`) — as whatever spelling
+    // `internal.utility` used. #1615 lets an operator write that binding as
+    // either a bare LMStudio key or an already-namespaced identifier, so a bare
+    // spelling produced exactly the split this issue names: loaded under one
+    // identifier, addressed by another.
+
+    /// The regression itself, as a pure computation: a bare `internal.utility`
+    /// key must resolve to the SAME namespaced identifier the residency load
+    /// uses (`utility_residency_pm_namespaces_like_the_dispatch_model`, above).
+    #[test]
+    fn compactor_wire_model_id_namespaces_a_bare_key() {
+        assert_eq!(super::compactor_wire_model_id("qwen3-4b-instruct-2507"), "darkmux:qwen3-4b-instruct-2507");
+    }
+
+    /// Trap 2 from this session: the utility binding accepts BOTH spellings
+    /// (#1615). An operator who already wrote `internal.utility` as
+    /// `darkmux:qwen3-4b-instruct-2507` must get the identical wire id back,
+    /// not a double-prefixed `darkmux:darkmux:...` — `bare_model_key` strips
+    /// the prefix before `namespaced_identifier` re-applies it.
+    #[test]
+    fn compactor_wire_model_id_is_idempotent_over_an_already_namespaced_key() {
+        assert_eq!(
+            super::compactor_wire_model_id("darkmux:qwen3-4b-instruct-2507"),
+            super::compactor_wire_model_id("qwen3-4b-instruct-2507"),
+            "both spellings of internal.utility must converge on one wire id"
+        );
+        assert_eq!(
+            super::compactor_wire_model_id("darkmux:qwen3-4b-instruct-2507"),
+            "darkmux:qwen3-4b-instruct-2507"
+        );
+    }
+
+    // ── (#2536 review, blocker 1) The ASSIGNMENT, not just the pure helper ──
+    //
+    // `compactor_wire_model_id` alone proves nothing about what reaches
+    // `compaction.compactor_model`. The first cut of this fix computed the id
+    // in a helper and STORED it in a bare statement at the `dispatch()` call
+    // site — and replacing that one statement with `let _ = wire_id;` (the
+    // pre-fix behavior verbatim) built clean and left 1559/1559 tests passing,
+    // because the red-prove had mutated the helper's RETURN VALUE, never the
+    // store. That is the same gap #2240's own review found on the main-model
+    // sibling of this bug, one binding over.
+    //
+    // The write therefore moved INTO `apply_compactor_residency`, and these
+    // tests drive that function — so deleting the assignment now reds. What
+    // remains uncovered is disclosed at the call site: deleting the whole call
+    // still compiles and stays green.
+
+    /// RED on "delete `compaction.compactor_model = ..` inside
+    /// `apply_compactor_residency`" and on "store the bare id instead of the
+    /// namespaced one": a compactor darkmux ensured resident must be ADDRESSED
+    /// under that same residency.
+    #[test]
+    fn apply_compactor_residency_writes_the_namespaced_id_onto_the_compaction_args() {
+        let ensured: std::sync::Mutex<Vec<(String, Option<u32>)>> = std::sync::Mutex::new(Vec::new());
+        let mut compaction = crate::dispatch::CompactionDispatchArgs {
+            compactor_model: Some("util-4b".to_string()),
+            context_window: Some(120_000),
+            ..Default::default()
+        };
+        let warning = super::apply_compactor_residency(&mut compaction, "util-4b", 68_000, |pm| {
+            ensured.lock().unwrap().push((pm.id.clone(), pm.n_ctx));
+            Ok(())
+        });
+        assert!(warning.is_none(), "a successful load must not warn: {warning:?}");
+        assert_eq!(
+            ensured.lock().unwrap().as_slice(),
+            &[("util-4b".to_string(), Some(68_000))],
+            "the residency load must still run, at the resolved COMPACTOR window (#1616), \
+             for the configured compactor"
+        );
+        assert_eq!(
+            compaction.compactor_model.as_deref(),
+            Some("darkmux:util-4b"),
+            "this field becomes the container's --compactor-model flag and then the \
+             compactor's own chat-completions `model` — it must be darkmux's own \
+             namespaced identifier, not the bare key (#2536)"
+        );
+        assert_eq!(
+            compaction.context_window,
+            Some(120_000),
+            "the PRIMARY model's window (the compaction TRIGGER input) must not be \
+             overwritten by the compactor's LOAD window (#1616)"
+        );
+    }
+
+    /// The same write, followed all the way to the argv the container is
+    /// actually spawned with — the flag whose value the compactor sends as its
+    /// `model` field. Pins the two halves together: if either the store or the
+    /// argv wiring regresses, this reds.
+    #[test]
+    fn apply_compactor_residency_puts_the_namespaced_id_on_the_container_argv() {
+        let mut compaction = crate::dispatch::CompactionDispatchArgs {
+            compactor_model: Some("util-4b".to_string()),
+            context_window: Some(120_000),
+            ..Default::default()
+        };
+        let warning =
+            super::apply_compactor_residency(&mut compaction, "util-4b", 68_000, |_pm| Ok(()));
+        assert!(warning.is_none());
+
+        let config = DockerRunConfig {
+            output_schema: None,
+            container_name: "darkmux-dispatch-compactor-wire".to_string(),
+            workspace: PathBuf::from("/tmp/ws"),
+            host_out: PathBuf::from("/tmp/out"),
+            mod_attachment_mounts: Vec::new(),
+            inject: false,
+            runtime_binary: None,
+            image: "darkmux-runtime:latest".to_string(),
+            role_id: "test-role".to_string(),
+            session_id: "sess-test".to_string(),
+            model: "primary-model".to_string(),
+            system_prompt: "Basic role.".to_string(),
+            message: "Hello world".to_string(),
+            json: false,
+            allowed_tools: None,
+            compaction,
+            feedback_templates: serde_json::Value::Null,
+            cache_dir: PathBuf::from("/tmp/cache"),
+            feedback_injection: false,
+            turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::BuiltIn,
+            ),
+            max_pause_ms_env: None,
+            remote_chat_url: None,
+            remote_needs_auth: false,
+            base_url_override: None,
+            workspace_read_only: false,
+            resume_checkpoint: false,
+        };
+        let argv = build_docker_run_argv(&config);
+        let flag = argv
+            .iter()
+            .position(|a| a == "--compactor-model")
+            .expect("the compactor flag must be on the argv");
+        assert_eq!(
+            argv[flag + 1],
+            "darkmux:util-4b",
+            "the container is spawned addressing the bare key, not darkmux's own \
+             instance (#2536): {argv:?}"
+        );
+    }
+
+    /// Trap 2, exercised through the same function: a compactor already
+    /// declared under the namespaced spelling must land on the identical wire
+    /// id a bare spelling would (#1615 accepts both).
+    #[test]
+    fn apply_compactor_residency_agrees_across_both_utility_binding_spellings() {
+        let mut bare = crate::dispatch::CompactionDispatchArgs {
+            compactor_model: Some("util-4b".to_string()),
+            ..Default::default()
+        };
+        super::apply_compactor_residency(&mut bare, "util-4b", 68_000, |_| Ok(()));
+        let mut namespaced = crate::dispatch::CompactionDispatchArgs {
+            compactor_model: Some("darkmux:util-4b".to_string()),
+            ..Default::default()
+        };
+        super::apply_compactor_residency(&mut namespaced, "darkmux:util-4b", 68_000, |_| Ok(()));
+        assert_eq!(
+            bare.compactor_model, namespaced.compactor_model,
+            "#1615: both spellings of internal.utility must dispatch identically"
+        );
+        assert_eq!(bare.compactor_model.as_deref(), Some("darkmux:util-4b"));
+    }
+
+    /// #2240's disclosed trade, inherited here: a load FAILURE still writes the
+    /// namespaced wire id (alongside the warning) — the load was attempted
+    /// under that identifier, and falling back to a bare key would silently
+    /// JIT-load at the wrong context (the #1135 ghost this residency mechanism
+    /// exists to close). What that costs is NOT the same as #2240's version and
+    /// is stated in `ensure_utility_resident`'s doc + warning: the dispatch now
+    /// dies at its first compaction rather than degrading.
+    #[test]
+    fn apply_compactor_residency_stays_namespaced_on_a_load_failure() {
+        let mut compaction = crate::dispatch::CompactionDispatchArgs {
+            compactor_model: Some("util-4b".to_string()),
+            ..Default::default()
+        };
+        let warning = super::apply_compactor_residency(&mut compaction, "util-4b", 68_000, |_pm| {
+            anyhow::bail!("insufficient RAM")
+        });
+        assert!(warning.is_some(), "a load failure must still warn");
+        assert_eq!(
+            compaction.compactor_model.as_deref(),
+            Some("darkmux:util-4b"),
+            "the load was attempted under the namespaced identifier even though it failed"
+        );
+    }
+
+    // ── (#2536 / #2537 / #2570) The two derived wire-id computations ────────
+    //
+    // FOUR production sites put a model id on a dispatch WIRE. Two DERIVE the
+    // darkmux-namespaced identifier: `dispatch_wire_model_id` (the main
+    // dispatch model, #2240) and `compactor_wire_model_id` (the compactor,
+    // #2536). The other two pass a config string through VERBATIM while their
+    // own `seat()` derives the namespaced identifier for the LOAD —
+    // `dispatch.single_shot` (`step_kinds/builtins.rs`) and `dispatch.map` —
+    // i.e. the same load/wire split this fix closes, still open there and
+    // filed as #2570. This test speaks only for the two derived ones.
+    //
+    // It pins BOTH halves of their relationship, because they are not simply
+    // "in agreement" (#2536 review, finding 2): with no `identifier` opt-out
+    // they must produce the same id, and the moment a profile entry names one
+    // they must DIVERGE — the main path honors the operator's alias, the
+    // compactor path cannot, since `utility_residency_pm` synthesizes its
+    // `ProfileModel` with `identifier: None` and the LOAD therefore never
+    // honors one either. Asserting only the agreeing half would have hidden
+    // the one input where these two genuinely differ. #2537 tracks collapsing
+    // them; whoever does that must decide which side the opt-out lands on, and
+    // this test is what will tell them the choice exists.
+    #[test]
+    fn wire_model_id_computations_agree_without_an_identifier_opt_out_and_diverge_with_one() {
+        use darkmux_types::{Profile, ProfileModel};
+        let bare_key = "qwen3-4b-instruct-2507";
+        let profile_of = |identifier: Option<&str>| Profile {
+            extras: Default::default(),
+            description: None,
+            default_model: None,
+            models: vec![ProfileModel {
+                endpoint: None,
+                extras: Default::default(),
+                id: bare_key.into(),
+                n_ctx: Some(120_000),
+                capabilities: Default::default(),
+                identifier: identifier.map(str::to_string),
+            }],
+            runtime: None,
+            use_when: None,
+        };
+
+        assert_eq!(
+            super::dispatch_wire_model_id(bare_key, &profile_of(None)),
+            super::compactor_wire_model_id(bare_key),
+            "with no opt-out, the main dispatch model and the compactor must dispatch \
+             against the identical namespaced identifier for the same bare model key \
+             (#2536/#2537)"
+        );
+
+        assert_eq!(
+            super::dispatch_wire_model_id(bare_key, &profile_of(Some("my-own-alias"))),
+            "my-own-alias",
+            "the main path honors an explicit profile `identifier` (#2240)"
+        );
+        assert_eq!(
+            super::compactor_wire_model_id(bare_key),
+            "darkmux:qwen3-4b-instruct-2507",
+            "the compactor path cannot honor one — `utility_residency_pm` builds its \
+             ProfileModel with `identifier: None`, so the LOAD never honors one either, \
+             and the wire mirrors the load exactly (#2536)"
+        );
     }
 
     // ─── #1139 map_load_result: bounded-load outcome → actionable error ───
