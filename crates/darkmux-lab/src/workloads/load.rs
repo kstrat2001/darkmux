@@ -21,6 +21,15 @@
 //! `darkmux_types::config_access::templates_override_dirs`, so "run this
 //! checkout's templates" is one env var away, deliberately, rather than an
 //! accident of `pwd`.
+//!
+//! **This is the on-disk (`builtin_dirs`) tier only — it does NOT make the
+//! USER tier above it cwd-insensitive too.** `lab::run::lab_run` resolves
+//! that tier via `paths::resolve(ResolveScope::Auto)`, which still returns
+//! `<cwd>/.darkmux` when the shell happens to be standing inside a directory
+//! that has one, so a workload can still resolve differently by cwd through
+//! that tier. `mission_config::load` avoids this on its own user tier via
+//! `ResolveScope::ForceUser` (#1012); doing the same here is tracked
+//! separately as #2590, deliberately out of scope for this fix.
 
 use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource};
 use anyhow::{Context, Result, anyhow, bail};
@@ -91,17 +100,30 @@ fn find_embedded(id: &str) -> Option<&'static str> {
 /// from `env(DARKMUX_TEMPLATES_DIR)` then `config.dirs.templates` (#661 Slice 3),
 /// prepended ahead of home/system.
 ///
-/// **(#2553) Deliberately NOT cwd-sensitive.** An earlier version of this
-/// function also pushed `<cwd>/templates/builtin/workloads`, so the document
-/// that won depended on which directory the shell happened to be in when
-/// `darkmux` ran — invisible to an operator who didn't already know to
-/// suspect it, and dangerous specifically when the cwd's document shares the
-/// binary's schema but has DIFFERENT content (a stale or half-edited
-/// worktree), because that case parses cleanly with no error to catch it.
-/// Same reasoning as `mission_config::load::builtin_dirs` (#2432). The
-/// explicit `templates_override_dirs()` tier above already gives an
-/// operator who wants "this checkout's templates" exactly that, on purpose:
+/// **(#2553) This ON-DISK tier is deliberately NOT cwd-sensitive.** An
+/// earlier version of this function also pushed
+/// `<cwd>/templates/builtin/workloads`, so the document that won depended on
+/// which directory the shell happened to be in when `darkmux` ran —
+/// invisible to an operator who didn't already know to suspect it, and
+/// dangerous specifically when the cwd's document shares the binary's schema
+/// but has DIFFERENT content (a stale or half-edited worktree), because that
+/// case parses cleanly with no error to catch it. Same reasoning as
+/// `mission_config::load::builtin_dirs` (#2432). The explicit
+/// `templates_override_dirs()` tier above already gives an operator who
+/// wants "this checkout's templates" exactly that, on purpose:
 /// `DARKMUX_TEMPLATES_DIR=$PWD/templates/builtin`.
+///
+/// **This does NOT make workload resolution as a whole cwd-insensitive —
+/// only this one tier.** The USER tier (searched by [`load`] before this
+/// function ever runs) still comes from `lab::run::lab_run`'s
+/// `paths::resolve(ResolveScope::Auto)`, which resolves to `<cwd>/.darkmux`
+/// whenever that directory exists — so a `./.darkmux/workloads/<id>.json`
+/// sitting in the shell's cwd still wins over every tier this function
+/// searches, same as it always did. `mission_config::load` closed that same
+/// gap on its own user tier by resolving through `ResolveScope::ForceUser`
+/// instead (#1012, `crate::loader::mission_configs_dir`); `lab_run`'s user
+/// tier was deliberately left on `Auto` here and stays cwd-sensitive by
+/// design, tracked separately as #2590.
 fn builtin_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for base in darkmux_types::config_access::templates_override_dirs() {

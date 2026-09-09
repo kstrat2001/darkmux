@@ -17,13 +17,16 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
         // now the sole member of the `workload` kind-family.
         LabCmd::Workload { sub } => match sub {
             WorkloadCmd::List => {
-                let ids = lab::run::lab_workloads();
-                if ids.is_empty() {
-                    println!("(no workloads found — check templates/builtin/workloads/ or .darkmux/workloads/)");
-                } else {
-                    for id in ids {
-                        println!("{id}");
-                    }
+                // (#2553 cleanup) No empty-list branch: `list_available`
+                // unconditionally inserts every `EMBEDDED_WORKLOADS` id, a
+                // fixed non-empty compiled-in set, so `lab_workloads()` can
+                // never return empty — the branch that used to print
+                // "no workloads found — check templates/builtin/workloads/"
+                // was dead code, and doubly so after this PR dropped the
+                // cwd-relative `templates/builtin/workloads/` search that
+                // path's own text referred to.
+                for id in lab::run::lab_workloads() {
+                    println!("{id}");
                 }
                 Ok(0)
             }
