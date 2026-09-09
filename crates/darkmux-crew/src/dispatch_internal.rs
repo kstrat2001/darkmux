@@ -3148,6 +3148,23 @@ fn dispatch_remote(
         ),
     );
 
+    // (#2344) Session-liveness heartbeat — the in-process twin of the
+    // container path's emitter (#638), opened at the same point the bookends
+    // open (before any model work) and keyed on the SAME `session_id` those
+    // bookends use. A hosted single-shot is not instantaneous — a reasoning
+    // model on a long brief runs for minutes — and until this, none of that
+    // wall-clock was live: the bookends are terminal-only records, so the
+    // whole hosted arm of `darkmux dispatch` and of every fleet-queue job
+    // read as "not running" on the live fleet view the entire time it WAS.
+    // Self-disables when Redis is unset. Stopped explicitly before each
+    // terminal record below; `SessionEmitter::drop` halts the beat thread
+    // for a `?`/panic in between and the presence TTL ages the key out.
+    let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
+        session_id.clone(),
+        Some(opts.role_id.clone()),
+        Some(pm.id.clone()),
+    );
+
     let req_body = single_shot_body(
         &pm.id,
         system_prompt,
@@ -3165,6 +3182,13 @@ fn dispatch_remote(
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
+            // (#2344) The one HTTP call is over — stop the beat before the
+            // terminal record, so the live view drops the session instead of
+            // waiting out the TTL. Same ordering as the container path's own
+            // stop site.
+            if let Some(em) = session_emitter.take() {
+                em.stop();
+            }
             bookend.close(
                 "dispatch",
                 build_remote_record(
@@ -3223,6 +3247,11 @@ fn dispatch_remote(
         cached_tok,
     );
 
+    // (#2344) See the error arm above — the call is done, so the session is
+    // no longer running; stop the beat before the terminal record.
+    if let Some(em) = session_emitter.take() {
+        em.stop();
+    }
     bookend.close(
         "dispatch",
         build_remote_record(
@@ -3456,6 +3485,18 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         ),
     );
 
+    // (#2344) Session-liveness heartbeat — see the hosted path above for the
+    // full reasoning. This is the primitive `darkmux acp`'s radio router and
+    // answering seats run on (`src/radio.rs::dispatch_router_call` via
+    // `darkmux_fleet::routing::dispatch_routed_via`), so before this the
+    // ONLY interactive local-AI surface darkmux ships was also the one the
+    // live fleet view could never show as running.
+    let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
+        session_id.clone(),
+        Some(opts.role_id.clone()),
+        Some(model_id.clone()),
+    );
+
     let t0 = SystemTime::now();
     let req = crate::single_shot::SingleShotRequest {
         base_url: opts.model_base_url_override.as_deref(),
@@ -3483,6 +3524,10 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 Some(msg) => e.context(msg),
                 None => e,
             };
+            // (#2344) The call is over — stop the beat before the terminal.
+            if let Some(em) = session_emitter.take() {
+                em.stop();
+            }
             bookend.close(
                 "dispatch",
                 build_remote_record(
@@ -3528,6 +3573,10 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         reply.cached_tokens,
     );
 
+    // (#2344) See the error arm above — stop the beat before the terminal.
+    if let Some(em) = session_emitter.take() {
+        em.stop();
+    }
     bookend.close(
         "dispatch",
         build_remote_record(

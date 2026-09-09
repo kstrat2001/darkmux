@@ -716,6 +716,55 @@ fn hosted_single_shot_step_payload(
     })
 }
 
+impl DispatchSingleShotStepKind {
+    /// (#2344) This kind's contract-#2 bookend records — the same shape
+    /// `DispatchMapStepKind::bookend_record` builds for its own kind, and
+    /// keyed on the SAME `session_id::task` this kind's `step result` record
+    /// already uses, so a consumer joins the pair to the tokens.
+    fn bookend_record(
+        step: &Step,
+        model: &str,
+        action: &str,
+        level: darkmux_flow::Level,
+        endpoint_label: Option<&str>,
+        extra: serde_json::Value,
+    ) -> darkmux_flow::FlowRecord {
+        let mut payload = serde_json::json!({
+            "step_id": step.id,
+            "kind": "dispatch.single_shot",
+            "runtime": "scheduler",
+        });
+        if let (Some(obj), Some(ex)) = (payload.as_object_mut(), extra.as_object()) {
+            for (k, v) in ex {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        darkmux_flow::stamp_remote_classification(&mut payload, endpoint_label, None);
+        darkmux_flow::FlowRecord {
+            ts: darkmux_flow::ts_utc_now(),
+            level,
+            category: darkmux_flow::Category::Work,
+            tier: darkmux_flow::Tier::Local,
+            stage: darkmux_flow::Stage::Dispatch,
+            action: action.to_string(),
+            handle: step.id.clone(),
+            phase_id: None,
+            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
+            source: Some("scheduler".to_string()),
+            model: Some(model.to_string()),
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            machine_uid: None,
+            prev_hash: None,
+            hash: None,
+            payload: Some(payload),
+            work_id: None,
+            attempt: None,
+        }
+    }
+}
+
 impl StepKind for DispatchSingleShotStepKind {
     fn id(&self) -> &'static str {
         "dispatch.single_shot"
@@ -802,7 +851,36 @@ impl StepKind for DispatchSingleShotStepKind {
         None
     }
 
-    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    /// The ctx-free entry point unit tests drive directly. Production takes
+    /// [`Self::run_streaming`] below; both funnel into `run_single_shot`, so
+    /// the presence beat and the liveness bookends are on ONE path, not two.
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        self.run_single_shot(step, task, input, None)
+    }
+
+    /// (#2344) The scheduler's real entry point. Overridden for the same
+    /// reason `dispatch.map` overrides it: the liveness bookends ride the
+    /// STREAMING seam (see [`StepBookend`]), so a kind that only implements
+    /// `run` can emit a start but never a live terminal.
+    fn run_streaming(
+        &self,
+        step: &Step,
+        task: &Task,
+        input: &BTreeMap<String, String>,
+        ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        self.run_single_shot(step, task, input, Some(ctx))
+    }
+}
+
+impl DispatchSingleShotStepKind {
+    fn run_single_shot(
+        &self,
+        step: &Step,
+        _task: &Task,
+        input: &BTreeMap<String, String>,
+        ctx: Option<&StepRunCtx>,
+    ) -> Result<StepOutcome> {
         use crate::single_shot::{
             single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest,
             SingleShotRequest,
@@ -822,6 +900,61 @@ impl StepKind for DispatchSingleShotStepKind {
             .get("timeout_seconds")
             .and_then(|v| v.as_u64())
             .unwrap_or(120) as u32;
+
+        // (#2344) Contract #2's liveness bookends, which this kind owed and
+        // never emitted — it performs REAL model work (one chat completion,
+        // local or hosted) and emitted only its own `step result` vocabulary,
+        // so a `dispatch.single_shot` seat had tokens and a model but no
+        // start and no terminal anywhere. Strictly worse than `dispatch.map`,
+        // which at least had the pair. Opened BEFORE any model work and
+        // closed on every exit path, `?` and panic included, via
+        // `StepBookend`'s Drop.
+        let endpoint_label: Option<String> = step
+            .config
+            .get("endpoint")
+            .and_then(|v| serde_json::from_value::<darkmux_types::ModelEndpoint>(v.clone()).ok())
+            .map(|ep| crate::dispatch_internal::remote_endpoint_label(&ep, model));
+        let mut bookend = StepBookend::new(
+            ctx,
+            Self::bookend_record(
+                step,
+                model,
+                "dispatch start",
+                darkmux_flow::Level::Info,
+                endpoint_label.as_deref(),
+                serde_json::json!({}),
+            ),
+            Self::bookend_record(
+                step,
+                model,
+                "dispatch error",
+                darkmux_flow::Level::Error,
+                endpoint_label.as_deref(),
+                serde_json::json!({
+                    "result_class": "error",
+                    "error": "dispatch.single_shot terminated before completion (early return or panic)",
+                }),
+            ),
+        );
+
+        // (#2344) Session-liveness heartbeat — the same in-process twin of
+        // the container path's emitter (#638) `dispatch.map` grew, opened at
+        // the same point the bookends open and keyed on the SAME
+        // `session_id::task` every record on this path uses. One hosted
+        // single-shot against a reasoning model is minutes of real
+        // wall-clock; without a beat none of it was visible on the live
+        // fleet view, because bookends are terminal-only records. Stopped
+        // explicitly once the call returns and before the terminal record
+        // below; `SessionEmitter::drop` halts the beat thread for a
+        // `?`/panic in between and the presence TTL ages the key out.
+        //
+        // See `DispatchMapStepKind::run_map`'s own spawn site for why the
+        // key is TASK-scoped here rather than step-scoped.
+        let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
+            darkmux_types::session_id::task(&step.task_id),
+            None,
+            Some(model.to_string()),
+        );
 
         let mut flow_records = Vec::new();
 
@@ -903,6 +1036,25 @@ impl StepKind for DispatchSingleShotStepKind {
             single_shot_chat(&req)
                 .with_context(|| format!("step `{}` dispatch.single_shot (local)", step.id))?
         };
+
+        // (#2344) The one call is over — no model work is in flight for this
+        // step — so stop the heartbeat before the terminal record, the same
+        // ordering `dispatch.map` and the container path both use.
+        if let Some(em) = session_emitter.take() {
+            em.stop();
+        }
+        bookend.close(Self::bookend_record(
+            step,
+            model,
+            "dispatch complete",
+            darkmux_flow::Level::Info,
+            endpoint_label.as_deref(),
+            serde_json::json!({
+                "result_class": "ok",
+                "stdout_chars": reply.content.len(),
+                "total_tokens": reply.total_tokens,
+            }),
+        ));
 
         Ok(StepOutcome {
             output: reply.content,
@@ -1570,14 +1722,14 @@ impl DispatchMapStepKind {
 
         // (#1607) Contract #2's liveness bookends. Opened BEFORE any model
         // work and closed on every exit path, including the ones a `?` takes:
-        // `MapBookend`'s Drop emits `dispatch error` unless `close` already
+        // `StepBookend`'s Drop emits `dispatch error` unless `close` already
         // consumed the terminal. This is what gives a per-seat `task-<id>`
         // session an endpoint to be attributed by — without it the seat's
         // token records name a model and a cost but never a place.
         let endpoint_label: Option<String> = endpoint
             .as_ref()
             .map(|ep| crate::dispatch_internal::remote_endpoint_label(ep, model));
-        let mut bookend = MapBookend::new(
+        let mut bookend = StepBookend::new(
             ctx,
             Self::bookend_record(
                 step,
@@ -1598,6 +1750,52 @@ impl DispatchMapStepKind {
                     "error": "dispatch.map terminated before completion (early return or panic)",
                 }),
             ),
+        );
+
+        // (#2344) Session-liveness heartbeat — the in-process twin of
+        // `dispatch_internal`'s container-path emitter (#638). `dispatch.map`
+        // performs REAL model work in the per-item loop below (`single_shot_chat`
+        // / the hosted single-shot call), but unlike the container path it
+        // never wrote a `darkmux:session-presence:<sid>` beat, so a
+        // long-running map (a probe/judge/verify seat with many items, or one
+        // hosted item taking real wall-clock) never showed up in the live
+        // fleet view while GENERATING — only its `dispatch start`/`complete`
+        // bookends (#1607, above) landed, and those are terminal-only, not a
+        // liveness signal. Self-disables when `DARKMUX_REDIS_URL` is unset,
+        // same gate the bookend's flow sink uses. Uses the SAME session id
+        // every record on this path uses (`session_id::task`), so a beat and
+        // its bookends key on the identical session. Stopped explicitly right
+        // after the loop (below) on the clean path; `SessionEmitter::drop`
+        // is the backstop for a `?`/panic in between — same discipline
+        // `dispatch_internal`'s `session_emitter` uses, and it never DELetes
+        // the key itself (only halts the refresh thread), so a beat that
+        // wasn't explicitly stopped ages out via the presence TTL instead of
+        // lingering as "running" forever.
+        //
+        // WHY TASK-SCOPED, not step-scoped (fresh-review finding). The key
+        // has to be the one the RECORDS use, because the live view joins the
+        // beat to the session the bookends and per-item records name — and
+        // #1979 pins both this kind and `dispatch.single_shot` to
+        // `session_id::task` deliberately (sibling seats fanned out within
+        // one task share a join key so a seat's tokens tie to its endpoint;
+        // only `dispatch.internal`, a solo dispatch, is step-scoped). A beat
+        // keyed on the step would be presence for a session no record names.
+        //
+        // The known cost, named rather than left to be rediscovered: a clean
+        // `stop()` pre-claims `edge-claim:session-end:<task-sid>` for
+        // `EDGE_CLAIM_TTL_SECS` (60s), so a LATER model-bearing step in the
+        // SAME task that is abandoned inside that window loses the claim and
+        // the presence reconciler skips its `session.end` edge — playback
+        // then lacks the close bracket for exactly the abandonment case that
+        // edge exists to provide. Steps are linear within a task and no
+        // shipped mission config puts two model-bearing steps in one task,
+        // so this is a sequencing hazard, not a live race. If one ever does,
+        // the fix is at the session convention (rekey the WHOLE vocabulary
+        // together), never at the beat alone.
+        let session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
+            darkmux_types::session_id::task(&step.task_id),
+            task.role_id.clone(),
+            Some(model.to_string()),
         );
 
         // Per-EXECUTION remote allowance. When the step named a
@@ -1687,6 +1885,18 @@ impl DispatchMapStepKind {
             results.push(res);
         }
 
+        // (#2344) The per-item loop is done — no more model work is in
+        // flight for this step — so stop the heartbeat here, before the
+        // terminal records below, mirroring `dispatch_internal`'s "the
+        // container has exited — the session is no longer running" comment
+        // at its own stop site. `stop()` joins the beat thread and DELetes
+        // the key for an instant drop on the live view instead of waiting
+        // out the TTL; a `?`/panic earlier in this function never reaches
+        // here and relies on `SessionEmitter::drop`'s TTL backstop instead.
+        if let Some(em) = session_emitter {
+            em.stop();
+        }
+
         // (#1442 gate C1) ONE step-level aggregate record after the loop.
         // Load-bearing: the mission graph's token meter folds "step result"
         // token fields per step with Math.max (a one-record-per-step
@@ -1726,7 +1936,10 @@ impl DispatchMapStepKind {
     }
 }
 
-/// (#1607) RAII half of `dispatch.map`'s liveness bookends.
+/// (#1607) RAII half of a step kind's liveness bookends — shared by
+/// `dispatch.map` and (#2344) `dispatch.single_shot`, which owes contract #2
+/// the same pair for the same reason. Named for the STEP rather than for
+/// either kind: nothing in it knows what a map item or a single shot is.
 ///
 /// Contract #2 requires a terminal on ALL exit paths, and `run_map` has many:
 /// a `?` on collection resolution, on the budget admit gate, on serialization,
@@ -1742,13 +1955,13 @@ impl DispatchMapStepKind {
 /// (the `run()` path, tests) records are returned in `StepOutcome` and are
 /// already lost on `Err`, so Drop has nowhere useful to put one — it no-ops
 /// rather than pretending. Production always has a ctx (`run_streaming`).
-struct MapBookend<'a> {
+struct StepBookend<'a> {
     ctx: Option<&'a StepRunCtx>,
     /// The terminal to emit if dropped without `close` — taken by `close`.
     on_abort: Option<darkmux_flow::FlowRecord>,
 }
 
-impl<'a> MapBookend<'a> {
+impl<'a> StepBookend<'a> {
     fn new(
         ctx: Option<&'a StepRunCtx>,
         start: darkmux_flow::FlowRecord,
@@ -1782,7 +1995,7 @@ impl<'a> MapBookend<'a> {
     }
 }
 
-impl Drop for MapBookend<'_> {
+impl Drop for StepBookend<'_> {
     fn drop(&mut self) {
         if let (Some(rec), Some(c)) = (self.on_abort.take(), self.ctx) {
             c.emit(rec);
@@ -4411,7 +4624,7 @@ mod tests {
         }));
         // The bookends ride the STREAMING seam, so drive `run_streaming` with a
         // live emitter — the same shape the scheduler supplies in production.
-        // The batched `run()` path deliberately emits none (see MapBookend).
+        // The batched `run()` path deliberately emits none (see StepBookend).
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = StepRunCtx::new(
             Some(tx),
@@ -4478,6 +4691,282 @@ mod tests {
             terminal.session_id.as_deref(),
             Some(darkmux_types::session_id::task("t1").as_str()),
             "SAME session as the seat's token records — that join is the whole point"
+        );
+    }
+
+    // ── (#2344) dispatch.map — session-presence heartbeat ────────────────
+
+    /// A minimal fake Redis peer that ACKS everything: it completes the two
+    /// `CLIENT SETINFO` handshake commands redis-rs pipelines on connect,
+    /// then answers `+OK\r\n` to whatever real command follows, and records
+    /// the raw bytes of every command it saw into `log` (in connection
+    /// order) so the test can inspect what was actually sent.
+    ///
+    /// Unlike `darkmux-flow`'s own `spawn_silent_redis_peer` (which never
+    /// reads and never replies to the real command, `pub(crate)` there and
+    /// unreachable from this crate anyway), this one has to actually ANSWER
+    /// — `SessionEmitter`'s beat thread and `stop()` both hang waiting on a
+    /// reply otherwise, which would make this a liveness test, not a
+    /// presence-content test.
+    ///
+    /// **Known limit (fresh-review finding), left as a comment rather than
+    /// engineered away:** each `read` is logged as ONE entry, and the
+    /// assertions below match a substring PAIR (`"SET"` and the key) within
+    /// a single entry. A command split across two reads would therefore
+    /// read as no match and fail the test spuriously. The commands in
+    /// question are ~161 bytes over loopback into a 4 KiB buffer, which the
+    /// kernel does not split in practice — 20 of 20 runs under heavy load
+    /// saw one read per command — so the fix (accumulate per connection and
+    /// parse RESP) would buy nothing but more test machinery. If this ever
+    /// flakes, that is the reason and that is the fix.
+    fn spawn_acking_recording_redis_server(log: Arc<Mutex<Vec<String>>>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let log = Arc::clone(&log);
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    // Two `+OK` replies satisfy the two ignored `CLIENT
+                    // SETINFO` commands redis-rs 0.27's
+                    // `connection_setup_pipeline` sends before any real
+                    // command — same shape `spawn_silent_redis_peer` uses.
+                    let _ = stream.write_all(b"+OK\r\n+OK\r\n");
+                    let _ = stream.flush();
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(2000)));
+                    let mut buf = [0u8; 4096];
+                    // Each darkmux-flow call site opens its own fresh
+                    // connection per command, so one real command (plus
+                    // possibly the client closing right after) is all this
+                    // connection ever sees.
+                    for _ in 0..4 {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                log.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                                let _ = stream.write_all(b"+OK\r\n");
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        port
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates the DARKMUX_REDIS_URL env var
+    fn dispatch_map_writes_and_releases_a_session_presence_beat() {
+        // (#2344) THE conformance test for the presence half of contract #2:
+        // `dispatch.map` already opens/closes its liveness BOOKENDS (#1607,
+        // the test above), but bookends are terminal-only records — they say
+        // "this started" and "this ended", never "this is still running".
+        // The live fleet view keys "running now" on the SEPARATE
+        // `darkmux:session-presence:<sid>` heartbeat
+        // (`darkmux-flow::session_presence`), which — before this fix —
+        // only the container dispatch path ever wrote
+        // (`dispatch_internal.rs`'s `session_emitter`). A `dispatch.map`
+        // step doing real in-process model work (the per-item loop) never
+        // wrote one, so a running map read as invisible on the live view
+        // exactly like #2344 describes.
+        //
+        // Deliberately does NOT assert the final `DEL` lands: `stop()`'s DEL
+        // is documented as best-effort even in production ("a Redis blip on
+        // the final DEL just means the key ages out via TTL instead" —
+        // `session_presence.rs`), and under real CPU contention this test's
+        // fake peer measurably reproduces exactly that blip against
+        // `open_redis_connection_bounded`'s tight 500ms connect budget —
+        // asserting it deterministically would test the machine's load, not
+        // this fix. What this test asserts instead is deterministic and is
+        // the property that actually matters (the task's own framing: "a
+        // beat that never stops is worse than no beat"): (1) `claim_edge`'s
+        // `SET NX` — the FIRST thing `stop()` does after joining the beat
+        // thread — proves `.stop()` was reached and the thread was joined;
+        // (2) waiting past one full beat interval and seeing no SECOND `SET`
+        // proves the beat thread actually stopped ticking rather than
+        // continuing to refresh the key forever.
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_acking_recording_redis_server(Arc::clone(&log));
+
+        let prev = std::env::var("DARKMUX_REDIS_URL").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", format!("redis://127.0.0.1:{port}"));
+        }
+
+        // A dispatch override that sleeps briefly before returning — the
+        // same trick `install_hosted_delayed` uses for `wall_ms` — gives the
+        // presence beat thread (spawned before the item loop starts) a
+        // window to actually get scheduled and complete its first `SET`
+        // before the loop finishes and `run_map` calls `.stop()`. Without
+        // this, a same-thread synchronous test can race the beat thread to
+        // zero.
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(crate::single_shot::SingleShotReply {
+                content: "ok".to_string(),
+                total_tokens: Some(5),
+                prompt_tokens: None,
+                completion_tokens: None,
+                reasoning_tokens: None,
+                cached_tokens: None,
+                model: None,
+            })
+        });
+
+        let s = map_step(json!({
+            "model": "qwen3.6-35b",
+            "user_template": "check {item}",
+            "collection": ["a"],
+        }));
+        let ctx = StepRunCtx::new(None, None, Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
+        DispatchMapStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx).unwrap();
+
+        // (2) — see doc above: past one full beat interval, a still-ticking
+        // thread would have fired a second SET by now.
+        std::thread::sleep(std::time::Duration::from_secs(
+            darkmux_flow::session_presence::DEFAULT_BEAT_INTERVAL_SECS + 1,
+        ));
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_REDIS_URL", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_REDIS_URL") },
+        }
+
+        let expected_key = format!(
+            "darkmux:session-presence:{}",
+            darkmux_types::session_id::task("t1")
+        );
+        let entries = log.lock().unwrap().clone();
+        let set_count =
+            entries.iter().filter(|e| e.contains("SET") && e.contains(&expected_key)).count();
+        let saw_claim_edge = entries.iter().any(|e| e.contains("edge-claim:session-end:task-t1"));
+        assert_eq!(
+            set_count, 1,
+            "expected exactly ONE session-presence SET beat for {expected_key} (fired once \
+             while the map's item loop ran) and no more after — a second one after the loop \
+             finished means the heartbeat thread was never told to stop; saw {entries:?}"
+        );
+        assert!(
+            saw_claim_edge,
+            "expected `stop()`'s session-end edge claim — the first thing `stop()` does after \
+             joining the beat thread — proving the release path was actually reached, not just \
+             the beat's start; saw {entries:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_REDIS_URL
+    fn dispatch_single_shot_writes_a_session_presence_beat_and_its_liveness_bookends() {
+        // (#2344, fresh-review blocker) `dispatch.single_shot` was the WORST
+        // of the uncovered paths, and it sat nine hundred lines above the
+        // `dispatch.map` fix in this same file: it performs real model work
+        // (one chat completion) and emitted neither a presence beat NOR the
+        // contract-#2 bookends — only its own `step result` vocabulary, so a
+        // seat had tokens and a model with no start, no terminal, and no
+        // liveness anywhere.
+        //
+        // Driven against TWO fakes and zero real anything: an httpmock HTTP
+        // server standing in for the hosted endpoint (the same in-process
+        // mode `tests/mock_single_shot_proof.rs` uses, reached over the real
+        // hardened curl path) and the acking Redis peer above. No LMStudio,
+        // no Docker, no model.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).header("content-type", "application/json").json_body(json!({
+                "id": "mock-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-5.1",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10 },
+            }));
+        });
+
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_acking_recording_redis_server(Arc::clone(&log));
+        let prev = std::env::var("DARKMUX_REDIS_URL").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", format!("redis://127.0.0.1:{port}"));
+        }
+
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({
+                "model": "gpt-5.1",
+                "user": "hello",
+                "endpoint": { "url": format!("{}/v1", server.base_url()) },
+            }),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(
+            Some(tx),
+            None,
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+        let out = DispatchSingleShotStepKind
+            .run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx)
+            .expect("the mock endpoint answers, so the step completes");
+        drop(ctx);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_REDIS_URL", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_REDIS_URL") },
+        }
+
+        assert_eq!(out.output, "ok", "the reply came back over the mock HTTP server");
+
+        // Presence — same two deterministic properties the map test asserts,
+        // and for the same reasons (see its doc): the beat fired, and
+        // `stop()` was genuinely reached (its session-end pre-claim is the
+        // first thing it does after joining the beat thread).
+        let expected_key = format!(
+            "darkmux:session-presence:{}",
+            darkmux_types::session_id::task("t1")
+        );
+        let entries = log.lock().unwrap().clone();
+        assert!(
+            entries.iter().any(|e| e.contains("SET") && e.contains(&expected_key)),
+            "a hosted `dispatch.single_shot` must beat while it is generating — expected a \
+             session-presence SET for {expected_key}; saw {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.contains("edge-claim:session-end:task-t1")),
+            "expected `stop()`'s session-end edge claim, proving the beat was released rather \
+             than left to TTL out; saw {entries:?}"
+        );
+
+        // Bookends — the half this kind never had at all.
+        let actions: Vec<String> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r.action),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            actions.iter().filter(|a| *a == "dispatch start").count(),
+            1,
+            "exactly one liveness start; got {actions:?}"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| a.starts_with("dispatch ") && *a != "dispatch start")
+                .count(),
+            1,
+            "exactly one terminal per open — the Drop guard must not double-emit alongside \
+             the clean close; got {actions:?}"
         );
     }
 
