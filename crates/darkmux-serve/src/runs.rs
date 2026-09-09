@@ -834,15 +834,51 @@ fn mission_to_run(
         .filter_map(|sid| flow_index.get(sid).map(|agg| (sid, agg)))
         .collect();
 
-    let representative = earliest_by_start(&sessions);
+    // (#2487) Filtered to unambiguous sessions BEFORE picking `representative`
+    // — the SAME `is_ambiguous()` guard `sessions_by_start` below already
+    // applies to role/model, moved up front instead of applied only to that
+    // copy. `representative` feeds `machine`, `start_ts_str` and (via
+    // `mission.started_ts`'s fallback) this row's SORT position, so leaving
+    // it unfiltered let an ambiguous session's machine/start win here while
+    // the identical session was already refused as a source for role/model a
+    // few lines down — one row mixing filtered and unfiltered provenance.
+    // There is no principled reason machine/start_ts are less contaminated
+    // than role/model: all four come from the exact same shared record
+    // bucket, so the #1918 corruption taints ordering exactly as much as
+    // attribution. `session_id` (below) no longer needs its own separate
+    // filter as a result — `representative` already guarantees it.
+    //
+    // This pool is the single source for EVERY attribute and time on the
+    // row: `representative` (machine, start), `remote` (route, #2558),
+    // `sessions_by_start` (role, model), `terminal_ts_str` (completion, and
+    // via `updated_ts` the row's first sort key) and `sessions_bare`
+    // (status). Half-filtering was worse than not filtering: an
+    // all-ambiguous row whose start came from the filtered pool and whose
+    // terminal and endpoint did not rendered "completed 09:00, via
+    // tainted-endpoint, no start, no machine, no role" — internally
+    // contradictory, where the pre-fix row was at least wrong-but-consistent
+    // from one source. Add a new field here and it reads this pool too.
+    let unambiguous_sessions: Vec<(&str, &SessionAgg)> =
+        sessions.iter().copied().filter(|(_, s)| !s.is_ambiguous()).collect();
+    let representative = earliest_by_start(&unambiguous_sessions);
     // TODO(step-4): a mission whose dispatches span MULTIPLE distinct
     // endpoints (mixed local/remote seats across phases) collapses to one
     // representative endpoint here — the Runs lens can't yet show per-seat
     // routing. Picking the first remote session is a reasonable
     // single-value summary for a flat row; don't overbuild this for a
     // view-model step 4 will replace with a richer render.
+    //
+    // (#2558, folded into #2487) Drawn from `unambiguous_sessions` for the
+    // same reason every other attribute here is: `endpoint` sits on the
+    // shared bucket's records exactly like `machine_id`, so a session
+    // spanning N missions hands the same endpoint to all of them. Leaving
+    // this one field unfiltered made an all-ambiguous row VISIBLY
+    // inconsistent rather than merely wrong — `runSubtitle`
+    // (ui/src/lenses/runs/format.ts) concatenates role · model · route ·
+    // machine, so the row rendered `via <endpoint>` and nothing else: the
+    // one attribute still sourced from the pool every sibling had refused.
     let remote = earliest_by_start(
-        &sessions
+        &unambiguous_sessions
             .iter()
             .copied()
             .filter(|(_, s)| s.endpoint.is_some())
@@ -871,24 +907,27 @@ fn mission_to_run(
     // attributes over every real dispatch session, exactly the corruption
     // `earliest_by_start` itself is already immune to.
     //
-    // (#1918 QA) ALSO filtered by `!is_ambiguous()`, for the SAME reason
-    // and by the SAME detector `sessions_bare` (status, #1979) already
-    // uses. Role and model are exactly the two attributes #1918 reports
-    // as cross-contaminated, and the write-side scoping alone does not
-    // close them for a MIXED day file — the state every operator has for
+    // (#1918 QA, widened by #2487) Built from `unambiguous_sessions` (above)
+    // rather than re-filtering `sessions` here — `representative` and this
+    // list now draw from the SAME ambiguity-filtered pool, by the SAME
+    // detector `sessions_bare` (status, #1979) already uses, so role/model
+    // and machine/start_ts can no longer disagree about which sessions are
+    // trustworthy. The write-side scoping alone does not close this for a
+    // MIXED day file — the state every operator has for
     // `RUNS_FLOW_SCAN_WINDOW_DAYS` after upgrading. A pre-1.43.0 record
     // set still carries the bare `task-<id>`/`step-<id>` bucket that N
     // missions shared; a NEW mission's structural prediction
     // (`collect_mission_step_sessions`, which by design still predicts the
     // unscoped form) claims that bucket, and because the legacy records
-    // are OLDER they sort FIRST here and win both attributes over the new
-    // mission's own correctly-scoped session. Proved: a new mission
-    // rendered `model: legacy-model-a` / `role: legacy-role` beside its
-    // own `correct-model` records. Membership deliberately still keeps
-    // these aggs (claiming the session suppresses a ghost row); only
-    // ATTRIBUTION is narrowed, mirroring `sessions_bare` exactly.
+    // are OLDER they sort FIRST here and would win every attribute over the
+    // new mission's own correctly-scoped session — role and model included,
+    // and (before #2487) machine and start_ts too. Proved: a new mission
+    // rendered `model: legacy-model-a` / `role: legacy-role` beside its own
+    // `correct-model` records. Membership (`sessions`, unfiltered) still
+    // keeps these aggs — claiming the session suppresses a ghost row; only
+    // ATTRIBUTION and ORDERING are narrowed, mirroring `sessions_bare`.
     let mut sessions_by_start: Vec<&SessionAgg> =
-        sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some() && !s.is_ambiguous()).collect();
+        unambiguous_sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some()).collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
 
     // Model is simple: the bookend's own record NEVER carries one
@@ -918,19 +957,37 @@ fn mission_to_run(
     // `machine_id` auto-stamped at write time whenever the caller left it
     // unset (`darkmux_flow::record`'s provenance stamp, CLAUDE.md's
     // "stamped at record-write time" contract), so the bookend session is
-    // never the one blanking this field the way it blanks role/model.
+    // never the one blanking this field the way it blanks role/model. But
+    // "representative-only" no longer means "unfiltered": `representative`
+    // (above) is now drawn from `unambiguous_sessions`, so an ambiguous
+    // session can no longer win `machine` even though it auto-stamps a
+    // value — the #2487 fix (see `unambiguous_sessions`'s own comment).
     let machine = representative.and_then(|(_, s)| s.machine.clone());
     let route = remote.and_then(|(_, s)| s.endpoint.clone());
     let start_ts_str = representative.and_then(|(_, s)| s.start_ts.clone());
-    let terminal_ts_str = sessions.iter().filter_map(|(_, s)| s.terminal_ts.clone()).max();
+    // (#2487) Filtered too — and this one is the load-bearing half of the
+    // ordering claim, not a tidying pass. `terminal_ts_str` feeds
+    // `completed_ts`, which feeds `updated_ts`, which is the FIRST sort key
+    // in both the viewer and the CLI (start time is only the third). So an
+    // unfiltered maximum here would set an all-ambiguous row's sort position
+    // outright, while `representative` — the field this commit filtered to
+    // fix ordering — contributes only the third-place tiebreak. Worse, a
+    // filtered start beside an unfiltered terminal renders a row that
+    // contradicts itself (`completed 09:00, no start, no machine, no role`),
+    // where the pre-fix row was at least wrong-but-consistent from one
+    // source. Same pool, same detector, so every time field on the row now
+    // comes from the same trustworthy candidate set.
+    let terminal_ts_str = unambiguous_sessions.iter().filter_map(|(_, s)| s.terminal_ts.clone()).max();
     // (#1915) The drill target — see `Run::session_id`'s own doc for why
     // this is populated for every mission row, tracked or not.
     //
-    // (#1918) Suppressed when the representative session is ambiguous —
-    // same rule and same reasoning as `flow_mission_to_run`'s identical
-    // guard: a session spanning more than one mission is not a valid
-    // drill target for any of them.
-    let session_id = representative.filter(|(_, agg)| !agg.is_ambiguous()).map(|(sid, _)| sid.to_string());
+    // (#1918, simplified by #2487) No separate ambiguity filter needed here
+    // any more — `representative` above already only ever holds an
+    // unambiguous session, so its id is always a valid drill target. Kept
+    // as a plain map rather than re-deriving the guard a second time, which
+    // is exactly the two-implementations-that-could-disagree risk
+    // `earliest_by_start`'s own doc warns against.
+    let session_id = representative.map(|(sid, _)| sid.to_string());
 
     let started_ts = mission
         .started_ts
@@ -953,8 +1010,15 @@ fn mission_to_run(
     // is the detector that already exists for exactly this corruption.
     // Membership (`sessions`) deliberately keeps them — claiming the
     // session still suppresses a ghost row; only STATUS is narrowed.
+    //
+    // (#2487) Mapped off `unambiguous_sessions` rather than re-running the
+    // same `!is_ambiguous()` filter 130 lines below where it was already
+    // computed. The reason is the one `session_id`'s own doc gives above:
+    // two separately-written implementations of one guard can drift apart,
+    // and a drift here would silently split STATUS off from the attribute
+    // and ordering fields that are supposed to describe the same sessions.
     let sessions_bare: Vec<&SessionAgg> =
-        sessions.iter().map(|(_, s)| *s).filter(|s| !s.is_ambiguous()).collect();
+        unambiguous_sessions.iter().map(|(_, s)| *s).collect();
     let status = mission_run_status(mission, &sessions_bare, now_ms);
     // (#1907) `mission_run_status` has exactly ONE arm that reaches
     // `Abandoned` via a deliberate teardown — `MissionStatus::Aborted =>
@@ -4754,6 +4818,7 @@ mod tests {
             }),
         );
         mission.started_ts = None;
+        let created_ts = mission.created_ts;
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase("p-collision", "collision-mission-1", vec!["t-collision".to_string()]);
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
@@ -4787,6 +4852,21 @@ mod tests {
                     "mission_id": "some-other-mission",
                     "source": "scheduler",
                 }),
+                // (#2487/#2558) The tainted session's TERMINAL, carrying an
+                // endpoint — the two remaining fields that used to read the
+                // unfiltered `sessions` pool. Without these records the
+                // fixture could not tell a filtered `completed_ts`/`route`
+                // from a field that was simply never populated.
+                serde_json::json!({
+                    "ts": "2026-01-01T09:00:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "collision-mission-1",
+                    "handle": "coder-phase",
+                    "mission_id": "collision-mission-1",
+                    "source": "mission",
+                    "machine_id": "studio",
+                    "payload": { "endpoint": "tainted-endpoint" },
+                }),
             ],
         );
 
@@ -4796,6 +4876,216 @@ mod tests {
         assert_eq!(
             row.session_id, None,
             "a tracked mission's representative session must ALSO go None when it is ambiguous — the guard is uniform across every population site, not a fleet-only special case: {row:?}"
+        );
+        // (#2487) Before the fix, `machine` and `started_ts` still read the
+        // SAME ambiguous session `session_id` was just suppressed for — the
+        // one session in this fixture is the mission's ONLY candidate, so
+        // once it is correctly excluded there is nothing left to fall back
+        // to. `None` is the deliberate, honest answer here (see
+        // `unambiguous_sessions`'s own doc in `mission_to_run`): a blank
+        // field beats a wrong one, and every other consumer of a `None`
+        // `machine`/`started_ts` already renders it as unknown, the same
+        // way a `None` role/model already does.
+        assert_eq!(
+            row.machine, None,
+            "an ambiguous representative session must not win `machine` either — same contamination role/model already refuse: {row:?}"
+        );
+        assert_eq!(
+            row.started_ts, None,
+            "an ambiguous representative session must not win `started_ts` either — this mission's own `started_ts` was explicitly unset, so the ONLY source was the tainted session: {row:?}"
+        );
+        // (#2487) The SORT key. `completed_ts` feeds `updated_ts`, which
+        // both the viewer and the CLI sort on FIRST — start time is only the
+        // third key — so a `terminal_ts_str` taken over the unfiltered pool
+        // would have set this row's position outright while every displayed
+        // field beside it went blank. That row also contradicts itself on
+        // screen: "completed 09:00, no start, no machine, no role."
+        assert_eq!(
+            row.completed_ts, None,
+            "an ambiguous session must not win `completed_ts` — it is the row's FIRST sort key via `updated_ts`, which is precisely the ordering this fix is about: {row:?}"
+        );
+        assert_eq!(
+            row.updated_ts,
+            Some(created_ts),
+            "with every session-derived time refused, the row falls back to the mission's own mint time (#1584's last arm) rather than inheriting a tainted position: {row:?}"
+        );
+        // (#2558, folded in here) `route` was the last field still reading
+        // the unfiltered pool. Left alone it rendered an all-ambiguous row as
+        // literally `via tainted-endpoint` and nothing else, since
+        // `runSubtitle` concatenates role · model · route · machine.
+        assert_eq!(
+            row.route, None,
+            "an ambiguous session must not win `route` either — otherwise it is the only surviving field on a row whose every sibling went blank: {row:?}"
+        );
+    }
+
+    /// (#2487) The production shape the issue actually reports: an OLDER,
+    /// ambiguous shared-bucket session (the legacy pre-1.43.0 corruption
+    /// #1918 diagnosed) sorts FIRST by `earliest_by_start` and, before this
+    /// fix, won `machine`/`started_ts` (and therefore this row's SORT
+    /// position) even though the identical session was already refused as
+    /// a source for role/model. Reuses the #1877 bookend fixture almost
+    /// verbatim (bookend + a real coder-step session), with one addition: a
+    /// SECOND `mission_id` folded into the bookend's own session, making it
+    /// ambiguous — after the fix, `machine`/`started_ts` must recover from
+    /// the coder session (the only unambiguous one), the same way role and
+    /// model already do.
+    ///
+    /// RED PROVED (see the mutation restoring `let representative =
+    /// earliest_by_start(&sessions);` unfiltered): with the mutation in
+    /// place, `machine` reported `Some("stale-bookend-machine")` and
+    /// `started_ts` reported the bookend's 08:00 timestamp — the tainted
+    /// session's own values — against this test's assertions of
+    /// `"real-coder-machine"` / 09:00.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_2487_ambiguous_bookend_never_wins_machine_or_start_ts() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut mission = minimal_mission(
+            "ambig-bookend-mission",
+            vec!["p-ambig".to_string()],
+            Some(MissionSpec {
+                config_id: "coder-phase".to_string(),
+                inputs_fingerprint: "fpa".to_string(),
+                origin: None,
+            }),
+        );
+        // Same reason the #1877 fixture unsets this: without it,
+        // `mission.started_ts` (the mission's own durable field) always
+        // wins first and the session-derived fallback this test pins would
+        // never actually be exercised.
+        mission.started_ts = None;
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-ambig", "ambig-bookend-mission", vec!["t-ambig".to_string()]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task("t-ambig", "p-ambig", vec!["s-ambig".to_string()], Some("coder"));
+        darkmux_crew::lifecycle::save_task("ambig-bookend-mission", &task).unwrap();
+        let step = minimal_step("s-ambig", "t-ambig", Some("crew-dispatch-coder-ambig"));
+        darkmux_crew::lifecycle::save_step("ambig-bookend-mission", "p-ambig", &step).unwrap();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                // This mission's own bookend — earliest ts, would win
+                // `earliest_by_start`'s pick if it weren't ambiguous.
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "ambig-bookend-mission",
+                    "handle": "coder-phase",
+                    "mission_id": "ambig-bookend-mission",
+                    "source": "mission",
+                    "machine_id": "stale-bookend-machine",
+                    // (#2558) An endpoint on the tainted session, EARLIER
+                    // than the coder's — `remote` is an `earliest_by_start`
+                    // pick, so unfiltered this one wins `route`.
+                    "payload": { "endpoint": "stale-bookend-endpoint" },
+                }),
+                // The #1918 collision: a DIFFERENT mission's record folded
+                // into the SAME bookend session, making it ambiguous.
+                serde_json::json!({
+                    "ts": "2026-01-01T08:05:00Z",
+                    "action": "step start",
+                    "session_id": "ambig-bookend-mission",
+                    "mission_id": "some-other-mission",
+                    "source": "scheduler",
+                }),
+                // The coder step's OWN dispatch — unambiguous, later, and
+                // on a DIFFERENT machine, so this test can tell whether
+                // `machine`/`started_ts` actually recovered from it.
+                serde_json::json!({
+                    "ts": "2026-01-01T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "crew-dispatch-coder-ambig",
+                    "handle": "coder",
+                    "mission_id": "ambig-bookend-mission",
+                    "machine_id": "real-coder-machine",
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T09:10:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "crew-dispatch-coder-ambig",
+                    "handle": "coder",
+                    "mission_id": "ambig-bookend-mission",
+                    "model": "qwen3.6-35b-a3b",
+                    "machine_id": "real-coder-machine",
+                    "payload": { "endpoint": "real-coder-endpoint" },
+                }),
+                // (#2487) The tainted session's terminal, LATER than the
+                // coder's — `terminal_ts_str` is a `max()`, so unfiltered
+                // this one wins `completed_ts` and therefore `updated_ts`,
+                // the row's first sort key.
+                serde_json::json!({
+                    "ts": "2026-01-01T09:30:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "ambig-bookend-mission",
+                    "handle": "coder-phase",
+                    "mission_id": "ambig-bookend-mission",
+                    "source": "mission",
+                    "machine_id": "stale-bookend-machine",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "ambig-bookend-mission").expect("row for ambig-bookend-mission");
+        assert!(row.tracked);
+
+        // Already correct before this fix — pinned here so the fixture's
+        // own premise (role/model DO recover) stays visible next to the
+        // machine/start_ts assertions this fix adds.
+        assert_eq!(row.role.as_deref(), Some("coder"));
+        assert_eq!(row.model.as_deref(), Some("qwen3.6-35b-a3b"));
+
+        // The #2487 fix: machine/start_ts must ALSO recover from the
+        // unambiguous coder session, not stay pinned to the tainted
+        // bookend.
+        assert_eq!(
+            row.machine.as_deref(),
+            Some("real-coder-machine"),
+            "machine must recover from the unambiguous coder session, not the ambiguous bookend: {row:?}"
+        );
+        assert_eq!(
+            row.started_ts,
+            parse_flow_ts("2026-01-01T09:00:00Z"),
+            "started_ts must recover from the unambiguous coder session's start, not the ambiguous bookend's earlier one: {row:?}"
+        );
+
+        // (#2487) The ordering half. `completed_ts` is what `updated_ts` —
+        // the FIRST sort key in both the viewer and the CLI — reads, so a
+        // `terminal_ts_str` taken as a `max()` over the unfiltered pool put
+        // this row at the tainted session's 09:30 rather than its own
+        // dispatch's 09:10. The filter is what actually delivers this
+        // commit's ordering claim; `representative` only reaches the third
+        // sort key.
+        assert_eq!(
+            row.completed_ts,
+            parse_flow_ts("2026-01-01T09:10:00Z"),
+            "completed_ts must come from the unambiguous coder session's terminal, not the later ambiguous one: {row:?}"
+        );
+        assert_eq!(
+            row.updated_ts,
+            parse_flow_ts("2026-01-01T09:10:00Z"),
+            "and therefore so must the row's first sort key: {row:?}"
+        );
+
+        // (#2558) Route recovers the same way — and does NOT keep the
+        // tainted session's earlier endpoint just because `remote` picks by
+        // earliest start.
+        assert_eq!(
+            row.route.as_deref(),
+            Some("real-coder-endpoint"),
+            "route must recover from the unambiguous coder session, not the ambiguous bookend's earlier endpoint: {row:?}"
+        );
+
+        // (#1915) The drill target follows the same recovered session.
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("crew-dispatch-coder-ambig"),
+            "session_id must also recover from the unambiguous coder session: {row:?}"
         );
     }
 
@@ -5148,6 +5438,18 @@ mod tests {
                 serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"mission start","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older","source":"mission_lifecycle"}),
                 serde_json::json!({"ts":"2026-01-01T08:00:01Z","action":"dispatch start","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","role":"review-probe-mid"}),
                 serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch complete","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","model":"m-old"}),
+                // (#2487) The older mission's OWN run-level dispatch bookend,
+                // mirroring the active mission's `owner/repo@deadbeef` below.
+                // Before #2487 this row's `completed_ts` was read off the
+                // SHARED probe session — the very session #1918 says belongs
+                // to two missions — which is what put it behind the active
+                // row. Now that an ambiguous session can no longer supply a
+                // time, the fixture supplies the terminal the real report
+                // actually had: a bookend keyed on the older run's own commit
+                // sha, never reused across missions. The ordering assertion
+                // below therefore now tests ordering rather than tainted data.
+                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"dispatch start","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
+                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch complete","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older"}),
                 serde_json::json!({"ts":"2026-01-01T08:20:01Z","action":"mission close","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older"}),
                 // active mission — mission-level bookend (its own unique
                 // session id, embeds the mission id — never reused) plus
