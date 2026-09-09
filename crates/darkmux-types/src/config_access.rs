@@ -781,8 +781,17 @@ pub fn radio_humor() -> u8 {
 }
 
 // ── ACP process lifecycle (#1698 Packet B2 / #1684 session hygiene) ──
-/// How many consecutive idle minutes `darkmux acp` waits (zero live
-/// sessions/commands) before self-exiting. Resolves
+/// How many consecutive idle minutes `darkmux acp` waits, with no command
+/// in flight, before self-exiting. (#1781) This window applies in full only
+/// to a process no client ever attached a session to — the orphan case the
+/// backstop exists for. Once a session has attached, the process is
+/// reclaimed only at a hard ceiling of **48× this window, never less than 7
+/// days** of uptime with no byte from the client, so a merely-idle editor
+/// panel is never killed out from under its client. Shortening this window
+/// therefore does NOT shorten that protection: the 7-day floor governs at
+/// every value up to 210 (~3.5 h), which is where 48× first exceeds it;
+/// above that the ceiling scales with the value (at `480`, 16 days).
+/// Resolves
 /// `env(DARKMUX_ACP_IDLE_EXIT_MINUTES) > config.runtime.acp_idle_exit_minutes > 30`.
 /// `0` disables self-exit entirely (an explicit opt-out, mirroring
 /// `remote.max_tokens_per_execution`'s `0`-means-hard-off convention
