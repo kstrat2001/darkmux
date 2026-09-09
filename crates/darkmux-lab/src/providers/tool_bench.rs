@@ -34,7 +34,7 @@ use crate::workloads::types::{
 use darkmux_types::Profile;
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -428,6 +428,20 @@ struct TrajStats {
 
 fn analyze_trajectory(text: &str) -> TrajStats {
     let mut s = TrajStats::default();
+    // (#1947) A reasoning checkpoint (#1221) closes one chat-completion
+    // call early and re-opens a new one to let the model check in, but the
+    // logical turn never ended — `loop_runner.rs` dispatches the
+    // continuation with the SAME `seq` as the turn it resumes
+    // (`next_seq = turns`, unincremented) and stamps only a genuinely NEW
+    // turn with `next_seq = turns + 1`. Counting `model.completed` EVENTS
+    // therefore counts "how many times this turn got interrupted to check
+    // in" as if every interruption were its own turn — one long
+    // checkpointed turn inflated `turns` 5-13x. Counting DISTINCT `seq`
+    // values among those events recovers the runtime's own notion of a
+    // turn. A `model.completed` missing `seq` (malformed/pre-seq legacy
+    // line) still counts on its own rather than being silently dropped.
+    let mut turn_seqs: HashSet<u64> = HashSet::new();
+    let mut turns_without_seq: u32 = 0;
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -464,7 +478,12 @@ fn analyze_trajectory(text: &str) -> TrajStats {
             }
             "dispatch.cycle.suspected" => s.cycles += 1,
             "model.completed" => {
-                s.turns += 1;
+                match v.get("seq").and_then(|s| s.as_u64()) {
+                    Some(seq) => {
+                        turn_seqs.insert(seq);
+                    }
+                    None => turns_without_seq += 1,
+                }
                 if let Some(u) = v.get("usage") {
                     s.prompt_tokens += u
                         .get("prompt_tokens")
@@ -479,6 +498,7 @@ fn analyze_trajectory(text: &str) -> TrajStats {
             _ => {}
         }
     }
+    s.turns = turn_seqs.len() as u32 + turns_without_seq;
     s
 }
 
@@ -1320,6 +1340,50 @@ not json — tolerated
         assert_eq!(s.turns, 2);
         assert_eq!(s.prompt_tokens, 300);
         assert_eq!(s.completion_tokens, 50);
+    }
+
+    /// (#1947) A reasoning checkpoint mid-turn closes one chat-completion
+    /// call and re-opens another for the SAME logical turn — the runtime
+    /// stamps every `model.completed` from that turn with the SAME `seq`.
+    /// Five events, one turn: naive event-counting (the pre-fix bug) would
+    /// say 5.
+    #[test]
+    fn analyze_trajectory_dedupes_a_checkpointed_turn() {
+        let jsonl = r#"{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}"#;
+        let s = analyze_trajectory(jsonl);
+        assert_eq!(s.turns, 1);
+    }
+
+    /// Inverted case: genuinely separate turns (distinct `seq`) must still
+    /// count separately — mixed with a checkpointed turn so a fixture using
+    /// only single-emission turns couldn't accidentally pass this test.
+    #[test]
+    fn analyze_trajectory_still_counts_genuinely_separate_turns() {
+        let jsonl = r#"{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":2}
+{"type":"model.completed","seq":3}"#;
+        let s = analyze_trajectory(jsonl);
+        assert_eq!(s.turns, 3);
+    }
+
+    /// A `model.completed` missing `seq` (a malformed line, or a pre-seq
+    /// legacy trajectory) counts on its own rather than being silently
+    /// dropped — three seq-less events plus one real turn is 4, not 1.
+    /// Red-proves against `None => {}` in `analyze_trajectory`'s match,
+    /// which reports 1 and left the whole suite green before this test.
+    #[test]
+    fn analyze_trajectory_keeps_model_completed_events_missing_seq() {
+        let jsonl = r#"{"type":"model.completed"}
+{"type":"model.completed"}
+{"type":"model.completed"}
+{"type":"model.completed","seq":1}"#;
+        let s = analyze_trajectory(jsonl);
+        assert_eq!(s.turns, 4);
     }
 
     #[test]
