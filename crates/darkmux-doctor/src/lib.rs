@@ -11009,6 +11009,73 @@ mod tests {
         );
     }
 
+    /// (#2498) The gap this fix closes: `check_lms_binary` must consult
+    /// `config.lms_bin`, not just the env tier. Before the #2498 test seam
+    /// (`config_access::set_config_for_test`) existed, this exact assertion
+    /// was UNWRITABLE — `config_access::config()` was always `EMPTY_CONFIG`
+    /// in every test build (#811), so no test anywhere in the workspace
+    /// could ever see the config tier win. That is precisely why
+    /// reintroducing #2149's regression (swapping the real
+    /// `config_access::lms_bin_with_source()` call for a raw
+    /// `std::env::var("DARKMUX_LMS_BIN")`) left the suite green: both of
+    /// `check_lms_binary`'s existing tests above drive the ENV tier only.
+    ///
+    /// Red-proved by hand for #2498: with the call in `check_lms_binary`
+    /// (line ~4862) swapped back to
+    /// `std::env::var("DARKMUX_LMS_BIN").unwrap_or_else(|_| "lms".into())`,
+    /// `cargo test -p darkmux-doctor --lib -- lms_binary` goes RED on THIS
+    /// test (config.lms_bin is never consulted, so the fake binary this
+    /// test points `config.lms_bin` at is never found, and the "via
+    /// config.lms_bin" provenance string never appears) while the other two
+    /// `check_lms_binary` tests above stay green throughout, exactly as the
+    /// issue predicted. Restored afterward.
+    #[serial_test::serial]
+    #[test]
+    fn check_lms_binary_resolves_from_config_tier_and_names_it() {
+        use darkmux_types::config::DarkmuxConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("lms");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // No env override in play — the value under test must come from
+        // the CONFIG tier alone.
+        let prev_lms_bin = std::env::var("DARKMUX_LMS_BIN").ok();
+        unsafe { std::env::remove_var("DARKMUX_LMS_BIN") };
+
+        let cfg = DarkmuxConfig { lms_bin: Some(fake.to_str().unwrap().to_string()), ..Default::default() };
+        let _guard = darkmux_types::config_access::set_config_for_test(cfg);
+
+        let check = check_lms_binary();
+
+        drop(_guard);
+        unsafe {
+            match prev_lms_bin {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("at that path"),
+            "a config.lms_bin path value resolves via the direct filesystem \
+             check, same as the env-tier equivalent: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("via config.lms_bin"),
+            "must resolve from AND name the CONFIG tier, not env or the \
+             built-in default: {}",
+            check.message
+        );
+    }
+
     #[test]
     fn parse_major_minor_accepts_two_part_versions_and_rejects_garbage() {
         assert_eq!(parse_major_minor("1.1"), Some((1, 1)));

@@ -28,6 +28,40 @@ static CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 #[cfg(any(test, feature = "test-support"))]
 static EMPTY_CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 
+// (#2498) The test seam: when set (via `set_config_for_test`), `config()`
+// returns THIS instead of `EMPTY_CONFIG`. A raw pointer rather than a
+// `Mutex<DarkmuxConfig>` because `config()` must hand back `&'static
+// DarkmuxConfig` (every accessor above borrows straight off it) — an
+// `AtomicPtr` swap is the cheapest way to get a `'static` reference that a
+// test can also RESET, which `OnceLock` (write-once) structurally can't do.
+// Each `set_config_for_test` call `Box::leak`s a fresh config; the leak is
+// deliberate and test-only (bounded by the number of tests that call it, not
+// by anything a real workload does). Null = "no override" = fall through to
+// `EMPTY_CONFIG`, so a test that never calls `set_config_for_test` sees
+// exactly the same empty config #811 always gave it.
+#[cfg(any(test, feature = "test-support"))]
+static CONFIG_OVERRIDE: std::sync::atomic::AtomicPtr<DarkmuxConfig> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+// (#2498) Per-THREAD install depth for the override above, which lets
+// `set_config_for_test` tell two very different situations apart:
+//
+//   * depth > 0 — a NESTED or re-entrant install on this same thread. Legal:
+//     the guard restores the pointer it displaced, so the inner scope ending
+//     hands the outer override back rather than clearing it.
+//   * depth == 0 with a non-null override — SOMEBODY ELSE's override is live,
+//     i.e. another test thread is mid-body. `CONFIG_OVERRIDE` is process-
+//     global, so that is cross-test contamination, and the setter panics on
+//     it (see `set_config_for_test`) instead of silently sharing.
+//
+// A thread-local (not a thread id) because the guard holds a raw pointer and
+// is therefore `!Send` — it cannot be dropped on a thread other than the one
+// that installed it, so the counter can't be stranded.
+#[cfg(feature = "test-support")]
+thread_local! {
+    static OVERRIDE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The config tier of `env > config.json > default`.
 ///
 /// **Production** (`cfg(not(test, test-support))`): the operator's real
@@ -44,11 +78,121 @@ static EMPTY_CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 /// — `pick_*()` take explicit cfg args, and accessor tests assert the env tier
 /// or the built-in default. A crate's whole test build opts in by enabling the
 /// `darkmux-types/test-support` feature (a dev-dependency); no per-test call.
+///
+/// (#2498) The ONE exception: a `test-support` test that has explicitly opted
+/// in via [`set_config_for_test`] sees that config instead, for as long as its
+/// returned guard is alive. Isolation is unchanged for every test that does
+/// NOT opt in — the override defaults to unset (null), so `config()` falls
+/// straight back through to `EMPTY_CONFIG` exactly as before this existed.
 fn config() -> &'static DarkmuxConfig {
     #[cfg(any(test, feature = "test-support"))]
-    return EMPTY_CONFIG.get_or_init(DarkmuxConfig::default);
+    {
+        let ptr = CONFIG_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(cfg) = unsafe { ptr.as_ref() } {
+            return cfg;
+        }
+        EMPTY_CONFIG.get_or_init(DarkmuxConfig::default)
+    }
     #[cfg(not(any(test, feature = "test-support")))]
     CONFIG.get_or_init(DarkmuxConfig::load_resolved)
+}
+
+/// (#2498) RAII guard returned by [`set_config_for_test`]. Restores whatever
+/// the config tier pointed at BEFORE this guard installed its override —
+/// `EMPTY_CONFIG` (the #811 isolation default) in the ordinary case, or the
+/// enclosing override when guards are nested. Restoration happens on an
+/// unwinding panic too, so a test that fails mid-assertion still can't leak
+/// its override into the next test in the process. **Bind it to a named
+/// variable** (`let _guard = set_config_for_test(cfg);`) — binding to `_`
+/// drops it immediately at the end of that statement, which restores the
+/// previous config before the rest of the test body runs. The setter is
+/// `#[must_use]`, so a bare `set_config_for_test(cfg);` statement is a lint,
+/// not a silently-vacuous test.
+///
+/// Holding a raw pointer makes this `!Send` by construction: the guard is
+/// dropped on the thread that installed it, which is what keeps the
+/// per-thread nesting depth honest.
+///
+/// **Serialization is a property of the whole test BINARY, not of your test.**
+/// This is process-global state (one `AtomicPtr`, same as every env-var
+/// mutation test in this module already touches process-global `std::env`),
+/// and `serial_test::serial` only coordinates among *annotated* tests —
+/// an un-annotated `#[test]` runs freely in libtest's thread pool and will
+/// happily read whatever config tier happens to be installed. So:
+///
+/// * the test that calls this MUST carry `#[serial_test::serial]`, **and**
+/// * every other test in the same binary that reads a field this override
+///   sets must carry it too, or be provably indifferent to that field.
+///
+/// The second half isn't compile-enforced. What IS enforced: a second
+/// concurrent writer panics loudly (see [`set_config_for_test`]) rather than
+/// silently sharing the tier, and this module's
+/// `zz_config_tier_is_empty_for_a_test_that_never_opts_in` fails if an
+/// override is ever left installed process-wide.
+#[cfg(feature = "test-support")]
+pub struct ConfigOverrideGuard {
+    /// The pointer this guard displaced — null in the ordinary
+    /// (non-nested) case. `Drop` restores THIS rather than storing null, so
+    /// an inner guard going out of scope can't clobber a still-live outer
+    /// override (which would silently drop the test back to `EMPTY_CONFIG`
+    /// mid-body and read as "the seam is broken").
+    prev: *mut DarkmuxConfig,
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for ConfigOverrideGuard {
+    fn drop(&mut self) {
+        CONFIG_OVERRIDE.store(self.prev, std::sync::atomic::Ordering::SeqCst);
+        // `try_with`, not `with`: a guard dropped during thread teardown must
+        // not panic on an already-destroyed TLS slot.
+        let _ = OVERRIDE_DEPTH.try_with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// (#2498) Test seam: redirect the config tier to `cfg` for the lifetime of
+/// the returned guard. `#[cfg(feature = "test-support")]` only (NOT plain
+/// `cfg(test)`) — matching the issue's own proposed shape, and keeping this
+/// callable from a DEPENDENT crate's tests (e.g. `darkmux-doctor`'s), which
+/// opt in via the `test-support` feature on their `darkmux-types` dev-dep
+/// the same way they already opt into the empty-config default.
+///
+/// Defaults to unset: a test that never calls this still sees the #811 empty
+/// config, unchanged. See [`ConfigOverrideGuard`] for the leak/panic/binding
+/// discipline this requires from the caller.
+///
+/// # Panics
+///
+/// If another THREAD's override is already installed. `CONFIG_OVERRIDE` is
+/// process-global and `serial_test::serial` only coordinates among annotated
+/// tests, so two concurrent writers would otherwise silently share the config
+/// tier — the second one's assertions reading the first one's config. That is
+/// contamination, and it fails loudly at the second writer rather than as a
+/// baffling assertion somewhere downstream. Nested/re-entrant guards on ONE
+/// thread are legal and do NOT panic (each restores what it displaced).
+#[cfg(feature = "test-support")]
+#[must_use = "the returned guard IS the override: dropping it immediately — a \
+              bare `set_config_for_test(cfg);` statement, or binding to `_` — \
+              restores the previous config before any assertion runs, so the \
+              test proves nothing (a NEGATIVE assertion in particular then \
+              passes vacuously). Bind it: `let _guard = set_config_for_test(cfg);`"]
+pub fn set_config_for_test(cfg: DarkmuxConfig) -> ConfigOverrideGuard {
+    let depth = OVERRIDE_DEPTH.with(|d| d.get());
+    assert!(
+        depth > 0 || CONFIG_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst).is_null(),
+        "set_config_for_test: another test thread's config override is already \
+         installed. This seam is PROCESS-GLOBAL, and `#[serial_test::serial]` \
+         only serializes tests that carry it — so every test that installs an \
+         override, and every test that reads a field one of them sets, must be \
+         serial. (Nested guards on a single thread are fine and never reach \
+         this check.)"
+    );
+    // `Box::into_raw` — the deliberate, test-only leak: `config()` hands out
+    // `&'static DarkmuxConfig`, so this allocation is never freed. Bounded by
+    // the number of tests that opt in, not by anything a real workload does.
+    let leaked: *mut DarkmuxConfig = Box::into_raw(Box::new(cfg));
+    let prev = CONFIG_OVERRIDE.swap(leaked, std::sync::atomic::Ordering::SeqCst);
+    OVERRIDE_DEPTH.with(|d| d.set(depth + 1));
+    ConfigOverrideGuard { prev }
 }
 
 /// Read an env var, **trimmed**, returning `None` when unset or
@@ -1608,6 +1752,40 @@ mod tests {
         assert_eq!(pick_string_with_source(k, None, None), (None, Source::BuiltIn));
     }
 
+    // (#2498) `pick_string` and `pick_string_with_source` are two
+    // independently-written implementations of the same ladder (an
+    // `or_else` chain vs an if-let chain — same pre-existing pattern as
+    // `pick_parsed`/`pick_parsed_with_source` below). They agree today; this
+    // keeps them agreeing. It walks the FULL cross product of the three
+    // tiers — env {unset, blank, set} x cfg {None, blank, set} x default
+    // {None, Some} = 18 cells — so "every tier combination" is literal, not
+    // an approximation of the six cells this originally covered. (It uniquely
+    // catches, for instance, deleting the blank-cfg filter from
+    // `pick_string_with_source`.)
+    #[serial_test::serial]
+    #[test]
+    fn pick_string_and_pick_string_with_source_agree() {
+        let k = "DARKMUX_TEST_PICK_STRING_AGREE";
+        for env in [None, Some("   "), Some("e")] {
+            unsafe {
+                match env {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+            for cfg in [None, Some("   "), Some("c")] {
+                for default in [None, Some("d")] {
+                    assert_eq!(
+                        pick_string(k, cfg, default),
+                        pick_string_with_source(k, cfg, default).0,
+                        "ladders diverged at env={env:?} cfg={cfg:?} default={default:?}"
+                    );
+                }
+            }
+        }
+        unsafe { std::env::remove_var(k); }
+    }
+
     // ── pick_parsed: env > cfg > default, unparseable env falls through ──
     #[serial_test::serial]
     #[test]
@@ -1646,6 +1824,176 @@ mod tests {
         assert_eq!(Source::BuiltIn.as_str(), "built-in");
         assert_eq!(Source::Config.as_str(), "config");
         assert_eq!(Source::Env.as_str(), "env");
+    }
+
+    // ── (#2498) the test seam itself: `set_config_for_test` must actually
+    //    make an accessor see the CONFIG tier. Gated on `test-support`
+    //    (matching `set_config_for_test`'s own gate) so it only runs under
+    //    `cargo test -p darkmux-types --features test-support` — NOT the
+    //    plain `cargo test -p darkmux-types` this crate's suite normally
+    //    runs under, since the function it exercises doesn't exist in that
+    //    build. The equivalent, always-in-the-normal-run proof lives in
+    //    `darkmux-doctor`'s `check_lms_binary_resolves_from_config_tier_and_
+    //    names_it` (that crate's dev-deps enable `test-support` on this one
+    //    unconditionally), which is also the test that red-proves #2149's
+    //    regression. This one is the seam's own self-test, one layer down.
+    #[cfg(feature = "test-support")]
+    #[serial_test::serial]
+    #[test]
+    fn set_config_for_test_redirects_the_config_tier() {
+        let k = "DARKMUX_LMS_BIN";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+
+        // Before opting in: the #811 empty-config default, same as every
+        // other test in this module gets.
+        assert_eq!(lms_bin_with_source(), ("lms".to_string(), Source::BuiltIn));
+
+        {
+            let cfg = DarkmuxConfig { lms_bin: Some("/opt/custom/lms".to_string()), ..Default::default() };
+            let _guard = set_config_for_test(cfg);
+            assert_eq!(
+                lms_bin_with_source(),
+                ("/opt/custom/lms".to_string(), Source::Config),
+                "an accessor must see the config the guard installed"
+            );
+        }
+        // Guard dropped at scope end: back to the #811 empty default — proves
+        // the seam can't leak into the next test in this process.
+        assert_eq!(
+            lms_bin_with_source(),
+            ("lms".to_string(), Source::BuiltIn),
+            "dropping the guard must restore EMPTY_CONFIG"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── (#2498) nested guards: an INNER guard's scope ending must restore the
+    //    OUTER override, not clear the tier. The first cut stored null in
+    //    `Drop` and stored (rather than swapped) in the setter, so the inner
+    //    drop silently dropped a still-live outer override back to
+    //    `EMPTY_CONFIG` mid-body — which reads as "the seam is broken" rather
+    //    than "you nested guards". Red-proves against either half of the fix
+    //    (revert `Drop` to `store(null)`, or the setter to `store` + a
+    //    `prev: null_mut()` guard, and the OUTER assertion below fails).
+    #[cfg(feature = "test-support")]
+    #[serial_test::serial]
+    #[test]
+    fn nested_guards_restore_the_enclosing_override_not_the_empty_config() {
+        let k = "DARKMUX_LMS_BIN";
+        let prev_env = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+
+        let outer = DarkmuxConfig { lms_bin: Some("OUTER".to_string()), ..Default::default() };
+        let _outer_guard = set_config_for_test(outer);
+        assert_eq!(config().lms_bin.as_deref(), Some("OUTER"));
+
+        {
+            let inner = DarkmuxConfig { lms_bin: Some("INNER".to_string()), ..Default::default() };
+            let _inner_guard = set_config_for_test(inner);
+            assert_eq!(
+                config().lms_bin.as_deref(),
+                Some("INNER"),
+                "the inner guard must win while it is alive"
+            );
+        }
+
+        assert_eq!(
+            config().lms_bin.as_deref(),
+            Some("OUTER"),
+            "dropping the INNER guard must restore the enclosing override, \
+             not clear the tier to EMPTY_CONFIG"
+        );
+
+        drop(_outer_guard);
+        assert_eq!(
+            config().lms_bin.as_deref(),
+            None,
+            "dropping the outermost guard restores the #811 empty config"
+        );
+
+        unsafe {
+            match prev_env {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── (#2498) A SECOND thread installing an override while one is live is
+    //    cross-test contamination, not nesting — `#[serial_test::serial]`
+    //    only serializes the tests that carry it, so an un-annotated test
+    //    calling this seam would otherwise silently share the process-global
+    //    config tier with whoever is mid-body. It must panic at the second
+    //    writer. Red-proves by deleting the `assert!` in
+    //    `set_config_for_test` (the join then returns `Ok`).
+    #[cfg(feature = "test-support")]
+    #[serial_test::serial]
+    #[test]
+    fn a_second_thread_installing_an_override_panics_instead_of_sharing() {
+        let outer = DarkmuxConfig { lms_bin: Some("OUTER".to_string()), ..Default::default() };
+        let _outer_guard = set_config_for_test(outer);
+
+        // The spawned thread's panic message is expected — silence the
+        // default hook for the duration so the run's output stays readable.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let joined = std::thread::spawn(|| {
+            let other = DarkmuxConfig { lms_bin: Some("OTHER".to_string()), ..Default::default() };
+            let _g = set_config_for_test(other);
+        })
+        .join();
+        std::panic::set_hook(prev_hook);
+
+        assert!(
+            joined.is_err(),
+            "a second THREAD installing an override must panic, not quietly \
+             take over the process-global config tier"
+        );
+        assert_eq!(
+            config().lms_bin.as_deref(),
+            Some("OUTER"),
+            "and this thread's override must survive the refused install"
+        );
+    }
+
+    // ── (#2498) The tripwire. Every OTHER assertion that the config tier is
+    //    empty for a non-opting-in test lives INSIDE the opting-in test —
+    //    which is exactly why a stuck override went unnoticed: no-op'ing
+    //    `ConfigOverrideGuard::drop` left the override installed for the whole
+    //    process and only 1 of 191 tests (the seam's own self-test) noticed.
+    //    This one is independent of the seam: it never opts in, and asserts
+    //    the WHOLE config document is the default one. Serial so it is ordered
+    //    against the seam's writers rather than racing them — which is the
+    //    coverage that matters here, since a leaked/stuck override outlives
+    //    its writer and this test then sees it. (Cross-thread contamination
+    //    from a NON-serial reader is the other half, and is caught at the
+    //    writer instead: `set_config_for_test` panics on a second concurrent
+    //    installer.)
+    //
+    //    The `zz_` prefix is load-bearing: libtest starts tests in
+    //    name-sorted order, so it puts this AFTER the seam's writers
+    //    (`nested_guards_…`, `set_config_for_test_…`) and the stuck override
+    //    is observed rather than missed. A scheduling heuristic, not a
+    //    guarantee — the writer-side panic above is the guarantee.
+    #[serial_test::serial]
+    #[test]
+    fn zz_config_tier_is_empty_for_a_test_that_never_opts_in() {
+        let observed = serde_json::to_value(config()).expect("config serializes");
+        let empty = serde_json::to_value(DarkmuxConfig::default()).expect("default serializes");
+        assert_eq!(
+            observed, empty,
+            "a test that never called set_config_for_test must see the #811 \
+             EMPTY config — a non-empty document here means either the \
+             production config file leaked into a test build, or another \
+             test's override is still installed"
+        );
     }
 
     // ── representative `_with_source` accessors honor the env layer live,
