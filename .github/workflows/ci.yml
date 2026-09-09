@@ -282,6 +282,18 @@ jobs:
         if: steps.filter.outputs.runtime != 'true'
         run: echo "No runtime/ changes detected; test+lint skipped (reports green)."
 
+  # A `mock-dispatch-proof` nightly job was written here and withdrawn before
+  # merge (#2486, #2600): `tests/mock_dispatch_proof.rs` is the only test in
+  # the tree that constructs and runs a real `docker run`, but a frontier
+  # review proved on real Linux Docker Engines (27.5.1 and 28.5.2, the runner
+  # image's own 28.0.4 included) that the job would be red every night from
+  # night one — `host.docker.internal` does not resolve on Docker Engine (no
+  # `--add-host host-gateway` is wired anywhere in darkmux, pending #839),
+  # and even mapped it would hit a refused connection because the mock model
+  # binds loopback only. There is also no notification path in this workflow
+  # beyond an artifact upload, so a red nightly would have gone unaddressed.
+  # The gating work is tracked in #2600 — read it before re-adding this job.
+
   cargo-audit:
     name: cargo audit (RUSTSEC advisories)
     runs-on: ubuntu-latest
