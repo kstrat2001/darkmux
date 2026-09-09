@@ -2902,6 +2902,16 @@ mod tests {
         assert_eq!(dir, tmp.path().join("hooks"), "must scope under DARKMUX_HOME, not the real user home");
     }
 
+    // (#2305) `#[serial]` because this READS a key another test WRITES.
+    // `hooks_rules_empty_by_default` and the outbox-cap default below both
+    // assert the built-in tier, and their env-setting neighbours are already
+    // serial — but `serial_test` only excludes among ANNOTATED tests, so an
+    // unannotated reader still runs inside a serial writer's set/restore
+    // window. Observed live in CI: `hooks_max_outbox_mb_defaults_to_256` read
+    // `5`, the value `hooks_max_outbox_mb_env_overrides_the_default` installs,
+    // against an expected `256`. Serializing the writer is necessary and not
+    // sufficient; the readers need it too.
+    #[serial_test::serial]
     #[test]
     fn hooks_rules_empty_by_default() {
         assert!(hooks_rules().is_empty(), "no config tier in test builds → no rules");
@@ -2909,6 +2919,7 @@ mod tests {
 
     // ─── (#2093 merge-gate finding 5) hard outbox cap ────────────────────
 
+    #[serial_test::serial]
     #[test]
     fn hooks_max_outbox_mb_defaults_to_256() {
         assert_eq!(hooks_max_outbox_mb(), 256, "no config tier in test builds → built-in default");
