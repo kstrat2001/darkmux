@@ -666,6 +666,27 @@ pub struct Step {
     /// override).
     #[serde(default)]
     pub config: serde_json::Value,
+    /// The instant this step's own dispatch actually began — the moment
+    /// its `StepKind::run_streaming` call was invoked, not the moment the
+    /// scheduler admitted it into a ready wave and flipped `status` to
+    /// `Running` (`scheduler::run_step_graph`'s wave-admission loop sets
+    /// `status` for every ready step in a wave at once; `started_ts` is
+    /// stamped separately, per step, from inside that step's own job
+    /// closure — see `WaveSignal::StepDispatching`).
+    ///
+    /// **`None` while `status == Running` is a real, honest state** — it
+    /// means the step has been admitted and claimed for this wave but
+    /// hasn't actually started dispatching yet (typically queued behind a
+    /// concurrency cap, `remote_cap` or otherwise, alongside other ready
+    /// siblings). It does NOT mean "unknown". Every consumer of this field
+    /// must treat `Running` + `None` as "scheduled, not yet generating",
+    /// never as "unknown start time" or a reason to fall back to `now()`.
+    ///
+    /// Before #2517, every step admitted into the same wave shared ONE
+    /// `now_unix()` stamped before any of them had dispatched — a wave
+    /// with more ready steps than the concurrency cap allows showed
+    /// several/many steps reading identical `started_ts` values while only
+    /// as many as the cap allows were actually generating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_ts: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
