@@ -610,3 +610,51 @@ pub struct IntegrityReport {
 fn is_false(b: &bool) -> bool {
     !*b
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (#2578) The READ-side twin every `integrity_check_file` test in
+    /// `lib.rs` is missing: those all construct an `IntegrityReport` by
+    /// running the real checker (the WRITE side) and assert on the
+    /// returned struct — none of them ever deserialize a JSON document
+    /// back into this type. `legacy_format` pairs `#[serde(default)]`
+    /// with `skip_serializing_if = "is_false"`, so it's OMITTED from
+    /// every normally-verified or normally-broken byte-hash-format
+    /// report — the common case — and only present (as `true`) for the
+    /// rarer legacy-format case. `flow integrity-check --json` writes
+    /// this type; nothing in this codebase reads it back today (per
+    /// #2578's own framing — "written ... never read back"), but the
+    /// derive is `Serialize, Deserialize` (both), so a future consumer
+    /// (an operator's own tooling, a `darkmux doctor` cross-check reading
+    /// its own prior run) inherits the omission-tolerance whether anyone
+    /// has built that consumer yet or not.
+    ///
+    /// **Proved failing first** (2026-09-10, this packet): dropping
+    /// `default` from `IntegrityReport::legacy_format` while keeping
+    /// `skip_serializing_if`, rebuilding (`cargo build -p darkmux-flow
+    /// --tests`, confirmed exit 0), and running `cargo test -p
+    /// darkmux-flow --lib` left all 254 other tests in this crate green.
+    /// Restored before writing this test.
+    #[test]
+    fn integrity_report_with_legacy_format_omitted_round_trips() {
+        // The common case: a normally-verified byte-hash-format file.
+        // `legacy_format` is `false`, so `is_false` skips it entirely —
+        // this document never carries the key at all.
+        let json = r#"{"path": "2026-09-10.jsonl", "records_checked": 12, "chain_valid": true}"#;
+        let report: IntegrityReport = serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("a report with legacy_format omitted must still deserialize: {e}"));
+        assert!(!report.legacy_format, "an omitted legacy_format must default to false");
+        assert_eq!(report.path, "2026-09-10.jsonl");
+        assert_eq!(report.records_checked, 12);
+        assert!(report.chain_valid);
+
+        // Round-trip fidelity: re-serializing must still omit the false flag.
+        let out = serde_json::to_value(&report).unwrap();
+        assert!(
+            out.as_object().unwrap().get("legacy_format").is_none(),
+            "is_false should have skipped legacy_format on re-serialize"
+        );
+    }
+}

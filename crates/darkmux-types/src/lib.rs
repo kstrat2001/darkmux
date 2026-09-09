@@ -1187,6 +1187,69 @@ mod tests {
         assert_eq!(back.tier2.as_ref().unwrap().slot_caps, t2.slot_caps);
     }
 
+    /// (#2578) The READ-side twin the fix's own commit note names: the
+    /// test above (`runtime_compaction_config_v0_1_shape_round_trips`)
+    /// always supplies `slot_caps` explicitly, so it never exercises the
+    /// omission path — which is exactly the shape a real operator writes.
+    /// `Tier2Config::slot_caps` pairs `#[serde(default)]` with
+    /// `skip_serializing_if = "BTreeMap::is_empty"`; an operator writing
+    /// `{"tier2": {"schema_version": "0.1"}}` — the profiles registry's
+    /// own on-disk shape (`~/.darkmux/profiles.json`), NOT a fixture — is
+    /// the document that stops loading if `default` is ever dropped.
+    ///
+    /// **Proved failing first** (2026-09-10, this packet): dropping
+    /// `default` from `Tier2Config::slot_caps` while keeping
+    /// `skip_serializing_if`, rebuilding (`cargo build -p darkmux-types
+    /// --tests`, confirmed exit 0), and running `cargo test -p
+    /// darkmux-types --lib` left all 206 other tests in this crate green —
+    /// this omission carried zero coverage of its own before this test.
+    /// Restored before writing this test.
+    #[test]
+    fn tier2_config_with_slot_caps_omitted_round_trips() {
+        // The exact operator-authored shape named in #2578: `tier2` present,
+        // `slot_caps` omitted entirely (never even an empty `{}`).
+        let json = r#"{"tier2": {"schema_version": "0.1"}}"#;
+        let cfg: RuntimeCompactionConfig = serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("an operator profile with slot_caps omitted must still deserialize: {e}"));
+        let t2 = cfg.tier2.as_ref().expect("tier2 set");
+        assert_eq!(t2.schema_version.as_deref(), Some("0.1"));
+        assert!(t2.slot_caps.is_empty(), "an omitted slot_caps must default to empty, not fail to parse");
+
+        // Round-trip fidelity: re-serializing must still omit the empty map.
+        let out = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            out["tier2"].as_object().unwrap().get("slot_caps").is_none(),
+            "BTreeMap::is_empty should have skipped slot_caps on re-serialize"
+        );
+    }
+
+    /// (#2578) The same READ-side omission-path gap, for
+    /// `BundleSelector::fact_families` — persisted on every review run
+    /// record. `bundle_selector_unknown_keys_are_preserved` (below)
+    /// always supplies `fact_families` explicitly; this is the document
+    /// that omits it entirely, which is what every unscoped probe seat's
+    /// serialized selector actually looks like on disk.
+    ///
+    /// **Proved failing first** (2026-09-10, this packet): dropping
+    /// `default` from `BundleSelector::fact_families` while keeping
+    /// `skip_serializing_if`, rebuilding (confirmed exit 0), and running
+    /// the crate's lib suite left all 206 other tests green. Restored
+    /// before writing this test.
+    #[test]
+    fn bundle_selector_with_fact_families_omitted_round_trips() {
+        let json = r#"{"max_bundles": 2}"#;
+        let sel: BundleSelector = serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("a selector with fact_families omitted must still deserialize: {e}"));
+        assert!(sel.fact_families.is_empty(), "an omitted fact_families must default to empty");
+        assert_eq!(sel.max_bundles, Some(2));
+
+        let out = serde_json::to_value(&sel).unwrap();
+        assert!(
+            out.as_object().unwrap().get("fact_families").is_none(),
+            "Vec::is_empty should have skipped fact_families on re-serialize"
+        );
+    }
+
     /// Backward-compat invariant: openclaw-shape passthrough fields
     /// (`model`, `mode`, `customInstructions`, `maxHistoryShare`,
     /// `recentTurnsPreserve`) deserialize into `.extras` and
