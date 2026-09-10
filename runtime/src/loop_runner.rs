@@ -3948,10 +3948,28 @@ fn run_with_sleeper(
                     // `Recovery budget 0/2`. Under default config the only
                     // backstop is the host's 600s SIGKILL — which produces NO
                     // envelope, so every banked checkpoint is lost too.
+                    //
+                    // (#2258) The tail window has to be sized by whichever
+                    // bound actually GOVERNED this call, not by
+                    // `reasoning_interval` unconditionally. #2171 widened this
+                    // arm to also handle generation-bound checkpoints (default
+                    // interval 4000, vs. the reasoning check-in's 1000) but
+                    // the sizing here kept reading the reasoning constant, so
+                    // a generation-bound call got an 8000-token tail
+                    // (`TAIL_SAMPLE_INTERVALS * 1000`) instead of the 32000
+                    // its own interval implies — a 4x-narrower sample than
+                    // the detector was tuned for on that pathway. `active_bound`
+                    // is the same read-back-what-was-sent helper the salvage
+                    // and checkpoint-continuation sites already use a few
+                    // screens up — it can never disagree with what the
+                    // request actually carried.
+                    let governing_interval =
+                        active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap)
+                            .value as u32;
                     let tail_ratio = crate::reasoning_loop::tail_repetition_ratio(
                         &carried,
                         crate::reasoning_loop::TAIL_WINDOW_TOKENS,
-                        crate::reasoning_loop::tail_sample_tokens(reasoning_interval),
+                        crate::reasoning_loop::tail_sample_tokens(governing_interval),
                     );
                     // Degeneracy DETECTION applies to any output; only the
                     // remedy differs. An earlier cut gated the detection itself
@@ -3959,8 +3977,10 @@ fn run_with_sleeper(
                     // with no gate at all — it checkpointed forever, and the
                     // pre-existing intra-turn stall escalation that used to
                     // bound exactly that shape became unreachable.
-                    let degenerate =
-                        crate::reasoning_loop::slice_is_degenerate(&carried, reasoning_interval);
+                    let degenerate = crate::reasoning_loop::slice_is_degenerate(
+                        &carried,
+                        governing_interval,
+                    );
                     // (#1221) EVERY continuation is the same logical turn,
                     // including the one that follows a `conclude`.
                     //
@@ -11365,6 +11385,248 @@ mod tests {
             "the model must never be told a checkpoint happened — a model invited \
              to wrap up will wrap up, and that measurably cost real findings \
              (got {budget_messages} budget message(s))"
+        );
+    }
+
+    /// (#2258) The degeneracy gate's tail window must be sized by whichever
+    /// bound actually GOVERNED the call, not by `reasoning_interval`
+    /// unconditionally. This dispatch never reasons, so every length-finish
+    /// is GENERATION-bound (`sent_generation_bound`) — `active_bound`
+    /// resolves to `generation_checkpoint_interval`, not the reasoning
+    /// interval, for every one of these calls.
+    ///
+    /// `reasoning_checkpoint_interval` (10) is set deliberately SMALLER than
+    /// `generation_checkpoint_interval` (50) here so the two produce
+    /// measurably different tail windows at `TAIL_SAMPLE_INTERVALS=8`: 80
+    /// tokens (wrong — the pre-#2258 bug) vs. 400 tokens (right — the bound
+    /// that actually governed).
+    ///
+    /// The mock returns the SAME 50-distinct-word block every call
+    /// (`w0`..`w49`), so the accumulation is exactly periodic with period 50
+    /// tokens, and `tail_repetition_ratio`'s distinct-windows count is fixed
+    /// at `min(50, tail_sample - 11)` once at least one full period is in
+    /// view. At checkpoint 5 (250 tokens accumulated — still short of the
+    /// 400-token generation tail, so the WHOLE accumulation is sampled when
+    /// sized correctly):
+    ///   - sized by the interval that governed (generation, 50 → tail 400,
+    ///     capped at the 250 accumulated so far): 239 windows, 50 distinct
+    ///     — ratio 50/239 ≈0.209, under the 0.25 degenerate threshold.
+    ///   - sized by the interval that did NOT govern (reasoning, 10 → tail
+    ///     80, already smaller than the accumulation): 69 windows, 50
+    ///     distinct — ratio 50/69 ≈0.725, comfortably CLEAN.
+    /// The two verdicts land on opposite sides of the threshold by roughly
+    /// a 3x margin each way, so this is not sensitive to tokenization edge
+    /// cases. (Checkpoint 5, not 8: the ratio crosses 0.25 as soon as the
+    /// correctly-sized tail exceeds 211 tokens — 250 at checkpoint 5 — so a
+    /// correct gate never reaches checkpoint 8 in this fixture at all.)
+    #[test]
+    #[serial_test::serial]
+    fn generation_bound_degeneracy_gate_sizes_the_tail_by_the_generation_interval() {
+        let block: String = (0..50).map(|i| format!("w{i} ")).collect();
+        let server = crate::test_support::GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(chat_response_json(Some(&block), None, "length", 100, 50));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("gen-degeneracy-window").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("write forever")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(50), None, Some(1000), Some(10), Some(50),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a generation-bound degenerate repeat is a clean escalation, not an Err");
+
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory written");
+        let checkpoints: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["type"] == "dispatch.checkpoint")
+            .collect();
+        let fifth = checkpoints
+            .iter()
+            .find(|c| c["checkpoint"] == serde_json::json!(5))
+            .unwrap_or_else(|| panic!("expected a checkpoint 5 record, got {checkpoints:?}"));
+
+        assert_eq!(
+            fifth["bound"]["kind"],
+            serde_json::json!("generation_checkpoint_interval"),
+            "checkpoint 5 must be governed by the generation check-in in this fixture, \
+             got {fifth:?}"
+        );
+        let ratio = fifth["tail_ratio"].as_f64().unwrap_or_else(|| {
+            panic!("checkpoint 5 must have a numeric tail_ratio, got {fifth:?}")
+        });
+        assert!(
+            ratio < 0.25,
+            "(#2258) checkpoint 5 has 250 accumulated tokens of an exactly-periodic \
+             50-token block — sized by the GENERATION interval (50, the bound that \
+             actually governed this call) the tail covers the whole accumulation and \
+             must read as degenerate (~0.209). A ratio of {ratio} means the gate sampled \
+             a narrower-than-governing tail — the #2258 regression."
+        );
+        assert_eq!(
+            fifth["verdict"],
+            serde_json::json!("conclude"),
+            "a ratio under the threshold must verdict conclude, got {fifth:?}"
+        );
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "the gate must catch the repeat at checkpoint 5 and escalate cleanly — a \
+             narrower-than-governing tail instead lets it run past the degeneracy gate \
+             all the way to the independent generation-continuation budget backstop, \
+             got {:?}",
+            outcome.terminal_reason
+        );
+        assert_eq!(outcome.turns, 1, "every hit is a continuation of the same logical turn");
+    }
+
+    /// (#2258) The INVERTED direction of the fixture above — a fix that
+    /// simply swapped the hardcoded `reasoning_interval` for a hardcoded
+    /// `generation_interval` (rather than reading back whichever bound
+    /// actually governed) would pass the generation-bound fixture above and
+    /// still be wrong: it would UNDER-size the tail for a genuinely
+    /// REASONING-bound call. This fixture pins that direction so such a fix
+    /// cannot ship.
+    ///
+    /// A priming turn (closed think block, dispatched via `finish_reason:
+    /// tool_calls`) establishes `dispatch_has_reasoned`. Turn 2 then opens
+    /// an UNCLOSED `<think>` and keeps re-affirming it every call (the mock
+    /// returns the identical `<think> w1..w49` slice each time), so
+    /// `carries_reasoning_bound` stays true and every length-finish in turn
+    /// 2 is REASONING-bound (`sent_reasoning_bound`) — the opposite
+    /// governing bound from the fixture above.
+    ///
+    /// `generation_checkpoint_interval` (10) is set deliberately SMALLER
+    /// than `reasoning_checkpoint_interval` (50) — the mirror image of the
+    /// generation-bound fixture's interval choice — so a fix that reads the
+    /// wrong bound is caught in BOTH directions: reading `reasoning_interval`
+    /// unconditionally is caught above; reading `generation_interval`
+    /// unconditionally (or otherwise failing to read back what this call
+    /// actually carried) is caught here.
+    ///
+    /// The block is `"<think> "` + 49 distinct words = 50 tokens/call, same
+    /// period as the fixture above, so checkpoint 5 lands at the identical
+    /// 250-accumulated-tokens point with the identical expected ratios
+    /// (~0.209 sized by the governing 50-interval, ~0.725 sized by the
+    /// wrong 10-interval) — the two fixtures are deliberately numerically
+    /// symmetric, just with the roles of the two intervals swapped.
+    #[test]
+    #[serial_test::serial]
+    fn reasoning_bound_degeneracy_gate_sizes_the_tail_by_the_reasoning_interval() {
+        let reasoning_block: String =
+            std::iter::once("<think> ".to_string()).chain((1..=49).map(|i| format!("w{i} "))).collect();
+
+        let server = crate::test_support::GuardedMockServer::start();
+        // Priming turn: a closed think block dispatched cleanly via
+        // finish_reason=tool_calls, matched on the ABSENCE of a "role":
+        // "tool" message — establishes `dispatch_has_reasoned` before the
+        // scenario under test. Same priming pattern as
+        // `salvage_record_names_the_reasoning_checkpoint_interval_bound`.
+        let _priming = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(
+                Some("<think>brief</think>"),
+                Some(serde_json::json!([{
+                    "id": "c0",
+                    "type": "function",
+                    "function": { "name": "echo", "arguments": "{\"text\":\"priming\"}" }
+                }])),
+                "tool_calls",
+                100,
+                20,
+            ));
+        });
+        // Turn 2: every length-finish is a reasoning-bound checkpoint
+        // continuation — matched on the PRESENCE of the priming turn's
+        // tool-result message, persistent for every call after.
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() >= 1
+            });
+            then.status(200).json_body(chat_response_json(
+                Some(&reasoning_block),
+                None,
+                "length",
+                100,
+                50,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("reasoning-degeneracy-window").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Echo, Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        // (#2258) `max_cumulative_tokens=700` is a bounded backstop, not the
+        // signal under test — a reasoning-bound thought is deliberately
+        // open-ended (no continuation budget of its own), and once the
+        // thought closes (checkpoint 5, correctly sized) the turn moves on
+        // to generation-bound answer-region continuations that could run
+        // for a while too — so without SOME ceiling this fixture could run
+        // long if the gate never fires at all. The assertions below read
+        // the checkpoint-5 record directly rather than the eventual
+        // terminal_reason, since both a correct and a wrong governing
+        // interval can reach the SAME cumulative-cap terminal eventually —
+        // the divergence is only visible mid-run.
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(50), Some(700), Some(1000), Some(50), Some(10),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a reasoning-bound degenerate repeat must not error the dispatch");
+        let _ = outcome;
+
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory written");
+        let checkpoints: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["type"] == "dispatch.checkpoint")
+            .collect();
+        let fifth = checkpoints
+            .iter()
+            .find(|c| c["checkpoint"] == serde_json::json!(5))
+            .unwrap_or_else(|| panic!("expected a checkpoint 5 record, got {checkpoints:?}"));
+
+        assert_eq!(
+            fifth["bound"]["kind"],
+            serde_json::json!("reasoning_checkpoint_interval"),
+            "checkpoint 5 must be governed by the reasoning check-in in this fixture, \
+             got {fifth:?}"
+        );
+        let ratio = fifth["tail_ratio"].as_f64().unwrap_or_else(|| {
+            panic!("checkpoint 5 must have a numeric tail_ratio, got {fifth:?}")
+        });
+        assert!(
+            ratio < 0.25,
+            "(#2258, inverted direction) checkpoint 5 has 250 accumulated tokens of an \
+             exactly-periodic 50-token block — sized by the REASONING interval (50, the \
+             bound that actually governed this call) the tail covers the whole \
+             accumulation and must read as degenerate (~0.209). A ratio of {ratio} means \
+             a fix that reads the GENERATION interval here (or otherwise fails to read \
+             back what this call actually carried) moved the #2258 bug rather than \
+             fixing it."
+        );
+        assert_eq!(
+            fifth["verdict"],
+            serde_json::json!("conclude"),
+            "a ratio under the threshold must verdict conclude, got {fifth:?}"
         );
     }
 
