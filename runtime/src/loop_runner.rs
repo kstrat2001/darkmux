@@ -3958,14 +3958,16 @@ fn run_with_sleeper(
                     // a generation-bound call got an 8000-token tail
                     // (`TAIL_SAMPLE_INTERVALS * 1000`) instead of the 32000
                     // its own interval implies — a 4x-narrower sample than
-                    // the detector was tuned for on that pathway. `active_bound`
-                    // is the same read-back-what-was-sent helper the salvage
-                    // and checkpoint-continuation sites already use a few
-                    // screens up — it can never disagree with what the
-                    // request actually carried.
-                    let governing_interval =
-                        active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap)
-                            .value as u32;
+                    // the detector was tuned for on that pathway. `per_call_cap`
+                    // IS the governing interval: the cap-selection `if/else if/
+                    // else` a few screens up already resolved it to whichever
+                    // bound this call carries (`reasoning_interval` /
+                    // `generation_interval` / `answer_max_tokens`), so no
+                    // lookup is needed to name it here — `active_bound` exists
+                    // to attach PROVENANCE (which `BoundKind` this was, for the
+                    // trajectory record below), not to compute the value; all
+                    // three of its branches return `per_call_cap` verbatim.
+                    let governing_interval = per_call_cap;
                     let tail_ratio = crate::reasoning_loop::tail_repetition_ratio(
                         &carried,
                         crate::reasoning_loop::TAIL_WINDOW_TOKENS,
@@ -11401,33 +11403,50 @@ mod tests {
     /// tokens (wrong — the pre-#2258 bug) vs. 400 tokens (right — the bound
     /// that actually governed).
     ///
-    /// The mock returns the SAME 50-distinct-word block every call
-    /// (`w0`..`w49`), so the accumulation is exactly periodic with period 50
+    /// The mock returns the SAME 90-distinct-word block every call
+    /// (`w0`..`w89`), so the accumulation is exactly periodic with period 90
     /// tokens, and `tail_repetition_ratio`'s distinct-windows count is fixed
-    /// at `min(50, tail_sample - 11)` once at least one full period is in
-    /// view. At checkpoint 5 (250 tokens accumulated — still short of the
-    /// 400-token generation tail, so the WHOLE accumulation is sampled when
-    /// sized correctly):
+    /// at 90 once at least one full period is in view. The period is
+    /// DELIBERATELY WIDER than the 50-token `generation_checkpoint_interval`
+    /// that governs the correct tail — see the guard note below for why a
+    /// period equal to (or narrower than) the governing interval is not
+    /// enough. At checkpoint 5 (450 tokens accumulated over 5 calls):
     ///   - sized by the interval that governed (generation, 50 → tail 400,
-    ///     capped at the 250 accumulated so far): 239 windows, 50 distinct
-    ///     — ratio 50/239 ≈0.209, under the 0.25 degenerate threshold.
+    ///     narrower than the 450 accumulated, so only the last 400 tokens
+    ///     are sampled): 389 windows, 90 distinct — ratio 90/389 ≈0.2314,
+    ///     under the 0.25 degenerate threshold.
     ///   - sized by the interval that did NOT govern (reasoning, 10 → tail
-    ///     80, already smaller than the accumulation): 69 windows, 50
-    ///     distinct — ratio 50/69 ≈0.725, comfortably CLEAN.
-    /// The two verdicts land on opposite sides of the threshold by roughly
-    /// a 3x margin each way, so this is not sensitive to tokenization edge
-    /// cases. (Checkpoint 5, not 8: the ratio crosses 0.25 as soon as the
-    /// correctly-sized tail exceeds 211 tokens — 250 at checkpoint 5 — so a
-    /// correct gate never reaches checkpoint 8 in this fixture at all.)
+    ///     80, already smaller than one period): 69 windows, all distinct
+    ///     (a sub-period slice of unique tokens can't repeat) — ratio 1.0,
+    ///     comfortably CLEAN.
+    /// (Checkpoint 5, not 8: the ratio crosses 0.25 as soon as the
+    /// correctly-sized tail exceeds 349 windows' worth — 360 accumulated at
+    /// checkpoint 4 still reads ≈0.258, clean — so a correct gate never
+    /// reaches checkpoint 8 in this fixture at all.)
+    ///
+    /// (#2258 review, guard hardening) A 50-token period — equal to the
+    /// governing generation interval — is NOT enough to red-prove Mutation
+    /// C (a "fix" that reads the raw `answer_max_tokens` cap, 1000 here,
+    /// instead of whichever bound actually governed): at checkpoint 5 with
+    /// a 50-token period, BOTH the correctly-sized tail (400, computed
+    /// above) and the mutant tail (1000 × 8 = 8000) exceed the 250-token
+    /// accumulation, so both sample the WHOLE accumulation and produce the
+    /// bit-identical ratio 50/239 ≈0.2092 — a mutant that ignores which
+    /// bound governed passes silently. Widening the period to 90 keeps the
+    /// correctly-sized tail (400) narrower than the 450-token accumulation
+    /// (sampling only the tail, ratio ≈0.2314) while the mutant tail (8000)
+    /// still swallows the whole accumulation (ratio 90/439 ≈0.2050) — both
+    /// verdicts still read "conclude" (both under 0.25), so the guard below
+    /// asserts the exact ratio, not just the threshold.
     #[test]
     #[serial_test::serial]
     fn generation_bound_degeneracy_gate_sizes_the_tail_by_the_generation_interval() {
-        let block: String = (0..50).map(|i| format!("w{i} ")).collect();
+        let block: String = (0..90).map(|i| format!("w{i} ")).collect();
         let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200)
-                .json_body(chat_response_json(Some(&block), None, "length", 100, 50));
+                .json_body(chat_response_json(Some(&block), None, "length", 100, 90));
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
@@ -11465,13 +11484,31 @@ mod tests {
         let ratio = fifth["tail_ratio"].as_f64().unwrap_or_else(|| {
             panic!("checkpoint 5 must have a numeric tail_ratio, got {fifth:?}")
         });
+        // (#2258 review, guard hardening) A threshold check (`ratio < 0.25`)
+        // only catches UNDER-sizing the tail (a narrower-than-governing tail
+        // reads clean, ratio 1.0 — see the fixture doc). It does NOT catch
+        // Mutation C (a "fix" that always reads the raw `answer_max_tokens`
+        // cap, ignoring which bound governed): with this 90-token period,
+        // the mutant tail (8000) still swallows the whole 450-token
+        // accumulation and produces ratio 90/439 ≈0.2050, which is ALSO
+        // under 0.25 — the threshold alone can't tell the two apart. The
+        // exact value can: sized by the GOVERNING generation interval (50 →
+        // tail 400, narrower than the 450-token accumulation) the sampled
+        // tail is 389 windows with all 90 periodic tokens distinct, giving
+        // exactly 90/389 ≈0.23136. Any other value means the tail was sized
+        // by something other than the interval that actually governed.
+        let expected_ratio = 90.0_f64 / 389.0_f64;
         assert!(
-            ratio < 0.25,
-            "(#2258) checkpoint 5 has 250 accumulated tokens of an exactly-periodic \
-             50-token block — sized by the GENERATION interval (50, the bound that \
-             actually governed this call) the tail covers the whole accumulation and \
-             must read as degenerate (~0.209). A ratio of {ratio} means the gate sampled \
-             a narrower-than-governing tail — the #2258 regression."
+            (ratio - expected_ratio).abs() < 1e-4,
+            "(#2258) checkpoint 5 has 450 accumulated tokens of an exactly-periodic \
+             90-token block — sized by the GENERATION interval (50, the bound that \
+             actually governed this call) the tail is 400 tokens, narrower than the \
+             accumulation, giving 389 windows and exactly 90/389 ≈{expected_ratio:.4} \
+             distinct. A ratio of {ratio} means the gate did not size the tail by the \
+             interval that governed — either the pre-#2258 regression (a \
+             narrower-than-governing tail, ratio near 1.0) or a fix that reads the raw \
+             per-call cap regardless of which bound governed (ratio ≈0.2050, this \
+             fixture's Mutation C)."
         );
         assert_eq!(
             fifth["verdict"],
@@ -11514,17 +11551,23 @@ mod tests {
     /// unconditionally (or otherwise failing to read back what this call
     /// actually carried) is caught here.
     ///
-    /// The block is `"<think> "` + 49 distinct words = 50 tokens/call, same
+    /// The block is `"<think> "` + 89 distinct words = 90 tokens/call, same
     /// period as the fixture above, so checkpoint 5 lands at the identical
-    /// 250-accumulated-tokens point with the identical expected ratios
-    /// (~0.209 sized by the governing 50-interval, ~0.725 sized by the
-    /// wrong 10-interval) — the two fixtures are deliberately numerically
-    /// symmetric, just with the roles of the two intervals swapped.
+    /// 450-accumulated-tokens point with the identical expected ratios
+    /// (~0.2314 sized by the governing 50-interval, 1.0 sized by the wrong
+    /// 10-interval) — the two fixtures are deliberately numerically
+    /// symmetric, just with the roles of the two intervals swapped. (#2258
+    /// review, guard hardening: the 90-token period, wider than the
+    /// 50-token governing interval, is what lets checkpoint 5's exact ratio
+    /// discriminate Mutation C — a fix that reads the raw
+    /// `answer_max_tokens` cap regardless of which bound governed — the
+    /// same reason the fixture above widened its own period from 50; see
+    /// its doc for the full math.)
     #[test]
     #[serial_test::serial]
     fn reasoning_bound_degeneracy_gate_sizes_the_tail_by_the_reasoning_interval() {
         let reasoning_block: String =
-            std::iter::once("<think> ".to_string()).chain((1..=49).map(|i| format!("w{i} "))).collect();
+            std::iter::once("<think> ".to_string()).chain((1..=89).map(|i| format!("w{i} "))).collect();
 
         let server = crate::test_support::GuardedMockServer::start();
         // Priming turn: a closed think block dispatched cleanly via
@@ -11562,7 +11605,7 @@ mod tests {
                 None,
                 "length",
                 100,
-                50,
+                90,
             ));
         });
 
@@ -11613,15 +11656,24 @@ mod tests {
         let ratio = fifth["tail_ratio"].as_f64().unwrap_or_else(|| {
             panic!("checkpoint 5 must have a numeric tail_ratio, got {fifth:?}")
         });
+        // (#2258 review, guard hardening) Same reasoning as the fixture
+        // above: a threshold check alone can't distinguish the correctly-
+        // sized tail from Mutation C's raw-cap tail (both land under 0.25
+        // at this accumulation), so assert the exact value the GOVERNING
+        // reasoning interval implies (400-token tail over a 450-token
+        // accumulation → 389 windows, 90 distinct → 90/389 ≈0.23136).
+        let expected_ratio = 90.0_f64 / 389.0_f64;
         assert!(
-            ratio < 0.25,
-            "(#2258, inverted direction) checkpoint 5 has 250 accumulated tokens of an \
-             exactly-periodic 50-token block — sized by the REASONING interval (50, the \
-             bound that actually governed this call) the tail covers the whole \
-             accumulation and must read as degenerate (~0.209). A ratio of {ratio} means \
-             a fix that reads the GENERATION interval here (or otherwise fails to read \
-             back what this call actually carried) moved the #2258 bug rather than \
-             fixing it."
+            (ratio - expected_ratio).abs() < 1e-4,
+            "(#2258, inverted direction) checkpoint 5 has 450 accumulated tokens of an \
+             exactly-periodic 90-token block — sized by the REASONING interval (50, the \
+             bound that actually governed this call) the tail is 400 tokens, narrower \
+             than the accumulation, giving 389 windows and exactly 90/389 \
+             ≈{expected_ratio:.4} distinct. A ratio of {ratio} means the gate did not \
+             size the tail by the interval that governed — either a fix that reads the \
+             GENERATION interval here (ratio near 1.0, moving the #2258 bug rather than \
+             fixing it) or a fix that reads the raw per-call cap regardless of which \
+             bound governed (ratio ≈0.2050, this fixture's Mutation C)."
         );
         assert_eq!(
             fifth["verdict"],
