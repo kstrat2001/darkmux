@@ -184,6 +184,7 @@ pub fn run() -> DoctorReport {
         check_daemon_auth(),
         check_utility_model_binding(),
         check_unpriceable_residents(),
+        check_unreachable_darkmux_residents(),
         check_role_profiles(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
@@ -1390,6 +1391,109 @@ fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelR
         hint: Some(
             "darkmux tried a config.json, then the GGUF header, then a catalog-size estimate — none of the three had anything to work from. A corrupt/truncated download, an ambiguous multi-file GGUF directory (no unambiguous -00001-of- shard to read), or an unusual weights format neither reader understands are the likely causes. If an MLX build of the same model exists (check the LMStudio catalog for a `-mlx`/`-bit` variant), load that instead — MLX builds ship a config.json and price normally. Otherwise this resident's commitment is invisible to the machine page's totals and its fit verdict for the whole machine stays UNKNOWN for as long as it's loaded.".into(),
         ),
+    }
+}
+
+/// (#1944) Surface — never touch — a `darkmux:`-namespaced resident that no
+/// current profile can address. Reconcile (`AcquireScope::Exclusive`,
+/// `ensure_wave_loaded`) already evicts a darkmux-owned orphan on the NEXT
+/// dispatch that reaches it — but only then. Between the moment a profile
+/// changes (or a review-staffing seat like `qwen38-probe` is retired) and the
+/// next dispatch, that orphan sits resident with nothing telling the operator
+/// it's there; #1944's own report was found by hand-reading `lms ps`, not by
+/// any darkmux surface. This check closes that gap: read-only, never
+/// auto-unloads (operator sovereignty, #44) — it names the stranded
+/// identifier and suggests the single surgical `lms unload`, exactly the move
+/// the issue's operator made by hand.
+///
+/// "Addressable" means the resident's namespaced identifier
+/// (`darkmux_profiles::swap::namespaced_identifier`) matches either (a) some
+/// model entry in some profile in the registry, or (b) the machine's
+/// `internal.utility` binding (#590) — the ONE darkmux-owned identifier that
+/// is legitimately never listed in any profile's `models[]`. A non-namespaced
+/// resident is user state and is never inspected here — same filter
+/// `is_darkmux_owned` applies everywhere else (`machine status`/`eject`,
+/// dispatch preflight, `plan_acquire`'s own Exclusive pass).
+fn check_unreachable_darkmux_residents() -> Check {
+    let registry = match darkmux_profiles::profiles::load_registry(None) {
+        Ok(r) => r.registry,
+        Err(_) => {
+            return Check {
+                name: "unreachable residents".into(),
+                status: Status::Warn,
+                message: "no profile registry — can't check resident reachability".into(),
+                hint: None,
+            };
+        }
+    };
+    let loaded = match darkmux_profiles::lms::list_loaded() {
+        Ok(l) => l,
+        Err(_) => {
+            return Check {
+                name: "unreachable residents".into(),
+                status: Status::Warn,
+                message: "could not enumerate loaded models".into(),
+                hint: None,
+            };
+        }
+    };
+    unreachable_residents_status(&loaded, &registry)
+}
+
+/// Pure decision for [`check_unreachable_darkmux_residents`], split out so
+/// every arm is unit-testable without a live LMStudio / profile file round
+/// trip (same split as `utility_binding_status` / `unpriceable_residents_status`).
+fn unreachable_residents_status(
+    loaded: &[darkmux_types::LoadedModel],
+    registry: &darkmux_types::ProfileRegistry,
+) -> Check {
+    let name = "unreachable residents".to_string();
+
+    let mut addressable: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for profile in registry.profiles.values() {
+        for m in &profile.models {
+            addressable.insert(darkmux_profiles::swap::namespaced_identifier(m));
+        }
+    }
+    if let Some(util_id) = registry.utility_model_id() {
+        // `internal.utility` is a bare id, never an explicit-identifier
+        // override (the schema has no field for one there) — the same
+        // namespaced form `apply_utility_model` loads it under (#590,
+        // #1616). Route through the same `ProfileModel`-shaped helper the
+        // profile loop above uses rather than adding a `darkmux-gestalt`
+        // dependency just for its two-arg twin.
+        let util_pm = darkmux_types::ProfileModel { id: util_id.to_string(), ..Default::default() };
+        addressable.insert(darkmux_profiles::swap::namespaced_identifier(&util_pm));
+    }
+
+    let unreachable: Vec<&str> = loaded
+        .iter()
+        .filter(|l| darkmux_profiles::swap::is_darkmux_owned(&l.identifier))
+        .filter(|l| !addressable.contains(&l.identifier))
+        .map(|l| l.identifier.as_str())
+        .collect();
+
+    if unreachable.is_empty() {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: "every darkmux-owned resident is addressable by some profile".into(),
+            hint: None,
+        };
+    }
+
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!(
+            "{} darkmux-owned resident(s) unreachable — no profile in the registry declares them, so nothing will ever dispatch to (or reconcile) them until reclaimed by hand: {}",
+            unreachable.len(),
+            unreachable.join(", ")
+        ),
+        hint: Some(format!(
+            "darkmux never auto-unloads a resident outside a reconcile it's already planning (operator sovereignty, #44) — reclaim the RAM yourself: `lms unload <identifier>` for each one listed (e.g. `lms unload {}`), or `darkmux machine eject` to sweep every darkmux-owned resident if nothing is running. This is usually a leftover from a superseded profile version or review-staffing seat — no data loss either way.",
+            unreachable[0]
+        )),
     }
 }
 
@@ -9125,9 +9229,9 @@ mod tests {
         // hooks checks are a different, disabled-by-default surface] + one
         // per active eureka rule.
         //
-        // (round-3 merge fix) The constant here is 56, not 55: #2452 added
-        // `check_state_file_permissions` to the static array (recount it
-        // before touching this number — `grep -c` inside the
+        // (round-3 merge fix) The constant here is 57, not 56: #1944 added
+        // `check_unreachable_darkmux_residents` to the static array (recount
+        // it before touching this number — `grep -c` inside the
         // `let checks = vec![...]` block), `check_hooks()` always
         // contributes exactly 1 more (disabled by default → the single
         // overview check), and only THEN does `eureka_checks()` add one per
@@ -9140,7 +9244,7 @@ mod tests {
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 56 + darkmux_eureka::all_rules().len();
+        let expected = 57 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -9836,6 +9940,131 @@ mod tests {
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("2 resident model"), "counts both unpriceable rows: {}", c.message);
         assert!(c.message.contains('a') && c.message.contains('c'));
+    }
+
+    // ─── check_unreachable_darkmux_residents (#1944) ───────────────────────
+
+    /// `models` pairs are `(id, explicit_identifier)` — a `None` explicit
+    /// identifier means the namespaced default (`namespaced_identifier`'s
+    /// documented opt-out shape).
+    fn registry_with(profiles: &[(&str, &[(&str, Option<&str>)])]) -> darkmux_types::ProfileRegistry {
+        let mut map = std::collections::BTreeMap::new();
+        for (name, models) in profiles {
+            let profile_models = models
+                .iter()
+                .map(|(id, explicit_identifier)| darkmux_types::ProfileModel {
+                    id: id.to_string(),
+                    identifier: explicit_identifier.map(str::to_string),
+                    ..Default::default()
+                })
+                .collect();
+            map.insert(
+                (*name).to_string(),
+                darkmux_types::Profile { models: profile_models, ..Default::default() },
+            );
+        }
+        darkmux_types::ProfileRegistry { profiles: map, ..Default::default() }
+    }
+
+    #[test]
+    fn unreachable_residents_no_loaded_models_passes() {
+        let registry = registry_with(&[]);
+        let c = super::unreachable_residents_status(&[], &registry);
+        assert_eq!(c.status, Status::Pass);
+    }
+
+    #[test]
+    fn unreachable_residents_addressable_resident_passes() {
+        let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
+        let loaded = vec![lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b")];
+        let c = super::unreachable_residents_status(&loaded, &registry);
+        assert_eq!(c.status, Status::Pass, "message: {}", c.message);
+    }
+
+    /// The live #1944 trace: a superseded review-staffing seat's identifier
+    /// (`qwen38-probe`) is no longer declared by ANY profile — WARN, name
+    /// it, and hint the surgical `lms unload` the issue's operator ran by
+    /// hand.
+    #[test]
+    fn unreachable_residents_names_the_orphan_and_hints_lms_unload() {
+        let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
+        let loaded = vec![
+            lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
+            lm("darkmux:qwen38-probe", "qwen/qwen3.8-27b"),
+        ];
+        let c = super::unreachable_residents_status(&loaded, &registry);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("darkmux:qwen38-probe"), "names the orphan: {}", c.message);
+        assert!(
+            !c.message.contains("darkmux:qwen/qwen3.8-27b"),
+            "an addressable sibling is not swept into the warning: {}",
+            c.message
+        );
+        let hint = c.hint.expect("a warn carries a remedy");
+        assert!(
+            hint.contains("lms unload darkmux:qwen38-probe"),
+            "hint names the exact surgical command: {hint}"
+        );
+    }
+
+    /// Operator sovereignty's inverted-case test: a NON-namespaced resident
+    /// — user state darkmux never brought up — must NEVER be flagged here,
+    /// no matter how far it is from anything a profile declares. This pins
+    /// the namespace convention's absolute half: user state is visible to
+    /// the planner as pool consumption only and is structurally off-limits
+    /// to any darkmux suggestion, this check included. A one-directional
+    /// test (only proving orphans get flagged) would risk shipping a
+    /// doctor check that also — wrongly — nudges the operator to `lms
+    /// unload` their own state.
+    #[test]
+    fn unreachable_residents_never_flags_a_foreign_resident() {
+        let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
+        let loaded = vec![lm("some-user-loaded-model", "some-user-loaded-model")];
+        let c = super::unreachable_residents_status(&loaded, &registry);
+        assert_eq!(
+            c.status,
+            Status::Pass,
+            "a foreign (non-namespaced) resident is never this check's business: {}",
+            c.message
+        );
+        assert!(
+            !c.message.contains("some-user-loaded-model"),
+            "a foreign identifier must never appear in this check's output, suggested or otherwise: {}",
+            c.message
+        );
+    }
+
+    /// The machine utility (compactor) binding (#590) is the one darkmux-
+    /// owned identifier legitimately absent from every profile's
+    /// `models[]` — it must count as addressable, or every machine with a
+    /// utility model registered gets a permanent false-positive Warn.
+    #[test]
+    fn unreachable_residents_utility_binding_counts_as_addressable() {
+        let mut registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
+        registry.internal = Some(darkmux_types::RegistryInternal { utility: Some("util-4b".to_string()) });
+        let loaded = vec![
+            lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
+            lm("darkmux:util-4b", "util-4b"),
+        ];
+        let c = super::unreachable_residents_status(&loaded, &registry);
+        assert_eq!(c.status, Status::Pass, "the utility binding is addressable, not orphaned: {}", c.message);
+    }
+
+    /// An explicit-identifier override (the namespace opt-out, #52) is
+    /// honored: a profile model that sets `identifier` explicitly makes
+    /// THAT string the addressable form, not the namespaced default —
+    /// matching `namespaced_identifier`'s own documented pass-through.
+    #[test]
+    fn unreachable_residents_honors_an_explicit_identifier_override() {
+        let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", Some("darkmux:my-alias"))])]);
+        let loaded = vec![lm("darkmux:my-alias", "qwen/qwen3.8-27b")];
+        let c = super::unreachable_residents_status(&loaded, &registry);
+        assert_eq!(
+            c.status,
+            Status::Pass,
+            "an explicit alias is addressable under its own spelling: {}",
+            c.message
+        );
     }
 
     // ─── role_profiles coherence (#1475 packet 1, #1547) ─────────────────
