@@ -869,16 +869,31 @@ fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<V
             // stop the ARRAY itself from being unbounded — a ladder with
             // hundreds of distinct, individually-legal depths reproduces
             // the same hang one hop up, in the number of `chaining@N`
-            // tasks `generate_tasks` emits (one per distinct depth) rather
-            // than in any single depth's own file count. Checked on the
-            // raw array length, before the per-element parse below, so the
-            // refusal names the actual manifest shape the operator wrote.
+            // tasks `generate_tasks` emits (one per DISTINCT depth, after
+            // its own de-dup) rather than in any single depth's own file
+            // count. Checked on the RAW array length, before dedup and
+            // before the per-element parse below, so the refusal names the
+            // actual manifest shape the operator wrote.
+            //
+            // (MUST FIX, third-round frontier review) This check counts raw
+            // entries, not distinct depths — a repeated-value array like
+            // `[2; 21]` trips this refusal while `generate_tasks` would
+            // only ever emit ONE `chaining@2` task from it. The message
+            // below used to claim "each distinct depth becomes its own
+            // chaining task" as if this array's length were exactly the
+            // task count it would generate, which is false whenever the
+            // array holds duplicates. Refusing on raw length anyway is the
+            // safe direction (over-refusal, never under-refusal), so the
+            // check itself is unchanged — only the message is corrected to
+            // describe what it actually counts.
             ensure!(
                 arr.len() <= MAX_CHAIN_LADDER_LEN,
                 "workload extras.chainDepths has {} entries, above the cap of {MAX_CHAIN_LADDER_LEN} \
-                 — each distinct depth becomes its own chaining task with up to `depth` hop files, \
-                 so a long ladder turns one manifest key into an effectively unbounded loop the \
-                 same way a single oversized depth does. Shorten the ladder.",
+                 — this cap counts raw array entries (before de-duplication), because after \
+                 de-duplication each distinct depth becomes its own chaining task with up to \
+                 `depth` hop files, so a long array is refused as a conservative bound on how many \
+                 chaining tasks it could generate, even if repeated values would collapse to fewer \
+                 at generation time. Shorten the array.",
                 arr.len()
             );
             let mut depths = Vec::with_capacity(arr.len());
@@ -892,6 +907,23 @@ fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<V
                             "workload extras.chainDepths must contain only positive integers, got {d}"
                         )
                     })?;
+                // (MUST FIX, third-round frontier review) The message above
+                // already claims "positive integers", but nothing below it
+                // enforced that floor — `0` parsed clean and was silently
+                // raised to `generate_tasks`'s own chaining minimum (`.max(2)`,
+                // see that call's doc) with no error and no name pointing at
+                // the accepted-then-overridden value. Same class of bug this
+                // review pass closed for `chainDepths` overflow and the seed
+                // sign message elsewhere in this file — refuse loudly instead
+                // of accepting a value the parser's own message already
+                // disclaims and generation would just discard.
+                ensure!(
+                    n >= 1,
+                    "workload extras.chainDepths contains {n}, but every depth must be a positive \
+                     integer — `0` would be silently raised to the chaining minimum (2) by \
+                     generate_tasks rather than used as written. Use a real depth (>= 1), or omit \
+                     chainDepths for the default ladder."
+                );
                 ensure!(
                     n <= MAX_CHAIN_DEPTH as u64,
                     "workload extras.chainDepths contains {n}, above the cap of {MAX_CHAIN_DEPTH} \
@@ -2348,6 +2380,26 @@ not json — tolerated
         assert!(format!("{err:#}").contains("soon"));
     }
 
+    // (MUST FIX, third-round frontier review) `0` parsed clean before this
+    // fix and was silently raised to the chaining minimum (2) by
+    // `generate_tasks`'s own `.max(2)` — the same "accepted then silently
+    // overridden" shape this pass closed elsewhere, except here the
+    // refusal message already claimed "positive integers" while nothing
+    // enforced it.
+    #[test]
+    fn chain_depths_strict_refuses_a_zero_depth_instead_of_silently_raising_it() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!([2, 0, 4]));
+        let err = chain_depths_strict(&extras)
+            .expect_err("0 must be refused, not silently raised to the chaining minimum");
+        let msg = format!("{err:#}");
+        assert!(msg.contains('0'), "the offending value is named: {msg}");
+        assert!(
+            msg.contains("positive"),
+            "the message names what's actually required: {msg}"
+        );
+    }
+
     #[test]
     fn chain_depths_strict_refuses_a_non_array_value_instead_of_defaulting() {
         let mut extras = BTreeMap::new();
@@ -2430,6 +2482,33 @@ not json — tolerated
         );
     }
 
+    // (MUST FIX, third-round frontier review) The aggregate cap counts RAW
+    // array entries, not distinct depths after dedup — a repeated-value
+    // ladder trips this refusal even though `generate_tasks` would only
+    // ever emit ONE `chaining@N` task from it. The refusal message used to
+    // claim "each distinct depth becomes its own chaining task" as if the
+    // array's length were exactly the task count it would generate, which
+    // is false here: 21 entries, all the same depth, generate one task.
+    // Over-refusal is still the right call (a conservative bound is safer
+    // than an accurate one that has to dedup first), but the message must
+    // say what the check actually counts.
+    #[test]
+    fn chain_depths_strict_refuses_a_repeated_value_ladder_on_raw_entry_count() {
+        let mut extras = BTreeMap::new();
+        let ladder = vec![2u32; MAX_CHAIN_LADDER_LEN + 1];
+        extras.insert("chainDepths".to_string(), serde_json::json!(ladder));
+        let err = chain_depths_strict(&extras).expect_err(
+            "a repeated-value ladder over the raw-entry cap must still be refused — it generates \
+             one task, but the cap is deliberately conservative on raw length",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("raw array entries") || msg.contains("de-duplication"),
+            "the message must name what it actually counts (raw entries, before dedup), not \
+             claim a 1:1 mapping to generated tasks that duplicates break: {msg}"
+        );
+    }
+
     #[test]
     fn chain_depths_strict_accepts_a_ladder_exactly_at_the_aggregate_cap() {
         let mut extras = BTreeMap::new();
@@ -2462,10 +2541,15 @@ not json — tolerated
              silently outrank the operator's own configured inactivity bound"
         );
 
-        // Drive the SAME extras (minus chainDepths, overridden to a single
-        // small depth so the mocked run stays cheap) through the real
-        // run() loop and confirm the override field it actually
-        // constructs stays None end to end.
+        // Drive the SAME extras through the real run() loop and confirm the
+        // override field it actually constructs stays None end to end. The
+        // shipped manifest already names its own `chainDepths: [2, 4, 6]`,
+        // so `run_and_capture_timeout_overrides_with_run_dir`'s
+        // `.entry("chainDepths").or_insert([2])` never fires here — this
+        // drives the FULL 3-depth ladder (8 dispatches: 5 fixed axes + one
+        // `chaining@N` per distinct depth), not a single small depth. (An
+        // earlier version of this comment claimed chainDepths was
+        // overridden to keep the run cheap; it never was for this test.)
         let extras_json = serde_json::to_value(&manifest.workload.extras).unwrap();
         let (seen, run_dir) = run_and_capture_timeout_overrides_with_run_dir(extras_json)
             .expect("run succeeds against a mocked dispatch");
@@ -2493,6 +2577,43 @@ not json — tolerated
             fixture.get("task_timeout_override_seconds"),
             Some(&serde_json::Value::Null),
             "the shipped manifest's own fixture must record no override on disk: {fixture}"
+        );
+    }
+
+    // (MUST FIX, third-round frontier review) The null-pinning test above
+    // only proves the ABSENT-override half of `bench-fixture.json`'s
+    // `task_timeout_override_seconds` field is written correctly. Nothing
+    // in this suite ever reads the file back for the PRESENT case — a
+    // regression that hardcoded `Value::Null` into the write path (the
+    // same "written but never read back" shape #2587 closed in the
+    // in-memory `seen` direction) would leave the whole provider suite
+    // green. Pin the positive half too: a real override must survive to
+    // disk as the actual value, not just as "present".
+    #[test]
+    fn run_records_a_present_task_timeout_override_on_disk() {
+        let (seen, run_dir) =
+            run_and_capture_timeout_overrides_with_run_dir(serde_json::json!({
+                "taskTimeoutSeconds": 45,
+                "chainDepths": [2]
+            }))
+            .expect("run succeeds against a mocked dispatch");
+        assert!(!seen.is_empty(), "the mocked dispatch never ran");
+        assert!(
+            seen.iter().all(|v| *v == Some(45)),
+            "every dispatch in the run must carry the manifest-derived override: {seen:?}"
+        );
+
+        let fixture_path = run_dir.path().join("bench-fixture.json");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&fixture_path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", fixture_path.display())),
+        )
+        .expect("bench-fixture.json is valid JSON");
+        assert_eq!(
+            fixture.get("task_timeout_override_seconds"),
+            Some(&serde_json::json!(45)),
+            "a present override must be recorded on disk as its real value, not just as \
+             non-null: {fixture}"
         );
     }
 
