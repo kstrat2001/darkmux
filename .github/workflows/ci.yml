@@ -190,6 +190,15 @@ jobs:
         with:
           key: fleet-e2e
 
+      # #2601: the runner image's own Google Chrome apt source can fail
+      # `apt-get update` (a mid-publish hash mismatch on Google's mirror) and
+      # take every apt install on the runner down with it, including this
+      # one, which has nothing to do with Chrome. Shared script — see its
+      # header for why drop over tolerate, and #2601 for the incident.
+      - name: Drop the runner's Google Chrome apt source (#2601)
+        if: steps.filter.outputs.rust == 'true'
+        run: bash scripts/drop-broken-apt-sources.sh
+
       - name: Install redis-server
         if: steps.filter.outputs.rust == 'true'
         run: |
@@ -379,6 +388,16 @@ jobs:
         if: steps.filter.outputs.viewer == 'true'
         working-directory: tests/e2e
         run: npm ci
+
+      # #2601: `--with-deps` shells out to apt-get itself to install the OS
+      # libraries Chromium needs; if the runner's own (unrelated) Google
+      # Chrome apt source is having a mid-publish hash mismatch, THAT
+      # internal apt-get update fails and takes this step down with it, even
+      # though this step doesn't touch that source's packages. Same shared
+      # fix as the other apt-touching jobs — see the script's header.
+      - name: Drop the runner's Google Chrome apt source (#2601)
+        if: steps.filter.outputs.viewer == 'true'
+        run: bash scripts/drop-broken-apt-sources.sh
 
       - name: Install Chromium for Playwright
         if: steps.filter.outputs.viewer == 'true'
@@ -729,6 +748,14 @@ jobs:
         if: steps.filter.outputs.ui == 'true'
         working-directory: tests/parity
         run: bun install --frozen-lockfile
+
+      # #2601: same internal apt-get-via-`--with-deps` exposure as the other
+      # Playwright install above — drop the runner's own (unrelated) Google
+      # Chrome apt source first so a mid-publish hash mismatch on Google's
+      # mirror can't fail this step's apt-get update.
+      - name: Drop the runner's Google Chrome apt source (#2601)
+        if: steps.filter.outputs.ui == 'true'
+        run: bash scripts/drop-broken-apt-sources.sh
 
       - name: Install chromium
         if: steps.filter.outputs.ui == 'true'
