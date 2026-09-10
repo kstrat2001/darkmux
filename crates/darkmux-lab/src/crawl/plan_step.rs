@@ -101,6 +101,37 @@ impl StepKind for CrawlPlanStepKind {
         None
     }
 
+    /// (#2577 audit, mechanism corrected on review) `CwdPolicy::
+    /// NoAmbientDependency` (the trait default, stated explicitly here) —
+    /// the only ambient-adjacent call reachable through this kind
+    /// (`plan_one_rule` -> `materialize` -> `resolve_one`'s first-clone
+    /// `git clone --bare`, via `run_git(None, ...)`) was first probed live
+    /// from a deleted process cwd: exit 0, no visible stdout noise. That
+    /// was originally credited to "`git`, invoked directly rather than
+    /// through a shell, doesn't consult the ambient directory" — **that
+    /// mechanism is wrong.** A repeat probe (a bare `Command::new("git")`,
+    /// no shell wrapper, exactly `run_git`'s own shape) shows `git` spawns
+    /// its OWN internal shell regardless of how darkmux invokes it: stderr
+    /// still carries `shell-init: error retrieving current directory` from
+    /// a deleted cwd — the exact `resolve_shell_cwd`'s doc comment above
+    /// (`step_kinds::builtins`, near its "Measured before this fix" note)
+    /// already names as a signature some panels in this project render as
+    /// a failure. The clone succeeds anyway only because BOTH of its own
+    /// arguments (`origin`, `mirror_path`) are already absolute by the
+    /// time `resolve_one` builds the command, so that internal shell never
+    /// has to resolve anything relative to the directory it failed to
+    /// read. This is no longer merely an audited-safe finding sitting on
+    /// luck: `resolve_one` now REFUSES a relative `path`-origin
+    /// unconditionally (#2577 review), so this kind's freedom from the
+    /// ambient directory is structural, not just today's hand audit.
+    /// Every OTHER git call inside `materialize` passes an explicitly
+    /// resolved mirror/tree path. Not a `StepKindRegistry::with_builtins()`
+    /// member, so `step_kinds::registry`'s `cwd_policy` conformance test
+    /// cannot see this kind — this doc comment is the record of the audit.
+    fn cwd_policy(&self) -> darkmux_crew::step_kinds::CwdPolicy {
+        darkmux_crew::step_kinds::CwdPolicy::NoAmbientDependency
+    }
+
     fn display_name(&self) -> &'static str {
         "Plan"
     }

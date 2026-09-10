@@ -123,6 +123,24 @@ impl StepKind for PlanSitesStepKind {
         None
     }
 
+    /// (#2577 audit, mechanism corrected on review) `CwdPolicy::
+    /// NoAmbientDependency` — see `plan_step::CrawlPlanStepKind::
+    /// cwd_policy`'s own doc for the full corrected mechanism (the earlier
+    /// "`git` doesn't consult the ambient directory when invoked directly"
+    /// explanation was wrong — `git` spawns its own internal shell
+    /// regardless; the clone is safe because its arguments are already
+    /// absolute, not because no shell runs). This kind's tree-source path
+    /// calls the SAME `plan_one_rule`, and its diff-source path
+    /// (`derive_workspace_spec` + `materialize`) goes through the same
+    /// `resolve_one`, which now REFUSES a relative `path`-origin
+    /// unconditionally (#2577 review) — this kind's freedom from the
+    /// ambient directory is now structural rather than resting on today's
+    /// hand audit alone. Not a `StepKindRegistry::with_builtins()` member,
+    /// so the registry conformance test cannot see it — audited by hand.
+    fn cwd_policy(&self) -> darkmux_crew::step_kinds::CwdPolicy {
+        darkmux_crew::step_kinds::CwdPolicy::NoAmbientDependency
+    }
+
     fn display_name(&self) -> &'static str {
         "Plan sites"
     }

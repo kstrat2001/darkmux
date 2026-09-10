@@ -424,7 +424,7 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
 // `run_step_graph` returns — `Step.output` still carries a plain-text
 // summary for consistency with every other step kind's convention.
 
-use crew::step_kinds::{resolve_local_seat, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
+use crew::step_kinds::{resolve_local_seat, CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
@@ -624,6 +624,18 @@ impl StepKind for MissionWorktreeStepKind {
         )
     }
 
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — `add_worktree`'s `git worktree add` always
+    /// runs against `ctx.repo_root`, resolved once at launch setup (before
+    /// the graph runs at all — `mission_launch.rs`'s `coder_phase::
+    /// repo_root()`), never re-read from the process's ambient directory
+    /// inside this kind's own `run_streaming`. Not a `StepKindRegistry::
+    /// with_builtins()` member, so the registry conformance test cannot
+    /// see this kind — audited by hand for #2577.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
+    }
+
     fn run_streaming(
         &self,
         step: &crew::types::Step,
@@ -768,6 +780,19 @@ impl StepKind for MissionCoderStepKind {
         const PORTS: [Port; 2] =
             [Port::data("coder-output"), Port::artifact(CODER_RESULT_ARTIFACT, make_coder_result_artifact)];
         &PORTS
+    }
+
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — this kind spawns no subprocess of its
+    /// own; it dispatches a model turn via `crew::dispatch::dispatch`,
+    /// passing `workdir: Some(ctx.wt_path.clone())` explicitly (the same
+    /// worktree path `MissionWorktreeStepKind` resolves). Was previously
+    /// covered only by the trait default (silently, with no row naming
+    /// this a checked audit) — a #2577-review finding. Not a
+    /// `StepKindRegistry::with_builtins()` member, so the registry
+    /// conformance test cannot see this kind — audited by hand.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
     }
 
     fn run(
@@ -1088,6 +1113,16 @@ impl StepKind for MissionVerifyStepKind {
     /// id convention.
     fn is_gate(&self) -> bool {
         true
+    }
+
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — `phase_review_output_at`'s `git diff`/
+    /// `git branch --show-current` calls always run against `ctx.wt_path`,
+    /// the phase's own worktree, never the process's ambient directory.
+    /// Not a `StepKindRegistry::with_builtins()` member — audited by hand
+    /// for #2577.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
     }
 
     fn run(

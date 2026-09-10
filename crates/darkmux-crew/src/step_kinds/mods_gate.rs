@@ -116,7 +116,7 @@
 
 use crate::mods::{self, GateOutcome, ModRecord};
 use crate::step_kinds::registry::StepKindRegistry;
-use crate::step_kinds::types::{SeatClaim, StepKind, StepOutcome, StepRunCtx};
+use crate::step_kinds::types::{CwdPolicy, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -183,6 +183,17 @@ impl StepKind for ModsGateStepKind {
     /// `deliver.github_review`/`procedural.shell` use.
     fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
         None
+    }
+
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — this kind's `git`/`sh -c` calls always
+    /// run against `gate_one_mod`'s resolved `scratch_checkout`, itself
+    /// derived from `config.workdir` (required; see `gate_one_mod`'s own
+    /// doc), never the process's own ambient directory. A missing/
+    /// unresolvable `config.workdir` is a named SKIP before any subprocess
+    /// spawns at all.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
     }
 
     fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {

@@ -104,8 +104,8 @@ pub use records_gather::{
 };
 pub use registry::StepKindRegistry;
 pub use types::{
-    ArtifactBus, MapDispatchOverride, OverrideDispatchCall, Port, PortKind, SeatClaim, StepKind,
-    StepOutcome, StepRunCtx, WaveSignal,
+    ArtifactBus, CwdPolicy, MapDispatchOverride, OverrideDispatchCall, Port, PortKind, SeatClaim,
+    StepKind, StepOutcome, StepRunCtx, WaveSignal,
 };
 // (#1877) `RemoteBudget`'s canonical home is `crate::remote_budget` (a
 // shared, public module of this crate); re-exported here too so a caller

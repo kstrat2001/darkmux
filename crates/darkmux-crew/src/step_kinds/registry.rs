@@ -265,6 +265,116 @@ mod tests {
         }
     }
 
+    /// (#2577) The `cwd_policy()` every registered Tier 1 kind MUST
+    /// report, pinned by VALUE — mirrors `expected_session`'s own
+    /// discipline immediately above (and its own doc's warning: because
+    /// `cwd_policy` has a trait DEFAULT, asserting only "is a value
+    /// present" would prove nothing — every kind already has one, for
+    /// free, whether or not anyone thought about it).
+    ///
+    /// `None` here would mean "a kind is registered with no row" — landing
+    /// there requires forgetting to add a row for a brand new kind, which
+    /// is caught by the panic in the test below rather than silently
+    /// defaulting to "safe".
+    fn expected_cwd_policy(kind_id: &str) -> Option<super::super::types::CwdPolicy> {
+        use super::super::types::CwdPolicy;
+        Some(match kind_id {
+            // The one kind allowed to fall back to the process's own
+            // ambient working directory — see `CwdPolicy::
+            // AmbientWithRefusal`'s own doc for why it is safe here (a
+            // documented resolve+refuse chain) and nowhere else.
+            "procedural.shell" => CwdPolicy::AmbientWithRefusal,
+            // Every other Tier 1 kind either dispatches to a model (never
+            // touching the local filesystem's ambient directory) or, for
+            // `procedural.noop`, spawns no subprocess at all.
+            "dispatch.internal" | "dispatch.single_shot" | "dispatch.map" | "procedural.noop" => {
+                CwdPolicy::NoAmbientDependency
+            }
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn with_builtins_has_exactly_one_kind_with_ambient_cwd_fallback() {
+        // Iterating the REGISTRY is the point, same as the session test
+        // above: a sixth Tier 1 kind fails HERE, the moment it is
+        // registered, because `expected_cwd_policy` will not have a row
+        // for it — forcing whoever adds it to state, in this table,
+        // whether it is safe to depend on the ambient directory.
+        //
+        // This test does NOT see Tier 2/3 kinds — those are registered by
+        // their own missions in other crates, with no single shared
+        // registry across all of them. An exhaustive sweep of every
+        // non-test `impl StepKind for` in the workspace (a review finding:
+        // the original #2577 sweep undercounted at 19; the reproducible
+        // count is FIFTEEN) finds ten such kinds: `mods.gate`, the two
+        // crawl planners (`crawl.plan`, `plan.sites`), the two crawl unit
+        // kinds (`crawl.unit`, `crawl.summary`), the three `mission.*`
+        // kinds (`mission.worktree`, `mission.coder`, `mission.verify`),
+        // `deliver.github_review`, and `records.gather`. Every one of
+        // them now carries its OWN explicit `cwd_policy()` override (a
+        // review finding: three of them — `mission.coder`,
+        // `deliver.github_review`, `records.gather` — previously carried
+        // none at all, silently inheriting the trait default with no row
+        // recording that as a checked audit; `crawl.unit`/`crawl.summary`
+        // were absent from this comment's roster entirely). See each
+        // kind's own `cwd_policy` doc for its audit.
+        //
+        // `mods.gate` requires and validates an explicit `config.workdir`
+        // (never falls through to ambient); the crawl planners' only
+        // ambient-adjacent call (`workspace_spec::materialize`'s
+        // first-clone `git clone --bare` with no `.current_dir()` set) was
+        // probed live from a deleted process cwd and reads clean at exit
+        // 0 — but NOT, as first recorded, because "`git` invoked directly
+        // never consults the ambient directory": a repeat probe (a bare
+        // `Command::new("git")`, no shell, matching `run_git` exactly)
+        // shows `git` spawns its own internal shell regardless, and that
+        // shell's `shell-init: error retrieving current directory`
+        // reaches stderr even on a clean exit. The clone is actually safe
+        // because `resolve_one` now REFUSES a relative `path`-origin
+        // unconditionally (see that function's own doc) — structural, not
+        // resting on the shell claim. The `mission.*` kinds in darkmux's
+        // own `coder_phase` module always pass an explicitly-resolved
+        // worktree path (`mission.coder` via `crew::dispatch`'s own
+        // `workdir`); `deliver.github_review` and `records.gather` spawn
+        // no subprocess at all.
+        let registry = StepKindRegistry::with_builtins();
+        for id in registry.ids() {
+            let kind = registry.get(&id).expect("registry.ids() only yields registered kinds");
+            let expected = expected_cwd_policy(&id).unwrap_or_else(|| {
+                panic!(
+                    "step kind `{id}` is registered but has no row in `expected_cwd_policy`. \
+                     Add one naming whether this kind can ever spawn a subprocess in the \
+                     process's own ambient working directory — check its `run`/`run_streaming` \
+                     for a `Command`/subprocess spawn with no explicitly-resolved directory. \
+                     Do not guess from the trait default (`NoAmbientDependency`) without \
+                     checking: the default exists so kinds that never touch a filesystem don't \
+                     have to say so, not to let a genuine subprocess spawn go unexamined.",
+                )
+            });
+            let actual = kind.cwd_policy();
+            assert_eq!(
+                actual, expected,
+                "{id} reports cwd_policy() == {actual:?}, but `expected_cwd_policy` pins \
+                 {expected:?}. If you just gave a SECOND kind `AmbientWithRefusal`, give it \
+                 `procedural.shell`'s own resolve+refuse chain (`builtins::resolve_shell_cwd`) \
+                 rather than a fresh copy, and add it to this table deliberately -- don't let \
+                 the mismatch alone be what tells you.",
+            );
+        }
+        let ambient: Vec<String> = registry
+            .ids()
+            .into_iter()
+            .filter(|id| registry.get(id).unwrap().cwd_policy() == super::super::types::CwdPolicy::AmbientWithRefusal)
+            .collect();
+        assert_eq!(
+            ambient,
+            vec!["procedural.shell".to_string()],
+            "exactly one built-in kind may depend on the process's own ambient working \
+             directory; found: {ambient:?}",
+        );
+    }
+
     #[test]
     fn an_explicit_config_session_wins_for_every_dispatching_kind() {
         // The caller-named session (review's seats, coder-phase's

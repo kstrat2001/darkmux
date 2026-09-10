@@ -41,7 +41,7 @@
 use crate::findings::FindingRecord;
 use crate::mods::ModRecord;
 use crate::step_kinds::registry::StepKindRegistry;
-use crate::step_kinds::types::{Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
+use crate::step_kinds::types::{CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1529,6 +1529,18 @@ impl StepKind for DeliverGithubReviewStepKind {
     /// `procedural.shell`/`procedural.noop` use.
     fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
         None
+    }
+
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — this kind spawns no subprocess at all: it
+    /// renders review text in-process and posts it over the network via
+    /// the GitHub API, never a `Command`. Was previously covered only by
+    /// the trait default (silently, with no row naming this a checked
+    /// audit) — a #2577-review finding. Not a `StepKindRegistry::
+    /// with_builtins()` member, so the registry conformance test cannot
+    /// see this kind — audited by hand.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
     }
 
     fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {

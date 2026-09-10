@@ -44,7 +44,7 @@ use crate::crawl::plan::{Plan, ReadFileEntry, Site, Unit};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, DispatchResult};
 use darkmux_crew::rules::{self, Rule};
-use darkmux_crew::step_kinds::{Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
+use darkmux_crew::step_kinds::{CwdPolicy, Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::thermal_governor;
 use darkmux_crew::types::{Step, Task};
 use serde_json::{json, Value};
@@ -1166,6 +1166,20 @@ impl StepKind for CrawlUnitStepKind {
     ) -> Option<String> {
         Some(task.role_id.as_deref().unwrap_or("crawler").to_string())
     }
+
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — this kind spawns no subprocess at all: it
+    /// dispatches a model turn (via the shared `crew::dispatch` path,
+    /// through `seat`/`dispatch_role` above) against a plan read off disk
+    /// through resolved paths, never a `Command`. Absent from the #2577
+    /// roster entirely until this review — a crawl-crate kind, registered
+    /// by its own mission with no shared registry the Tier-1 conformance
+    /// test can see, so it went unmentioned rather than mis-declared.
+    /// Audited by hand.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
+    }
+
     fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let cfg = UnitStepConfig::from_step(step)?;
         // (#2310 fix-loop E2, S5-7) Legal, honored, and said out loud: a
@@ -1724,6 +1738,18 @@ impl StepKind for CrawlSummaryStepKind {
     fn provides(&self) -> &'static [Port] {
         const PORTS: [Port; 1] = [Port::data(CRAWL_SUMMARY_OUTPUT_KIND)];
         &PORTS
+    }
+
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — this kind spawns no subprocess and
+    /// dispatches no model at all ([`SeatClaim::NoModel`] above): it folds
+    /// unit outcomes already on disk, read through resolved paths, never a
+    /// `Command`. Absent from the #2577 roster entirely until this review
+    /// — same reason as `CrawlUnitStepKind` just above: a crawl-crate
+    /// kind with no shared registry the Tier-1 conformance test can see.
+    /// Audited by hand.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
     }
 
     /// Fan-in over every `crawl.unit` step this MISSION ran.

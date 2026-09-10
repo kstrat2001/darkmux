@@ -480,6 +480,60 @@ impl SeatClaim {
     }
 }
 
+/// (#2577) How a [`StepKind`] that spawns a subprocess resolves the
+/// directory it runs in — specifically, whether it can ever fall back to
+/// the darkmux PROCESS's own ambient working directory (`std::env::
+/// current_dir()`), the one value every scheduler worker thread shares
+/// with every other test and every other step in the same run.
+///
+/// **Origin.** `procedural.shell` used to inherit that ambient directory
+/// unconditionally when a step declared no `cwd`/`workdir` (#2532) — fine
+/// for a single darkmux CLI invocation, but this project's own worktree
+/// workflow routinely deletes the directory darkmux was started from,
+/// and worse, in a scheduler test the SAME process-global is shared by
+/// every one of a wave's concurrently-dispatched sibling steps (#2577:
+/// `scheduler::tests::dispatch_free_siblings_do_not_serialize_behind_the_
+/// remote_cap` runs four of these on four worker threads at once). #2532
+/// fixed `procedural.shell` itself: resolve a documented tier chain
+/// (`step_kinds::builtins::resolve_shell_cwd`) and refuse loudly, naming
+/// the tier, when nothing resolves. This enum is the DECLARATION half of
+/// that fix — every [`StepKind`] that spawns a subprocess states which
+/// side of the line it is on, so a future sibling that copies
+/// `procedural.shell`'s shape (or invents a new one) cannot silently land
+/// on the unconditional-inheritance behavior #2532 retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CwdPolicy {
+    /// This kind spawns no subprocess at all, OR every subprocess it
+    /// spawns is always given a directory resolved from step/task config
+    /// (or a value computed earlier in the same run, e.g. a materialized
+    /// worktree path) — the process's own ambient working directory is
+    /// never consulted. The overwhelming majority of kinds are this.
+    NoAmbientDependency,
+    /// This kind spawns a subprocess that MAY run in the darkmux
+    /// process's own ambient working directory, when nothing more
+    /// specific is configured — and REFUSES loudly (rather than silently
+    /// inheriting a vanished one) when that directory no longer exists.
+    /// See `step_kinds::builtins::resolve_shell_cwd`'s own doc for the
+    /// full resolution chain and the refusal message it produces.
+    ///
+    /// **Exactly one kind should ever report this: `procedural.shell`.**
+    /// `step_kinds::registry`'s `with_builtins_has_exactly_one_kind_with_
+    /// ambient_cwd_fallback` test asserts that over the actual registered
+    /// registry (a real enumeration, not a source scan) for every Tier 1
+    /// builtin; it cannot see Tier 2/3 kinds registered by an individual
+    /// mission (`mods.gate`, the crawl planners `crawl.plan`/`plan.sites`,
+    /// the crawl unit kinds `crawl.unit`/`crawl.summary`, `mission.worktree`/
+    /// `mission.coder`/`mission.verify`, `deliver.github_review`,
+    /// `records.gather` — ten kinds total, see that test's own comment)
+    /// since those live in separate crates with their own registration
+    /// functions and no single shared registry walks all of them today —
+    /// each carries its own explicit `cwd_policy()` override recording a
+    /// #2577 hand audit instead (see that issue's investigation, and each
+    /// kind's own doc), and every one of them either spawns no subprocess
+    /// or always resolves an explicit directory first.
+    AmbientWithRefusal,
+}
+
 /// One registered step-kind implementation. `run` is synchronous and
 /// blocking (matches every other dispatch primitive in darkmux — see
 /// `workloads::types::WorkloadProvider`'s own doc: "darkmux is a single-
@@ -814,5 +868,14 @@ pub trait StepKind: Send + Sync {
     /// one is a config/kind-authoring bug to surface, not silently resolve).
     fn is_gate(&self) -> bool {
         false
+    }
+
+    /// (#2577) See [`CwdPolicy`]'s own doc for the full origin and
+    /// contract. Defaults to [`CwdPolicy::NoAmbientDependency`] — safe for
+    /// every kind that spawns no subprocess, which is most of them; a kind
+    /// that DOES spawn one and ever falls back to the process's own
+    /// ambient working directory must override this and say so.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
     }
 }
