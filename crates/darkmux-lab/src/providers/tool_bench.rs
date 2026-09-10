@@ -32,14 +32,52 @@ use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
 };
 use darkmux_types::Profile;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) struct ToolBenchProvider;
+/// The dispatch seam. Production is `darkmux_crew::dispatch::dispatch`; a
+/// test injects a closure that captures the `DispatchOpts` this provider's
+/// `run()` actually constructs. Mirrors `crawl::unit_step::UnitDispatchFn`
+/// (the end-to-end pin #2542/#2586 established) rather than inventing a new
+/// shape — this is the same class of defect (a manifest-key override that
+/// reaches the wrong `DispatchOpts` field), pinned at the SAME hop crawl's
+/// own seam already pins (the actual struct handed to `dispatch()`), not a
+/// hop further than that — the crawl fix already has this seam and its own
+/// tests already read the field off the constructed options. What this
+/// seam adds over crawl's is breadth, not depth: the run loop dispatches
+/// once per task × trial, so the test here asserts the override across
+/// every dispatch in the run (six, at `chainDepths: [2]`) rather than one.
+/// #2596 tracks, separately, the one hop THIS seam does not reach for
+/// either provider: the override's field value → the container's real
+/// inactivity budget.
+pub(crate) type ToolBenchDispatchFn = Arc<
+    dyn Fn(darkmux_crew::dispatch::DispatchOpts) -> Result<darkmux_crew::dispatch::DispatchResult>
+        + Send
+        + Sync,
+>;
+
+pub(crate) struct ToolBenchProvider {
+    dispatch: ToolBenchDispatchFn,
+}
+
+impl ToolBenchProvider {
+    /// The registered provider — dispatches for real.
+    pub(crate) fn production() -> Self {
+        Self { dispatch: Arc::new(darkmux_crew::dispatch::dispatch) }
+    }
+    /// A provider whose dispatch is `f`. Test-only in practice; lets a test
+    /// drive `run()` end-to-end and inspect the `DispatchOpts` it actually
+    /// builds, without a container.
+    #[cfg(test)]
+    pub(crate) fn with_dispatch(f: ToolBenchDispatchFn) -> Self {
+        Self { dispatch: f }
+    }
+}
 
 const BENCH: &str = "tool-bench";
 const BENCH_VERSION: &str = "1.0.0";
@@ -704,6 +742,202 @@ fn build_rows(trials: &[Trial<'_>], k: u32, artifact: &scores::ArtifactKey) -> V
     rows
 }
 
+// ─── manifest-extras parsing ────────────────────────────────────────────
+
+/// Accept an `f64` as an integral `u64` only if it is finite, non-negative,
+/// has no fractional part, and is strictly below `u64::MAX as f64`.
+///
+/// That last comparison is deliberately `<`, not `<=`: `u64::MAX`
+/// (`2^64 - 1`) is not exactly representable in `f64` — converting it
+/// rounds UP to `2^64`, the same threshold at which `f as u64` starts
+/// SATURATING instead of truncating. So a strict `<` against that same
+/// rounded-up constant is exactly the boundary where the cast stops being
+/// safe: any float below it truncates to a value that fits in `u64`; the
+/// constant itself (and anything at or above it) would silently saturate
+/// to `u64::MAX` with no error at all if allowed through (second-round
+/// frontier review — the earlier `<=` form let a float at that exact
+/// boundary, genuinely one past the real max, pass and then saturate).
+fn integral_f64_to_u64(f: f64) -> Option<u64> {
+    (f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f < u64::MAX as f64).then_some(f as u64)
+}
+
+/// Parse a JSON string as a number leniently — bare integer OR any decimal
+/// / exponent form Rust's own `f64` parser accepts, as long as the result
+/// is integral. (Second-round frontier review) Before this, a quoted
+/// string only ever tried `u64`'s own parser, which accepts neither a
+/// decimal point nor an exponent — so a BARE `45.0` or `4.5e1` was
+/// accepted (via the numeric branches' `as_f64` fallback) while the exact
+/// same value QUOTED (`"45.0"`, `"4.5e1"`) was refused. That asymmetry
+/// defeated the point of accepting floats at all: a shell arithmetic
+/// result or a template's number-to-string conversion — the motivating
+/// case for tolerating floats in the first place — most often round-trips
+/// through a shell or a config file AS a quoted string, not bare.
+fn quoted_number_to_u64(s: &str) -> Option<u64> {
+    let t = s.trim();
+    t.parse::<u64>().ok().or_else(|| t.parse::<f64>().ok().and_then(integral_f64_to_u64))
+}
+
+/// Read one `extras` key as a number, leniently accepting any of three JSON
+/// forms. The workload manifest's own doc comment invites an operator to
+/// "override by copying this manifest into your workloads dir" — a
+/// hand-edited JSON file is exactly as likely to quote a number as not
+/// (`"trials": "5"`), and a value produced by a script (a Python dump, a
+/// shell arithmetic result, a YAML-to-JSON conversion) is exactly as likely
+/// to come out as an integral float (`45.0`) as a bare integer.
+/// `serde_json::Value::as_u64` alone accepts none of those — a quoted or
+/// integral-float value silently read as ABSENT and fell back to the
+/// built-in default with no indication anything was wrong, the same shape
+/// `crawl::unit_step`'s `timeout_seconds` parse fixed for its own key
+/// (#2542 follow-up review). `Ok(None)` means the key is genuinely absent
+/// (or explicit `null`); anything else that fails to parse as a number is a
+/// loud, named error — never a silent default. `expect` names what a
+/// caller-facing error should call the value — "a positive integer" for a
+/// count, "an integer" for a key like `seed` that legitimately accepts
+/// zero — since the keys this parses don't all mean the same thing and one
+/// shared phrase would misdescribe at least one of them.
+fn extras_u64_strict(
+    extras: &BTreeMap<String, serde_json::Value>,
+    key: &str,
+    expect: &str,
+) -> Result<Option<u64>> {
+    match extras.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .or_else(|| v.as_f64().and_then(integral_f64_to_u64))
+            .or_else(|| v.as_str().and_then(quoted_number_to_u64))
+            .map(Some)
+            .ok_or_else(|| anyhow!("workload extras.{key} must be {expect}, got {v}")),
+    }
+}
+
+/// The chaining ladder's own hop count. Above this, `generate_tasks`'s
+/// per-depth loops (naming `depth` file names, then writing `depth` hop
+/// files) turn a single manifest value into a hang — and a `chainDepths`
+/// value that overflows `u32` used to saturate silently to `u32::MAX`
+/// rather than error, which is exactly that hang from a shape (a stray
+/// extra digit, a copy-paste of a timestamp) that used to be merely inert
+/// dead weight before this parse started being trusted. The cap is
+/// generous relative to the shipped ladder (`[2, 4, 6]`) — nothing about a
+/// real benchmark run plausibly needs a chain longer than this — while
+/// staying small enough that even the maximum still generates instantly.
+const MAX_CHAIN_DEPTH: u32 = 1000;
+
+/// The chaining ladder's own LENGTH — how many distinct depths one
+/// `chainDepths` array may name, as opposed to [`MAX_CHAIN_DEPTH`] which
+/// bounds each depth individually. `generate_tasks` emits one whole
+/// `chaining@N` task per DISTINCT depth (after its own `.max(2)` +
+/// dedup), each with up to `depth` hop files — so a ladder of many
+/// distinct, individually-legal depths reproduces the exact unbounded-loop
+/// shape `MAX_CHAIN_DEPTH` exists to refuse, just moved from one element's
+/// value to the array's length. Generous relative to the shipped ladder
+/// (`[2, 4, 6]`, 3 entries) — a real benchmark sweep gains nothing from
+/// dozens of depths that a handful doesn't already cover.
+const MAX_CHAIN_LADDER_LEN: usize = 20;
+
+/// The `chainDepths` array, leniently. Same string-or-number-or-integral-float
+/// tolerance as [`extras_u64_strict`] applied per element — a hand-authored
+/// ALL-STRING array like `["2", "4", "6"]` used to have every element
+/// silently filtered out by `.as_u64()` (every element fails → empty `Vec`
+/// → the `!v.is_empty()` guard discarded it) and fall back to the default
+/// ladder with no error. A genuinely MIXED array like `["2", 4]` did not
+/// have this problem before this fix — `.as_u64()` kept the numeric
+/// entries and only dropped the string ones, silently narrowing the
+/// ladder rather than collapsing it, which is a real but smaller version
+/// of the same bug and is fixed the same way here. A present-but-wrong-
+/// shaped key (not an array at all, or an array holding something that
+/// isn't a number in either form, or a number above [`MAX_CHAIN_DEPTH`] or
+/// outside `u32`) now errors loudly instead. An explicitly EMPTY array
+/// (`[]`) still falls back to the default ladder — unchanged from before
+/// this fix, since that's an existing, intentional degrade-to-safe-default
+/// rather than the silent-type-coercion bug this closes. An array with
+/// more than [`MAX_CHAIN_LADDER_LEN`] entries is refused for the same
+/// reason as an over-cap single depth — see that constant's own doc.
+fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<Vec<u32>> {
+    const DEFAULT: [u32; 3] = [2, 4, 6];
+    match extras.get("chainDepths") {
+        None | Some(serde_json::Value::Null) => Ok(DEFAULT.to_vec()),
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| {
+                anyhow!("workload extras.chainDepths must be an array of positive integers, got {v}")
+            })?;
+            if arr.is_empty() {
+                return Ok(DEFAULT.to_vec());
+            }
+            // (Also fix, second-round frontier review) The per-element cap
+            // below stops any ONE depth from being unbounded; it does not
+            // stop the ARRAY itself from being unbounded — a ladder with
+            // hundreds of distinct, individually-legal depths reproduces
+            // the same hang one hop up, in the number of `chaining@N`
+            // tasks `generate_tasks` emits (one per DISTINCT depth, after
+            // its own de-dup) rather than in any single depth's own file
+            // count. Checked on the RAW array length, before dedup and
+            // before the per-element parse below, so the refusal names the
+            // actual manifest shape the operator wrote.
+            //
+            // (MUST FIX, third-round frontier review) This check counts raw
+            // entries, not distinct depths — a repeated-value array like
+            // `[2; 21]` trips this refusal while `generate_tasks` would
+            // only ever emit ONE `chaining@2` task from it. The message
+            // below used to claim "each distinct depth becomes its own
+            // chaining task" as if this array's length were exactly the
+            // task count it would generate, which is false whenever the
+            // array holds duplicates. Refusing on raw length anyway is the
+            // safe direction (over-refusal, never under-refusal), so the
+            // check itself is unchanged — only the message is corrected to
+            // describe what it actually counts.
+            ensure!(
+                arr.len() <= MAX_CHAIN_LADDER_LEN,
+                "workload extras.chainDepths has {} entries, above the cap of {MAX_CHAIN_LADDER_LEN} \
+                 — this cap counts raw array entries (before de-duplication), because after \
+                 de-duplication each distinct depth becomes its own chaining task with up to \
+                 `depth` hop files, so a long array is refused as a conservative bound on how many \
+                 chaining tasks it could generate, even if repeated values would collapse to fewer \
+                 at generation time. Shorten the array.",
+                arr.len()
+            );
+            let mut depths = Vec::with_capacity(arr.len());
+            for d in arr {
+                let n = d
+                    .as_u64()
+                    .or_else(|| d.as_f64().and_then(integral_f64_to_u64))
+                    .or_else(|| d.as_str().and_then(quoted_number_to_u64))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "workload extras.chainDepths must contain only positive integers, got {d}"
+                        )
+                    })?;
+                // (MUST FIX, third-round frontier review) The message above
+                // already claims "positive integers", but nothing below it
+                // enforced that floor — `0` parsed clean and was silently
+                // raised to `generate_tasks`'s own chaining minimum (`.max(2)`,
+                // see that call's doc) with no error and no name pointing at
+                // the accepted-then-overridden value. Same class of bug this
+                // review pass closed for `chainDepths` overflow and the seed
+                // sign message elsewhere in this file — refuse loudly instead
+                // of accepting a value the parser's own message already
+                // disclaims and generation would just discard.
+                ensure!(
+                    n >= 1,
+                    "workload extras.chainDepths contains {n}, but every depth must be a positive \
+                     integer — `0` would be silently raised to the chaining minimum (2) by \
+                     generate_tasks rather than used as written. Use a real depth (>= 1), or omit \
+                     chainDepths for the default ladder."
+                );
+                ensure!(
+                    n <= MAX_CHAIN_DEPTH as u64,
+                    "workload extras.chainDepths contains {n}, above the cap of {MAX_CHAIN_DEPTH} \
+                     — every unit of depth is another hop file the sandbox has to generate and \
+                     another required tool call in the task, so a value this large turns one \
+                     manifest key into an effectively unbounded loop. Lower the value."
+                );
+                depths.push(n as u32);
+            }
+            Ok(depths)
+        }
+    }
+}
+
 // ─── provider impl ───────────────────────────────────────────────────────
 
 impl WorkloadProvider for ToolBenchProvider {
@@ -733,23 +967,129 @@ impl WorkloadProvider for ToolBenchProvider {
         _loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
     ) -> Result<RunResult> {
         let wl = &loaded.manifest.workload;
-        let extras_u64 = |key: &str| wl.extras.get(key).and_then(|v| v.as_u64());
-        let trials_per_task = extras_u64("trials").unwrap_or(1).clamp(1, 20) as u32;
-        let timeout = extras_u64("taskTimeoutSeconds").unwrap_or(600).clamp(30, 3600) as u32;
-        let chain_depths: Vec<u32> = wl
-            .extras
-            .get("chainDepths")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|d| d.as_u64()).map(|d| d as u32).collect())
-            .filter(|v: &Vec<u32>| !v.is_empty())
-            .unwrap_or_else(|| vec![2, 4, 6]);
+        // (Also consider, second-round frontier review) `trials` still
+        // silently clamps to `[1, 20]` rather than refusing loudly like
+        // `taskTimeoutSeconds` below — a real inconsistency between two
+        // keys parsed three lines apart, called out here rather than left
+        // to look like an oversight. It's a deliberate, narrower one:
+        // `trials` never outranks the operator's own env/config (it only
+        // ever multiplies how many times THIS run repeats each task), so
+        // a clamp here can't silently override a bound the operator typed
+        // elsewhere the way an un-ranged `taskTimeoutSeconds` would.
+        let trials_per_task =
+            extras_u64_strict(&wl.extras, "trials", "a positive integer")?.unwrap_or(1).clamp(1, 20) as u32;
+        // (#2587) `extras.taskTimeoutSeconds` must reach the ONE
+        // `DispatchOpts` field the container-agentic path actually reads.
+        // Every tool-bench task dispatches a tool-granting role
+        // (`darkmux_crew::dispatch::dispatch`'s default container path),
+        // which never reads `DispatchOpts::timeout_seconds` — that field
+        // bounds only the tool-less single-call paths (see its own doc).
+        // `timeout_override_seconds` is what feeds the container path's
+        // inactivity budget. `timeout` below is still passed as the dead
+        // `timeout_seconds` field for parity with `dispatch_task`'s other
+        // required-`u32` convention, not because it does anything here.
+        //
+        // (MUST FIX, frontier review) This value, when present, is direct
+        // operator input at the point of dispatch and unconditionally
+        // outranks `env(DARKMUX_INACTIVITY_TIMEOUT_SECONDS)` and
+        // `config.runtime.inactivity_timeout_seconds` for this dispatch —
+        // see `DispatchOpts::timeout_override_seconds`'s own doc. The
+        // shipped `templates/builtin/workloads/tool-bench.json` used to set
+        // this key to 600, which meant every `darkmux lab run tool-bench`
+        // silently overrode an operator's own longer configured bound with
+        // darkmux's own built-in default — a false provenance claim (the
+        // container is told this came from the operator; it came from
+        // darkmux's template). Fixed by deleting the key from the shipped
+        // manifest rather than special-casing "600 means built-in
+        // default": a genuinely operator-set 600 and a should-have-been-
+        // absent 600 are indistinguishable once parsed, so the manifest
+        // itself has to stop asserting a value it doesn't own. The omitted
+        // key now takes the same standing env/config/600 path every other
+        // workload takes.
+        let task_timeout_extra = extras_u64_strict(&wl.extras, "taskTimeoutSeconds", "a positive integer")?;
+        // The valid range is refused loudly rather than silently clamped:
+        // now that this value is live and genuinely outranks the
+        // operator's own configuration, silently substituting a floor or
+        // ceiling the operator didn't type would be the same class of
+        // surprise as the false-provenance problem above — the operator
+        // reads back a bound they didn't choose, attributed to input they
+        // did type. A named refusal keeps "what's in the manifest is what
+        // takes effect" true in both directions.
+        //
+        // (Also fix, second-round frontier review) THREE routes now set
+        // this same `timeout_override_seconds` field with THREE different
+        // validity windows: `darkmux dispatch --timeout` accepts `1..`
+        // with no ceiling (src/cli.rs, #2480 review blocker 6); crawl's
+        // `config.timeout_seconds` step-config key mirrors that, also
+        // `1..` (`crawl::unit_step`, #2542 follow-up review); this key
+        // alone narrows to 30-3600. That is a DELIBERATE, not accidental,
+        // divergence — the other two bound a whole dispatch/session an
+        // operator explicitly asked to run (a coder task, an arbitrary
+        // crawl unit), where "how long is reasonable" is genuinely
+        // open-ended and the operator's call alone. This key bounds ONE
+        // axis probe inside a fixed, quick tool-call benchmark — by
+        // design a read, a search, or a short hop-chain, never a task
+        // this harness expects to run for hours — and a run dispatches
+        // several of these per invocation (one per axis × trial), so a
+        // single mis-set multi-hour value here would make the whole bench
+        // sweep impractical to run in CI or a local loop, not just one
+        // dispatch. The floor (30s) and ceiling (3600s) both predate this
+        // review pass (previously a silent `clamp(30, 3600)`); this pass
+        // only made the same bounds loud. Widen this if a real workload
+        // shape needs a benchmark task longer than an hour — until then,
+        // the narrower window is this key's own considered choice, named
+        // here so a reader hitting all three sites doesn't read the
+        // difference as drift.
+        const MIN_TASK_TIMEOUT_SECONDS: u64 = 30;
+        const MAX_TASK_TIMEOUT_SECONDS: u64 = 3600;
+        if let Some(n) = task_timeout_extra {
+            // (#2586 review pattern) `0` is refused outright: `Some(0)`
+            // resolves straight through `effective_inactivity_timeout_seconds`
+            // to an already-expired inactivity deadline — the host
+            // watchdog kills the dispatch at its first poll, an instant
+            // kill, not "shortest allowed timeout". Mirrors `darkmux
+            // dispatch --timeout`'s own `range(1..)` clap validator's
+            // OWN zero-refusal (src/cli.rs, #2480 review blocker 6) and
+            // the crawl unit step's identical `ensure!(n >= 1, ...)`
+            // (#2542 follow-up review) — that mirroring covers only the
+            // `>= 1` floor those two sites share with this one, not the
+            // `<= 3600` ceiling that is unique to this key (see above).
+            ensure!(
+                n >= 1,
+                "workload extras.taskTimeoutSeconds must be >= 1 — `0` resolves to an \
+                 already-expired inactivity deadline (an instant kill) on the container path, \
+                 not 'unbounded' or 'shortest allowed'. Omit taskTimeoutSeconds for the standing \
+                 env/config/600 default, or set a real positive bound."
+            );
+            ensure!(
+                (MIN_TASK_TIMEOUT_SECONDS..=MAX_TASK_TIMEOUT_SECONDS).contains(&n),
+                "workload extras.taskTimeoutSeconds is {n}, outside the allowed range \
+                 {MIN_TASK_TIMEOUT_SECONDS}-{MAX_TASK_TIMEOUT_SECONDS} seconds. This value \
+                 outranks your own env/config inactivity setting when present, so it is refused \
+                 rather than silently clamped to a bound you didn't type — pick a value inside \
+                 the range, or omit the key for the standing env/config/600 default. This range \
+                 is narrower than `darkmux dispatch --timeout`'s on purpose: it bounds one quick \
+                 tool-bench axis probe, not an open-ended dispatch."
+            );
+        }
+        let timeout_override_seconds: Option<u32> = task_timeout_extra.map(|n| n as u32);
+        let timeout = timeout_override_seconds.unwrap_or(600);
+        let chain_depths: Vec<u32> = chain_depths_strict(&wl.extras)?;
         // Fresh nonces per run unless the operator pins `seed` to reproduce a
         // fixture. Regenerability is the anti-memorization property.
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let seed = extras_u64("seed")
+        // (Also fix, second-round frontier review) "a non-negative integer",
+        // not "an integer" — the shared message names what the CALLER
+        // accepts, and this field is still parsed as `u64`: a negative
+        // seed (`-5`) IS an integer, and the old "must be an integer, got
+        // -5" wording flatly contradicted the value it was pointing at.
+        // "positive integer" is still wrong for seed (0 is legitimate);
+        // "non-negative integer" is the one phrase that is never untrue for
+        // this key's actual domain.
+        let seed = extras_u64_strict(&wl.extras, "seed", "a non-negative integer")?
             .unwrap_or_else(|| (now_ms as u64) ^ ((std::process::id() as u64) << 32));
 
         let tasks = generate_tasks(seed, &chain_depths);
@@ -757,12 +1097,25 @@ impl WorkloadProvider for ToolBenchProvider {
 
         // Forensics: the full fixture (prompts, files, expected answers) so a
         // surprising score is auditable straight from the run dir.
+        // `task_timeout_override_seconds` is recorded here too, but it is
+        // ONLY the manifest's own override — the value `extras.taskTimeoutSeconds`
+        // resolved to, or `null` when the key was omitted. It is NOT the
+        // dispatch's effective inactivity bound: on the omitted-key path
+        // (the shipped manifest's own path) this is always `null`, even
+        // though a real bound (env/config/600) still governed every
+        // dispatch. This field answers "did the manifest ask for a
+        // specific bound", not "what bound applied" — for the latter, each
+        // task's own `tasks/<id>-t<trial>/qa-reply.json` carries the
+        // dispatch's real envelope, whose `bounds.inactivity_timeout_seconds`
+        // block names both the resolved value and its source (env, config,
+        // built-in, or this override) for that one dispatch.
         fs::write(
             run_dir.join("bench-fixture.json"),
             serde_json::to_string_pretty(&serde_json::json!({
                 "seed": seed,
                 "trials": trials_per_task,
                 "chain_depths": chain_depths,
+                "task_timeout_override_seconds": timeout_override_seconds,
                 "tasks": tasks,
             }))?,
         )?;
@@ -806,6 +1159,8 @@ impl WorkloadProvider for ToolBenchProvider {
                     wl.image.as_deref(),
                     config_path,
                     timeout,
+                    timeout_override_seconds,
+                    &self.dispatch,
                 )?;
 
                 let trial_dir = run_dir.join("tasks").join(format!("{}-t{trial}", task.id));
@@ -1033,8 +1388,8 @@ fn extract_reply(stdout: &str) -> String {
 }
 
 /// Dispatch one task via the internal runtime. Same shape as the coding-task
-/// provider's helper; `timeout` is the bench's per-task cap (a stuck dispatch
-/// is an infra row + rerun, never a capability zero).
+/// provider's helper; `timeout` is the bench's per-task inactivity cap (a
+/// stuck dispatch is an infra row + rerun, never a capability zero).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_task(
     role_id: &str,
@@ -1046,8 +1401,13 @@ fn dispatch_task(
     image: Option<&str>,
     config_path: Option<&str>,
     timeout: u32,
+    // (#2587) The real per-task bound on the container-agentic path — see
+    // `run()`'s own comment on `timeout_override_seconds` for why this is
+    // separate from `timeout` above.
+    timeout_override_seconds: Option<u32>,
+    dispatch_fn: &ToolBenchDispatchFn,
 ) -> Result<(String, String, bool, Option<PathBuf>)> {
-    use darkmux_crew::dispatch::{dispatch, DispatchOpts};
+    use darkmux_crew::dispatch::DispatchOpts;
     let opts = DispatchOpts {
         brief_refs: Vec::new(),
         workspace_read_only: false,
@@ -1055,7 +1415,7 @@ fn dispatch_task(
         resume_from: None,
         host_out: None,
         max_turns_override: None,
-        timeout_override_seconds: None, // (#2480)
+        timeout_override_seconds, // (#2587) routed from extras.taskTimeoutSeconds
         role_id: role_id.to_string(),
         message: prompt.to_string(),
         session_id: Some(session_id.to_string()),
@@ -1076,7 +1436,7 @@ fn dispatch_task(
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
     };
-    let result = dispatch(opts).context("internal-runtime dispatch via tool-bench")?;
+    let result = (dispatch_fn)(opts).context("internal-runtime dispatch via tool-bench")?;
     Ok((
         result.stdout,
         result.stderr,
@@ -1603,5 +1963,700 @@ not json — tolerated
             .map(|a| a.iter().filter_map(|d| d.as_u64()).collect())
             .expect("chainDepths present");
         assert_eq!(depths, vec![2, 4, 6]);
+    }
+
+    // ─── #2587: extras.taskTimeoutSeconds → DispatchOpts.timeout_override_seconds ───
+    //
+    // Every test injects the dispatch (`ToolBenchProvider::with_dispatch`) —
+    // no container, no real model. This is the same end-to-end-pin pattern
+    // #2542/#2586 established for the crawl unit step, reused here: read
+    // the value off the SAME `DispatchOpts` `run()` actually constructs,
+    // never a re-derivation of the extras-parsing logic.
+
+    use darkmux_crew::dispatch::{DispatchOpts, DispatchResult};
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    fn loaded_workload(extras: serde_json::Value) -> LoadedWorkload {
+        let mut wl = serde_json::json!({
+            "id": "tool-bench-test",
+            "provider": "tool-bench",
+            "role": "tool-bench",
+        });
+        if let (Some(obj), serde_json::Value::Object(extra_map)) = (wl.as_object_mut(), extras) {
+            obj.extend(extra_map);
+        }
+        let manifest_json = serde_json::json!({ "workload": wl });
+        let manifest: crate::workloads::types::WorkloadManifest =
+            serde_json::from_str(&manifest_json.to_string()).expect("test workload manifest parses");
+        LoadedWorkload {
+            manifest,
+            manifest_path: PathBuf::new(),
+            base_dir: PathBuf::new(),
+            source: crate::workloads::types::WorkloadSource::Embedded,
+        }
+    }
+
+    fn mock_ok_result() -> Result<DispatchResult> {
+        Ok(DispatchResult {
+            exit_code: 0,
+            stdout: serde_json::json!({
+                "result": "stop",
+                "metrics": {
+                    "model": "m", "wall_ms": 10, "prompt_tokens": 5,
+                    "completion_tokens": 5, "rest_ms": 0
+                }
+            })
+            .to_string(),
+            stderr: String::new(),
+            session_id: "s".into(),
+            // No out_dir: `run()`'s trajectory-copy block is a no-op on
+            // `None` (see its own `if let Some(out) = out_dir.as_deref()`),
+            // so a mocked dispatch needs no `.darkmux-runtime/` fixture.
+            out_dir: None,
+        })
+    }
+
+    /// Drives `ToolBenchProvider::run()` end-to-end with a mocked dispatch,
+    /// capturing `timeout_override_seconds` off EVERY `DispatchOpts` the run
+    /// constructs (one per task × trial) so the assertion holds across the
+    /// whole loop, not just its first call. Also returns the run dir's
+    /// `TempDir` (kept alive past `run()`, unlike a local that would be
+    /// dropped and deleted on return) so a caller can inspect what `run()`
+    /// actually wrote to disk — `bench-fixture.json` in particular, which
+    /// nothing else in this suite ever reads back.
+    ///
+    /// `.entry("chainDepths").or_insert([2])` below ONLY fires when the
+    /// caller's own `extras` doesn't already name `chainDepths` — for
+    /// those calls it keeps the run to six dispatches (5 fixed axes + one
+    /// `chaining@2`). (Corrected, second-round frontier review: an earlier
+    /// version of this comment claimed `[2]` unconditionally overrides the
+    /// ladder to keep every call "cheap" — that was never true for a
+    /// caller that supplies its OWN `chainDepths`, most notably the
+    /// shipped-manifest test below, which passes the real manifest's
+    /// `[2, 4, 6]` and so runs the FULL 3-depth ladder — 8 dispatches, not
+    /// six. Harmless to any assertion here, since none of them hardcode a
+    /// dispatch count, but the old comment was a wrong description of what
+    /// its own test does.)
+    fn run_and_capture_timeout_overrides_with_run_dir(
+        mut extras: serde_json::Value,
+    ) -> Result<(Vec<Option<u32>>, TempDir)> {
+        if let Some(obj) = extras.as_object_mut() {
+            obj.entry("chainDepths").or_insert(serde_json::json!([2]));
+        }
+        let loaded = loaded_workload(extras);
+        let run_dir = TempDir::new().unwrap();
+        let sandbox_dir = TempDir::new().unwrap();
+        let seen: Arc<Mutex<Vec<Option<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let provider = ToolBenchProvider::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+            captured.lock().unwrap().push(opts.timeout_override_seconds);
+            mock_ok_result()
+        }));
+        let profile = Profile::default();
+        provider.run(&loaded, run_dir.path(), sandbox_dir.path(), &profile, "default", None, None)?;
+        let result = seen.lock().unwrap().clone();
+        Ok((result, run_dir))
+    }
+
+    fn run_and_capture_timeout_overrides(extras: serde_json::Value) -> Result<Vec<Option<u32>>> {
+        run_and_capture_timeout_overrides_with_run_dir(extras).map(|(seen, _run_dir)| seen)
+    }
+
+    #[test]
+    fn run_routes_extras_task_timeout_seconds_into_the_containers_override_field() {
+        let seen = run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": 45 }))
+            .expect("run succeeds against a mocked dispatch");
+        assert!(!seen.is_empty(), "the mocked dispatch never ran");
+        assert!(
+            seen.iter().all(|v| *v == Some(45)),
+            "every dispatch in the run must carry the SAME manifest-derived override: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn run_leaves_the_override_absent_when_task_timeout_seconds_is_omitted() {
+        let seen = run_and_capture_timeout_overrides(serde_json::json!({}))
+            .expect("run succeeds against a mocked dispatch");
+        assert!(!seen.is_empty(), "the mocked dispatch never ran");
+        assert!(
+            seen.iter().all(|v| v.is_none()),
+            "an omitted key must write no override — the standing inactivity-budget \
+             resolution must survive unclamped: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn run_routes_the_string_form_of_task_timeout_seconds_too() {
+        // The shape a hand-quoted manifest value takes — `"taskTimeoutSeconds": "45"`
+        // — must route identically to the literal-integer form above.
+        let seen =
+            run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": "45" }))
+                .expect("run succeeds against a mocked dispatch");
+        assert!(
+            seen.iter().all(|v| *v == Some(45)),
+            "the STRING form must route identically to the literal-integer form: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn run_refuses_a_zero_task_timeout_seconds() {
+        // `Some(0)` resolves through `effective_inactivity_timeout_seconds`
+        // to an already-expired inactivity deadline — the host watchdog
+        // kills the dispatch at its first poll. Mirrors `darkmux dispatch
+        // --timeout`'s `range(1..)` clap validator and the crawl unit
+        // step's identical `ensure!(n >= 1, ...)` (#2542 follow-up review).
+        let err = run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": 0 }))
+            .expect_err("a 0 taskTimeoutSeconds must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("must be >= 1"), "the floor is named: {msg}");
+        assert!(msg.to_lowercase().contains("instant kill"), "the WHY is named: {msg}");
+    }
+
+    #[test]
+    fn run_refuses_a_zero_task_timeout_seconds_in_its_string_form_too() {
+        let err =
+            run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": "0" }))
+                .expect_err("the string form's 0 must be refused identically");
+        assert!(format!("{err:#}").contains("must be >= 1"));
+    }
+
+    #[test]
+    fn run_refuses_a_garbage_task_timeout_seconds_by_name() {
+        let err =
+            run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": "soon" }))
+                .expect_err("a non-numeric taskTimeoutSeconds must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("positive integer"), "{msg}");
+        assert!(msg.contains("soon"), "the offending value is named: {msg}");
+    }
+
+    // ─── manifest-key sweep (#2587): trials / seed / chainDepths ───
+    //
+    // Same silent-drop-on-wrong-type hazard as taskTimeoutSeconds, on the
+    // other keys this provider reads from `extras`. These exercise the
+    // shared helpers directly rather than the full `run()` loop — `trials`
+    // and `seed` don't feed a `DispatchOpts` field at all (they size the
+    // task loop / seed the RNG), so there is no dispatch-level pin to add;
+    // the parse itself is the unit under test, and it's the SAME function
+    // `run()` calls.
+
+    #[test]
+    fn extras_u64_strict_accepts_the_string_form_like_the_number_form() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!("5"));
+        assert_eq!(extras_u64_strict(&extras, "trials", "a positive integer").unwrap(), Some(5));
+        extras.insert("trials".to_string(), serde_json::json!(5));
+        assert_eq!(extras_u64_strict(&extras, "trials", "a positive integer").unwrap(), Some(5));
+    }
+
+    #[test]
+    fn extras_u64_strict_reads_a_genuinely_absent_key_as_none() {
+        let extras = BTreeMap::new();
+        assert_eq!(extras_u64_strict(&extras, "seed", "a non-negative integer").unwrap(), None);
+    }
+
+    #[test]
+    fn extras_u64_strict_refuses_garbage_by_name_instead_of_defaulting() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!("many"));
+        let err = extras_u64_strict(&extras, "trials", "a positive integer")
+            .expect_err("garbage must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("trials"), "the key is named: {msg}");
+        assert!(msg.contains("many"), "the offending value is named: {msg}");
+    }
+
+    // (Also fix, frontier review; wording corrected second round) The
+    // shared error message must describe what the KEY actually accepts,
+    // not a blanket "positive integer" — a zero seed is legitimate. The
+    // ORIGINAL fix for this used "an integer", which is equally wrong in
+    // the other direction: seed is parsed as `u64`, so a NEGATIVE seed is
+    // refused too, and "must be an integer, got -5" contradicts itself
+    // (-5 genuinely is an integer). "a non-negative integer" is the one
+    // phrase that is never untrue for this key's real domain — see the
+    // negative-seed tests below for the case "an integer" got wrong.
+    #[test]
+    fn extras_u64_strict_describes_seed_as_a_non_negative_integer_not_a_positive_integer() {
+        let mut extras = BTreeMap::new();
+        extras.insert("seed".to_string(), serde_json::json!("not-a-number"));
+        let err =
+            extras_u64_strict(&extras, "seed", "a non-negative integer").expect_err("garbage refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must be a non-negative integer"),
+            "seed's message names what it accepts: {msg}"
+        );
+        assert!(
+            !msg.contains("must be a positive integer"),
+            "seed accepts 0 — calling it a positive integer is misleading: {msg}"
+        );
+    }
+
+    // The unit test above only proves `extras_u64_strict` HONORS whatever
+    // `expect` string it's handed — it does not prove `run()`'s own call
+    // site for `seed` actually passes "a non-negative integer" rather than
+    // "a positive integer". This drives the real call site end to end so a
+    // regression there is caught here too, not just in the direct-call
+    // test above.
+    #[test]
+    fn run_describes_a_garbage_seed_as_a_non_negative_integer_not_a_positive_integer() {
+        let err = run_and_capture_timeout_overrides(serde_json::json!({ "seed": "not-a-number" }))
+            .expect_err("a non-numeric seed must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must be a non-negative integer"),
+            "the real call site names what seed accepts: {msg}"
+        );
+        assert!(
+            !msg.contains("must be a positive integer"),
+            "seed accepts 0 — the real call site must not call it a positive integer: {msg}"
+        );
+    }
+
+    // (Also fix, second-round frontier review) The exact bug named above:
+    // a NEGATIVE seed is an integer, so a message reading "must be an
+    // integer, got -5" is self-contradicting — the real constraint is
+    // non-negativity, which the message must actually say.
+    #[test]
+    fn extras_u64_strict_describes_a_negative_seed_as_needing_non_negative_not_merely_an_integer() {
+        let mut extras = BTreeMap::new();
+        extras.insert("seed".to_string(), serde_json::json!(-5));
+        let err = extras_u64_strict(&extras, "seed", "a non-negative integer")
+            .expect_err("a negative seed must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("-5"), "the offending value is named: {msg}");
+        assert!(
+            msg.contains("non-negative"),
+            "the message must name the actual constraint (non-negativity), not just \"an \
+             integer\" — -5 IS an integer, so that wording would contradict the value it names: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_describes_a_negative_seed_as_needing_non_negative_not_merely_an_integer() {
+        let err = run_and_capture_timeout_overrides(serde_json::json!({ "seed": -5 }))
+            .expect_err("a negative seed must be refused at the real call site too");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("-5"), "the offending value is named: {msg}");
+        assert!(
+            msg.contains("non-negative"),
+            "the real call site's message must name the actual constraint: {msg}"
+        );
+    }
+
+    // (Also fix, frontier review) A value written as an integral float
+    // (`45.0`) is exactly what a Python dump, a shell arithmetic result, or
+    // a YAML-to-JSON conversion produces — it must route identically to the
+    // bare-integer and quoted-string forms already covered above.
+    #[test]
+    fn extras_u64_strict_accepts_the_integral_float_form_too() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!(5.0));
+        assert_eq!(extras_u64_strict(&extras, "trials", "a positive integer").unwrap(), Some(5));
+    }
+
+    // (Also fix, second-round frontier review) The bare-float leniency
+    // above and the quoted-string leniency are currently asymmetric: a
+    // QUOTED decimal or exponent form (`"45.0"`, `"4.5e1"`) still refuses,
+    // because the string branch only tries `u64`'s own parser, which
+    // doesn't accept a decimal point or an exponent at all. But a shell
+    // arithmetic result or a format conversion — the stated motivation for
+    // accepting floats in the first place — most often arrives QUOTED, not
+    // bare, once it's round-tripped through a shell or a template. Both
+    // forms must resolve identically.
+    #[test]
+    fn extras_u64_strict_accepts_a_quoted_integral_float_like_the_bare_form() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!("5.0"));
+        assert_eq!(
+            extras_u64_strict(&extras, "trials", "a positive integer").unwrap(),
+            Some(5),
+            "a quoted decimal form must resolve exactly like its bare float form"
+        );
+    }
+
+    #[test]
+    fn extras_u64_strict_accepts_a_quoted_exponent_form() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!("4.5e1"));
+        assert_eq!(
+            extras_u64_strict(&extras, "trials", "a positive integer").unwrap(),
+            Some(45),
+            "a quoted exponent form (4.5e1 == 45) must be accepted, the same as a bare one"
+        );
+    }
+
+    #[test]
+    fn extras_u64_strict_refuses_a_quoted_non_integral_float() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!("5.5"));
+        let err = extras_u64_strict(&extras, "trials", "a positive integer")
+            .expect_err("a quoted fractional value must be refused, same as its bare form");
+        assert!(format!("{err:#}").contains("5.5"));
+    }
+
+    #[test]
+    fn extras_u64_strict_refuses_a_non_integral_float() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!(5.5));
+        let err = extras_u64_strict(&extras, "trials", "a positive integer")
+            .expect_err("a fractional value must be refused, not truncated");
+        assert!(format!("{err:#}").contains("5.5"));
+    }
+
+    // (Also fix, second-round frontier review) `u64::MAX` is not exactly
+    // representable in `f64` — converting it rounds UP to `2^64`, one past
+    // the real ceiling. The filter's upper bound used that same rounded-up
+    // constant (`f <= u64::MAX as f64`), so a JSON float holding EXACTLY
+    // `u64::MAX as f64` (i.e. `2^64`, genuinely `u64::MAX + 1`) passed the
+    // filter, and the subsequent `f as u64` cast then silently SATURATED it
+    // to `u64::MAX` — no error, no indication anything was out of range.
+    // `seed` is the one caller of `extras_u64_strict` with no downstream
+    // range check (trials clamps, taskTimeoutSeconds range-refuses), so this
+    // is the call site where the silent saturation would actually reach an
+    // operator: a seed one past the real max would silently become
+    // `u64::MAX` instead of being refused.
+    #[test]
+    fn extras_u64_strict_refuses_a_float_that_rounds_up_past_u64_max_instead_of_saturating() {
+        let mut extras = BTreeMap::new();
+        extras.insert("seed".to_string(), serde_json::json!(u64::MAX as f64));
+        let result = extras_u64_strict(&extras, "seed", "a non-negative integer");
+        assert!(
+            result.is_err(),
+            "a float at u64::MAX's own rounded-up ceiling is one past the true max and must be \
+             refused, not silently saturated to u64::MAX: {result:?}"
+        );
+    }
+
+    #[test]
+    fn chain_depths_strict_accepts_mixed_string_and_number_elements() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!(["2", 4, "6"]));
+        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
+    }
+
+    // (Also fix, frontier review) A genuinely MIXED array used to keep its
+    // numeric entries and silently drop only the string ones — never the
+    // full-collapse-to-default the all-string case hits. Both shapes must
+    // now route through the SAME strict parse and produce the SAME result,
+    // whether every element is a string, every element is a number, or the
+    // array mixes both.
+    #[test]
+    fn chain_depths_strict_treats_all_string_and_mixed_arrays_identically() {
+        let mut all_string = BTreeMap::new();
+        all_string.insert("chainDepths".to_string(), serde_json::json!(["2", "4", "6"]));
+        let mut mixed = BTreeMap::new();
+        mixed.insert("chainDepths".to_string(), serde_json::json!(["2", 4, "6"]));
+        assert_eq!(
+            chain_depths_strict(&all_string).unwrap(),
+            chain_depths_strict(&mixed).unwrap(),
+            "an all-string array and a mixed array holding the same depths must resolve identically"
+        );
+    }
+
+    #[test]
+    fn chain_depths_strict_accepts_integral_float_elements() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!([2.0, 4, "6"]));
+        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
+    }
+
+    // (Also fix, second-round frontier review) Same quoted/bare parity gap
+    // as `extras_u64_strict` — a quoted decimal element (`"4.0"`) must
+    // resolve exactly like its bare float form.
+    #[test]
+    fn chain_depths_strict_accepts_a_quoted_integral_float_element() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!(["2", "4.0", 6]));
+        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn chain_depths_strict_refuses_a_garbage_element_by_name() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!([2, "soon"]));
+        let err = chain_depths_strict(&extras).expect_err("a garbage element must be refused");
+        assert!(format!("{err:#}").contains("soon"));
+    }
+
+    // (MUST FIX, third-round frontier review) `0` parsed clean before this
+    // fix and was silently raised to the chaining minimum (2) by
+    // `generate_tasks`'s own `.max(2)` — the same "accepted then silently
+    // overridden" shape this pass closed elsewhere, except here the
+    // refusal message already claimed "positive integers" while nothing
+    // enforced it.
+    #[test]
+    fn chain_depths_strict_refuses_a_zero_depth_instead_of_silently_raising_it() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!([2, 0, 4]));
+        let err = chain_depths_strict(&extras)
+            .expect_err("0 must be refused, not silently raised to the chaining minimum");
+        let msg = format!("{err:#}");
+        assert!(msg.contains('0'), "the offending value is named: {msg}");
+        assert!(
+            msg.contains("positive"),
+            "the message names what's actually required: {msg}"
+        );
+    }
+
+    #[test]
+    fn chain_depths_strict_refuses_a_non_array_value_instead_of_defaulting() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!("2,4,6"));
+        let err = chain_depths_strict(&extras).expect_err("a non-array value must be refused");
+        assert!(format!("{err:#}").contains("array"));
+    }
+
+    #[test]
+    fn chain_depths_strict_falls_back_to_the_default_ladder_when_absent_or_empty() {
+        let extras = BTreeMap::new();
+        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
+        let mut extras2 = BTreeMap::new();
+        extras2.insert("chainDepths".to_string(), serde_json::json!([]));
+        assert_eq!(chain_depths_strict(&extras2).unwrap(), vec![2, 4, 6]);
+    }
+
+    // (Also fix, frontier review) A value above `MAX_CHAIN_DEPTH` must be
+    // refused loudly and NAME the cap — not saturate to `u32::MAX`, which
+    // is exactly the shape that turned `generate_tasks`'s `for i in
+    // 1..depth` loop into a hang.
+    #[test]
+    fn chain_depths_strict_refuses_a_depth_above_the_cap() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!([2, MAX_CHAIN_DEPTH + 1]));
+        let err = chain_depths_strict(&extras).expect_err("a depth above the cap must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&(MAX_CHAIN_DEPTH + 1).to_string()), "the offending value is named: {msg}");
+        assert!(msg.contains(&MAX_CHAIN_DEPTH.to_string()), "the cap is named: {msg}");
+    }
+
+    #[test]
+    fn chain_depths_strict_accepts_a_depth_exactly_at_the_cap() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!([MAX_CHAIN_DEPTH]));
+        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![MAX_CHAIN_DEPTH]);
+    }
+
+    // (Also fix, frontier review) A value that overflows `u32` entirely
+    // (not just above the bench's own cap) must be refused, never
+    // truncated/saturated to `u32::MAX` — the exact silent-saturation shape
+    // the reviewer red-proved as a hang.
+    #[test]
+    fn chain_depths_strict_refuses_a_value_above_u32_max_instead_of_saturating() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!([2, (u32::MAX as u64) + 1]));
+        let err =
+            chain_depths_strict(&extras).expect_err("a value above u32::MAX must be refused, not saturated");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains(&u32::MAX.to_string()),
+            "the old bug silently coerced this to u32::MAX with no error at all; a loud refusal \
+             must name the cap ({MAX_CHAIN_DEPTH}), not the value it used to be saturated to: {msg}"
+        );
+        assert!(msg.contains(&MAX_CHAIN_DEPTH.to_string()), "the cap is named: {msg}");
+    }
+
+    // (Also fix, second-round frontier review) `MAX_CHAIN_DEPTH` bounds
+    // each ELEMENT, not the LADDER as a whole — a `chainDepths` array with
+    // many distinct depths, every one individually under the per-element
+    // cap, still generates one whole `chaining@N` task PER distinct depth
+    // (`generate_tasks`'s `BTreeSet<u32>` dedup only collapses
+    // DUPLICATE depths, not the count of distinct ones), each with up to
+    // `depth` hop files. A long enough ladder of distinct, individually-
+    // legal depths is exactly the unbounded-loop shape `MAX_CHAIN_DEPTH`
+    // exists to refuse, just moved from one element to the array's length.
+    #[test]
+    fn chain_depths_strict_refuses_a_ladder_with_too_many_distinct_entries() {
+        let mut extras = BTreeMap::new();
+        // Every entry here is individually far under MAX_CHAIN_DEPTH — the
+        // per-element cap alone does not catch this.
+        let ladder: Vec<u32> = (2..=(MAX_CHAIN_LADDER_LEN as u32 + 3)).collect();
+        extras.insert("chainDepths".to_string(), serde_json::json!(ladder));
+        let err = chain_depths_strict(&extras)
+            .expect_err("a ladder with more distinct depths than the aggregate cap must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&MAX_CHAIN_LADDER_LEN.to_string()),
+            "the aggregate cap is named: {msg}"
+        );
+    }
+
+    // (MUST FIX, third-round frontier review) The aggregate cap counts RAW
+    // array entries, not distinct depths after dedup — a repeated-value
+    // ladder trips this refusal even though `generate_tasks` would only
+    // ever emit ONE `chaining@N` task from it. The refusal message used to
+    // claim "each distinct depth becomes its own chaining task" as if the
+    // array's length were exactly the task count it would generate, which
+    // is false here: 21 entries, all the same depth, generate one task.
+    // Over-refusal is still the right call (a conservative bound is safer
+    // than an accurate one that has to dedup first), but the message must
+    // say what the check actually counts.
+    #[test]
+    fn chain_depths_strict_refuses_a_repeated_value_ladder_on_raw_entry_count() {
+        let mut extras = BTreeMap::new();
+        let ladder = vec![2u32; MAX_CHAIN_LADDER_LEN + 1];
+        extras.insert("chainDepths".to_string(), serde_json::json!(ladder));
+        let err = chain_depths_strict(&extras).expect_err(
+            "a repeated-value ladder over the raw-entry cap must still be refused — it generates \
+             one task, but the cap is deliberately conservative on raw length",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("raw array entries") || msg.contains("de-duplication"),
+            "the message must name what it actually counts (raw entries, before dedup), not \
+             claim a 1:1 mapping to generated tasks that duplicates break: {msg}"
+        );
+    }
+
+    #[test]
+    fn chain_depths_strict_accepts_a_ladder_exactly_at_the_aggregate_cap() {
+        let mut extras = BTreeMap::new();
+        let ladder: Vec<u32> = (2..(2 + MAX_CHAIN_LADDER_LEN as u32)).collect();
+        extras.insert("chainDepths".to_string(), serde_json::json!(ladder.clone()));
+        assert_eq!(chain_depths_strict(&extras).unwrap(), ladder);
+    }
+
+    // ─── manifest sweep: the SHIPPED tool-bench.json takes the absent-key path ───
+    //
+    // (MUST FIX, frontier review) The shipped manifest used to set
+    // `taskTimeoutSeconds: 600`, which meant every real `darkmux lab run
+    // tool-bench` silently overrode the operator's own configured
+    // inactivity bound with darkmux's own built-in default. The fix deletes
+    // the key from the manifest; this test pins that the ACTUAL shipped
+    // file (not a synthetic stand-in) now resolves through the
+    // omitted-key path, end to end, through the real `run()` loop.
+
+    #[test]
+    fn shipped_tool_bench_manifest_omits_task_timeout_seconds_and_writes_no_override() {
+        const SHIPPED: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../templates/builtin/workloads/tool-bench.json"
+        ));
+        let manifest: crate::workloads::types::WorkloadManifest =
+            serde_json::from_str(SHIPPED).expect("the shipped tool-bench.json parses");
+        assert!(
+            !manifest.workload.extras.contains_key("taskTimeoutSeconds"),
+            "the shipped manifest must not set taskTimeoutSeconds — a shipped value would \
+             silently outrank the operator's own configured inactivity bound"
+        );
+
+        // Drive the SAME extras through the real run() loop and confirm the
+        // override field it actually constructs stays None end to end. The
+        // shipped manifest already names its own `chainDepths: [2, 4, 6]`,
+        // so `run_and_capture_timeout_overrides_with_run_dir`'s
+        // `.entry("chainDepths").or_insert([2])` never fires here — this
+        // drives the FULL 3-depth ladder (8 dispatches: 5 fixed axes + one
+        // `chaining@N` per distinct depth), not a single small depth. (An
+        // earlier version of this comment claimed chainDepths was
+        // overridden to keep the run cheap; it never was for this test.)
+        let extras_json = serde_json::to_value(&manifest.workload.extras).unwrap();
+        let (seen, run_dir) = run_and_capture_timeout_overrides_with_run_dir(extras_json)
+            .expect("run succeeds against a mocked dispatch");
+        assert!(!seen.is_empty(), "the mocked dispatch never ran");
+        assert!(
+            seen.iter().all(|v| v.is_none()),
+            "the shipped manifest's own extras must resolve to no override: {seen:?}"
+        );
+
+        // (MUST FIX, second-round frontier review) `bench-fixture.json`'s
+        // `task_timeout_override_seconds` key is a claim about what `run()`
+        // wrote to disk, not just what it constructed in memory — and
+        // nothing in this suite read the file back before this. Pin it
+        // directly: against the shipped manifest's own extras, the written
+        // fixture must name no override, matching the in-memory `seen`
+        // assertion above at the artifact `darkmux lab run` actually leaves
+        // behind.
+        let fixture_path = run_dir.path().join("bench-fixture.json");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&fixture_path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", fixture_path.display())),
+        )
+        .expect("bench-fixture.json is valid JSON");
+        assert_eq!(
+            fixture.get("task_timeout_override_seconds"),
+            Some(&serde_json::Value::Null),
+            "the shipped manifest's own fixture must record no override on disk: {fixture}"
+        );
+    }
+
+    // (MUST FIX, third-round frontier review) The null-pinning test above
+    // only proves the ABSENT-override half of `bench-fixture.json`'s
+    // `task_timeout_override_seconds` field is written correctly. Nothing
+    // in this suite ever reads the file back for the PRESENT case — a
+    // regression that hardcoded `Value::Null` into the write path (the
+    // same "written but never read back" shape #2587 closed in the
+    // in-memory `seen` direction) would leave the whole provider suite
+    // green. Pin the positive half too: a real override must survive to
+    // disk as the actual value, not just as "present".
+    #[test]
+    fn run_records_a_present_task_timeout_override_on_disk() {
+        let (seen, run_dir) =
+            run_and_capture_timeout_overrides_with_run_dir(serde_json::json!({
+                "taskTimeoutSeconds": 45,
+                "chainDepths": [2]
+            }))
+            .expect("run succeeds against a mocked dispatch");
+        assert!(!seen.is_empty(), "the mocked dispatch never ran");
+        assert!(
+            seen.iter().all(|v| *v == Some(45)),
+            "every dispatch in the run must carry the manifest-derived override: {seen:?}"
+        );
+
+        let fixture_path = run_dir.path().join("bench-fixture.json");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&fixture_path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", fixture_path.display())),
+        )
+        .expect("bench-fixture.json is valid JSON");
+        assert_eq!(
+            fixture.get("task_timeout_override_seconds"),
+            Some(&serde_json::json!(45)),
+            "a present override must be recorded on disk as its real value, not just as \
+             non-null: {fixture}"
+        );
+    }
+
+    // ─── Also fix: silent clamp → loud out-of-range refusal ───
+
+    #[test]
+    fn run_refuses_a_task_timeout_seconds_below_the_allowed_range() {
+        let err = run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": 5 }))
+            .expect_err("below-floor must be refused, not silently clamped up to 30");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("30-3600"), "the range is named: {msg}");
+        assert!(msg.contains('5'), "the offending value is named: {msg}");
+    }
+
+    #[test]
+    fn run_refuses_a_task_timeout_seconds_above_the_allowed_range() {
+        let err =
+            run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": 999_999 }))
+                .expect_err("above-ceiling must be refused, not silently clamped down to 3600");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("30-3600"), "the range is named: {msg}");
+        assert!(msg.contains("999999"), "the offending value is named: {msg}");
+    }
+
+    #[test]
+    fn run_accepts_a_task_timeout_seconds_at_each_end_of_the_allowed_range() {
+        let low = run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": 30 }))
+            .expect("the floor itself must be accepted");
+        assert!(low.iter().all(|v| *v == Some(30)));
+        let high =
+            run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": 3600 }))
+                .expect("the ceiling itself must be accepted");
+        assert!(high.iter().all(|v| *v == Some(3600)));
+    }
+
+    // (Also fix, frontier review) The integral-float form of
+    // taskTimeoutSeconds must route through run() identically to the
+    // integer and string forms already covered above.
+    #[test]
+    fn run_routes_the_integral_float_form_of_task_timeout_seconds_too() {
+        let seen =
+            run_and_capture_timeout_overrides(serde_json::json!({ "taskTimeoutSeconds": 45.0 }))
+                .expect("run succeeds against a mocked dispatch");
+        assert!(seen.iter().all(|v| *v == Some(45)), "the float form must route identically: {seen:?}");
     }
 }
