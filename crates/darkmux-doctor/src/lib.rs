@@ -9982,7 +9982,10 @@ mod tests {
     /// `models` pairs are `(id, explicit_identifier)` — a `None` explicit
     /// identifier means the namespaced default (`namespaced_identifier`'s
     /// documented opt-out shape).
-    fn registry_with(profiles: &[(&str, &[(&str, Option<&str>)])]) -> darkmux_types::ProfileRegistry {
+    /// One profile fixture: its name, and the models it declares.
+    type ProfileSpec<'a> = (&'a str, &'a [(&'a str, Option<&'a str>)]);
+
+    fn registry_with(profiles: &[ProfileSpec<'_>]) -> darkmux_types::ProfileRegistry {
         let mut map = std::collections::BTreeMap::new();
         for (name, models) in profiles {
             let profile_models = models
