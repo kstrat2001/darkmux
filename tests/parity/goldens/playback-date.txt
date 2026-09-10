@@ -17,7 +17,7 @@ fleet
 
 === stage ===
 TOKENS
-577,442
+584,118
 LOCAL TOKENS
 0
 CLOUD TOKENS
@@ -25,13 +25,13 @@ CLOUD TOKENS
 UNATTRIBUTED
 289k
 GENERATED
-12k
+19k
 FRESH INPUT
 0
 RE-READ
 277k
 UNCLASSIFIED
-21
+28
 DISPATCHES
 Orchestrator note: First editor-embedded review shipped tonight — the crew reviewed a real ticket inside Zed, end to end on local models, and the report rendered beautifully. Four feature findings captured for the real integration. Great night. · 03:06:54 history →
 MacBook-Pro
