@@ -433,8 +433,31 @@ jobs:
           # never reworded; its dir is excluded from every scan.
           SCAN="README.md CONTRIBUTING.md DESIGN.md AGENTS.md CLAUDE.md ROADMAP.md DISCLAIMER.md docs/ENVIRONMENT.md docs/ENGAGEMENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/"
           EXCL="--exclude-dir=pr-review-bench"
+          # (#2589) One mktemp'd stderr file per scan below, cleaned up on
+          # exit regardless of which scan fires it — a runner is ephemeral so
+          # a leaked /tmp/*.err here was harmless, but a fixed name is still
+          # sloppy precedent (the release skill's copy of this same pattern
+          # is NOT ephemeral — see that fix — so this scan matches it).
+          PAT_ERRF=$(mktemp)
+          VERB_ERRF=$(mktemp)
+          IDENTITY_ERRF=$(mktemp)
+          trap 'rm -f "$PAT_ERRF" "$VERB_ERRF" "$IDENTITY_ERRF"' EXIT
+          # (#2589) Gate on grep's real exit status, not the two-way `if cmd;
+          # then` truthiness test, which conflates exit 1 (no match — clean)
+          # with exit 2 (a scan error, e.g. a path in $SCAN that no longer
+          # exists because it moved or was renamed) — both read as "false" to
+          # `if`, so a broken scan path passed this guard vacuously. Exit 2 is
+          # now a loud failure with the real stderr attached, not silence.
           PAT='admin[- ]agent|admin</code>'
-          if bad=$(grep -rniE $EXCL "$PAT" $SCAN 2>/dev/null); then
+          set +e
+          bad=$(grep -rniE $EXCL "$PAT" $SCAN 2>"$PAT_ERRF")
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 2 ]; then
+            echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
+            cat "$PAT_ERRF"
+            exit 1
+          elif [ "$STATUS" -eq 0 ]; then
             echo "::error::Retired term in user-facing docs — use 'utility', not 'admin' (the role_family loader rejects 'admin'):"
             echo "$bad"
             exit 1
@@ -497,8 +520,28 @@ jobs:
           # per release naming its `**vX.Y.Z**`) legitimately quote old verbs
           # — excluded by the -v filter; live prose never carries that
           # bold-version marker.
+          # (#2589) Same real-exit-status gate as the PAT scan above, plus:
+          # this check pipes grep's output into a second `grep -v` filter, so
+          # the OLD `if bad=$(cmd1 | cmd2); then` truthiness reflected cmd2's
+          # exit status, not cmd1's — a path error in cmd1 (exit 2) was
+          # doubly invisible. Capture cmd1's status directly, then filter
+          # its captured output as a second, exit-code-free step.
           VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close|lab runs|lab workloads|lab fixtures|lab inspect|lab compare|lab register|lab unregister|lab review-bench)\b'
-          if bad=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
+          set +e
+          raw=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>"$VERB_ERRF")
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 2 ]; then
+            echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
+            cat "$VERB_ERRF"
+            exit 1
+          fi
+          # The filter's own exit status is NOT a verdict — `grep -v` exits 1
+          # when every matched line is legitimately excluded, which under
+          # `bash -e` aborted the step on a CLEAN tree. The verdict is the
+          # emptiness test below; the FIRST grep's status is what gates, above.
+          bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.' || true)
+          if [ -n "$bad" ]; then
             echo "::error::Retired verb spelling in user-facing docs (#1426/#1463/#1465) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family) / lab run list|inspect|compare (not lab runs/inspect/compare) / lab workload list (not lab workloads) / lab fixture list|register|unregister (not lab fixtures/register/unregister) / lab eval (not lab review-bench); swap + recommendations retired:"
             echo "$bad"
             exit 1
@@ -517,8 +560,24 @@ jobs:
           # (the retired action phrase), and `to multiplex` (present-purpose
           # framing — legit prose uses "profile multiplexer" as a noun with a
           # founding/now-internal qualifier, never "to multiplex").
+          # (#2589) Same fix shape as the VERBPAT scan above — real exit
+          # status from the first grep, filter applied as a separate step.
           IDENTITYPAT='/darkmux-swap-stack|swap stacks?|to multiplex'
-          if bad=$(grep -rniE $EXCL "$IDENTITYPAT" $SCAN 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
+          set +e
+          raw=$(grep -rniE $EXCL "$IDENTITYPAT" $SCAN 2>"$IDENTITY_ERRF")
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 2 ]; then
+            echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
+            cat "$IDENTITY_ERRF"
+            exit 1
+          fi
+          # The filter's own exit status is NOT a verdict — `grep -v` exits 1
+          # when every matched line is legitimately excluded, which under
+          # `bash -e` aborted the step on a CLEAN tree. The verdict is the
+          # emptiness test below; the FIRST grep's status is what gates, above.
+          bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.' || true)
+          if [ -n "$bad" ]; then
             echo "::error::Retired IDENTITY language in user-facing docs (#1449) — darkmux 2.0 is a mission orchestrator and a lab, NOT a profile multiplexer. Drop the swap-stack framing (residency is internal to gestalt now); reference the multiplexer only as founding/now-internal heritage:"
             echo "$bad"
             exit 1
