@@ -7166,7 +7166,7 @@ mod tests {
 
         let mut started = std::collections::HashSet::new();
         let mut closed = std::collections::HashSet::new();
-        close_grown_nothing_phase(mission_id, &p1, &[p1.clone()], &mut started, &mut closed, false);
+        close_grown_nothing_phase(mission_id, &p1, std::slice::from_ref(&p1), &mut started, &mut closed, false);
 
         assert_eq!(
             phase_status_on_disk(mission_id, &p1),
