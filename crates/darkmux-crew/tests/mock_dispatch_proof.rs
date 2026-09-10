@@ -70,12 +70,16 @@ impl EnvVarGuard {
         // `dispatch()` spawned is still alive, and therefore no thread
         // still reading env, at either mutation point.
         //
-        // (#2234 follow-up review) NOT true of a panicking `dispatch()`
-        // call: `StopFlagGuard`'s Drop on unwind only SIGNALS each
-        // background thread to stop (an atomic store) — it does not
-        // synchronously `.join()` any of them, so a thread can remain
-        // alive for up to its own poll interval (≤500ms) after
-        // `dispatch()`'s stack frame has finished unwinding. This file's
+        // (#2234 follow-up review; wording corrected #2641 follow-up
+        // review, CONSIDER 3) NOT true of a panicking `dispatch()` call:
+        // `StopFlagGuard`'s Drop on unwind only SIGNALS each background
+        // thread to stop (an atomic store) — it does not synchronously
+        // `.join()` any of them, so a thread can remain alive for up to
+        // its own poll interval, and longer if a tick is blocked in
+        // `lms list_loaded` (the sampler's own doc, `dispatch_internal.rs`,
+        // documents that call as able to stall up to ~30s — roughly 60x
+        // `SAMPLER_POLL_INTERVAL`'s 500ms, which bounds only the SLEEP
+        // between ticks, not a tick already in flight). This file's
         // tests all call `dispatch()` and let it return normally (`Ok`
         // or `Err`, never letting a panic propagate out of it), so the
         // guarantee above holds for what these tests actually do — but it
