@@ -12,6 +12,26 @@
 //!   crew::loader — read JSON manifests from `~/.darkmux/crew/<entity>/`
 //!                  with binary-embedded built-ins as fallback
 
+// (#1748) The mechanical absence-claim backstop — a text-search lint plus
+// a whole-file check, run against a finding's own "X is missing" claim
+// before that claim reaches a reader unqualified. See the module's own
+// `//!` doc for exactly what it catches and what it misses.
+//
+// (#1748 review CONSIDER 8) Deliberately a PLAIN `//` comment, not an
+// outer `///` doc comment on this `mod` item: an outer `///` here merges
+// with `absence_backstop.rs`'s own inner `//!` docs into ONE doc block
+// that resolves its intra-doc links in THIS file's scope
+// (`darkmux_crew::`) rather than the module's own — `[`run_backstop`]` in
+// that module's top-of-file doc, a function declared right there in
+// `absence_backstop.rs`, resolved fine on its own and broke the moment an
+// outer `///` landed on the `mod` line above it (`RUSTDOCFLAGS="-D
+// warnings" cargo doc -p darkmux-crew --no-deps` — 9 unresolved links
+// with the `///` present, 0 with it removed). If this module ever needs
+// a one-line summary in `lib.rs`'s own rendered module index, put it
+// back as `///`, but move the CONTENT out of `absence_backstop.rs`'s own
+// `//!` header first, or split it so nothing there is depended on for
+// its own scope.
+pub mod absence_backstop;
 // (#1230 Packet 1) Bounded concurrent-dispatch executor over gestalt's
 // `plan_waves` — see the module doc. No production caller in this packet;
 // Packet 2's `run_step_graph` scheduler is the intended first consumer.

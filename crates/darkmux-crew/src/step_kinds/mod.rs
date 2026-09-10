@@ -96,6 +96,15 @@ pub use deliver_github_review::{
     register_deliver_kind, render_github_review, DeliverGithubReviewStepKind, DeliverOutcome,
     DeliverScope, GatedMod, GithubReviewComment, GithubReviewPayload, DELIVER_GITHUB_REVIEW_KIND,
 };
+/// (#1748) Crate-internal only (never re-exported past this crate's own
+/// boundary the way the block above is) — `deliver_github_review` is a
+/// module-private child of `step_kinds`, so `crate::absence_backstop`
+/// (a top-level sibling module, not a descendant of `step_kinds`) cannot
+/// name `crate::step_kinds::deliver_github_review::rule_id_of` directly
+/// even though the function itself is `pub(crate)`. This one-line
+/// re-export is the seam, so the rule-id lookup stays defined in exactly
+/// ONE place rather than growing a second copy in `absence_backstop.rs`.
+pub(crate) use deliver_github_review::rule_id_of;
 pub use mods_gate::{register_mods_gate_kind, ModsGateStepKind, MODS_GATE_KIND};
 pub use records_gather::{
     register_records_gather_kind, GatherOutput, RecordsGatherStepKind, RECORDS_GATHER_KIND,
