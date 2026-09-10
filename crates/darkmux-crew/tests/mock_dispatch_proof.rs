@@ -56,10 +56,20 @@ struct EnvVarGuard {
 impl EnvVarGuard {
     fn set(key: &'static str, value: &Path) -> Self {
         let prev = std::env::var(key).ok();
-        // SAFETY: matches the pattern `darkmux-flow`'s own tests use for
-        // this exact env var — every caller of this guard in this file
-        // carries `#[serial_test::serial]`, so only one test ever holds
-        // `key` at a time.
+        // SAFETY: `set_var`/`remove_var` are unsafe because of the
+        // possibility of a concurrent `getenv` from another thread in
+        // this process. `#[serial_test::serial]` on every caller of this
+        // guard only bounds concurrency BETWEEN TESTS in this binary —
+        // it says nothing about threads a single test's own call to
+        // `dispatch()` spawns. The actual guarantee: this guard sets the
+        // var BEFORE `dispatch()` is called and restores it only AFTER
+        // `dispatch()` returns, and `dispatch_internal::dispatch` joins
+        // its watchdog/sampler/tailer threads on every one of its exit
+        // paths before returning (see `dispatch_internal.rs`) — so by
+        // construction no thread `dispatch()` spawned is still alive,
+        // and therefore no thread still reading env, at either mutation
+        // point. This is a property of the call sequence in this file,
+        // not something `serial_test` itself proves.
         unsafe { std::env::set_var(key, value) };
         EnvVarGuard { key, prev }
     }
@@ -477,11 +487,25 @@ fn scan_flow_records_for_session(flows_dir: &Path, session_id: &str) -> (bool, b
 // placed ahead of the real `docker` on `PATH` — the wrapper writes every
 // argv token to a file, one per line, then `exec`s straight into the real
 // `docker` binary, so the container that runs is bit-for-bit the one a
-// real dispatch would spawn. This is the only way to observe what the
+// real dispatch would spawn. This is the direct way to observe what the
 // container was ACTUALLY given: `--rm` removes the container the instant
 // it exits (so `docker inspect` after the fact sees nothing), and the
 // runtime never echoes its own resolved inactivity budget back into the
-// JSON envelope on a clean run.
+// JSON envelope on a clean run. It is not the ONLY way — a dispatch that
+// stalls past 75% of its budget makes the runtime print its resolved
+// bound to stderr (`runtime/src/loop_runner.rs`'s soft-threshold nudge)
+// — but that requires provoking a stall and is far slower than reading
+// the argv directly.
+//
+// A hop still sits below both tests here, unpinned by either: the
+// runtime reads the forwarded value with
+// `std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok().and_then(|s|
+// s.parse().ok()).unwrap_or(600)` (`runtime/src/loop_runner.rs`) — these
+// tests confirm the HOST forwards the right value to the container's
+// environment, not that the RUNTIME inside the container parses that
+// env var correctly. A typo'd literal or a flipped default there would
+// leave every container silently running on 600 while both tests here
+// stay green, since neither reads runtime-side behavior back out.
 
 /// Locate the real `docker` binary via `command -v docker`, resolved
 /// BEFORE this test prepends a capturing wrapper to `PATH` — the wrapper
@@ -520,7 +544,7 @@ fn shell_quote(path: &Path) -> String {
 /// dispatch would make. Prepending `dir` to `PATH` (see
 /// `PathPrependGuard`) is what makes `Command::new("docker")` inside
 /// `dispatch()` resolve to this wrapper instead of the real binary.
-fn write_docker_argv_capture_wrapper(dir: &Path, real_docker: &Path, capture_file: &Path) -> PathBuf {
+fn write_docker_argv_capture_wrapper(dir: &Path, real_docker: &Path, capture_file: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let wrapper_path = dir.join("docker");
     let script = format!(
@@ -539,7 +563,6 @@ fn write_docker_argv_capture_wrapper(dir: &Path, real_docker: &Path, capture_fil
         .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&wrapper_path, perms).expect("chmod +x the docker argv-capture wrapper");
-    wrapper_path
 }
 
 /// Prepends `dir` to `PATH` for the process's lifetime, restoring the
@@ -559,9 +582,12 @@ impl PathPrependGuard {
             Some(existing) => format!("{}:{}", dir.display(), existing),
             None => dir.display().to_string(),
         };
-        // SAFETY: matches `EnvVarGuard`'s own safety note above — every
-        // caller of this guard in this file carries `#[serial_test::serial]`,
-        // so only one test ever holds `PATH` mutated at a time.
+        // SAFETY: matches `EnvVarGuard`'s own safety note above — the
+        // guarantee is the call sequence (mutate before `dispatch()`,
+        // restore only after it returns, and `dispatch()` joins every
+        // thread it spawned on every exit path before returning), not
+        // `serial_test` alone. `serial_test` only bounds concurrency
+        // BETWEEN tests in this binary.
         unsafe { std::env::set_var("PATH", &joined) };
         PathPrependGuard { prev }
     }
@@ -594,9 +620,16 @@ fn captured_container_inactivity_budget(capture_file: &Path) -> (String, String)
     let mut source = None;
     for invocation in content.split("---END---\n") {
         let lines: Vec<&str> = invocation.lines().collect();
-        if !lines.iter().any(|l| *l == "run") {
+        if !lines.contains(&"run") {
             continue;
         }
+        // Reset per matching invocation — without this, an EARLIER `run`
+        // invocation's values would survive into a LATER one that lacks
+        // the forwarded vars (e.g. a future code path that stops
+        // forwarding them), reporting a stale value as if it were the
+        // last invocation's ground truth instead of failing loudly.
+        value = None;
+        source = None;
         for line in &lines {
             if let Some(v) = line.strip_prefix("DARKMUX_INACTIVITY_TIMEOUT_SECONDS=") {
                 value = Some(v.to_string());
@@ -829,6 +862,20 @@ fn dispatch_i2596_start_record_and_container_budget_must_agree() {
         .get("source")
         .and_then(Value::as_str)
         .expect("record bounds.inactivity_timeout_seconds.source is a string");
+
+    // Anchor to the actual override (77) before comparing the two sides
+    // to each other. Without this, the test below only proves AGREEMENT
+    // — a future refactor that routes both call sites through one shared
+    // broken helper (e.g. the collapse the #2480-era comment at the
+    // `dispatch_internal.rs` call site invites) would leave both sides
+    // at the built-in default (600) and this test would stay green,
+    // since 600 == 600 agrees just as well as 77 == 77 does.
+    assert_eq!(
+        container_value, "77",
+        "the container's forwarded DARKMUX_INACTIVITY_TIMEOUT_SECONDS must be the \
+         --timeout override (77) actually passed to this dispatch, not any other \
+         value both call sites might agree on"
+    );
 
     assert_eq!(
         record_value.to_string(),
