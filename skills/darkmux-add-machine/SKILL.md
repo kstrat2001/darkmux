@@ -47,7 +47,7 @@ Ask: *"Which machine is your fleet's hub (the Redis-running machine)?"*
 
 Need from the operator:
 
-- **Coordinator's reachable address** — usually a tailnet IP (`100.x.y.z`) or a Tailscale Magic DNS name (e.g. `studio.your-tailnet.ts.net`).
+- **Coordinator's reachable address** — prefer its Tailscale Magic DNS name (e.g. `studio.your-tailnet.ts.net`) over its bare tailnet IP (`100.x.y.z`): a machine that later sits behind `tailscale serve` routes by Host header, so a roster entry pointing at the bare IP gets Tailscale's own 404 even though the daemon is healthy (#1849) — the DNS name works in both setups. (The raw Redis reachability check below accepts either form; the DNS-name preference matters for the `machine add --address` step in Step 7.)
 - **Redis URL** — typically `redis://default:<password>@<coord-addr>:6379`. The operator should have this from their bootstrap on the coordinator; encourage them to use the existing value verbatim.
 - **Existing fleet machine ids** — so we can pick a non-colliding id for this new machine. Operator can run `darkmux machine list` on their coordinator to print these; or if this skill has reachable Redis, `XRANGE darkmux:flow - + COUNT 1000` would show recent provenance fields.
 
@@ -132,14 +132,14 @@ Should show one entry — this machine.
 This is the hand-coordinated step the cross-machine state issue ([#280](https://github.com/kstrat2001/darkmux/issues/280)) will close. For now: on EACH of the operator's existing machines, run:
 
 ```bash
-darkmux machine add <new-machine-id> --address <new-machine-tailnet-addr>:8765
+darkmux machine add <new-machine-id> --address <new-machine-tailnet-dns-name>:8765
 ```
 
-The `<new-machine-tailnet-addr>` is THIS machine's Tailscale IP / Magic DNS name (operator can find via `tailscale ip -4` on this machine).
+The `<new-machine-tailnet-dns-name>` is THIS machine's Tailscale Magic DNS name (operator can find via `tailscale status` on this machine, or the Tailscale admin console). Prefer the DNS name over the tailnet IP: a machine that later sits behind `tailscale serve` routes by Host header, so a roster entry pointing at the bare IP gets Tailscale's own 404 even though the daemon is healthy — the DNS name works in both setups. A raw `host:port` is fine only for a daemon bound directly to a non-loopback address (no `tailscale serve` in front of it).
 
 Surface this clearly to the operator:
 
-> Adding a peer to a fleet currently requires running `machine add` on every existing fleet member's machine. Cross-machine roster replication is filed as #280 and will close that loop. For now, walk over to each of your other Macs and run `darkmux machine add <this-id> --address <addr>:8765` once.
+> Adding a peer to a fleet currently requires running `machine add` on every existing fleet member's machine. Cross-machine roster replication is filed as #280 and will close that loop. For now, walk over to each of your other Macs and run `darkmux machine add <this-id> --address <dns-name>:8765` once.
 
 ## Step 8 — Smoke test: cross-fleet flow record
 

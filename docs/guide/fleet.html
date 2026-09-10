@@ -40,7 +40,7 @@
   <div class="wrap">
     <div class="callout warn">
       <strong>Don't have a hub yet?</strong>
-      <p style="margin: 6px 0 0;">A peer connects to a hub, the always-on machine running Redis. If you haven't set one up, do that first: <a href="always-on-hub.html"><strong>set up an always-on hub</strong></a>. It's a short, secure, copy/paste recipe (password-less Redis bound to your tailnet, never the public internet). Come back here once <code>darkmux doctor</code> is green on the hub. You'll need one value from it: the hub's tailnet address (<code>tailscale ip -4</code> on the hub).</p>
+      <p style="margin: 6px 0 0;">A peer connects to a hub, the always-on machine running Redis. If you haven't set one up, do that first: <a href="always-on-hub.html"><strong>set up an always-on hub</strong></a>. It's a short, secure, copy/paste recipe (password-less Redis bound to your tailnet, never the public internet). Come back here once <code>darkmux doctor</code> is green on the hub. You'll need two values from it: the hub's tailnet <strong>address</strong> (<code>tailscale ip -4</code> on the hub, for the raw Redis check below) and its tailnet <strong>DNS name</strong> (<code>tailscale status</code>, or the Tailscale admin console — for the roster entry you register with <code>machine add</code>).</p>
     </div>
   </div>
 </section>
@@ -119,12 +119,15 @@ brew services start darkmux                         <span class="comment"># daem
 darkmux doctor 2>&amp;1 | grep -i "daemon reachable"   <span class="comment"># ✓</span></code></pre>
     <p>The worker enables itself because Redis is configured, and shares a consumer group with every other worker on the fleet, so each job goes to exactly one of them. To take the machine back out of the pool, <code>brew services stop darkmux</code>: it reverts to a Part 1 observability peer (records still flow, it just stops claiming).</p>
     <p>Because the queue is first-available, any worker can claim any job. Match a worker to the work you send the fleet: a small box is great for light dispatches, but a big-model job that lands on it will run out of memory. If you want a machine to take only the work you hand it, keep it a Part 1 peer and dispatch on it directly.</p>
-    <p>Register it in the hub's roster so it shows in <code>machine list</code>, and add the hub to the peer's roster:</p>
+    <p>Register it in the hub's roster so it shows in <code>machine list</code>, and add the hub to the peer's roster. Use each machine's tailnet <strong>DNS name</strong>, not its IP — a peer that later sits behind <a href="always-on-hub.html#viewer">Tailscale Serve</a> routes by Host header, so a bare IP gets Tailscale's own 404 even though the daemon is healthy:</p>
     <pre><code><span class="comment"># On the hub:</span>
-darkmux machine add mini-1 --address &lt;peer-tailnet-addr&gt;:8765
+darkmux machine add mini-1 --address &lt;peer-tailnet-dns-name&gt;:8765
 <span class="comment"># On the peer:</span>
-darkmux machine add &lt;hub-id&gt; --address "$HUB_IP":8765
+darkmux machine add &lt;hub-id&gt; --address &lt;hub-tailnet-dns-name&gt;:8765
 darkmux machine list</code></pre>
+    <div class="callout">
+      <strong>The DNS name above resolves — but only reaches the daemon if something is actually listening on that machine's tailnet interface at <code>:8765</code>.</strong> The <a href="always-on-hub.html#quick-path">quick-path</a> daemon binds <code>127.0.0.1:8765</code> only; the <a href="always-on-hub.html#viewer">Tailscale Serve recipe</a> proxies a <em>browser</em> to it on <code>:443</code>, a different port, and doesn't expose <code>:8765</code> on the tailnet. For <code>machine list --deep</code> / <code>machine status</code> to reach a peer at its default port, that peer needs a genuinely non-loopback daemon: <code>darkmux serve --bind &lt;its-tailnet-ip&gt;</code> plus <code>DARKMUX_SERVE_TOKEN</code> set to the fleet's shared token (a non-loopback bind refuses to start without one, and <code>machine list --deep</code> already sends it). Keep the roster entry pointed at the DNS name regardless — it's still what survives Tailscale Serve ever landing in front of that daemon later.
+    </div>
   </div>
 </section>
 
@@ -144,8 +147,8 @@ darkmux machine list</code></pre>
     </ul>
     <pre><code>darkmux machine list --deep</code></pre>
     <pre><code>MACHINE        ADDRESS                PROBE      RAM-FREE    OS              VERSION  MODELS
-laptop         100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   1.17.0   darkmux:qwen3.6-35b-a3b-mlx
-studio         100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   1.17.0   darkmux:qwen3-4b-instruct</code></pre>
+laptop         laptop:8765            ✓ 23ms     78 GB       macos aarch64   1.17.0   darkmux:qwen3.6-35b-a3b-mlx
+studio         studio:8765            ✓ 45ms     12 GB       macos aarch64   1.17.0   darkmux:qwen3-4b-instruct</code></pre>
     <p>Bounded at ~1s per peer on <code>--deep</code>; degraded peers render with <code>specs?</code> rather than failing the whole command. (Only machines running a daemon, meaning Part 2 workers or the hub, appear here; Part 1 observability peers show their records in the viewer but not in this live probe.)</p>
 
     <div class="callout warn">

@@ -1159,9 +1159,12 @@ pub(crate) enum MachineCmd {
         /// Logical machine id (what flow records carry as `machine_id`).
         /// Example: `studio`, `laptop`, `mini-1`.
         id: String,
-        /// Tailnet address or DNS name to reach the daemon on. Example:
-        /// `100.64.0.2`, `100.64.0.2:8765`, `studio.tailnet`. If
-        /// no `:port` suffix, port 8765 is assumed.
+        /// Tailnet DNS name to reach the daemon on. Example: `studio`,
+        /// `studio.tailnet.ts.net`, `studio:8765`. Prefer the DNS name: a
+        /// peer behind `tailscale serve` routes by Host header and will
+        /// 404 a bare IP. A raw `host:port` works for a daemon bound
+        /// directly to a non-loopback address. If no `:port` suffix,
+        /// port 8765 is assumed.
         #[arg(long)]
         address: String,
         /// Optional one-line description for `machine list` + topology
