@@ -1259,6 +1259,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             source_input: None,
             ticket: None,
             spec: None,
+            machine: None,
         }
     }
 

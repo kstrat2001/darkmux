@@ -1452,6 +1452,7 @@ mod tests {
             source_input: None,
             ticket: None,
             spec: None,
+            machine: None,
         };
         save_json(&mission_path(id), &m).unwrap();
         m

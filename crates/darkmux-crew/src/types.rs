@@ -341,6 +341,35 @@ pub struct Mission {
     /// as ungrouped; no migration needed (lenient-on-read, contract 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<MissionSpec>,
+    /// (#1810) The machine this mission was minted on, stamped once at
+    /// creation from `darkmux_flow::resolve_machine_id()` — the SAME
+    /// resolution every flow record uses (env `DARKMUX_MACHINE_ID` >
+    /// `config.machine_id` > cached `hostname(1)`).
+    ///
+    /// Exists because `darkmux-serve`'s `/runs` previously had no durable
+    /// source for a mission's machine at all: it derived `machine` by
+    /// joining the mission to its flow SESSIONS, and that join is bounded
+    /// by `RUNS_FLOW_SCAN_WINDOW_DAYS` — so a mission older than the
+    /// window lost its machine even though the mission record itself, and
+    /// the flow day-file holding the fact, were both still on disk and
+    /// fully intact. A doc comment on that window claimed tracked records
+    /// were "unaffected... read in full regardless of age" — true of the
+    /// mission's EXISTENCE, false of this ATTRIBUTE. This field makes
+    /// `machine` a durable mission fact like `created_ts` or `ticket`,
+    /// independent of flow retention, closing that gap for good.
+    ///
+    /// `None` on missions minted before this field existed (and on any
+    /// mission created where `resolve_machine_id()` itself returns `None`,
+    /// e.g. a sandboxed CI run with no `hostname` binary) — `mission_to_
+    /// run` falls back to the flow-derived value for those, same as
+    /// before. `route`/`role`/`model` are deliberately NOT given the same
+    /// treatment: a mission can span many dispatches across many models
+    /// and (for role) many distinct steps, so there is no single durable
+    /// value to stamp for those the way there is for machine (a mission
+    /// runs on exactly one host); they stay flow-derived and therefore
+    /// still windowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 impl Mission {
@@ -1187,6 +1216,7 @@ mod tests {
             source_input: None,
             ticket: None,
             spec: None,
+            machine: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""status":"finalized""#), "got {s}");
@@ -1209,6 +1239,7 @@ mod tests {
             source_input: None,
             ticket: None,
             spec: None,
+            machine: None,
         }
     }
 

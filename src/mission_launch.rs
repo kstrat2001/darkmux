@@ -2506,6 +2506,10 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
             .map(String::from),
         ticket: config.extras.get("ticket").and_then(|v| v.as_str()).map(String::from),
         spec,
+        // (#1810) Stamped once at mint time so `/runs` has a durable
+        // machine to read even after this mission ages out of the
+        // RUNS_FLOW_SCAN_WINDOW_DAYS-bounded flow join.
+        machine: crate::flow::resolve_machine_id(),
     };
     crew::lifecycle::save_mission(&mission).context("persisting mission.json")?;
 
@@ -6177,6 +6181,7 @@ mod tests {
             source_input: None,
             ticket: None,
             spec: None,
+            machine: None,
         };
         crew::lifecycle::save_mission(&mission).unwrap();
         let mut phase = new_planned_phase(mission_id, phase_id, Some("gate phase"), None, now);
@@ -7246,6 +7251,7 @@ mod tests {
             source_input: None,
             ticket: None,
             spec: None,
+            machine: None,
         };
         crew::lifecycle::save_mission(&mission).unwrap();
         for (id, status) in phases {

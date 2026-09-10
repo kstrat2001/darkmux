@@ -962,7 +962,16 @@ fn mission_to_run(
     // (above) is now drawn from `unambiguous_sessions`, so an ambiguous
     // session can no longer win `machine` even though it auto-stamps a
     // value — the #2487 fix (see `unambiguous_sessions`'s own comment).
-    let machine = representative.and_then(|(_, s)| s.machine.clone());
+    //
+    // (#1810) `mission.machine` — stamped durably at mint time — wins FIRST.
+    // Before this, `machine` was ENTIRELY flow-derived, so a mission whose
+    // dispatches all predate `RUNS_FLOW_SCAN_WINDOW_DAYS` lost this field
+    // even though the mission record and the flow day-file holding the fact
+    // were both still fully intact on disk — the durable record's
+    // EXISTENCE survived the window; this one ATTRIBUTE on it did not. The
+    // flow-derived fallback stays for missions minted before this field
+    // existed (or where `resolve_machine_id()` had nothing to stamp).
+    let machine = mission.machine.clone().or_else(|| representative.and_then(|(_, s)| s.machine.clone()));
     let route = remote.and_then(|(_, s)| s.endpoint.clone());
     let start_ts_str = representative.and_then(|(_, s)| s.start_ts.clone());
     // (#2487) Filtered too — and this one is the load-bearing half of the
@@ -1559,12 +1568,25 @@ fn lab_staffing_role_model_route(
 /// request (a real #925-style per-request-timeout risk on a Studio-scale
 /// install with months of history), and every dispatch that predates the
 /// #1508/#1509 unification would become a PERMANENT untracked ghost.
-/// Tracked runs (missions, lab runs) are UNAFFECTED — they're durable
-/// records, read in full regardless of age; only the flow-derived
-/// route/role/model resolution and ghost synthesis are windowed. A
-/// discoverable knob (a named const, not a magic number scattered inline)
-/// rather than adaptive-silent, per CLAUDE.md's "cadence is a recorded
-/// knob" observability doctrine.
+///
+/// Tracked runs (missions, lab runs) are unaffected in EXISTENCE — they're
+/// durable records, listed and readable in full regardless of age. They
+/// are NOT unaffected in ATTRIBUTION (#1810 — an earlier version of this
+/// comment claimed otherwise, and was wrong): `route`, `role` and `model`
+/// are resolved by joining a mission to its flow SESSIONS
+/// (`mission_to_run`), and that join is exactly as windowed as ghost
+/// synthesis is. A mission whose dispatches all predate this window loses
+/// those three fields even though the mission record and the flow
+/// day-file holding the fact are both still fully intact on disk — the
+/// fact is real and durable, but the only path to it is this windowed
+/// derivation. `machine` is the one exception: since #1810 it is stamped
+/// durably on the mission record itself at creation
+/// (`Mission::machine`), so it survives the window; `lab_summary_to_run`
+/// was never affected either way, because it reads the daemon's own
+/// `machine_id` directly rather than deriving it from flow. A discoverable
+/// knob (a named const, not a magic number scattered inline) rather than
+/// adaptive-silent, per CLAUDE.md's "cadence is a recorded knob"
+/// observability doctrine.
 const RUNS_FLOW_SCAN_WINDOW_DAYS: i64 = 14;
 
 /// Per-session_id rollup built by ONE pass over the flow stream
@@ -2610,6 +2632,12 @@ mod tests {
             source_input: None,
             ticket: None,
             spec,
+            // (#1810) Intentionally None by default: existing tests exercise
+            // the flow-derived fallback path (the behavior every mission
+            // minted before this field existed still needs). Tests pinning
+            // the NEW durable-machine behavior set `.machine` explicitly
+            // after calling this helper.
+            machine: None,
         }
     }
 
@@ -4215,6 +4243,93 @@ mod tests {
         assert!(runs[0].tracked);
         assert_eq!(runs[0].role.as_deref(), Some("coder"));
         assert_eq!(runs[0].model.as_deref(), Some("qwen3.6-35b-a3b"));
+    }
+
+    /// (#1810) A tracked mission whose flow day-file predates
+    /// `RUNS_FLOW_SCAN_WINDOW_DAYS` must still report its machine, because
+    /// #1810 makes `machine` a durable fact on the `Mission` record itself
+    /// (stamped at mint time) rather than something ONLY derivable by
+    /// joining to flow sessions. Before the fix, `machine` came exclusively
+    /// from `representative.and_then(|(_, s)| s.machine.clone())` — a
+    /// windowed flow-index lookup — so a mission this old read `machine:
+    /// None` even though the mission record and the (still-on-disk, just
+    /// out-of-window) day-file both had the fact.
+    ///
+    /// The day-file here is dated 2020-01-01 — `for_each_recent_flow_record`
+    /// bounds its walk to day-FILE NAMES within the window, so this file is
+    /// never even opened, which is exactly the "still on disk, unreachable"
+    /// shape the issue measured (a real 2026-06-12 day-file, 84 days old,
+    /// on an install whose scan window is 14).
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_mission_older_than_the_flow_window_still_reports_its_durable_machine() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut mission = minimal_mission(
+            "ancient-mission-1",
+            vec!["ancient-mission-1-phase".to_string()],
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+        );
+        mission.machine = Some("durable-studio".to_string());
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase(
+            "ancient-mission-1-phase",
+            "ancient-mission-1",
+            vec!["ancient-mission-1-task".to_string()],
+        );
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task(
+            "ancient-mission-1-task",
+            "ancient-mission-1-phase",
+            vec!["ancient-mission-1-step".to_string()],
+            Some("coder"),
+        );
+        darkmux_crew::lifecycle::save_task("ancient-mission-1", &task).unwrap();
+        let step = minimal_step(
+            "ancient-mission-1-step",
+            "ancient-mission-1-task",
+            Some("crew-dispatch-ancient-xyz"),
+        );
+        darkmux_crew::lifecycle::save_step("ancient-mission-1", "ancient-mission-1-phase", &step).unwrap();
+
+        // The dispatch's own flow records exist, with a REAL (different)
+        // machine_id stamped on them — but they're filed under a date far
+        // outside RUNS_FLOW_SCAN_WINDOW_DAYS, so the windowed scan never
+        // reads this file at all. If `machine` were still purely
+        // flow-derived, this row would read `machine: None`.
+        write_day_file(
+            flows.path(),
+            "2020-01-01",
+            &[
+                serde_json::json!({
+                    "ts": "2020-01-01T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "crew-dispatch-ancient-xyz",
+                    "handle": "coder",
+                    "machine_id": "flow-derived-machine-should-not-win",
+                }),
+                serde_json::json!({
+                    "ts": "2020-01-01T09:10:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "crew-dispatch-ancient-xyz",
+                    "handle": "coder",
+                    "model": "qwen3.6-35b-a3b",
+                    "machine_id": "flow-derived-machine-should-not-win",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        assert_eq!(runs.len(), 1, "exactly one Run — the tracked mission, no ghost duplicate: {runs:?}");
+        assert_eq!(runs[0].id, "ancient-mission-1");
+        assert!(runs[0].tracked);
+        assert_eq!(
+            runs[0].machine.as_deref(),
+            Some("durable-studio"),
+            "machine must come from the mission's OWN durable field, surviving the flow retention \
+             window entirely — not from the (unreachable, out-of-window) flow session: {runs:?}"
+        );
     }
 
     /// (#1982) A lab run dispatches its inner work through the ordinary
