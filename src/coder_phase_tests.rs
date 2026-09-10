@@ -2108,6 +2108,38 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Finalized);
     }
 
+    /// (#1507 MUST-FIX 1) The impossibility pin above seeds an Active mission
+    /// and calls finalize ONCE — it never seeds the shape `mission finalize`
+    /// actually has to reconcile in production: a mission that is ALREADY
+    /// terminal but still holds a Planned phase (`terminate_mission`'s own
+    /// reconcile-steps comment names this exact on-disk shape). Before
+    /// #1507's guard drew a reconcile-vs-re-liven distinction
+    /// (`phase_start_for_reconcile`), `teardown_and_terminate_phase`'s
+    /// Planned arm called the PLAIN `phase_start`, which the #1507 guard
+    /// refuses on a terminal mission — stranding the phase Planned forever
+    /// and making the operator's suggested remedy (re-run `mission
+    /// finalize`) fail identically every time.
+    #[test]
+    #[serial_test::serial]
+    fn finalize_reconciles_a_planned_phase_inside_an_already_terminal_mission() {
+        let _g = CrewEnvGuard::new();
+        let _cwd = NonGitCwdGuard::new();
+        let mid = "fin-already-terminal-planned";
+        let mut m = mission(mid, "already terminal, stray planned phase");
+        m.phase_ids = vec!["p1".to_string()];
+        m.status = crew::types::MissionStatus::Finalized; // already terminal on disk
+        crew::lifecycle::save_mission(&m).unwrap();
+        crew::lifecycle::save_phase(&phase("p1", mid, PhaseStatus::Planned)).unwrap();
+
+        assert_eq!(finalize(mid, None).unwrap(), 0);
+        assert_eq!(
+            phase_status_now("p1"),
+            PhaseStatus::Complete,
+            "the reconcile door must close a Planned phase even though the mission is already terminal"
+        );
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Finalized);
+    }
+
     #[test]
     #[serial_test::serial]
     fn abort_leaves_no_phase_non_terminal_impossibility_pin() {

@@ -973,28 +973,71 @@ pub fn reconcile_mint_failure_with_payload(mission_id: &str, reason: &str, paylo
 /// mission's phase could be re-STARTED). The #1463 retirement of the old
 /// "Finalized mission with a non-terminal phase" drift arm assumed that
 /// shape was unreachable once finalize/abort started reconciling their
-/// phases; this guard is what keeps that assumption true, by refusing the
-/// reachable path directly rather than detecting the damage after the
-/// fact. Mirrors `load_mission_by_id`'s own "unknown status" doctrine: a
-/// mission that can't be loaded (missing/unparseable) is NOT a reason to
-/// refuse — this guard fails open on unknown, and closed only on a
-/// confirmed terminal status.
+/// phases; this guard is what keeps that assumption true for the RE-LIVEN
+/// door specifically (see [`phase_start_for_reconcile`] for the other
+/// door this deliberately leaves open).
+///
+/// Fails open when the owning mission can't be loaded (missing,
+/// unparseable, or an unrecognized-on-this-binary status) — this is a
+/// judgment call, not a guarantee: `classify_mission_close_refusal`
+/// (`envelope.rs`) treats the same "can't be read" shape as loud Drift,
+/// and on paper this guard could too. It doesn't, for two concrete
+/// reasons rather than symmetry with that function (which is a dedicated
+/// close-time anomaly classifier, not a guard on a hot mutating call): a
+/// pre-rename legacy phase has no `mission.json` at all and must stay
+/// startable (`phase_lifecycle_operates_on_legacy_sprints_dir_data`
+/// below pins exactly this), and a corrupt/unreadable `mission.json`
+/// blocking every phase under it forever is a worse failure than the one
+/// this guard exists to prevent. So: refused when the mission's
+/// terminality is OBSERVABLE, not exhaustively guaranteed.
 pub fn phase_start(id: &str) -> Result<Phase> {
+    phase_start_impl(id, true)
+}
+
+/// The reconcile-only door — used ONLY by the whole-mission terminal's own
+/// teardown (`coder_phase::teardown_and_terminate_phase`,
+/// `mission_launch::close_grown_nothing_phase`), which relies on the
+/// Planned → Running → Complete/Abandoned idiom as a STEPPING STONE to
+/// CLOSE a phase, because `phase_complete`/`phase_abandon` only transition
+/// out of Running.
+///
+/// That idiom has to keep working precisely when the owning mission is
+/// ALREADY terminal — `mission finalize`/`mission abort` re-run against a
+/// mission that's terminal but still holds a stray Planned phase (a real
+/// on-disk shape `terminate_mission` explicitly anticipates in its own
+/// reconcile-steps comment) is the case this exists for. Guarding this
+/// door with [`phase_start`]'s terminal-mission check would refuse the
+/// only path that can still close the phase, stranding it Planned forever
+/// — the #1507 re-liven fix regressing the #1504 invariant it exists to
+/// protect. Everything else `phase_start` checks (the phase-status match:
+/// still errors on `Running`/`Complete`) is unchanged; the mission-terminal
+/// check is intentionally the only thing this variant drops. `pub` (its
+/// two callers live in the `darkmux` binary crate, not here), but not a
+/// CLI-reachable verb — the operator/CLI surface has no standalone `phase
+/// start` (#1463 retired the `phase` family), so there is no door for this
+/// to leak the re-liven guard's refusal through by accident.
+pub fn phase_start_for_reconcile(id: &str) -> Result<Phase> {
+    phase_start_impl(id, false)
+}
+
+fn phase_start_impl(id: &str, refuse_terminal_mission: bool) -> Result<Phase> {
     let mut phase = load_phase_by_id(id)?;
     match phase.status {
         PhaseStatus::Planned | PhaseStatus::Abandoned => {}
         PhaseStatus::Running => bail!("phase `{id}` is already Running"),
         PhaseStatus::Complete => bail!("phase `{id}` is Complete (terminal) — create a new phase instead"),
     }
-    if let Ok(mission) = load_mission_by_id(&phase.mission_id) {
-        match mission.status {
-            MissionStatus::Finalized | MissionStatus::Aborted => bail!(
-                "mission `{}` is {:?} (terminal) — phase `{id}` can't be restarted; a terminal \
-                 mission's phases are frozen, launch a fresh mission instead (#1507)",
-                phase.mission_id,
-                mission.status
-            ),
-            MissionStatus::Active | MissionStatus::Paused => {}
+    if refuse_terminal_mission {
+        if let Ok(mission) = load_mission_by_id(&phase.mission_id) {
+            match mission.status {
+                MissionStatus::Finalized | MissionStatus::Aborted => bail!(
+                    "mission `{}` is {:?} (terminal) — phase `{id}` can't be restarted; a terminal \
+                     mission's phases are frozen, launch a fresh mission instead (#1507)",
+                    phase.mission_id,
+                    mission.status
+                ),
+                MissionStatus::Active | MissionStatus::Paused => {}
+            }
         }
     }
     phase.status = PhaseStatus::Running;
