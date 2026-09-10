@@ -1477,10 +1477,17 @@ fn teardown_and_terminate_phase(
     // Drive the phase to the recorded terminal. `abort` → Abandoned (legal
     // restart later); `finalize` → Complete. `phase_complete` only transitions
     // from Running, so a never-started Planned phase is started first (#1463).
+    //
+    // (#1507 MUST-FIX 1) `phase_start_for_reconcile`, NOT `phase_start` —
+    // this call has to succeed even when `mission` is ALREADY terminal (a
+    // `mission finalize` re-run against a mission that closed with a stray
+    // Planned phase still on it, exactly the case the reconcile-steps
+    // comment below anticipates). `phase_start`'s re-liven guard would
+    // refuse that start and strand the phase Planned forever.
     let flip = match kind {
         MissionTerminal::Abort => crew::lifecycle::phase_abandon(&phase.id),
         MissionTerminal::Finalize => match phase.status {
-            PhaseStatus::Planned => crew::lifecycle::phase_start(&phase.id)
+            PhaseStatus::Planned => crew::lifecycle::phase_start_for_reconcile(&phase.id)
                 .and_then(|_| crew::lifecycle::phase_complete(&phase.id)),
             _ => crew::lifecycle::phase_complete(&phase.id),
         },

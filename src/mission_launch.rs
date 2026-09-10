@@ -2125,7 +2125,14 @@ fn close_grown_nothing_phase(
         return;
     }
     lazy_close_prior_phases(mission_id, phase_order, real_phase_id, closed);
-    let result = crew::lifecycle::phase_start(real_phase_id).and_then(|_| {
+    // (#1507 MUST-FIX 2) `phase_start_for_reconcile`, NOT `phase_start` —
+    // this Planned → Running → Complete/Abandoned idiom is a reconcile
+    // stepping stone, not a re-liven. It has to succeed even when the
+    // mission went terminal mid-flight (the door #1507's guard says it is
+    // closing); `phase_start`'s guard would refuse the start and strand
+    // this phase Planned forever, same regression as coder_phase.rs's
+    // `teardown_and_terminate_phase`.
+    let result = crew::lifecycle::phase_start_for_reconcile(real_phase_id).and_then(|_| {
         if producer_errored {
             crew::lifecycle::phase_abandon(real_phase_id)
         } else {
@@ -7125,6 +7132,48 @@ mod tests {
         lazy_start_phase_for_step(mission_id, p1, NodeStatus::Running, &mut started);
         lazy_start_phase_for_step(mission_id, p1, NodeStatus::Running, &mut started);
         assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Running);
+    }
+
+    /// (#1507 MUST-FIX 2) Same regression class as `coder_phase.rs`'s
+    /// `teardown_and_terminate_phase`, proven at a second call site:
+    /// `close_grown_nothing_phase` uses the identical Planned -> Running ->
+    /// Complete/Abandoned idiom to honestly close a phase whose `grow`
+    /// template(s) produced nothing, because `phase_complete`/`phase_abandon`
+    /// only transition out of Running. Under a mission that went terminal
+    /// mid-flight — the door #1507's guard says it is closing — the plain
+    /// `phase_start` this used to call would refuse the start and strand the
+    /// phase Planned forever. `phase_start_for_reconcile` is the fix: it
+    /// keeps `phase_start`'s phase-status checks but drops ONLY the
+    /// mission-terminal refusal, because this call is a reconcile stepping
+    /// stone, not a re-liven.
+    #[test]
+    #[serial_test::serial]
+    fn close_grown_nothing_phase_reconciles_inside_an_already_terminal_mission() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let mission_id = "grown-nothing-already-terminal";
+        let real_phase_ids = ensure_mission_and_phases_with_provenance(mission_id, &config, None, None).unwrap();
+        let p1 = real_phase_ids["p1"].clone();
+        assert_eq!(phase_status_on_disk(mission_id, &p1), PhaseStatus::Planned, "starts Planned");
+
+        // Flip the mission terminal on disk WITHOUT reconciling its phases —
+        // the on-disk shape `terminate_mission`'s own reconcile-steps comment
+        // anticipates: a mission that closed through another door while a
+        // phase stayed Planned.
+        let mut m = load_mission_for_brief(mission_id).unwrap();
+        m.status = MissionStatus::Finalized;
+        crew::lifecycle::save_mission(&m).unwrap();
+
+        let mut started = std::collections::HashSet::new();
+        let mut closed = std::collections::HashSet::new();
+        close_grown_nothing_phase(mission_id, &p1, std::slice::from_ref(&p1), &mut started, &mut closed, false);
+
+        assert_eq!(
+            phase_status_on_disk(mission_id, &p1),
+            PhaseStatus::Complete,
+            "the reconcile door must close a Planned phase even though the mission is already terminal"
+        );
+        assert!(closed.contains(&p1), "closed set records the successful reconcile");
     }
 
     /// (#1503) The reuse/reopen-by-derived-id path is gone: a mint against
