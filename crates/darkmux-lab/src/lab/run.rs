@@ -87,12 +87,22 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     let paths = paths::resolve(ResolveScope::Auto);
     paths::ensure(&paths)?;
 
-    let user_dir = if paths.scope == paths::Scope::Project || paths.scope == paths::Scope::User {
-        Some(paths.root.as_path())
-    } else {
-        None
-    };
-    let mut loaded_workload = load(&opts.workload_id, user_dir)?;
+    // (#2590) The workload USER tier is forced to the home root — a
+    // SEPARATE resolution from `paths` above. `paths` stays `Auto`
+    // (cwd-sensitive) on purpose: it governs run-artifact placement
+    // (`darkmux_types::config_access::lab_dir()`, resolved independently
+    // below) and sandbox/fixture-registry lookup (`paths.sandboxes`, used
+    // by `resolve_source_sandbox` further down) — both deliberately
+    // project-local when the cwd has a `.darkmux/`. Folding the workload
+    // *document* lookup into that same `Auto` root is what let a stale
+    // `./.darkmux/workloads/<id>.json` silently outrank the embedded
+    // workload of the same id, and let a cwd-only id resolve at all — the
+    // exact bug class #1012 closed for crew/mission state and #2432 closed
+    // for mission configs' user tier. `mission_config::load`'s
+    // `crate::loader::user_state_root()` forces `ResolveScope::ForceUser`
+    // for precisely this reason; the workload loader now does the same.
+    let user_workloads_root = paths::resolve(ResolveScope::ForceUser).root;
+    let mut loaded_workload = load(&opts.workload_id, Some(user_workloads_root.as_path()))?;
 
     // (#1004) Loop-lab A/B "with-context" arm: splice the caller-built
     // engagement-context blocks in FRONT of the workload's own prompt, so the
@@ -368,8 +378,11 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
 }
 
 pub fn lab_workloads() -> Vec<String> {
-    let paths = paths::resolve(ResolveScope::Auto);
-    list_available(Some(&paths.root))
+    // (#2590) Forced home, matching `lab_run`'s workload user-tier
+    // resolution above — a project-local `.darkmux/workloads/` must not
+    // appear in this listing either.
+    let user_root = paths::resolve(ResolveScope::ForceUser).root;
+    list_available(Some(&user_root))
 }
 
 /// (#489) Phase 2 — read the provider-written `<run_dir>/manifest.json`,
@@ -474,21 +487,79 @@ pub(crate) fn resolve_source_sandbox(
             .with_context(|| format!("loading {}", reg_path.display()))?;
         match registry.find_satisfying(requires) {
             Some((_name, fixture)) => Ok(fixture.path.clone()),
-            None => Err(anyhow!(
-                "workload `{}` requires a fixture satisfying `{}` but no registered \
-                 fixture matches.\n\
-                 \n\
-                 Fix:\n\
-                   1. Register an existing fixture that satisfies this requirement:\n\
-                      darkmux lab fixture register /path/to/your/fixture\n\
-                   2. Or inspect what's registered:\n\
-                      darkmux lab fixture list\n\
-                   3. Or update the fixture's `.fixture.json` to set:\n\
-                      \"satisfies\": \"{}\"",
-                loaded.manifest.workload.id,
-                requires,
-                requires,
-            )),
+            // (#2590 follow-up) The fixture REGISTRY still resolves through
+            // `paths` — project-local via `ResolveScope::Auto` — while the
+            // workload DOCUMENT above is now home-only via `ForceUser`. That
+            // split is newly reachable in a state it never could be before
+            // this fix: a home-tier workload that `requires_fixture` can now
+            // resolve and dispatch from a plain directory (no `.darkmux`
+            // anywhere in cwd) yet fail this exact lookup from a directory
+            // that happens to hold its OWN project-local `.darkmux` — even
+            // when the fixture is registered globally at
+            // `~/.darkmux/lab-registry.json`. Before this fix that state was
+            // unreachable: the workload document itself failed to resolve
+            // from such a directory, so the operator got a clean "workload
+            // not found" instead of a fixture error that looks wrong for a
+            // fixture that IS registered. Naming the consulted path here is
+            // the minimum fix — it makes the split visible instead of
+            // silent; forcing the registry itself to the home root too is a
+            // real blast-radius change and belongs in its own issue.
+            None => {
+                // (MUST FIX, third-round frontier review) `paths::resolve`
+                // decides this root in a fixed order — `DARKMUX_HOME` when
+                // set (an explicit override that wins regardless of cwd,
+                // checked BEFORE the project-local branch below is ever
+                // evaluated), then project-local when the current directory
+                // has its own `.darkmux/`, then the home tier
+                // (`~/.darkmux`) otherwise. The old wording named only two
+                // of those three branches, folding the `DARKMUX_HOME`
+                // override into the same "otherwise" bucket as the genuine
+                // home tier — so with an explicit `DARKMUX_HOME` set AND a
+                // project-local `.darkmux/` also present, it named the
+                // right path but mislabeled the reason as "the home tier",
+                // and `DARKMUX_HOME` appeared in the sentence only as a
+                // negative condition on the OTHER branch ("...and
+                // DARKMUX_HOME is not set"). A test asserting the message
+                // merely CONTAINS "DARKMUX_HOME" passed on that negative
+                // clause alone — it never checked which branch the message
+                // claimed was actually taken. Name all three branches, in
+                // decision order, and say which one fired for THIS run.
+                let darkmux_home_is_set = std::env::var("DARKMUX_HOME")
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty());
+                let decided_by = if darkmux_home_is_set {
+                    "DARKMUX_HOME is set, so its override root above is what was actually \
+                     consulted — not the home tier, and not this directory's own \
+                     project-local `.darkmux/` even if one exists"
+                } else if paths.scope == paths::Scope::Project {
+                    "the current directory has its own `.darkmux/` and DARKMUX_HOME is unset, \
+                     so this run resolved project-local"
+                } else {
+                    "DARKMUX_HOME is unset and the current directory has no project-local \
+                     `.darkmux/`, so this run resolved to the home tier (~/.darkmux)"
+                };
+                Err(anyhow!(
+                    "workload `{}` requires a fixture satisfying `{}` but no registered \
+                     fixture matches in the registry at {} (this registry's root is decided \
+                     in order — DARKMUX_HOME override when set, else project-local when the \
+                     current directory has its own `.darkmux/`, else the home tier; for THIS \
+                     run: {} — which can differ from what `darkmux lab fixture list` shows from \
+                     elsewhere).\n\
+                     \n\
+                     Fix:\n\
+                       1. Register an existing fixture that satisfies this requirement:\n\
+                          darkmux lab fixture register /path/to/your/fixture\n\
+                       2. Or inspect what's registered in THIS directory's registry:\n\
+                          darkmux lab fixture list\n\
+                       3. Or update the fixture's `.fixture.json` to set:\n\
+                          \"satisfies\": \"{}\"",
+                    loaded.manifest.workload.id,
+                    requires,
+                    reg_path.display(),
+                    decided_by,
+                    requires,
+                ))
+            }
         }
     } else {
         Ok(paths.sandboxes.join(&loaded.manifest.workload.id))
@@ -500,10 +571,212 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// RAII guard that changes the process cwd for the test's duration and
+    /// restores it on drop — mirrors `workloads::load`'s test-only `CwdGuard`
+    /// (#2432/#2553). Every caller MUST be `#[serial_test::serial]` — cwd is
+    /// a process-global resource, and `serial_test` only coordinates among
+    /// ANNOTATED tests, not any unannotated test elsewhere in this crate
+    /// that happens to read/write cwd too. RAII (not manual set/restore)
+    /// matters here specifically because these tests assert on the fix
+    /// under test: an assertion panic mid-test must still restore cwd, or a
+    /// red-proof run (which is EXPECTED to panic when the fix is reverted)
+    /// leaks the temp cwd into every test that runs after it in the same
+    /// `cargo test` process.
+    struct CwdGuard {
+        prev: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(dir: &Path) -> Self {
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    /// RAII guard for `DARKMUX_HOME`: sets it for the test's duration and
+    /// restores the PRIOR value (or removes it) on drop, for the same
+    /// red-proof-must-still-clean-up reason as `CwdGuard`. Mirrors
+    /// `crawl::unit_step_tests::HomeGuard`.
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(dir: &Path) -> Self {
+            let prev = std::env::var_os("DARKMUX_HOME");
+            unsafe { std::env::set_var("DARKMUX_HOME", dir) };
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
+            }
+        }
+    }
+
+    /// RAII guard that scopes the REAL `HOME` env var (which
+    /// `dirs::home_dir()` reads) and force-clears `DARKMUX_HOME` for the
+    /// duration, restoring both on drop. `HomeGuard` above sets
+    /// `DARKMUX_HOME`, the bootstrap override that short-circuits
+    /// `paths::resolve` BEFORE the `Auto`/`ForceUser` distinction is ever
+    /// evaluated — the wrong tool for a test that wants to actually
+    /// EXERCISE that distinction, since `DARKMUX_HOME` would make `Auto`
+    /// and `ForceUser` resolve identically regardless of cwd, silently
+    /// proving nothing. Setting `HOME` instead moves `dirs::home_dir()`'s
+    /// answer without pre-empting the branch under test. Clearing
+    /// `DARKMUX_HOME` too matters for the same reason the operator's
+    /// standing note does (`env -u DARKMUX_HOME HOME=<tmp>`): an ambient
+    /// `DARKMUX_HOME` in the shell running `cargo test` would otherwise
+    /// still win and mask the test's real HOME override.
+    struct RealHomeGuard {
+        prev_home: Option<std::ffi::OsString>,
+        prev_darkmux_home: Option<std::ffi::OsString>,
+    }
+
+    impl RealHomeGuard {
+        fn set(dir: &Path) -> Self {
+            let prev_home = std::env::var_os("HOME");
+            let prev_darkmux_home = std::env::var_os("DARKMUX_HOME");
+            unsafe {
+                std::env::set_var("HOME", dir);
+                std::env::remove_var("DARKMUX_HOME");
+            }
+            Self {
+                prev_home,
+                prev_darkmux_home,
+            }
+        }
+    }
+
+    impl Drop for RealHomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.prev_darkmux_home {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
+            }
+        }
+    }
+
+    // (#2590) `lab_workloads()` resolves the workload user tier via
+    // `paths::resolve(ResolveScope::ForceUser)`, which reads `DARKMUX_HOME` —
+    // a process-global. This test itself mutates neither, but a concurrent
+    // unannotated test could still be surprised by an in-flight guard from a
+    // SERIAL test above it if it asserted on the resolved root; it doesn't
+    // (panic-freedom only, and `list_available` tolerates any dir, existing
+    // or not), so it's serial here purely for auditability, not necessity.
+    #[serial_test::serial]
     #[test]
     fn workloads_returns_strings_without_panicking() {
         // Just verify the function doesn't panic on a fresh user dir.
         let _ = lab_workloads();
+    }
+
+    /// (#2590) The workload USER tier must NOT be cwd-sensitive: a
+    /// `.darkmux/workloads/<id>.json` planted in the shell's cwd must not
+    /// resolve, and must not appear in `lab workload list` — matching
+    /// `mission_config::load`'s `ForceUser` fix (#1012, #2432). Red-proved:
+    /// reverting `lab_workloads`'s `ResolveScope::ForceUser` back to `Auto`
+    /// makes `cwd-only-ghost` appear in this list.
+    #[serial_test::serial]
+    #[test]
+    fn workload_listing_ignores_a_cwd_local_darkmux_dir() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".darkmux").join("workloads")).unwrap();
+        std::fs::write(
+            project
+                .path()
+                .join(".darkmux")
+                .join("workloads")
+                .join("cwd-only-ghost.json"),
+            r#"{"workload":{"id":"cwd-only-ghost","provider":"prompt","prompt":"hi"}}"#,
+        )
+        .unwrap();
+
+        // An empty, isolated home — nothing here defines `cwd-only-ghost`,
+        // so if it resolves at all, it can only have come from the cwd.
+        let home = TempDir::new().unwrap();
+        let _home_guard = RealHomeGuard::set(home.path());
+        let _cwd_guard = CwdGuard::new(project.path());
+
+        let ids = lab_workloads();
+
+        assert!(
+            !ids.contains(&"cwd-only-ghost".to_string()),
+            "a cwd-local .darkmux/workloads/<id>.json must not resolve as a \
+             workload — the user tier is forced home (#2590); ids={ids:?}"
+        );
+        // Sanity: the embedded set is still there — this isn't an empty
+        // list masquerading as a pass.
+        assert!(
+            ids.contains(&"quick-q".to_string()),
+            "the embedded built-ins must still be listed; ids={ids:?}"
+        );
+    }
+
+    /// (#2590) The counterpart of `workload_listing_ignores_a_cwd_local_darkmux_dir`
+    /// for the actual DISPATCH path, not just the listing: `lab_run` must
+    /// also refuse to resolve a workload id that exists ONLY in a cwd-local
+    /// `.darkmux/workloads/`. Red-proved: reverting `lab_run`'s
+    /// `ResolveScope::ForceUser` (the workload-user-dir resolution, not the
+    /// `paths` variable used for run-artifact/sandbox placement) back to
+    /// `Auto` makes this resolve the cwd document and proceed instead of
+    /// erroring "not found".
+    #[serial_test::serial]
+    #[test]
+    fn run_ignores_a_cwd_local_darkmux_dir_for_workload_lookup() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".darkmux").join("workloads")).unwrap();
+        std::fs::write(
+            project
+                .path()
+                .join(".darkmux")
+                .join("workloads")
+                .join("cwd-only-ghost.json"),
+            r#"{"workload":{"id":"cwd-only-ghost","provider":"prompt","prompt":"hi"}}"#,
+        )
+        .unwrap();
+
+        // An empty, isolated home — nothing here defines `cwd-only-ghost`
+        // either, so the ONLY way it could resolve is via the cwd.
+        let home = TempDir::new().unwrap();
+        let _home_guard = RealHomeGuard::set(home.path());
+        let _cwd_guard = CwdGuard::new(project.path());
+
+        let err = lab_run(RunOpts {
+            workload_id: "cwd-only-ghost".into(),
+            profile_name: None,
+            runs: 1,
+            config_path: None,
+            quiet: true,
+            loop_override: None,
+            inject_context: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("not found"),
+            "lab_run must not resolve a cwd-only workload id — the user tier \
+             is forced home (#2590); got: {err}"
+        );
     }
 
     // (#488) Phase 1 — per-run COW sandbox isolation invariants. These
@@ -821,6 +1094,119 @@ mod tests {
         assert!(msg.contains("never-registered@1.0"), "got: {msg}");
         assert!(msg.contains("darkmux lab fixture register"), "got: {msg}");
         assert!(msg.contains("darkmux lab fixture list"), "got: {msg}");
+        // (#2590 follow-up) The registry still resolves through `paths`
+        // (project-local via `ResolveScope::Auto`) while the workload
+        // DOCUMENT now resolves home-only via `ForceUser` — a split that's
+        // newly reachable and newly confusing (a fixture registered at the
+        // home root looks "missing" from a directory with its own
+        // `.darkmux/`). Naming the exact registry path consulted is the
+        // minimum fix that makes the split visible instead of silent.
+        assert!(
+            msg.contains(&paths.root.join("lab-registry.json").display().to_string()),
+            "error must name the registry path actually consulted, so the \
+             project/home split is visible instead of silent: got: {msg}"
+        );
+    }
+
+    /// (#2590 follow-up, review round 2 finding 2 — THIRD-ROUND FIX) The
+    /// explanatory clause added by the fix above claimed the registry "is
+    /// looked up project-locally when the current directory has its own
+    /// `.darkmux/` AND DARKMUX_HOME is not set, the home tier otherwise" —
+    /// which still mislabeled this exact state: with an explicit
+    /// `DARKMUX_HOME` set AND a project-local `.darkmux/` also sitting in
+    /// cwd, that wording named the right PATH but folded the override into
+    /// the same "otherwise" bucket as the genuine home tier, so it called
+    /// the decided branch "the home tier" when the actual root came from
+    /// `DARKMUX_HOME`, not from `dirs::home_dir()`. `DARKMUX_HOME` appeared
+    /// in the sentence only as a NEGATIVE condition on the other branch
+    /// ("...and DARKMUX_HOME is not set") — so a prior assertion checking
+    /// only `msg.contains("DARKMUX_HOME")` passed on that negative clause
+    /// alone, without ever checking which branch the message claimed was
+    /// actually taken. The message now names all three branches in
+    /// decision order and says which one fired for THIS run; the
+    /// assertion below is tightened to the taken-branch phrasing instead
+    /// of bare substring presence. Red-proved: reverting the `decided_by`
+    /// computation back to the two-branch hedge keeps the path assertions
+    /// green while failing the taken-branch assertion below.
+    #[test]
+    #[serial_test::serial]
+    fn resolver_fixture_error_names_dark_home_not_the_bypassed_project_root() {
+        use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec};
+        use std::collections::BTreeMap;
+
+        let dark_home = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(dark_home.path());
+
+        // A project-local `.darkmux/` ALSO exists in cwd — exactly the
+        // state the finding names ("an explicit state root set and a
+        // project-local registry also present"). `DARKMUX_HOME` must win
+        // regardless.
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".darkmux")).unwrap();
+        let _cwd_guard = CwdGuard::new(project.path());
+
+        let paths = paths::resolve(ResolveScope::Auto);
+        assert_eq!(
+            paths.root, dark_home.path(),
+            "sanity: DARKMUX_HOME must win over the project-local .darkmux/ \
+             in cwd, or this test isn't exercising the state under test"
+        );
+
+        let loaded = LoadedWorkload {
+            manifest: WorkloadManifest {
+                workload: WorkloadSpec {
+                    id: "demo".into(),
+                    provider: "coding-task".into(),
+                    description: None,
+                    role: Some("coder".into()),
+                    prompt: Some("do the thing".into()),
+                    prompt_file: None,
+                    sandbox_seed: None,
+                    setup_content: BTreeMap::new(),
+                    requires_external_sandbox: true,
+                    requires_fixture: Some("never-registered@1.0".into()),
+                    verify: None,
+                    expected: None,
+                    image: None,
+                    extras: BTreeMap::new(),
+                },
+            },
+            manifest_path: project.path().join("workloads/demo.json"),
+            base_dir: project.path().to_path_buf(),
+            source: WorkloadSource::OnDisk,
+        };
+        let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
+        let msg = format!("{err:#}");
+
+        let dark_home_registry = dark_home.path().join("lab-registry.json");
+        let bypassed_project_registry = project.path().join(".darkmux").join("lab-registry.json");
+
+        assert!(
+            msg.contains(&dark_home_registry.display().to_string()),
+            "must name the DARKMUX_HOME-rooted registry actually consulted: {msg}"
+        );
+        assert!(
+            !msg.contains(&bypassed_project_registry.display().to_string()),
+            "must not name the project-local registry that was never consulted: {msg}"
+        );
+        assert!(
+            msg.contains("DARKMUX_HOME is set, so its override root above is what was actually \
+                          consulted"),
+            "the explanation must AFFIRMATIVELY name DARKMUX_HOME as the branch that decided \
+             this path — a message that only mentions DARKMUX_HOME as a negative condition on \
+             the project-local branch (\"...and DARKMUX_HOME is not set\") would still contain \
+             the substring \"DARKMUX_HOME\" without ever claiming it was the decider: {msg}"
+        );
+        assert!(
+            !msg.contains("so this run resolved to the home tier"),
+            "must not mislabel this DARKMUX_HOME-decided run as having resolved to the home \
+             tier — the override root is neither the home tier nor the bypassed project-local \
+             `.darkmux/`: {msg}"
+        );
+        assert!(
+            !msg.contains("so this run resolved project-local"),
+            "must not claim the bypassed project-local `.darkmux/` decided this run: {msg}"
+        );
     }
 
     /// (#489) Phase 2 — `enrich_manifest_with_fixture_info` adds the
@@ -970,16 +1356,23 @@ mod tests {
             r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}}}"#,
         )
         .unwrap();
-        // Set up a workload manifest in the user dir.
-        let darkmux_dir = tmp.path().join(".darkmux");
-        fs::create_dir_all(darkmux_dir.join("workloads")).unwrap();
+        // (#2590) The workload user tier is forced HOME now, not cwd — a
+        // `.darkmux/workloads/` planted in the shell's cwd (this test's
+        // pre-#2590 setup) no longer resolves. Plant the workload manifest
+        // under a `DARKMUX_HOME`-scoped home dir instead; `DARKMUX_HOME` IS
+        // the darkmux root directly (no nested `.darkmux/`), so the
+        // manifest lives at `<home>/workloads/q.json`. The RAII guard also
+        // isolates `paths::resolve(Auto)`'s root (used by `lab_run` for
+        // run-artifact placement + `paths::ensure`), since `DARKMUX_HOME`
+        // wins over both `Auto` and `ForceUser` identically.
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("workloads")).unwrap();
         fs::write(
-            darkmux_dir.join("workloads/q.json"),
+            home.join("workloads").join("q.json"),
             r#"{"workload":{"id":"q","provider":"prompt","prompt":"hi"}}"#,
         )
         .unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _home_guard = HomeGuard::set(&home);
         let err = lab_run(RunOpts {
             workload_id: "q".into(),
             profile_name: None,
@@ -990,7 +1383,6 @@ mod tests {
             inject_context: None,
         })
         .unwrap_err();
-        std::env::set_current_dir(prev).unwrap();
         assert!(err.to_string().contains("default_profile"));
     }
 

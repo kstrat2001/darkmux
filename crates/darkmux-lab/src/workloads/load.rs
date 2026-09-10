@@ -22,14 +22,27 @@
 //! checkout's templates" is one env var away, deliberately, rather than an
 //! accident of `pwd`.
 //!
-//! **This is the on-disk (`builtin_dirs`) tier only — it does NOT make the
-//! USER tier above it cwd-insensitive too.** `lab::run::lab_run` resolves
-//! that tier via `paths::resolve(ResolveScope::Auto)`, which still returns
-//! `<cwd>/.darkmux` when the shell happens to be standing inside a directory
-//! that has one, so a workload can still resolve differently by cwd through
-//! that tier. `mission_config::load` avoids this on its own user tier via
-//! `ResolveScope::ForceUser` (#1012); doing the same here is tracked
-//! separately as #2590, deliberately out of scope for this fix.
+//! **(#2590) The USER tier is now ALSO not cwd-sensitive.** #2553 closed only
+//! the on-disk tier above and left the user tier deliberately open, tracked
+//! separately: `lab::run::lab_run` and `lab::run::lab_workloads` both passed
+//! `paths::resolve(ResolveScope::Auto)`'s root as the workload user dir, which
+//! still returns `<cwd>/.darkmux` whenever that directory exists — so a
+//! `./.darkmux/workloads/<id>.json` could still silently outrank the embedded
+//! workload of the same id, and a cwd-only id could still resolve and appear
+//! in `lab workload list`, byte-for-byte the bug class #1012 closed for
+//! crew/mission state and #2432 closed for mission configs' own user tier.
+//! Two pieces of prior art in this crate already assumed the fix rather than
+//! the bug: `providers::coding_task`'s setupContent-key validation and its
+//! module doc both describe operator-installed workloads as living at
+//! `~/.darkmux/workloads/<id>.json` — home, unconditional, no cwd branch.
+//! Closed the same way: `lab_run` and `lab_workloads` now resolve the
+//! workload user dir via a SEPARATE `paths::resolve(ResolveScope::ForceUser)`
+//! call, not the `Auto`-resolved `paths` those functions also use for
+//! run-artifact placement (`config_access::lab_dir()`, independent and
+//! unchanged) and sandbox/fixture-registry lookup (`paths.sandboxes`,
+//! also unchanged) — both of which stay deliberately project-local. Only the
+//! workload id → document lookup moved to `ForceUser`; see `lab::run::lab_run`'s
+//! own doc comment for the split.
 
 use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource};
 use anyhow::{Context, Result, anyhow, bail};
@@ -113,17 +126,13 @@ fn find_embedded(id: &str) -> Option<&'static str> {
 /// wants "this checkout's templates" exactly that, on purpose:
 /// `DARKMUX_TEMPLATES_DIR=$PWD/templates/builtin`.
 ///
-/// **This does NOT make workload resolution as a whole cwd-insensitive —
-/// only this one tier.** The USER tier (searched by [`load`] before this
-/// function ever runs) still comes from `lab::run::lab_run`'s
-/// `paths::resolve(ResolveScope::Auto)`, which resolves to `<cwd>/.darkmux`
-/// whenever that directory exists — so a `./.darkmux/workloads/<id>.json`
-/// sitting in the shell's cwd still wins over every tier this function
-/// searches, same as it always did. `mission_config::load` closed that same
-/// gap on its own user tier by resolving through `ResolveScope::ForceUser`
-/// instead (#1012, `crate::loader::mission_configs_dir`); `lab_run`'s user
-/// tier was deliberately left on `Auto` here and stays cwd-sensitive by
-/// design, tracked separately as #2590.
+/// **(#2590) The USER tier (searched by [`load`] before this function ever
+/// runs) is ALSO no longer cwd-sensitive.** `lab::run::lab_run` and
+/// `lab::run::lab_workloads` now pass a SEPARATE `paths::resolve(ResolveScope::
+/// ForceUser)` root as the workload user dir, mirroring `mission_config::load`'s
+/// own user-tier fix (#1012, `crate::loader::mission_configs_dir`) — a
+/// `./.darkmux/workloads/<id>.json` sitting in the shell's cwd no longer wins
+/// over any tier, here or above.
 fn builtin_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for base in darkmux_types::config_access::templates_override_dirs() {
@@ -157,7 +166,82 @@ pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> 
     } else {
         avail.join(", ")
     };
+    // (#2590 follow-up, review round 2 finding 1) The USER tier is forced
+    // home-only above, on purpose — but that leaves the exact silence the
+    // sibling `resolve_source_sandbox` fixture-error fix (`lab::run`)
+    // removed, one lookup over: standing in a project directory holding a
+    // `.darkmux/workloads/<id>.json` for an id that resolves nowhere
+    // darkmux actually searches, the operator got a bare "not found" that
+    // never mentioned the document sitting right there in cwd. Name it,
+    // same remedy shape as that sibling fix.
+    if let Some(note) = ignored_project_local_note(id) {
+        bail!("workload \"{id}\" not found. Available: {listed}\n\n{note}");
+    }
     bail!("workload \"{id}\" not found. Available: {listed}")
+}
+
+/// Callers only reach this from [`load`]'s "not found" tail, after every
+/// other tier (user, on-disk, embedded) already failed to resolve `id`.
+///
+/// (MUST FIX, third-round frontier review) An earlier version of this
+/// function took `user_dir: Option<&Path>` and short-circuited to `None`
+/// up front whenever `user_dir == Some(auto_root)`, with a doc comment
+/// claiming THAT equality check was what enforced "only fires when a
+/// project-local `.darkmux` is genuinely being bypassed". It wasn't: when
+/// `user_dir` equals the `ResolveScope::Auto`-resolved root (no
+/// project-local `.darkmux/` exists, or `DARKMUX_HOME` is set — see
+/// `darkmux_types::paths::resolve`), `auto_root.join("workloads")` is the
+/// BYTE-IDENTICAL path `load` already searched for this exact `id` at its
+/// own top (`find_in_dir(&user_dir.join("workloads"), id)`) and already
+/// failed to find anything in — so the fallback `find_in_dir` call below
+/// was *already* guaranteed to return `None` again in that case, with or
+/// without the equality check. Deleting the whole equality-check block
+/// changed no observable behavior (confirmed: every existing test for
+/// this function still passes with it removed), which is the proof it was
+/// dead — a defensive-looking guard that claimed to be load-bearing but
+/// wasn't. The real reason a false-positive note can't fire is structural:
+/// this function only ever returns `Some` when the id resolves under
+/// `auto_root` in a lookup `load` had not already performed and failed —
+/// i.e. genuinely, not merely apparently, bypassed. `user_dir` itself adds
+/// nothing this function needs, so the parameter is gone too.
+fn ignored_project_local_note(id: &str) -> Option<String> {
+    let auto_root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
+    let project_workloads = auto_root.join("workloads");
+    let found = find_in_dir(&project_workloads, id)?;
+    Some(format!(
+        "Note: `{id}` exists at {} but is ignored — the workload user tier \
+         resolves to the home directory unconditionally (#2590), never the \
+         current directory's own `.darkmux/`. Move it to \
+         ~/.darkmux/workloads/{id}.json (or export DARKMUX_HOME to point at \
+         a different root) if you want darkmux to use it.",
+        display_under_cwd(&found),
+    ))
+}
+
+/// (review round 2 finding 3) `darkmux_types::paths::resolve` derives the
+/// project root from `std::env::current_dir()`, which resolves symlinks
+/// (e.g. macOS's `/tmp` → `/private/tmp`, or any temp dir under
+/// `/var/folders/...` → `/private/var/folders/...`) — a spelling the
+/// operator's own shell won't have shown them, since `pwd`/`ls` read the
+/// shell's own unresolved `$PWD`. Left alone, the operator sees one
+/// spelling of their own directory in the terminal and a DIFFERENT one in
+/// this note, for what is the same path. Re-spell `p` (which must be
+/// somewhere under the real cwd) using `$PWD`'s logical form when it
+/// actually names the same real directory — falling back to `p` verbatim
+/// whenever `$PWD` is unset, stale, or unreadable, so this is cosmetic-only
+/// and never changes what gets searched or found.
+fn display_under_cwd(p: &Path) -> String {
+    (|| {
+        let pwd = PathBuf::from(env::var_os("PWD")?);
+        let real_pwd = pwd.canonicalize().ok()?;
+        let real_cwd = env::current_dir().ok()?.canonicalize().ok()?;
+        if real_pwd != real_cwd {
+            return None;
+        }
+        let rest = p.strip_prefix(&real_cwd).ok()?;
+        Some(pwd.join(rest).display().to_string())
+    })()
+    .unwrap_or_else(|| p.display().to_string())
 }
 
 pub fn list_available(user_dir: Option<&Path>) -> Vec<String> {
@@ -702,6 +786,168 @@ mod tests {
 
         let err = load("cwd-only-2553", None).unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    // ─── #2590 review round 2 — name the ignored project-local document ──
+    //
+    // A trap worth naming for whoever red-proves the test below (or any
+    // test in this module): filtering by the bare function name with an
+    // `--exact`-style flag has silently matched ZERO tests and still
+    // exited 0 in this repo before — the module-qualified path
+    // (`workloads::load::tests::<name>`, as `cargo test <name>` without
+    // `--exact` or `cargo nextest run -E 'test(<name>)'` would resolve it)
+    // is what's required for the filter to actually select something. A
+    // green "0 passed; 0 failed" reads identically to a real pass at a
+    // glance — it isn't one.
+
+    /// The sibling of `resolve_source_sandbox`'s fixture-error fix, one
+    /// lookup over: a project directory holding its OWN
+    /// `.darkmux/workloads/<id>.json` for an id that resolves nowhere
+    /// darkmux actually searches (no user/on-disk/embedded tier has it
+    /// either) must have that ignored document NAMED in the "not found"
+    /// error, not silently omitted. Red-proved: deleting the
+    /// `ignored_project_local_note` call in [`load`] makes this fail —
+    /// the error still says "not found" but drops the ignored path.
+    #[test]
+    #[serial_test::serial]
+    fn not_found_names_an_ignored_project_local_document() {
+        let home_tmp = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
+        let _templates_guard =
+            EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", home_tmp.path().join("nope"));
+        // (MUST FIX, third-round frontier review) `ignored_project_local_note`
+        // calls `paths::resolve(ResolveScope::Auto)`, which checks
+        // `DARKMUX_HOME` BEFORE it ever looks at cwd's own `.darkmux/` (see
+        // that function's own doc). An ambient `DARKMUX_HOME` in the shell
+        // running `cargo test` — not unusual on this project, which asks
+        // contributors to export it for flow provenance — would make
+        // `auto_root` resolve to that override instead of `cwd_tmp`'s
+        // project-local `.darkmux/`, so the note would never find the
+        // planted document and this test would fail red for an operator
+        // with it exported, even though nothing here is actually broken.
+        // CI never sets `DARKMUX_HOME`, so CI would never catch this drift.
+        // Same clear-guard pattern as `lab::run`'s `RealHomeGuard`, which
+        // documents the identical reasoning for the identical hazard.
+        let _darkmux_home_guard = EnvVarGuard::set("DARKMUX_HOME", "");
+
+        let cwd_tmp = TempDir::new().unwrap();
+        write(
+            &cwd_tmp.path().join(".darkmux/workloads/cwd-only-ignored.json"),
+            &manifest_json("cwd-only-ignored"),
+        );
+        let _cwd_guard = CwdGuard::new(cwd_tmp.path());
+
+        // Mirrors what `lab_run`/`lab_workloads`/`lab_inspect` actually pass:
+        // the `ResolveScope::ForceUser`-resolved root — home-tier,
+        // unconditionally — which here differs from what `Auto` would
+        // resolve from cwd (the project-local `.darkmux` just planted).
+        let forced_user_root = home_tmp.path().join(".darkmux");
+        let err = load("cwd-only-ignored", Some(&forced_user_root)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(
+            msg.contains("cwd-only-ignored.json"),
+            "expected the ignored project-local document's path named in the error: {msg}"
+        );
+    }
+
+    /// The counterpart: when `user_dir` (the `ForceUser` root) already IS
+    /// what `Auto` resolves to — no project-local `.darkmux` exists in cwd
+    /// at all — nothing should be claimed as "ignored".
+    ///
+    /// (MUST FIX, third-round frontier review — corrected claim) This test
+    /// used to claim it also "guards against a note that fires whenever
+    /// ANY document exists at that id, whether or not it's actually the
+    /// document that's being bypassed" — it doesn't, and can't: nothing is
+    /// planted anywhere in this test, so there's no document for a
+    /// false-positive note to accidentally pick up in the first place.
+    /// What this test actually pins is narrower and still real: the "no
+    /// project `.darkmux` exists" shape produces no note. The broader
+    /// "genuinely bypassed, not merely apparently" guarantee is structural
+    /// (see `ignored_project_local_note`'s own doc) — it follows from
+    /// `load`'s fallback lookup being the byte-identical call `load`
+    /// already tried and failed, not from anything a black-box test on an
+    /// empty directory can additionally demonstrate.
+    #[test]
+    #[serial_test::serial]
+    fn not_found_stays_bare_when_nothing_is_actually_ignored() {
+        let home_tmp = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
+        let _templates_guard =
+            EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", home_tmp.path().join("nope"));
+        // Same ambient-DARKMUX_HOME hazard as the sibling test above — clear
+        // it so this test exercises the intended state regardless of the
+        // shell it runs in.
+        let _darkmux_home_guard = EnvVarGuard::set("DARKMUX_HOME", "");
+
+        // No project-local `.darkmux` anywhere in cwd — Auto falls back to
+        // the same home root ForceUser already resolved and searched.
+        let cwd_tmp = TempDir::new().unwrap();
+        let _cwd_guard = CwdGuard::new(cwd_tmp.path());
+
+        let forced_user_root = home_tmp.path().join(".darkmux");
+        let err = load("nothing-anywhere", Some(&forced_user_root)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(
+            !msg.contains("is ignored"),
+            "nothing was actually bypassed here — the note should not fire: {msg}"
+        );
+    }
+
+    /// (review round 2 finding 3) `display_under_cwd` must re-spell a path
+    /// using `$PWD`'s logical form when it names the same real directory —
+    /// the note's path must match what the operator's own `pwd`/`ls`
+    /// already showed them, not `std::env::current_dir()`'s
+    /// symlink-resolved form (macOS: `/tmp` → `/private/tmp`, or any path
+    /// under `/var/folders/...` → `/private/var/folders/...`). Builds an
+    /// explicit symlink so the divergence is guaranteed regardless of
+    /// where the test tempdir itself happens to live. Red-proved: deleting
+    /// the `$PWD`-based branch in `display_under_cwd` (falling straight to
+    /// `p.display()`) makes this fail — `shown` would come back resolved,
+    /// same as `target`, and the `assert_ne!` sanity check below would
+    /// have nothing to distinguish.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn display_under_cwd_prefers_the_logical_pwd_spelling_over_the_resolved_one() {
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        let symlinked = tmp.path().join("symlinked");
+        std::os::unix::fs::symlink(&real_dir, &symlinked).unwrap();
+
+        // (MUST FIX, third-round frontier review) This test used to
+        // restore cwd and `PWD` manually, ordered before the assertions so
+        // a failed ASSERTION was safe — but the restore calls themselves
+        // (`.unwrap()` on `set_current_dir`, on a real filesystem) are
+        // panic sites, and a panic there would skip the second restore and
+        // leave the process cwd or `PWD` clobbered for every test that
+        // runs after it in the same `cargo test` binary. `CwdGuard` and
+        // `EnvVarGuard` exist in this exact module specifically to make
+        // that failure mode unreachable: their `Drop` impls run during
+        // unwinding too, so restoration happens regardless of what panics
+        // in between. Using them here is the RAII form every other cwd/env
+        // mutating test in this module already follows.
+        let _cwd_guard = CwdGuard::new(&symlinked);
+        let _pwd_guard = EnvVarGuard::set("PWD", &symlinked);
+
+        let target = env::current_dir().unwrap().join("some-file.json");
+        let shown = display_under_cwd(&target);
+
+        // Sanity: prove the symlink actually causes divergence here, or
+        // this test isn't exercising the case under test at all.
+        assert_ne!(
+            target.display().to_string(),
+            symlinked.join("some-file.json").display().to_string(),
+            "the symlink must make the resolved and logical spellings differ"
+        );
+        assert_eq!(
+            shown,
+            symlinked.join("some-file.json").display().to_string(),
+            "must re-spell using $PWD's logical form, matching what the \
+             operator's shell already showed them"
+        );
     }
 
     /// The escape-hatch verification, by EXECUTION not by reading. This is

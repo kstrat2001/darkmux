@@ -106,8 +106,22 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("manifest missing 'provider' field"))?;
 
-    let paths = paths::resolve(ResolveScope::Auto);
-    let loaded = load(workload_id, Some(&paths.root))?;
+    // (#2590) This is the THIRD workload-document lookup site, missed by the
+    // original fix, which covered only `lab::run::lab_run` and
+    // `lab::run::lab_workloads`. `resolve_run_dir` above deliberately stays
+    // `Auto`/project-sensitive (it reads `config_access::lab_dir()`, the same
+    // cwd-sensitive root `lab run` wrote the run's artifacts under — that
+    // part is correct and untouched). The workload DOCUMENT lookup below is
+    // a separate concern: before this fix it also used `Auto`'s root, so a
+    // `./.darkmux/workloads/<id>.json` sitting in the shell's cwd could
+    // shadow the embedded/home-tier document of the same id when inspecting
+    // a run, and a run naming a home-tier-only workload could fail "not
+    // found" here even though `lab run`/`lab workload list` resolve it fine
+    // — the same split-tier inconsistency `lab_run`/`lab_workloads` closed,
+    // one call site over. Force the workload user tier home, matching those
+    // two.
+    let user_workloads_root = paths::resolve(ResolveScope::ForceUser).root;
+    let loaded = load(workload_id, Some(&user_workloads_root))?;
 
     let report = with_provider(provider_id, |p| p.inspect(&loaded, &run_dir))??;
     Ok(report)
@@ -130,6 +144,120 @@ fn resolve_run_dir(path: &str) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// RAII guard that changes the process cwd for the test's duration and
+    /// restores it on drop — mirrors `workloads::load`'s and `lab::run`'s
+    /// test-only `CwdGuard` (#2432/#2553/#2590). Every caller MUST be
+    /// `#[serial_test::serial]` — cwd is a process-global resource.
+    struct CwdGuard {
+        prev: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(dir: &Path) -> Self {
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    /// RAII guard that scopes the REAL `HOME` env var (which
+    /// `dirs::home_dir()` reads) and force-clears `DARKMUX_HOME` for the
+    /// duration, restoring both on drop. Mirrors `lab::run::tests::RealHomeGuard`
+    /// — `DARKMUX_HOME` short-circuits `paths::resolve` before the
+    /// `Auto`/`ForceUser` distinction under test is ever evaluated, so a
+    /// test exercising that distinction must move `HOME` instead and clear
+    /// any ambient `DARKMUX_HOME` in the shell running `cargo test`.
+    struct RealHomeGuard {
+        prev_home: Option<std::ffi::OsString>,
+        prev_darkmux_home: Option<std::ffi::OsString>,
+    }
+
+    impl RealHomeGuard {
+        fn set(dir: &Path) -> Self {
+            let prev_home = std::env::var_os("HOME");
+            let prev_darkmux_home = std::env::var_os("DARKMUX_HOME");
+            unsafe {
+                std::env::set_var("HOME", dir);
+                std::env::remove_var("DARKMUX_HOME");
+            }
+            Self {
+                prev_home,
+                prev_darkmux_home,
+            }
+        }
+    }
+
+    impl Drop for RealHomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.prev_darkmux_home {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
+            }
+        }
+    }
+
+    /// (#2590) The third document-lookup site, missed by the original fix:
+    /// `lab_inspect` must not resolve a workload id that exists ONLY in a
+    /// cwd-local `.darkmux/workloads/`, matching `lab_run`/`lab_workloads`'s
+    /// `ForceUser` fix. Red-proved: reverting `lab_inspect`'s
+    /// `ResolveScope::ForceUser` (the workload-user-dir resolution, not
+    /// `resolve_run_dir`'s cwd-sensitive run-artifact lookup, which is
+    /// untouched and correct) back to `Auto` makes this resolve the cwd
+    /// document and proceed to `with_provider` instead of erroring
+    /// "not found".
+    #[serial_test::serial]
+    #[test]
+    fn lab_inspect_ignores_a_cwd_local_darkmux_dir_for_workload_lookup() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".darkmux").join("workloads")).unwrap();
+        std::fs::write(
+            project
+                .path()
+                .join(".darkmux")
+                .join("workloads")
+                .join("cwd-only-ghost.json"),
+            r#"{"workload":{"id":"cwd-only-ghost","provider":"prompt","prompt":"hi"}}"#,
+        )
+        .unwrap();
+
+        // A real run dir naming that cwd-only-only id in its manifest, so
+        // `lab_inspect` gets past the manifest-exists check and reaches the
+        // workload-document lookup under test.
+        let run_dir = TempDir::new().unwrap();
+        std::fs::write(
+            run_dir.path().join("manifest.json"),
+            r#"{"workload":"cwd-only-ghost","provider":"prompt"}"#,
+        )
+        .unwrap();
+
+        // An empty, isolated home — nothing here defines `cwd-only-ghost`
+        // either, so the ONLY way it could resolve is via the cwd.
+        let home = TempDir::new().unwrap();
+        let _home_guard = RealHomeGuard::set(home.path());
+        let _cwd_guard = CwdGuard::new(project.path());
+
+        let err = lab_inspect(run_dir.path().to_str().unwrap()).unwrap_err();
+
+        assert!(
+            err.to_string().contains("not found"),
+            "lab_inspect must not resolve a cwd-only workload id when \
+             inspecting a run — the user tier is forced home (#2590); \
+             got: {err}"
+        );
+    }
 
     #[test]
     fn resolve_run_dir_absolute() {
