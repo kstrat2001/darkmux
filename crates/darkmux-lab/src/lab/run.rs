@@ -487,19 +487,40 @@ pub(crate) fn resolve_source_sandbox(
             .with_context(|| format!("loading {}", reg_path.display()))?;
         match registry.find_satisfying(requires) {
             Some((_name, fixture)) => Ok(fixture.path.clone()),
+            // (#2590 follow-up) The fixture REGISTRY still resolves through
+            // `paths` — project-local via `ResolveScope::Auto` — while the
+            // workload DOCUMENT above is now home-only via `ForceUser`. That
+            // split is newly reachable in a state it never could be before
+            // this fix: a home-tier workload that `requires_fixture` can now
+            // resolve and dispatch from a plain directory (no `.darkmux`
+            // anywhere in cwd) yet fail this exact lookup from a directory
+            // that happens to hold its OWN project-local `.darkmux` — even
+            // when the fixture is registered globally at
+            // `~/.darkmux/lab-registry.json`. Before this fix that state was
+            // unreachable: the workload document itself failed to resolve
+            // from such a directory, so the operator got a clean "workload
+            // not found" instead of a fixture error that looks wrong for a
+            // fixture that IS registered. Naming the consulted path here is
+            // the minimum fix — it makes the split visible instead of
+            // silent; forcing the registry itself to the home root too is a
+            // real blast-radius change and belongs in its own issue.
             None => Err(anyhow!(
                 "workload `{}` requires a fixture satisfying `{}` but no registered \
-                 fixture matches.\n\
+                 fixture matches in the registry at {} (this registry is looked up \
+                 project-locally when the current directory has its own `.darkmux/`, \
+                 which can differ from the home-tier registry that `darkmux lab \
+                 fixture list` shows from elsewhere).\n\
                  \n\
                  Fix:\n\
                    1. Register an existing fixture that satisfies this requirement:\n\
                       darkmux lab fixture register /path/to/your/fixture\n\
-                   2. Or inspect what's registered:\n\
+                   2. Or inspect what's registered in THIS directory's registry:\n\
                       darkmux lab fixture list\n\
                    3. Or update the fixture's `.fixture.json` to set:\n\
                       \"satisfies\": \"{}\"",
                 loaded.manifest.workload.id,
                 requires,
+                reg_path.display(),
                 requires,
             )),
         }
@@ -1036,6 +1057,18 @@ mod tests {
         assert!(msg.contains("never-registered@1.0"), "got: {msg}");
         assert!(msg.contains("darkmux lab fixture register"), "got: {msg}");
         assert!(msg.contains("darkmux lab fixture list"), "got: {msg}");
+        // (#2590 follow-up) The registry still resolves through `paths`
+        // (project-local via `ResolveScope::Auto`) while the workload
+        // DOCUMENT now resolves home-only via `ForceUser` — a split that's
+        // newly reachable and newly confusing (a fixture registered at the
+        // home root looks "missing" from a directory with its own
+        // `.darkmux/`). Naming the exact registry path consulted is the
+        // minimum fix that makes the split visible instead of silent.
+        assert!(
+            msg.contains(&paths.root.join("lab-registry.json").display().to_string()),
+            "error must name the registry path actually consulted, so the \
+             project/home split is visible instead of silent: got: {msg}"
+        );
     }
 
     /// (#489) Phase 2 — `enrich_manifest_with_fixture_info` adds the

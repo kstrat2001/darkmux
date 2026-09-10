@@ -430,6 +430,13 @@ mod tests {
         assert_eq!(pick_role(&loaded), "analyst");
     }
 
+    // `DARKMUX_DEFAULT_ROLE` is a process-global; this test removes it, so it
+    // needs the same `#[serial_test::serial]` its sibling twin
+    // (`coding_task::tests::pick_role_default_coder`) already carries for the
+    // identical mutation, or a concurrent unannotated test reading the var
+    // could observe it cleared mid-run. Unguarded, pre-existing (found
+    // 2026-09 auditing #2590's fixes for the same class of race).
+    #[serial_test::serial]
     #[test]
     fn pick_role_default_code_reviewer() {
         let tmp = TempDir::new().unwrap();
