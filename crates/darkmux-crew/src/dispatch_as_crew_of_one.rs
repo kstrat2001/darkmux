@@ -57,7 +57,6 @@ use crate::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, Phase
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_gestalt::ModelHost;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -106,63 +105,48 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
         .context("licensed-adjacent role dispatch requires acknowledgment")?;
 
-    // (#2585) `--resume-from` checkpoint validation must ALSO run here, for
-    // the identical reason the ack gate above does. `run_step_graph`'s
-    // `ensure_wave_loaded` (called a few lines down) loads the step's
-    // residency-classified model BEFORE the step's own `run()` — and
-    // therefore before `dispatch_internal::dispatch`'s own #2162 copy of
-    // this exact check — ever executes. Left unreplicated here, a bad
-    // `--resume-from` on the container path paid the FULL residency cost
-    // (evicting other models, loading tens of gigabytes) before the
-    // checkpoint problem ever surfaced, and the error that came back named
-    // a model load rather than the checkpoint that actually caused it —
-    // exactly the misattribution #2585 was filed to fix.
-    //
-    // The validation is pure — it only reads `resume_from` off disk, no
-    // mutation — so calling it here and letting `dispatch_internal::
-    // dispatch`'s own #2162 call run again a moment later, deep inside the
-    // wave-loaded step, is a harmless second no-op read of the same files:
-    // the same pattern the ack gate above already relies on.
-    //
-    // `intended_workspace` mirrors, exactly, what `dispatch_internal::
-    // dispatch`'s own #2162 hoist will separately compute a moment later:
-    // `opts.workdir` canonicalized via the SAME `validate_workdir` (so a
-    // legitimate checkpoint's recorded origin path — itself canonicalized —
-    // compares equal here rather than a raw-vs-resolved mismatch spuriously
-    // rejecting it), or the deterministic no-`--workdir` auto-tempdir name.
-    // `--resume-from` is usable only alongside `--workdir` in practice (see
-    // `dispatch_internal::auto_workspace_path`'s own doc: the no-`--workdir`
-    // case always fails the workspace check downstream regardless of what's
-    // computed here), so exact agreement only matters for the `--workdir`
-    // case — achieved here by calling the identical function.
-    //
-    // Named, not fixed (#2585's own "watch for" scope note): reusing
-    // `validate_workdir` here means a `--resume-from` dispatch with an
-    // INVALID `--workdir` (missing dir, symlink escape) now also refuses
-    // before the wave — but an ORDINARY (non-resume) dispatch's own
-    // `--workdir` validation stays exactly where it was, inside
-    // `dispatch_internal::dispatch`, still stranded behind the wave. That
-    // is a real, separate instance of this same bug class; out of scope
-    // here because #2585 asks only for the checkpoint gate.
-    if let Some(resume_from) = opts.resume_from.as_ref() {
-        let intended_workspace: PathBuf = match opts.workdir.as_deref() {
-            Some(custom) => darkmux_types::workdir::validate_workdir(custom)
-                .context("darkmux dispatch --resume-from")?,
-            None => {
-                let unix_micros = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_micros())
-                    .unwrap_or(0);
-                crate::dispatch_internal::auto_workspace_path(&opts.role_id, unix_micros)
-            }
-        };
-        crate::dispatch_internal::validate_resume_checkpoint(
-            resume_from,
-            &opts.role_id,
-            &intended_workspace,
-            opts.workspace_read_only,
-        )
-        .context("darkmux dispatch --resume-from")?;
+    // (#2585 / #2614 review) `--resume-from` checkpoint validation used to
+    // ALSO be hoisted here, mirroring the ack gate immediately above — but
+    // unlike that gate (which prompts, and so must keep a copy on this
+    // interactive CLI path no matter what), the checkpoint gate is purely
+    // deterministic. #2614's review found #2585's hoist covered only THIS
+    // entry point: a mission config or the panel staffing a
+    // `dispatch.internal` step with `resume_from` in its config went
+    // through neither this function nor its hoist, so it still paid the
+    // full residency cost before its own in-body checkpoint check ever
+    // fired. The fix generalized the gate to `StepKind::resume_precheck`,
+    // consulted by `scheduler::run_step_graph` for every ready step of
+    // every graph — the CLI's own one-step graph included — strictly
+    // before `plan_waves`/`ensure_wave_loaded` can make anything resident.
+    // That covers this call's own `run_step_graph` invocation below, so
+    // duplicating the check here would be pure drift risk (two call sites
+    // that could disagree) for a check that gains nothing by running
+    // twice. See `StepKind::resume_precheck`'s own doc for the full
+    // reasoning, including why it deliberately never validates the
+    // working directory itself.
+
+    // (#2614 review, "Also fix" — the stranded sibling) An ORDINARY
+    // (non-resume) dispatch's own `--workdir` validation lives inside
+    // `dispatch_internal::dispatch`, which `run_step_graph`'s
+    // `ensure_wave_loaded` (below) only reaches AFTER already loading the
+    // wave's model — so a mistyped `--workdir` on this CLI path pays the
+    // full residency cost (a real reconcile: evict + load, tens of
+    // gigabytes) for what is, here, a pure typo. Unlike the resume-
+    // checkpoint gate above, this hoist stays HERE rather than moving into
+    // the scheduler: on THIS wrapper's path `opts.workdir` is always the
+    // operator's own `--workdir` flag at invocation time — `build_graph`
+    // below stamps it straight onto the Task with no further resolution —
+    // so it is always meant to exist RIGHT NOW, never a path a
+    // still-earlier step in a mission graph is about to materialize (the
+    // case that makes a scheduler-side existence check unsafe in general;
+    // see `StepKind::resume_precheck`'s own doc). Every production path
+    // this wrapper does NOT cover (`mission launch <config>`, the panel)
+    // is exactly that "an earlier step creates the directory" case, and
+    // stays untouched by this hoist. `dispatch_internal::dispatch`'s own
+    // later call re-validates the same path — a harmless second read, not
+    // a second authority, same pattern the resume gate already relies on.
+    if let Some(workdir) = opts.workdir.as_deref() {
+        darkmux_types::workdir::validate_workdir(workdir)?;
     }
 
     let session_id = opts
@@ -707,7 +691,7 @@ mod tests {
         fn run(
             &self,
             step: &crate::types::Step,
-            _task: &crate::types::Task,
+            task: &crate::types::Task,
             _input: &BTreeMap<String, String>,
         ) -> Result<StepOutcome> {
             let session_id =
@@ -715,6 +699,39 @@ mod tests {
             let message =
                 step.config.get("message").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             self.calls.lock().unwrap().push((message, session_id.clone()));
+            // (#2614 review, "the red-prove does not reach the ordering
+            // assertions") A SECOND, redundant `resume_from` check here —
+            // mirroring the real `DispatchInternalStepKind::run`, which
+            // calls `dispatch()`, which carries its OWN #2162 copy of the
+            // checkpoint gate independent of the scheduler's earlier one.
+            // Without this, mutating away (or breaking the wiring of)
+            // `resume_precheck` above makes this fake step simply SUCCEED
+            // — `dispatch_as_crew_of_one_with` would return `Ok`, so the
+            // ordering test's `.expect_err(...)` panics immediately and
+            // the ordering assertions below it (`ops.is_empty()`,
+            // `calls.is_empty()`) never execute at all. That red run
+            // proves only "refusal happens somewhere", not "refusal
+            // happens BEFORE the wave loads" — the actual claim #2585/
+            // #2614 make. With this second check in place, breaking the
+            // early gate still refuses (via THIS check instead) but only
+            // after `ensure_wave_loaded` has already run — so the ordering
+            // assertions execute and go red on `ops`, which is what a
+            // mutation-proof of ORDER, not just refusal, requires.
+            if let Some(resume_from) =
+                step.config.get("resume_from").and_then(|v| v.as_str()).map(std::path::PathBuf::from)
+            {
+                let role_id = task.role_id.clone().or_else(|| {
+                    step.config.get("role_id").and_then(|v| v.as_str()).map(String::from)
+                });
+                let role_id = role_id.ok_or_else(|| {
+                    anyhow!(
+                        "step `{}`: `dispatch.internal` requires task.role_id or config.role_id",
+                        step.id
+                    )
+                })?;
+                crate::dispatch_internal::validate_resume_checkpoint_content(&resume_from, &role_id)
+                    .context("darkmux dispatch --resume-from")?;
+            }
             if self.should_err {
                 bail!("fake dispatch() failure — preflight/model resolution");
             }
@@ -740,6 +757,39 @@ mod tests {
             _ctx: &crate::step_kinds::StepRunCtx,
         ) -> crate::step_kinds::SeatClaim {
             crate::step_kinds::SeatClaim::LocalModel(self.placement.clone())
+        }
+
+        /// (#2614 review) Stands in for the real `DispatchInternalStepKind::
+        /// resume_precheck` the SAME way `dispatch_role` above stands in for
+        /// its real `dispatch_role` — reads `resume_from`/`role_id` off the
+        /// step config exactly as the real kind's `dispatch_opts_for`/
+        /// `task_or_config_str` do, then calls the SAME workdir-independent
+        /// `validate_resume_checkpoint_content` the production kind calls.
+        /// Without this override the scheduler's new resume-precheck filter
+        /// would silently no-op on this fake (the trait default), which
+        /// would prove nothing about ORDER — the whole point of the two
+        /// `#2585`/`#2614` tests below.
+        fn resume_precheck(
+            &self,
+            step: &crate::types::Step,
+            task: &crate::types::Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &crate::step_kinds::StepRunCtx,
+        ) -> Result<()> {
+            let Some(resume_from) =
+                step.config.get("resume_from").and_then(|v| v.as_str()).map(std::path::PathBuf::from)
+            else {
+                return Ok(());
+            };
+            let role_id = task.role_id.clone().or_else(|| {
+                step.config.get("role_id").and_then(|v| v.as_str()).map(String::from)
+            });
+            let role_id = role_id.ok_or_else(|| {
+                anyhow!("step `{}`: `dispatch.internal` requires task.role_id or config.role_id", step.id)
+            })?;
+            crate::dispatch_internal::validate_resume_checkpoint_content(&resume_from, &role_id)
+                .context("darkmux dispatch --resume-from")?;
+            Ok(())
         }
     }
 
@@ -1246,11 +1296,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn dispatch_as_crew_of_one_refuses_a_bad_resume_from_before_the_wave_loads_anything() {
-        // (#2585) The mechanism this test proves: on the container path, a
-        // bad `--resume-from` must be refused BEFORE `run_step_graph`'s
-        // `ensure_wave_loaded` ever attempts to load this dispatch's model
-        // — not merely refused eventually. No `checkpoint.json` is written
-        // under `resume_from`, matching #2585's own illustrative repro.
+        // (#2585 / #2614) The mechanism this test proves: on the CLI's
+        // crew-of-one path, a bad `--resume-from` must be refused BEFORE
+        // `run_step_graph`'s `ensure_wave_loaded` ever attempts to load
+        // this dispatch's model — not merely refused eventually. Since
+        // #2614's review, the refusal fires from
+        // `scheduler::run_step_graph`'s new `resume_precheck` filter (see
+        // `StepKind::resume_precheck`'s own doc) rather than a pre-mint
+        // hoist in this function — `FakeDispatchKind::resume_precheck`
+        // stands in for the real `DispatchInternalStepKind`'s copy the
+        // same way its `dispatch_role`/`seat` already stand in for theirs.
+        // No `checkpoint.json` is written under `resume_from`, matching
+        // #2585's own illustrative repro.
         let _guard = RunGuard::new();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let kind = FakeDispatchKind {
@@ -1295,23 +1352,60 @@ mod tests {
 
         // ORDERING, not just refusal: the wave never touched the host at
         // all (zero ops of any kind — `ensure_wave_loaded` was never
-        // entered), and the fake `dispatch.internal` step (standing in for
-        // `dispatch_internal::dispatch`, which carries its OWN #2162 copy
-        // of this same check) never ran either — the refusal fired before
-        // `run_step_graph` was ever called.
+        // entered), and the fake `dispatch.internal` step's own `run()`
+        // (standing in for `dispatch_internal::dispatch`, which carries its
+        // OWN #2162 copy of the workspace-dependent half of this same
+        // check) never ran either — the refusal fired inside
+        // `scheduler::run_step_graph`'s pre-wave filter loop, strictly
+        // before `plan_waves`/`ensure_wave_loaded` and strictly before the
+        // step's own body.
         let ops = host.lock().unwrap().ops.clone();
         assert!(ops.is_empty(), "no residency action of any kind before the refusal: {ops:?}");
         assert!(calls.lock().unwrap().is_empty(), "the step's own run() must never be reached");
 
-        // No records emitted either: the mission/phase/task/step quadruple
-        // is minted AFTER this gate, so a refused resume leaves the run
-        // directory untouched — the same "nothing spent" standard the
-        // #2609/#2580 sibling fixes proved (a records directory that must
-        // stay empty, a listener that must receive zero connections).
+        // (#2614 review, "make it a decision" finding) RECORDS VISIBILITY,
+        // decided explicitly: #2585's original pre-mint hoist ran BEFORE
+        // `lifecycle::save_mission`, so a refused resume left NOTHING
+        // minted — invisible on the mission board and in the viewer.
+        // Moving the gate into the scheduler (this PR) trades that away on
+        // purpose: minting happens before `run_step_graph` is ever called,
+        // so by the time this scheduler-level filter refuses the step, the
+        // mission/phase/task/step quadruple already exists on disk. The
+        // refusal is therefore VISIBLE — a real mission, Abandoned, naming
+        // the checkpoint failure — the same shape a mission config's own
+        // dispatch.internal step gets when the licensed-adjacent consent
+        // gate (already scheduler-hosted) refuses it. Consistency with
+        // that established, already-shipped behavior is the reason this
+        // is the right tradeoff, not an unexamined side effect of where
+        // the check happens to run.
         let missions_dir = crate::loader::missions_dir();
-        let entries: Vec<_> =
-            std::fs::read_dir(&missions_dir).map(|rd| rd.collect::<Vec<_>>()).unwrap_or_default();
-        assert!(entries.is_empty(), "no mission/phase/task/step must be minted for a refused resume");
+        let entries: Vec<_> = std::fs::read_dir(&missions_dir)
+            .map(|rd| rd.collect::<Result<Vec<_>, _>>().unwrap())
+            .unwrap_or_default();
+        assert_eq!(entries.len(), 1, "the refused resume's mission IS minted (visible), unlike #2585's original hoist");
+        let mission_id = entries[0].file_name().to_string_lossy().to_string();
+        let mission = crate::lifecycle::load_mission_by_id(&mission_id)
+            .expect("the minted mission.json must still be readable");
+        // `finalize` (this module) always drives the MISSION-level terminal
+        // to `Finalized` regardless of outcome (see
+        // `envelope::finalize_mission_with_payload` — the finer clean-vs-
+        // failed signal lives in the PHASE status and the envelope's own
+        // `PhaseOutcome`, not in `mission.json`'s top-level `status`).
+        // `Active` is the one status that would mean this run never
+        // reached ANY terminal — the real "still spending/lingering"
+        // failure mode this assertion guards against.
+        assert_eq!(
+            mission.status,
+            MissionStatus::Finalized,
+            "a resume refused by the scheduler's precheck must reach a terminal status, not linger Active"
+        );
+        let phase = crate::lifecycle::load_phase_by_id(&mission.phase_ids[0])
+            .expect("the minted phase.json must still be readable");
+        assert_eq!(
+            phase.status,
+            PhaseStatus::Abandoned,
+            "the refused step's phase must read as Abandoned (failed), not Complete"
+        );
     }
 
     #[test]
@@ -1361,5 +1455,67 @@ mod tests {
             .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::Load { .. }))
             .collect();
         assert_eq!(loads.len(), 1, "the legitimate resume still loads the model exactly once: {ops:?}");
+    }
+
+    /// (#2614 review, "Also fix" — the stranded sibling) An ORDINARY
+    /// (non-resume) dispatch with a mistyped `--workdir` must refuse
+    /// BEFORE `run_step_graph`'s `ensure_wave_loaded` ever attempts to
+    /// load a model — not merely refuse eventually, deep inside
+    /// `dispatch_internal::dispatch`, after paying the full residency
+    /// cost for what is, on this path, a pure typo. No `--resume-from`
+    /// here at all: this is the sibling bug the checkpoint-gate hoist
+    /// above does not close on its own.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_as_crew_of_one_refuses_a_bad_workdir_before_the_wave_loads_anything() {
+        let _guard = RunGuard::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let kind = FakeDispatchKind {
+            exit_code: 0,
+            stdout: r#"{"result":"stop"}"#.to_string(),
+            stderr: String::new(),
+            should_err: false,
+            placement: placement(),
+            calls: calls.clone(),
+        };
+        let registry = test_registry(kind);
+        let host = Arc::new(Mutex::new(MockHost::new().cataloged("test-model", 5_000_000_000)));
+        let host_for_factory = host.clone();
+        let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(SharedMockHost(host_for_factory.clone()))
+        };
+
+        // A path that does not exist at all — `validate_workdir` bails on
+        // `canonicalize()` before ever reaching the `is_dir` check.
+        let missing = TempDir::new().unwrap();
+        let workdir_path = missing.path().join("does-not-exist");
+
+        let mut opts = test_opts("coder", "probe");
+        opts.workdir = Some(workdir_path);
+
+        let err = dispatch_as_crew_of_one_with(opts, &registry, &host_factory)
+            .expect_err("a --workdir that does not exist must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("workdir path does not exist or cannot be resolved"),
+            "must name the real `validate_workdir` failure: {msg}"
+        );
+
+        // ORDERING: the wave never touched the host (zero ops — `ensure_
+        // wave_loaded` was never entered), and the fake step's own run()
+        // was never reached either — the refusal fired before minting and
+        // before `run_step_graph` was ever called.
+        let ops = host.lock().unwrap().ops.clone();
+        assert!(ops.is_empty(), "no residency action of any kind before the refusal: {ops:?}");
+        assert!(calls.lock().unwrap().is_empty(), "the step's own run() must never be reached");
+
+        // Unlike the resume-checkpoint gate (moved into the scheduler,
+        // hence visible-but-Abandoned per the finding above), THIS hoist
+        // stays wrapper-local and pre-mint — a bad `--workdir` here mints
+        // nothing at all, the same shape #2585's original hoist had.
+        let missions_dir = crate::loader::missions_dir();
+        let entries: Vec<_> =
+            std::fs::read_dir(&missions_dir).map(|rd| rd.collect::<Vec<_>>()).unwrap_or_default();
+        assert!(entries.is_empty(), "a pre-mint hoist refusal must mint nothing");
     }
 }

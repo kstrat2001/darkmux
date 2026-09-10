@@ -580,13 +580,15 @@ pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 /// which is the exact case. Revisit if the auto-tempdir path ever gains a
 /// way to name a prior run's workspace.
 ///
-/// `pub(crate)` (not private) since #2585: `dispatch_as_crew_of_one`'s own
-/// hoisted checkpoint gate (the container-path fix for that issue) calls
-/// this directly to compute the SAME intended-workspace name a moment
-/// before `dispatch()`'s own copy above does — one function decides the
-/// name for both callers, so they can't drift apart the way two
-/// independent derivations could.
-pub(crate) fn auto_workspace_path(role_id: &str, unix_micros: u128) -> PathBuf {
+/// (#2585 review history) Was briefly widened to `pub(crate)` so
+/// `dispatch_as_crew_of_one`'s own pre-mint checkpoint hoist could call
+/// this directly and derive the identical intended-workspace name. #2614's
+/// review moved that gate into `StepKind::resume_precheck` (consulted by
+/// `scheduler::run_step_graph`, which never needs this workdir-dependent
+/// name — see that method's own doc on why the workdir check stays out of
+/// the scheduler entirely) and deleted the CLI wrapper's hoist, so this is
+/// private again: `dispatch()` above is its only caller.
+fn auto_workspace_path(role_id: &str, unix_micros: u128) -> PathBuf {
     std::env::temp_dir().join(format!("darkmux-dispatch-{role_id}-{unix_micros}"))
 }
 
@@ -689,11 +691,28 @@ pub(crate) fn auto_workspace_path(role_id: &str, unix_micros: u128) -> PathBuf {
 /// one, and unreachable because a no-`--workdir` resume cannot match its
 /// origin's workspace regardless. `auto_workspace_path`'s own doc spells
 /// out both cases; read it before changing what is passed here.
-pub(crate) fn validate_resume_checkpoint(
+/// (#2614 review) The WORKDIR-INDEPENDENT half of
+/// [`validate_resume_checkpoint`] — existence, JSON shape, schema version,
+/// and role match. Everything this function checks is knowable from
+/// `resume_from` and `expected_role_id` ALONE, with no dependency on the
+/// dispatch's resolved workspace — which is exactly what makes it safe to
+/// call from `StepKind::resume_precheck`, ahead of `plan_waves`/
+/// `ensure_wave_loaded`, for EVERY caller of `run_step_graph` (see that
+/// method's own doc for why a workdir-DEPENDENT check must never be hoisted
+/// there). `validate_resume_checkpoint` below calls this first, then adds
+/// the workspace/mount-mode checks that DO need the resolved workspace —
+/// splitting the function changes nothing about what a full
+/// `dispatch_internal::dispatch` call validates or in what order; it only
+/// gives the workdir-independent half a name a workdir-independent caller
+/// can reach on its own.
+///
+/// Returns the checkpoint's raw (already read, already schema-checked)
+/// file contents, same as `validate_resume_checkpoint` — a caller that
+/// only needs THIS half and never proceeds to stage the checkpoint (the
+/// scheduler precheck) can simply discard it.
+pub(crate) fn validate_resume_checkpoint_content(
     resume_from: &Path,
     expected_role_id: &str,
-    expected_workspace: &Path,
-    expected_workspace_read_only: bool,
 ) -> Result<String> {
     let src = resume_from.join(CHECKPOINT_FILENAME);
     if !src.is_file() {
@@ -777,6 +796,17 @@ pub(crate) fn validate_resume_checkpoint(
             checkpoint_role_id.unwrap_or("<missing>")
         );
     }
+    Ok(contents)
+}
+
+pub(crate) fn validate_resume_checkpoint(
+    resume_from: &Path,
+    expected_role_id: &str,
+    expected_workspace: &Path,
+    expected_workspace_read_only: bool,
+) -> Result<String> {
+    let contents = validate_resume_checkpoint_content(resume_from, expected_role_id)?;
+    let src = resume_from.join(CHECKPOINT_FILENAME);
     // (Security audit, #2114 resume follow-up) Workspace mount-mode + path
     // gate — see this fn's own doc for the escalation this closes.
     let origin_path = resume_from.join(RESUME_ORIGIN_FILENAME);
@@ -4157,6 +4187,56 @@ impl Drop for ContainerKillGuard {
             docker_kill_by_name(&self.container_name);
         }
     }
+}
+
+/// (#2614 review, "Also fix" — wrong problem surfaced) A `--resume-from`
+/// aimed at a role that resolves to the bare hosted single-shot path (a
+/// remote profile + a tool-less role, per `container_path_required`) can
+/// NEVER be honored — that path has no container, no workspace, no
+/// checkpoint to resume into (see `dispatch()`'s own copy of this refusal
+/// a few lines down for the full "why not built" reasoning). Before this
+/// existed, `StepKind::resume_precheck`'s scheduler-level gate validated
+/// checkpoint CONTENT first and unconditionally — so an invalid/missing
+/// checkpoint on exactly this role shape surfaced "RESUME CHECKPOINT NOT
+/// FOUND", the operator would go fix the checkpoint, redispatch, and only
+/// THEN hit this refusal. Two rounds of confusion for what is really one,
+/// more fundamental blocker — the same misattribution class #2585 exists
+/// to close, reached from the opposite direction (right problem surfaced
+/// too LATE instead of the wrong problem surfaced too EARLY).
+///
+/// Called from `StepKind::resume_precheck` BEFORE
+/// `validate_resume_checkpoint_content`, so this refusal wins regardless of
+/// whether a checkpoint even exists under `resume_from`. `Ok(())` for every
+/// other case: no `resume_from` set, a local dispatch, or a remote dispatch
+/// that resolves to the agentic-remote CONTAINER path (a tool-granting
+/// role) — all of which either have nothing to check here or go on to the
+/// ordinary checkpoint gate. Role + profile resolution only (`load_roles`,
+/// the profile registry) — no LMStudio call, no residency action, cheap
+/// enough to run ahead of the wave the same way the checkpoint content
+/// check itself is.
+pub(crate) fn refuse_resume_on_bare_hosted_path(opts: &DispatchOpts) -> Result<()> {
+    if opts.resume_from.is_none() {
+        return Ok(());
+    }
+    let Some((role, _system_prompt, _pm)) = try_resolve_remote_target(opts)? else {
+        return Ok(()); // local — the ordinary container/checkpoint path applies
+    };
+    if container_path_required(&role, opts.force_container) {
+        return Ok(()); // agentic-remote container — resume goes through the normal gate
+    }
+    bail!(
+        "darkmux dispatch: --resume-from is not supported on the \
+         remote single-shot dispatch path (role `{}` grants no \
+         tools, so this dispatch resolved to a bare hosted \
+         chat-completions call — no Docker, no container, no \
+         checkpoint). darkmux never silently starts a dispatch \
+         fresh under a name that looked like a resume: resume \
+         needs the container path, which a tool-granting role \
+         (e.g. a coder or reviewer role with a non-empty \
+         tool_palette) resolves to — or drop --resume-from to \
+         start this role fresh on purpose.",
+        opts.role_id
+    );
 }
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
