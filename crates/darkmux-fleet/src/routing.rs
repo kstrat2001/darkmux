@@ -1146,6 +1146,17 @@ mod tests {
     // "nearest brace block". See `guard_search_scope`'s doc for the
     // mechanism and `resume_from_guard_precedes`'s doc for why `body` must
     // arrive pre-scoped either way.
+    // - Round-2's own walk still broke, in the WIDE-only direction: it
+    //   returned at the FIRST block it recognized as a match body, and a
+    //   NESTED match between an arm's guard and its call also has its own
+    //   depth-0 arrows — so the walk stopped at the inner match's arm
+    //   instead of continuing out to the real, outer one, cutting the
+    //   outer guard out of the search (a false ACCUSATION against correct
+    //   code, never a false certification — see `guard_search_scope`'s
+    //   doc for why the direction is structurally one-way). The round-3
+    //   fix keeps walking through every containing block and remembers
+    //   the OUTERMOST one recognized as a match, instead of stopping at
+    //   the first.
     //
     // **Which layer is authoritative, for a maintainer facing one red and
     // one green:** the runtime test
@@ -1207,6 +1218,16 @@ mod tests {
     // - The anchor match inside a qualifying block is still TEXTUAL, not a
     //   real control-flow prover — accepted as vanishingly unlikely given
     //   how specific the anchor phrase is, same as #2580's check accepts.
+    // - (#2609 review round 3 Also-fix 1) A call site sitting BEFORE the
+    //   enclosing match's first arm's own `=>` — a match scrutinee, or a
+    //   pattern guard's condition (`Foo(x) if call_here() => ...`) — falls
+    //   back to `nearest_enclosing_block`'s WHOLE-match scope instead of a
+    //   single arm's, so a sibling arm's guard is visible there too (too
+    //   WIDE, same failure class as a brace-less arm, different trigger).
+    //   Neither of this file's two real call sites is in a scrutinee or a
+    //   pattern guard today — both are ordinary arm bodies — so this is
+    //   correct by accident rather than by construction; see
+    //   `match_arm_span_within`'s doc for the mechanism.
 
     /// If `cs[i]` begins a `//` line comment, `/* */` block comment, raw
     /// string, ordinary string, or char literal, returns the index just
@@ -1689,6 +1710,19 @@ mod tests {
     /// textual-heuristic tolerance `resume_from_guard_precedes`'s own doc
     /// already accepts — because a match arm's PATTERN never itself
     /// contains a `resume_from`-conditioned guard with this exact anchor.
+    ///
+    /// (#2609 review round 3 Also-fix 1, documentation only) When `at`
+    /// sits inside `[block_start, block_end)` but BEFORE this match's
+    /// first arm's own `=>` — the scrutinee, or a pattern guard's
+    /// condition (`Foo(x) if call_here() => ...`) — none of the per-arm
+    /// ranges built from `arrow_ends` cover it (they all start at or after
+    /// the first arrow), so this returns `None` even though `at` genuinely
+    /// is inside a match body. `guard_search_scope`'s walk then keeps going
+    /// outward and can land on `nearest_enclosing_block`'s WHOLE-match
+    /// fallback for that call, which makes a sibling arm's guard visible —
+    /// too WIDE. Not fixed here: neither of this file's two real call
+    /// sites sits in a scrutinee or a pattern guard (both are ordinary arm
+    /// bodies), so this is a named gap, not a live bypass today.
     fn match_arm_span_within(
         body: &str,
         block_start: usize,
@@ -1725,29 +1759,69 @@ mod tests {
     /// `nearest_enclosing_block` when `at` isn't inside any `match` at all
     /// — there is no arm to scope to.
     ///
-    /// (#2609 review round 2 MUST-FIX) Walks every brace block containing
-    /// `at`, SMALLEST first, and returns the first one `match_arm_span_
-    /// within` recognizes as a match body. Starting from the smallest is
-    /// what fixes the too-narrow case: a nested `if`/closure block around
-    /// the call is tried first, is correctly rejected (it has no depth-0
-    /// `=>` of its own), and the walk continues outward to the arm's own
-    /// block, then — since an arm's own `{ ... }` body ALSO has no depth-0
-    /// `=>` of its own — outward again to the `match`'s own enclosing
-    /// block, which does, and which is where `match_arm_span_within`
-    /// computes the correct per-arm boundaries regardless of how deep the
-    /// call sits inside that one arm.
+    /// (#2609 review round 2) Walks every brace block containing `at`,
+    /// SMALLEST first. Starting from the smallest is what fixes the
+    /// too-narrow case: a nested `if`/closure block around the call is
+    /// tried first, is correctly rejected (it has no depth-0 `=>` of its
+    /// own), and the walk continues outward to the arm's own block, then —
+    /// since an arm's own `{ ... }` body ALSO has no depth-0 `=>` of its
+    /// own — outward again to the `match`'s own enclosing block, which
+    /// does, and which is where `match_arm_span_within` computes the
+    /// correct per-arm boundaries regardless of how deep the call sits
+    /// inside that one arm.
+    ///
+    /// (#2609 review round 3 MUST-FIX) That reasoning silently assumed
+    /// every block nested BETWEEN the arm's guard and the call has no
+    /// `=>` of its own — true for an `if` or a closure, false for a
+    /// NESTED `match`, which has depth-0 arrows relative to its own
+    /// content just like the outer one does. The round-2 code returned at
+    /// the FIRST block `match_arm_span_within` recognized, so a call
+    /// wrapped in a nested match (with the real, outer arm's guard left
+    /// untouched, earlier in the SAME outer arm) scoped to the inner
+    /// match's own arm instead — cutting the outer guard out of the
+    /// search and producing a false accusation against provably-correct
+    /// code. Red-proven: wrapping `dispatch_via_queue(opts, Some(&target))`
+    /// in `match true { true => return dispatch_via_queue(...), false =>
+    /// {} }` inside the `local_unknown: false` arm, guard left in place,
+    /// made the structural scan below FAIL while the runtime test
+    /// (`dispatch_routed_via_refuses_resume_from_before_the_queue_is_
+    /// touched`) stayed GREEN — ground truth says the guard fires, the
+    /// scan accused it anyway.
+    ///
+    /// Fixed by not stopping at the first match: the walk now keeps going
+    /// through every containing block, smallest to largest, and remembers
+    /// the LAST (i.e. largest / outermost) span `match_arm_span_within`
+    /// recognizes, falling back to `nearest_enclosing_block` only when
+    /// NONE of them are. A nested match's own block is still recognized
+    /// and still yields a span — that span is just no longer trusted as
+    /// final the moment a bigger ancestor match also claims the offset.
+    ///
+    /// **Direction, stated so it doesn't have to be re-derived:** this
+    /// class can only make the chosen scope WIDER (an outer arm's span
+    /// always contains every block nested inside it), never narrower —
+    /// `match_arm_span_within`'s per-arm boundaries are always a subset of
+    /// whichever block produced them. So the round-2 bug could only ever
+    /// produce a false ACCUSATION (a real guard the scan fails to see),
+    /// never a false CERTIFICATION (a missing guard the scan fails to
+    /// flag) — the security property this whole conformance check exists
+    /// for held throughout. What it broke was a maintainer's honest
+    /// refactor (wrapping a guarded call in a nested match for unrelated
+    /// reasons) failing a test that then pointed at the wrong cause, plus
+    /// this very doc comment asserting the false-accusation case couldn't
+    /// happen when it plainly could.
     fn guard_search_scope(body: &str, at: usize) -> (usize, usize) {
         let mut containing: Vec<(usize, usize)> = all_brace_block_spans(body)
             .into_iter()
             .filter(|(start, end)| *start <= at && at < *end)
             .collect();
         containing.sort_by_key(|(start, end)| end - start);
+        let mut outermost_arm: Option<(usize, usize)> = None;
         for (start, end) in containing {
             if let Some(span) = match_arm_span_within(body, start, end, at) {
-                return span;
+                outermost_arm = Some(span);
             }
         }
-        nearest_enclosing_block(body, at)
+        outermost_arm.unwrap_or_else(|| nearest_enclosing_block(body, at))
     }
 
     /// Collapse Rust string-literal line continuations (a `\` immediately

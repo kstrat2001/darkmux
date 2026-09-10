@@ -98,11 +98,19 @@ fn spawn_connection_counting_peer() -> (u16, std::sync::mpsc::Receiver<()>) {
 /// (before the caller mutates anything), then restores them all when
 /// dropped — including during unwind, since `Drop::drop` runs on the
 /// unwind path by default (this crate doesn't set `panic = "abort"`).
-struct EnvRestore(Vec<(&'static str, Option<String>)>);
+///
+/// (#2609 review round 3 Also-fix 2) Captures via `var_os`/`OsString`,
+/// not `var(..).ok()`/`String` — the earlier form (pre-existing, carried
+/// forward unchanged by the round-2 fix above) collapsed a
+/// non-UTF8-representable original value to `None`, i.e. to "was unset",
+/// so drop would REMOVE such a var instead of restoring its real original
+/// value. `OsString` round-trips the raw bytes regardless of encoding, so
+/// "unset" and "set to something `var()` can't decode" stay distinct.
+struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
 impl EnvRestore {
     fn capture(vars: &[&'static str]) -> Self {
-        Self(vars.iter().map(|&k| (k, std::env::var(k).ok())).collect())
+        Self(vars.iter().map(|&k| (k, std::env::var_os(k))).collect())
     }
 }
 
