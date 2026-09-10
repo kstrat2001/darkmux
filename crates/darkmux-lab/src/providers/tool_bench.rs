@@ -744,6 +744,39 @@ fn build_rows(trials: &[Trial<'_>], k: u32, artifact: &scores::ArtifactKey) -> V
 
 // ─── manifest-extras parsing ────────────────────────────────────────────
 
+/// Accept an `f64` as an integral `u64` only if it is finite, non-negative,
+/// has no fractional part, and is strictly below `u64::MAX as f64`.
+///
+/// That last comparison is deliberately `<`, not `<=`: `u64::MAX`
+/// (`2^64 - 1`) is not exactly representable in `f64` — converting it
+/// rounds UP to `2^64`, the same threshold at which `f as u64` starts
+/// SATURATING instead of truncating. So a strict `<` against that same
+/// rounded-up constant is exactly the boundary where the cast stops being
+/// safe: any float below it truncates to a value that fits in `u64`; the
+/// constant itself (and anything at or above it) would silently saturate
+/// to `u64::MAX` with no error at all if allowed through (second-round
+/// frontier review — the earlier `<=` form let a float at that exact
+/// boundary, genuinely one past the real max, pass and then saturate).
+fn integral_f64_to_u64(f: f64) -> Option<u64> {
+    (f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f < u64::MAX as f64).then_some(f as u64)
+}
+
+/// Parse a JSON string as a number leniently — bare integer OR any decimal
+/// / exponent form Rust's own `f64` parser accepts, as long as the result
+/// is integral. (Second-round frontier review) Before this, a quoted
+/// string only ever tried `u64`'s own parser, which accepts neither a
+/// decimal point nor an exponent — so a BARE `45.0` or `4.5e1` was
+/// accepted (via the numeric branches' `as_f64` fallback) while the exact
+/// same value QUOTED (`"45.0"`, `"4.5e1"`) was refused. That asymmetry
+/// defeated the point of accepting floats at all: a shell arithmetic
+/// result or a template's number-to-string conversion — the motivating
+/// case for tolerating floats in the first place — most often round-trips
+/// through a shell or a config file AS a quoted string, not bare.
+fn quoted_number_to_u64(s: &str) -> Option<u64> {
+    let t = s.trim();
+    t.parse::<u64>().ok().or_else(|| t.parse::<f64>().ok().and_then(integral_f64_to_u64))
+}
+
 /// Read one `extras` key as a number, leniently accepting any of three JSON
 /// forms. The workload manifest's own doc comment invites an operator to
 /// "override by copying this manifest into your workloads dir" — a
@@ -771,12 +804,8 @@ fn extras_u64_strict(
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(v) => v
             .as_u64()
-            .or_else(|| {
-                v.as_f64()
-                    .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0 && *f <= u64::MAX as f64)
-                    .map(|f| f as u64)
-            })
-            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            .or_else(|| v.as_f64().and_then(integral_f64_to_u64))
+            .or_else(|| v.as_str().and_then(quoted_number_to_u64))
             .map(Some)
             .ok_or_else(|| anyhow!("workload extras.{key} must be {expect}, got {v}")),
     }
@@ -794,6 +823,18 @@ fn extras_u64_strict(
 /// staying small enough that even the maximum still generates instantly.
 const MAX_CHAIN_DEPTH: u32 = 1000;
 
+/// The chaining ladder's own LENGTH — how many distinct depths one
+/// `chainDepths` array may name, as opposed to [`MAX_CHAIN_DEPTH`] which
+/// bounds each depth individually. `generate_tasks` emits one whole
+/// `chaining@N` task per DISTINCT depth (after its own `.max(2)` +
+/// dedup), each with up to `depth` hop files — so a ladder of many
+/// distinct, individually-legal depths reproduces the exact unbounded-loop
+/// shape `MAX_CHAIN_DEPTH` exists to refuse, just moved from one element's
+/// value to the array's length. Generous relative to the shipped ladder
+/// (`[2, 4, 6]`, 3 entries) — a real benchmark sweep gains nothing from
+/// dozens of depths that a handful doesn't already cover.
+const MAX_CHAIN_LADDER_LEN: usize = 20;
+
 /// The `chainDepths` array, leniently. Same string-or-number-or-integral-float
 /// tolerance as [`extras_u64_strict`] applied per element — a hand-authored
 /// ALL-STRING array like `["2", "4", "6"]` used to have every element
@@ -809,7 +850,9 @@ const MAX_CHAIN_DEPTH: u32 = 1000;
 /// outside `u32`) now errors loudly instead. An explicitly EMPTY array
 /// (`[]`) still falls back to the default ladder — unchanged from before
 /// this fix, since that's an existing, intentional degrade-to-safe-default
-/// rather than the silent-type-coercion bug this closes.
+/// rather than the silent-type-coercion bug this closes. An array with
+/// more than [`MAX_CHAIN_LADDER_LEN`] entries is refused for the same
+/// reason as an over-cap single depth — see that constant's own doc.
 fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<Vec<u32>> {
     const DEFAULT: [u32; 3] = [2, 4, 6];
     match extras.get("chainDepths") {
@@ -821,16 +864,29 @@ fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<V
             if arr.is_empty() {
                 return Ok(DEFAULT.to_vec());
             }
+            // (Also fix, second-round frontier review) The per-element cap
+            // below stops any ONE depth from being unbounded; it does not
+            // stop the ARRAY itself from being unbounded — a ladder with
+            // hundreds of distinct, individually-legal depths reproduces
+            // the same hang one hop up, in the number of `chaining@N`
+            // tasks `generate_tasks` emits (one per distinct depth) rather
+            // than in any single depth's own file count. Checked on the
+            // raw array length, before the per-element parse below, so the
+            // refusal names the actual manifest shape the operator wrote.
+            ensure!(
+                arr.len() <= MAX_CHAIN_LADDER_LEN,
+                "workload extras.chainDepths has {} entries, above the cap of {MAX_CHAIN_LADDER_LEN} \
+                 — each distinct depth becomes its own chaining task with up to `depth` hop files, \
+                 so a long ladder turns one manifest key into an effectively unbounded loop the \
+                 same way a single oversized depth does. Shorten the ladder.",
+                arr.len()
+            );
             let mut depths = Vec::with_capacity(arr.len());
             for d in arr {
                 let n = d
                     .as_u64()
-                    .or_else(|| {
-                        d.as_f64()
-                            .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0 && *f <= u64::MAX as f64)
-                            .map(|f| f as u64)
-                    })
-                    .or_else(|| d.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                    .or_else(|| d.as_f64().and_then(integral_f64_to_u64))
+                    .or_else(|| d.as_str().and_then(quoted_number_to_u64))
                     .ok_or_else(|| {
                         anyhow!(
                             "workload extras.chainDepths must contain only positive integers, got {d}"
@@ -879,6 +935,15 @@ impl WorkloadProvider for ToolBenchProvider {
         _loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
     ) -> Result<RunResult> {
         let wl = &loaded.manifest.workload;
+        // (Also consider, second-round frontier review) `trials` still
+        // silently clamps to `[1, 20]` rather than refusing loudly like
+        // `taskTimeoutSeconds` below — a real inconsistency between two
+        // keys parsed three lines apart, called out here rather than left
+        // to look like an oversight. It's a deliberate, narrower one:
+        // `trials` never outranks the operator's own env/config (it only
+        // ever multiplies how many times THIS run repeats each task), so
+        // a clamp here can't silently override a bound the operator typed
+        // elsewhere the way an un-ranged `taskTimeoutSeconds` would.
         let trials_per_task =
             extras_u64_strict(&wl.extras, "trials", "a positive integer")?.unwrap_or(1).clamp(1, 20) as u32;
         // (#2587) `extras.taskTimeoutSeconds` must reach the ONE
@@ -910,8 +975,7 @@ impl WorkloadProvider for ToolBenchProvider {
         // key now takes the same standing env/config/600 path every other
         // workload takes.
         let task_timeout_extra = extras_u64_strict(&wl.extras, "taskTimeoutSeconds", "a positive integer")?;
-        // (2..3600 named below) The valid range is refused loudly rather
-        // than silently clamped, matching the `0` refusal just below it:
+        // The valid range is refused loudly rather than silently clamped:
         // now that this value is live and genuinely outranks the
         // operator's own configuration, silently substituting a floor or
         // ceiling the operator didn't type would be the same class of
@@ -919,6 +983,31 @@ impl WorkloadProvider for ToolBenchProvider {
         // reads back a bound they didn't choose, attributed to input they
         // did type. A named refusal keeps "what's in the manifest is what
         // takes effect" true in both directions.
+        //
+        // (Also fix, second-round frontier review) THREE routes now set
+        // this same `timeout_override_seconds` field with THREE different
+        // validity windows: `darkmux dispatch --timeout` accepts `1..`
+        // with no ceiling (src/cli.rs, #2480 review blocker 6); crawl's
+        // `config.timeout_seconds` step-config key mirrors that, also
+        // `1..` (`crawl::unit_step`, #2542 follow-up review); this key
+        // alone narrows to 30-3600. That is a DELIBERATE, not accidental,
+        // divergence — the other two bound a whole dispatch/session an
+        // operator explicitly asked to run (a coder task, an arbitrary
+        // crawl unit), where "how long is reasonable" is genuinely
+        // open-ended and the operator's call alone. This key bounds ONE
+        // axis probe inside a fixed, quick tool-call benchmark — by
+        // design a read, a search, or a short hop-chain, never a task
+        // this harness expects to run for hours — and a run dispatches
+        // several of these per invocation (one per axis × trial), so a
+        // single mis-set multi-hour value here would make the whole bench
+        // sweep impractical to run in CI or a local loop, not just one
+        // dispatch. The floor (30s) and ceiling (3600s) both predate this
+        // review pass (previously a silent `clamp(30, 3600)`); this pass
+        // only made the same bounds loud. Widen this if a real workload
+        // shape needs a benchmark task longer than an hour — until then,
+        // the narrower window is this key's own considered choice, named
+        // here so a reader hitting all three sites doesn't read the
+        // difference as drift.
         const MIN_TASK_TIMEOUT_SECONDS: u64 = 30;
         const MAX_TASK_TIMEOUT_SECONDS: u64 = 3600;
         if let Some(n) = task_timeout_extra {
@@ -927,10 +1016,12 @@ impl WorkloadProvider for ToolBenchProvider {
             // to an already-expired inactivity deadline — the host
             // watchdog kills the dispatch at its first poll, an instant
             // kill, not "shortest allowed timeout". Mirrors `darkmux
-            // dispatch --timeout`'s own `range(1..)` clap validator
-            // (src/cli.rs, #2480 review blocker 6) and the crawl unit
-            // step's identical `ensure!(n >= 1, ...)` (#2542 follow-up
-            // review).
+            // dispatch --timeout`'s own `range(1..)` clap validator's
+            // OWN zero-refusal (src/cli.rs, #2480 review blocker 6) and
+            // the crawl unit step's identical `ensure!(n >= 1, ...)`
+            // (#2542 follow-up review) — that mirroring covers only the
+            // `>= 1` floor those two sites share with this one, not the
+            // `<= 3600` ceiling that is unique to this key (see above).
             ensure!(
                 n >= 1,
                 "workload extras.taskTimeoutSeconds must be >= 1 — `0` resolves to an \
@@ -944,7 +1035,9 @@ impl WorkloadProvider for ToolBenchProvider {
                  {MIN_TASK_TIMEOUT_SECONDS}-{MAX_TASK_TIMEOUT_SECONDS} seconds. This value \
                  outranks your own env/config inactivity setting when present, so it is refused \
                  rather than silently clamped to a bound you didn't type — pick a value inside \
-                 the range, or omit the key for the standing env/config/600 default."
+                 the range, or omit the key for the standing env/config/600 default. This range \
+                 is narrower than `darkmux dispatch --timeout`'s on purpose: it bounds one quick \
+                 tool-bench axis probe, not an open-ended dispatch."
             );
         }
         let timeout_override_seconds: Option<u32> = task_timeout_extra.map(|n| n as u32);
@@ -956,19 +1049,34 @@ impl WorkloadProvider for ToolBenchProvider {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let seed = extras_u64_strict(&wl.extras, "seed", "an integer")?
+        // (Also fix, second-round frontier review) "a non-negative integer",
+        // not "an integer" — the shared message names what the CALLER
+        // accepts, and this field is still parsed as `u64`: a negative
+        // seed (`-5`) IS an integer, and the old "must be an integer, got
+        // -5" wording flatly contradicted the value it was pointing at.
+        // "positive integer" is still wrong for seed (0 is legitimate);
+        // "non-negative integer" is the one phrase that is never untrue for
+        // this key's actual domain.
+        let seed = extras_u64_strict(&wl.extras, "seed", "a non-negative integer")?
             .unwrap_or_else(|| (now_ms as u64) ^ ((std::process::id() as u64) << 32));
 
         let tasks = generate_tasks(seed, &chain_depths);
         let role = wl.role.clone().unwrap_or_else(|| "tool-bench".to_string());
 
         // Forensics: the full fixture (prompts, files, expected answers) so a
-        // surprising score is auditable straight from the run dir. Also
-        // consider: `timeout_override_seconds` is recorded here too — it is
-        // now a value that genuinely bounds the run and genuinely outranks
-        // the operator's own configuration, so a run that didn't record its
-        // own effective bound would be a gap in exactly the artifact this
-        // exists to make a surprising score auditable from.
+        // surprising score is auditable straight from the run dir.
+        // `task_timeout_override_seconds` is recorded here too, but it is
+        // ONLY the manifest's own override — the value `extras.taskTimeoutSeconds`
+        // resolved to, or `null` when the key was omitted. It is NOT the
+        // dispatch's effective inactivity bound: on the omitted-key path
+        // (the shipped manifest's own path) this is always `null`, even
+        // though a real bound (env/config/600) still governed every
+        // dispatch. This field answers "did the manifest ask for a
+        // specific bound", not "what bound applied" — for the latter, each
+        // task's own `tasks/<id>-t<trial>/qa-reply.json` carries the
+        // dispatch's real envelope, whose `bounds.inactivity_timeout_seconds`
+        // block names both the resolved value and its source (env, config,
+        // built-in, or this override) for that one dispatch.
         fs::write(
             run_dir.join("bench-fixture.json"),
             serde_json::to_string_pretty(&serde_json::json!({
@@ -1879,10 +1987,28 @@ not json — tolerated
 
     /// Drives `ToolBenchProvider::run()` end-to-end with a mocked dispatch,
     /// capturing `timeout_override_seconds` off EVERY `DispatchOpts` the run
-    /// constructs (one per task × trial — `chainDepths: [2]` keeps this to
-    /// six dispatches) so the assertion holds across the whole loop, not
-    /// just its first call.
-    fn run_and_capture_timeout_overrides(mut extras: serde_json::Value) -> Result<Vec<Option<u32>>> {
+    /// constructs (one per task × trial) so the assertion holds across the
+    /// whole loop, not just its first call. Also returns the run dir's
+    /// `TempDir` (kept alive past `run()`, unlike a local that would be
+    /// dropped and deleted on return) so a caller can inspect what `run()`
+    /// actually wrote to disk — `bench-fixture.json` in particular, which
+    /// nothing else in this suite ever reads back.
+    ///
+    /// `.entry("chainDepths").or_insert([2])` below ONLY fires when the
+    /// caller's own `extras` doesn't already name `chainDepths` — for
+    /// those calls it keeps the run to six dispatches (5 fixed axes + one
+    /// `chaining@2`). (Corrected, second-round frontier review: an earlier
+    /// version of this comment claimed `[2]` unconditionally overrides the
+    /// ladder to keep every call "cheap" — that was never true for a
+    /// caller that supplies its OWN `chainDepths`, most notably the
+    /// shipped-manifest test below, which passes the real manifest's
+    /// `[2, 4, 6]` and so runs the FULL 3-depth ladder — 8 dispatches, not
+    /// six. Harmless to any assertion here, since none of them hardcode a
+    /// dispatch count, but the old comment was a wrong description of what
+    /// its own test does.)
+    fn run_and_capture_timeout_overrides_with_run_dir(
+        mut extras: serde_json::Value,
+    ) -> Result<(Vec<Option<u32>>, TempDir)> {
         if let Some(obj) = extras.as_object_mut() {
             obj.entry("chainDepths").or_insert(serde_json::json!([2]));
         }
@@ -1898,7 +2024,11 @@ not json — tolerated
         let profile = Profile::default();
         provider.run(&loaded, run_dir.path(), sandbox_dir.path(), &profile, "default", None, None)?;
         let result = seen.lock().unwrap().clone();
-        Ok(result)
+        Ok((result, run_dir))
+    }
+
+    fn run_and_capture_timeout_overrides(extras: serde_json::Value) -> Result<Vec<Option<u32>>> {
+        run_and_capture_timeout_overrides_with_run_dir(extras).map(|(seen, _run_dir)| seen)
     }
 
     #[test]
@@ -1991,7 +2121,7 @@ not json — tolerated
     #[test]
     fn extras_u64_strict_reads_a_genuinely_absent_key_as_none() {
         let extras = BTreeMap::new();
-        assert_eq!(extras_u64_strict(&extras, "seed", "an integer").unwrap(), None);
+        assert_eq!(extras_u64_strict(&extras, "seed", "a non-negative integer").unwrap(), None);
     }
 
     #[test]
@@ -2005,38 +2135,81 @@ not json — tolerated
         assert!(msg.contains("many"), "the offending value is named: {msg}");
     }
 
-    // (Also fix, frontier review) The shared error message must describe
-    // what the KEY actually accepts, not a blanket "positive integer" — a
-    // zero seed is legitimate, and a seed is an arbitrary number, not a
-    // "positive integer" in any meaningful sense.
+    // (Also fix, frontier review; wording corrected second round) The
+    // shared error message must describe what the KEY actually accepts,
+    // not a blanket "positive integer" — a zero seed is legitimate. The
+    // ORIGINAL fix for this used "an integer", which is equally wrong in
+    // the other direction: seed is parsed as `u64`, so a NEGATIVE seed is
+    // refused too, and "must be an integer, got -5" contradicts itself
+    // (-5 genuinely is an integer). "a non-negative integer" is the one
+    // phrase that is never untrue for this key's real domain — see the
+    // negative-seed tests below for the case "an integer" got wrong.
     #[test]
-    fn extras_u64_strict_describes_seed_as_an_integer_not_a_positive_integer() {
+    fn extras_u64_strict_describes_seed_as_a_non_negative_integer_not_a_positive_integer() {
         let mut extras = BTreeMap::new();
         extras.insert("seed".to_string(), serde_json::json!("not-a-number"));
-        let err = extras_u64_strict(&extras, "seed", "an integer").expect_err("garbage refused");
+        let err =
+            extras_u64_strict(&extras, "seed", "a non-negative integer").expect_err("garbage refused");
         let msg = format!("{err:#}");
-        assert!(msg.contains("must be an integer"), "seed's message names what it accepts: {msg}");
         assert!(
-            !msg.contains("positive integer"),
+            msg.contains("must be a non-negative integer"),
+            "seed's message names what it accepts: {msg}"
+        );
+        assert!(
+            !msg.contains("must be a positive integer"),
             "seed accepts 0 — calling it a positive integer is misleading: {msg}"
         );
     }
 
     // The unit test above only proves `extras_u64_strict` HONORS whatever
     // `expect` string it's handed — it does not prove `run()`'s own call
-    // site for `seed` actually passes "an integer" rather than "a positive
-    // integer". This drives the real call site end to end so a regression
-    // there (the call site reverted to the shared "positive integer"
-    // phrase) is caught here too, not just in the direct-call test above.
+    // site for `seed` actually passes "a non-negative integer" rather than
+    // "a positive integer". This drives the real call site end to end so a
+    // regression there is caught here too, not just in the direct-call
+    // test above.
     #[test]
-    fn run_describes_a_garbage_seed_as_an_integer_not_a_positive_integer() {
+    fn run_describes_a_garbage_seed_as_a_non_negative_integer_not_a_positive_integer() {
         let err = run_and_capture_timeout_overrides(serde_json::json!({ "seed": "not-a-number" }))
             .expect_err("a non-numeric seed must be refused");
         let msg = format!("{err:#}");
-        assert!(msg.contains("must be an integer"), "the real call site names what seed accepts: {msg}");
         assert!(
-            !msg.contains("positive integer"),
+            msg.contains("must be a non-negative integer"),
+            "the real call site names what seed accepts: {msg}"
+        );
+        assert!(
+            !msg.contains("must be a positive integer"),
             "seed accepts 0 — the real call site must not call it a positive integer: {msg}"
+        );
+    }
+
+    // (Also fix, second-round frontier review) The exact bug named above:
+    // a NEGATIVE seed is an integer, so a message reading "must be an
+    // integer, got -5" is self-contradicting — the real constraint is
+    // non-negativity, which the message must actually say.
+    #[test]
+    fn extras_u64_strict_describes_a_negative_seed_as_needing_non_negative_not_merely_an_integer() {
+        let mut extras = BTreeMap::new();
+        extras.insert("seed".to_string(), serde_json::json!(-5));
+        let err = extras_u64_strict(&extras, "seed", "a non-negative integer")
+            .expect_err("a negative seed must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("-5"), "the offending value is named: {msg}");
+        assert!(
+            msg.contains("non-negative"),
+            "the message must name the actual constraint (non-negativity), not just \"an \
+             integer\" — -5 IS an integer, so that wording would contradict the value it names: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_describes_a_negative_seed_as_needing_non_negative_not_merely_an_integer() {
+        let err = run_and_capture_timeout_overrides(serde_json::json!({ "seed": -5 }))
+            .expect_err("a negative seed must be refused at the real call site too");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("-5"), "the offending value is named: {msg}");
+        assert!(
+            msg.contains("non-negative"),
+            "the real call site's message must name the actual constraint: {msg}"
         );
     }
 
@@ -2051,6 +2224,46 @@ not json — tolerated
         assert_eq!(extras_u64_strict(&extras, "trials", "a positive integer").unwrap(), Some(5));
     }
 
+    // (Also fix, second-round frontier review) The bare-float leniency
+    // above and the quoted-string leniency are currently asymmetric: a
+    // QUOTED decimal or exponent form (`"45.0"`, `"4.5e1"`) still refuses,
+    // because the string branch only tries `u64`'s own parser, which
+    // doesn't accept a decimal point or an exponent at all. But a shell
+    // arithmetic result or a format conversion — the stated motivation for
+    // accepting floats in the first place — most often arrives QUOTED, not
+    // bare, once it's round-tripped through a shell or a template. Both
+    // forms must resolve identically.
+    #[test]
+    fn extras_u64_strict_accepts_a_quoted_integral_float_like_the_bare_form() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!("5.0"));
+        assert_eq!(
+            extras_u64_strict(&extras, "trials", "a positive integer").unwrap(),
+            Some(5),
+            "a quoted decimal form must resolve exactly like its bare float form"
+        );
+    }
+
+    #[test]
+    fn extras_u64_strict_accepts_a_quoted_exponent_form() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!("4.5e1"));
+        assert_eq!(
+            extras_u64_strict(&extras, "trials", "a positive integer").unwrap(),
+            Some(45),
+            "a quoted exponent form (4.5e1 == 45) must be accepted, the same as a bare one"
+        );
+    }
+
+    #[test]
+    fn extras_u64_strict_refuses_a_quoted_non_integral_float() {
+        let mut extras = BTreeMap::new();
+        extras.insert("trials".to_string(), serde_json::json!("5.5"));
+        let err = extras_u64_strict(&extras, "trials", "a positive integer")
+            .expect_err("a quoted fractional value must be refused, same as its bare form");
+        assert!(format!("{err:#}").contains("5.5"));
+    }
+
     #[test]
     fn extras_u64_strict_refuses_a_non_integral_float() {
         let mut extras = BTreeMap::new();
@@ -2058,6 +2271,30 @@ not json — tolerated
         let err = extras_u64_strict(&extras, "trials", "a positive integer")
             .expect_err("a fractional value must be refused, not truncated");
         assert!(format!("{err:#}").contains("5.5"));
+    }
+
+    // (Also fix, second-round frontier review) `u64::MAX` is not exactly
+    // representable in `f64` — converting it rounds UP to `2^64`, one past
+    // the real ceiling. The filter's upper bound used that same rounded-up
+    // constant (`f <= u64::MAX as f64`), so a JSON float holding EXACTLY
+    // `u64::MAX as f64` (i.e. `2^64`, genuinely `u64::MAX + 1`) passed the
+    // filter, and the subsequent `f as u64` cast then silently SATURATED it
+    // to `u64::MAX` — no error, no indication anything was out of range.
+    // `seed` is the one caller of `extras_u64_strict` with no downstream
+    // range check (trials clamps, taskTimeoutSeconds range-refuses), so this
+    // is the call site where the silent saturation would actually reach an
+    // operator: a seed one past the real max would silently become
+    // `u64::MAX` instead of being refused.
+    #[test]
+    fn extras_u64_strict_refuses_a_float_that_rounds_up_past_u64_max_instead_of_saturating() {
+        let mut extras = BTreeMap::new();
+        extras.insert("seed".to_string(), serde_json::json!(u64::MAX as f64));
+        let result = extras_u64_strict(&extras, "seed", "a non-negative integer");
+        assert!(
+            result.is_err(),
+            "a float at u64::MAX's own rounded-up ceiling is one past the true max and must be \
+             refused, not silently saturated to u64::MAX: {result:?}"
+        );
     }
 
     #[test]
@@ -2090,6 +2327,16 @@ not json — tolerated
     fn chain_depths_strict_accepts_integral_float_elements() {
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!([2.0, 4, "6"]));
+        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
+    }
+
+    // (Also fix, second-round frontier review) Same quoted/bare parity gap
+    // as `extras_u64_strict` — a quoted decimal element (`"4.0"`) must
+    // resolve exactly like its bare float form.
+    #[test]
+    fn chain_depths_strict_accepts_a_quoted_integral_float_element() {
+        let mut extras = BTreeMap::new();
+        extras.insert("chainDepths".to_string(), serde_json::json!(["2", "4.0", 6]));
         assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
     }
 
@@ -2158,6 +2405,39 @@ not json — tolerated
         assert!(msg.contains(&MAX_CHAIN_DEPTH.to_string()), "the cap is named: {msg}");
     }
 
+    // (Also fix, second-round frontier review) `MAX_CHAIN_DEPTH` bounds
+    // each ELEMENT, not the LADDER as a whole — a `chainDepths` array with
+    // many distinct depths, every one individually under the per-element
+    // cap, still generates one whole `chaining@N` task PER distinct depth
+    // (`generate_tasks`'s `BTreeSet<u32>` dedup only collapses
+    // DUPLICATE depths, not the count of distinct ones), each with up to
+    // `depth` hop files. A long enough ladder of distinct, individually-
+    // legal depths is exactly the unbounded-loop shape `MAX_CHAIN_DEPTH`
+    // exists to refuse, just moved from one element to the array's length.
+    #[test]
+    fn chain_depths_strict_refuses_a_ladder_with_too_many_distinct_entries() {
+        let mut extras = BTreeMap::new();
+        // Every entry here is individually far under MAX_CHAIN_DEPTH — the
+        // per-element cap alone does not catch this.
+        let ladder: Vec<u32> = (2..=(MAX_CHAIN_LADDER_LEN as u32 + 3)).collect();
+        extras.insert("chainDepths".to_string(), serde_json::json!(ladder));
+        let err = chain_depths_strict(&extras)
+            .expect_err("a ladder with more distinct depths than the aggregate cap must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&MAX_CHAIN_LADDER_LEN.to_string()),
+            "the aggregate cap is named: {msg}"
+        );
+    }
+
+    #[test]
+    fn chain_depths_strict_accepts_a_ladder_exactly_at_the_aggregate_cap() {
+        let mut extras = BTreeMap::new();
+        let ladder: Vec<u32> = (2..(2 + MAX_CHAIN_LADDER_LEN as u32)).collect();
+        extras.insert("chainDepths".to_string(), serde_json::json!(ladder.clone()));
+        assert_eq!(chain_depths_strict(&extras).unwrap(), ladder);
+    }
+
     // ─── manifest sweep: the SHIPPED tool-bench.json takes the absent-key path ───
     //
     // (MUST FIX, frontier review) The shipped manifest used to set
@@ -2187,12 +2467,32 @@ not json — tolerated
         // run() loop and confirm the override field it actually
         // constructs stays None end to end.
         let extras_json = serde_json::to_value(&manifest.workload.extras).unwrap();
-        let seen = run_and_capture_timeout_overrides(extras_json)
+        let (seen, run_dir) = run_and_capture_timeout_overrides_with_run_dir(extras_json)
             .expect("run succeeds against a mocked dispatch");
         assert!(!seen.is_empty(), "the mocked dispatch never ran");
         assert!(
             seen.iter().all(|v| v.is_none()),
             "the shipped manifest's own extras must resolve to no override: {seen:?}"
+        );
+
+        // (MUST FIX, second-round frontier review) `bench-fixture.json`'s
+        // `task_timeout_override_seconds` key is a claim about what `run()`
+        // wrote to disk, not just what it constructed in memory — and
+        // nothing in this suite read the file back before this. Pin it
+        // directly: against the shipped manifest's own extras, the written
+        // fixture must name no override, matching the in-memory `seen`
+        // assertion above at the artifact `darkmux lab run` actually leaves
+        // behind.
+        let fixture_path = run_dir.path().join("bench-fixture.json");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&fixture_path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", fixture_path.display())),
+        )
+        .expect("bench-fixture.json is valid JSON");
+        assert_eq!(
+            fixture.get("task_timeout_override_seconds"),
+            Some(&serde_json::Value::Null),
+            "the shipped manifest's own fixture must record no override on disk: {fixture}"
         );
     }
 

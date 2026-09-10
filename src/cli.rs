@@ -183,6 +183,18 @@ pub(crate) enum Cmd {
         // NO limit at all on the remote path (`curl -m 0`). Same flag, same
         // value, opposite behavior, decided by routing the operator cannot
         // see — refuse it at the parser instead.
+        //
+        // (Second-round frontier review of #2610) `range(1..)` is
+        // deliberately unbounded above — this flag sets a whole dispatch an
+        // operator explicitly asked to run, and "how long is reasonable" is
+        // genuinely open-ended and the operator's own call. Crawl's
+        // `config.timeout_seconds` step-config key mirrors this same `1..`
+        // window (`crawl::unit_step`). `darkmux-lab`'s tool-bench workload
+        // manifest key `taskTimeoutSeconds` sets the identical
+        // `timeout_override_seconds` field but narrows to 30-3600 — see
+        // that call site's own comment for why the narrower window there is
+        // a considered choice (one quick per-axis probe task, not an
+        // open-ended dispatch) rather than drift from this flag's range.
         #[arg(long, verbatim_doc_comment, value_parser = clap::value_parser!(u32).range(1..))]
         timeout: Option<u32>,
         /// Explicit working directory override (#143). When set, the

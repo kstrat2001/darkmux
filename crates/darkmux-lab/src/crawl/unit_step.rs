@@ -882,6 +882,16 @@ impl UnitStepConfig {
                 // (src/cli.rs, #2480 review blocker 6), which refused `0`
                 // for exactly this reason on the CLI path; a config-file
                 // route to the same field gets the same floor.
+                // (Second-round frontier review of #2610) No upper bound
+                // here, matching the CLI flag's own `1..` — deliberately.
+                // A crawl unit is a whole coding task an operator names in
+                // a mission config; how long that reasonably takes is the
+                // operator's own open-ended call, same as `--timeout`. The
+                // tool-bench workload provider's `taskTimeoutSeconds`
+                // manifest key sets this SAME `timeout_override_seconds`
+                // field but narrows to 30-3600 seconds — see that call
+                // site's own comment for why (one quick per-axis probe
+                // task inside a fixed bench sweep, not an open-ended unit).
                 anyhow::ensure!(
                     n >= 1,
                     "step `{}`: `{CRAWL_UNIT_KIND}` config.timeout_seconds must be >= 1 — `0` \
