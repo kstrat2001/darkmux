@@ -138,7 +138,13 @@ impl MachineFingerprint {
         // `lms --version` emits one plain line (`CLI commit: efce996`);
         // bare `lms version` emits a multi-line ANSI-art banner, which the
         // first tool-bench live run stored verbatim as the fingerprint.
-        let mut lms_version_cmd = std::process::Command::new("lms");
+        //
+        // (#1939) Resolved through the one `env > config.lms_bin > "lms"`
+        // precedence home, not a literal — an operator who set `lms_bin` to
+        // a non-default path otherwise gets an `engine_version` fingerprint
+        // that describes a DIFFERENT binary than the one that served the
+        // run (or a silently absent version if bare `lms` isn't on PATH).
+        let mut lms_version_cmd = std::process::Command::new(darkmux_types::config_access::lms_bin());
         darkmux_profiles::lms::pin_cwd(&mut lms_version_cmd);
         let engine_version = lms_version_cmd
             .arg("--version")
