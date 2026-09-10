@@ -1796,19 +1796,26 @@ mod tests {
     /// and still yields a span — that span is just no longer trusted as
     /// final the moment a bigger ancestor match also claims the offset.
     ///
-    /// **Direction, stated so it doesn't have to be re-derived:** this
-    /// class can only make the chosen scope WIDER (an outer arm's span
-    /// always contains every block nested inside it), never narrower —
-    /// `match_arm_span_within`'s per-arm boundaries are always a subset of
-    /// whichever block produced them. So the round-2 bug could only ever
-    /// produce a false ACCUSATION (a real guard the scan fails to see),
-    /// never a false CERTIFICATION (a missing guard the scan fails to
-    /// flag) — the security property this whole conformance check exists
-    /// for held throughout. What it broke was a maintainer's honest
-    /// refactor (wrapping a guarded call in a nested match for unrelated
-    /// reasons) failing a test that then pointed at the wrong cause, plus
-    /// this very doc comment asserting the false-accusation case couldn't
-    /// happen when it plainly could.
+    /// **Direction, corrected (round 4) — this paragraph previously had it
+    /// backwards.** Taking the LAST (outermost) recognized arm span rather
+    /// than the first does widen the chosen scope monotonically — an outer
+    /// arm's span always contains every block nested inside it, never the
+    /// reverse. But widening the search scope is what produces a false
+    /// CERTIFICATION, not a false accusation: more text becomes visible to
+    /// `resume_from_guard_precedes`, and — as round 3's own bug showed —
+    /// that "more text" can be a SIBLING arm's guard inside a nested
+    /// `match`, which the guard search then accepts as "preceding" a call
+    /// that is genuinely unguarded in its own arm. A false ACCUSATION (a
+    /// real guard the scan fails to see) is what a scope that is too
+    /// NARROW produces — round 2's failure mode, not this one. So the
+    /// security property this whole conformance check exists for did NOT
+    /// hold throughout round 3; `nested_match_sibling_exclusions` below is
+    /// what restores it, by excluding a nested match's sibling-arm text
+    /// from the guard search even though that text sits inside the (still
+    /// outermost) scope. This is also what the assertion's own failure
+    /// message already said ("not a sibling arm's or an unrelated
+    /// block's") while this comment claimed the opposite could never
+    /// happen.
     fn guard_search_scope(body: &str, at: usize) -> (usize, usize) {
         let mut containing: Vec<(usize, usize)> = all_brace_block_spans(body)
             .into_iter()
@@ -1822,6 +1829,69 @@ mod tests {
             }
         }
         outermost_arm.unwrap_or_else(|| nearest_enclosing_block(body, at))
+    }
+
+    /// Byte ranges within `body`, inside the outermost scope
+    /// `[scope_start, scope_end)` computed by `guard_search_scope`, that
+    /// must stay invisible to the guard search even though they sit inside
+    /// that scope: the SIBLING-arm text of any `match` block that is
+    /// nested strictly inside the scope and that also contains `at`.
+    ///
+    /// (#2609 review round 4 MUST-FIX) `guard_search_scope`'s outermost-arm
+    /// widening (round 3) fixed round 2's too-NARROW failure but opened a
+    /// too-WIDE one: when the call sits in one arm of a nested `match` and
+    /// a DIFFERENT (sibling) arm of that SAME nested `match` carries a
+    /// `resume_from` guard, the outer arm's span contains the nested
+    /// match's whole brace block — every sibling arm included — so the
+    /// sibling's guard reads as "preceding" the call even though the two
+    /// arms are mutually exclusive at runtime and the call's own arm has
+    /// no guard at all. Red-proven: wrapping the call in
+    /// `match true { true => { <the real guard, moved here> } false => {
+    /// dispatch_via_queue(...) } }`, with the guard genuinely absent from
+    /// the `false` arm the call lives in, made the structural scan below
+    /// PASS while the runtime test
+    /// (`dispatch_routed_via_refuses_resume_from_before_the_queue_is_
+    /// touched`, dialed against a real queue) FAILED — a live bypass the
+    /// scan certified as safe.
+    ///
+    /// Fixed not by narrowing `guard_search_scope`'s scope (that would
+    /// reopen round 2's bug) but by excluding, from WITHIN the unchanged
+    /// outermost scope, every nested match's sibling-arm text: for each
+    /// match block strictly inside the outer scope that also contains
+    /// `at`, only the arm of THAT block containing `at` stays visible to
+    /// the guard search — the rest of the block (its sibling arms) is
+    /// excluded even though it lies inside the outer arm's byte range. A
+    /// guard in the SAME inner arm as the call is unaffected (it isn't in
+    /// an excluded range); a guard in a sibling arm is.
+    fn nested_match_sibling_exclusions(
+        body: &str,
+        scope_start: usize,
+        scope_end: usize,
+        at: usize,
+    ) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (block_start, block_end) in all_brace_block_spans(body) {
+            // Only blocks STRICTLY nested inside the outer scope — this
+            // naturally excludes the ancestor match block that produced
+            // the outer scope itself (that block always starts at or
+            // before `scope_start` and/or ends at or after `scope_end`,
+            // since it also holds the outer arm's OWN siblings).
+            if block_start < scope_start || block_end > scope_end {
+                continue;
+            }
+            if !(block_start <= at && at < block_end) {
+                continue;
+            }
+            if let Some((arm_start, arm_end)) = match_arm_span_within(body, block_start, block_end, at) {
+                if arm_start > block_start {
+                    out.push((block_start, arm_start));
+                }
+                if arm_end < block_end {
+                    out.push((arm_end, block_end));
+                }
+            }
+        }
+        out
     }
 
     /// Collapse Rust string-literal line continuations (a `\` immediately
@@ -1878,9 +1948,25 @@ mod tests {
     /// second arm's call. Scoping `body` to the call's own match-arm span
     /// closes this: the first arm's guard sits in a sibling span the scoped
     /// search never sees.
-    fn resume_from_guard_precedes(body: &str, call_at_in_body: usize) -> bool {
+    ///
+    /// `excluded` (#2609 review round 4 MUST-FIX) is a set of byte ranges
+    /// INTO `body` — from `nested_match_sibling_exclusions` — that must be
+    /// treated as if they weren't there, even though `body` is already
+    /// scoped down to the outermost arm and these ranges sit inside it: a
+    /// nested `match`'s sibling-arm text, which the outermost-scope fix
+    /// (round 3) made visible again. A candidate guard whose `if` keyword
+    /// starts inside one of these ranges is skipped, exactly as if it had
+    /// never been found.
+    fn resume_from_guard_precedes(
+        body: &str,
+        call_at_in_body: usize,
+        excluded: &[(usize, usize)],
+    ) -> bool {
         for (cond_start, block_start, block_end) in find_if_blocks(body) {
             if block_end > call_at_in_body {
+                continue;
+            }
+            if excluded.iter().any(|(ex_start, ex_end)| cond_start >= *ex_start && cond_start < *ex_end) {
                 continue;
             }
             let cond_text = &body[cond_start..block_start];
@@ -2051,9 +2137,20 @@ mod tests {
             let (scope_start, scope_end) = guard_search_scope(body, call_at_in_body);
             let scoped_body = &body[scope_start..scope_end];
             let call_at_in_scoped = call_at_in_body - scope_start;
+            // (#2609 review round 4 MUST-FIX) The outermost scope above is
+            // still right — narrowing it back would reopen round 2's bug —
+            // but it can also make a nested match's SIBLING arm visible to
+            // the guard search below. Exclude that sibling-arm text
+            // explicitly; see `nested_match_sibling_exclusions`'s doc.
+            let excluded_in_body =
+                nested_match_sibling_exclusions(body, scope_start, scope_end, call_at_in_body);
+            let excluded_in_scoped: Vec<(usize, usize)> = excluded_in_body
+                .into_iter()
+                .map(|(ex_start, ex_end)| (ex_start - scope_start, ex_end - scope_start))
+                .collect();
 
             assert!(
-                resume_from_guard_precedes(scoped_body, call_at_in_scoped),
+                resume_from_guard_precedes(scoped_body, call_at_in_scoped, &excluded_in_scoped),
                 "`{fn_name}` calls `dispatch_via_queue(` at file offset {call_at} without a \
                  `resume_from`-conditioned guard preceding it IN ITS OWN ENCLOSING SCOPE — the \
                  same match arm when the call sits in one, its own enclosing block otherwise. \
