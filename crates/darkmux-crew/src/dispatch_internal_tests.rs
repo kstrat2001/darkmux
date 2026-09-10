@@ -857,6 +857,134 @@
         assert_eq!(merged.rests, 2);
     }
 
+    // ─── #2263 review MUST FIX: cumulative_turns/compactions and
+    // cumulative_prompt_tokens/completion_tokens must not fabricate a zero
+    // that sits below the per-run figures on the SAME dispatch.complete /
+    // dispatch.error record ────────────────────────────────────────────
+
+    #[test]
+    fn reconcile_cumulative_counts_prefers_the_larger_of_metrics_and_tailer() {
+        let from_metrics = CumulativeCounts { turns: 0, compactions: 0 };
+        let from_tailer = CumulativeCounts { turns: 7, compactions: 3 };
+        let merged = reconcile_cumulative_counts(from_metrics, from_tailer);
+        assert_eq!(merged.turns, 7);
+        assert_eq!(merged.compactions, 3);
+    }
+
+    #[test]
+    fn reconcile_cumulative_counts_keeps_metrics_when_it_reports_more_than_the_tailer() {
+        // A clean-exit metrics.json legitimately carries MORE than the
+        // tailer's this-invocation-only count whenever the checkpoint
+        // seeded a prior invocation's turns/compactions into it — a real
+        // resume, not a defect. Max, not "prefer the tailer."
+        let from_metrics = CumulativeCounts { turns: 12, compactions: 5 };
+        let from_tailer = CumulativeCounts { turns: 3, compactions: 1 };
+        let merged = reconcile_cumulative_counts(from_metrics, from_tailer);
+        assert_eq!(merged.turns, 12);
+        assert_eq!(merged.compactions, 5);
+    }
+
+    #[test]
+    fn reconcile_token_totals_prefers_the_larger_of_metrics_and_tailer() {
+        let from_metrics = TokenTotals { prompt: 0, completion: 0, reasoning: None, cached: None };
+        let from_tailer = TokenTotals { prompt: 9100, completion: 9600, reasoning: Some(500), cached: Some(50) };
+        let merged = reconcile_token_totals(from_metrics, from_tailer);
+        assert_eq!(merged.prompt, 9100);
+        assert_eq!(merged.completion, 9600);
+        // `reasoning`/`cached` are NOT reconciled — they aren't surfaced as
+        // cumulative fields, so there is nothing for the tailer side to
+        // contribute; the metrics-side value (here, unset) passes through.
+        assert_eq!(merged.reasoning, None);
+        assert_eq!(merged.cached, None);
+    }
+
+    #[test]
+    fn reconcile_token_totals_keeps_metrics_when_it_reports_more_than_the_tailer() {
+        let from_metrics = TokenTotals { prompt: 5000, completion: 2000, reasoning: Some(80), cached: Some(10) };
+        let from_tailer = TokenTotals { prompt: 100, completion: 50, reasoning: None, cached: None };
+        let merged = reconcile_token_totals(from_metrics, from_tailer);
+        assert_eq!(merged.prompt, 5000);
+        assert_eq!(merged.completion, 2000);
+        assert_eq!(merged.reasoning, Some(80), "metrics-side reasoning/cached pass through unconditionally");
+        assert_eq!(merged.cached, Some(10));
+    }
+
+    /// Reachable path 1 (MUST FIX #1): the loop's ERROR ARM
+    /// (`runtime::main`'s `else` branch with no surviving `LoopOutcome`)
+    /// writes `metrics.json` with `turns`/`compactions`/
+    /// `total_prompt_tokens`/`total_completion_tokens` HARDCODED to `0` —
+    /// not a race, certain, every time the loop returns an error — even
+    /// though real turns/tokens already streamed to `trajectory.jsonl` and
+    /// were seen live by the tailer before the failure. Without
+    /// reconciliation, `read_cumulative_counts`/`read_token_totals` trust
+    /// that zeroed-but-present file as authoritative and the
+    /// `dispatch.error` record reports `cumulative_turns: 0` /
+    /// `cumulative_prompt_tokens: 0` beside `total_turns`/`prompt_tokens`
+    /// in the thousands.
+    #[test]
+    fn dispatch_error_terminal_recovers_cumulative_counts_from_the_live_tailer_when_metrics_json_is_zeroed(
+    ) {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(
+            rt.join("metrics.json"),
+            r#"{"turns": 0, "compactions": 0, "total_prompt_tokens": 0, "total_completion_tokens": 0}"#,
+        )
+        .unwrap();
+
+        // Confirms the gap this finding names: the raw metrics.json read
+        // alone reports the fabricated zero, not the real work already done.
+        let cumulative_from_metrics = read_cumulative_counts(out.path());
+        assert_eq!((cumulative_from_metrics.turns, cumulative_from_metrics.compactions), (0, 0));
+        let tokens_from_metrics = read_token_totals(out.path());
+        assert_eq!((tokens_from_metrics.prompt, tokens_from_metrics.completion), (0, 0));
+
+        // What the live tailer accumulated processing this dispatch's real
+        // turns/tokens as they streamed, before the crash — independent of
+        // the post-hoc metrics.json read.
+        let from_tailer_counts = CumulativeCounts { turns: 5000, compactions: 12 };
+        let from_tailer_tokens =
+            TokenTotals { prompt: 91_000, completion: 34_500, reasoning: None, cached: None };
+
+        let merged_counts = reconcile_cumulative_counts(cumulative_from_metrics, from_tailer_counts);
+        assert_eq!(merged_counts.turns, 5000, "payload must carry the tailer-observed turns, not 0");
+        assert_eq!(merged_counts.compactions, 12);
+
+        let merged_tokens = reconcile_token_totals(tokens_from_metrics, from_tailer_tokens);
+        assert_eq!(merged_tokens.prompt, 91_000, "payload must carry the tailer-observed tokens, not 0");
+        assert_eq!(merged_tokens.completion, 34_500);
+    }
+
+    /// Reachable path 2 (MUST FIX #1): metrics.json is written at exit, so
+    /// a watchdog hard-kill (or any SIGKILL before the clean-exit write
+    /// runs) leaves NO metrics.json at all — same fabricated-zero landing
+    /// as the error arm above, via a completely different cause.
+    #[test]
+    fn dispatch_error_terminal_recovers_cumulative_counts_from_the_live_tailer_when_metrics_json_is_absent(
+    ) {
+        let out = TempDir::new().unwrap();
+        // No .darkmux-runtime dir at all — the container never got far
+        // enough to create it, let alone write metrics.json.
+
+        let cumulative_from_metrics = read_cumulative_counts(out.path());
+        assert_eq!((cumulative_from_metrics.turns, cumulative_from_metrics.compactions), (0, 0));
+        let tokens_from_metrics = read_token_totals(out.path());
+        assert_eq!((tokens_from_metrics.prompt, tokens_from_metrics.completion), (0, 0));
+
+        let from_tailer_counts = CumulativeCounts { turns: 3000, compactions: 8 };
+        let from_tailer_tokens =
+            TokenTotals { prompt: 61_000, completion: 22_000, reasoning: None, cached: None };
+
+        let merged_counts = reconcile_cumulative_counts(cumulative_from_metrics, from_tailer_counts);
+        assert_eq!(merged_counts.turns, 3000, "payload must carry the tailer-observed turns, not 0");
+        assert_eq!(merged_counts.compactions, 8);
+
+        let merged_tokens = reconcile_token_totals(tokens_from_metrics, from_tailer_tokens);
+        assert_eq!(merged_tokens.prompt, 61_000, "payload must carry the tailer-observed tokens, not 0");
+        assert_eq!(merged_tokens.completion, 22_000);
+    }
+
     // ─── #2094 finding 8: turn_delay_effective_ms ─────────────────────────
 
     #[test]
@@ -8702,6 +8830,37 @@
         assert_eq!(turns, 2, "dispatch.turn unaffected by the telemetry emission");
     }
 
+    /// (#2263 review, minor) The tailer's per-turn token accumulation casts
+    /// each `usage` field's `u64` down to `u32` before feeding
+    /// `saturating_add` — the surrounding code's OWN stated convention is
+    /// "clamp, never wrap." A bare `as u32` cast wraps instead: a usage
+    /// value 5 over `u32::MAX` would read back as `4`, not `u32::MAX`.
+    /// Unreachable with a real token count, but this pins the cast itself
+    /// (`u32::try_from(..).unwrap_or(u32::MAX)`) independent of whether any
+    /// real provider can trigger it.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record()
+    fn handle_event_model_completed_saturates_rather_than_wraps_a_u64_usage_field_beyond_u32_max() {
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-sat".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // u32::MAX == 4_294_967_295; these are each 5 over it. A wrapping
+        // `as u32` cast reads each back as `4`; a saturating conversion
+        // clamps each to `u32::MAX`.
+        state.handle_event(
+            r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":4294967300,"completion_tokens":4294967300,"reasoning_tokens":4294967300,"cached_tokens":4294967300}}"#,
+        );
+        assert_eq!(state.summary.prompt_tokens, u32::MAX, "must clamp, not wrap to 4");
+        assert_eq!(state.summary.completion_tokens, u32::MAX, "must clamp, not wrap to 4");
+        assert_eq!(state.summary.reasoning_tokens, Some(u32::MAX), "must clamp, not wrap to 4");
+        assert_eq!(state.summary.cached_tokens, Some(u32::MAX), "must clamp, not wrap to 4");
+    }
+
     /// (#1483) A multi-turn / multi-tool agent loop stamps EVERY live per-event
     /// flow record (`dispatch.turn`, `dispatch.tool`, `telemetry.tokens`) with
     /// the graph `step_id` — so the mission-graph viewer can attribute the live
@@ -12527,6 +12686,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             0,
             &super::TrajectorySummary::default(),
             super::TokenTotals { prompt: 10, completion: 20, reasoning: None, cached: None },
+            super::CumulativeCounts::default(),
             None,
             &stats,
             &extras,
@@ -12549,13 +12709,31 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert!(payload["cached_tokens"].is_null());
     }
 
-    /// (#1444) When `TokenTotals` DOES carry a reasoning/cached figure
-    /// (metrics.json had the field, from a hosted reasoning-family
-    /// dispatch), the payload surfaces it as a real number — never
-    /// silently dropped.
+    /// (#1444) When the tailer's live token accumulation DOES carry a
+    /// reasoning/cached figure (a hosted reasoning-family dispatch
+    /// reported one on some turn), the payload surfaces it as a real
+    /// number — never silently dropped.
+    ///
+    /// (#2263) `prompt_tokens`/`completion_tokens`/`reasoning_tokens`/
+    /// `cached_tokens` on the payload now come from `TrajectorySummary`
+    /// (the tailer's live per-turn sum — this-invocation-only by
+    /// construction), NOT from `TokenTotals`/`tokens` (metrics.json's
+    /// whole-dispatch cumulative counters, seeded from the checkpoint on
+    /// a resume). This test constructs the summary directly instead of
+    /// routing the figures through `tokens`, which now only feeds the
+    /// separate `cumulative_prompt_tokens`/`cumulative_completion_tokens`
+    /// fields — asserted below too, so a regression that swaps the two
+    /// sources back is caught.
     #[test]
     fn build_dispatch_complete_payload_carries_reasoning_and_cached_tokens_when_present() {
         let stats = super::reduce_host_stats(&[]);
+        let summary = super::TrajectorySummary {
+            prompt_tokens: 100,
+            completion_tokens: 600,
+            reasoning_tokens: Some(500),
+            cached_tokens: Some(20),
+            ..Default::default()
+        };
         let payload = super::build_dispatch_complete_payload(
             1000,
             super::RestTotals { rest_ms: 0, rests: 0 },
@@ -12563,19 +12741,33 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "stdout-body",
             "",
             0,
-            &super::TrajectorySummary::default(),
-            super::TokenTotals { prompt: 100, completion: 600, reasoning: Some(500), cached: Some(20) },
+            &summary,
+            // (#2263) Deliberately DIFFERENT numbers from `summary` above —
+            // this is the WHOLE-DISPATCH cumulative view (as if a resume had
+            // already run once before), proving the payload's
+            // `prompt_tokens`/`completion_tokens` read from `summary`, not
+            // from this cumulative source.
+            super::TokenTotals { prompt: 9100, completion: 9600, reasoning: Some(9500), cached: Some(920) },
+            super::CumulativeCounts { turns: 7, compactions: 3 },
             None,
             &stats,
             &no_extras(),
             &None,
             None,
         );
+        assert_eq!(payload["prompt_tokens"], 100);
         assert_eq!(payload["completion_tokens"], 600);
         assert_eq!(payload["reasoning_tokens"], 500);
         assert_eq!(payload["cached_tokens"], 20);
         // Subset, never additional: reasoning_tokens <= completion_tokens.
         assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
+        // (#2263) The cumulative (whole-task) view lives in its OWN fields,
+        // sourced from `tokens`/`cumulative` — never conflated with the
+        // this-run numbers above.
+        assert_eq!(payload["cumulative_prompt_tokens"], 9100);
+        assert_eq!(payload["cumulative_completion_tokens"], 9600);
+        assert_eq!(payload["cumulative_turns"], 7);
+        assert_eq!(payload["cumulative_compactions"], 3);
     }
 
     #[test]
@@ -12606,6 +12798,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             137,
             &super::TrajectorySummary::default(),
             super::TokenTotals::default(),
+            super::CumulativeCounts::default(),
             Some("azure/gpt-x"),
             &stats,
             &extras,
@@ -12635,6 +12828,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             0,
             &super::TrajectorySummary::default(),
             super::TokenTotals::default(),
+            super::CumulativeCounts::default(),
             None,
             &super::HostStats::default(),
             &no_extras(),

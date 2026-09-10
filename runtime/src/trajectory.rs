@@ -90,6 +90,24 @@ pub struct Metrics {
     pub compactions: u32,
     pub total_prompt_tokens: u32,
     pub total_completion_tokens: u32,
+    /// (#2263) THIS invocation's own contribution to `turns` above — on a
+    /// resumed dispatch, `turns` is seeded from the checkpoint (the whole
+    /// dispatch's cumulative count, across every resume), so it is the
+    /// WRONG number to attribute to `model` above. This field is never
+    /// seeded: `0` on the first call of a fresh dispatch, and equal to
+    /// `turns` exactly on a dispatch that was never resumed (seed is
+    /// `0`). A consumer attributing cost or turn count to `model` reads
+    /// these `_this_run` fields, never the whole-dispatch ones.
+    pub turns_this_run: u32,
+    /// (#2263) This invocation's own contribution to `total_prompt_tokens`
+    /// above. See `turns_this_run`'s doc.
+    pub total_prompt_tokens_this_run: u32,
+    /// (#2263) This invocation's own contribution to
+    /// `total_completion_tokens` above. See `turns_this_run`'s doc.
+    pub total_completion_tokens_this_run: u32,
+    /// (#2263) This invocation's own contribution to `compactions` above.
+    /// See `turns_this_run`'s doc.
+    pub compactions_this_run: u32,
     /// (#1444) Sum of every turn's reported reasoning tokens. Whether they
     /// are a SUBSET of `total_completion_tokens` above or a third class
     /// outside it is PROVIDER-SPECIFIC — OpenAI and Azure document the
@@ -1430,6 +1448,10 @@ mod tests {
             compactions: 0,
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
+            turns_this_run: 3,
+            total_prompt_tokens_this_run: 0,
+            total_completion_tokens_this_run: 0,
+            compactions_this_run: 0,
             total_reasoning_tokens: None,
             total_cached_tokens: None,
             total_messages: 0,
@@ -1470,6 +1492,10 @@ mod tests {
             compactions: 0,
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
+            turns_this_run: 0,
+            total_prompt_tokens_this_run: 0,
+            total_completion_tokens_this_run: 0,
+            compactions_this_run: 0,
             total_reasoning_tokens: None,
             total_cached_tokens: None,
             total_messages: 0,

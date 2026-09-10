@@ -77,8 +77,43 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.45.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.46.0";
 // Version history:
+//   1.46.0 (#2263) — the internal-runtime `dispatch complete` payload's
+//           `prompt_tokens`/`completion_tokens`/`total_tokens`/
+//           `reasoning_tokens`/`cached_tokens` now come from the live
+//           tailer's per-turn accumulation (`TrajectorySummary`,
+//           this-invocation-only by construction — the SAME source
+//           `total_turns`/`total_compactions` already trusted), not from
+//           `metrics.json`'s `total_prompt_tokens`/`total_completion_
+//           tokens` (the runtime's WHOLE-DISPATCH cumulative counters,
+//           seeded from the checkpoint on `--resume-from`). A resumed
+//           dispatch used to report the PRIOR invocation's tokens folded
+//           into these fields, misattributed to whichever model the
+//           resumed dispatch happened to run — the same corruption the
+//           runtime's own `--json` envelope had (`metrics.turns`/
+//           `compactions`/`prompt_tokens`/`completion_tokens`, fixed
+//           unversioned since that envelope carries no schema of its
+//           own; see `LoopOutcome::turns_this_run`'s doc). A dispatch
+//           that was never resumed reports IDENTICAL numbers before and
+//           after this bump (the checkpoint seed is `0`), so this is a
+//           pure bug fix on the resumed path, never a shape change on
+//           the ordinary one.
+//
+//           MINOR, not major, following this history's own precedent
+//           (1.43.0's session_id value-convention change, cited there):
+//           no field was renamed or retyped, and the corrected value is
+//           the WHOLE reason these fields exist — an unfixed reader
+//           already had a wrong answer, not a differently-shaped one.
+//
+//           New keys, genuinely additive: `cumulative_turns` /
+//           `cumulative_compactions` / `cumulative_prompt_tokens` /
+//           `cumulative_completion_tokens` — the WHOLE TASK's counters
+//           across every resume (what `metrics.json` itself reports),
+//           for "what has this cost so far" alongside the now-correct
+//           per-invocation numbers. Equal to `total_turns`/
+//           `total_compactions`/`prompt_tokens`/`completion_tokens` on a
+//           never-resumed dispatch. Older readers ignore the new keys.
 //   1.45.0 (#1934) — additive payload keys `role` and `baseline` on every
 //           `telemetry.lms` load/unload payload (the ones `lms_diff`
 //           produces: `{event:"load", model, gb}` /

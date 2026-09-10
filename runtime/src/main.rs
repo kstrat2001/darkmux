@@ -1152,6 +1152,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             compactions: 0,
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
+            // (#2263) Same "no LoopOutcome survives an Err return" gap as
+            // every other hardcoded 0 in this arm.
+            turns_this_run: 0,
+            total_prompt_tokens_this_run: 0,
+            total_completion_tokens_this_run: 0,
+            compactions_this_run: 0,
             // (#1444) No `LoopOutcome` survives an `Err` return (same gap
             // this file's own `rest_ms`/`rests` comment already names for
             // this arm) — `None`, not `Some(0)`: nothing was measured, not
@@ -1191,6 +1197,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                 "error", None, &model, started_at_unix_ms, wall_ms,
                 // turns, compactions, prompt_tokens, completion_tokens
                 0, 0, 0, 0,
+                // (#2263) this_run — same "no LoopOutcome survives an Err
+                // return" limit as everything else on this path.
+                ThisRunCounters::default(),
                 // (#1444) reasoning_tokens, cached_tokens — `None`, not
                 // `Some(0)`: no `LoopOutcome` survives an `Err` return, so
                 // nothing was measured here at all.
@@ -1257,6 +1266,13 @@ fn metrics_from_outcome(
         compactions: o.compactions,
         total_prompt_tokens: o.total_prompt_tokens,
         total_completion_tokens: o.total_completion_tokens,
+        // (#2263) See `LoopOutcome::turns_this_run`'s doc — this invocation's
+        // own contribution, distinct from the whole-dispatch cumulative
+        // fields above.
+        turns_this_run: o.turns_this_run,
+        total_prompt_tokens_this_run: o.total_prompt_tokens_this_run,
+        total_completion_tokens_this_run: o.total_completion_tokens_this_run,
+        compactions_this_run: o.compactions_this_run,
         total_reasoning_tokens: o.total_reasoning_tokens,
         total_cached_tokens: o.total_cached_tokens,
         total_messages: o.messages.len(),
@@ -1297,6 +1313,12 @@ fn envelope_from_outcome(
         o.compactions,
         o.total_prompt_tokens,
         o.total_completion_tokens,
+        ThisRunCounters {
+            turns: o.turns_this_run,
+            compactions: o.compactions_this_run,
+            prompt_tokens: o.total_prompt_tokens_this_run,
+            completion_tokens: o.total_completion_tokens_this_run,
+        },
         o.total_reasoning_tokens,
         o.total_cached_tokens,
         o.messages.len(),
@@ -1304,6 +1326,23 @@ fn envelope_from_outcome(
         o.rests,
         o.turn_delay_effective_ms,
     )
+}
+
+/// (#2263) This invocation's own contribution to the four whole-dispatch
+/// counters `build_json_envelope` also takes, bundled into one struct
+/// rather than four more positional `u32`s. `build_json_envelope`'s own
+/// doc already names "many same-typed positional scalars" as exactly the
+/// shape that lets a wiring mistake hide silently; four more adjacent
+/// `u32`s of the SAME meaning-family as the four already there would make
+/// that risk worse, not better. See `LoopOutcome::turns_this_run`'s doc
+/// for what "this run" means and why it differs from the cumulative
+/// fields on a resumed dispatch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ThisRunCounters {
+    turns: u32,
+    compactions: u32,
+    prompt_tokens: u32,
+    completion_tokens: u32,
 }
 
 /// Construct the `--json` envelope. Pure function — extracted so the
@@ -1339,6 +1378,13 @@ fn build_json_envelope(
     compactions: u32,
     prompt_tokens: u32,
     completion_tokens: u32,
+    // (#2263) This invocation's own contribution to the four counters
+    // above — see `ThisRunCounters`'s doc. On a dispatch that was never
+    // resumed this is byte-for-byte the same as `turns`/`compactions`/
+    // `prompt_tokens`/`completion_tokens` above (the checkpoint seed is
+    // `0`), which is exactly what keeps the never-resumed envelope shape
+    // unchanged apart from the new key.
+    this_run: ThisRunCounters,
     // (#1444) `None` when no turn this dispatch ever reported the field —
     // serializes as JSON `null`, distinct from a fabricated `0`.
     reasoning_tokens: Option<u32>,
@@ -1362,10 +1408,26 @@ fn build_json_envelope(
             // u128 wall_ms is safe to narrow for JSON numeric encoding —
             // u64 covers 584 million years of milliseconds.
             "wall_ms": wall_ms as u64,
+            // (#2263) These four are the WHOLE dispatch's cumulative
+            // counters — on a resumed dispatch, seeded from the
+            // checkpoint, so they cover every resume that ever touched
+            // this task, not just `model` above. Attributing cost or turn
+            // count to `model` from these is the exact corruption #2263
+            // exists to fix — read `this_run` below instead for that.
             "turns": turns,
             "compactions": compactions,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            // (#2263) THIS invocation's own contribution — the honest
+            // "what did `model` above actually do" numbers. Equal to the
+            // four cumulative fields above whenever this dispatch was
+            // never resumed.
+            "this_run": {
+                "turns": this_run.turns,
+                "compactions": this_run.compactions,
+                "prompt_tokens": this_run.prompt_tokens,
+                "completion_tokens": this_run.completion_tokens,
+            },
             // (#1444) Billed reasoning burn from hosted reasoning-family
             // models. `null` when the provider never reported it (every
             // local LMStudio dispatch today). Whether it sits INSIDE
@@ -1521,6 +1583,14 @@ mod tests {
             turns: 2,
             total_prompt_tokens: 300,
             total_completion_tokens: 950,
+            // (#2263) Same values as the cumulative fields above — this
+            // helper is shared by tests that predate `_this_run` and don't
+            // exercise it; the dedicated resume-vs-fresh assertions live
+            // in their own test below instead of disturbing this one.
+            turns_this_run: 2,
+            total_prompt_tokens_this_run: 300,
+            total_completion_tokens_this_run: 950,
+            compactions_this_run: 1,
             total_reasoning_tokens: reasoning,
             total_cached_tokens: cached,
             final_answer: None,
@@ -1737,6 +1807,9 @@ mod tests {
             0,
             2970,
             112,
+            // (#2263) this_run — a fresh (never-resumed) dispatch, so
+            // identical to the cumulative fields above.
+            ThisRunCounters { turns: 1, compactions: 0, prompt_tokens: 2970, completion_tokens: 112 },
             // (#1444) reasoning_tokens, cached_tokens — a hosted
             // reasoning-family model reported both this turn.
             Some(80),
@@ -1764,6 +1837,12 @@ mod tests {
         assert_eq!(env["metrics"]["reasoning_tokens"], 80);
         assert_eq!(env["metrics"]["cached_tokens"], 64);
         assert_eq!(env["metrics"]["total_messages"], 3);
+        // (#2263) A never-resumed dispatch's `this_run` block equals the
+        // cumulative fields above, field for field.
+        assert_eq!(env["metrics"]["this_run"]["turns"], 1);
+        assert_eq!(env["metrics"]["this_run"]["compactions"], 0);
+        assert_eq!(env["metrics"]["this_run"]["prompt_tokens"], 2970);
+        assert_eq!(env["metrics"]["this_run"]["completion_tokens"], 112);
         // (#2094 second round, finding 3 CONSIDER) The rest fields live
         // right next to wall_ms in the same metrics object.
         assert_eq!(env["metrics"]["rest_ms"], 1000);
@@ -1776,7 +1855,8 @@ mod tests {
         // Failure path emits same envelope shape so consumers can parse
         // uniformly without branching on success/error.
         let env = build_json_envelope(
-            "error", None, "darkmux:foo", 1700000000000, 500, 0, 0, 0, 0, None, None, 0, 0, 0, 0,
+            "error", None, "darkmux:foo", 1700000000000, 500, 0, 0, 0, 0,
+            ThisRunCounters::default(), None, None, 0, 0, 0, 0,
         );
         assert_eq!(env["result"], "error");
         assert!(env["final_assistant"].is_null(), "error envelope must have null final_assistant");
@@ -1795,7 +1875,9 @@ mod tests {
     fn json_envelope_serializes_as_single_line() {
         // qa-review parses with `jq -c` — verify the serialized form is
         // single-line + valid JSON. (No surprise whitespace, etc.)
-        let env = build_json_envelope("stop", Some("x"), "m", 0, 0, 0, 0, 0, 0, None, None, 0, 0, 0, 0);
+        let env = build_json_envelope(
+            "stop", Some("x"), "m", 0, 0, 0, 0, 0, 0, ThisRunCounters::default(), None, None, 0, 0, 0, 0,
+        );
         let s = serde_json::to_string(&env).unwrap();
         assert!(!s.contains('\n'), "envelope must serialize on one line; got: {s}");
         // Round-trip must produce identical structure.
@@ -1810,7 +1892,9 @@ mod tests {
         // stays parseable. Regression guard for "naive println escaping"
         // mistakes that would tempt a future refactor.
         let tricky = "line1\nline2\twith \"quotes\" and \\backslash";
-        let env = build_json_envelope("stop", Some(tricky), "m", 0, 0, 0, 0, 0, 0, None, None, 0, 0, 0, 0);
+        let env = build_json_envelope(
+            "stop", Some(tricky), "m", 0, 0, 0, 0, 0, 0, ThisRunCounters::default(), None, None, 0, 0, 0, 0,
+        );
         let s = serde_json::to_string(&env).unwrap();
         let back: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(back["final_assistant"], tricky);
