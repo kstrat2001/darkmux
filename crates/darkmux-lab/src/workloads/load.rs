@@ -685,6 +685,31 @@ mod tests {
         assert_eq!(loaded.source, WorkloadSource::Embedded);
     }
 
+    /// (#2493) Pins the shipped `quick-q` manifest's verify keyword to the
+    /// stemmed form. A v3.7.1 dogfood run answered correctly with
+    /// "activates" and failed verify because the keyword was the bare
+    /// "active" — an inflection the case-sensitive substring check
+    /// (`run_verify` in `providers/prompt.rs`) can't see through. This test
+    /// guards the OTHER half of that fix: a future manifest edit reverting
+    /// the keyword back to "active" would reintroduce the exact bug even
+    /// with `run_verify`'s matcher unchanged, since a bare-word manifest
+    /// keyword is what made it inflection-brittle in the first place.
+    #[test]
+    fn quick_q_verify_keyword_is_stemmed_not_a_bare_inflection() {
+        let loaded = load("quick-q", None).expect("quick-q should load from the embedded const");
+        let verify = loaded
+            .manifest
+            .workload
+            .verify
+            .as_ref()
+            .expect("quick-q ships a verify spec");
+        assert_eq!(
+            verify.must_contain,
+            vec!["activ".to_string()],
+            "quick-q's must_contain keyword regressed to a bare inflection — see #2493"
+        );
+    }
+
     /// (#1530) The ONBOARDING workload specifically — `skills/darkmux-lab-run`
     /// tells a brand-new operator to run `darkmux lab run demo-quickstart`,
     /// and a brew / `cargo install` operator has no source checkout, so the

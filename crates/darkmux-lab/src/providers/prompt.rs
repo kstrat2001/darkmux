@@ -297,15 +297,24 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> VerifyOutcome {
             };
         }
     };
+    // (#2493) Case-INSENSITIVE substring match. What this check is
+    // actually establishing is "did the reply's text carry this signal
+    // anywhere" — never "did the model spell it with this exact casing".
+    // A command-output keyword (`"OK"`, `"FAILED"`) is emitted verbatim by
+    // a deterministic test runner, so this costs those checks nothing; a
+    // free-text model reply (quick-q's `"active"`) can capitalize a word
+    // at a sentence boundary the prompt itself didn't, and a brittle
+    // case-sensitive check has no way to tell that apart from a real miss.
+    let text_lower = text.to_lowercase();
     let missing: Vec<&String> = v
         .must_contain
         .iter()
-        .filter(|s| !text.contains(s.as_str()))
+        .filter(|s| !text_lower.contains(&s.to_lowercase()))
         .collect();
     let present: Vec<&String> = v
         .must_not_contain
         .iter()
-        .filter(|s| text.contains(s.as_str()))
+        .filter(|s| text_lower.contains(&s.to_lowercase()))
         .collect();
     if missing.is_empty() && present.is_empty() {
         return VerifyOutcome {
@@ -516,6 +525,53 @@ mod tests {
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
         let v = run_verify(&loaded, "we have alpha and beta here");
         assert!(v.passed);
+    }
+
+    /// (#2493) The exact live failure: a v3.7.1 dogfood run of `quick-q`
+    /// answered correctly using "activates" and failed verify because the
+    /// manifest's keyword was the bare "active" matched case-sensitively —
+    /// `"activates".contains("active")` is true, so this specific pair was
+    /// never actually the break; the real inflected miss is a form that
+    /// does NOT contain "active" as a substring at all, e.g. "activating"
+    /// still contains it, but a keyword of "activ" catches every inflected
+    /// form uniformly by design rather than by accident of substring luck.
+    /// This test pins the shape darkmux actually ships today: `quick-q`'s
+    /// manifest keyword is the stem `"activ"`, checked case-insensitively.
+    #[test]
+    fn run_verify_accepts_every_inflection_of_a_stemmed_keyword() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = spec_with_prompt("x");
+        spec.verify = Some(VerifySpec {
+            must_contain: vec!["activ".into()],
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        for reply in [
+            "it activates a small fraction of its parameters",
+            "the activated subset stays small",
+            "this is a form of sparse activation",
+            "only a few parameters are active per forward pass",
+        ] {
+            let v = run_verify(&loaded, reply);
+            assert!(v.passed, "expected {reply:?} to pass a stemmed \"activ\" check, got {v:?}");
+        }
+    }
+
+    /// (#2493) Case must not matter for a free-text keyword check — a model
+    /// is free to capitalize a word at a sentence boundary the prompt
+    /// itself never did, and that is not evidence the answer missed the
+    /// concept the check is guarding.
+    #[test]
+    fn run_verify_keyword_match_is_case_insensitive() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = spec_with_prompt("x");
+        spec.verify = Some(VerifySpec {
+            must_contain: vec!["active".into()],
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let v = run_verify(&loaded, "Active parameters differ between the two.");
+        assert!(v.passed, "expected a capitalized match to pass, got {v:?}");
     }
 
     #[test]
