@@ -2,6 +2,7 @@
 
 use crate::{ack_job, claim_job, init_consumer_group, ClaimOutcome, ClaimedJob, WorkJob, WORK_STREAM};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // ─── Daemon runner loop (PR-C.2) ──────────────────────────────────────
@@ -28,6 +29,51 @@ pub(crate) const RUNNER_CONSUMER_GROUP: &str = "darkmux-runners";
 /// every BLOCK round) and long enough that a quiet queue doesn't
 /// hot-spin Redis. (#246 PR-C.2)
 const RUNNER_BLOCK_MS: u64 = 2_000;
+
+/// (#2476 review round 2, MUST FIX 3) True while this thread is inside
+/// its one synchronous `crew::dispatch::dispatch()` call — the span that
+/// covers `dispatch_internal.rs`'s own post-wait interrupt check
+/// (`is_set() && !status.success()`, the thing that actually issues
+/// `docker kill <container>`; `kill_all` alone only kills the `docker
+/// run` CLIENT process, never the container — see
+/// `darkmux_serve::reap_dispatch_children_on_shutdown`'s own doc). The
+/// daemon's shutdown path polls [`dispatch_in_flight`], bounded, after
+/// signaling the interrupt, so that post-wait check gets a real window
+/// to run before the process exits, rather than the process exiting the
+/// instant its own (unrelated) HTTP connection drain completes — which
+/// can be near-instant on an idle daemon and has nothing to do with
+/// whether this SEPARATE, unjoined `std::thread` has reacted to the
+/// interrupt yet. Only one dispatch runs on this thread at a time (the
+/// claim/dispatch/ack loop is strictly sequential), so a bare
+/// `AtomicBool` is sufficient — no counter needed.
+static RUNNER_DISPATCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// True while the runner thread is inside `dispatch()` — see
+/// [`RUNNER_DISPATCH_IN_FLIGHT`]'s own doc. Read-only from any other
+/// thread or crate (`darkmux-serve`'s shutdown path is the one caller
+/// today).
+pub fn dispatch_in_flight() -> bool {
+    RUNNER_DISPATCH_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+/// RAII guard scoping [`RUNNER_DISPATCH_IN_FLIGHT`] to exactly the
+/// `dispatch()` call — set true on construction, false on drop,
+/// regardless of how the call returns (`Ok`, `Err`, or a panic the
+/// caller's own `catch_unwind` converts back into a normal return).
+struct DispatchInFlightGuard;
+
+impl DispatchInFlightGuard {
+    fn new() -> Self {
+        RUNNER_DISPATCH_IN_FLIGHT.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for DispatchInFlightGuard {
+    fn drop(&mut self) {
+        RUNNER_DISPATCH_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Spawn the daemon runner thread. Returns the JoinHandle so callers
 /// can monitor (typically the daemon never joins — the runner runs
@@ -270,7 +316,15 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     // Convert + dispatch. The dispatch function is synchronous and may
     // block several minutes for long-agentic dispatches.
     let opts = job.into_dispatch_opts();
-    let dispatch_result = darkmux_crew::dispatch::dispatch(opts);
+    // (#2476 review round 2, MUST FIX 3) Scoped tightly to the dispatch
+    // call itself — see `DispatchInFlightGuard`'s and
+    // `RUNNER_DISPATCH_IN_FLIGHT`'s own docs. The flag goes false the
+    // instant `dispatch()` returns, not when this whole function (ack
+    // included) finishes.
+    let dispatch_result = {
+        let _in_flight = DispatchInFlightGuard::new();
+        darkmux_crew::dispatch::dispatch(opts)
+    };
 
     match dispatch_result {
         Ok(outcome) => {

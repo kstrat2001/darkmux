@@ -137,6 +137,33 @@ pub fn kill_all(sig: i32) {
     }
 }
 
+/// Send `sig` to every currently-registered child pid EXCEPT those in
+/// `excluded` — the same best-effort, snapshot-then-signal semantics as
+/// [`kill_all`], but lets a caller carve out pids it has decided to
+/// handle more gently (a targeted SIGTERM plus a bounded wait, never
+/// escalated to this call's own signal) rather than reaching them with
+/// the blanket sweep too.
+///
+/// (#2476 review round 2, MUST FIX 2) Added for `darkmux acp`'s shutdown
+/// handler: a `mission launch` child holds its own `LaunchFinalizeGuard`
+/// and its own registered docker/curl grandchildren, so SIGKILLing it
+/// alongside every other registered dispatch child (the router/answerer
+/// curl calls, which hold no such state) leaves the mission `active`
+/// with no terminal record and orphans those grandchildren — this call
+/// lets the caller reap everything else while leaving pids it has
+/// already signaled more carefully untouched.
+pub fn kill_all_except(sig: i32, excluded: &BTreeSet<u32>) {
+    let pids: Vec<u32> = match CHILDREN.lock() {
+        Ok(set) => set.iter().copied().filter(|pid| !excluded.contains(pid)).collect(),
+        Err(_) => return,
+    };
+    for pid in pids {
+        unsafe {
+            libc::kill(pid as libc::pid_t, sig);
+        }
+    }
+}
+
 /// Test-only: empty the registry so back-to-back tests in the SAME
 /// process (this global is process-wide, not per-test) don't contaminate
 /// each other. Gated the same way `darkmux-types`'s other test-support
@@ -223,5 +250,66 @@ mod tests {
         register(999_999); // extremely unlikely to be a real live pid
         kill_all(SIGKILL);
         deregister(999_999);
+    }
+
+    /// [`kill_all_except`]'s whole reason to exist: two real registered
+    /// children, one named in `excluded` — the sweep must kill the
+    /// OTHER one and leave the excluded one alive. RED-proved by hand:
+    /// swapping this call for plain `kill_all` (ignoring `excluded`)
+    /// makes the "excluded survives" assertion below fail, since both
+    /// children would die.
+    #[test]
+    #[serial_test::serial]
+    fn kill_all_except_spares_the_excluded_pid_and_kills_the_rest() {
+        reset_for_test();
+        let mut spared = std::process::Command::new("sleep").arg("30").spawn().expect("spawning the spared child");
+        let mut reaped = std::process::Command::new("sleep").arg("30").spawn().expect("spawning the reaped child");
+        let spared_pid = spared.id();
+        let reaped_pid = reaped.id();
+        register(spared_pid);
+        register(reaped_pid);
+
+        let excluded: BTreeSet<u32> = [spared_pid].into_iter().collect();
+        kill_all_except(SIGKILL, &excluded);
+
+        let reaped_status =
+            reaped.wait_timeout_or_kill(std::time::Duration::from_secs(5), "kill_all_except's target");
+        assert!(!reaped_status.success(), "the non-excluded child must be killed: {reaped_status:?}");
+
+        // The spared child must still be alive — poll briefly rather than
+        // asserting instantly, since a false pass here (checking before
+        // `kill_all_except` could possibly have reached it) would prove
+        // nothing.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            spared.try_wait().expect("polling the spared child").is_none(),
+            "kill_all_except must not signal an excluded pid"
+        );
+        kill_pid(spared_pid, SIGKILL).expect("cleaning up the spared child");
+        let _ = spared.wait();
+        deregister(spared_pid);
+        deregister(reaped_pid);
+    }
+
+    /// Small helper so the exclusion test above reads as an assertion,
+    /// not a hand-rolled poll loop — used exactly once, kept local
+    /// rather than promoted to a shared test util for one call site.
+    trait WaitTimeoutOrKill {
+        fn wait_timeout_or_kill(&mut self, timeout: std::time::Duration, label: &str) -> std::process::ExitStatus;
+    }
+
+    impl WaitTimeoutOrKill for std::process::Child {
+        fn wait_timeout_or_kill(&mut self, timeout: std::time::Duration, label: &str) -> std::process::ExitStatus {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if let Some(status) = self.try_wait().expect("polling a child") {
+                    return status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("{label} did not exit within {timeout:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
     }
 }
