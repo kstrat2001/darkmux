@@ -683,6 +683,53 @@ impl StepKind for DispatchInternalStepKind {
     ) -> Option<String> {
         task_or_config_str(task.role_id.as_ref(), step, "role_id")
     }
+
+    /// (#2614 review, MUST FIX + "Also fix" wrong-problem-surfaced finding)
+    /// The scheduler-hoisted half of the `--resume-from` checkpoint gate —
+    /// see `StepKind::resume_precheck`'s own doc for the full "why here,
+    /// why not the workdir check too" reasoning. The early-out on a bare
+    /// `config_str` read (no `resume_from` key at all) stays cheap and
+    /// I/O-free for the overwhelming majority of dispatches that never set
+    /// one; only a `--resume-from` dispatch pays for the full
+    /// `dispatch_opts_for` hop below.
+    ///
+    /// **Order matters here.** `refuse_resume_on_bare_hosted_path` runs
+    /// FIRST — a role that resolves to the bare hosted single-shot path
+    /// (a remote profile + a tool-less role) can never honor a resume
+    /// AT ALL, checkpoint content notwithstanding; checking checkpoint
+    /// existence/schema first would surface "checkpoint not found" for a
+    /// dispatch that was always going to be refused for an entirely
+    /// different, more fundamental reason once the operator fixed it. Only
+    /// once that's ruled out does `validate_resume_checkpoint_content` run
+    /// — the workdir-independent existence/schema/role-match half of the
+    /// gate. The workspace/mount-mode half stays inside `dispatch_internal
+    /// ::dispatch`'s own `validate_resume_checkpoint` call, which runs
+    /// later (post-wave-load) once this step's real workspace is resolved;
+    /// that later call re-validates the content half too (a harmless
+    /// second no-op read of the same file), same "duplicate read, not
+    /// duplicate authority" pattern the CLI wrapper's now-deleted hoist
+    /// relied on.
+    fn resume_precheck(
+        &self,
+        step: &Step,
+        task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
+    ) -> Result<()> {
+        if config_str(step, "resume_from").is_none() {
+            return Ok(());
+        }
+        let opts = dispatch_opts_for(step, task, input)
+            .with_context(|| format!("step `{}` dispatch.internal", step.id))?;
+        let Some(resume_from) = opts.resume_from.clone() else {
+            return Ok(());
+        };
+        crate::dispatch_internal::refuse_resume_on_bare_hosted_path(&opts)
+            .context("darkmux dispatch --resume-from")?;
+        crate::dispatch_internal::validate_resume_checkpoint_content(&resume_from, &opts.role_id)
+            .context("darkmux dispatch --resume-from")?;
+        Ok(())
+    }
 }
 
 /// (#1412) Clamp a requested `max_tokens` down to the per-execution remote
@@ -3147,6 +3194,7 @@ impl StepKind for ProceduralNoopStepKind {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::TempDir;
 
     fn step(id: &str, kind: &str, config: serde_json::Value) -> Step {
         Step {
@@ -3191,6 +3239,111 @@ mod tests {
     /// implementations read the bus, so an empty one is sufficient here.
     fn bare_ctx() -> StepRunCtx {
         StepRunCtx::new(None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
+    }
+
+    // ── #2614 review: resume_precheck / message ordering ────────────────
+
+    /// (#2614 review, MUST FIX) `StepKind::resume_precheck` is what closes
+    /// the checkpoint gate on the mission-launcher / panel entry points
+    /// #2585 never reached — proved here by driving the SCHEDULER-FACING
+    /// trait method directly, on the real production kind, with NO
+    /// `run_step_graph`/Docker/model involved.
+    #[test]
+    fn dispatch_internal_resume_precheck_refuses_a_missing_checkpoint() {
+        let resume_from = TempDir::new().unwrap(); // no checkpoint.json written
+        let s = step(
+            "s1",
+            "dispatch.internal",
+            json!({
+                "role_id": "coder",
+                "message": "resume please",
+                "resume_from": resume_from.path().to_str().unwrap(),
+            }),
+        );
+        let err = DispatchInternalStepKind
+            .resume_precheck(&s, &empty_task(), &BTreeMap::new(), &bare_ctx())
+            .expect_err("a --resume-from with no checkpoint must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RESUME CHECKPOINT NOT FOUND"), "{msg}");
+        assert!(msg.contains("darkmux dispatch --resume-from"), "{msg}");
+    }
+
+    #[test]
+    fn dispatch_internal_resume_precheck_is_a_noop_with_no_resume_from_configured() {
+        let s = step("s1", "dispatch.internal", json!({"role_id": "coder", "message": "hi"}));
+        DispatchInternalStepKind
+            .resume_precheck(&s, &empty_task(), &BTreeMap::new(), &bare_ctx())
+            .expect("no `resume_from` key at all must never refuse");
+    }
+
+    /// (#2614 review, "Also fix" — wrong problem surfaced) A role that
+    /// resolves to the bare hosted single-shot path (a remote profile, no
+    /// tools) can NEVER honor `--resume-from` — regardless of whether the
+    /// checkpoint at `resume_from` is even valid. `resume_from` here has
+    /// NO `checkpoint.json` (deliberately invalid), the same repro shape
+    /// as the sibling test above — so if `validate_resume_checkpoint_
+    /// content` ran BEFORE `refuse_resume_on_bare_hosted_path` inside
+    /// `resume_precheck`, this would surface "RESUME CHECKPOINT NOT
+    /// FOUND" instead: the operator fixes a checkpoint that could never
+    /// have helped, redispatches, and only then discovers resume was
+    /// never possible on this role shape at all. `pr-reviewer` is a real
+    /// built-in, tool-less role (same fixture
+    /// `dispatch_remote_refuses_resume_from_before_the_http_call` in
+    /// `dispatch_internal_tests.rs` uses) pinned at a `config_path`
+    /// profiles registry whose only profile targets a REMOTE endpoint —
+    /// no HTTP mock needed, since a correct refusal never dials it.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_internal_resume_precheck_names_the_remote_single_shot_path_not_the_checkpoint() {
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let registry_dir = TempDir::new().unwrap();
+        let pf = registry_dir.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"cloud":{"models":[
+                    {"id":"gpt-remote","n_ctx":100000,
+                     "endpoint":{"url":"http://127.0.0.1:1"}}
+                ]}},
+                "default_profile":"cloud"}"#,
+        )
+        .unwrap();
+
+        let resume_from = TempDir::new().unwrap(); // deliberately no checkpoint.json
+
+        let s = step(
+            "s1",
+            "dispatch.internal",
+            json!({
+                "role_id": "pr-reviewer",
+                "message": "resume please",
+                "resume_from": resume_from.path().to_str().unwrap(),
+                "config_path": pf.to_str().unwrap(),
+            }),
+        );
+
+        let result = DispatchInternalStepKind.resume_precheck(&s, &empty_task(), &BTreeMap::new(), &bare_ctx());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        let err = result.expect_err("a bare-hosted role with --resume-from must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not supported on the remote single-shot dispatch path"),
+            "must name the remote single-shot path as the reason: {msg}"
+        );
+        assert!(
+            !msg.contains("RESUME CHECKPOINT NOT FOUND"),
+            "must not surface a checkpoint-content error first for a role this can never \
+             resume regardless of checkpoint validity: {msg}"
+        );
     }
 
     // ── (#2570) load/wire agreement for dispatch.single_shot / dispatch.map ──

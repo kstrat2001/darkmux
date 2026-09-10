@@ -898,6 +898,124 @@ pub fn run_step_graph(
         // keystrokes. The interactive prompt stays where it already was, on
         // the CLI verb's pre-`run_step_graph` path. See
         // `licensed_adjacent_ack_status`'s own doc.
+        // (#2614 review, "Also fix" — merged) This used to be TWO separate
+        // loops back to back over the same `ready_ids` — the licensed-
+        // adjacent consent gate (#1511, doc below) and the `--resume-from`
+        // checkpoint gate (#2614, doc below) — each independently cloning
+        // the same `step`/`task` snapshot and calling the same
+        // `gather_inputs` (which clones every satisfied dependency's whole
+        // output; on a fan-out wave that cost is siblings × upstream
+        // bytes) for every step that reached it. `resume_precheck` reads
+        // `input` at all only inside `dispatch.internal`'s own resume-
+        // gated branch — every OTHER kind (i.e. the overwhelming majority
+        // of dispatches, and every dispatch that isn't a `--resume-from`
+        // one) ignored it entirely, so the second loop's whole `input`
+        // computation was pure waste layered on top of the first loop's
+        // identical, already-wasted-per-kind computation. One pass, one
+        // snapshot, one `gather_inputs`, one `ctx` — both gates still run
+        // in the SAME order (ack before resume) with the SAME "fail the
+        // one step, not the batch" shape, so a step that fails the ack
+        // gate is refused there and never reaches the resume check, byte-
+        // for-byte matching what two sequential loops produced.
+        //
+        // (#1511) Licensed-adjacent operator-consent gate — for every
+        // gate-approved ready step, on this main thread, strictly BEFORE
+        // `jobs` is built below (the structure `plan_waves`/
+        // `ensure_wave_loaded` draw their placements from). See
+        // `crate::dispatch::licensed_adjacent_ack_status`'s own doc for
+        // what "licensed-adjacent" means and the ack's operator-sovereign
+        // escape hatches.
+        //
+        // Before this, the SAME check lived only inside
+        // `dispatch_internal::dispatch` — a step's own `run`/`run_streaming`
+        // body — which `ensure_wave_loaded` (inside `run_bounded`, called
+        // further down) already runs BEFORE any step body ever executes.
+        // So a mission config staffing an unacked licensed-adjacent role
+        // pulled the model into RAM — real resource cost — before the
+        // operator ever saw the disclaimer (#1511). #1510 fixed only the
+        // `dispatch` CLI verb's own crew-of-one path
+        // (`dispatch_as_crew_of_one_with`, which calls the PROMPTING check
+        // before `run_step_graph` even starts, i.e. before ANY step in its
+        // one-step graph reaches this loop) — general mission configs
+        // (`mission launch <config>`, multi-task graphs) still routed
+        // every step through this scheduler and never got that fix.
+        //
+        // THE ROLE COMES FROM THE KIND, never from a field read here.
+        // `StepKind::dispatch_role` is asked, and it is the same method
+        // the kind's own `seat()` resolves its placement from — see that
+        // trait method's doc. An earlier version of this filter read
+        // `task.role_id.or(step.config.role_id)` directly, which is a
+        // PARALLEL GUESS: `mission.coder` takes its role off the run's
+        // `ArtifactBus` and never reads `task.role_id` at all, and
+        // `crawl.unit` defaults to `"crawler"` when the task names none —
+        // so with the gate fully in place, a task naming a benign role (or
+        // naming none) still loaded the forbidden model, because the guess
+        // and the loader were reading different sources. Both mutations
+        // were proven, not suspected; see the tests at the bottom of this
+        // module.
+        //
+        // `None` here means the KIND DECLARED it dispatches no role — a
+        // `procedural.*` step, a bare-model `dispatch.single_shot`/
+        // `dispatch.map` (including an empty map, which loads nothing), or
+        // a kind whose local seat would not resolve at all (for which the
+        // wave loader performs no load either). It is not the scheduler
+        // failing to guess. That distinction is what makes `Ok(())` safe
+        // here, and the registry conformance tests assert the implication
+        // that backs it: a kind whose seat claims a real model or endpoint
+        // must name a role.
+        //
+        // And it NEVER PROMPTS. `licensed_adjacent_ack_status` is the
+        // check-only variant on purpose — but NOT merely because this loop
+        // is on the main thread: `resolve_gate` above blocks on that same
+        // thread and says so in its own comment. The difference is opt-in.
+        // A gate blocks only for a step the operator marked `gate:
+        // "operator"` in the mission config; a consent prompt would sit on
+        // the path of EVERY ready step of EVERY wave in EVERY graph,
+        // including a mission launched detached with an inherited TTY,
+        // which would hang indefinitely while eating the parent shell's
+        // keystrokes. The interactive prompt stays where it already was, on
+        // the CLI verb's pre-`run_step_graph` path. See
+        // `licensed_adjacent_ack_status`'s own doc.
+        //
+        // (#2614) The `--resume-from` checkpoint gate, run second — for
+        // the identical reason the ack gate above is hoisted here:
+        // `dispatch.internal`'s own in-body copy
+        // (`dispatch_internal::dispatch`'s `validate_resume_checkpoint`
+        // call) sits behind `run()`, which `ensure_wave_loaded` (inside
+        // `run_bounded`, further down) already runs BEFORE any step body
+        // executes. #2585 fixed this ONLY on `darkmux dispatch`'s own
+        // crew-of-one path — a mission config or the panel staffing a
+        // `dispatch.internal` step with `resume_from` in its config went
+        // through neither hoist, so a bad checkpoint on those paths still
+        // paid the full residency cost (evict + load tens of gigabytes)
+        // before ever being refused, and the error named a model load
+        // rather than the checkpoint that caused it. `kind.resume_precheck`
+        // — never a parallel guess at what `dispatch.internal` reads off
+        // `step.config` — see that method's own doc for why it is asked of
+        // the kind rather than re-derived here, and for why it
+        // deliberately does NOT validate the working directory itself
+        // (only `dispatch_internal::validate_resume_checkpoint_content`,
+        // the workdir-independent half of the gate): a mission graph's
+        // workdir can legitimately be a path a still-earlier step in the
+        // same run materializes, so a scheduler-side existence check would
+        // refuse work that is only valid once the wave actually runs.
+        // Defaults to `Ok(())` for every kind that never reads
+        // `resume_from` — every kind except `dispatch.internal` today.
+        //
+        // Filtering here, before `jobs` is built, means a refused/unacked
+        // step's placement is never handed to `plan_waves` at all — there
+        // is nothing to "half-load": the step is dropped from THIS wave
+        // exactly like a declined operator gate above (`apply_step_terminal`,
+        // identical terminal shape), and every OTHER ready step in the
+        // same wave — including a sibling actually bound for a real load —
+        // is unaffected. A whole-wave refusal was considered and rejected
+        // for both gates: consent/resume validity is a per-STEP decision,
+        // not a per-wave one, so failing only the offending step (loud,
+        // via its own terminal error) keeps an unrelated sibling's
+        // dispatch from being held hostage — the same "fail the one step,
+        // not the batch" precedent the gate-decline filter above and
+        // `ensure_wave_loaded`'s own per-placement refusal both already
+        // establish.
         let ready_ids: Vec<String> = {
             let mut approved: Vec<String> = Vec::with_capacity(ready_ids.len());
             for id in ready_ids {
@@ -916,6 +1034,9 @@ pub fn run_step_graph(
                     approved.push(id);
                     continue;
                 };
+                // Computed ONCE, shared by both gates below — see this
+                // block's own doc for why a second, identical computation
+                // per step was pure waste.
                 let input = gather_inputs(&step_snapshot, &task_snapshot, tasks, steps);
                 // The same run-scoped `ArtifactBus` `seat()` and
                 // `run_streaming` read below — `mission.coder` resolves its
@@ -929,11 +1050,31 @@ pub fn run_step_graph(
                     dispatch_override.clone(),
                     bus.clone(),
                 );
+
                 let ack_result = match kind.dispatch_role(&step_snapshot, &task_snapshot, &input, &ctx) {
                     Some(role_id) => crate::dispatch::licensed_adjacent_ack_status(&role_id),
                     None => Ok(()),
                 };
-                match ack_result {
+                if let Err(e) = ack_result {
+                    apply_step_terminal(
+                        steps,
+                        tasks,
+                        &mut report,
+                        &mut *emit,
+                        &mut *persist,
+                        &id,
+                        now_unix(),
+                        // Refused before any dispatch attempt — nothing
+                        // to time, so no `StepRecord`, same as a
+                        // declined gate above.
+                        None,
+                        Err(format!("{e:#}")),
+                        Vec::new(),
+                    );
+                    continue;
+                }
+
+                match kind.resume_precheck(&step_snapshot, &task_snapshot, &input, &ctx) {
                     Ok(()) => approved.push(id),
                     Err(e) => {
                         apply_step_terminal(
@@ -944,9 +1085,6 @@ pub fn run_step_graph(
                             &mut *persist,
                             &id,
                             now_unix(),
-                            // Refused before any dispatch attempt — nothing
-                            // to time, so no `StepRecord`, same as a
-                            // declined gate above.
                             None,
                             Err(format!("{e:#}")),
                             Vec::new(),
@@ -958,12 +1096,13 @@ pub fn run_step_graph(
         };
 
         if ready_ids.is_empty() {
-            // Every step ready this wave was gate-declined or refused the
-            // licensed-adjacent consent gate — nothing left to run THIS
-            // wave, but a later wave may still have work (a sibling task
-            // the decline/refusal didn't touch). Loop back to
-            // `step_is_ready` rather than falling through the empty-wave
-            // machinery below for no reason.
+            // Every step ready this wave was gate-declined, refused the
+            // licensed-adjacent consent gate, or refused its own
+            // `resume_precheck` (#2614) — nothing left to run THIS wave,
+            // but a later wave may still have work (a sibling task the
+            // decline/refusal didn't touch). Loop back to `step_is_ready`
+            // rather than falling through the empty-wave machinery below
+            // for no reason.
             report.iterations += 1;
             continue;
         }
@@ -4973,6 +5112,32 @@ mod tests {
         fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
             Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![] })
         }
+        /// (#2614 review, MUST FIX) Stands in for `dispatch.internal`'s
+        /// real `resume_precheck` — reads an optional `resume_from` string
+        /// off `step.config` and, when present, calls the SAME production
+        /// `validate_resume_checkpoint_content` the real kind calls. This
+        /// is what lets `resume_precheck_never_reaches_the_wave_loader_for_
+        /// a_generic_mission_graph_step` below prove the scheduler's new
+        /// filter loop generically — with NO crew-of-one wrapper anywhere
+        /// in the call path, the shape a `mission launch <config>` step
+        /// actually runs through.
+        fn resume_precheck(
+            &self,
+            step: &Step,
+            task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> Result<()> {
+            let Some(resume_from) =
+                step.config.get("resume_from").and_then(|v| v.as_str()).map(std::path::PathBuf::from)
+            else {
+                return Ok(());
+            };
+            let role_id = Self::role_of(step, task)
+                .ok_or_else(|| anyhow::anyhow!("step `{}`: no role to validate a resume against", step.id))?;
+            crate::dispatch_internal::validate_resume_checkpoint_content(&resume_from, &role_id)?;
+            Ok(())
+        }
     }
 
     /// The artifact name `BusRoleLocalModelKind` below reads its dispatch
@@ -5216,6 +5381,117 @@ mod tests {
         assert_eq!(steps["ok-step"].status, NodeStatus::Complete);
         assert_eq!(steps["ok-step"].output.as_deref(), Some("ok"));
         assert!(report.completed.contains(&"ok-step".to_string()));
+    }
+
+    /// (#2614 review, MUST FIX) The gap the ack-gate test above does NOT
+    /// cover: `--resume-from` on a GENERIC mission-graph step, with no
+    /// crew-of-one wrapper anywhere in the call path — the exact shape a
+    /// `mission launch <config>` step or the panel runs through, which
+    /// #2585's wrapper-local hoist never reached at all. Two ready steps
+    /// land in the SAME wave (no deps, both an ordinary `"coder"` role so
+    /// the licensed-adjacent gate has nothing to say about either): one
+    /// carries a `resume_from` pointing at a directory with NO
+    /// `checkpoint.json` and wants `forbidden-model`; the other carries no
+    /// `resume_from` at all and wants `normal-model`. Proves ORDER, not
+    /// mere presence, the same two ways `licensed_adjacent_role_never_
+    /// reaches_the_wave_loader` does: the host PANICS if ever asked to
+    /// load `forbidden-model` (so the refusal must fire before
+    /// `ensure_wave_loaded`), and the sibling still loads its own model
+    /// and runs to completion (a bad resume on one step must not hold an
+    /// unrelated sibling's dispatch hostage).
+    #[test]
+    #[serial_test::serial]
+    fn resume_precheck_never_reaches_the_wave_loader_for_a_generic_mission_graph_step() {
+        let ack_dir = tempfile::TempDir::new().unwrap(); // "coder" isn't licensed-adjacent; unused
+        let resume_from = tempfile::TempDir::new().unwrap(); // no checkpoint.json written
+
+        let (mut resume_task, resume_step) = kinded_step(
+            "resume",
+            "test.role-local-model",
+            json!({
+                "model_key": "forbidden-model",
+                "resume_from": resume_from.path().to_str().unwrap(),
+            }),
+            &[],
+        );
+        resume_task.role_id = Some("coder".to_string());
+
+        let (mut ok_task, ok_step) =
+            kinded_step("ok", "test.role-local-model", json!({"model_key": "normal-model"}), &[]);
+        ok_task.role_id = Some("coder".to_string());
+
+        let (steps, report) =
+            run_consent_graph(ack_dir.path(), vec![(resume_task, resume_step), (ok_task, ok_step)]);
+
+        assert_eq!(steps["resume-step"].status, NodeStatus::Error);
+        let message = steps["resume-step"].output.clone().unwrap_or_default();
+        assert!(message.contains("RESUME CHECKPOINT NOT FOUND"), "{message}");
+        assert!(report.errored.contains(&"resume-step".to_string()));
+
+        // The sibling in the SAME wave is unaffected.
+        assert_eq!(steps["ok-step"].status, NodeStatus::Complete);
+        assert_eq!(steps["ok-step"].output.as_deref(), Some("ok"));
+        assert!(report.completed.contains(&"ok-step".to_string()));
+    }
+
+    /// (#2614 review, Also-fix 1) Pins the ORDER the two hoisted gates run
+    /// in for a single step that fails BOTH — something neither test above
+    /// can do. `licensed_adjacent_role_never_reaches_the_wave_loader`'s
+    /// step carries no `resume_from` at all, and `resume_precheck_never_
+    /// reaches_the_wave_loader_for_a_generic_mission_graph_step`'s step is
+    /// bound to an ordinary, non-licensed-adjacent role — neither step in
+    /// either test could ever fail the OTHER gate, so neither test can
+    /// tell "ack ran first" apart from "resume ran first". This one can:
+    /// the step is bound to `health-research` (licensed-adjacent, no prior
+    /// ack — fails the ack gate) AND carries a `resume_from` pointing at a
+    /// directory with no `checkpoint.json` (would ALSO fail
+    /// `resume_precheck` if it ever ran). `RoleLocalModelKind::
+    /// resume_precheck` resolves its role the same way `dispatch_role`
+    /// does — falls through to `task.role_id`, here `"health-research"` —
+    /// so if the resume check ran FIRST it would produce its own,
+    /// distinct "RESUME CHECKPOINT NOT FOUND" message instead of the ack
+    /// gate's "requires operator acknowledgment" one: a real, observable
+    /// difference, not a coincidence of shared wording.
+    ///
+    /// Today's merged loop (`run_step_graph`'s single filter pass: ack
+    /// check, `continue` on failure BEFORE `resume_precheck` is ever
+    /// called) reports the ack message. If that ordering ever flips, this
+    /// test starts reporting the resume message instead and fails loud,
+    /// naming the mismatch — an unacknowledged role's checkpoint must
+    /// never be read off disk before the consent gate has had its say.
+    #[test]
+    #[serial_test::serial]
+    fn licensed_adjacent_ack_gate_precedes_resume_precheck_for_a_step_that_fails_both() {
+        let ack_dir = tempfile::TempDir::new().unwrap(); // empty — "health-research" has no prior ack
+        let resume_from = tempfile::TempDir::new().unwrap(); // no checkpoint.json written
+
+        let (mut doubly_failing_task, doubly_failing_step) = kinded_step(
+            "doubly-failing",
+            "test.role-local-model",
+            json!({
+                "model_key": "forbidden-model",
+                "resume_from": resume_from.path().to_str().unwrap(),
+            }),
+            &[],
+        );
+        doubly_failing_task.role_id = Some("health-research".to_string());
+
+        let (steps, report) =
+            run_consent_graph(ack_dir.path(), vec![(doubly_failing_task, doubly_failing_step)]);
+
+        assert_eq!(steps["doubly-failing-step"].status, NodeStatus::Error);
+        let message = steps["doubly-failing-step"].output.clone().unwrap_or_default();
+        assert!(
+            message.contains("requires operator acknowledgment"),
+            "the ack gate must run FIRST and its refusal must be the one reported for a step \
+             that fails both gates — got: {message}"
+        );
+        assert!(
+            !message.contains("RESUME CHECKPOINT NOT FOUND"),
+            "resume_precheck must never even run for a step the ack gate already refused — \
+             got: {message}"
+        );
+        assert!(report.errored.contains(&"doubly-failing-step".to_string()));
     }
 
     /// (#1511, review mutation 1) The `mission.coder` shape: the TASK names

@@ -400,6 +400,26 @@ pub struct DispatchOpts {
     /// `exec`, still can't touch the tree when the mount itself refuses
     /// writes. `false` (the default) preserves every existing caller's
     /// read-write workspace exactly.
+    ///
+    /// (#2614 review, "Also record") `step_kinds::builtins::
+    /// dispatch_opts_for` hardcodes this to `false` for every
+    /// `dispatch.internal` step — no step-config key threads a caller's
+    /// intent through yet. That is also what closes a latent divergence
+    /// #2614's review found in #2585's now-deleted CLI wrapper hoist: that
+    /// hoist read the CALLER's own `--workspace-read-only`-shaped value
+    /// (there wasn't one, so this was moot in practice) while `dispatch_
+    /// opts_for`'s reconstruction always used this hardcoded `false` — the
+    /// two could have disagreed the moment a real flag existed, letting a
+    /// read-only-intended resume pass an early gate but fail (or worse,
+    /// silently escalate) once the real, hardcoded value was checked
+    /// post-wave. Since the checkpoint gate no longer has a wrapper-side
+    /// copy at all (`StepKind::resume_precheck` validates checkpoint
+    /// CONTENT only, never the workspace/mount-mode half — see that
+    /// method's own doc), there is exactly one place this field's value is
+    /// checked against a checkpoint's origin (`dispatch_internal::dispatch`
+    /// itself), so no second copy can drift from it. If a step config ever
+    /// gains a way to request a read-only mount, wire it into `dispatch_
+    /// opts_for` here — not into a second, wrapper-side check.
     pub workspace_read_only: bool,
     /// (#1959 flow-record vocabulary retirement) Provenance the runtime
     /// itself has no concept of — merged under `payload.context` on EVERY
@@ -446,11 +466,37 @@ pub struct DispatchOpts {
     /// ever called — and carries the analogous refusal in
     /// `darkmux-fleet`'s `dispatch_routed_via` (#2584): the queue's
     /// `WorkJob` has no checkpoint field, so a queued dispatch has no way
-    /// to honor one on the peer either. See `dispatch_internal`'s
-    /// `validate_resume_checkpoint` (the early gate) and
-    /// `write_staged_resume_checkpoint` (the later write) for the
-    /// validate-then-stage mechanics and the `resumed_from` provenance
-    /// this stamps into the dispatch's flow records.
+    /// to honor one on the peer either. A FOURTH route bypassed this gate
+    /// the same way, and worse, at MULTIPLE entry points: every caller of
+    /// `dispatch.internal` — `darkmux dispatch`'s own crew-of-one path
+    /// (`dispatch_as_crew_of_one`), a `mission launch <config>` staffing a
+    /// `dispatch.internal` step with a `resume_from` in its config, and the
+    /// panel — reaches this `dispatch()` call only from INSIDE that step's
+    /// own `run()`, which `scheduler::run_step_graph`'s
+    /// `ensure_wave_loaded` calls only AFTER already loading the wave's
+    /// model. A bad `--resume-from` on ANY of those paths paid the FULL
+    /// residency cost first and then surfaced an error naming a model
+    /// load, not the checkpoint that actually caused it (#2585 fixed only
+    /// the crew-of-one path with a wrapper-local hoist; #2614's review
+    /// found the other two still exposed and generalized the fix).
+    /// `StepKind::resume_precheck` is the general form: `scheduler::
+    /// run_step_graph` consults it for every ready step, on the main
+    /// thread, strictly before `plan_waves`/`ensure_wave_loaded` — the
+    /// SAME hoist point the licensed-adjacent ack gate already uses (see
+    /// `dispatch_role`'s doc) — and it covers all three callers with one
+    /// change, so the crew-of-one wrapper's own pre-mint hoist was deleted
+    /// rather than kept alongside it. It calls `dispatch_internal::
+    /// validate_resume_checkpoint_content` — the workdir-INDEPENDENT half
+    /// of the gate (existence, schema, role match) — deliberately never
+    /// the workdir-dependent workspace/mount-mode half, which stays here,
+    /// inside `dispatch()`'s own later call, because a mission graph's
+    /// working directory can legitimately be a path a still-earlier step
+    /// in the same run materializes and a scheduler-side existence check
+    /// would refuse work that is only valid once the wave actually runs.
+    /// See `dispatch_internal`'s `validate_resume_checkpoint` (the full
+    /// gate, called here) and `write_staged_resume_checkpoint` (the later
+    /// write) for the validate-then-stage mechanics and the `resumed_from`
+    /// provenance this stamps into the dispatch's flow records.
     pub resume_from: Option<PathBuf>,
     /// (#2153) Caller-named host out dir (the `/darkmux-out` mount) to use
     /// for THIS dispatch, instead of letting `dispatch_internal::dispatch`

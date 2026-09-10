@@ -815,6 +815,69 @@ pub trait StepKind: Send + Sync {
         ctx: &StepRunCtx,
     ) -> Option<String>;
 
+    /// (#2614 review, MUST FIX) A fallible, kind-owned precheck the
+    /// scheduler's `run_step_graph` consults for EVERY ready step, on the
+    /// main thread, strictly before `plan_waves`/`ensure_wave_loaded` can
+    /// make anything resident — the exact same hoist point, and the exact
+    /// same "defaults to success, fails only the offending step" shape,
+    /// the licensed-adjacent ack gate (`dispatch_role` above +
+    /// `licensed_adjacent_ack_status`) already established. Where that
+    /// gate asks a SEPARATE function keyed on the role this kind
+    /// resolves, this one asks the KIND ITSELF, because the precheck
+    /// isn't role-keyed — `dispatch.internal`'s is `--resume-from`
+    /// checkpoint validation (#2585/#2614), read straight off its own
+    /// step config.
+    ///
+    /// **Why a scheduler-level hook, not a wrapper hoist.** #2585 first
+    /// fixed this ONLY on `darkmux dispatch`'s own crew-of-one path
+    /// (`dispatch_as_crew_of_one_with` calling the checkpoint validation
+    /// before `run_step_graph` even starts) — the identical shape #1510
+    /// used for the ack gate before #1511 hoisted THAT into the
+    /// scheduler. #2614's review caught the same gap #1511 closed: a
+    /// mission config (`mission launch <config>`, the panel) staffing a
+    /// `dispatch.internal` step with a `resume_from` in its config never
+    /// went through the CLI wrapper at all, so it paid the full residency
+    /// cost before the step's own in-body checkpoint check ever ran. This
+    /// method is the general fix — one gate, asked once per ready step,
+    /// covering every caller of `run_step_graph` (the CLI's crew-of-one
+    /// wrapper included) rather than one hoist per entry point. The CLI
+    /// wrapper's own pre-mint hoist was deleted once this shipped —
+    /// duplicating a NON-INTERACTIVE check (unlike the ack gate's
+    /// prompting variant, which still needs its wrapper copy) is pure
+    /// drift risk with nothing gained.
+    ///
+    /// **Never validates the working directory itself.** A kind that
+    /// checks `resume_from` here must NOT call
+    /// `darkmux_types::workdir::validate_workdir` (or otherwise demand the
+    /// intended workspace already exist on disk) — a mission graph's
+    /// working directory can legitimately be a path a still-earlier step
+    /// in the SAME run materializes (`CwdPolicy`'s own doc: "a value
+    /// computed earlier in the same run, e.g. a materialized worktree
+    /// path"), so a scheduler-side existence/symlink check here would
+    /// refuse work that only becomes valid once the wave actually runs.
+    /// `dispatch_internal::validate_resume_checkpoint_content` is the
+    /// workdir-INDEPENDENT half of the checkpoint gate (existence, JSON
+    /// shape, schema version, role match) — the half safe to hoist here.
+    /// The workdir-DEPENDENT half (the origin-workspace/mount-mode match)
+    /// stays exactly where it always lived, inside
+    /// `dispatch_internal::dispatch`'s own call, which runs after the
+    /// wave loads and therefore after the real workspace is resolved.
+    ///
+    /// Defaults to `Ok(())` — every kind that never reads `resume_from`
+    /// (which is all of them except `dispatch.internal`) is unaffected by
+    /// this hook's mere existence, same discipline `seat`/`provides`/
+    /// `requires` all use for their own no-op defaults.
+    fn resume_precheck(
+        &self,
+        step: &Step,
+        task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        ctx: &StepRunCtx,
+    ) -> Result<()> {
+        let _ = (step, task, input, ctx);
+        Ok(())
+    }
+
     /// (#1530 Packet 0) The [`Port`]s this kind PRODUCES — what a future
     /// consumer (a graph validator, the viewer's port-wiring annotation)
     /// can expect available after this step runs. For an

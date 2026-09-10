@@ -579,8 +579,125 @@ pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 /// MISMATCH. `--resume-from` is therefore usable only alongside `--workdir`,
 /// which is the exact case. Revisit if the auto-tempdir path ever gains a
 /// way to name a prior run's workspace.
+///
+/// (#2585 review history) Was briefly widened to `pub(crate)` so
+/// `dispatch_as_crew_of_one`'s own pre-mint checkpoint hoist could call
+/// this directly and derive the identical intended-workspace name. #2614's
+/// review moved that gate into `StepKind::resume_precheck` (consulted by
+/// `scheduler::run_step_graph`, which never needs this workdir-dependent
+/// name — see that method's own doc on why the workdir check stays out of
+/// the scheduler entirely) and deleted the CLI wrapper's hoist, so this is
+/// private again: `dispatch()` above is its only caller.
 fn auto_workspace_path(role_id: &str, unix_micros: u128) -> PathBuf {
     std::env::temp_dir().join(format!("darkmux-dispatch-{role_id}-{unix_micros}"))
+}
+
+/// (#2614 review) The WORKDIR-INDEPENDENT half of
+/// [`validate_resume_checkpoint`] — existence, JSON shape, schema version,
+/// and role match. Everything this function checks is knowable from
+/// `resume_from` and `expected_role_id` ALONE, with no dependency on the
+/// dispatch's resolved workspace — which is exactly what makes it safe to
+/// call from `StepKind::resume_precheck`, ahead of `plan_waves`/
+/// `ensure_wave_loaded`, for EVERY caller of `run_step_graph` (see that
+/// method's own doc for why a workdir-DEPENDENT check must never be hoisted
+/// there). `validate_resume_checkpoint` below calls this first, then adds
+/// the workspace/mount-mode checks that DO need the resolved workspace —
+/// splitting the function changes nothing about what a full
+/// `dispatch_internal::dispatch` call validates or in what order; it only
+/// gives the workdir-independent half a name a workdir-independent caller
+/// can reach on its own.
+///
+/// Returns the checkpoint's raw (already read, already schema-checked)
+/// file contents, same as `validate_resume_checkpoint` — a caller that
+/// only needs THIS half and never proceeds to stage the checkpoint (the
+/// scheduler precheck) can simply discard it.
+pub(crate) fn validate_resume_checkpoint_content(
+    resume_from: &Path,
+    expected_role_id: &str,
+) -> Result<String> {
+    let src = resume_from.join(CHECKPOINT_FILENAME);
+    if !src.is_file() {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT NOT FOUND — expected {} to \
+             exist (no checkpoint.json under --resume-from {}); this \
+             dispatch cannot resume. darkmux never silently starts a \
+             dispatch fresh under a name that looked like a resume — pass \
+             a --resume-from dir that actually has a checkpoint, or drop \
+             --resume-from to start fresh on purpose.",
+            src.display(),
+            resume_from.display()
+        );
+    }
+    let contents = fs::read_to_string(&src)
+        .with_context(|| format!("reading resume checkpoint at {}", src.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+        anyhow!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} is not valid \
+             JSON ({e}); refusing to resume from a file that isn't a real \
+             checkpoint",
+            src.display()
+        )
+    })?;
+    let obj = value.as_object().ok_or_else(|| {
+        anyhow!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
+             parse as a darkmux checkpoint (top level is not a JSON \
+             object)",
+            src.display()
+        )
+    })?;
+    let schema_version = obj.get("schema_version").and_then(|v| v.as_u64());
+    if schema_version.is_none() {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
+             parse as a darkmux checkpoint (missing or non-numeric \
+             `schema_version`)",
+            src.display()
+        );
+    }
+    // (CONSIDER 6, security audit) A stale pre-v3 checkpoint (no `role_id`
+    // field at all — written by a runtime that predates this fix) gets its
+    // own honest message here, BEFORE the role check below would otherwise
+    // misreport it as `role_id: "<missing>"` — an honest version gap is not
+    // a role mismatch.
+    if schema_version.is_some_and(|v| v < 3) {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT STALE SCHEMA — {} has \
+             schema_version={} (this darkmux build writes/expects >= 3); \
+             it predates the role_id field this resume gate needs and \
+             cannot be safely resumed — start fresh instead.",
+            src.display(),
+            schema_version.unwrap_or(0)
+        );
+    }
+    if !obj.get("messages").is_some_and(|v| v.is_array()) {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
+             parse as a darkmux checkpoint (missing or non-array \
+             `messages`)",
+            src.display()
+        );
+    }
+    // (Security audit, #2114 resume follow-up) Refuse a resume whose
+    // recorded role differs from the resuming role — see this fn's own
+    // doc for the threat this closes (and does NOT close). A missing/
+    // non-string `role_id` on a schema_version >= 3 checkpoint is ALSO
+    // refused (never treated as "no role, so anything matches") — every
+    // checkpoint a fixed runtime writes stamps one; its absence on a v3+
+    // file means something that didn't come from a genuine
+    // write_checkpoint call at all.
+    let checkpoint_role_id = obj.get("role_id").and_then(|v| v.as_str());
+    if checkpoint_role_id != Some(expected_role_id) {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT ROLE MISMATCH — {} was written for role `{}`, \
+             but this dispatch is running as role `{expected_role_id}`; refusing to resume a \
+             checkpoint under a different role (it may be more permissive than the one it was \
+             recorded under)",
+            src.display(),
+            checkpoint_role_id.unwrap_or("<missing>")
+        );
+    }
+    Ok(contents)
 }
 
 /// (#2114 follow-up / #2162) `DispatchOpts::resume_from`'s host-side
@@ -688,88 +805,8 @@ pub(crate) fn validate_resume_checkpoint(
     expected_workspace: &Path,
     expected_workspace_read_only: bool,
 ) -> Result<String> {
+    let contents = validate_resume_checkpoint_content(resume_from, expected_role_id)?;
     let src = resume_from.join(CHECKPOINT_FILENAME);
-    if !src.is_file() {
-        bail!(
-            "darkmux dispatch: RESUME CHECKPOINT NOT FOUND — expected {} to \
-             exist (no checkpoint.json under --resume-from {}); this \
-             dispatch cannot resume. darkmux never silently starts a \
-             dispatch fresh under a name that looked like a resume — pass \
-             a --resume-from dir that actually has a checkpoint, or drop \
-             --resume-from to start fresh on purpose.",
-            src.display(),
-            resume_from.display()
-        );
-    }
-    let contents = fs::read_to_string(&src)
-        .with_context(|| format!("reading resume checkpoint at {}", src.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
-        anyhow!(
-            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} is not valid \
-             JSON ({e}); refusing to resume from a file that isn't a real \
-             checkpoint",
-            src.display()
-        )
-    })?;
-    let obj = value.as_object().ok_or_else(|| {
-        anyhow!(
-            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
-             parse as a darkmux checkpoint (top level is not a JSON \
-             object)",
-            src.display()
-        )
-    })?;
-    let schema_version = obj.get("schema_version").and_then(|v| v.as_u64());
-    if schema_version.is_none() {
-        bail!(
-            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
-             parse as a darkmux checkpoint (missing or non-numeric \
-             `schema_version`)",
-            src.display()
-        );
-    }
-    // (CONSIDER 6, security audit) A stale pre-v3 checkpoint (no `role_id`
-    // field at all — written by a runtime that predates this fix) gets its
-    // own honest message here, BEFORE the role check below would otherwise
-    // misreport it as `role_id: "<missing>"` — an honest version gap is not
-    // a role mismatch.
-    if schema_version.is_some_and(|v| v < 3) {
-        bail!(
-            "darkmux dispatch: RESUME CHECKPOINT STALE SCHEMA — {} has \
-             schema_version={} (this darkmux build writes/expects >= 3); \
-             it predates the role_id field this resume gate needs and \
-             cannot be safely resumed — start fresh instead.",
-            src.display(),
-            schema_version.unwrap_or(0)
-        );
-    }
-    if !obj.get("messages").is_some_and(|v| v.is_array()) {
-        bail!(
-            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
-             parse as a darkmux checkpoint (missing or non-array \
-             `messages`)",
-            src.display()
-        );
-    }
-    // (Security audit, #2114 resume follow-up) Refuse a resume whose
-    // recorded role differs from the resuming role — see this fn's own
-    // doc for the threat this closes (and does NOT close). A missing/
-    // non-string `role_id` on a schema_version >= 3 checkpoint is ALSO
-    // refused (never treated as "no role, so anything matches") — every
-    // checkpoint a fixed runtime writes stamps one; its absence on a v3+
-    // file means something that didn't come from a genuine
-    // write_checkpoint call at all.
-    let checkpoint_role_id = obj.get("role_id").and_then(|v| v.as_str());
-    if checkpoint_role_id != Some(expected_role_id) {
-        bail!(
-            "darkmux dispatch: RESUME CHECKPOINT ROLE MISMATCH — {} was written for role `{}`, \
-             but this dispatch is running as role `{expected_role_id}`; refusing to resume a \
-             checkpoint under a different role (it may be more permissive than the one it was \
-             recorded under)",
-            src.display(),
-            checkpoint_role_id.unwrap_or("<missing>")
-        );
-    }
     // (Security audit, #2114 resume follow-up) Workspace mount-mode + path
     // gate — see this fn's own doc for the escalation this closes.
     let origin_path = resume_from.join(RESUME_ORIGIN_FILENAME);
@@ -4152,6 +4189,76 @@ impl Drop for ContainerKillGuard {
     }
 }
 
+/// (#2614 review, "Also fix" — wrong problem surfaced) A `--resume-from`
+/// aimed at a role that resolves to the bare hosted single-shot path (a
+/// remote profile + a tool-less role, per `container_path_required`) can
+/// NEVER be honored — that path has no container, no workspace, no
+/// checkpoint to resume into (see `dispatch()`'s own copy of this refusal
+/// a few lines down for the full "why not built" reasoning). Before this
+/// existed, `StepKind::resume_precheck`'s scheduler-level gate validated
+/// checkpoint CONTENT first and unconditionally — so an invalid/missing
+/// checkpoint on exactly this role shape surfaced "RESUME CHECKPOINT NOT
+/// FOUND", the operator would go fix the checkpoint, redispatch, and only
+/// THEN hit this refusal. Two rounds of confusion for what is really one,
+/// more fundamental blocker — the same misattribution class #2585 exists
+/// to close, reached from the opposite direction (right problem surfaced
+/// too LATE instead of the wrong problem surfaced too EARLY).
+///
+/// Called from `StepKind::resume_precheck` BEFORE
+/// `validate_resume_checkpoint_content`, so this refusal wins regardless of
+/// whether a checkpoint even exists under `resume_from`. `Ok(())` for every
+/// other case: no `resume_from` set, a local dispatch, or a remote dispatch
+/// that resolves to the agentic-remote CONTAINER path (a tool-granting
+/// role) — all of which either have nothing to check here or go on to the
+/// ordinary checkpoint gate. Role + profile resolution only (`load_roles`,
+/// the profile registry) — no LMStudio call, no residency action, cheap
+/// enough to run ahead of the wave the same way the checkpoint content
+/// check itself is.
+pub(crate) fn refuse_resume_on_bare_hosted_path(opts: &DispatchOpts) -> Result<()> {
+    if opts.resume_from.is_none() {
+        return Ok(());
+    }
+    let Some((role, _system_prompt, _pm)) = try_resolve_remote_target(opts)? else {
+        return Ok(()); // local — the ordinary container/checkpoint path applies
+    };
+    if container_path_required(&role, opts.force_container) {
+        return Ok(()); // agentic-remote container — resume goes through the normal gate
+    }
+    bail!(resume_from_bare_hosted_refusal(&opts.role_id));
+}
+
+/// (#2614 review, Also-fix — duplication) Single source of truth for the
+/// refusal text `refuse_resume_on_bare_hosted_path` above and `dispatch()`'s
+/// own inline `dispatch_remote` guard below both emit — before this, the
+/// two sites carried a byte-identical ten-line message hand-copied twice,
+/// which is exactly the drift risk this same commit's own rationale (for
+/// deleting the CLI wrapper's duplicate resume-checkpoint hoist) argues
+/// against. `dispatch()`'s own call site still duplicates the CALL to this
+/// function (`bail!(resume_from_bare_hosted_refusal(&opts.role_id))`), not
+/// the message text — `every_dispatch_remote_call_site_is_guarded_
+/// against_resume_from`'s textual scanner requires the guard's `if` block
+/// to contain a diverging construct naming the anchor phrase, and
+/// deliberately does not chase that anchor into an ordinary helper
+/// function a block merely calls (see that test's own doc for why); its
+/// escape valve for exactly this case — "extend this test to also scan
+/// the helper" — is what `resume_from_guard_precedes` does for THIS named
+/// function specifically, so both call sites can share one string without
+/// silently defeating that scan.
+pub(crate) fn resume_from_bare_hosted_refusal(role_id: &str) -> String {
+    format!(
+        "darkmux dispatch: --resume-from is not supported on the \
+         remote single-shot dispatch path (role `{role_id}` grants no \
+         tools, so this dispatch resolved to a bare hosted \
+         chat-completions call — no Docker, no container, no \
+         checkpoint). darkmux never silently starts a dispatch \
+         fresh under a name that looked like a resume: resume \
+         needs the container path, which a tool-granting role \
+         (e.g. a coder or reviewer role with a non-empty \
+         tool_palette) resolves to — or drop --resume-from to \
+         start this role fresh on purpose."
+    )
+}
+
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
@@ -4204,19 +4311,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // CONTAINER workspace, and this path has none — so it is
             // deliberately NOT built; the fix is refusal.
             if opts.resume_from.is_some() {
-                bail!(
-                    "darkmux dispatch: --resume-from is not supported on the \
-                     remote single-shot dispatch path (role `{}` grants no \
-                     tools, so this dispatch resolved to a bare hosted \
-                     chat-completions call — no Docker, no container, no \
-                     checkpoint). darkmux never silently starts a dispatch \
-                     fresh under a name that looked like a resume: resume \
-                     needs the container path, which a tool-granting role \
-                     (e.g. a coder or reviewer role with a non-empty \
-                     tool_palette) resolves to — or drop --resume-from to \
-                     start this role fresh on purpose.",
-                    opts.role_id
-                );
+                // (#2614 review, Also-fix — duplication) The message text
+                // itself lives in ONE place, `resume_from_bare_hosted_
+                // refusal` (see its own doc). This call site still
+                // duplicates the CALL, not the string — see that
+                // function's doc and `resume_from_guard_precedes`'s own
+                // "named helper" chase for why the conformance scan below
+                // still covers this guard.
+                bail!(resume_from_bare_hosted_refusal(&opts.role_id));
             }
             return dispatch_remote(&opts, &role, &system_prompt, &pm);
         }
