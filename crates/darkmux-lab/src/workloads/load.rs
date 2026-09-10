@@ -685,17 +685,21 @@ mod tests {
         assert_eq!(loaded.source, WorkloadSource::Embedded);
     }
 
-    /// (#2493) Pins the shipped `quick-q` manifest's verify keyword to the
-    /// stemmed form. A v3.7.1 dogfood run answered correctly with
-    /// "activates" and failed verify because the keyword was the bare
-    /// "active" — an inflection the case-sensitive substring check
-    /// (`run_verify` in `providers/prompt.rs`) can't see through. This test
-    /// guards the OTHER half of that fix: a future manifest edit reverting
-    /// the keyword back to "active" would reintroduce the exact bug even
-    /// with `run_verify`'s matcher unchanged, since a bare-word manifest
-    /// keyword is what made it inflection-brittle in the first place.
+    /// (#2493 follow-up) Pins the shipped `quick-q` manifest's verify
+    /// keyword to the bare word, NOT a widened stem. #2493's first fix
+    /// widened this to the stem `"activ"` to catch inflections like
+    /// "activates" — but a stem is a substring probe, and frontier review
+    /// proved it also passes wrong answers that merely mention some other
+    /// inflection of the word ("activation", "deactivate") while getting
+    /// the actual content wrong (see
+    /// `run_verify_bare_keyword_rejects_wrong_answers_using_other_inflections`
+    /// in `providers/prompt.rs`). The keyword reverted to the bare
+    /// "active"; case-insensitivity (kept, since `quick-q` carries no
+    /// `command`) is the part of the original fix that was actually
+    /// justified. This test guards against a future edit re-widening the
+    /// manifest keyword back to a stem.
     #[test]
-    fn quick_q_verify_keyword_is_stemmed_not_a_bare_inflection() {
+    fn quick_q_verify_keyword_is_the_bare_word_not_a_widened_stem() {
         let loaded = load("quick-q", None).expect("quick-q should load from the embedded const");
         let verify = loaded
             .manifest
@@ -705,8 +709,8 @@ mod tests {
             .expect("quick-q ships a verify spec");
         assert_eq!(
             verify.must_contain,
-            vec!["activ".to_string()],
-            "quick-q's must_contain keyword regressed to a bare inflection — see #2493"
+            vec!["active".to_string()],
+            "quick-q's must_contain keyword regressed to a stem — see #2493 follow-up"
         );
     }
 
