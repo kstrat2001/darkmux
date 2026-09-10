@@ -47,7 +47,15 @@ Check the data-shape schemas — a bump there is worth calling out and (if cross
 grep 'FLOW_SCHEMA_VERSION: &str' crates/darkmux-flow/src/schema.rs
 grep 'RULES_SCHEMA_VERSION' crates/darkmux-eureka/src/lib.rs
 ```
-Pick `NEW=x.y.z`. Tag will be `vNEW`.
+Pick and **export** `NEW` — the two blocks in step 2 are meant to be saved as
+scripts and run with `bash <file>`, a fresh process that inherits nothing
+from this shell except its exported environment:
+```bash
+export NEW=x.y.z   # tag will be vNEW
+```
+A plain `NEW=x.y.z` (no export) is invisible to `bash <file>`. Each block
+below asserts `$NEW` is set before touching anything else, but the assert
+only catches a forgotten export here — it can't supply the value.
 
 ## 2. Version PR
 
@@ -90,18 +98,30 @@ subshell, not the terminal session it's running in; run the block itself
 ```bash
 (
   set -eu
-  LOGF=$(mktemp) || { echo "mktemp failed"; exit 1; }
-  trap 'rm -f "$LOGF"' EXIT INT TERM
+  # $NEW must be exported from step 1 — this block runs as `bash <file>`, a
+  # fresh process, so a plain `NEW=x.y.z` typed into the parent shell never
+  # reaches it. Checked with an explicit `if`/`exit`, not bare `set -u` and
+  # not `${NEW:?message}`: on this repo's bash (3.2, the macOS default), a
+  # nounset-triggered abort inside a subshell that also carries an EXIT trap
+  # is silently swallowed to exit 0 — proven by running this exact shape
+  # with $NEW unset (#2589 round 3). `${NEW:?...}` hits the identical
+  # swallow because it fails the same way nounset does; only a real `exit`
+  # call after an ordinary `[ -z ... ]` test propagates correctly here.
+  if [ -z "${NEW:-}" ]; then
+    echo "NEW is not set — export it from step 1 before running this block" >&2
+    exit 1
+  fi
   # Gate on cargo's real exit code, not a text search over its output — a
   # build that never compiles prints no "test result:" line at all, so a
-  # grep for one finds nothing and reports a false "tests ok" (#2589).
-  # Output is tee'd (not just redirected) so a run that takes minutes stays
-  # visible while it's being watched; PIPESTATUS reads cargo's own exit
-  # code explicitly rather than the pipeline's (tee's), which is the exact
-  # `cmd | grep`-shaped trap this whole change exists to close (#2589).
+  # grep for one finds nothing and reports a false "tests ok" (#2589). Run
+  # directly, no tee/log file: plain `cargo test` already streams live to
+  # this block's own stdout, nothing here ever reads a captured copy back,
+  # and a previous version tee'd into a temp file that went unread end to
+  # end — dead plumbing with its own trap to maintain for no gain (#2589
+  # round 3).
   set +e
-  cargo test 2>&1 | tee "$LOGF"
-  STATUS=${PIPESTATUS[0]}
+  cargo test
+  STATUS=$?
   set -e
   if [ "$STATUS" -ne 0 ]; then
     echo "investigate — cargo test exited $STATUS (compile or test failure; see output above)"
@@ -118,45 +138,80 @@ but reading `gh pr checks`' own exit code as that gate is itself the trap.
 `gh pr checks` (plain-text mode) exits non-zero whenever any check is not yet
 green, which is the loop's entire normal in-flight state — treating that as
 fatal aborted the poll on its first iteration, before it ever polled anything
-(#2589). `--json` mode exits 0 for a successful query regardless of check
-state, so a non-zero exit *there* is a genuine transport/auth failure worth
-surfacing immediately, and the check states themselves come from reading
-`bucket` in the JSON, never inferred from an exit code:
+(#2589). `--json` mode does **not** dodge this the way it looks like it
+should: `gh pr checks` errors out — non-zero exit, empty stdout, `no checks
+reported on the '<branch>' branch` on stderr — for a PR with zero checks
+registered yet, regardless of `--json`/`--jq`, because that check lives in
+gh's own source *above* the JSON exporter. That is the literal state in the
+seconds right after the PR opens, so it has to be treated as "keep waiting,"
+not a transport failure — matched on the exact message text, so any *other*
+non-zero exit (auth, network, a renamed branch) still aborts immediately
+(verified live against this repo's own `w9/apt` PR while it genuinely had
+zero checks registered — #2589 round 3):
 ```bash
 (
   set -eu
+  # $NEW must be exported from step 1 — see the note on the version-PR block
+  # above for why `set -u`/`${NEW:?...}` can't be trusted to catch this on
+  # their own in a subshell carrying an EXIT trap on this repo's bash.
+  if [ -z "${NEW:-}" ]; then
+    echo "NEW is not set — export it from step 1 before running this block" >&2
+    exit 1
+  fi
   ERRF=$(mktemp) || { echo "mktemp failed"; exit 1; }
-  trap 'rm -f "$ERRF"' EXIT INT TERM
+  # Cleanup always runs, but INT/TERM must ALSO actually stop the poll — a
+  # trap that only cleans up and never calls `exit` doesn't terminate
+  # execution, it just runs and control falls through to whatever statement
+  # follows. Proven: the old single `trap '...' EXIT INT TERM` absorbed a
+  # SIGINT sent mid-loop and ran every remaining iteration to completion
+  # instead of stopping (#2589 round 3). INT/TERM get their own `exit` here.
+  cleanup() { rm -f "$ERRF"; }
+  trap cleanup EXIT
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
 
-  # Bound: 30s x 120 attempts = 60 minutes. Measured on this repo: the main
-  # workflow's median run is ~5.5 min, the quality workflow's median ~11 min
-  # (max ~16 min), and one real successful release measured 22 min end to
-  # end (the poll starts right after the PR opens, so queue time counts
-  # against it too). 60 minutes is ~2.7x the slowest real run observed —
-  # raise it again if a future release routinely queues longer than that.
+  # Bound: 30s x 120 attempts = 60 minutes. Measured fresh against this
+  # repo's own last ~60 completed runs per workflow (createdAt -> updatedAt,
+  # which includes queue time — the same wall clock the poll experiences):
+  # CI's median is ~8 min with a max of ~59 min; quality's median is ~15 min
+  # with a max of ~44 min. 60 minutes is roughly 1x the slowest run actually
+  # observed, NOT the ~2.7x an earlier version of this comment claimed
+  # (#2589 round 3) — the bound itself is still the right call (it sits on
+  # the safe side of the slowest real run, and a timeout blocks a merge
+  # rather than permitting one), but say so honestly. Raise it if a future
+  # release routinely queues past an hour.
   POLL_SECONDS=30
   MAX_ATTEMPTS=120
   ATTEMPTS=0
   while :; do
     set +e
     RESULT=$(gh pr checks release-$NEW --json bucket --jq '
-      if length == 0 then "no-checks"
-      elif ([.[] | select(.bucket=="pending")] | length) > 0 then "pending"
-      else "done"
-      end
+      . as $all
+      | if ($all | length) == 0 then "no-checks"
+        elif (($all | map(select(.bucket=="pass" or .bucket=="fail" or .bucket=="skipping" or .bucket=="cancel")) | length) == ($all | length)) then "done"
+        else "pending"
+        end
     ' 2>"$ERRF")
     STATUS=$?
     set -e
     if [ "$STATUS" -ne 0 ]; then
-      echo "gh pr checks failed (exit $STATUS) — not retrying blindly:"
-      cat "$ERRF"
-      exit 1
+      if grep -qF "no checks reported on" "$ERRF"; then
+        RESULT="no-checks"
+      else
+        echo "gh pr checks failed (exit $STATUS) — not retrying blindly:"
+        cat "$ERRF"
+        exit 1
+      fi
     fi
-    # "no-checks" (nothing registered yet, right after the PR opened) and
-    # "pending" (still running — a check already having failed doesn't
-    # count as done while a SIBLING check is still in flight) both mean
-    # keep waiting. Only "done" — nothing left pending, pass or fail — ends
-    # the poll; the conclusion itself is judged separately below.
+    # "no-checks" (nothing registered yet) and "pending" both mean keep
+    # waiting. "done" requires EVERY reported bucket to be one of the known
+    # terminal values (pass/fail/skipping/cancel) — inverted from the old
+    # "done unless a bucket literally equals pending" test, which read an
+    # unrecognized or MISSING bucket field as done by default. gh's own
+    # fallback-to-pending only covers unmapped *state* values; it does not
+    # cover a renamed or absent "bucket" key in some future gh version, and
+    # that reads here as JSON `null`, which must not be waved through as
+    # done (#2589 round 3).
     if [ "$RESULT" = "done" ]; then
       break
     fi
@@ -168,23 +223,22 @@ surfacing immediately, and the check states themselves come from reading
     sleep "$POLL_SECONDS"
   done
 
-  # A nightly-only job (mutation full sweep) legitimately reads "skipped" on
-  # every PR run, so the OLD `unique|join(",")` always included it and
-  # `[ "$C" = "success" ]` was never true on this repo — a silent no-op
-  # before this change, a hard failure on every real release after it
-  # (#2589). Filter out conclusions that aren't a verdict (skipped/neutral/
-  # null) before judging, and refuse to merge if nothing verdict-bearing is
-  # left (a run with only skipped jobs proves nothing, so it's not "success"
-  # either) — genuine bad conclusions (failure/cancelled/timed_out) are
-  # never filtered, so they still block the merge as before.
+  # This verdict read is deliberately a SEPARATE call from the poll above,
+  # not unified onto one source: `gh pr checks` dedupes re-run check names
+  # and folds in legacy commit statuses; the raw `check-runs` API below does
+  # neither. Not exploitable on this repo today, but the two views can in
+  # principle disagree on what "everything" means — worth a line (#2589
+  # round 3).
+  #
+  # `per_page=100` plus an explicit count assertion, not the bare default of
+  # 30: the check-runs endpoint paginates, a re-run only ever ADDS rows, and
+  # a silently truncated read would report success over a subset that
+  # happens to all be green while a real failure sits on a page never
+  # fetched. This repo's PRs carry ~10 check runs today; 100 is headroom,
+  # and the assertion below still catches it if that ever stops being true
+  # (#2589 round 3).
   set +e
-  C=$(gh api "repos/kstrat2001/darkmux/commits/$(git rev-parse HEAD)/check-runs" --jq '
-    ([.check_runs[].conclusion] | map(select(. != "skipped" and . != "neutral" and . != null))) as $v
-    | if ($v | length) == 0 then "no-verdicts"
-      elif ($v | all(. == "success")) then "success"
-      else ($v | unique | join(","))
-      end
-  ' 2>"$ERRF")
+  RAW=$(gh api "repos/kstrat2001/darkmux/commits/$(git rev-parse HEAD)/check-runs?per_page=100" 2>"$ERRF")
   API_STATUS=$?
   set -e
   if [ "$API_STATUS" -ne 0 ]; then
@@ -192,6 +246,40 @@ surfacing immediately, and the check states themselves come from reading
     cat "$ERRF"
     exit 1
   fi
+  TOTAL=$(echo "$RAW" | jq '.total_count')
+  GOT=$(echo "$RAW" | jq '.check_runs | length')
+  if [ "$TOTAL" != "$GOT" ]; then
+    echo "check-runs response truncated: total_count=$TOTAL but only $GOT rows returned (per_page=100 wasn't enough) — refusing to judge a partial set"
+    exit 1
+  fi
+
+  # A nightly-only job (mutation full sweep) legitimately reads "skipped" on
+  # every PR run, so the OLD `unique|join(",")` always included it and
+  # `[ "$C" = "success" ]` was never true on this repo — a silent no-op
+  # before this change, a hard failure on every real release after it
+  # (#2589). Filter out conclusions that aren't a verdict (skipped/neutral)
+  # before judging — but do NOT filter `null`: a check run's conclusion is
+  # null exactly while it's still running (status != "completed"), so
+  # dropping it is what let two successes plus a still-in-flight check read
+  # as "success" and merge, and — compounded with the poll-side bug above —
+  # let a run with five successes, one skipped, and four still-running
+  # checks merge as well (#2589 round 3). Map null to a readable
+  # "in_progress" instead, so it still fails the all-success test and shows
+  # up by name in the non-matching output. Genuine bad conclusions
+  # (failure/cancelled/timed_out) are never filtered, so they still block
+  # the merge as before. Refuse to merge if nothing verdict-bearing is left
+  # either (a run with only skipped jobs proves nothing, so it's not
+  # "success").
+  C=$(echo "$RAW" | jq -r '
+    ([.check_runs[].conclusion]
+      | map(select(. != "skipped" and . != "neutral"))
+      | map(if . == null then "in_progress" else . end)
+    ) as $v
+    | if ($v | length) == 0 then "no-verdicts"
+      elif ($v | all(. == "success")) then "success"
+      else ($v | unique | join(","))
+      end
+  ')
 
   if [ "$C" = "success" ]; then
     gh pr merge release-$NEW --squash --delete-branch
