@@ -537,6 +537,7 @@
     /// message that names the rename, points at the offending file
     /// path, and tells the operator what to change. Pre-1.0 no-compat
     /// doctrine — no silent rewrite, no env-var alias.
+    #[serial]
     #[test]
     fn validate_rejects_legacy_admin_role_family_user_source() {
         let legacy_role = Role {
@@ -616,6 +617,7 @@
     /// Unknown role_family values (a typo like `"worker"`) are now rejected
     /// rather than silently treated as specialist (#590: validated two-value
     /// axis). User source → actionable; builtin source → regression framing.
+    #[serial]
     #[test]
     fn validate_rejects_unknown_role_family() {
         let r = Role {

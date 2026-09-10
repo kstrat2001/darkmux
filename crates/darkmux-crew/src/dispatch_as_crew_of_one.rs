@@ -822,6 +822,7 @@ mod tests {
     // container and no model, which is the property that actually matters
     // here.
 
+    #[serial_test::serial]
     #[test]
     fn build_graph_is_one_phase_one_task_one_step() {
         let opts = test_opts("coder", "do the thing");
@@ -837,6 +838,7 @@ mod tests {
         assert_eq!(step.kind, "dispatch.internal");
     }
 
+    #[serial_test::serial]
     #[test]
     fn build_graph_sources_role_profile_workdir_image_from_the_task() {
         let mut opts = test_opts("coder", "hi");
@@ -861,6 +863,7 @@ mod tests {
             .expect("reconstructing DispatchOpts from the crew-of-one step")
     }
 
+    #[serial_test::serial]
     #[test]
     fn build_graph_step_config_carries_the_cli_flags() {
         let mut opts = test_opts("coder", "hello there");
@@ -951,6 +954,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     fn build_graph_omits_resume_from_by_default() {
         let opts = test_opts("coder", "hi");
@@ -962,6 +966,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     fn build_graph_step_config_carries_resume_from() {
         // (#2114 follow-up) The CLI's `--resume-from <dir>` must reach
@@ -1002,6 +1007,7 @@ mod tests {
     /// silently approves) while `build_graph_step_config_carries_resume_
     /// from` above stays green throughout — proving the two tests check
     /// genuinely different things.
+    #[serial_test::serial]
     #[test]
     fn resume_precheck_refuses_through_the_real_graph_builder_and_the_real_registry() {
         let resume_from = tempfile::TempDir::new().unwrap(); // no checkpoint.json written
@@ -1026,6 +1032,7 @@ mod tests {
         assert!(msg.contains("RESUME CHECKPOINT NOT FOUND"), "{msg}");
     }
 
+    #[serial_test::serial]
     #[test]
     fn build_graph_external_phase_id_is_a_separate_concept_from_the_graphs_own_phase() {
         // `opts.phase_id` (the CLI's `--phase-id`, external mission-phase
@@ -1040,6 +1047,7 @@ mod tests {
         assert_ne!(task.phase_id, "some-other-mission-phase");
     }
 
+    #[serial_test::serial]
     #[test]
     fn build_graph_omits_phase_id_key_when_the_cli_flag_is_unset() {
         // Matches the pre-#1509 `DispatchOpts.phase_id: None` default —

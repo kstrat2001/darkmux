@@ -360,6 +360,7 @@ mod tests {
         Body { schema_version: "1.0".into(), n: 7, note: "hi".into() }
     }
 
+    #[serial_test::serial]
     #[test]
     fn an_envelope_round_trips_through_its_own_output_string() {
         let out = Output::wrap("crawl.unit-outcome", body(), Producer::of("m-1", "t-1", "s-1"));

@@ -87,6 +87,8 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
     // wins over the project/user auto-resolve below. The pointer can't live
     // inside the config it locates, so it stays a direct env read. Tilde-
     // expanded for ergonomics.
+    #[cfg(any(test, feature = "test-support"))]
+    crate::env_audit::audit_env_read("DARKMUX_HOME");
     if let Some(root) = env::var("DARKMUX_HOME")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -127,6 +129,8 @@ fn paths_from_root(chosen: PathBuf, chosen_scope: Scope) -> DarkmuxPaths {
     //
     // Tilde expansion is supported for ergonomics — most operators write
     // `~/Library/...` rather than the literal expanded path.
+    #[cfg(any(test, feature = "test-support"))]
+    crate::env_audit::audit_env_read("DARKMUX_NOTEBOOK_DIR");
     let notebook = env::var("DARKMUX_NOTEBOOK_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())

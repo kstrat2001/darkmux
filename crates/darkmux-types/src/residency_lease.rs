@@ -171,6 +171,8 @@ fn remove_lease(pid: u32) -> Result<()> {
 /// (honor `DARKMUX_HOME`, tilde-expanded, else `~/.darkmux`) so the two
 /// per-process registries always agree on where "home" is.
 fn residency_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    crate::env_audit::audit_env_read("DARKMUX_HOME");
     if let Ok(root) = std::env::var("DARKMUX_HOME") {
         let root = root.trim();
         if !root.is_empty() {

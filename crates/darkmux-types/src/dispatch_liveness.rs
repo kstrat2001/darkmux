@@ -110,6 +110,8 @@ fn append_heartbeat(pid: u32, line: &str) -> std::io::Result<()> {
 /// config reads — the floor can't afford a cwd stat or a config load at the
 /// first instant of a possibly-already-hung process.
 fn liveness_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    crate::env_audit::audit_env_read("DARKMUX_HOME");
     if let Ok(root) = std::env::var("DARKMUX_HOME") {
         let root = root.trim();
         if !root.is_empty() {

@@ -1630,6 +1630,7 @@ mod tests {
 
     // ── stop_file_path_from_record_context ──
 
+    #[serial_test::serial]
     #[test]
     fn stop_file_path_derives_from_crawl_record_context() {
         let ctx = serde_json::json!({
@@ -1701,6 +1702,7 @@ mod tests {
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
     }
 
+    #[serial_test::serial]
     #[test]
     fn stop_file_path_ordinary_manifest_name_still_resolves() {
         // The direction most likely to be broken by an over-eager fix: a
@@ -1737,6 +1739,7 @@ mod tests {
     /// absence of any `ParentDir` component is asserted separately, and
     /// the shape is pinned exactly (`<name>/STOP`, two components past
     /// `<root>/crawl`).
+    #[serial_test::serial]
     #[test]
     fn no_workspace_value_can_escape_the_crawl_root() {
         let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
@@ -1823,6 +1826,7 @@ mod tests {
     /// The ASCII restriction is defense-in-depth against homoglyph
     /// confusion, and it needs its own guard or it can be dropped
     /// silently.
+    #[serial_test::serial]
     #[test]
     fn accepted_character_class_is_ascii_only() {
         let sweep = (0u32..=0x2FF)
@@ -1853,6 +1857,7 @@ mod tests {
     /// The inverse direction: names that are legitimate single components
     /// must still resolve, or the breaker silently stops working for real
     /// crawls. Pins that the validator is not over-broad.
+    #[serial_test::serial]
     #[test]
     fn ordinary_names_still_resolve() {
         for name in ["a", "1", "acme", "crawl_v2.1-final", "a..b", "a.", "UPPER-case_9"] {
@@ -1867,6 +1872,7 @@ mod tests {
     /// itself would fail with ENAMETOOLONG, which `write_stop_file`
     /// already swallows) — pinned so the behavior is deliberate, and to
     /// prove it cannot escape either.
+    #[serial_test::serial]
     #[test]
     fn very_long_name_is_contained_even_though_accepted() {
         let name = "a".repeat(4096);
@@ -1880,6 +1886,7 @@ mod tests {
     /// resolving is exactly the reason-being-`None` case, on a
     /// crawl-shaped context. This is the drift guard — one predicate is
     /// shared today, and this fails the moment a second one is introduced.
+    #[serial_test::serial]
     #[test]
     fn path_and_unresolved_reason_never_disagree() {
         let names = [
@@ -1909,6 +1916,7 @@ mod tests {
         assert_eq!(stop_file_unresolved_reason(None), None);
     }
 
+    #[serial_test::serial]
     #[test]
     fn stop_file_unresolved_reason_none_when_derivation_succeeds() {
         let ctx = serde_json::json!({ "workspace": "my-manifest", "unit": "unit-1" });
