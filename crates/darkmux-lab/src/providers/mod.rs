@@ -9,6 +9,6 @@ use anyhow::Result;
 pub fn register_builtins() -> Result<()> {
     registry::register(Box::new(prompt::PromptProvider))?;
     registry::register(Box::new(coding_task::CodingTaskProvider))?;
-    registry::register(Box::new(tool_bench::ToolBenchProvider))?;
+    registry::register(Box::new(tool_bench::ToolBenchProvider::production()))?;
     Ok(())
 }
