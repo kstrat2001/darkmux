@@ -3084,7 +3084,20 @@ mod tests {
         //           the keys are present, so a fleet mixing tagged and
         //           untagged emitters is a real divergence and must show
         //           as skew. See `schema.rs`'s own history entry.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.45.0");
+        //   1.46.0: `dispatch complete`'s `prompt_tokens`/
+        //           `completion_tokens`/`total_tokens`/`reasoning_tokens`/
+        //           `cached_tokens` now come from the live tailer's own
+        //           per-turn sum (this-invocation-only), not from
+        //           `metrics.json`'s whole-dispatch cumulative counters
+        //           (#2263) — a resumed dispatch used to fold the PRIOR
+        //           invocation's tokens into these fields, misattributed
+        //           to the resumed dispatch's own model. New additive
+        //           keys `cumulative_turns`/`cumulative_compactions`/
+        //           `cumulative_prompt_tokens`/`cumulative_completion_
+        //           tokens` carry the whole-task view separately. See
+        //           `schema.rs`'s own history entry for the full
+        //           explanation.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.46.0");
     }
 
     #[test]

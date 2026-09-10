@@ -12527,6 +12527,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             0,
             &super::TrajectorySummary::default(),
             super::TokenTotals { prompt: 10, completion: 20, reasoning: None, cached: None },
+            super::CumulativeCounts::default(),
             None,
             &stats,
             &extras,
@@ -12549,13 +12550,31 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert!(payload["cached_tokens"].is_null());
     }
 
-    /// (#1444) When `TokenTotals` DOES carry a reasoning/cached figure
-    /// (metrics.json had the field, from a hosted reasoning-family
-    /// dispatch), the payload surfaces it as a real number — never
-    /// silently dropped.
+    /// (#1444) When the tailer's live token accumulation DOES carry a
+    /// reasoning/cached figure (a hosted reasoning-family dispatch
+    /// reported one on some turn), the payload surfaces it as a real
+    /// number — never silently dropped.
+    ///
+    /// (#2263) `prompt_tokens`/`completion_tokens`/`reasoning_tokens`/
+    /// `cached_tokens` on the payload now come from `TrajectorySummary`
+    /// (the tailer's live per-turn sum — this-invocation-only by
+    /// construction), NOT from `TokenTotals`/`tokens` (metrics.json's
+    /// whole-dispatch cumulative counters, seeded from the checkpoint on
+    /// a resume). This test constructs the summary directly instead of
+    /// routing the figures through `tokens`, which now only feeds the
+    /// separate `cumulative_prompt_tokens`/`cumulative_completion_tokens`
+    /// fields — asserted below too, so a regression that swaps the two
+    /// sources back is caught.
     #[test]
     fn build_dispatch_complete_payload_carries_reasoning_and_cached_tokens_when_present() {
         let stats = super::reduce_host_stats(&[]);
+        let summary = super::TrajectorySummary {
+            prompt_tokens: 100,
+            completion_tokens: 600,
+            reasoning_tokens: Some(500),
+            cached_tokens: Some(20),
+            ..Default::default()
+        };
         let payload = super::build_dispatch_complete_payload(
             1000,
             super::RestTotals { rest_ms: 0, rests: 0 },
@@ -12563,19 +12582,33 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "stdout-body",
             "",
             0,
-            &super::TrajectorySummary::default(),
-            super::TokenTotals { prompt: 100, completion: 600, reasoning: Some(500), cached: Some(20) },
+            &summary,
+            // (#2263) Deliberately DIFFERENT numbers from `summary` above —
+            // this is the WHOLE-DISPATCH cumulative view (as if a resume had
+            // already run once before), proving the payload's
+            // `prompt_tokens`/`completion_tokens` read from `summary`, not
+            // from this cumulative source.
+            super::TokenTotals { prompt: 9100, completion: 9600, reasoning: Some(9500), cached: Some(920) },
+            super::CumulativeCounts { turns: 7, compactions: 3 },
             None,
             &stats,
             &no_extras(),
             &None,
             None,
         );
+        assert_eq!(payload["prompt_tokens"], 100);
         assert_eq!(payload["completion_tokens"], 600);
         assert_eq!(payload["reasoning_tokens"], 500);
         assert_eq!(payload["cached_tokens"], 20);
         // Subset, never additional: reasoning_tokens <= completion_tokens.
         assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
+        // (#2263) The cumulative (whole-task) view lives in its OWN fields,
+        // sourced from `tokens`/`cumulative` — never conflated with the
+        // this-run numbers above.
+        assert_eq!(payload["cumulative_prompt_tokens"], 9100);
+        assert_eq!(payload["cumulative_completion_tokens"], 9600);
+        assert_eq!(payload["cumulative_turns"], 7);
+        assert_eq!(payload["cumulative_compactions"], 3);
     }
 
     #[test]
@@ -12606,6 +12639,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             137,
             &super::TrajectorySummary::default(),
             super::TokenTotals::default(),
+            super::CumulativeCounts::default(),
             Some("azure/gpt-x"),
             &stats,
             &extras,
@@ -12635,6 +12669,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             0,
             &super::TrajectorySummary::default(),
             super::TokenTotals::default(),
+            super::CumulativeCounts::default(),
             None,
             &super::HostStats::default(),
             &no_extras(),

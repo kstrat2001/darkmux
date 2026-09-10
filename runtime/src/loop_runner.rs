@@ -467,6 +467,28 @@ pub struct LoopOutcome {
     /// Phase 6: middle-replace via the companion compactor model.
     pub compactions: u32,
 
+    /// (#2263) `turns` above is the WHOLE dispatch's turn count — on a
+    /// resume, seeded from the checkpoint, because that's what the loop's
+    /// own `max_turns` budget needs. This is THIS INVOCATION's own
+    /// contribution: `turns` minus whatever the checkpoint seeded, `0` on
+    /// a fresh dispatch's very first call. On a never-resumed dispatch
+    /// this equals `turns` exactly (the seed is `0`) — a consumer that
+    /// reads this field unconditionally gets the right number either way.
+    /// Attribute a resumed dispatch's cost to the model that actually ran
+    /// it by reading these `_this_run` fields, never the whole-dispatch
+    /// ones above, whenever the number is going next to a model name.
+    pub turns_this_run: u32,
+    /// (#2263) This invocation's own contribution to `total_prompt_tokens`
+    /// above. See `turns_this_run`'s doc for the seeded-vs-this-run
+    /// distinction.
+    pub total_prompt_tokens_this_run: u32,
+    /// (#2263) This invocation's own contribution to
+    /// `total_completion_tokens` above. See `turns_this_run`'s doc.
+    pub total_completion_tokens_this_run: u32,
+    /// (#2263) This invocation's own contribution to `compactions` above.
+    /// See `turns_this_run`'s doc.
+    pub compactions_this_run: u32,
+
     /// (#2094) Sum of every inter-turn rest this dispatch took, in
     /// milliseconds — the AFTER-clamp duration actually slept. `wall_ms`
     /// (computed by the caller from `trajectory.elapsed_ms()`) INCLUDES
@@ -486,6 +508,21 @@ pub struct LoopOutcome {
     /// (#799) Bash invocations that FAILED TO RUN (never executed) during the
     /// dispatch — the verifier-fabrication backstop. Empty on an honest run.
     pub failed_to_run: Vec<FailedExec>,
+}
+
+/// (#2263) What THIS invocation itself contributed to a counter the loop's
+/// own budgets need seeded cumulatively across a resume (`turns`,
+/// `total_prompt_tokens`, `total_completion_tokens`, `compactions` — see
+/// their own `resume_seed`-seeding at the top of `run_with_sleeper`).
+/// `saturating_sub`, not `-`: the seed can only ever be `<=` the live
+/// counter in practice (counters only grow after a resume, never shrink),
+/// but a hand-edited or corrupt checkpoint claiming a seed larger than
+/// what has since accumulated must degrade to `0`, never panic on
+/// underflow. `seed == 0` (a fresh, never-resumed dispatch) makes this an
+/// identity — `this_run_delta(0, x) == x` — which is what keeps the
+/// never-resumed path reporting exactly what it always has.
+fn this_run_delta(seed: u32, cumulative: u32) -> u32 {
+    cumulative.saturating_sub(seed)
 }
 
 /// (#2094) Injectable sleep abstraction for the global inter-turn rest.
@@ -1367,6 +1404,22 @@ fn run_with_sleeper(
     // messages opened the ORIGINAL dispatch, so re-seeding from scratch
     // would duplicate them.
     let resume_seed = resume_from;
+    // (#2263) The checkpoint's own counters at the moment THIS invocation
+    // resumed from it — captured once, up front, so every `LoopOutcome`
+    // return site below can report what THIS invocation itself contributed
+    // (`this_run_delta`) alongside the whole-dispatch cumulative counters
+    // the loop's own budgets need seeded (`turns`/`total_prompt_tokens`/
+    // `total_completion_tokens`/`compactions` themselves — unchanged,
+    // still correctly seeded for `max_turns`/`max_cumulative_tokens`/
+    // `bail_after_compactions` gating). All four are `0` when this is a
+    // fresh (non-resumed) dispatch, which is exactly what makes the
+    // never-resumed case a no-op: `this_run_delta(0, x) == x`.
+    let resume_seed_turns = resume_seed.as_ref().map(|c| c.turns).unwrap_or(0);
+    let resume_seed_prompt_tokens =
+        resume_seed.as_ref().map(|c| c.total_prompt_tokens).unwrap_or(0);
+    let resume_seed_completion_tokens =
+        resume_seed.as_ref().map(|c| c.total_completion_tokens).unwrap_or(0);
+    let resume_seed_compactions = resume_seed.as_ref().map(|c| c.compactions).unwrap_or(0);
     let mut messages = match &resume_seed {
         Some(ckpt) => ckpt.messages.clone(),
         None => initial_messages,
@@ -1911,6 +1964,10 @@ fn run_with_sleeper(
                         total_reasoning_tokens,
                         total_cached_tokens,
                         compactions,
+                        turns_this_run: this_run_delta(resume_seed_turns, turns),
+                        total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                        total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                        compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                         rest_ms,
                         rests,
                         turn_delay_effective_ms: turn_delay_ms,
@@ -2043,6 +2100,10 @@ fn run_with_sleeper(
                     total_reasoning_tokens,
                     total_cached_tokens,
                     compactions,
+                    turns_this_run: this_run_delta(resume_seed_turns, turns),
+                    total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                    total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                    compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                     rest_ms,
                     rests,
                     turn_delay_effective_ms: turn_delay_ms,
@@ -2082,6 +2143,10 @@ fn run_with_sleeper(
                     total_reasoning_tokens,
                     total_cached_tokens,
                     compactions,
+                    turns_this_run: this_run_delta(resume_seed_turns, turns),
+                    total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                    total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                    compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                     rest_ms,
                     rests,
                     turn_delay_effective_ms: turn_delay_ms,
@@ -2831,6 +2896,10 @@ fn run_with_sleeper(
                     total_reasoning_tokens,
                     total_cached_tokens,
                     compactions,
+                    turns_this_run: this_run_delta(resume_seed_turns, turns),
+                    total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                    total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                    compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                     rest_ms,
                     rests,
                     turn_delay_effective_ms: turn_delay_ms,
@@ -2916,6 +2985,10 @@ fn run_with_sleeper(
                             total_reasoning_tokens,
                             total_cached_tokens,
                             compactions,
+                            turns_this_run: this_run_delta(resume_seed_turns, turns),
+                            total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                            total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                            compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                             rest_ms,
                             rests,
                             turn_delay_effective_ms: turn_delay_ms,
@@ -3056,6 +3129,10 @@ fn run_with_sleeper(
                             total_reasoning_tokens,
                             total_cached_tokens,
                             compactions,
+                            turns_this_run: this_run_delta(resume_seed_turns, turns),
+                            total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                            total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                            compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                             rest_ms,
                             rests,
                             turn_delay_effective_ms: turn_delay_ms,
@@ -3568,6 +3645,10 @@ fn run_with_sleeper(
                                 total_reasoning_tokens,
                                 total_cached_tokens,
                                 compactions,
+                                turns_this_run: this_run_delta(resume_seed_turns, turns),
+                                total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                                total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                                compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                                 rest_ms,
                                 rests,
                                 turn_delay_effective_ms: turn_delay_ms,
@@ -3687,6 +3768,10 @@ fn run_with_sleeper(
                         total_reasoning_tokens,
                         total_cached_tokens,
                         compactions,
+                        turns_this_run: this_run_delta(resume_seed_turns, turns),
+                        total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                        total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                        compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                         rest_ms,
                         rests,
                         turn_delay_effective_ms: turn_delay_ms,
@@ -3830,6 +3915,10 @@ fn run_with_sleeper(
                                 total_reasoning_tokens,
                                 total_cached_tokens,
                                 compactions,
+                                turns_this_run: this_run_delta(resume_seed_turns, turns),
+                                total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                                total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                                compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                                 rest_ms,
                                 rests,
                                 turn_delay_effective_ms: turn_delay_ms,
@@ -3979,6 +4068,10 @@ fn run_with_sleeper(
                             total_reasoning_tokens,
                             total_cached_tokens,
                             compactions,
+                            turns_this_run: this_run_delta(resume_seed_turns, turns),
+                            total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                            total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                            compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
                             rest_ms,
                             rests,
                             turn_delay_effective_ms: turn_delay_ms,
@@ -5455,6 +5548,112 @@ mod tests {
         turn1_mock.assert_hits(0);
         turn2_mock.assert_hits(0);
         turn3_mock.assert_hits(1);
+
+        // (#2263) `turns`/`total_prompt_tokens`/`total_completion_tokens`/
+        // `compactions` are the WHOLE dispatch's cumulative counters,
+        // correctly seeded from the checkpoint for the loop's own budget
+        // math — that part was never broken. The bug was reporting THOSE
+        // seeded numbers as if they were this invocation's own work. The
+        // `_this_run` counterparts must report ONLY what turn 3 (the one
+        // real call this resumed process made) actually cost: turn 3's
+        // own usage (140 prompt + 5 completion from `chat_response_json`
+        // above), not the checkpoint's 220+40 plus turn 3's usage.
+        assert_eq!(
+            outcome.turns_this_run, 1,
+            "this invocation made exactly ONE call (turn 3) — not the whole \
+             dispatch's 3 turns, 2 of which belong to the resumed-from checkpoint"
+        );
+        assert_eq!(
+            outcome.total_prompt_tokens_this_run, 140,
+            "this invocation's own prompt tokens (turn 3 only) — the checkpoint's \
+             seeded 220 must NOT be added in, or this run's cost gets misattributed \
+             to whatever model made this resumed call"
+        );
+        assert_eq!(
+            outcome.total_completion_tokens_this_run, 5,
+            "this invocation's own completion tokens (turn 3 only), not the \
+             checkpoint's seeded 40 folded in"
+        );
+        assert_eq!(
+            outcome.compactions_this_run, 0,
+            "no compaction fired in this invocation (cfg is never_compact); must \
+             report 0, not whatever the checkpoint happened to seed"
+        );
+        // Sanity: the WHOLE-dispatch cumulative fields are unchanged by this
+        // fix — still seeded + accumulated, still what the loop's own
+        // max_turns/max_cumulative_tokens/bail_after_compactions budgets need.
+        assert_eq!(outcome.total_prompt_tokens, 360, "220 seeded + 140 this run");
+        assert_eq!(outcome.total_completion_tokens, 45, "40 seeded + 5 this run");
+        assert_eq!(outcome.compactions, 0);
+    }
+
+    /// (#2263) The inverted case: a dispatch that was NEVER resumed must
+    /// report IDENTICAL numbers in both the cumulative and `_this_run`
+    /// fields — the fix must not shift the ordinary (non-resumed) path's
+    /// output at all. `resume_from: None` below is the only difference
+    /// from the resumed scenario above; a 2-turn scripted dispatch (tool
+    /// call, then stop) matches `checkpoint_written_after_turn_1_has_
+    /// matching_message_count`'s own fixture shape.
+    #[test]
+    #[serial_test::serial]
+    fn a_never_resumed_dispatch_reports_the_same_numbers_in_both_fields() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = crate::test_support::GuardedMockServer::start();
+        let tool_calls = serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}" },
+        }]);
+        let tc1 = tool_calls.clone();
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(None, Some(tc1.clone()), "tool_calls", 100, 20));
+        });
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() >= 1
+            });
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 120, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("no-resume-parity").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("2-turn scripted dispatch (tool call, then stop) returns Ok");
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        assert_eq!(outcome.turns, 2);
+        assert_eq!(
+            outcome.turns_this_run, outcome.turns,
+            "never resumed — this_run must equal the whole-dispatch count exactly"
+        );
+        assert_eq!(outcome.total_prompt_tokens_this_run, outcome.total_prompt_tokens);
+        assert_eq!(outcome.total_completion_tokens_this_run, outcome.total_completion_tokens);
+        assert_eq!(outcome.compactions_this_run, outcome.compactions);
+        // Pin the actual numbers too, not just the equality — a bug that
+        // zeroed BOTH sides identically would still pass an equality-only
+        // assertion.
+        assert_eq!(outcome.total_prompt_tokens, 220, "100 (turn 1) + 120 (turn 2)");
+        assert_eq!(outcome.total_completion_tokens, 25, "20 (turn 1) + 5 (turn 2)");
     }
 
     #[test]

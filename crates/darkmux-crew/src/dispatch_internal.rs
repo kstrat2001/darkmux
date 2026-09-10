@@ -5675,6 +5675,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // container has exited. Best-effort — zero totals on any read failure
     // (this is observability enrichment, never a dispatch-failing path).
     let tokens = read_token_totals(&host_out);
+    // (#2263) Same best-effort read, same source file — the WHOLE
+    // dispatch's cumulative turns/compactions across every resume, for
+    // the `cumulative_turns`/`cumulative_compactions` payload fields.
+    let cumulative = read_cumulative_counts(&host_out);
     // (#2094) Same best-effort read, same source file — the sum of every
     // inter-turn rest this dispatch took + how many. `wall_ms` above
     // INCLUDES this time (wall stays wall); a caller wanting model-only
@@ -5716,6 +5720,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         exit_code,
         &trajectory_summary,
         tokens,
+        cumulative,
         remote_endpoint_raw_label.as_deref(),
         &host_stats,
         &host_extras,
@@ -6240,6 +6245,26 @@ struct TrajectorySummary {
     /// `reconcile_rest_totals`); a crash-during-write race loses at most
     /// this one derived field, never the totals it's derived from.
     paced_rest_ms: u64,
+    /// (#2263) Live running sum of THIS DISPATCH's own `model.completed`
+    /// usage — accumulated turn-by-turn from the exact same events
+    /// `turns` above counts, so it is this-invocation-only BY
+    /// CONSTRUCTION: `host_out` is always a fresh per-dispatch tempdir
+    /// (including for a resumed dispatch, see `write_staged_resume_
+    /// checkpoint`'s own doc), so `trajectory.jsonl` — and therefore this
+    /// sum — never sees a PRIOR invocation's calls. This is deliberately
+    /// NOT sourced from `metrics.json`'s `total_prompt_tokens`/
+    /// `total_completion_tokens` (`TokenTotals`/`read_token_totals`
+    /// below): those are the runtime's WHOLE-DISPATCH cumulative
+    /// counters, seeded from the checkpoint on a resume so the loop's own
+    /// budgets see the right total — exactly the number that must NOT be
+    /// attributed to whichever model this dispatch happens to be running.
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    /// (#2263) Same tri-state contract as the runtime's own
+    /// `LoopOutcome::total_reasoning_tokens`/`total_cached_tokens`:
+    /// `None` until at least one turn this dispatch reports the field.
+    reasoning_tokens: Option<u32>,
+    cached_tokens: Option<u32>,
     // (#1955) The two things the orchestrator could not see.
     //
     // Both were already COMPUTED here — the tailer forwards checkpoints and
@@ -6366,6 +6391,38 @@ pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
         // extra branching needed here.
         reasoning: v.get("total_reasoning_tokens").and_then(|n| n.as_u64()).map(|n| n as u32),
         cached: v.get("total_cached_tokens").and_then(|n| n.as_u64()).map(|n| n as u32),
+    }
+}
+
+/// (#2263) `turns` / `compactions` as `metrics.json` reports them — the
+/// WHOLE dispatch's cumulative count across every resume (the runtime
+/// seeds both from the checkpoint on a resume; see `RunCheckpoint`'s own
+/// doc). Surfaced on `dispatch.complete` as `cumulative_turns`/
+/// `cumulative_compactions`, alongside `total_turns`/`total_compactions`
+/// (this invocation's own count, from the live tailer) — never as a
+/// replacement for them. Same read pattern, same best-effort
+/// degrade-to-default posture as [`read_token_totals`].
+#[derive(Default, Debug, Clone, Copy)]
+pub struct CumulativeCounts {
+    pub turns: u32,
+    pub compactions: u32,
+}
+
+/// Read `turns` / `compactions` from the runtime's `metrics.json`, the
+/// same file [`read_token_totals`] reads. Best-effort: a missing/malformed
+/// file degrades to zero — this is observability enrichment, never a
+/// dispatch-failing path.
+pub fn read_cumulative_counts(out_dir: &Path) -> CumulativeCounts {
+    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
+    let Ok(raw) = fs::read_to_string(&metrics_path) else {
+        return CumulativeCounts::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return CumulativeCounts::default();
+    };
+    CumulativeCounts {
+        turns: v.get("turns").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+        compactions: v.get("compactions").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
     }
 }
 
@@ -6849,6 +6906,7 @@ fn build_dispatch_complete_payload(
     exit_code: i32,
     summary: &TrajectorySummary,
     tokens: TokenTotals,
+    cumulative: CumulativeCounts,
     remote_endpoint_raw_label: Option<&str>,
     host_stats: &HostStats,
     host_extras: &HostExtras,
@@ -6913,16 +6971,51 @@ fn build_dispatch_complete_payload(
         "tool_calls_invalid_name": summary.tool_calls_invalid_name,
         "tool_calls_ungranted": summary.tool_calls_ungranted,
         "total_compactions": summary.compactions,
-        "prompt_tokens": tokens.prompt,
-        "completion_tokens": tokens.completion,
-        "total_tokens": tokens.total(),
+        // (#2263, FLOW_SCHEMA_VERSION 1.46.0) THIS DISPATCH's own token
+        // usage, summed live from the tailer's per-turn `model.completed`
+        // events — the SAME source `total_turns`/`total_compactions`
+        // above already trust, and this-invocation-only by construction
+        // (`host_out` is always a fresh per-dispatch tempdir; see
+        // `TrajectorySummary::prompt_tokens`'s own doc). Previously
+        // sourced from `metrics.json`'s `total_prompt_tokens`/
+        // `total_completion_tokens` (`tokens.prompt`/`tokens.completion`
+        // below) — the runtime's WHOLE-DISPATCH cumulative counters,
+        // seeded from the checkpoint on a resume — so a resumed
+        // dispatch's `prompt_tokens` here used to report the PRIOR
+        // invocation's tokens too, misattributed to whichever model this
+        // dispatch happens to run. See `cumulative_prompt_tokens` below
+        // for the whole-task total.
+        "prompt_tokens": summary.prompt_tokens,
+        "completion_tokens": summary.completion_tokens,
+        "total_tokens": summary.prompt_tokens.saturating_add(summary.completion_tokens),
         // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0) `null`
         // when the field was never reported for this dispatch (every
         // local LMStudio dispatch today) — never a fabricated `0`. Whether
         // it sits inside `completion_tokens` above is provider-scoped
         // (#1444 review); consumers must not derive one from the other.
-        "reasoning_tokens": tokens.reasoning,
-        "cached_tokens": tokens.cached,
+        // (#2263) Same tailer source as `prompt_tokens`/`completion_tokens`
+        // above, for the same reason — these were already this-run-only
+        // (never seeded across a resume, per #1444's own scope cut), so
+        // switching sources changes nothing on the resumed OR fresh path;
+        // it only buys the same crash-survival property `total_turns`
+        // already has (a live-streamed sum survives a SIGKILL that races
+        // metrics.json's own exit-time write).
+        "reasoning_tokens": summary.reasoning_tokens,
+        "cached_tokens": summary.cached_tokens,
+        // (#2263, additive, FLOW_SCHEMA_VERSION 1.46.0) The WHOLE TASK's
+        // cumulative counters across every resume — what `metrics.json`
+        // itself reports (seeded from the checkpoint, then accumulated).
+        // Never read these next to `model` above as if they were this
+        // dispatch's own cost; that is exactly the corruption #2263
+        // fixes. Present for "what has this whole task cost so far,
+        // across every model that has ever touched it" — equal to the
+        // `total_turns`/`total_compactions`/`prompt_tokens`/
+        // `completion_tokens` fields above whenever this dispatch was
+        // never resumed (nothing to have seeded).
+        "cumulative_turns": cumulative.turns,
+        "cumulative_compactions": cumulative.compactions,
+        "cumulative_prompt_tokens": tokens.prompt,
+        "cumulative_completion_tokens": tokens.completion,
     });
     // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
     // parity with `dispatch_remote`'s completion record, and needed by any
@@ -7831,13 +7924,52 @@ impl TailerState {
                 // off-meter" odometer climbs DURING the dispatch, not just
                 // at complete. Each turn's billed usage is its own
                 // `telemetry.tokens` record; the viewer SUMS records, and
-                // per-turn billed prompt tokens genuinely sum to the
-                // runtime's metrics totals (each turn re-sends context —
-                // same accumulator the runtime uses). The former
-                // at-complete aggregate is gone so nothing double-counts.
-                // Skipped when the event carries no `usage` (such turns
-                // also don't accumulate in metrics.json — symmetric).
+                // per-turn billed prompt tokens genuinely sum to THIS
+                // DISPATCH's own totals (each turn re-sends context — same
+                // accumulator the runtime uses).
+                //
+                // (#2263) That "sums to the runtime's own totals" claim
+                // used to say "metrics.json totals" unconditionally — true
+                // for a fresh dispatch, but metrics.json's
+                // `total_prompt_tokens`/`total_completion_tokens` are
+                // SEEDED from the checkpoint on a resume (the runtime's
+                // own whole-dispatch cumulative counters), so they no
+                // longer equal the sum of THIS process's own per-turn
+                // events. `self.summary.prompt_tokens`/`completion_tokens`
+                // below accumulate straight from these events instead —
+                // this-invocation-only by construction (`host_out` is
+                // always a fresh tempdir) — and are what
+                // `build_dispatch_complete_payload` now reports as
+                // `prompt_tokens`/`completion_tokens`, replacing the old
+                // metrics.json-sourced (cumulative, seeded) totals.
+                //
+                // The former at-complete aggregate record is gone so
+                // nothing double-counts. Skipped when the event carries no
+                // `usage` (such turns also don't accumulate in
+                // metrics.json — symmetric).
                 if let Some(tokens_payload) = turn_tokens_payload(&event) {
+                    self.summary.prompt_tokens = self.summary.prompt_tokens.saturating_add(
+                        tokens_payload.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0)
+                            as u32,
+                    );
+                    self.summary.completion_tokens =
+                        self.summary.completion_tokens.saturating_add(
+                            tokens_payload
+                                .get("completion_tokens")
+                                .and_then(|n| n.as_u64())
+                                .unwrap_or(0) as u32,
+                        );
+                    if let Some(rt) =
+                        tokens_payload.get("reasoning_tokens").and_then(|n| n.as_u64())
+                    {
+                        self.summary.reasoning_tokens =
+                            Some(self.summary.reasoning_tokens.unwrap_or(0).saturating_add(rt as u32));
+                    }
+                    if let Some(ct) = tokens_payload.get("cached_tokens").and_then(|n| n.as_u64())
+                    {
+                        self.summary.cached_tokens =
+                            Some(self.summary.cached_tokens.unwrap_or(0).saturating_add(ct as u32));
+                    }
                     self.emit_telemetry("tokens", "telemetry.tokens", tokens_payload);
                 }
             }
