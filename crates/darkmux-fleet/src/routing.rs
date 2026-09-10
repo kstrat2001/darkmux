@@ -483,10 +483,9 @@ pub fn dispatch_routed_via(
                          --machine={target} (role `{}`): a queued dispatch runs on the \
                          PEER machine via the fleet work queue, which carries no \
                          checkpoint — the peer would start fresh and report success \
-                         under a name that looked like a resume. darkmux never \
-                         silently starts a dispatch fresh under a name that looked \
-                         like a resume: resume on THIS machine (drop --machine) or \
-                         start this role fresh on the peer on purpose (drop \
+                         regardless. darkmux never silently starts a dispatch fresh under \
+                         a name that looked like a resume: resume on THIS machine (drop \
+                         --machine) or start this role fresh on the peer on purpose (drop \
                          --resume-from).",
                         opts.role_id
                     ));
@@ -528,10 +527,9 @@ pub fn dispatch_routed_via(
                          --machine={target} (role `{}`): a queued dispatch runs on the \
                          PEER machine via the fleet work queue, which carries no \
                          checkpoint — the peer would start fresh and report success \
-                         under a name that looked like a resume. darkmux never \
-                         silently starts a dispatch fresh under a name that looked \
-                         like a resume: resume on THIS machine (drop --machine) or \
-                         start this role fresh on the peer on purpose (drop \
+                         regardless. darkmux never silently starts a dispatch fresh under \
+                         a name that looked like a resume: resume on THIS machine (drop \
+                         --machine) or start this role fresh on the peer on purpose (drop \
                          --resume-from).",
                         opts.role_id
                     ));
@@ -999,12 +997,18 @@ mod tests {
             // Local machine differs from the `--machine` target below, so
             // `routing_decision` resolves `Remote { local_unknown: false }`
             // — the ordinary cross-machine case, not the unresolvable-local
-            // warning arm. That sibling arm cannot be forced into
-            // `local_unknown: true` from a portable unit test (it requires
-            // BOTH `DARKMUX_MACHINE_ID` unset AND the `hostname` shell-out
-            // to fail) — its identical guard is instead proven by the
-            // structural conformance test below,
-            // `every_dispatch_via_queue_call_site_is_guarded_against_
+            // warning arm. That sibling arm can't be forced into
+            // `local_unknown: true` from THIS shared unit-test binary (it
+            // requires BOTH `DARKMUX_MACHINE_ID` unset AND the `hostname`
+            // shell-out to fail — the latter is only forceable before
+            // `darkmux_flow::resolve_machine_id()`'s process-wide
+            // `OnceLock` caches a real hostname, which some earlier test in
+            // this same binary has already done by the time this one runs).
+            // It IS reachable from a dispatch, and is exercised end-to-end
+            // in its own process by `resume_from_local_unknown_arm.rs`
+            // (a separate integration-test binary in this crate's `tests/`).
+            // Its guard is also proven by the structural conformance test
+            // below, `every_dispatch_via_queue_call_site_is_guarded_against_
             // resume_from`, which reads this file's own source rather than
             // running it.
             std::env::set_var("DARKMUX_MACHINE_ID", "local-a");
@@ -1099,20 +1103,36 @@ mod tests {
     // ─── #2584 conformance: every call site of `dispatch_via_queue` must be
     //     guarded against `resume_from` ─────────────────────────────────
     //
-    // The test above pins the ONE reachable route (`local_unknown: false`,
-    // the ordinary cross-machine case). It cannot exercise the sibling
-    // `local_unknown: true` arm's guard end-to-end — that requires BOTH
-    // `DARKMUX_MACHINE_ID` unset AND the `hostname` shell-out to fail,
-    // which is not something a portable unit test can force (the existing
-    // `routing_decision_machine_set_but_local_unknown_warns` test in
-    // `darkmux-crew` covers that arm only at the pure-decision-matrix
-    // level, same limitation). This check closes that runtime gap
-    // structurally instead: it does not run `dispatch_routed_via`, it
-    // reads `routing.rs`'s own source and proves BOTH match arms carry the
-    // guard, so a future edit that (say) restores only one arm's refusal —
-    // or drops it during a refactor of this match — fails a fast test even
-    // though no realistic runtime scenario would ever exercise the
-    // untouched arm.
+    // The test above pins the `local_unknown: false` arm (the ordinary
+    // cross-machine case) end-to-end. The sibling `local_unknown: true` arm
+    // — local machine_id unresolvable — turns out ALSO to be reachable from
+    // a real dispatch, in `resume_from_local_unknown_arm.rs` (a separate
+    // integration-test binary in this crate's `tests/`): forcing it needs
+    // only `DARKMUX_MACHINE_ID` unset and `PATH` emptied so the `hostname`
+    // shell-out fails to spawn, and it must run in its OWN process because
+    // `darkmux_flow::resolve_machine_id()` caches that shell-out's result in
+    // a process-wide `OnceLock` — once any test in a shared binary resolves
+    // it to `Some(<hostname>)`, every later test in that same process is
+    // stuck with that cached value regardless of what env it mutates
+    // afterward. An earlier version of this comment called that arm
+    // "not producible portably" — that was true only of the EXISTING shared
+    // unit-test binary, not of the arm itself; a fresh binary is enough.
+    //
+    // So this check is not the only thing standing between the operator and
+    // the untested arm any more. It still earns its place as a SECOND,
+    // structural layer: it does not run `dispatch_routed_via` at all, it
+    // reads `routing.rs`'s own source and proves EACH match arm's own call
+    // site carries the guard IN THAT ARM — a future edit that restores only
+    // one arm's refusal, or drops a guard during a refactor of this match,
+    // fails a fast test without needing a live dispatch to reach the arm
+    // that lost it. **The per-arm scoping is load-bearing, not incidental:**
+    // an earlier version of this check searched the whole ENCLOSING
+    // FUNCTION for a preceding guard rather than the call's own match-arm
+    // block, which meant the FIRST arm's guard (textually earlier in the
+    // source) satisfied the search for the SECOND arm's call too — so
+    // deleting only the second arm's guard left this check GREEN. See
+    // `resume_from_guard_precedes`'s doc and `nearest_enclosing_block` for
+    // the fix.
     //
     // **Same shape as `darkmux-crew`'s `every_dispatch_remote_call_site_
     // is_guarded_against_resume_from` (#2580), NOT an extension of it.**
@@ -1137,7 +1157,17 @@ mod tests {
     //   either fails LOUD rather than silently, but if `dispatch_via_queue`
     //   genuinely needs wider visibility this scan's premise is gone.
     // - A reimplementation of "publish this dispatch to the fleet queue"
-    //   that never calls `dispatch_via_queue` itself.
+    //   that never calls `dispatch_via_queue` itself. Not hypothetical: one
+    //   already exists — `darkmux mission dispatch`'s per-phase fan-out
+    //   loop (`src/main.rs`, around the `fleet::publish_job(&client, job)`
+    //   call inside the `for (phase_id, session_id, job) in &jobs` loop)
+    //   builds its own `WorkJob`s via `fleet::build_work_job` and calls
+    //   `publish_job` directly, entirely outside this file. It is NOT a
+    //   live bypass today only because `mission dispatch` has no
+    //   `--resume-from` flag at all (only the single-dispatch `dispatch`
+    //   verb does) — there is no checkpoint surface to silently drop. If
+    //   `mission dispatch` ever grows one, it needs this same guard BEFORE
+    //   its own publish loop, and this check will not notice either way.
     // - A call reached only through a function-pointer alias.
     // - A call inside an `impl` block method or a macro body (the function
     //   extractor only indexes column-0 `fn`/`pub fn` items) — this FAILS
@@ -1229,10 +1259,70 @@ mod tests {
         }
     }
 
+    /// If a function-declaration keyword sequence (`fn `, `pub fn `, or a
+    /// restricted-visibility form — `pub(crate) fn `, `pub(super) fn `,
+    /// `pub(self) fn `, `pub(in a::b) fn `) begins at `cs[i]`, returns the
+    /// index just past the trailing space of `fn `. Otherwise `None`.
+    ///
+    /// (#2584 review — Also-fix 1) The earlier version of this scan only
+    /// recognized `fn ` and `pub fn `, so a `pub(crate) fn` at column 0
+    /// (this very file already declares three: `scan_flow_entries_for_
+    /// completion`, `match_completion`, `completion_to_dispatch_result`)
+    /// silently dropped out of the function index — invisible to every
+    /// consumer of `top_level_function_spans`, including the guard-search
+    /// used by `every_dispatch_via_queue_call_site_is_guarded_against_
+    /// resume_from` above, with no failure signal pointing at the real
+    /// cause. Recognizing the restricted forms here closes that gap.
+    fn fn_decl_prefix_len(cs: &[char], i: usize) -> Option<usize> {
+        if cs[i..].starts_with(&['f', 'n', ' ']) {
+            return Some(i + 3);
+        }
+        if !cs[i..].starts_with(&['p', 'u', 'b']) {
+            return None;
+        }
+        let mut j = i + 3;
+        if cs.get(j) == Some(&'(') {
+            // Skip the parenthesized visibility qualifier — `(crate)`,
+            // `(super)`, `(self)`, `(in some::path)` — by depth-matched
+            // parens rather than a fixed keyword list, so a future Rust
+            // edition's restricted-visibility syntax doesn't need a rewrite
+            // here too.
+            let mut depth = 1i32;
+            let mut k = j + 1;
+            while k < cs.len() && depth > 0 {
+                match cs[k] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                k += 1;
+            }
+            if depth != 0 {
+                return None; // unterminated — not genuine code; bail conservatively.
+            }
+            j = k;
+        }
+        // Require at least one space between the visibility keyword and `fn`.
+        let space_start = j;
+        while cs.get(j) == Some(&' ') {
+            j += 1;
+        }
+        if j == space_start {
+            return None;
+        }
+        if cs[j..].starts_with(&['f', 'n', ' ']) {
+            Some(j + 3)
+        } else {
+            None
+        }
+    }
+
     /// Every top-level (column-0) function in `src`, as `(name,
     /// body_start, body_end)` byte-offset spans covering from the opening
     /// `{` through its matching closing `}`. Same algorithm as
-    /// `darkmux-crew`'s `top_level_function_spans`.
+    /// `darkmux-crew`'s `top_level_function_spans`, extended (#2584 review)
+    /// to recognize restricted-visibility `fn` declarations via
+    /// `fn_decl_prefix_len` above.
     fn top_level_function_spans(src: &str) -> Vec<(String, usize, usize)> {
         let mut spans = Vec::new();
         let cs: Vec<char> = src.chars().collect();
@@ -1245,16 +1335,7 @@ mod tests {
             }
             let at_line_start = i == 0 || cs[i - 1] == '\n';
             if at_line_start {
-                let rest: String = cs[i..(i + 8).min(cs.len())].iter().collect();
-                let (is_fn, kw_len) = if rest.starts_with("pub fn ") {
-                    (true, 7)
-                } else if rest.starts_with("fn ") {
-                    (true, 3)
-                } else {
-                    (false, 0)
-                };
-                if is_fn {
-                    let name_start = i + kw_len;
+                if let Some(name_start) = fn_decl_prefix_len(&cs, i) {
                     let mut k = name_start;
                     while k < cs.len() && (cs[k].is_alphanumeric() || cs[k] == '_') {
                         k += 1;
@@ -1457,6 +1538,60 @@ mod tests {
         out
     }
 
+    /// Every matching brace-delimited block in `body` (comment/string-aware),
+    /// at EVERY nesting depth — struct-pattern braces (`Foo { a, b } =>`)
+    /// included, since this scan doesn't need to distinguish those from
+    /// control-flow blocks: it only ever uses the result to find the
+    /// SMALLEST block containing a given offset, and a struct-pattern brace
+    /// never contains anything past its own `=>`.
+    ///
+    /// (#2584 review MUST-FIX) Added so the guard search below can be scoped
+    /// to "the block immediately containing this call" instead of "anywhere
+    /// in the whole enclosing function" — see `resume_from_guard_precedes`'s
+    /// doc for why the wider scope was a false-negative trap.
+    fn all_brace_block_spans(body: &str) -> Vec<(usize, usize)> {
+        let cs: Vec<char> = body.chars().collect();
+        let byte_offsets: Vec<usize> = body.char_indices().map(|(b, _)| b).collect();
+        let mut stack: Vec<usize> = Vec::new();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            match cs[i] {
+                '{' => stack.push(i),
+                '}' => {
+                    if let Some(start_char) = stack.pop() {
+                        let start_b = byte_offsets[start_char];
+                        let end_b =
+                            if i + 1 < byte_offsets.len() { byte_offsets[i + 1] } else { body.len() };
+                        out.push((start_b, end_b));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The SMALLEST brace-delimited block in `body` that strictly contains
+    /// `at` — i.e. the nearest enclosing block, which for a call sitting
+    /// directly in a `match` arm's body is that arm's own `{ ... }` block,
+    /// NOT the whole function or the whole `match`. Falls back to the
+    /// entire `body` span if `at` isn't inside any brace pair (shouldn't
+    /// happen for a call site inside a real function body, but a scan
+    /// bug here must fail wide-open rather than panic).
+    fn nearest_enclosing_block(body: &str, at: usize) -> (usize, usize) {
+        all_brace_block_spans(body)
+            .into_iter()
+            .filter(|(start, end)| *start <= at && at < *end)
+            .min_by_key(|(start, end)| end - start)
+            .unwrap_or((0, body.len()))
+    }
+
     /// Collapse Rust string-literal line continuations (a `\` immediately
     /// followed by a newline strips the newline and the next line's
     /// leading whitespace) — this repo wraps long operator-facing messages
@@ -1492,6 +1627,21 @@ mod tests {
     /// `call_at_in_body`, and whose block text (after `\`-continuation
     /// collapsing) contains BOTH `RESUME_FROM_GUARD_ANCHOR` and a
     /// diverging construct (`return Err`/`bail!`/`panic!`).
+    ///
+    /// **`body` must already be scoped to the nearest enclosing block of the
+    /// call site being checked — see `nearest_enclosing_block` — never the
+    /// whole enclosing FUNCTION.** (#2584 review MUST-FIX) Both
+    /// `dispatch_via_queue` call sites live in the same function
+    /// (`dispatch_routed_via`'s two `Remote` match arms), and this function
+    /// only checks "some guard occurs before this call ANYWHERE in `body`" —
+    /// it has no notion of match-arm exclusivity. Called with the whole
+    /// function body, the FIRST arm's guard (earlier in the source) would
+    /// satisfy this check for the SECOND arm's call too, even after deleting
+    /// the second arm's own guard — the two arms are mutually exclusive at
+    /// runtime, but textually the first arm's guard still "precedes" the
+    /// second arm's call. Scoping `body` to the call's own match-arm block
+    /// closes this: the first arm's guard sits in a sibling block the scoped
+    /// search never sees.
     fn resume_from_guard_precedes(body: &str, call_at_in_body: usize) -> bool {
         for (cond_start, block_start, block_end) in find_if_blocks(body) {
             if block_end > call_at_in_body {
@@ -1550,10 +1700,28 @@ mod tests {
             .unwrap_or_else(|e| panic!("reading {} for resume_from conformance: {e}", path.display()));
 
         let functions = top_level_function_spans(&src);
+        // (#2584 review — Also-fix 1) This file declares 9 top-level
+        // (column-0, outside `mod tests`) functions today, 3 of them
+        // `pub(crate)` — a shape `fn_decl_prefix_len` now recognizes
+        // explicitly. The floor below is DELIBERATELY not pinned to
+        // "today's count minus one": a floor with zero slack against the
+        // real count means the FIRST legitimate function move out of this
+        // file (a refactor, not a regression) trips this assertion, and a
+        // message that only says "the extractor is broken" sends the
+        // maintainer chasing the wrong cause — the real one being that this
+        // scan's premise ("every relevant fn lives in this one file")
+        // no longer holds. A few functions of real slack, plus a message
+        // that names BOTH possibilities, keeps a genuine extractor
+        // regression loud without turning an honest refactor into one.
         assert!(
             functions.len() > 5,
-            "sanity: found only {} top-level fns in routing.rs — the extractor is almost \
-             certainly broken, not this file suddenly tiny",
+            "found only {} top-level fns in routing.rs (expected several more — this file \
+             currently declares 9). Two different things produce this: (a) the extractor \
+             regressed on a shape it should recognize (`fn_decl_prefix_len` — plain `fn`, \
+             `pub fn`, or a restricted-visibility `pub(...) fn`), or (b) a function that used \
+             to live at top-level in this file was genuinely moved or deleted, which means \
+             this whole conformance scan's premise (everything relevant lives in THIS file) \
+             may no longer hold. Check git blame on the delta before assuming either.",
             functions.len()
         );
 
@@ -1592,12 +1760,28 @@ mod tests {
             "found zero calls to `dispatch_via_queue(` — either the extractor regressed or the \
              function was deleted; either way this test's premise no longer holds"
         );
+        // (#2584 review — Also-fix 2) This is a bare count assertion, and
+        // its failure cuts BOTH ways — don't just bump the constant to make
+        // it pass again without asking which direction moved and why:
+        // MORE than 2 is probably an honest new call site that needs the
+        // same guard this test enforces on the existing two (bump the
+        // constant once that guard is in place). FEWER than 2 is the
+        // dangerous direction — it can mean a call site was hidden from
+        // this scan rather than removed, e.g. a function-pointer alias
+        // (`let f = dispatch_via_queue; ...; f(opts, ...)` — `find_calls`
+        // only matches the identifier `dispatch_via_queue` immediately
+        // followed by `(`, so an alias call never counts here at all).
+        // Blindly lowering this constant to match a drop makes that
+        // exact bypass permanent and silent.
         assert_eq!(
             call_offsets.len(),
             2,
             "expected exactly the two known call sites (both Remote arms of \
-             `dispatch_routed_via`'s match) — found {}. A new call site needs the same guard \
-             this test enforces on the existing two; update this count once it does.",
+             `dispatch_routed_via`'s match) — found {}. If this went UP: a new call site needs \
+             the same guard this test enforces on the existing two before you bump this \
+             constant. If this went DOWN: do not just lower the constant — find out where the \
+             missing call went first (a function-pointer alias is the known way a real call to \
+             `dispatch_via_queue` can go invisible to this text scan).",
             call_offsets.len()
         );
 
@@ -1615,14 +1799,29 @@ mod tests {
             let body = &src[*fn_start..*fn_end];
             let call_at_in_body = call_at - fn_start;
 
+            // (#2584 review MUST-FIX) Scope the guard search to the call's
+            // own nearest enclosing block — for these two call sites, that
+            // is each `Remote` match arm's own `{ ... }` body — NOT the
+            // whole `{fn_name}` function. `dispatch_routed_via` holds BOTH
+            // `dispatch_via_queue` call sites (one per match arm), and a
+            // function-wide search would let one arm's guard vouch for the
+            // OTHER arm's call, since match arms are mutually exclusive at
+            // runtime but not textually ordered against each other. See
+            // `resume_from_guard_precedes`'s doc for the full mechanism.
+            let (block_start, block_end) = nearest_enclosing_block(body, call_at_in_body);
+            let scoped_body = &body[block_start..block_end];
+            let call_at_in_scoped = call_at_in_body - block_start;
+
             assert!(
-                resume_from_guard_precedes(body, call_at_in_body),
+                resume_from_guard_precedes(scoped_body, call_at_in_scoped),
                 "`{fn_name}` calls `dispatch_via_queue(` at file offset {call_at} without a \
-                 `resume_from`-conditioned guard preceding it — this is the #2561/#2580/#2584 \
-                 bypass class: a caller can silently spend real tokens on a PEER machine under \
-                 a --resume-from flag that was never honored. The guard must sit inside an `if` \
-                 whose condition mentions `resume_from`, closes before the call, and contains \
-                 both {RESUME_FROM_GUARD_ANCHOR:?} and a diverging bail!/return Err/panic!."
+                 `resume_from`-conditioned guard preceding it IN THE SAME MATCH ARM — this is \
+                 the #2561/#2580/#2584 bypass class: a caller can silently spend real tokens on \
+                 a PEER machine under a --resume-from flag that was never honored. The guard \
+                 must sit inside an `if` whose condition mentions `resume_from`, closes before \
+                 the call, and contains both {RESUME_FROM_GUARD_ANCHOR:?} and a diverging \
+                 bail!/return Err/panic! — all within this call's own enclosing block, not a \
+                 sibling arm's."
             );
         }
     }
