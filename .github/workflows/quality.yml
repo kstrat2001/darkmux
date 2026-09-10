@@ -27,6 +27,31 @@ name: quality
 # where the baseline suite failed and zero mutants were ever generated
 # rendered "No surviving mutants" and went green. An advisory check is still
 # allowed to say nothing; it is not allowed to say "clean" when it never ran.
+#
+# (#2550) A CANCELLED run is the same class of lie, from a different cause.
+# A large diff can outrun `mutants-in-diff`'s `timeout-minutes` budget while
+# a mutation invocation is mid-run — the job's conclusion becomes
+# `cancelled`, distinct from both `success` and `failure`, and
+# `cargo mutants` never gets to write an exit code. At the time of the real
+# incident (run 34324045744, PR head `386afc48`, 2026-09-09) the "Report
+# survivors" step for that invocation was ALREADY gated on `if: always()` —
+# it DID run, with conclusion `failure` — but the summary script treated the
+# resulting empty `exit_code` as a bare parse error and printed its message
+# to **stderr** before exiting 2, so nothing ever reached
+# `$GITHUB_STEP_SUMMARY` and that scope's section of the PR summary was
+# simply ABSENT. Advisory-plus-cancelled then read, on the PR page, almost
+# identically to advisory-plus-clean: nothing distinguished "we looked and
+# found nothing" from "we never finished looking". (A day later, an
+# unrelated fix — #2602 — put these same Report steps on `!cancelled()`,
+# which really would skip a step outright on job cancellation; that is a
+# separate, real hole, not the one that produced the original incident.)
+# Each Report step below stays on `always()` (its own Mutate step stays on
+# `!cancelled()` — a new multi-minute mutation run must not START once
+# cancellation is already underway) and passes `--job-status "${{
+# job.status }}"` to the summary script, which now renders a loud, distinct
+# CANCELLED verdict (with whatever partial progress cargo-mutants had
+# already written) instead of erroring to stderr. See
+# `scripts/ci-mutants-summary.py`'s own `CANCELLED_SENTINEL`.
 
 on:
   pull_request:
@@ -457,16 +482,40 @@ jobs:
           exit 0
 
       - name: Report survivors
-        # (#2602 round 3) `always()` -> `!cancelled()`, matching "Mutate only
-        # what this PR touched" above — see that step's comment. Kept in
-        # lockstep with its own Mutate step, same shape as the runtime/ and
-        # plugins/darkmux-bundler-rust/ pairs below.
-        if: ${{ !cancelled() }}
+        # (#2550) This step was ALREADY on `always()` at the time of the
+        # real incident (run 34324045744, PR head `386afc48`, 2026-09-09) —
+        # it ran, with conclusion `failure`. The actual mechanism was in the
+        # summary script: `${{ steps.mutants.outputs.exit_code }}` arrives
+        # empty when "Mutate only what this PR touched" above is cancelled
+        # (this job's own `timeout-minutes` budget running out, most likely
+        # — a manual cancel can also cause it) mid-run, and the script's old
+        # handling of an empty `exit_code` printed its message to **stderr**
+        # and exited 2 before any Markdown reached stdout — so nothing was
+        # ever appended to `$GITHUB_STEP_SUMMARY` and the root scope's
+        # section was simply ABSENT: indistinguishable, on the PR page, from
+        # a clean sweep. (A day after the incident, an unrelated fix —
+        # #2602 — briefly put this step on `!cancelled()`, which really
+        # would skip it outright on cancellation; that was a separate, real
+        # hole, not the cause of the original incident, and this fix reverts
+        # it back to `always()`.) "Mutate only what this PR touched" above
+        # stays on `!cancelled()` on purpose — it must NOT start a brand-new
+        # multi-minute mutation run once cancellation is already underway;
+        # only the (cheap, read-only) reporting step needs the wider gate.
+        #
+        # `--job-status "${{ job.status }}"` lets the summary script tell
+        # "this invocation was cut off by cancellation" (job.status ==
+        # cancelled, exit_code empty) apart from "an earlier unrelated step
+        # failed" (job.status == failure, exit_code also empty) — only the
+        # former gets the loud, distinct CANCELLED report instead of the old
+        # stderr-only error; see ci-mutants-summary.py's own
+        # `CANCELLED_SENTINEL`.
+        if: ${{ always() }}
         run: |
           python3 scripts/ci-mutants-summary.py \
             "${{ steps.mutants.outputs.exit_code }}" diff \
             "Mutation testing — this PR's changed lines" \
             --changed-lines "${{ steps.diff.outputs.changed_lines }}" \
+            --job-status "${{ job.status }}" \
             mutants-out/mutants.out mutants.out >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
@@ -550,21 +599,19 @@ jobs:
           exit 0
 
       - name: Report survivors (runtime/)
-        # (#2602 round 2) `!cancelled()`, matching "Mutate runtime/..."
-        # above — must stay identical to it or a cancellation skips one but
-        # not the other, reproducing the empty-`exit_code` integer-parse
-        # error the original `always()` fix existed to prevent (see that
-        # step's comment). Also (#2602 round 2): a genuinely empty
-        # `exit_code` — the mutation step above legitimately skipped, or
-        # failed to run for a reason other than cancellation — now reads as
-        # an honest "did not run" from the summary script rather than a
-        # confusing integer-parse error either way.
-        if: ${{ !cancelled() && steps.diff.outputs.runtime_changed_lines != '0' }}
+        # (#2550) `!cancelled()` -> `always()`, matching "Report survivors"
+        # (root)'s own change above — see that step's comment for the full
+        # rationale. Kept in lockstep with its OWN Mutate step, which stays
+        # on `!cancelled()` for the same reason root's does: don't start a
+        # brand-new baseline+mutation run once the job is already being
+        # cancelled. `--job-status` added for the same reason as root's.
+        if: ${{ always() && steps.diff.outputs.runtime_changed_lines != '0' }}
         run: |
           python3 scripts/ci-mutants-summary.py \
             "${{ steps.mutants_runtime.outputs.exit_code }}" diff \
             "Mutation testing — this PR's changed lines (runtime/)" \
             --changed-lines "${{ steps.diff.outputs.runtime_changed_lines }}" \
+            --job-status "${{ job.status }}" \
             mutants-runtime-out/mutants.out mutants-runtime.out >> "$GITHUB_STEP_SUMMARY"
 
       # The mirror of the step above, for the common case where this PR
@@ -572,8 +619,18 @@ jobs:
       # something about `runtime/` coverage rather than silently omitting
       # it, which would read identically to "we looked and found nothing"
       # (the same illegibility #2550 named for a cancelled sweep).
+      #
+      # (#2550) `always() &&` added to this note's own condition too: it had
+      # no status-check function at all before, which is an IMPLICIT
+      # `success()` gate — on a job cancelled elsewhere (root's own Mutate
+      # step, say) this note would silently vanish for a scope that never
+      # had anything to report in the first place (no diff under `runtime/`
+      # regardless of cancellation), leaving the summary looking incomplete
+      # for a reason unrelated to the actual finding. `always()` keeps this
+      # scope's section present no matter where else in the job a
+      # cancellation lands.
       - name: Note runtime/ mutation was skipped (nothing to mutate there)
-        if: steps.diff.outputs.runtime_changed_lines == '0'
+        if: ${{ always() && steps.diff.outputs.runtime_changed_lines == '0' }}
         run: |
           {
             echo "## Mutation testing — this PR's changed lines (runtime/)"
@@ -609,18 +666,26 @@ jobs:
           exit 0
 
       - name: Report survivors (plugins/darkmux-bundler-rust/)
-        # Must stay identical to "Mutate plugins/darkmux-bundler-rust/..."
-        # above's own condition — see that step's comment.
-        if: ${{ !cancelled() && steps.diff.outputs.bundler_changed_lines != '0' }}
+        # (#2550) `always()`, matching "Report survivors" (root) and
+        # "Report survivors (runtime/)" above — see root's comment for the
+        # full rationale, and note the SAME `!cancelled()` -> `always()`
+        # constraint that comment names: the Mutate step above stays on
+        # `!cancelled()`, only the reporting step widens.
+        if: ${{ always() && steps.diff.outputs.bundler_changed_lines != '0' }}
         run: |
           python3 scripts/ci-mutants-summary.py \
             "${{ steps.mutants_bundler.outputs.exit_code }}" diff \
             "Mutation testing — this PR's changed lines (plugins/darkmux-bundler-rust/)" \
             --changed-lines "${{ steps.diff.outputs.bundler_changed_lines }}" \
+            --job-status "${{ job.status }}" \
             mutants-bundler-out/mutants.out mutants-bundler.out >> "$GITHUB_STEP_SUMMARY"
 
+      # (#2550) `always() &&` added — same reason as "Note runtime/ mutation
+      # was skipped" above: this note had no status-check function at all,
+      # so it silently vanished on a cancellation elsewhere in the job even
+      # though this scope had nothing to do with that cancellation.
       - name: Note plugins/darkmux-bundler-rust/ mutation was skipped (nothing to mutate there)
-        if: steps.diff.outputs.bundler_changed_lines == '0'
+        if: ${{ always() && steps.diff.outputs.bundler_changed_lines == '0' }}
         run: |
           {
             echo "## Mutation testing — this PR's changed lines (plugins/darkmux-bundler-rust/)"
@@ -862,11 +927,22 @@ jobs:
           exit 0
 
       - name: Summarize
+        # Already `always()` before #2550 — this job's own long history of
+        # never finishing a sweep (#2499) meant this step already needed to
+        # survive a cancellation to report anything at all. What #2550 adds
+        # is `--job-status`, so a cancelled/timed-out sweep gets the loud,
+        # distinguishable CANCELLED report (with whatever partial progress
+        # cargo-mutants had written) instead of the old empty-exit_code
+        # message, which only ever reached stderr and never
+        # `$GITHUB_STEP_SUMMARY` — see ci-mutants-summary.py's own
+        # `CANCELLED_SENTINEL` and the "Report survivors" step's comment in
+        # the `mutants-in-diff` job above for the full rationale.
         if: always()
         run: |
           python3 scripts/ci-mutants-summary.py \
             "${{ steps.mutants.outputs.exit_code }}" full \
             "Nightly mutation sweep (root \`darkmux\` package — see #1716)" \
+            --job-status "${{ job.status }}" \
             mutants-out/mutants.out mutants.out >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4

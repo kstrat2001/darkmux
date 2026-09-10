@@ -94,6 +94,53 @@ job was written advisory in the first place.
 
 What GATES is tool integrity: the tool did not run, or it ran and reported
 numbers we cannot reconcile. That distinction is the whole of #1716.
+
+## A fourth false-green shape: a cancelled run reading as silence (#2550)
+
+A large diff can outrun `mutants-in-diff`'s job-level `timeout-minutes`
+budget while a mutation invocation is mid-run. `cargo mutants` never gets to
+write its exit code, so `${{ steps.mutants.outputs.exit_code }}` arrives at
+the "Report survivors" step as an empty string. At the time of the actual
+incident (run 34324045744, PR head `386afc48`, 2026-09-09) that step was
+already gated on `if: always()` — it DID run, and its own conclusion was
+recorded as `failure` — but this script's `__main__` treated the empty
+`exit_code` as a bare parse error: it printed
+`exit_code must be an integer, got ''` to **stderr** and exited 2, before a
+single line of Markdown reached stdout. Piped with `>> "$GITHUB_STEP_SUMMARY"`,
+that meant nothing was ever appended, so the scope's whole section of the PR
+summary was simply ABSENT. Advisory-plus-cancelled then read, on the PR
+page, almost identically to advisory-plus-clean: nothing distinguished "we
+looked and found nothing" from "we never finished looking" — the same lie
+#1716 closed for a swallowed exit code, wearing a new cause.
+
+(The day after the incident, an unrelated fix — #2602 — put these same
+Report steps on `!cancelled()`, which really would skip a step outright once
+the job itself is cancelled. That is a real hole, just not the one that
+produced the original #2550 incident, which happened while the step was
+still on `always()`. This fix moves the steps back to `always()` and closes
+the actual hole above: an empty `exit_code` now renders a loud CANCELLED
+verdict instead of erroring to stderr.)
+
+The fix has two halves, one in each file. Here: `CANCELLED_SENTINEL`, a
+sentinel exit code that shares `main()`'s existing "DID NOT RUN" branch but
+gets its own loud CANCELLED wording and its own attempt to recover partial
+progress from whatever `outcomes.json`/`.txt` files cargo-mutants had already
+written before the cutoff — reached via `__main__`'s `--job-status` flag,
+which distinguishes "the job was cancelled" (this case) from every other
+reason `exit_code` can arrive empty. In `quality.yml`: the Report steps stay
+on `always()`, so they get their chance in the ~5-minute cancellation grace
+window GitHub grants `always()`-conditioned steps — while the Mutate steps
+stay on `!cancelled()`, deliberately, so a new multi-minute mutation run
+never STARTS once cancellation is already underway.
+
+Two limits, named rather than papered over. `always()` is not universal: on
+a runner *shutdown* (as opposed to a job cancellation) GitHub skips condition
+evaluation entirely, so `always()`-gated steps are skipped too; and a
+STEP-level `timeout-minutes` (not used anywhere in `quality.yml` today) also
+yields `job.status == "failure"` with an empty `exit_code`, landing in the
+generic "DID NOT RUN" branch rather than the CANCELLED one. Neither is
+reachable in this workflow as written, but neither is this fix a claim that
+every cancellation shape is covered.
 """
 import json
 import os
@@ -123,6 +170,30 @@ OK_CODES = {0, 2, 3}
 # "unrecognized JSON shape" fixture cannot accidentally agree with it.
 TOTALS_KEYS = ("total_mutants", "missed", "caught", "timeout", "unviable")
 
+# (#2550) A sentinel for "cargo-mutants never reported an exit code at all,
+# because the JOB was cancelled — almost certainly `quality.yml`'s own
+# `timeout-minutes` budget running out while this invocation was still
+# running (a manual cancel can also cause this)". Never a real cargo-mutants
+# exit code, so it is never in `OK_CODES` and shares `main()`'s existing "DID
+# NOT RUN" branch — but it gets its OWN wording (CANCELLED, not just "DID NOT
+# RUN") and its own attempt to recover partial progress from whatever
+# `outcomes.json`/`missed.txt`/`caught.txt` cargo-mutants had already written
+# before the cutoff. See `__main__`'s `--job-status` handling for how a bare,
+# unset `exit_code` argument becomes this sentinel instead of the older
+# generic "exit_code is empty" message.
+#
+# This is the fix for the actual failure mode #2550 reports: the real
+# incident (run 34324045744, PR head `386afc48`, 2026-09-09) hit an empty
+# `exit_code` on a "Report survivors" step that was ALREADY on `always()` —
+# it ran, and failed loudly at the process level, but that generic
+# `main()`'s "exit_code must be an integer, got ''" message only ever went to
+# stderr, so nothing reached `$GITHUB_STEP_SUMMARY` and the scope's section
+# was simply ABSENT: indistinguishable, on the PR page, from a clean sweep.
+# (`!cancelled()`, which really would skip the step outright, was introduced
+# on these Report steps the NEXT day by an unrelated fix and is reverted back
+# to `always()` here — it was never the cause of the original incident.)
+CANCELLED_SENTINEL = -1
+
 EXIT_MEANING = {
     0: "Success — ran, all mutants caught",
     1: "Usage — bad CLI arguments",
@@ -132,6 +203,8 @@ EXIT_MEANING = {
     5: "FilterDiffMismatch — the --in-diff file didn't match the source tree",
     6: "FilterDiffInvalid — the --in-diff file could not be parsed",
     70: "Software — an internal cargo-mutants error",
+    CANCELLED_SENTINEL: "Cancelled — the job was cut off (most likely its own timeout-minutes "
+    "budget) before cargo-mutants reported a final result",
 }
 
 
@@ -1152,6 +1225,30 @@ def load_outcomes_totals(out_dir: Path | None) -> dict[str, int] | None:
     return totals or None
 
 
+def load_planned_total(out_dir: Path | None) -> int | None:
+    """Read cargo-mutants' own list of every mutant it PLANNED to test this
+    invocation (`mutants.json` — a JSON array, one entry per candidate
+    mutant). cargo-mutants writes this file up front, before mutating
+    anything, so unlike `outcomes.json` it survives a cancellation that never
+    reaches the end of a run — it is what lets a CANCELLED report say "N of
+    M mutants evaluated" instead of just "N" (issue #2550's own
+    fix-direction 2). Returns None if the file is missing, unreadable, or not
+    a JSON array, so the denominator is simply omitted rather than rendered
+    wrong."""
+    if out_dir is None:
+        return None
+    planned = out_dir / "mutants.json"
+    if not planned.exists():
+        return None
+    try:
+        data = json.loads(planned.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    return len(data)
+
+
 def main(
     exit_code: int,
     mode: str,
@@ -1164,6 +1261,102 @@ def main(
     lines = [f"## {title}", ""]
 
     if exit_code not in OK_CODES:
+        if exit_code == CANCELLED_SENTINEL:
+            # (#2550) The job was cancelled — never a real cargo-mutants exit
+            # code, so this gets its own wording rather than the generic
+            # "DID NOT RUN" below: a reader needs to know this specific run
+            # was CUT OFF, not merely that something went wrong. Attempt to
+            # recover partial progress the same way the normal path falls
+            # back to the per-category `.txt` files (below) — cargo-mutants
+            # appends to those as it goes, so whatever was on disk at the
+            # moment of cancellation is real, if incomplete.
+            #
+            # `out_dir is None` is a DIFFERENT case from "cut off mid-run"
+            # and is worded separately: it means cargo-mutants' own
+            # `--output` directory was never created at all, which happens
+            # when this scope's Mutate step itself never ran (e.g. one of
+            # the `runtime/`/`plugins/darkmux-bundler-rust/` scopes, whose
+            # Mutate steps stay on `!cancelled()` and so are skipped
+            # outright when an earlier scope's cancellation already reached
+            # the job). Without this branch, three scopes that never started
+            # would each render the same "still running" wording as a scope
+            # that genuinely got cut off mid-mutation — reading as three
+            # truncated runs when only one ran at all.
+            if out_dir is None:
+                lines += [
+                    "**This scope's mutation testing was CANCELLED before it started — this "
+                    'is not a pass, and it is not the same as "no survivors".**',
+                    "",
+                    "This invocation's own `Mutate` step never ran at all — skipped outright "
+                    "by its `!cancelled()` gate once cancellation reached the job from "
+                    "elsewhere, most likely another scope's `timeout-minutes` budget running "
+                    "out (a manual cancel can also cause this) — so nothing was ever tested "
+                    "here.",
+                    "",
+                ]
+            else:
+                lines += [
+                    "**Mutation testing was CANCELLED before it finished — this is not a pass, "
+                    'and it is not the same as "no survivors".**',
+                    "",
+                    "The job was cancelled while this invocation was still running — most likely "
+                    "its own `timeout-minutes` budget ran out, though a manual cancel can also "
+                    "cause this. cargo-mutants never reported a final exit code either way.",
+                    "",
+                ]
+            partial = load_outcomes_totals(out_dir)
+            if partial is not None:
+                p_missed = partial.get("missed", 0)
+                p_caught = partial.get("caught", 0)
+                p_timeout = partial.get("timeout", 0)
+                p_unviable = partial.get("unviable", 0)
+                p_total = partial.get(
+                    "total_mutants", p_missed + p_caught + p_timeout + p_unviable
+                )
+            elif out_dir is not None:
+                p_missed = line_count(out_dir / "missed.txt")
+                p_caught = line_count(out_dir / "caught.txt")
+                p_timeout = line_count(out_dir / "timeout.txt")
+                p_unviable = line_count(out_dir / "unviable.txt")
+                p_total = p_missed + p_caught + p_timeout + p_unviable
+            else:
+                p_total = p_missed = p_caught = p_timeout = p_unviable = 0
+            if p_total > 0:
+                # (#2550's own fix-direction 2) Say how many mutants it got
+                # through OUT OF how many were planned, when cargo-mutants'
+                # up-front `mutants.json` survived the cutoff to say — a bare
+                # count with no denominator doesn't answer "how much of this
+                # scope got looked at".
+                planned_total = load_planned_total(out_dir)
+                denominator = (
+                    f" of {planned_total}"
+                    if planned_total is not None and planned_total >= p_total
+                    else ""
+                )
+                lines += [
+                    f"Partial progress recovered from before the cutoff: **{p_total}"
+                    f"{denominator} mutant(s) evaluated** — {p_caught} caught, {p_missed} "
+                    f"missed, {p_timeout} timed out, {p_unviable} unviable. This is NOT the "
+                    "full picture — an unknown number of mutants beyond these were never "
+                    "reached, so a zero here is not a clean result.",
+                ]
+            elif out_dir is None:
+                lines += [
+                    "No results to recover — this scope's invocation never started.",
+                ]
+            else:
+                lines += [
+                    "No partial results were recovered from this run — it was cut off "
+                    "before cargo-mutants evaluated any mutant (quite possibly still "
+                    "inside its own baseline build/test phase).",
+                ]
+            lines += [
+                "",
+                "Reporting this as a failure instead of a silent gap in the summary — "
+                "see #2550.",
+            ]
+            print("\n".join(lines))
+            return 1
         lines += [
             "**Mutation testing DID NOT RUN — this is not a pass.**",
             "",
@@ -1502,6 +1695,171 @@ SELF_TEST_CASES = [
         "expect_exit": 0,
         "must_contain": ["nothing to mutate"],
         "must_not_contain": ["ZERO mutants", "DID NOT RUN"],
+    },
+    # -------------------------------------------------------------------
+    # (#2550) The timeout/cancellation path. These are the rows that matter
+    # most for this fix: nothing in this repo previously asserted that a
+    # CANCELLED run reads differently from either a clean pass or the older
+    # generic "did not run" message — the whole reason a large-diff timeout
+    # read as silence on the PR page instead of a loud failure.
+    # -------------------------------------------------------------------
+    {
+        # `files: None` means the candidate `--output` directory was never
+        # created at all — cargo-mutants was never even invoked for this
+        # scope (e.g. the `runtime/`/`plugins/darkmux-bundler-rust/` Mutate
+        # steps, which stay on `!cancelled()` and are skipped outright once
+        # an earlier scope's cancellation reaches the job). That is a
+        # DIFFERENT finding from "cut off mid-run" and gets its own wording
+        # (below) so three scopes that never started don't each render the
+        # same "still running" text as a scope that genuinely was mid-flight.
+        "name": "cancelled job whose own Mutate step never ran at all (no output dir) "
+        "— reports 'never started', not 'still running', and fails",
+        "argv": ["", "diff", "T", "--job-status", "cancelled"],
+        "files": None,
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED", "not a pass", "never started", "No results to recover"],
+        "must_not_contain": [
+            "No surviving mutants",
+            "nothing to mutate",
+            "Every mutation",
+            "DID NOT RUN",
+            "still running",
+            "No partial results",
+        ],
+    },
+    {
+        # The genuinely-different case from the one above: the `--output`
+        # directory DOES exist (cargo-mutants' own Mutate step started and
+        # created it) but nothing was written into it yet — cut off while
+        # still inside its own baseline build/test phase, before the first
+        # mutant was judged.
+        "name": "cancelled job whose invocation started but produced zero partial "
+        "results (still running, e.g. baseline phase) — CANCELLED and fails",
+        "argv": ["", "diff", "T", "--job-status", "cancelled"],
+        "files": {},
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED", "not a pass", "still running", "No partial results", "baseline"],
+        "must_not_contain": ["No surviving mutants", "nothing to mutate", "Every mutation", "never started"],
+    },
+    {
+        "name": "cancelled job with partial per-category .txt progress reports the "
+        "partial counts (with a denominator from mutants.json) and still fails",
+        "argv": ["", "diff", "T", "--job-status", "cancelled"],
+        "files": {
+            # outcomes.json deliberately absent here — this case exercises
+            # the .txt FALLBACK specifically (see the next case below for
+            # outcomes.json present, which is the shape a real cancelled run
+            # actually uploads). The per-category .txt files are appended to
+            # as each mutant is judged, so these ARE real progress from
+            # before the cutoff.
+            "caught.txt": "a\nb\nc\n",
+            "missed.txt": "d\n",
+            # cargo-mutants writes mutants.json UP FRONT, before mutating
+            # anything, so it survives a cancellation that outcomes.json
+            # (written only at the very end) does not — this is what lets
+            # the report say "4 of 6", not just "4".
+            "mutants.json": "[1, 2, 3, 4, 5, 6]",
+        },
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED", "4 of 6 mutant(s) evaluated", "3 caught", "1 missed", "NOT the full picture"],
+        "must_not_contain": ["No surviving mutants", "nothing to mutate", "Every mutation", "No partial results"],
+    },
+    {
+        # (CONSIDER 3) The shape a REAL cancelled run actually uploads:
+        # cargo-mutants rewrites outcomes.json incrementally as it goes, not
+        # only at the very end — confirmed against a real cancelled run's
+        # artifact, which contained a populated outcomes.json. Without this
+        # case, `load_outcomes_totals` winning over the .txt fallback in the
+        # CANCELLED branch was exercised by no self-test at all.
+        "name": "cancelled job with a partially-written outcomes.json prefers it over "
+        "the .txt fallback and still fails",
+        "argv": ["", "diff", "T", "--job-status", "cancelled"],
+        "files": {
+            "outcomes.json": _outcomes(total_mutants=62, missed=0, caught=55, timeout=7, unviable=0),
+            "mutants.json": "[" + ", ".join(str(i) for i in range(93)) + "]",
+            # Deliberately-wrong .txt files: if the fallback wins by mistake,
+            # these counts (not outcomes.json's) show up in the assertions
+            # below and the case fails loudly rather than silently agreeing.
+            "caught.txt": "\n".join(f"m{i}" for i in range(1)),
+            "missed.txt": "\n".join(f"m{i}" for i in range(1)),
+        },
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED", "62 of 93 mutant(s) evaluated", "55 caught", "0 missed", "7 timed out"],
+        "must_not_contain": ["1 caught", "1 missed", "the per-category .txt files"],
+    },
+    {
+        "name": "cancelled nightly sweep (full mode) reports CANCELLED and fails",
+        "argv": ["", "full", "T", "--job-status", "cancelled"],
+        "files": None,
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED"],
+        "must_not_contain": ["ZERO mutants", "direction of travel"],
+    },
+    {
+        # Pins that --job-status only changes behavior for "cancelled" —
+        # the existing generic "did not run" message (still stderr-only,
+        # still exit 2) is unchanged for every other value, including a
+        # value this script has never seen before.
+        "name": "empty exit_code with --job-status success (not cancelled) keeps the "
+        "generic did-not-run message, not the CANCELLED one",
+        "argv": ["", "diff", "T", "--job-status", "success"],
+        "files": None,
+        "expect_exit": 2,
+        "must_contain": ["exit_code is empty", "did not run"],
+        "must_not_contain": ["CANCELLED", "No surviving mutants", "nothing to mutate"],
+    },
+    {
+        # MUST FIX (adversarial review): `--changed-lines ""` used to
+        # hard-exit(2) to stderr BEFORE `--job-status` was even parsed, so a
+        # job cancelled before its diff-counting step finished — the diff
+        # step's own output arriving empty, which happens for exactly the
+        # class of cancellation this whole fix is about — never reached the
+        # CANCELLED report at all: 0 bytes to $GITHUB_STEP_SUMMARY, exit 2.
+        # This is the reviewer's own exact repro (positional exit_code also
+        # empty, pointing at a candidate dir that doesn't exist).
+        "name": "empty --changed-lines together with --job-status cancelled routes "
+        "to the CANCELLED report (not the changed-lines error) and fails loudly",
+        "argv": ["", "diff", "T", "--changed-lines", "", "--job-status", "cancelled"],
+        "files": None,
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED"],
+        "must_not_contain": ["changed-lines is empty", "--changed-lines must be an integer"],
+    },
+    {
+        # The paired case: when the job is NOT cancelled, an empty
+        # `--changed-lines` is still the honest "the diff step did not run"
+        # error it always was — only the cancelled combination changed.
+        "name": "empty --changed-lines with --job-status NOT cancelled still hard-fails "
+        "with the changed-lines error, unchanged",
+        "argv": ["0", "diff", "T", "--changed-lines", "", "--job-status", "failure"],
+        "files": None,
+        "expect_exit": 2,
+        "must_contain": ["changed-lines is empty"],
+        "must_not_contain": ["CANCELLED"],
+    },
+    # The pinned property: a TIMED-OUT run and a genuinely clean run must
+    # NEVER produce the same exit status, even when everything else about
+    # them (changed-lines count, title) is identical — that is the whole
+    # point of #2550. These two cases are deliberately matched on
+    # changed-lines=5 so the ONLY variable is exit_code/--job-status.
+    {
+        "name": "#2550 pin (1/2): TIMED OUT at changed-lines=5",
+        "argv": ["", "diff", "T", "--job-status", "cancelled", "--changed-lines", "5"],
+        "files": None,
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED"],
+        "must_not_contain": ["No surviving mutants", "nothing to mutate", "Every mutation"],
+    },
+    {
+        "name": "#2550 pin (2/2): a genuinely clean pass at the SAME changed-lines=5 "
+        "— must exit differently from the TIMED OUT case directly above",
+        "argv": ["0", "diff", "T", "--changed-lines", "5"],
+        "files": {
+            "outcomes.json": _outcomes(total_mutants=5, missed=0, caught=5, timeout=0, unviable=0),
+        },
+        "expect_exit": 0,
+        "must_contain": ["Every mutation this PR made testable was caught"],
+        "must_not_contain": ["CANCELLED", "DID NOT RUN"],
     },
 ]
 
@@ -2763,7 +3121,8 @@ def self_test() -> int:
 
 USAGE = (
     "usage: ci-mutants-summary.py <exit_code> <diff|full> <title> "
-    "[--changed-lines N] [out_dir_candidate ...]\n"
+    "[--changed-lines N] [--job-status success|failure|cancelled] "
+    "[out_dir_candidate ...]\n"
     "       ci-mutants-summary.py --count-changed-lines <unified.diff> "
     "[--manifest-path <Cargo.toml>] [--mutants-list <list.json>]\n"
     "       ci-mutants-summary.py --self-test"
@@ -2777,6 +3136,33 @@ if __name__ == "__main__":
         sys.exit(count_changed_lines_main(sys.argv[1:]))
 
     args = sys.argv[1:]
+
+    # (#2550) `--job-status`, when given, carries `${{ job.status }}` from
+    # the workflow: "success" | "failure" | "cancelled". Only meaningful
+    # alongside an EMPTY exit_code (below) — a real exit_code means this
+    # invocation actually produced a result and --job-status is irrelevant.
+    # "cancelled" there is the specific case this flag exists for: the job
+    # was cut off (almost always its own `timeout-minutes` budget) while
+    # THIS invocation was still running, which gets its own loud CANCELLED
+    # report (see `CANCELLED_SENTINEL`) instead of the generic "did not run"
+    # message below.
+    #
+    # Parsed BEFORE `--changed-lines`, deliberately: a job cancelled early
+    # enough leaves BOTH the diff-counting step's and the mutation step's
+    # outputs empty, and `--changed-lines`'s own empty-value guard used to
+    # hard-exit before `--job-status` was ever looked at — so the exact
+    # cancellation this flag exists to route through the loud CANCELLED
+    # report never reached it at all; it hit `--changed-lines`'s generic
+    # "did not run" message and exited 2 with an empty summary instead.
+    job_status = ""
+    if "--job-status" in args:
+        i = args.index("--job-status")
+        if i + 1 >= len(args):
+            print("--job-status requires a value", file=sys.stderr)
+            sys.exit(2)
+        job_status = args[i + 1]
+        del args[i : i + 2]
+
     changed_lines = 0
     if "--changed-lines" in args:
         i = args.index("--changed-lines")
@@ -2787,28 +3173,32 @@ if __name__ == "__main__":
         # (#2602 round 3) Same empty-vs-malformed distinction as the
         # exit_code check below, given the SAME treatment: a diff step that
         # never ran (skipped by an earlier failure or a cancelled job) leaves
-        # this GitHub Actions output empty, not zero. `--changed-lines` was
-        # parsed BEFORE the exit_code check, so in the exact failure this
-        # script exists to make legible — the diff step failing, both
-        # substitutions arriving empty — the reader hit this branch first and
-        # saw "--changed-lines must be an integer, got ''": the identical
-        # confusing integer-parse complaint the exit_code fix (above) was
-        # written to replace. Checked here too, so neither argument's empty
-        # value reads as a malformed integer from a step that ran.
+        # this GitHub Actions output empty, not zero.
         if raw == "":
-            print(
-                "changed-lines is empty — the diff-counting step did not run "
-                "(skipped by an earlier failure or a cancelled job), not that "
-                "it ran and counted zero",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        try:
-            changed_lines = int(raw)
-        except ValueError:
-            print(f"--changed-lines must be an integer, got {raw!r}", file=sys.stderr)
-            sys.exit(2)
-        del args[i : i + 2]
+            if job_status == "cancelled":
+                # A cancelled job legitimately never got as far as counting
+                # changed lines. That is not an error condition here — it is
+                # exactly the case `--job-status cancelled` exists to make
+                # legible via the CANCELLED report below, which doesn't use
+                # `changed_lines` at all. Fall through with the default (0)
+                # rather than hard-exiting before the exit_code check ever
+                # gets a chance to route to `CANCELLED_SENTINEL`.
+                del args[i : i + 2]
+            else:
+                print(
+                    "changed-lines is empty — the diff-counting step did not run "
+                    "(skipped by an earlier failure or a cancelled job), not that "
+                    "it ran and counted zero",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        else:
+            try:
+                changed_lines = int(raw)
+            except ValueError:
+                print(f"--changed-lines must be an integer, got {raw!r}", file=sys.stderr)
+                sys.exit(2)
+            del args[i : i + 2]
 
     if len(args) < 3:
         print(USAGE, file=sys.stderr)
@@ -2823,6 +3213,14 @@ if __name__ == "__main__":
     # reads as if THIS script received bad input, when the honest report is
     # that the mutation step upstream never executed.
     if args[0] == "":
+        if job_status == "cancelled":
+            # (#2550) The specific, previously-silent case: the job was
+            # cancelled while this invocation was running. Route through
+            # `main()`'s normal "not in OK_CODES" gate with the sentinel so
+            # it gets a real, distinguishable exit status and a report that
+            # actually lands in $GITHUB_STEP_SUMMARY (this generic branch's
+            # message, below, only ever went to stderr).
+            sys.exit(main(CANCELLED_SENTINEL, args[1], args[2], args[3:], changed_lines))
         print(
             "exit_code is empty — the mutation step did not run (skipped by an "
             "earlier failure or a cancelled job), not that it ran and failed",
