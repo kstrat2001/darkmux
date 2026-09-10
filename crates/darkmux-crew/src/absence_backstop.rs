@@ -23,9 +23,15 @@
 //!   1. [`detect_absence_claim`] — a keyword/phrase match over the
 //!      finding's OWN claim text (`emitted.why`), looking for a
 //!      recognized absence phrasing ("does not", "never calls",
-//!      "missing", "not handled", "there is no", …) plus a
-//!      backtick-quoted token somewhere in the same sentence — the thing
-//!      the claim says is absent.
+//!      "missing", "not handled", "there is no", …) plus the
+//!      backtick-quoted token GOVERNED by that phrase's grammar — after
+//!      it for an active-voice claim ("does not call `X`" — `X` is the
+//!      verb's object, the thing claimed absent), before it for the
+//!      passive-voice claims that put the subject first ("`X` is never
+//!      called"). Never "the first backtick span in the sentence"
+//!      regardless of direction — see [`detect_absence_claim`]'s own doc
+//!      for why that distinction is load-bearing (#1748 review MUST
+//!      FIX 4).
 //!   2. [`check_absence_claim`] — a plain substring/line search for that
 //!      token over the WHOLE FILE's text, not the hunk/window excerpt a
 //!      reviewing seat happened to be shown.
