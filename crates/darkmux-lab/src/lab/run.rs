@@ -504,26 +504,62 @@ pub(crate) fn resolve_source_sandbox(
             // the minimum fix — it makes the split visible instead of
             // silent; forcing the registry itself to the home root too is a
             // real blast-radius change and belongs in its own issue.
-            None => Err(anyhow!(
-                "workload `{}` requires a fixture satisfying `{}` but no registered \
-                 fixture matches in the registry at {} (this registry follows the \
-                 standard project/home resolution — project-local when the current \
-                 directory has its own `.darkmux/` and `DARKMUX_HOME` is not set, \
-                 the home tier otherwise — which can differ from what `darkmux lab \
-                 fixture list` shows from elsewhere).\n\
-                 \n\
-                 Fix:\n\
-                   1. Register an existing fixture that satisfies this requirement:\n\
-                      darkmux lab fixture register /path/to/your/fixture\n\
-                   2. Or inspect what's registered in THIS directory's registry:\n\
-                      darkmux lab fixture list\n\
-                   3. Or update the fixture's `.fixture.json` to set:\n\
-                      \"satisfies\": \"{}\"",
-                loaded.manifest.workload.id,
-                requires,
-                reg_path.display(),
-                requires,
-            )),
+            None => {
+                // (MUST FIX, third-round frontier review) `paths::resolve`
+                // decides this root in a fixed order — `DARKMUX_HOME` when
+                // set (an explicit override that wins regardless of cwd,
+                // checked BEFORE the project-local branch below is ever
+                // evaluated), then project-local when the current directory
+                // has its own `.darkmux/`, then the home tier
+                // (`~/.darkmux`) otherwise. The old wording named only two
+                // of those three branches, folding the `DARKMUX_HOME`
+                // override into the same "otherwise" bucket as the genuine
+                // home tier — so with an explicit `DARKMUX_HOME` set AND a
+                // project-local `.darkmux/` also present, it named the
+                // right path but mislabeled the reason as "the home tier",
+                // and `DARKMUX_HOME` appeared in the sentence only as a
+                // negative condition on the OTHER branch ("...and
+                // DARKMUX_HOME is not set"). A test asserting the message
+                // merely CONTAINS "DARKMUX_HOME" passed on that negative
+                // clause alone — it never checked which branch the message
+                // claimed was actually taken. Name all three branches, in
+                // decision order, and say which one fired for THIS run.
+                let darkmux_home_is_set = std::env::var("DARKMUX_HOME")
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty());
+                let decided_by = if darkmux_home_is_set {
+                    "DARKMUX_HOME is set, so its override root above is what was actually \
+                     consulted — not the home tier, and not this directory's own \
+                     project-local `.darkmux/` even if one exists"
+                } else if paths.scope == paths::Scope::Project {
+                    "the current directory has its own `.darkmux/` and DARKMUX_HOME is unset, \
+                     so this run resolved project-local"
+                } else {
+                    "DARKMUX_HOME is unset and the current directory has no project-local \
+                     `.darkmux/`, so this run resolved to the home tier (~/.darkmux)"
+                };
+                Err(anyhow!(
+                    "workload `{}` requires a fixture satisfying `{}` but no registered \
+                     fixture matches in the registry at {} (this registry's root is decided \
+                     in order — DARKMUX_HOME override when set, else project-local when the \
+                     current directory has its own `.darkmux/`, else the home tier; for THIS \
+                     run: {} — which can differ from what `darkmux lab fixture list` shows from \
+                     elsewhere).\n\
+                     \n\
+                     Fix:\n\
+                       1. Register an existing fixture that satisfies this requirement:\n\
+                          darkmux lab fixture register /path/to/your/fixture\n\
+                       2. Or inspect what's registered in THIS directory's registry:\n\
+                          darkmux lab fixture list\n\
+                       3. Or update the fixture's `.fixture.json` to set:\n\
+                          \"satisfies\": \"{}\"",
+                    loaded.manifest.workload.id,
+                    requires,
+                    reg_path.display(),
+                    decided_by,
+                    requires,
+                ))
+            }
         }
     } else {
         Ok(paths.sandboxes.join(&loaded.manifest.workload.id))
@@ -1072,20 +1108,26 @@ mod tests {
         );
     }
 
-    /// (#2590 follow-up, review round 2 finding 2) The explanatory clause
-    /// added by the fix above claims the registry "is looked up
-    /// project-locally when the current directory has its own `.darkmux/`"
-    /// — true as a description of `ResolveScope::Auto` in isolation, but
-    /// `DARKMUX_HOME` short-circuits `paths::resolve` BEFORE that branch is
-    /// ever evaluated (see `darkmux_types::paths::resolve`). With an
-    /// explicit `DARKMUX_HOME` set AND a project-local `.darkmux/` also
-    /// sitting in cwd, the OLD wording named the right path (`DARKMUX_HOME`
-    /// wins either way) but gave the wrong REASON — cwd's own `.darkmux/`
-    /// had nothing to do with why that path was chosen. Red-proved:
-    /// reverting the hedge back to the unconditional "when the current
-    /// directory has its own `.darkmux/`" phrasing keeps this test's path
-    /// assertions green while making its "DARKMUX_HOME" assertion fail —
-    /// the wording no longer names the actual override that decided it.
+    /// (#2590 follow-up, review round 2 finding 2 — THIRD-ROUND FIX) The
+    /// explanatory clause added by the fix above claimed the registry "is
+    /// looked up project-locally when the current directory has its own
+    /// `.darkmux/` AND DARKMUX_HOME is not set, the home tier otherwise" —
+    /// which still mislabeled this exact state: with an explicit
+    /// `DARKMUX_HOME` set AND a project-local `.darkmux/` also sitting in
+    /// cwd, that wording named the right PATH but folded the override into
+    /// the same "otherwise" bucket as the genuine home tier, so it called
+    /// the decided branch "the home tier" when the actual root came from
+    /// `DARKMUX_HOME`, not from `dirs::home_dir()`. `DARKMUX_HOME` appeared
+    /// in the sentence only as a NEGATIVE condition on the other branch
+    /// ("...and DARKMUX_HOME is not set") — so a prior assertion checking
+    /// only `msg.contains("DARKMUX_HOME")` passed on that negative clause
+    /// alone, without ever checking which branch the message claimed was
+    /// actually taken. The message now names all three branches in
+    /// decision order and says which one fired for THIS run; the
+    /// assertion below is tightened to the taken-branch phrasing instead
+    /// of bare substring presence. Red-proved: reverting the `decided_by`
+    /// computation back to the two-branch hedge keeps the path assertions
+    /// green while failing the taken-branch assertion below.
     #[test]
     #[serial_test::serial]
     fn resolver_fixture_error_names_dark_home_not_the_bypassed_project_root() {
@@ -1148,9 +1190,22 @@ mod tests {
             "must not name the project-local registry that was never consulted: {msg}"
         );
         assert!(
-            msg.contains("DARKMUX_HOME"),
-            "the explanation must name the override that actually decided \
-             this path, not just cwd's own `.darkmux/`: {msg}"
+            msg.contains("DARKMUX_HOME is set, so its override root above is what was actually \
+                          consulted"),
+            "the explanation must AFFIRMATIVELY name DARKMUX_HOME as the branch that decided \
+             this path — a message that only mentions DARKMUX_HOME as a negative condition on \
+             the project-local branch (\"...and DARKMUX_HOME is not set\") would still contain \
+             the substring \"DARKMUX_HOME\" without ever claiming it was the decider: {msg}"
+        );
+        assert!(
+            !msg.contains("so this run resolved to the home tier"),
+            "must not mislabel this DARKMUX_HOME-decided run as having resolved to the home \
+             tier — the override root is neither the home tier nor the bypassed project-local \
+             `.darkmux/`: {msg}"
+        );
+        assert!(
+            !msg.contains("so this run resolved project-local"),
+            "must not claim the bypassed project-local `.darkmux/` decided this run: {msg}"
         );
     }
 

@@ -174,28 +174,38 @@ pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> 
     // darkmux actually searches, the operator got a bare "not found" that
     // never mentioned the document sitting right there in cwd. Name it,
     // same remedy shape as that sibling fix.
-    if let Some(note) = ignored_project_local_note(id, user_dir) {
+    if let Some(note) = ignored_project_local_note(id) {
         bail!("workload \"{id}\" not found. Available: {listed}\n\n{note}");
     }
     bail!("workload \"{id}\" not found. Available: {listed}")
 }
 
-/// Only reachable when there IS a project-local `.darkmux` actually being
-/// bypassed: the `ResolveScope::Auto`-resolved root differs from the
-/// `ResolveScope::ForceUser` root the caller already searched (as
-/// `user_dir`). An operator with no project-local `.darkmux/` at all, or
-/// one who set `DARKMUX_HOME` (which makes `Auto` and `ForceUser` resolve
-/// identically regardless of cwd — see `darkmux_types::paths::resolve`),
-/// gets no note: nothing is actually being ignored in that case, so
-/// claiming otherwise would be the same kind of wrong steer this note
-/// exists to avoid.
-fn ignored_project_local_note(id: &str, user_dir: Option<&Path>) -> Option<String> {
+/// Callers only reach this from [`load`]'s "not found" tail, after every
+/// other tier (user, on-disk, embedded) already failed to resolve `id`.
+///
+/// (MUST FIX, third-round frontier review) An earlier version of this
+/// function took `user_dir: Option<&Path>` and short-circuited to `None`
+/// up front whenever `user_dir == Some(auto_root)`, with a doc comment
+/// claiming THAT equality check was what enforced "only fires when a
+/// project-local `.darkmux` is genuinely being bypassed". It wasn't: when
+/// `user_dir` equals the `ResolveScope::Auto`-resolved root (no
+/// project-local `.darkmux/` exists, or `DARKMUX_HOME` is set — see
+/// `darkmux_types::paths::resolve`), `auto_root.join("workloads")` is the
+/// BYTE-IDENTICAL path `load` already searched for this exact `id` at its
+/// own top (`find_in_dir(&user_dir.join("workloads"), id)`) and already
+/// failed to find anything in — so the fallback `find_in_dir` call below
+/// was *already* guaranteed to return `None` again in that case, with or
+/// without the equality check. Deleting the whole equality-check block
+/// changed no observable behavior (confirmed: every existing test for
+/// this function still passes with it removed), which is the proof it was
+/// dead — a defensive-looking guard that claimed to be load-bearing but
+/// wasn't. The real reason a false-positive note can't fire is structural:
+/// this function only ever returns `Some` when the id resolves under
+/// `auto_root` in a lookup `load` had not already performed and failed —
+/// i.e. genuinely, not merely apparently, bypassed. `user_dir` itself adds
+/// nothing this function needs, so the parameter is gone too.
+fn ignored_project_local_note(id: &str) -> Option<String> {
     let auto_root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
-    if let Some(udir) = user_dir {
-        if udir == auto_root {
-            return None;
-        }
-    }
     let project_workloads = auto_root.join("workloads");
     let found = find_in_dir(&project_workloads, id)?;
     Some(format!(
@@ -805,6 +815,20 @@ mod tests {
         let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
         let _templates_guard =
             EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", home_tmp.path().join("nope"));
+        // (MUST FIX, third-round frontier review) `ignored_project_local_note`
+        // calls `paths::resolve(ResolveScope::Auto)`, which checks
+        // `DARKMUX_HOME` BEFORE it ever looks at cwd's own `.darkmux/` (see
+        // that function's own doc). An ambient `DARKMUX_HOME` in the shell
+        // running `cargo test` — not unusual on this project, which asks
+        // contributors to export it for flow provenance — would make
+        // `auto_root` resolve to that override instead of `cwd_tmp`'s
+        // project-local `.darkmux/`, so the note would never find the
+        // planted document and this test would fail red for an operator
+        // with it exported, even though nothing here is actually broken.
+        // CI never sets `DARKMUX_HOME`, so CI would never catch this drift.
+        // Same clear-guard pattern as `lab::run`'s `RealHomeGuard`, which
+        // documents the identical reasoning for the identical hazard.
+        let _darkmux_home_guard = EnvVarGuard::set("DARKMUX_HOME", "");
 
         let cwd_tmp = TempDir::new().unwrap();
         write(
@@ -828,12 +852,22 @@ mod tests {
     }
 
     /// The counterpart: when `user_dir` (the `ForceUser` root) already IS
-    /// what `Auto` resolves to — no project-local `.darkmux` is being
-    /// bypassed at all — nothing should be claimed as "ignored". Covers
-    /// both the "no project `.darkmux` exists" case (Auto falls through to
-    /// the same home root) and guards against a note that fires whenever
+    /// what `Auto` resolves to — no project-local `.darkmux` exists in cwd
+    /// at all — nothing should be claimed as "ignored".
+    ///
+    /// (MUST FIX, third-round frontier review — corrected claim) This test
+    /// used to claim it also "guards against a note that fires whenever
     /// ANY document exists at that id, whether or not it's actually the
-    /// document that's being bypassed.
+    /// document that's being bypassed" — it doesn't, and can't: nothing is
+    /// planted anywhere in this test, so there's no document for a
+    /// false-positive note to accidentally pick up in the first place.
+    /// What this test actually pins is narrower and still real: the "no
+    /// project `.darkmux` exists" shape produces no note. The broader
+    /// "genuinely bypassed, not merely apparently" guarantee is structural
+    /// (see `ignored_project_local_note`'s own doc) — it follows from
+    /// `load`'s fallback lookup being the byte-identical call `load`
+    /// already tried and failed, not from anything a black-box test on an
+    /// empty directory can additionally demonstrate.
     #[test]
     #[serial_test::serial]
     fn not_found_stays_bare_when_nothing_is_actually_ignored() {
@@ -841,6 +875,10 @@ mod tests {
         let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
         let _templates_guard =
             EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", home_tmp.path().join("nope"));
+        // Same ambient-DARKMUX_HOME hazard as the sibling test above — clear
+        // it so this test exercises the intended state regardless of the
+        // shell it runs in.
+        let _darkmux_home_guard = EnvVarGuard::set("DARKMUX_HOME", "");
 
         // No project-local `.darkmux` anywhere in cwd — Auto falls back to
         // the same home root ForceUser already resolved and searched.
@@ -879,21 +917,23 @@ mod tests {
         let symlinked = tmp.path().join("symlinked");
         std::os::unix::fs::symlink(&real_dir, &symlinked).unwrap();
 
-        let prev_cwd = env::current_dir().unwrap();
-        let prev_pwd = env::var_os("PWD");
-        env::set_current_dir(&symlinked).unwrap();
-        unsafe { env::set_var("PWD", &symlinked) };
+        // (MUST FIX, third-round frontier review) This test used to
+        // restore cwd and `PWD` manually, ordered before the assertions so
+        // a failed ASSERTION was safe — but the restore calls themselves
+        // (`.unwrap()` on `set_current_dir`, on a real filesystem) are
+        // panic sites, and a panic there would skip the second restore and
+        // leave the process cwd or `PWD` clobbered for every test that
+        // runs after it in the same `cargo test` binary. `CwdGuard` and
+        // `EnvVarGuard` exist in this exact module specifically to make
+        // that failure mode unreachable: their `Drop` impls run during
+        // unwinding too, so restoration happens regardless of what panics
+        // in between. Using them here is the RAII form every other cwd/env
+        // mutating test in this module already follows.
+        let _cwd_guard = CwdGuard::new(&symlinked);
+        let _pwd_guard = EnvVarGuard::set("PWD", &symlinked);
 
         let target = env::current_dir().unwrap().join("some-file.json");
         let shown = display_under_cwd(&target);
-
-        env::set_current_dir(&prev_cwd).unwrap();
-        unsafe {
-            match &prev_pwd {
-                Some(v) => env::set_var("PWD", v),
-                None => env::remove_var("PWD"),
-            }
-        }
 
         // Sanity: prove the symlink actually causes divergence here, or
         // this test isn't exercising the case under test at all.
