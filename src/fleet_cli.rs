@@ -49,7 +49,7 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
     let roster = fleet::load_roster()?;
     let entry = roster.machines.get(id).ok_or_else(|| {
         anyhow::anyhow!(
-            "no machine `{id}` in roster — add it with `darkmux machine add {id} --address <addr>`, \
+            "no machine `{id}` in roster — add it with `darkmux machine add {id} --address <dns-name>`, \
              or omit the id to read this host"
         )
     })?;
@@ -78,28 +78,41 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
         ),
         // A 404 means the peer IS reachable — its daemon just doesn't serve
         // this route. "Could not reach" would be the wrong vocabulary.
-        //
-        // (#1849) When this request went out to a bare IP, that 404 might
-        // not be darkmux's at all: a peer behind `tailscale serve` routes
-        // by Host header and answers a bare IP with Tailscale's own 404,
-        // not the daemon's. Name that possibility — this is a statement
-        // about the request darkmux just made and the response it got
-        // back, never a claim about how the operator's peer is actually
-        // set up (darkmux describes, never adjudicates).
         Err(ureq::Error::Status(404, _)) => {
-            let tailscale_serve_hint = if fleet::address_host_is_bare_ip(&entry.address) {
-                " This request went to a bare IP — a peer behind `tailscale serve` answers \
-                 on its DNS name, not its IP, and would 404 exactly like this."
-            } else {
-                ""
-            };
-            anyhow::bail!(
-                "peer `{id}` answered but has no `{path}` route — it may be running an older \
-                 darkmux (route not found).{tailscale_serve_hint} Upgrade darkmux on `{id}` \
-                 and retry."
-            )
+            anyhow::bail!(route_missing_message(id, path, &entry.address))
         }
         Err(e) => anyhow::bail!("could not reach `{id}` ({url}): {e}"),
+    }
+}
+
+/// Build the message for a peer that answered but has no `path` route
+/// (#1849). Two mutually exclusive possible causes, so the sentence picks
+/// one remedy rather than naming both and leaving the operator to guess:
+///
+/// - The request went to a bare, non-loopback IP: a peer behind
+///   `tailscale serve` routes by Host header and answers a bare IP with
+///   Tailscale's own 404, not the daemon's — the remedy is re-adding the
+///   peer by its DNS name, not upgrading darkmux.
+/// - Otherwise, the 404 is darkmux's own (an older binary without this
+///   route) — the remedy is upgrading darkmux on the peer.
+///
+/// This is a statement about the request darkmux just made and the
+/// response it got back, never a claim about how the operator's peer is
+/// actually set up (darkmux describes, never adjudicates).
+fn route_missing_message(id: &str, path: &str, address: &str) -> String {
+    if fleet::address_host_is_bare_ip(address) {
+        format!(
+            "peer `{id}` answered but has no `{path}` route. This request went to a bare IP — \
+             a peer behind `tailscale serve` answers on its DNS name, not its IP, and would 404 \
+             exactly like this. If `{id}` sits behind `tailscale serve`, re-add it by DNS name \
+             (`darkmux machine add {id} --address <dns-name>:8765`); otherwise it may be running \
+             an older darkmux (route not found) — upgrade darkmux on `{id}` and retry."
+        )
+    } else {
+        format!(
+            "peer `{id}` answered but has no `{path}` route — it may be running an older \
+             darkmux (route not found). Upgrade darkmux on `{id}` and retry."
+        )
     }
 }
 
@@ -140,6 +153,9 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
     let token = darkmux_flow::serve_token();
     let token_str = token.as_ref().map(|t| t.expose_for_compare());
     let mut auth_required: Vec<String> = Vec::new();
+    // (#1849) Peers that answered with a 404 on `/machine/specs` — reachable,
+    // but no route, distinct from a generic probe failure.
+    let mut route_missing: Vec<String> = Vec::new();
     let specs_by_id: std::collections::BTreeMap<String, Option<serde_json::Value>> = if deep {
         probes
             .iter()
@@ -149,6 +165,10 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
                         SpecsProbe::Ok(v) => Some(v),
                         SpecsProbe::AuthRequired => {
                             auth_required.push(m.id.clone());
+                            None
+                        }
+                        SpecsProbe::RouteMissing => {
+                            route_missing.push(m.id.clone());
                             None
                         }
                         SpecsProbe::Unavailable => None,
@@ -191,6 +211,11 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
                     // timeout/other failure, so a consumer (viewer/script) gets
                     // the same signal the text table's `auth?` column carries.
                     "specs_auth_required": auth_required.contains(&m.id),
+                    // (#1849) Distinguish a null `specs` caused by a 404 (the
+                    // peer answered but has no `/machine/specs` route) from a
+                    // generic probe failure — the same signal the text
+                    // table's `no-route?` column carries.
+                    "specs_route_missing": route_missing.contains(&m.id),
                 }))
                 .collect::<Vec<_>>(),
         });
@@ -213,7 +238,7 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
     if probes.is_empty() {
         println!("(no peers in roster — single-machine fleet)");
         println!();
-        println!("Add a peer: darkmux machine add <id> --address <tailnet-addr>");
+        println!("Add a peer: darkmux machine add <id> --address <dns-name>");
         return Ok(0);
     }
     // Column-header row dimmed as secondary structure. Styling wraps the
@@ -288,6 +313,14 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
                 None if auth_required.contains(&m.id) => {
                     ("auth?".into(), "—".into(), "—".into(), "—".into())
                 }
+                // (#1849) Distinguish a 404 (peer reachable, no
+                // `/machine/specs` route) from a generic specs failure —
+                // this is the exact shape a bare-IP peer behind `tailscale
+                // serve` produces, and it must not render identically to
+                // an unreachable/timed-out peer.
+                None if route_missing.contains(&m.id) => {
+                    ("no-route?".into(), "—".into(), "—".into(), "—".into())
+                }
                 None => ("specs?".into(), "—".into(), "—".into(), "—".into()),
             };
             let row = format!(
@@ -321,16 +354,56 @@ Set DARKMUX_SERVE_TOKEN (or the darkmux-serve-token Keychain item) to the shared
             ))
         );
     }
+    // (#1849) If any peer answered but has no `/machine/specs` route,
+    // surface the fix rather than leaving a silent "no-route?" — and branch
+    // by cause the same way `route_missing_message` does for a single peer.
+    if !route_missing.is_empty() {
+        println!(
+            "{}",
+            style::warn(&format!(
+                "  ! {} peer(s) answered but have no `/machine/specs` route ({}) — it may be \
+running an older darkmux (route not found). Upgrade darkmux on those peer(s) and retry.",
+                route_missing.len(),
+                route_missing.join(", ")
+            ))
+        );
+        let bare_ip_peers: Vec<&str> = probes
+            .iter()
+            .filter(|(m, _)| {
+                route_missing.contains(&m.id) && fleet::address_host_is_bare_ip(&m.address)
+            })
+            .map(|(m, _)| m.id.as_str())
+            .collect();
+        if !bare_ip_peers.is_empty() {
+            println!(
+                "{}",
+                style::warn(&format!(
+                    "    {} of those ({}) are addressed by bare IP — a peer behind `tailscale \
+serve` answers a bare IP with its own 404 too. If that's the shape, re-add it by DNS name \
+(`darkmux machine add <id> --address <dns-name>:8765`) instead.",
+                    bare_ip_peers.len(),
+                    bare_ip_peers.join(", ")
+                ))
+            );
+        }
+    }
     Ok(0)
 }
 
 /// Outcome of probing a peer's `/machine/specs` (#881). `AuthRequired`
 /// (401/403) is distinguished from `Unavailable` (timeout, refused, other
 /// non-2xx, bad JSON) so a missing shared fleet token reads as `auth?`, not a
-/// silent `specs?`.
+/// silent `specs?`. `RouteMissing` (404, #1849) is likewise distinguished —
+/// the peer IS reachable and answered, its daemon just doesn't serve this
+/// route (an older darkmux, or a bare-IP request landing on `tailscale
+/// serve`'s own 404 instead of the daemon's) — a generic `specs?` would
+/// read exactly like the unreachable-peer case this command already tells
+/// apart via the PROBE column, hiding the #1849 shape from the one surface
+/// (`machine list --deep`) that showcases it in the docs.
 enum SpecsProbe {
     Ok(serde_json::Value),
     AuthRequired,
+    RouteMissing,
     Unavailable,
 }
 
@@ -366,6 +439,7 @@ fn fetch_machine_specs(address: &str, token: Option<&str>) -> SpecsProbe {
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
             SpecsProbe::AuthRequired
         }
+        Err(ureq::Error::Status(404, _)) => SpecsProbe::RouteMissing,
         Err(_) => SpecsProbe::Unavailable,
     }
 }
@@ -495,16 +569,24 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn fetch_peer_json_404_from_bare_ip_gets_the_tailscale_serve_hint() {
-        // (#1849) `one_shot_http` binds loopback, so the roster address IS
-        // a bare IP (`127.0.0.1:<port>`) — exactly the shape a 404 through
-        // `tailscale serve` looks like from the client's side.
+    fn fetch_peer_json_404_from_loopback_ip_gets_no_tailscale_serve_hint() {
+        // (#1849 MUST FIX 1, red-prove: loopback direction) `one_shot_http`
+        // binds loopback, so the roster address IS a bare IP
+        // (`127.0.0.1:<port>`) by shape — but loopback traffic never
+        // traverses `tailscale serve` (the docs' own self-registration
+        // recipe, `machine add <id> --address 127.0.0.1:8765`, is exactly
+        // this shape), so the hint must NOT fire here. This is the
+        // opposite of what this test asserted before #1849's loopback
+        // exclusion — it used to assert the hint DID fire, which was only
+        // true because the guard didn't yet know loopback isn't the
+        // tailscale-serve shape.
         let addr = one_shot_http("404 Not Found", "{}");
         let _tmp = isolated_roster(&[("peer1", addr.as_str())]);
         let err = fetch_peer_json("peer1", "/machine/resources").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("tailscale serve"), "{msg}");
-        assert!(msg.contains("DNS name, not its IP"), "{msg}");
+        assert!(msg.contains("older"), "base message still present: {msg}");
+        assert!(!msg.contains("tailscale serve"), "{msg}");
+        assert!(!msg.contains("bare IP"), "{msg}");
         unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
     }
 
@@ -548,5 +630,75 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("parsing JSON from `peer1`"), "{msg}");
         unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    // ── route_missing_message (#1849) — pure, no network ────────────────
+    //
+    // `address_host_is_bare_ip` is pure string parsing, so the
+    // hint-selection logic is testable directly without a TCP round trip.
+    // The live-network tests above (loopback, DNS name) already prove
+    // `fetch_peer_json` threads `entry.address` into this function; these
+    // tests prove the function's own branching, including the direction a
+    // network fixture can't cheaply cover: a real (non-loopback) bare IP.
+
+    #[test]
+    fn route_missing_message_hints_tailscale_serve_for_a_non_loopback_bare_ip() {
+        // (#1849 MUST FIX 1, red-prove: non-loopback direction) A
+        // tailnet-shaped address — the documented CGNAT example range,
+        // never a real tailnet IP — still gets the hint after the
+        // loopback exclusion below.
+        let msg = route_missing_message("peer1", "/machine/resources", "100.64.0.2:8765");
+        assert!(msg.contains("tailscale serve"), "{msg}");
+        assert!(msg.contains("DNS name, not its IP"), "{msg}");
+    }
+
+    #[test]
+    fn route_missing_message_no_hint_for_a_loopback_bare_ip() {
+        // (#1849 MUST FIX 1, red-prove: loopback direction)
+        let msg = route_missing_message("peer1", "/machine/resources", "127.0.0.1:8765");
+        assert!(msg.contains("older"), "{msg}");
+        assert!(!msg.contains("tailscale serve"), "{msg}");
+    }
+
+    #[test]
+    fn route_missing_message_no_hint_for_a_dns_name() {
+        let msg = route_missing_message("peer1", "/machine/resources", "studio.tailnet:8765");
+        assert!(msg.contains("older"), "{msg}");
+        assert!(!msg.contains("tailscale serve"), "{msg}");
+    }
+
+    // ── fetch_machine_specs / SpecsProbe::RouteMissing (#1849 MUST FIX 2) ──
+
+    #[test]
+    fn fetch_machine_specs_404_is_route_missing_not_unavailable() {
+        // Red-prove: a 404 on `/machine/specs` must render as a distinct
+        // outcome from a generic probe failure — `machine list --deep`
+        // renders `RouteMissing` as `no-route?`, never the same `specs?`
+        // a timeout or bad-JSON response gets.
+        let addr = one_shot_http("404 Not Found", "{}");
+        match fetch_machine_specs(&addr, None) {
+            SpecsProbe::RouteMissing => {}
+            SpecsProbe::Unavailable => {
+                panic!("404 read as generic Unavailable, not RouteMissing")
+            }
+            SpecsProbe::Ok(_) => panic!("expected RouteMissing, got Ok"),
+            SpecsProbe::AuthRequired => panic!("expected RouteMissing, got AuthRequired"),
+        }
+    }
+
+    #[test]
+    fn fetch_machine_specs_bad_json_is_unavailable_not_route_missing() {
+        // Inverted case: a generic failure (malformed body on a 200) must
+        // NOT read as RouteMissing — the two outcomes stay distinguishable
+        // in both directions.
+        let addr = one_shot_http("200 OK", "this is not json");
+        match fetch_machine_specs(&addr, None) {
+            SpecsProbe::Unavailable => {}
+            SpecsProbe::RouteMissing => {
+                panic!("bad JSON on 200 read as RouteMissing, not Unavailable")
+            }
+            SpecsProbe::Ok(_) => panic!("expected Unavailable, got Ok"),
+            SpecsProbe::AuthRequired => panic!("expected Unavailable, got AuthRequired"),
+        }
     }
 }

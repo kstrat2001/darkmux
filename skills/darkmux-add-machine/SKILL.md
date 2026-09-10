@@ -47,7 +47,7 @@ Ask: *"Which machine is your fleet's hub (the Redis-running machine)?"*
 
 Need from the operator:
 
-- **Coordinator's reachable address** — usually a tailnet IP (`100.x.y.z`) or a Tailscale Magic DNS name (e.g. `studio.your-tailnet.ts.net`).
+- **Coordinator's reachable address** — prefer its Tailscale Magic DNS name (e.g. `studio.your-tailnet.ts.net`) over its bare tailnet IP (`100.x.y.z`): a machine that later sits behind `tailscale serve` routes by Host header, so a roster entry pointing at the bare IP gets Tailscale's own 404 even though the daemon is healthy (#1849) — the DNS name works in both setups. (The raw Redis reachability check below accepts either form; the DNS-name preference matters for the `machine add --address` step in Step 7.)
 - **Redis URL** — typically `redis://default:<password>@<coord-addr>:6379`. The operator should have this from their bootstrap on the coordinator; encourage them to use the existing value verbatim.
 - **Existing fleet machine ids** — so we can pick a non-colliding id for this new machine. Operator can run `darkmux machine list` on their coordinator to print these; or if this skill has reachable Redis, `XRANGE darkmux:flow - + COUNT 1000` would show recent provenance fields.
 
@@ -139,7 +139,7 @@ The `<new-machine-tailnet-dns-name>` is THIS machine's Tailscale Magic DNS name 
 
 Surface this clearly to the operator:
 
-> Adding a peer to a fleet currently requires running `machine add` on every existing fleet member's machine. Cross-machine roster replication is filed as #280 and will close that loop. For now, walk over to each of your other Macs and run `darkmux machine add <this-id> --address <addr>:8765` once.
+> Adding a peer to a fleet currently requires running `machine add` on every existing fleet member's machine. Cross-machine roster replication is filed as #280 and will close that loop. For now, walk over to each of your other Macs and run `darkmux machine add <this-id> --address <dns-name>:8765` once.
 
 ## Step 8 — Smoke test: cross-fleet flow record
 

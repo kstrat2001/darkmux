@@ -359,12 +359,20 @@ pub fn probe_reachability(address: &str) -> ReachabilityResult {
     }
 }
 
-/// True when `address`'s host portion is a bare IP literal (v4 or v6),
-/// with or without an explicit `:port` suffix or a `scheme://` prefix — as
-/// opposed to a DNS name. (#1849) A peer behind `tailscale serve` routes by
-/// Host header and 404s a bare IP even though the daemon is healthy; this
-/// helper lets a 404 handler attach that context without resolving
-/// anything or touching the network itself.
+/// True when `address`'s host portion is a bare, non-loopback IP literal
+/// (v4 or v6), with or without an explicit `:port` suffix or a
+/// `scheme://` prefix — as opposed to a DNS name. (#1849) A peer behind
+/// `tailscale serve` routes by Host header and 404s a bare IP even though
+/// the daemon is healthy; this helper lets a 404 handler attach that
+/// context without resolving anything or touching the network itself.
+///
+/// Loopback (`127.0.0.1`, `::1`, …) is excluded on purpose: loopback
+/// traffic never traverses `tailscale serve` — a machine self-registering
+/// its own daemon (`machine add <id> --address 127.0.0.1:8765`, the
+/// recipe both `docs/guide/always-on-hub.html` and
+/// `skills/darkmux-add-machine/SKILL.md` give for Step 6) hits the local
+/// daemon directly, so a 404 there is never that failure mode and the
+/// hint would be actively wrong.
 pub fn address_host_is_bare_ip(address: &str) -> bool {
     let trimmed = address.trim();
     let without_scheme = trimmed
@@ -380,8 +388,12 @@ pub fn address_host_is_bare_ip(address: &str) -> bool {
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(without_scheme);
-    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
-        return true;
+    // A trailing dot is the absolute-FQDN convention; an IP literal
+    // written that way (copy-pasted from somewhere that appends one) still
+    // parses as the same IP once it's stripped.
+    let unbracketed = unbracketed.strip_suffix('.').unwrap_or(unbracketed);
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        return !ip.is_loopback();
     }
     match without_scheme.rsplit_once(':') {
         Some((host, _port)) => {
@@ -389,7 +401,10 @@ pub fn address_host_is_bare_ip(address: &str) -> bool {
                 .strip_prefix('[')
                 .and_then(|s| s.strip_suffix(']'))
                 .unwrap_or(host);
-            host.parse::<std::net::IpAddr>().is_ok()
+            let host = host.strip_suffix('.').unwrap_or(host);
+            host.parse::<std::net::IpAddr>()
+                .map(|ip| !ip.is_loopback())
+                .unwrap_or(false)
         }
         None => false,
     }
@@ -605,5 +620,44 @@ mod address_host_is_bare_ip_tests {
         assert!(!address_host_is_bare_ip("studio.tailnet.ts.net"));
         assert!(!address_host_is_bare_ip("studio.tailnet.ts.net:8765"));
         assert!(!address_host_is_bare_ip("http://studio.tailnet.ts.net:8765"));
+    }
+
+    // (#1849 MUST FIX 1, red-prove both directions) Loopback is a bare IP
+    // literal by shape, but it never traverses `tailscale serve` — the
+    // self-registration recipe (`machine add <id> --address
+    // 127.0.0.1:8765`) both the hub guide and the add-machine skill give
+    // is loopback, and a 404 there must never carry the tailscale-serve
+    // hint.
+    #[test]
+    fn loopback_ipv4_is_not_a_bare_ip() {
+        assert!(!address_host_is_bare_ip("127.0.0.1"));
+        assert!(!address_host_is_bare_ip("127.0.0.1:8765"));
+        assert!(!address_host_is_bare_ip("http://127.0.0.1:8765"));
+        // The whole 127.0.0.0/8 range is loopback, not just 127.0.0.1.
+        assert!(!address_host_is_bare_ip("127.5.5.5:8765"));
+    }
+
+    #[test]
+    fn loopback_ipv6_is_not_a_bare_ip() {
+        assert!(!address_host_is_bare_ip("::1"));
+        assert!(!address_host_is_bare_ip("[::1]:8765"));
+    }
+
+    // The inverse of the two tests above: a real (non-loopback) bare IP
+    // must still get the hint after the loopback exclusion — the guard
+    // narrows, it doesn't disable.
+    #[test]
+    fn non_loopback_bare_ip_is_still_a_bare_ip_after_the_loopback_exclusion() {
+        assert!(address_host_is_bare_ip("100.64.0.5"));
+        assert!(address_host_is_bare_ip("100.64.0.5:8765"));
+        assert!(address_host_is_bare_ip("fd7a:115c:a1e0::1234"));
+    }
+
+    // (#1849 CONSIDER 9) A trailing dot is the absolute-FQDN convention;
+    // an IP literal written that way still reads as the same IP.
+    #[test]
+    fn trailing_dot_ip_is_still_a_bare_ip() {
+        assert!(address_host_is_bare_ip("100.64.0.2."));
+        assert!(address_host_is_bare_ip("100.64.0.2.:8765"));
     }
 }

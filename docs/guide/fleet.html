@@ -125,6 +125,9 @@ darkmux machine add mini-1 --address &lt;peer-tailnet-dns-name&gt;:8765
 <span class="comment"># On the peer:</span>
 darkmux machine add &lt;hub-id&gt; --address &lt;hub-tailnet-dns-name&gt;:8765
 darkmux machine list</code></pre>
+    <div class="callout">
+      <strong>The DNS name above resolves — but only reaches the daemon if something is actually listening on that machine's tailnet interface at <code>:8765</code>.</strong> The <a href="always-on-hub.html#quick-path">quick-path</a> daemon binds <code>127.0.0.1:8765</code> only; the <a href="always-on-hub.html#viewer">Tailscale Serve recipe</a> proxies a <em>browser</em> to it on <code>:443</code>, a different port, and doesn't expose <code>:8765</code> on the tailnet. For <code>machine list --deep</code> / <code>machine status</code> to reach a peer at its default port, that peer needs a genuinely non-loopback daemon: <code>darkmux serve --bind &lt;its-tailnet-ip&gt;</code> plus <code>DARKMUX_SERVE_TOKEN</code> set to the fleet's shared token (a non-loopback bind refuses to start without one, and <code>machine list --deep</code> already sends it). Keep the roster entry pointed at the DNS name regardless — it's still what survives Tailscale Serve ever landing in front of that daemon later.
+    </div>
   </div>
 </section>
 
