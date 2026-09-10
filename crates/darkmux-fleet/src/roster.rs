@@ -572,12 +572,12 @@ mod address_host_is_bare_ip_tests {
 
     #[test]
     fn bare_ipv4_is_a_bare_ip() {
-        assert!(address_host_is_bare_ip("100.74.208.36"));
+        assert!(address_host_is_bare_ip("100.64.0.5"));
     }
 
     #[test]
     fn ipv4_with_port_is_a_bare_ip() {
-        assert!(address_host_is_bare_ip("100.74.208.36:8765"));
+        assert!(address_host_is_bare_ip("100.64.0.5:8765"));
     }
 
     #[test]
@@ -592,7 +592,7 @@ mod address_host_is_bare_ip_tests {
 
     #[test]
     fn scheme_prefixed_ip_is_still_a_bare_ip() {
-        assert!(address_host_is_bare_ip("http://100.74.208.36:8765"));
+        assert!(address_host_is_bare_ip("http://100.64.0.5:8765"));
     }
 
     // Inverted case (#1849 red-prove requirement): a DNS name — the form
