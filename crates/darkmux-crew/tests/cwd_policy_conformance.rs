@@ -155,7 +155,7 @@ fn scan_file(path: &Path) -> Vec<ImplBlock> {
             if let Some(idx) = line.find("impl StepKind for ") {
                 let rest = &line[idx + "impl StepKind for ".len()..];
                 let type_name =
-                    rest.split(|c: char| c == ' ' || c == '{' || c == '<').next().unwrap_or("").trim().to_string();
+                    rest.split([' ', '{', '<']).next().unwrap_or("").trim().to_string();
                 if !type_name.is_empty() {
                     current_impl = Some((depth, type_name, false));
                 }
