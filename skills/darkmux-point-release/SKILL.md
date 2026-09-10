@@ -83,16 +83,54 @@ Then by hand (judgment, not scriptable):
 
 Verify, then ship the PR (mechanical release-prep → external QA skipped, named; CI gates):
 ```bash
-cargo test 2>&1 | grep -E "test result: FAILED" && echo "investigate" || echo "tests ok"
+# Gate on cargo's real exit code, not a text search over its output — a build
+# that never compiles prints no "test result:" line at all, so a grep for one
+# finds nothing and reports a false "tests ok" (#2589).
+if cargo test > /tmp/release-test.log 2>&1; then
+  echo "tests ok"
+else
+  STATUS=$?
+  echo "investigate — cargo test exited $STATUS (compile or test failure; full output in /tmp/release-test.log)"
+  tail -80 /tmp/release-test.log
+  exit 1
+fi
 git add -A && git commit -m "release: $NEW — <one-line theme>"
 git push -u origin release-$NEW
 gh pr create --title "release: $NEW" --body "Routine point release. <what's in it>. Formula pin follows after the tag."
 ```
-**Merge-gate on conclusion==SUCCESS, not just completion** (the recurring trap):
+**Merge-gate on conclusion==SUCCESS, not just completion** (the recurring trap).
+Bounded poll, gated on `gh`'s real exit code with its stderr surfaced — an
+unbounded `until` loop that only ever inspects stdout hangs forever on an
+error `gh` never gets past (expired auth, wrong repo, a rate limit), not just
+on a slow check (#2589):
 ```bash
-until [ "$(gh pr checks release-$NEW 2>/dev/null | grep -c 'pending\|queued\|in_progress')" -eq 0 ] && gh pr checks release-$NEW 2>/dev/null | grep -q .; do sleep 30; done
+ATTEMPTS=0
+MAX_ATTEMPTS=40   # ~20 minutes at 30s between polls — bounded, never infinite
+while :; do
+  CHECKS_OUT=$(gh pr checks release-$NEW 2>/tmp/pr-checks.err)
+  STATUS=$?
+  if [ "$STATUS" -ne 0 ]; then
+    echo "gh pr checks failed (exit $STATUS) — not retrying blindly:"
+    cat /tmp/pr-checks.err
+    exit 1
+  fi
+  if [ -n "$CHECKS_OUT" ] && ! printf '%s\n' "$CHECKS_OUT" | grep -q 'pending\|queued\|in_progress'; then
+    break
+  fi
+  ATTEMPTS=$((ATTEMPTS + 1))
+  if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+    echo "timed out after $((MAX_ATTEMPTS * 30))s waiting for checks on release-$NEW"
+    exit 1
+  fi
+  sleep 30
+done
 C=$(gh api repos/kstrat2001/darkmux/commits/$(git rev-parse HEAD)/check-runs --jq '[.check_runs[].conclusion]|unique|join(",")')
-[ "$C" = "success" ] && gh pr merge release-$NEW --squash --delete-branch
+if [ "$C" = "success" ]; then
+  gh pr merge release-$NEW --squash --delete-branch
+else
+  echo "checks did not all succeed (conclusions: $C) — not merging"
+  exit 1
+fi
 git checkout main && git pull --ff-only
 ```
 
