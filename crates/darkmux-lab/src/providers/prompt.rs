@@ -297,15 +297,45 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> VerifyOutcome {
             };
         }
     };
+    // (#2493, corrected by frontier review) Case sensitivity is a property
+    // of WHAT is being matched, never a blanket policy — the original fix
+    // lowercased unconditionally, which silently re-scoped every workload
+    // that ALSO carries a `command` (demo-quickstart, quick-coding,
+    // medium-coding): those manifests ask the model to quote a
+    // DETERMINISTIC test runner's own output verbatim in its reply
+    // ("Reply with... the OK / FAILED line"), and that keyword's casing is
+    // fixed by the runner, never the model, so lowering it gains nothing
+    // and actively breaks it two ways — a two-letter keyword like "ok"
+    // becomes a case-insensitive substring probe against ordinary prose
+    // ("looked", "book"), a false PASS; a negative keyword like "failed"
+    // now matches a CORRECT reply that narrates past failure ("the suite
+    // failed before my fix, it passes now"), a false FAILURE. A workload
+    // with no `command` (quick-q) has no deterministic anchor at all — the
+    // keyword there is checking whether the model's own free-form prose
+    // engaged with a concept, and the model is free to capitalize that
+    // word at a sentence boundary the prompt itself never did, which is
+    // what case-insensitivity is actually for.
+    //
+    // So: case-sensitive (verbatim) whenever `command` is set, since only
+    // THEN is the keyword standing in for a runner's own fixed-case token;
+    // case-insensitive otherwise, for the free-text-only shape.
+    let case_sensitive = v.command.is_some();
+    let matches = |haystack: &str, needle: &str| -> bool {
+        if case_sensitive {
+            haystack.contains(needle)
+        } else {
+            haystack.to_lowercase().contains(&needle.to_lowercase())
+        }
+    };
     let missing: Vec<&String> = v
         .must_contain
         .iter()
-        .filter(|s| !text.contains(s.as_str()))
+        .filter(|s| !matches(text, s))
         .collect();
     let present: Vec<&String> = v
         .must_not_contain
         .iter()
-        .filter(|s| text.contains(s.as_str()))
+        .filter(|s| matches(text, s))
         .collect();
     if missing.is_empty() && present.is_empty() {
         return VerifyOutcome {
@@ -516,6 +546,137 @@ mod tests {
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
         let v = run_verify(&loaded, "we have alpha and beta here");
         assert!(v.passed);
+    }
+
+    /// (#2493 follow-up) NOT a claim about `quick-q`'s shipped manifest —
+    /// that keyword is back to the bare "active" (see
+    /// `quick_q_verify_keyword_is_the_bare_word_not_a_widened_stem` in
+    /// `workloads/load.rs`). This is a characterization of the matcher
+    /// itself for a `command`-less spec: a stem is still ordinary substring
+    /// matching, so a workload that deliberately WANTS one (unlike
+    /// `quick-q`) still gets it. It is not a guard by itself — every reply
+    /// here is already lowercase and already contains "activ" literally,
+    /// so it stays green under the pre-#2493 matcher too; see
+    /// `run_verify_bare_keyword_rejects_wrong_answers_using_other_inflections`
+    /// below for the case a stem actually gets wrong.
+    #[test]
+    fn run_verify_stem_matching_still_works_for_a_spec_that_chooses_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = spec_with_prompt("x");
+        spec.verify = Some(VerifySpec {
+            must_contain: vec!["activ".into()],
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        for reply in [
+            "it activates a small fraction of its parameters",
+            "the activated subset stays small",
+            "this is a form of sparse activation",
+            "only a few parameters are active per forward pass",
+        ] {
+            let v = run_verify(&loaded, reply);
+            assert!(v.passed, "expected {reply:?} to pass a stemmed \"activ\" check, got {v:?}");
+        }
+    }
+
+    /// (#2493 follow-up) A bare, un-stemmed keyword — the shape `quick-q`
+    /// actually ships — REJECTS three wrong answers a widened `"activ"`
+    /// stem let through: a different mechanism entirely, the wrong
+    /// direction, and an explicit "no difference" (the exact negation of a
+    /// correct answer). None of the three contains the literal word
+    /// "active" as a substring — each uses a different inflection
+    /// ("activation", "activates", "activate") — so the bare keyword
+    /// correctly fails all three rather than passing them on the strength
+    /// of an unrelated inflected word appearing somewhere in the reply.
+    #[test]
+    fn run_verify_bare_keyword_rejects_wrong_answers_using_other_inflections() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = spec_with_prompt("x");
+        spec.verify = Some(VerifySpec {
+            must_contain: vec!["active".into()],
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let wrong_answers = [
+            // Names a different mechanism entirely (quantization, not
+            // active-parameter count).
+            "The difference comes from weight quantization, not parameter activation.",
+            // Describes the wrong direction (reverses which architecture
+            // activates fewer parameters).
+            "The dense model activates fewer parameters per token than the MoE model.",
+            // Asserts there is no difference at all — the exact negation
+            // of a correct answer.
+            "There is no observable difference between the two on Apple Silicon; both architectures activate the same number of parameters.",
+        ];
+        for reply in wrong_answers {
+            let v = run_verify(&loaded, reply);
+            assert!(!v.passed, "expected a wrong answer to be REJECTED: {reply:?}, got {v:?}");
+        }
+    }
+
+    /// (#2493 follow-up) Case must not matter for a free-text, `command`-
+    /// less keyword check — a model is free to capitalize a word at a
+    /// sentence boundary the prompt itself never did, and that is not
+    /// evidence the answer missed the concept the check is guarding.
+    #[test]
+    fn run_verify_keyword_match_is_case_insensitive_without_a_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = spec_with_prompt("x");
+        spec.verify = Some(VerifySpec {
+            must_contain: vec!["active".into()],
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let v = run_verify(&loaded, "Active parameters differ between the two.");
+        assert!(v.passed, "expected a capitalized match to pass, got {v:?}");
+    }
+
+    /// (#2493 follow-up, MUST FIX 2) A workload that ALSO carries a
+    /// `command` (demo-quickstart's, quick-coding's, medium-coding's
+    /// shape) asks the model to quote a deterministic test runner's own
+    /// output verbatim — that keyword's casing is fixed by the runner, so
+    /// matching stays case-SENSITIVE there. Without this, a two-letter
+    /// keyword like "OK" lowercases into a substring probe that any prose
+    /// mentioning "looked" or "book" satisfies by accident — a false PASS
+    /// on a reply that plainly says the suite was never run.
+    #[test]
+    fn run_verify_command_spec_keyword_match_stays_case_sensitive() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = spec_with_prompt("x");
+        spec.verify = Some(VerifySpec {
+            command: Some("true".into()),
+            must_contain: vec!["OK".into()],
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let v = run_verify(&loaded, "I looked at the test file but never ran the suite.");
+        assert!(
+            !v.passed,
+            "a lowercase 'ok' inside 'looked' must not satisfy a command-spec's must_contain: {v:?}"
+        );
+    }
+
+    /// (#2493 follow-up, MUST FIX 2) The other direction of the same gap:
+    /// a `command`-spec's negative keyword ("FAILED") must not
+    /// case-insensitively match a CORRECT reply that narrates PAST failure
+    /// in prose ("failed before my fix, passes now") — that reply is
+    /// reporting a fix, not a current failure, and a case-insensitive
+    /// match would flip a passing run to a false failure.
+    #[test]
+    fn run_verify_command_spec_negative_keyword_does_not_false_fail_on_past_tense_prose() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = spec_with_prompt("x");
+        spec.verify = Some(VerifySpec {
+            command: Some("true".into()),
+            must_not_contain: vec!["FAILED".into()],
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let v = run_verify(&loaded, "The suite failed before my fix; it passes now.");
+        assert!(
+            v.passed,
+            "lowercase 'failed' narrating past tense must not trip a command-spec's must_not_contain: {v:?}"
+        );
     }
 
     #[test]

@@ -685,6 +685,35 @@ mod tests {
         assert_eq!(loaded.source, WorkloadSource::Embedded);
     }
 
+    /// (#2493 follow-up) Pins the shipped `quick-q` manifest's verify
+    /// keyword to the bare word, NOT a widened stem. #2493's first fix
+    /// widened this to the stem `"activ"` to catch inflections like
+    /// "activates" — but a stem is a substring probe, and frontier review
+    /// proved it also passes wrong answers that merely mention some other
+    /// inflection of the word ("activation", "deactivate") while getting
+    /// the actual content wrong (see
+    /// `run_verify_bare_keyword_rejects_wrong_answers_using_other_inflections`
+    /// in `providers/prompt.rs`). The keyword reverted to the bare
+    /// "active"; case-insensitivity (kept, since `quick-q` carries no
+    /// `command`) is the part of the original fix that was actually
+    /// justified. This test guards against a future edit re-widening the
+    /// manifest keyword back to a stem.
+    #[test]
+    fn quick_q_verify_keyword_is_the_bare_word_not_a_widened_stem() {
+        let loaded = load("quick-q", None).expect("quick-q should load from the embedded const");
+        let verify = loaded
+            .manifest
+            .workload
+            .verify
+            .as_ref()
+            .expect("quick-q ships a verify spec");
+        assert_eq!(
+            verify.must_contain,
+            vec!["active".to_string()],
+            "quick-q's must_contain keyword regressed to a stem — see #2493 follow-up"
+        );
+    }
+
     /// (#1530) The ONBOARDING workload specifically — `skills/darkmux-lab-run`
     /// tells a brand-new operator to run `darkmux lab run demo-quickstart`,
     /// and a brew / `cargo install` operator has no source checkout, so the
