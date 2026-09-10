@@ -115,6 +115,152 @@ describe("tokensOffMeter", () => {
     expect(t.cloudRuns).toBe(1);
   });
 
+  it("(#1853) the single-shot LOCAL fallback (no telemetry family, no endpoint, dispatch.complete carries the totals) counts as local — not invisible", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "s8", action: "dispatch.start", handle: "radio-router" }),
+      rec({
+        session_id: "s8",
+        action: "dispatch.complete",
+        payload: { total_tokens: 970, prompt_tokens: 900, completion_tokens: 70 },
+      }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(970);
+    expect(t.local).toBe(970);
+    expect(t.cloud).toBe(0);
+    expect(t.unknown).toBe(0);
+    expect(t.fresh).toBe(900); // one turn = the whole prompt is first-read
+    expect(t.runs).toBe(1);
+    // A local direct run must not inflate the cloud run count — hybridNote
+    // derives local runs as `t.runs - t.cloudRuns`.
+    expect(t.cloudRuns).toBe(0);
+  });
+
+  it("(#1853, inverted) a session with BOTH a telemetry family AND a token-bearing local dispatch.complete is not double-counted", () => {
+    // Before #1853, this session's dispatch.complete (token-bearing, no
+    // endpoint) never entered `dcTok` at all (the endpoint gate skipped
+    // collection), so the `sess.has` double-count guard below was never
+    // exercised for the endpoint-less path. Now that collection is
+    // endpoint-blind, the same guard has to hold: a session already fully
+    // counted via its telemetry family must not ALSO have its
+    // dispatch.complete totals summed in — that would double-count rather
+    // than fix the undercount.
+    const data: FlowRecord[] = [
+      rec({ session_id: "s9", action: "dispatch.start", handle: "coder" }),
+      tokenRec("s9", 1, 100, 20),
+      rec({ session_id: "s9", action: "dispatch.complete", payload: { total_tokens: 120 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(120); // NOT 240
+    expect(t.local).toBe(120);
+    expect(t.cloud).toBe(0);
+    expect(t.unknown).toBe(0);
+    expect(t.runs).toBe(1); // NOT 2 (no phantom directRun for s9)
+  });
+
+  it("(#1853, inverted) a cloud single-shot session is still classified cloud, never local, once collection is endpoint-blind", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "s10", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure-foundry" } }),
+      rec({
+        session_id: "s10",
+        action: "dispatch.complete",
+        payload: { endpoint: "azure-foundry", total_tokens: 500, prompt_tokens: 450, completion_tokens: 50 },
+      }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(500);
+    expect(t.cloud).toBe(500);
+    expect(t.local).toBe(0);
+    expect(t.unknown).toBe(0);
+    expect(t.cloudRuns).toBe(1);
+  });
+
+  // (#2635) `dispatch.single_shot`'s session id is deliberately TASK-scoped
+  // — sibling seats fanned out within one task can complete under the SAME
+  // session id. `dcTok` used to be a single-value Map keyed by session id,
+  // so the second completion silently overwrote the first: the reviewer's
+  // exact repro was one task, two single-shot steps sharing session
+  // `task:t3`, no telemetry family — a hosted seat ({endpoint, total_tokens:
+  // 700}) and a local seat ({total_tokens: 500}). Pre-fix the LAST WRITE
+  // won regardless of order, so ordering mattered and tokens vanished
+  // (`total=500 cloud=500` when the local seat wrote last — a local seat's
+  // tokens painted on the CLOUD tile, and the 700 real hosted tokens gone
+  // entirely). Both orderings below must land on the SAME correct totals,
+  // and neither seat's tokens may be lost.
+  it("(#2635) task-scoped session collision — hosted-then-local — both seats' tokens survive, correctly attributed", () => {
+    const data: FlowRecord[] = [
+      rec({
+        session_id: "task:t3",
+        action: "dispatch.complete",
+        payload: { endpoint: "azure:h/gpt-4o", total_tokens: 700 },
+      }),
+      rec({ session_id: "task:t3", action: "dispatch.complete", payload: { total_tokens: 500 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(1200);
+    expect(t.cloud).toBe(700);
+    expect(t.local).toBe(500);
+    expect(t.unknown).toBe(0);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.runs).toBe(2);
+  });
+
+  it("(#2635) task-scoped session collision — local-then-hosted — same totals regardless of order", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "task:t3b", action: "dispatch.complete", payload: { total_tokens: 500 } }),
+      rec({
+        session_id: "task:t3b",
+        action: "dispatch.complete",
+        payload: { endpoint: "azure:h/gpt-4o", total_tokens: 700 },
+      }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(1200);
+    expect(t.cloud).toBe(700);
+    expect(t.local).toBe(500);
+    expect(t.unknown).toBe(0);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.runs).toBe(2);
+  });
+
+  it("(#2635) task-scoped session collision — two local seats — both counted, neither dropped", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "task:t3c", action: "dispatch.complete", payload: { total_tokens: 500 } }),
+      rec({ session_id: "task:t3c", action: "dispatch.complete", payload: { total_tokens: 700 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(1200);
+    expect(t.local).toBe(1200);
+    expect(t.cloud).toBe(0);
+    expect(t.unknown).toBe(0);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.runs).toBe(2);
+  });
+
+  // (CONSIDER 3, #2635) Documents a currently-inert gap rather than fixing
+  // it: a completion that carries no `endpoint` of its own is credited to
+  // `local` even when the endpoint-bearing `dispatch.start` that would have
+  // proven it hosted has scrolled outside the caller's playhead window (see
+  // `tokensOffMeter`'s module doc on the playhead gate). Every producer
+  // today stamps `endpoint` on BOTH bookends of a hosted call
+  // (builtins.rs's `bookend_record`), so this can't happen from live data —
+  // this test pins today's behavior so a future producer that stops
+  // double-stamping makes the gap LOUD (a failing test) instead of a
+  // silent misclassification.
+  it("(CONSIDER 3, #2635) a lone endpoint-less completion is credited to local, even though its hosted start may be off-window — known gap, pinned", () => {
+    const data: FlowRecord[] = [
+      rec({
+        session_id: "s11",
+        action: "dispatch.complete",
+        payload: { total_tokens: 640, prompt_tokens: 600, completion_tokens: 40 },
+      }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.local).toBe(640);
+    expect(t.cloud).toBe(0);
+    expect(t.unknown).toBe(0);
+  });
+
   it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {
     const data: FlowRecord[] = [
       rec({ session_id: "s7", action: "dispatch.start", handle: "pr-reviewer", payload: { endpoint: "gemini" } }),

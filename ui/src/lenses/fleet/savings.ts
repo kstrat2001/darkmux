@@ -104,19 +104,37 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // ANY dispatch bookend carrying an `endpoint` — a `dispatch.complete` that
   // named its endpoint but carried no token totals still marks its session
   // cloud (the review path's `remote_tokens`-only completes are exactly
-  // this case). `dcTok` is the single-shot hosted fallback's own totals
-  // (sessions with no `telemetry.tokens` family at all).
+  // this case). `dcTok` is the single-shot fallback's own totals (sessions
+  // with no `telemetry.tokens` family at all) — REGARDLESS of endpoint
+  // (#1853). A local single-shot dispatch (radio-router, radio-host) is
+  // exactly the endpoint-less case: gating collection on `p.endpoint` (as
+  // this loop did before #1853) meant its tokens never entered `dcTok` at
+  // all, so they landed in no bucket — not even `unknown`. Collection
+  // stays endpoint-blind; `epBySid`/`localSids` decide the bucket at
+  // classification time, below.
+  //
+  // (#2635 follow-up) `dcTok` holds an ARRAY per session id, not one
+  // payload — `dispatch.single_shot`'s `dispatch_session_id` is
+  // deliberately TASK-scoped ("sibling seats fanned out within one task
+  // share this key", builtins.rs), so two sibling steps — one hosted, one
+  // local — can legitimately complete under the SAME session id. A single
+  // Map entry per sid (as this used to be) silently dropped every
+  // completion but the last, and could paint one seat's tokens on the
+  // other seat's tile at classification time. Accumulating means every
+  // completion survives to be classified on its own terms below.
   const epBySid = new Map<string, string>();
-  const dcTok = new Map<string, TokenPayload>();
+  const dcTok = new Map<string, TokenPayload[]>();
 
   for (const r of data) {
     const p = r.payload as TokenPayload | undefined;
-    if (!r.session_id || !p || !p.endpoint) continue;
-    if (isDispatchStart(r.action) || isDispatchComplete(r.action)) {
+    if (!r.session_id || !p) continue;
+    if (p.endpoint && (isDispatchStart(r.action) || isDispatchComplete(r.action))) {
       epBySid.set(r.session_id, String(p.endpoint));
     }
     if (isDispatchComplete(r.action) && hasAnyTokenCounts(p)) {
-      dcTok.set(r.session_id, p);
+      const arr = dcTok.get(r.session_id);
+      if (arr) arr.push(p);
+      else dcTok.set(r.session_id, [p]);
     }
   }
 
@@ -187,29 +205,63 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     }
   }
 
-  // (#1186) Single-shot fallback — endpoint sessions with no telemetry
-  // family count their completion-record totals as cloud. The `sess.has`
-  // guard preserves the telemetry-exclusive rule that prevents
-  // double-counting. One turn means the whole prompt is first-read, so
-  // `fresh += prompt` is exact here, not an approximation.
+  // (#1186, reclassified #1853) Single-shot fallback — sessions with no
+  // telemetry family count their completion-record totals from `dcTok`.
+  // The `sess.has` guard preserves the telemetry-exclusive rule that
+  // prevents double-counting (a session that has BOTH a telemetry family
+  // and a token-bearing completion is already fully counted above and is
+  // skipped here).
+  //
+  // Classification happens HERE, not at collection — and (#2635) it is
+  // PER-COMPLETION, not per-session: cloud when THIS payload's own
+  // `endpoint` is set, local when it isn't. A session-level check
+  // (`epBySid.has(sid)` as this used to read) is wrong here specifically
+  // BECAUSE `dcTok`'s session id can be shared by sibling seats (see the
+  // module-level comment above `dcTok`'s declaration) — `epBySid` would
+  // credit a purely-local seat as cloud (or vice versa) whenever ANY
+  // sibling under the same task-scoped sid happened to name an endpoint.
+  // Each `dcTok` payload IS itself the `dispatch.complete` record that
+  // proves its own classification, so it needs no session-level lookup.
+  // The `unknown` branch stays a defensive floor: a payload lacking
+  // `endpoint` satisfies the exact same criterion `localSids` used to add
+  // this sid (`isDispatchComplete` + no `endpoint`, on this very record),
+  // so `!localSids.has(sid)` should never fire — kept anyway rather than
+  // assuming that invariant can't drift, same posture as before. One turn
+  // means the whole prompt is first-read, so `fresh += prompt` is exact
+  // here, not an approximation.
   let directRuns = 0;
-  for (const [sid, p] of dcTok) {
+  for (const [sid, payloads] of dcTok) {
     if (sess.has(sid)) continue;
-    // `remote_tokens` is the review path's spelling for its own spend; the
-    // other three are null there. Last in the chain so it never overrides a
-    // record that reported the standard fields.
-    const tt = p.total_tokens || (p.prompt_tokens || 0) + (p.completion_tokens || 0) || p.remote_tokens || 0;
-    total += tt;
-    cloud += tt;
-    prompt += p.prompt_tokens || 0;
-    completion += p.completion_tokens || 0;
-    fresh += p.prompt_tokens || 0;
-    // A `remote_tokens`-only payload has no prompt/completion split to
-    // decompose, so without this its spend joins `total` while appearing in
-    // NO class chip.
-    if (isRemoteOnlyTokens(p)) uncls += tt;
-    directRuns++;
-    cloudRuns++;
+    for (const p of payloads) {
+      // `remote_tokens` is the review path's spelling for its own spend; the
+      // other three are null there. Last in the chain so it never overrides
+      // a record that reported the standard fields.
+      const tt = p.total_tokens || (p.prompt_tokens || 0) + (p.completion_tokens || 0) || p.remote_tokens || 0;
+      total += tt;
+      if (p.endpoint) {
+        cloud += tt;
+        cloudRuns++;
+      } else if (!localSids.has(sid)) {
+        unknown += tt;
+      }
+      // Known, currently-inert gap: a completion that itself carries no
+      // `endpoint` but whose endpoint-bearing `dispatch.start` sibling has
+      // scrolled outside the caller's playhead window is credited to
+      // `local` here rather than `unknown` — the wrong direction for the
+      // #1607 honesty contract. Every current producer stamps `endpoint`
+      // on BOTH bookends of a hosted call (see `bookend_record` in
+      // builtins.rs), so no live data can hit this today; pinned in
+      // savings.test.ts so a future producer that stops double-stamping
+      // makes the gap loud instead of silent.
+      prompt += p.prompt_tokens || 0;
+      completion += p.completion_tokens || 0;
+      fresh += p.prompt_tokens || 0;
+      // A `remote_tokens`-only payload has no prompt/completion split to
+      // decompose, so without this its spend joins `total` while appearing
+      // in NO class chip.
+      if (isRemoteOnlyTokens(p)) uncls += tt;
+      directRuns++;
+    }
   }
 
   // `local` is what is LEFT after both `cloud` and `unknown` are removed —
