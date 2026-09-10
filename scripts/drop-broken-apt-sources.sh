@@ -93,19 +93,33 @@
 # The classic-format branch used to gate the COUNT itself on being able to
 # cleanly extract a URI at all — which meant a `deb`/`deb-src` line this
 # script's positional extraction didn't fully understand (verified against
-# apt's own parser: a quoted URI, an option value containing `]`, or an
-# option value containing `#` are all real, apt-accepted shapes this
-# extraction mishandles) simply vanished from the tally instead of costing a
-# match. In a mixed file, that made an untouched OTHER source disappear from
-# the total, leaving the browser source alone looking like 100% of what the
-# file declares — and deleting the whole file, the other source included.
-# That is the exact failure mode the paragraph above calls out as worse than
-# the flake this script exists to fix, reached by a different door. The
-# deb822 branch never had this hole, because it always counted every token
-# it split out regardless of what the token looked like; the fix brings the
-# classic branch's counting rule into line with it, so a line this script
-# can't fully parse can only ever cost a match, in both formats alike, never
-# quietly remove one from the denominator.
+# apt's own parser: a quoted URI, or an option value containing `#`, are
+# real, apt-accepted shapes this extraction mishandles) simply vanished from
+# the tally instead of costing a match. In a mixed file, that made an
+# untouched OTHER source disappear from the total, leaving the browser
+# source alone looking like 100% of what the file declares — and deleting
+# the whole file, the other source included. That is the exact failure mode
+# the paragraph above calls out as worse than the flake this script exists
+# to fix, reached by a different door. The deb822 branch never had this
+# hole, because it always counted every token it split out regardless of
+# what the token looked like; the fix brings the classic branch's counting
+# rule into line with it, so a line this script can't fully parse can only
+# ever cost a match, in both formats alike, never quietly remove one from
+# the denominator.
+#
+# That guarantee covers the denominator, not the numerator — a line the
+# script COULD extract *a* URI from, but the wrong one, could still create a
+# false match instead of merely costing one. It did: an option value glued
+# directly to the URI that follows it with no separating space (e.g.
+# `[signed-by=...]https://dl.google.com/x] https://example.org/repo`) used
+# to have its options block cut at the FIRST `]` — which landed inside the
+# glued browser-looking text rather than at the option's own close — so a
+# third-party source got read as `https://dl.google.com/x]`, matched, and
+# deleted, while the real declared source (`example.org`) was destroyed
+# alongside it with no warning. The options-block walk below now stops only
+# at a `]` actually followed by whitespace (or end of line), matching apt's
+# own cutpoint exactly, so this shape resolves to the real URI instead of a
+# false match — closing that hole rather than merely documenting it.
 #
 # The host must match dl.google.com EXACTLY as a hostname, not a substring.
 # A file is removed only when EVERY declared source in it — every
@@ -136,6 +150,15 @@
 # also attempted and fails without output of its own (e.g. no `sudo`
 # binary exists at all) — the first error is the informative one and is
 # never allowed to be silently overwritten by a blank one.
+#
+# A file this script COULD read but couldn't fully parse (a quoted URI is
+# the known real-world shape) gets the same "never silently claim nothing
+# was found" treatment. This script never GUESSES such a line into a match
+# — it is always left in place, which is the safe direction — but it also
+# can't prove the line ISN'T a Google Chrome source apt would still fetch,
+# so it's WARNED about too, and that warning is what keeps the closing
+# "nothing to drop" line from asserting something this script never
+# actually checked.
 #
 # Exit status: this script exits non-zero if it found a source it could NOT
 # remove (escalation unavailable or failed) — that leaves the exact flake
@@ -180,7 +203,13 @@ as_root() {
 # the first of / ? # onward to isolate the AUTHORITY first (userinfo@host:port
 # — never the path/query/fragment), THEN drop any userinfo (user[:pass]@)
 # within that authority by cutting at its LAST '@', THEN drop a port by
-# cutting at the first remaining ':'.
+# cutting at the first remaining ':' — EXCEPT when the host itself is a
+# bracketed IPv6 literal (`[::1]`, optionally followed by `:port`), where the
+# host is everything between the brackets and a naive first-':' cut would
+# instead chop the literal apart at its own internal colons. Neither of
+# darkmux's targets (dl.google.com, a hostname) is ever an IPv6 literal, so
+# this branch can never itself produce a match either way — it only keeps
+# the extracted "host" honest for a shape this script otherwise mangles.
 #
 # The authority must be isolated BEFORE the userinfo cut, not folded into one
 # cut across the whole remainder — a path segment can itself contain an '@'
@@ -199,7 +228,18 @@ host_of() {
   case "$authority" in
     *@*) authority="${authority##*@}" ;;
   esac
-  authority="${authority%%:*}"
+  case "$authority" in
+    \[*)
+      # IPv6 literal: the host is everything between the brackets; an
+      # optional port, if present, follows immediately after the closing
+      # bracket as ":port" and is dropped along with the bracket itself.
+      authority="${authority#\[}"
+      authority="${authority%%]*}"
+      ;;
+    *)
+      authority="${authority%%:*}"
+      ;;
+  esac
   printf '%s' "$authority"
 }
 
@@ -242,6 +282,7 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
 
   total=0
   matching=0
+  file_unresolved=0
 
   if [[ "$f" == *.sources ]]; then
     # deb822 stanza format: a stanza's URIs: field can hold more than one
@@ -313,7 +354,38 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
       [ "$rest" = "$nocomment" ] && rest="${nocomment#deb}"
       rest="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]+//')"
       if [[ "$rest" == \[* ]]; then
-        rest="${rest#*]}"
+        # apt ends the options block at the FIRST ']' that is followed by
+        # whitespace (or end of line) — not simply the first ']' anywhere.
+        # Verified against apt's own parser both ways: a ']' glued directly
+        # to what follows it (no separating space) does NOT end the block,
+        # and a ']' that genuinely is followed by whitespace still ends it
+        # exactly where expected. Cutting at the first ']' unconditionally
+        # (the prior behavior) let an option value glued straight to a
+        # following URI — e.g. `[signed-by=...]https://dl.google.com/x]
+        # https://example.org/repo` — misread as if the option's own
+        # trailing text were the declared source's URI, treating a
+        # third-party source as a Google Chrome one and deleting it. Walking
+        # bracket-by-bracket instead of stopping at the first one reproduces
+        # apt's real cutpoint, so the URI extracted here is the one apt
+        # itself would use.
+        walk="$rest"
+        closed=0
+        while [[ "$walk" == *']'* ]]; do
+          after="${walk#*]}"
+          if [ -z "$after" ] || [[ "$after" == [[:space:]]* ]]; then
+            rest="$after"
+            closed=1
+            break
+          fi
+          walk="$after"
+        done
+        # An options block with no ']' that is ever followed by whitespace
+        # (or end of line) is malformed in a way this script can't resolve
+        # into a clean URI — leave `rest` empty so the unconditional count
+        # below still tallies the line, but the unparsed-line accounting
+        # further down treats it the same as any other line this script
+        # can't finish extracting a URI from, rather than guessing.
+        [ "$closed" -eq 0 ] && rest=""
         rest="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]+//')"
       fi
       uri="${rest%%[[:space:]]*}"
@@ -331,13 +403,26 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
       # vanish from a mixed file's total, making the file look like a 100%
       # match on the browser source alone and deleting the whole thing,
       # including the source this script never even looked at. Real apt
-      # accepts a quoted URI, an option value containing ']', and an option
-      # value containing '#' (all three verified against apt's own parser),
-      # none of which this script's positional extraction fully understands
-      # — so those shapes still often fail to yield a clean match below, but
-      # they can no longer make a mixed file's total look smaller than it is.
+      # accepts a quoted URI, and an option value containing '#' (both
+      # verified against apt's own parser), neither of which this script's
+      # positional extraction fully understands — so those shapes still fail
+      # to yield a clean match below, but they can no longer make a mixed
+      # file's total look smaller than it is. (An option value containing
+      # ']' USED to be a third such shape, but glued straight to a following
+      # URI with no separating space it didn't just fail to match — it could
+      # extract the WRONG URI and falsely match on it, per the options-block
+      # walk fixed above; it's not counted alongside these two because it's
+      # not merely safe-but-lossy the way they are.)
       total=$((total + 1))
-      [ -z "$uri" ] && continue
+      if [ -z "$uri" ]; then
+        # Recognized as a real declared source, but this script could not
+        # extract ANY URI from it (an options block whose ']' never lands
+        # before whitespace or end of line, i.e. the malformed-brackets case
+        # above). Never counts as a match — see the residual-honesty note
+        # near the closing summary for why this still has to be surfaced.
+        file_unresolved=$((file_unresolved + 1))
+        continue
+      fi
 
       # Only a scheme-bearing URI can possibly MATCH — gate the match test,
       # never the count above, on this. See the header note on non-web
@@ -347,8 +432,35 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
         if host_matches "$host"; then
           matching=$((matching + 1))
         fi
+      else
+        # Recognized as a real declared source, and this script DID extract
+        # something — but it isn't a URI apt would accept as one (a quoted
+        # URI is the known real-world example: the extracted token still
+        # carries its literal quote characters, so it can never look
+        # scheme-bearing). Same residual-honesty accounting as the
+        # empty-`uri` case above.
+        file_unresolved=$((file_unresolved + 1))
       fi
     done <<<"$content"
+  fi
+
+  if [ "$file_unresolved" -gt 0 ]; then
+    # This file counts as declaring $file_unresolved source line(s) this
+    # script could not turn into a clean, comparable URI — apt itself may
+    # still parse and fetch what's there (a quoted URI is a real,
+    # apt-accepted shape; see the mkcorpus note this pairs with), so the
+    # script genuinely does not know whether one of them names
+    # dl.google.com. It never matches these lines either way (safe: nothing
+    # gets deleted on a guess) — but staying silent about the gap would let
+    # the closing summary below claim "no Google Chrome apt source found"
+    # when the honest answer is "this script couldn't tell." Reusing the
+    # `warned` flag (rather than a separate silent counter) is what keeps
+    # that summary honest: it suppresses the false-negative claim the same
+    # way any other warning already does.
+    msg="$f declares $file_unresolved source line(s) this script could not fully parse into a comparable URI — it cannot rule out one of them being a Google Chrome apt source that apt itself would still fetch. Left in place; inspect by hand if apt-get update continues to fail on this runner because of a source here."
+    echo "WARNING: $msg" >&2
+    echo "::warning::$msg"
+    warned=1
   fi
 
   if [ "$total" -eq 0 ]; then
