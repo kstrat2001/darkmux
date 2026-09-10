@@ -77,18 +77,55 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.46.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.47.0";
 // Version history:
-//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #1645: `dispatch_internal.rs`'s
-//           `dispatch_remote`/`dispatch_local_single_shot` arms (the hosted and
-//           container-free local single-shot dispatch paths) now resolve
-//           `mission_id` via the SAME `resolve_mission_for_phase(phase_id)`
-//           lookup the container-agentic path already used (#714), instead of
-//           a hardcoded `None` a #1177-era TODO left in `build_remote_record`.
-//           `mission_id` is an existing optional field on every record shape —
-//           this only changes which producers populate it, not the field
-//           itself, so no new key and no shape change. A dispatch whose
-//           `phase_id` never resolves to a mission (a bare `darkmux dispatch
+//   1.47.0 (#1645 fix-pass) — `dispatch_internal.rs`'s `dispatch_remote`/
+//           `dispatch_local_single_shot` arms (the hosted and container-free
+//           local single-shot dispatch paths) now resolve `mission_id` via
+//           the SAME `resolve_mission_for_phase(phase_id)` lookup the
+//           container-agentic path already used (#714), instead of a
+//           hardcoded `None` a #1177-era TODO left in `build_remote_record`.
+//
+//           MINOR, not "no bump — only producers changed, mission_id is an
+//           existing field." That reasoning is exactly what 1.43.0's and
+//           1.45.0's entries (both directly above/below this one in the
+//           source) reject: 1.43.0 bumped for a pure VALUE-convention
+//           change with no field added/removed/retyped, because an older
+//           reader that predicted the string wrong now predicts wrong for
+//           new records; 1.45.0 bumped an additive-payload-key change on
+//           the same "only producers changed which keys they write"
+//           grounds, because "a consumer that knows these keys reads a
+//           DIFFERENT ANSWER out of the same record set than one that does
+//           not." The same argument transfers verbatim here: a consumer
+//           that reads `mission_id` off a `dispatch_remote`/
+//           `dispatch_local_single_shot` record now gets a real mission
+//           where it used to get `None` — a different answer from the
+//           same record set, not a differently-shaped one.
+//
+//           Real consumers that read that different answer:
+//           `darkmux-serve::runs` (the mission_id fold, and
+//           `is_ambiguous()` — which since #2487 gates the drill target
+//           AND role/model/machine/route/both timestamps/the sort key),
+//           `darkmux-serve::mission_graph`, and the UI's
+//           `ui/src/lib/flow.ts` machine-timeline bars (keyed on the
+//           session/mission pair).
+//
+//           And the skew argument transfers too:
+//           `darkmux-flow::status` computes schema skew as
+//           `redis_observed.filter(|v| v != FLOW_SCHEMA_VERSION)`. This
+//           operator's own fleet is a mixed-writer fleet BY DESIGN (the
+//           laptop runs source builds, the hub runs brew/stable) — leaving
+//           this constant at 1.46.0 would report NO skew while two
+//           `dispatch_remote`/`dispatch_local_single_shot` record shapes
+//           were live on one stream, the exact failure 1.45.0's entry
+//           named ("Leaving it at 1.44.0 would have reported no skew while
+//           two shapes were live").
+//
+//           `mission_id` is an existing optional field on every record
+//           shape — no new key, no retyped field, `FlowRecord`'s Rust
+//           shape is unchanged — so this is additive/value-convention, not
+//           breaking: MINOR, not MAJOR. A dispatch whose `phase_id` never
+//           resolves to a mission (a bare `darkmux dispatch
 //           <role>`, RADIO's answering seat) still carries no `mission_id`,
 //           same as before.
 //   1.46.0 (#2263) — the internal-runtime `dispatch complete` payload's

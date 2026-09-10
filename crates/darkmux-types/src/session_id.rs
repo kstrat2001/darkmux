@@ -124,10 +124,17 @@ pub fn step(step_id: &str) -> String {
 ///   a scoped record always also carries `FlowRecord.mission_id` (every
 ///   site that applies this function does so in lock-step with populating
 ///   that field — unconditionally in the launcher's `emit`-wrap, and gated
-///   on the SAME `resolve_mission_for_phase` result in
-///   `dispatch_internal::dispatch`), so `mission_id` already answers it.
-///   The unscoped prediction is still needed for the case where the
-///   mission does NOT resolve, which leaves BOTH fields in their raw form
+///   on the SAME `resolve_mission_for_phase` result at ITS OWN resolution
+///   site. As of #1645 fix-pass that is three sites, not one:
+///   `dispatch_internal::dispatch` (the container-agentic path), and
+///   `dispatch_internal::dispatch_remote` /
+///   `dispatch_internal::dispatch_local_single_shot` (the hosted and
+///   container-free local single-shot arms, which route around the first
+///   entirely for a remote-resolved profile) — all three resolve
+///   `mission_id` and apply this function to `session_id` back to back, at
+///   their own call site), so `mission_id` already answers it. The
+///   unscoped prediction is still needed for the case where the mission
+///   does NOT resolve, which leaves BOTH fields in their raw form
 ///   together.
 /// - `darkmux-serve::mission_graph::step_for_record` (and its page-side
 ///   twin `ui/src/lenses/mission/graph.ts::stepForRecord`) DOES have to

@@ -2521,6 +2521,208 @@
         }
     }
 
+    // ─── #1645 fix-pass MUST FIX 1 (fuller fix): dispatch_remote itself ──
+
+    /// (#1645 fix-pass review) `build_remote_record_threads_mission_id_
+    /// through` (above) proves the BUILDER threads `mission_id`; it does
+    /// NOT prove `dispatch_remote` — the arm actually reachable in
+    /// production today — ever calls it with a real resolved mission_id.
+    /// This drives `dispatch_remote` directly (it's accessible here via
+    /// `super::*`, same module tree) through a real loopback HTTP mock
+    /// (`one_shot_http_mock`, the same helper the resume-from test above
+    /// uses), with a real on-disk phase resolving to a real mission, and
+    /// reads back every flow record it actually wrote to disk.
+    ///
+    /// Isolates `DARKMUX_HOME` (config.json / remote-budget resolution),
+    /// `DARKMUX_CREW_DIR` (phase lookup) and `DARKMUX_FLOWS_DIR` (record
+    /// readback) so this never touches the operator's real `~/.darkmux`.
+    #[test]
+    #[serial]
+    fn dispatch_remote_stamps_mission_id_resolved_from_phase_on_every_record() {
+        let (base_url, _rx) = one_shot_http_mock(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        );
+
+        let home = TempDir::new().unwrap();
+        let crew_dir = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+
+        const MISSION_ID: &str = "mock-mission-1645-remote";
+        const PHASE_ID: &str = "mock-phase-1645-remote";
+        let phases_dir = crew_dir.path().join("missions").join(MISSION_ID).join("phases");
+        std::fs::create_dir_all(&phases_dir).unwrap();
+        std::fs::write(
+            phases_dir.join(format!("{PHASE_ID}.json")),
+            format!(
+                r#"{{"id":"{PHASE_ID}","mission_id":"{MISSION_ID}","description":"d","status":"planned","depends_on":[],"created_ts":0}}"#
+            ),
+        )
+        .unwrap();
+
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_CREW_DIR", crew_dir.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+
+        let session_id = format!("mock-dispatch-remote-mission-proof-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session_id = Some(session_id.clone());
+        opts.phase_id = Some(PHASE_ID.to_string());
+        opts.json = false;
+
+        let role = quarantine_test_role(); // `dispatch_remote` ignores `_role` entirely
+        let pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
+            r#"{{"id":"gpt-remote","n_ctx":100000,"endpoint":{{"url":"{base_url}"}}}}"#
+        ))
+        .unwrap();
+
+        let result = dispatch_remote(&opts, &role, "system prompt", &pm);
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_crew {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        result.expect("dispatch_remote must succeed against the mock server");
+
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(flows_dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&path).unwrap();
+            for line in contents.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if v.get("session_id").and_then(|s| s.as_str()) == Some(session_id.as_str()) {
+                        records.push(v);
+                    }
+                }
+            }
+        }
+        assert!(!records.is_empty(), "dispatch_remote must have written flow records for this session");
+        for rec in &records {
+            assert_eq!(
+                rec.get("mission_id").and_then(|v| v.as_str()),
+                Some(MISSION_ID),
+                "every dispatch_remote record must carry the phase-resolved mission_id, got: {rec:?}"
+            );
+        }
+        let actions: Vec<&str> = records.iter().filter_map(|r| r["action"].as_str()).collect();
+        assert!(actions.contains(&"dispatch start"), "must have emitted dispatch start: {actions:?}");
+        assert!(actions.contains(&"dispatch complete"), "must have emitted dispatch complete: {actions:?}");
+    }
+
+    /// (#1645 fix-pass CONSIDER 3) `dispatch_opts_for` (the `dispatch.
+    /// internal` StepKind's own opts builder, `step_kinds/builtins.rs`)
+    /// hands every unconfigured step the SAME config-derived
+    /// `session_id::step(&step.id)` default, byte-identical across every
+    /// launch of the same mission config — regardless of whether the
+    /// resolved profile routes to the container path or to
+    /// `dispatch_remote`. `dispatch_internal::dispatch` (the container
+    /// path) already composes the resolved mission id into that default
+    /// via `scope_to_run` (#1918); this proves `dispatch_remote` now does
+    /// the identical composition, so two DIFFERENT missions launching the
+    /// same config's hosted step diverge instead of colliding on one
+    /// session_id — now carrying DIFFERENT `mission_id`s too, which would
+    /// otherwise be a worse collision than before this fix existed at all.
+    #[test]
+    #[serial]
+    fn dispatch_remote_scopes_a_config_derived_session_id_by_mission_so_two_missions_diverge() {
+        let home = TempDir::new().unwrap();
+        let crew_dir = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+
+        for (mission_id, phase_id) in [("mission-a-1645", "p1-a-1645"), ("mission-b-1645", "p1-b-1645")] {
+            let phases_dir = crew_dir.path().join("missions").join(mission_id).join("phases");
+            std::fs::create_dir_all(&phases_dir).unwrap();
+            std::fs::write(
+                phases_dir.join(format!("{phase_id}.json")),
+                format!(
+                    r#"{{"id":"{phase_id}","mission_id":"{mission_id}","description":"d","status":"planned","depends_on":[],"created_ts":0}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_CREW_DIR", crew_dir.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+
+        // The SAME config-derived default `dispatch_opts_for` hands an
+        // unconfigured `dispatch.internal` step — literal out of the
+        // mission config document, identical whichever mission launches it.
+        let raw_session_id = darkmux_types::session_id::step("s1-1645");
+        let role = quarantine_test_role();
+
+        let mut seen_session_ids = std::collections::HashSet::new();
+        for (mission_id, phase_id) in [("mission-a-1645", "p1-a-1645"), ("mission-b-1645", "p1-b-1645")] {
+            let (base_url, _rx) = one_shot_http_mock(
+                r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            );
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.role_id = "pr-reviewer".to_string();
+            opts.session_id = Some(raw_session_id.clone());
+            opts.phase_id = Some(phase_id.to_string());
+            opts.json = false;
+            let pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
+                r#"{{"id":"gpt-remote","n_ctx":100000,"endpoint":{{"url":"{base_url}"}}}}"#
+            ))
+            .unwrap();
+            let result =
+                dispatch_remote(&opts, &role, "system prompt", &pm).expect("dispatch_remote must succeed");
+            assert_eq!(
+                result.session_id,
+                darkmux_types::session_id::scope_to_run(&raw_session_id, mission_id),
+                "dispatch_remote's returned session_id must be scoped to its own mission"
+            );
+            seen_session_ids.insert(result.session_id);
+        }
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_crew {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        assert_eq!(
+            seen_session_ids.len(),
+            2,
+            "two missions launching the identical config-derived session_id default must diverge \
+             once scoped to their own mission — without scope_to_run both dispatches would collide \
+             on the SAME session_id while now carrying DIFFERENT mission_ids"
+        );
+    }
+
     // ─── #2580 review finding: the SECOND unguarded route into
     //     `dispatch_remote` — `dispatch_local_single_shot` ignored
     //     `resume_from` exactly as `dispatch()`'s pre-fix branch did ───────
@@ -8344,6 +8546,59 @@
         });
         let payload = turn_tokens_payload(&event).expect("maps usage");
         assert_eq!(payload["total_tokens"], 345, "no reported total → derive from the split");
+    }
+
+    // ─── build_remote_record (#1645 fix-pass MUST FIX 1) ───────────────
+
+    /// (#1645 fix-pass review) `dispatch_remote` performs real HTTP and is
+    /// therefore never executed by the ordinary suite — the SAME class of
+    /// gap `remote_usage_tokens`' own doc (right below) names for the token
+    /// extraction. #1645's only new regression test drove
+    /// `dispatch_local_single_shot`'s LOCAL arm, whose two production
+    /// callers (`src/radio.rs`, `src/radio_answer.rs`) both pass
+    /// `phase_id: None` — so that arm's `mission_id` threading is
+    /// prospective, while `dispatch_remote` is the arm ACTUALLY reachable
+    /// today (`dispatch()` routes any `dispatch.internal` step whose
+    /// resolved profile is remote here, before the container path's own
+    /// resolution ever runs). Proven: reverting `dispatch_remote`'s three
+    /// live `build_remote_record` call sites back to a hardcoded `None`
+    /// (leaving the `on_abort` closure's `mission_id_for_abort` stamped, so
+    /// nothing warns about an unused binding) left `cargo test -p
+    /// darkmux-crew` fully green — 1630 passed, 0 failed.
+    ///
+    /// `build_remote_record` is a pure function (no HTTP, no env, no
+    /// filesystem) — this test calls it directly, so it kills that exact
+    /// mutant in one assertion regardless of which caller reaches it.
+    #[test]
+    fn build_remote_record_threads_mission_id_through() {
+        let rec = build_remote_record(
+            "coder",
+            "sess-1",
+            "gpt-remote",
+            Some("m1"),
+            Some("p1"),
+            "dispatch start",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            rec.mission_id.as_deref(),
+            Some("m1"),
+            "mission_id must thread through verbatim, not get dropped on the way to FlowRecord"
+        );
+        assert_eq!(rec.phase_id.as_deref(), Some("p1"));
+
+        // Inverted case, same discipline as #1645's own inverted test: no
+        // mission resolved ⇒ no fabricated mission_id.
+        let bare = build_remote_record(
+            "coder",
+            "sess-2",
+            "gpt-remote",
+            None,
+            None,
+            "dispatch start",
+            serde_json::json!({}),
+        );
+        assert!(bare.mission_id.is_none(), "a None mission_id must never be fabricated into Some");
     }
 
     // ─── remote_usage_tokens (#1444 review) ───────────────────────────
