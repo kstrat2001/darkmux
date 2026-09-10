@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Node, NodeChange } from "reactflow";
-import { recordDimensions, withMeasuredDimensions } from "./measuredDims";
+import { clampCanvasHeight, recordDimensions, withMeasuredDimensions } from "./measuredDims";
 
 const dimChange = (id: string, width: number, height: number): NodeChange => ({
   id,
@@ -85,5 +85,24 @@ describe("withMeasuredDimensions", () => {
       ["b", 320, 88],
       ["c", undefined, undefined],
     ]);
+  });
+});
+
+describe("clampCanvasHeight", () => {
+  it("uses the real available space when it is small but positive — the #2520 regression", () => {
+    // #2520's own measurement: an 844×390 landscape phone leaves ~103px
+    // above the fixed phone drawer. The old `Math.max(240, available)`
+    // floor returned 240 here, running the canvas (and React Flow's
+    // pinned controls/minimap) under the drawer with no way to reach them.
+    expect(clampCanvasHeight(103.3125)).toBeCloseTo(103.3125);
+  });
+
+  it("still returns a valid positive length when available space is exhausted", () => {
+    expect(clampCanvasHeight(0)).toBeGreaterThan(0);
+    expect(clampCanvasHeight(-40)).toBeGreaterThan(0);
+  });
+
+  it("passes through generous desktop/portrait-phone room untouched", () => {
+    expect(clampCanvasHeight(560)).toBe(560);
   });
 });

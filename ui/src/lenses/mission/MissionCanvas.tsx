@@ -33,6 +33,7 @@ import { useIsMobile } from "../../hooks/useIsMobile";
 import {
   recordDimensions,
   withMeasuredDimensions,
+  clampCanvasHeight,
   type NodeDimensionsMap,
 } from "./measuredDims";
 import {
@@ -345,7 +346,7 @@ export function MissionCanvas({
       // where that rule does not apply, leaving desktop untouched.
       const shell = el.closest(".app-shell");
       const inset = shell ? parseFloat(getComputedStyle(shell).paddingBottom) || 0 : 0;
-      const h = Math.max(240, window.innerHeight - top - inset);
+      const h = clampCanvasHeight(window.innerHeight - top - inset);
       el.style.height = `${h}px`;
       // (#2376) The ACTUAL rendered pane's aspect, not the window's — a
       // landscape phone's canvas is short and wide even though `isMobile`

@@ -65,3 +65,41 @@ export function withMeasuredDimensions(nodes: Node[], dims: NodeDimensionsMap): 
     return { ...node, width: measured.width, height: measured.height };
   });
 }
+
+/**
+ * (#2520) The smallest height `clampCanvasHeight` will ever return.
+ *
+ * NOT a usability minimum — it exists only so `MissionCanvas`'s
+ * `el.style.height` write is always a valid, positive CSS length. Setting
+ * `height` to `0px` or a negative value is either invisible or silently
+ * ignored by the browser (the previous height stays applied), which is the
+ * literal "collapsed to nothing" failure this guards against. Deliberately
+ * tiny: a real usability floor would just be the SAME wrong idea
+ * `clampCanvasHeight`'s own doc describes, at a different constant that
+ * would eventually be wrong for some other viewport too.
+ */
+export const MIN_VALID_CANVAS_PX = 1;
+
+/**
+ * (#2520) How tall the mission canvas's own container may be, given how
+ * much vertical room is actually left below its top edge.
+ *
+ * Replaces a flat `Math.max(240, available)` floor that was tuned against
+ * desktop and portrait-phone viewports, where `available` is comfortably
+ * above 240px. On a landscape phone (844×390) `available` can be well
+ * under half that — measured #2520: top 210.6875 + a 76px drawer inset
+ * leaves only ~103px above the phone's always-`position:fixed` bottom
+ * drawer. Flooring to 240px there does not protect against a collapse; it
+ * makes the canvas TALLER than the room it has, running its own bottom
+ * edge (and React Flow's controls/minimap, which it pins there) UNDER the
+ * drawer — not merely below the fold, since the drawer is fixed to the
+ * VIEWPORT rather than the page, so no scroll position ever uncovers them.
+ *
+ * `available` can also be transiently ≤0 (the very first layout pass,
+ * before the sticky header/drawer inset have settled), which is the case
+ * this function's floor genuinely exists to catch — see
+ * `MIN_VALID_CANVAS_PX`'s own doc. Pure.
+ */
+export function clampCanvasHeight(available: number): number {
+  return Math.max(MIN_VALID_CANVAS_PX, available);
+}
