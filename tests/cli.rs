@@ -2766,6 +2766,364 @@ fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
     );
 }
 
+/// (#2476 review round 2, MUST FIX 4) `darkmux acp`'s own OS-signal
+/// wiring (`acp::run()`'s `tokio::spawn(host_shutdown_reap_loop(
+/// reap_on_host_shutdown))`, installed unconditionally before the ACP
+/// stdio loop starts serving) has NEVER been constructed by any test —
+/// every existing `acp.rs` signal test proves a piece of the mechanism
+/// in-process (`wait_for_host_shutdown_signal_ready` reacts to a real
+/// SIGTERM, `host_shutdown_reap_loop` calls its `on_signal` callback,
+/// `child_registry::kill_all` kills a real registered pid), but nothing
+/// spawns the REAL `darkmux acp` binary and signals it. `src/acp.rs`'s
+/// own production closure (`reap_on_host_shutdown`, wired into `run()`)
+/// was consequently silently deletable — deleting the `tokio::spawn(...)`
+/// call in `run()` leaves every existing unit test green, since none of
+/// them construct `acp::run()` itself.
+///
+/// This spawns the real binary in `acp` mode with piped stdio (stdin
+/// held open by this test so the ACP stdio loop never sees an EOF that
+/// would exit the process on its own, independent of signal handling —
+/// this test needs the process to still be alive when SIGTERM lands, not
+/// racing an unrelated early exit), waits for it to be observably
+/// running, sends a real SIGTERM, and asserts it exits within a bound at
+/// the documented exit code (130 — `reap_on_host_shutdown`'s own
+/// `std::process::exit(130)`, matching the mission-launch SIGTERM
+/// precedent's exit code elsewhere in this file).
+///
+/// RED-PROVED by hand: commenting out the `tokio::spawn(host_shutdown_
+/// reap_loop(reap_on_host_shutdown));` line in `acp::run()` makes this
+/// test fail — the process then has no signal handler installed at all,
+/// SIGTERM takes default disposition (process-terminated-by-signal, no
+/// exit code), and `exit_status.code()` reports `None` instead of
+/// `Some(130)`, so the process also never got the chance to reap
+/// anything it might have had in flight.
+///
+/// **Retries, growing the pre-signal wait, rather than one fixed sleep.**
+/// There is no in-process readiness latch reachable from OUTSIDE a spawned
+/// BINARY the way `acp.rs`'s own `wait_for_host_shutdown_signal_ready`
+/// tests use one — a fixed sleep is the only pre-signal readiness signal
+/// available here, and measured directly on this machine under real
+/// concurrent load (multiple live `darkmux` processes + other cargo
+/// activity, `uptime` load average in the 20s), even 2.5s was
+/// insufficient often enough to make a single fixed-sleep attempt
+/// unreliable — a genuinely loaded box can push a debug binary's tokio
+/// runtime startup + first task scheduling round past that. Retrying
+/// with a longer wait on each attempt (rather than one long wait
+/// up-front) keeps the common case fast while still tolerating a
+/// once-in-a-while slow scheduling round without flaking outright.
+#[test]
+fn acp_sigterm_reaps_children_and_exits_130() {
+    const WAITS_MS: [u64; 4] = [1_000, 3_000, 6_000, 10_000];
+    let mut last_debug = String::new();
+
+    for (attempt, wait_ms) in WAITS_MS.iter().enumerate() {
+        let mut child = darkmux_std_cmd()
+            .args(["acp"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning darkmux acp");
+        let pid = child.id();
+        // Held so the child's stdin never sees EOF — an ACP agent seeing
+        // EOF on stdin is a legitimate "the client disconnected" exit on
+        // its own, which would race this test's SIGTERM instead of
+        // proving anything about signal handling. Never written to; the
+        // ACP protocol handshake is irrelevant here —
+        // `host_shutdown_reap_loop` is spawned independently of (and
+        // before) the stdio-driven `serve()` loop.
+        let _stdin_holder = child.stdin.take();
+
+        std::thread::sleep(std::time::Duration::from_millis(*wait_ms));
+
+        assert!(
+            child.try_wait().expect("polling darkmux acp before SIGTERM").is_none(),
+            "darkmux acp must still be running before SIGTERM — an early exit here would prove \
+             nothing about signal handling"
+        );
+
+        let kill_status = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .expect("running kill -TERM");
+        assert!(kill_status.success(), "kill -TERM itself must succeed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let exit_status = loop {
+            if let Some(status) = child.try_wait().expect("polling darkmux acp after SIGTERM") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "darkmux acp did not exit within 5s of SIGTERM (#2476 review round 2 regression)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        if exit_status.code() == Some(130) {
+            return; // PASS — the documented signal-handling contract held.
+        }
+
+        // A signal-terminated exit (no code at all) with a SHORT wait
+        // behind it is exactly the "listener wasn't installed yet on a
+        // loaded box" outcome this retry loop exists to tolerate — but
+        // ONLY on the shortest attempt; a longer wait still landing here
+        // stops looking like scheduling noise. Any OTHER exit code (a
+        // real crash / clean-but-wrong exit) is never worth retrying —
+        // that is a genuine finding, reported immediately.
+        use std::io::Read;
+        let mut out = String::new();
+        let mut err = String::new();
+        let _ = child.stdout.take().unwrap().read_to_string(&mut out);
+        let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+        last_debug = format!(
+            "attempt {} (wait={wait_ms}ms): exit_status={exit_status:?} stdout={out:?} stderr={err:?}",
+            attempt + 1
+        );
+        if exit_status.code().is_some() {
+            panic!(
+                "darkmux acp exited with an unexpected but well-formed code (not a signal-\
+                 disposition race — not worth retrying): {last_debug}"
+            );
+        }
+    }
+
+    panic!(
+        "darkmux acp never reached its documented SIGTERM exit code (130) across {} attempts \
+         with growing pre-signal waits (up to {}ms) — this is no longer plausibly scheduling \
+         noise. Last attempt: {last_debug}",
+        WAITS_MS.len(),
+        WAITS_MS.last().unwrap()
+    );
+}
+
+/// True if `redis-server` is on PATH — `darkmux serve`'s fleet runner
+/// thread (the thing that actually gets a dispatch child registered for
+/// `serve_sigterm_reaps_the_fleet_runners_curl_child` below to reap) only
+/// activates with a real Redis to point it at. Mirrors
+/// `tests/e2e/harness.rs`'s own `redis_available` gate (that file's own
+/// doc explains why a missing dependency must not silently read as
+/// "passed" — this test opts into the SAME discipline, but stays inside
+/// `tests/cli.rs` rather than pulling in the full `FleetHarness` (a
+/// release-binary-building, multi-node harness built for a different
+/// scenario shape) for what only needs one daemon + one ephemeral redis.
+fn redis_available_for_serve_test() -> bool {
+    std::process::Command::new("redis-server")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Spawn a throwaway `redis-server` on an ephemeral port, isolated under
+/// `workdir` (no persistence — `--save ""`, `--appendonly no`). Returns
+/// the child (kill it when done — this test owns it, never signals it by
+/// pattern) and its `redis://` URL. Same shape as `tests/e2e/harness.rs`'s
+/// `spawn_redis`, kept local here rather than shared: this test needs
+/// only single-instance ephemeral Redis, not that harness's multi-node
+/// bookkeeping.
+fn spawn_ephemeral_redis(workdir: &std::path::Path) -> (std::process::Child, String) {
+    fs::create_dir_all(workdir).expect("creating redis workdir");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral redis port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener); // release for redis-server to bind
+
+    let child = std::process::Command::new("redis-server")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--save")
+        .arg("")
+        .arg("--appendonly")
+        .arg("no")
+        .arg("--dir")
+        .arg(workdir)
+        .arg("--bind")
+        .arg("127.0.0.1")
+        .arg("--protected-mode")
+        .arg("no")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning redis-server (is it on PATH? `brew install redis`)");
+
+    let url = format!("redis://127.0.0.1:{port}");
+    let client = redis::Client::open(url.as_str()).expect("redis::Client::open");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(mut conn) = client.get_connection() {
+            let ping: redis::RedisResult<String> = redis::cmd("PING").query(&mut conn);
+            if ping.as_deref() == Ok("PONG") {
+                break;
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "redis-server on {url} never became ready");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    (child, url)
+}
+
+/// Poll `GET /health` on `port` until it answers or `timeout` elapses —
+/// a real observable readiness signal for `darkmux serve`, not a fixed
+/// sleep.
+fn wait_for_serve_health(port: u16, timeout: std::time::Duration) {
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "darkmux serve on :{port} never became reachable");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// (#2476 review round 2, MUST FIX 4) `darkmux_serve::run()`'s own
+/// shutdown wiring — specifically the `reap_dispatch_children_on_
+/// shutdown()` call inside `run()`'s shutdown task — has NEVER been
+/// constructed by any test. `lib_tests.rs`'s own
+/// `reap_dispatch_children_on_shutdown_kills_a_real_registered_child`
+/// calls that function DIRECTLY (its own doc concedes "no OS signal
+/// needed HERE") — proving the function's own behavior, never that
+/// `run()` actually CALLS it on a real SIGTERM. Deleting the call site
+/// (`crates/darkmux-serve/src/lib.rs`'s `reap_dispatch_children_on_
+/// shutdown();` inside `run()`) leaves every existing `darkmux-serve`
+/// unit test green.
+///
+/// This spawns a real `darkmux serve` daemon pointed at a throwaway
+/// Redis + a `DARKMUX_PROFILES` registry naming a HANGING endpoint (the
+/// same `HangingStubServer` + `hanging_endpoint_profiles_json` fixture
+/// the SIGTERM-mid-dispatch tests above use — no model dispatch
+/// required), publishes one `WorkJob` for a tool-less role onto the
+/// fleet queue so the daemon's OWN fleet-runner thread claims it and
+/// blocks on a real `curl` to the hanging stub — a REAL in-flight
+/// dispatch child registered in `child_registry`, exactly the shape
+/// `reap_dispatch_children_on_shutdown`'s own doc describes — then sends
+/// a real SIGTERM and asserts: the daemon exits within a bound, and the
+/// `curl` child is torn down rather than orphaned past the parent's
+/// exit.
+///
+/// **Scope, stated honestly.** The hosted/curl path (a tool-less role,
+/// which this test uses) needs only `kill_all`'s SIGKILL to reap
+/// cleanly — `dispatch_internal.rs`'s hosted-call path has no extra
+/// post-wait cleanup step the way the DOCKER container path does (see
+/// `docker_kill_by_name`'s own call sites). So this test proves the
+/// production wiring is exercised and that a real curl child does not
+/// orphan past `darkmux serve`'s exit — it does NOT reach the
+/// container-specific race MUST FIX 3 also fixed (the `docker kill
+/// <container>` window), which needs Docker + the runtime image,
+/// unavailable in this test environment — the same documented
+/// limitation `mission_launch_generic_sigterm_mid_dispatch_finalizes_
+/// and_reaps_curl`'s own module comment names for crawl's container
+/// path, above.
+///
+/// RED-PROVED by hand: commenting out the `reap_dispatch_children_on_
+/// shutdown();` call inside `darkmux-serve/src/lib.rs`'s `run()` makes
+/// this test fail — the fleet-runner thread's `curl` child is never
+/// signaled, so it keeps running (holding the stub connection open)
+/// past the daemon's own exit, and `assert_no_surviving_remote_curl`
+/// catches the orphan.
+#[test]
+fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
+    if !redis_available_for_serve_test() {
+        eprintln!("skipping: redis-server not on PATH");
+        return;
+    }
+
+    let stub = HangingStubServer::start();
+    let (home, darkmux_home) = isolated_roots();
+    let redis_workdir = home.parent().unwrap().join("redis");
+    let (mut redis_child, redis_url) = spawn_ephemeral_redis(&redis_workdir);
+
+    let profiles_path = darkmux_home.join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+    let flows_dir = darkmux_home.join("flows");
+    fs::create_dir_all(&flows_dir).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral serve port");
+    let serve_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut serve_child = darkmux_std_cmd()
+        .env("HOME", &home)
+        .env("DARKMUX_HOME", &darkmux_home)
+        .env("DARKMUX_MACHINE_ID", "cli-test-serve-node")
+        .env("DARKMUX_REDIS_URL", &redis_url)
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_FLOWS_DIR", &flows_dir)
+        .args(["serve", "--bind", "127.0.0.1", "--port", &serve_port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux serve");
+    let serve_pid = serve_child.id();
+
+    wait_for_serve_health(serve_port, std::time::Duration::from_secs(15));
+
+    // Publish directly onto the same Redis the daemon's fleet-runner
+    // thread is polling — the runner claims it, converts it via
+    // `into_dispatch_opts`, and calls the SAME synchronous
+    // `crew::dispatch::dispatch` the CLI's own `dispatch` verb uses; a
+    // tool-less role routes that to the light single-shot HOSTED path (a
+    // plain host `curl`), which is what actually reaches the stub.
+    let redis_client = redis::Client::open(redis_url.as_str()).expect("redis::Client::open for publish");
+    let job = darkmux_fleet::WorkJob {
+        target_machine: None,
+        role_id: "dialectic-judge".to_string(),
+        message: "hang please".to_string(),
+        session_id: "cli-test-serve-sigterm-session".to_string(),
+        workdir: None,
+        phase_id: None,
+        image: None,
+        timeout_seconds: 60,
+        published_at_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        published_by_machine: None,
+        published_by_orchestrator: None,
+        attempt: 1,
+    };
+    darkmux_fleet::publish_job(&redis_client, &job).expect("publishing the WorkJob onto the fleet queue");
+
+    // A REAL observable readiness signal, not a fixed sleep: the runner
+    // thread has claimed the job and its dispatch's `curl` has actually
+    // reached the hanging stub.
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "the fleet runner never reached a dispatch call to the stub server within 20s — either \
+         it never claimed the published job, or dispatch never got as far as the curl call"
+    );
+
+    let kill_status = std::process::Command::new("kill")
+        .args(["-TERM", &serve_pid.to_string()])
+        .status()
+        .expect("running kill -TERM");
+    assert!(kill_status.success(), "kill -TERM itself must succeed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(status) = serve_child.try_wait().expect("polling darkmux serve after SIGTERM") {
+            eprintln!("darkmux serve exited with {status:?}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "darkmux serve did not exit within 15s of SIGTERM (#2476 review round 2 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(5)),
+        "no curl connection to the stub server was ever torn down — the fleet runner's dispatch \
+         child survived the daemon's own exit (#2476 review round 2 regression)"
+    );
+    assert_no_surviving_remote_curl(serve_pid, "serve");
+
+    let _ = redis_child.kill();
+    let _ = redis_child.wait();
+}
+
 // ─── #2131: the shared LaunchFinalizeGuard, ported to crawl + generic ─────
 //
 // (#2131, historical) When this proof was written, `src/crawl_launch.rs` was a

@@ -154,20 +154,62 @@
 //!   cleanup path; named here so a stop-button user isn't surprised by
 //!   drift accumulating in `mission status` or stray files under the
 //!   workspace.
-//! - (#2476 — RESOLVED) This file had NO OS signal handling at all — a
-//!   SIGINT/SIGTERM to `darkmux acp` itself (as opposed to an
-//!   ACP-protocol `session/cancel`, covered above) killed the process by
-//!   default disposition and orphaned whatever curl/subprocess child was
-//!   in flight. `run()` now spawns [`host_shutdown_reap_loop`], which
-//!   waits on `tokio::signal` (NOT `launch_guard::arm()`/raw
-//!   `libc::signal()` — see [`wait_for_host_shutdown_signal`]'s own doc
-//!   for why that would be the wrong tool for a long-lived host) and, on
-//!   a real signal, reaps every registered dispatch child
-//!   (`darkmux_types::child_registry::kill_all`) before exiting. The
-//!   `mission launch` subprocess [`run_launch_command`] spawns is
-//!   registered the same way via [`spawn_registered`], closing the one
-//!   child this file spawns directly that `child_registry` didn't already
-//!   cover through `darkmux-crew`'s own dispatch machinery.
+//! - (#2476 — RESOLVED, revised in review round 2) This file had NO OS
+//!   signal handling at all — a SIGINT/SIGTERM to `darkmux acp` itself (as
+//!   opposed to an ACP-protocol `session/cancel`, covered above) killed
+//!   the process by default disposition and orphaned whatever
+//!   curl/subprocess child was in flight. `run()` now spawns
+//!   [`host_shutdown_reap_loop`], which waits on `tokio::signal` (NOT
+//!   `launch_guard::arm()`/raw `libc::signal()` — see
+//!   [`wait_for_host_shutdown_signal_ready`]'s own doc for why that would be
+//!   the wrong tool for a long-lived host) and, on a real signal, runs
+//!   [`reap_on_host_shutdown`] before exiting. The `mission launch`
+//!   subprocess [`run_launch_command`] spawns is registered via
+//!   [`spawn_registered`] — the RAII guard [`SpawnedLaunchChild`] that
+//!   function uses closes the one child this file spawns directly that
+//!   `child_registry` didn't already cover through `darkmux-crew`'s own
+//!   dispatch machinery, and — unlike the plain register/deregister pair
+//!   the first cut of this fix used — deregisters correctly even when
+//!   `session/cancel`/`session/close` abort the awaiting task mid-wait
+//!   (an `AbortHandle::abort()` drops the future AT its suspended await
+//!   point, skipping any deregister statement placed AFTER it; RAII
+//!   `Drop` runs regardless). `reap_on_host_shutdown` does NOT reach the
+//!   `mission launch` child with the same blanket SIGKILL it sends every
+//!   other registered dispatch child: that subprocess holds its own
+//!   `LaunchFinalizeGuard` and its own registered docker/curl
+//!   grandchildren (unreachable from this process's registry), so
+//!   SIGKILLing it races the finalize and orphans those grandchildren —
+//!   #2476's own failure, one process down. It gets `radio_cli.rs`'s
+//!   `forward_signal_and_wait` treatment instead: SIGTERM, a bounded
+//!   wait ([`LAUNCH_CHILD_SHUTDOWN_GRACE`]), and — if it hasn't finished —
+//!   left running rather than forced, exactly as that module's own doc
+//!   explains for why a force-kill there was measured to make things
+//!   worse, not better.
+//!
+//!   **What "RESOLVED" above does NOT cover (review round 2, CONSIDER
+//!   6) — named explicitly rather than left implicit.** This entry only
+//!   ever closed the SIGNAL gap. Three other ways this process's
+//!   `run()` future can end are still uncovered by
+//!   [`reap_on_host_shutdown`]/[`spawn_registered`]'s RAII guard, and a
+//!   `mission launch` child in flight when any of them fires gets no
+//!   grace at all — its `Child` simply drops, and `kill_on_drop(true)`
+//!   sends it a bare SIGKILL:
+//!   1. **`serve()` returning on client EOF** (the editor quits) —
+//!      plausibly the single MOST common way this process ends in
+//!      practice, and the one this doc previously left unnamed. No
+//!      reap, no `mark_interrupted`, no grace.
+//!   2. **`idle_self_exit_loop`'s process-level backstop** (#1698 Packet
+//!      B2 scope G2, #1781) — the same SIGKILL-on-drop applies; the
+//!      backstop's own `in_flight` count does not track the detached
+//!      ephemeral-join task from the #1777 fix above, so it is not even
+//!      a perfect proxy for "nothing is running."
+//!   3. **A task panic** unwinding past the point where a `Child` is
+//!      held.
+//!
+//!   Closing these needs a completion-independent cleanup path (the
+//!   SAME gap this doc's #1684-remainder entry above already names for
+//!   `kill_on_drop`'s SIGKILL having no finalize step), not more signal
+//!   handling — tracked as follow-up, not forced into this fix's scope.
 //! - The `case_id` passed to the review mission is derived from the diff's
 //!   content hash + the cwd's directory name (see [`derive_case_id`]) —
 //!   deterministic (no `Date`/random per the task brief) but not
@@ -726,18 +768,95 @@ pub fn run() -> Result<i32> {
     rt.block_on(async {
         // (#2476) Reap-on-signal for the whole long-lived host — see
         // `host_shutdown_reap_loop`'s own doc for why this exits the
-        // process rather than continuing to serve.
-        tokio::spawn(host_shutdown_reap_loop(|| {
-            eprintln!(
-                "[darkmux-acp] shutdown signal received — reaping in-flight dispatch children"
-            );
-            darkmux_types::interrupt::mark_interrupted();
-            darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
-            std::process::exit(130);
-        }));
+        // process rather than continuing to serve, and
+        // `reap_on_host_shutdown`'s own doc (#2476 review round 2, MUST
+        // FIX 2) for why it treats `mission launch` children differently
+        // from every other registered dispatch child.
+        tokio::spawn(host_shutdown_reap_loop(reap_on_host_shutdown));
         serve(router, AnsweringSeat { call: answerer, scope }, Arc::new(IdleState::new()), AcpStdio::new()).await
     })?;
     Ok(0)
+}
+
+/// (#2476 review round 2, MUST FIX 2) How long [`reap_on_host_shutdown`]
+/// waits after forwarding SIGTERM to a still-running `mission launch`
+/// child before it gives up watching it and proceeds to exit — mirrors
+/// `radio_cli.rs`'s `FORWARD_SIGNAL_GRACE` and the same measured
+/// reasoning: the child's `LaunchFinalizeGuard` write is `fsync`-bound,
+/// not a fixed small cost, so no fixed number makes a force kill safe
+/// (see `forward_signal_and_wait`'s own doc). This bounds only how long
+/// THIS process stays alive watching before it exits anyway — never a
+/// kill budget.
+const LAUNCH_CHILD_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// (#2476 review round 2, MUST FIX 2) The production reap-on-signal
+/// action [`run`] hands to [`host_shutdown_reap_loop`]. Split out (rather
+/// than inlined in the closure, as before this fix) so its own doc has
+/// somewhere to live.
+///
+/// **Why `mission launch` children get gentler treatment than every
+/// other registered dispatch child.** SIGKILLing a `mission launch`
+/// subprocess races its own `LaunchFinalizeGuard` (`launch_guard.rs`),
+/// leaves the mission permanently `active` with no terminal record
+/// (violating the dispatch-liveness contract every other signal-aware
+/// launcher in this codebase honors), and orphans that child's OWN
+/// registered docker/curl grandchildren — this process's registry
+/// cannot reach them, because they live in the CHILD's own registry
+/// entries, reaped only by ITS OWN signal handling, not this one. That is
+/// #2476's own failure, one process down.
+///
+/// The fix mirrors `radio_cli.rs`'s `forward_signal_and_wait`: forward
+/// SIGTERM to each registered launch child, wait — bounded — for it to
+/// finalize on its own, and never escalate to SIGKILL if it doesn't
+/// (`radio_cli.rs`'s own doc: "an earlier cut escalated to SIGKILL here
+/// and was measured destroying a real finalize under ordinary machine
+/// load"). Every OTHER registered child (the router/answerer curl
+/// dispatches) holds no such state, so the blanket `kill_all_except`
+/// sweep below is still the right tool for them — this function only
+/// carves the launch children OUT of that sweep; it does not spare them
+/// from being signaled at all, only from being FORCED.
+fn reap_on_host_shutdown() {
+    eprintln!("[darkmux-acp] shutdown signal received — reaping in-flight dispatch children");
+    darkmux_types::interrupt::mark_interrupted();
+
+    let launch_pids: std::collections::BTreeSet<u32> =
+        LAUNCH_CHILDREN.lock().map(|s| s.clone()).unwrap_or_default();
+    for pid in &launch_pids {
+        if let Err(e) = darkmux_types::child_registry::kill_pid(*pid, darkmux_types::child_registry::SIGTERM) {
+            if e.raw_os_error() != Some(darkmux_types::child_registry::ESRCH) {
+                eprintln!(
+                    "[darkmux-acp] could not forward the shutdown signal to `mission launch` (pid {pid}): {e}"
+                );
+            }
+        }
+    }
+    if !launch_pids.is_empty() {
+        let deadline = std::time::Instant::now() + LAUNCH_CHILD_SHUTDOWN_GRACE;
+        loop {
+            // (#2476 review round 2) `kill(pid, 0)` — the standard POSIX
+            // existence probe, not a real signal — is what "still alive"
+            // means here; `kill_pid` validates only the pid shape, not the
+            // signal value, so passing `0` through it is safe.
+            let still_alive =
+                launch_pids.iter().any(|pid| darkmux_types::child_registry::kill_pid(*pid, 0).is_ok());
+            if !still_alive {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "[darkmux-acp] `mission launch` (pid(s) {launch_pids:?}) still finishing after {}s \
+                     — exiting now without forcing it down; `darkmux mission status` shows whether it \
+                     finalized, `darkmux mission abort <id>` closes it if not.",
+                    LAUNCH_CHILD_SHUTDOWN_GRACE.as_secs()
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    darkmux_types::child_registry::kill_all_except(darkmux_types::child_registry::SIGKILL, &launch_pids);
+    std::process::exit(130);
 }
 
 /// `transport` is generic (#1698 Packet B test infrastructure) — production
@@ -2004,36 +2123,81 @@ fn loaded_config(config_id: &str) -> Result<crate::crew::mission_config::Mission
         .with_context(|| format!("loading mission config \"{config_id}\""))
 }
 
-/// (#2476) Spawn `cmd`, registering its pid in `darkmux_types::
-/// child_registry` for the span between spawn and the wait resolving —
-/// the SAME "register before the blocking wait" convention
-/// `dispatch_internal.rs`'s `PidRegistration` established for the
-/// synchronous docker/curl children `crew::dispatch` spawns (see that
-/// struct's own doc). [`run_launch_command`]'s `mission launch`
-/// subprocess already had `.kill_on_drop(true)` for ACP-level
-/// `session/cancel` aborts (dropping the awaiting task drops the
-/// `Child`), but an OS SIGINT/SIGTERM to `darkmux acp` ITSELF never
-/// reached that `Drop` at all before this fix — an unhandled signal tore
-/// the whole process down before any Rust destructor could run, orphaning
-/// this subprocess. Registering here is what lets this file's own host
-/// shutdown handling ([`host_shutdown_reap_loop`], below) reach it
-/// through the exact same `child_registry::kill_all` every other
-/// signal-aware dispatch path in this codebase already uses — the router
-/// and answerer curl dispatches need no equivalent change: they already
-/// register through `darkmux-crew`'s own `remote_chat_attempt`/
+/// (#2476 review round 2, MUST FIX 2) The pids of every currently-live
+/// [`spawn_registered`] child — a SUBSET of `darkmux_types::
+/// child_registry`'s own process-wide set, used only to single those
+/// pids out for the gentler shutdown treatment [`run`]'s production
+/// closure gives them (SIGTERM + a bounded wait, never the blanket
+/// SIGKILL `child_registry::kill_all` sends everything else) — see
+/// [`SpawnedLaunchChild`]'s and that closure's own docs for why.
+static LAUNCH_CHILDREN: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// (#2476 review round 2, MUST FIX 1 + MUST FIX 2) RAII guard for one
+/// [`spawn_registered`] child pid — registers it in BOTH the
+/// process-wide `child_registry` (so [`host_shutdown_reap_loop`]'s reap
+/// sweep can reach it at all) and this file's own [`LAUNCH_CHILDREN`]
+/// (so that sweep's production closure can single it out for a graceful
+/// SIGTERM-then-wait instead of the blanket SIGKILL every OTHER
+/// registered dispatch child gets — see that closure's own doc). `Drop`
+/// deregisters BOTH unconditionally, mirroring `dispatch_internal.rs`'s
+/// `PidRegistration` — the SAME convention this function's doc already
+/// claimed to follow, except the ORIGINAL `spawn_registered` only
+/// deregistered via a plain statement placed AFTER the awaited
+/// `wait_with_output()`, which `session/cancel`'s and `session/close`'s
+/// `handle.abort()` never reach: `Handle::abort()` drops the awaited
+/// future AT its suspended await point, skipping every statement after
+/// it, so a CANCELLED launch left its pid registered forever in a
+/// process-wide set while the underlying OS process (reaped by
+/// `kill_on_drop`) was already gone and its pid free for the kernel to
+/// recycle onto an unrelated process — exactly the hazard `child_registry
+/// ::kill_pid`'s own doc warns a caller about. RAII closes that: `Drop`
+/// runs on every exit path, abort included, the same guarantee
+/// `PidRegistration` gives `dispatch_internal.rs`'s docker/curl children.
+struct SpawnedLaunchChild(u32);
+
+impl SpawnedLaunchChild {
+    fn new(pid: u32) -> Self {
+        darkmux_types::child_registry::register(pid);
+        if let Ok(mut set) = LAUNCH_CHILDREN.lock() {
+            set.insert(pid);
+        }
+        Self(pid)
+    }
+}
+
+impl Drop for SpawnedLaunchChild {
+    fn drop(&mut self) {
+        darkmux_types::child_registry::deregister(self.0);
+        if let Ok(mut set) = LAUNCH_CHILDREN.lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// (#2476) Spawn `cmd`, registering its pid (via [`SpawnedLaunchChild`])
+/// for the span between spawn and the wait resolving — the SAME
+/// "register before the blocking wait" convention `dispatch_internal.rs`'s
+/// `PidRegistration` established for the synchronous docker/curl children
+/// `crew::dispatch` spawns (see that struct's own doc, and
+/// `SpawnedLaunchChild`'s doc for why THIS function now uses an RAII
+/// guard too rather than a plain register/deregister pair).
+/// [`run_launch_command`]'s `mission launch` subprocess already had
+/// `.kill_on_drop(true)` for ACP-level `session/cancel` aborts (dropping
+/// the awaiting task drops the `Child`), but an OS SIGINT/SIGTERM to
+/// `darkmux acp` ITSELF never reached that `Drop` at all before this fix —
+/// an unhandled signal tore the whole process down before any Rust
+/// destructor could run, orphaning this subprocess. Registering here is
+/// what lets this file's own host shutdown handling
+/// ([`host_shutdown_reap_loop`], below) reach it — the router and answerer
+/// curl dispatches need no equivalent change: they already register
+/// through `darkmux-crew`'s own `remote_chat_attempt`/
 /// `dispatch_local_single_shot`, shared, unmodified code this file
 /// already calls.
 async fn spawn_registered(mut cmd: Command) -> std::io::Result<std::process::Output> {
     let child = cmd.spawn()?;
     let pid = child.id();
-    if let Some(pid) = pid {
-        darkmux_types::child_registry::register(pid);
-    }
-    let result = child.wait_with_output().await;
-    if let Some(pid) = pid {
-        darkmux_types::child_registry::deregister(pid);
-    }
-    result
+    let _guard = pid.map(SpawnedLaunchChild::new);
+    child.wait_with_output().await
 }
 
 /// (#2476) Wait for SIGINT or SIGTERM — mirrors `darkmux-serve`'s own
@@ -2054,16 +2218,38 @@ async fn spawn_registered(mut cmd: Command) -> std::io::Result<std::process::Out
 /// same primitive `darkmux serve` already uses successfully, avoids that
 /// interaction entirely. See `darkmux_types::interrupt::mark_interrupted`'s
 /// own doc for the fuller version of this reasoning.
-async fn wait_for_host_shutdown_signal() {
+///
+/// **The `ready` parameter (#2476 review round 2, CONSIDER 7).** `None`
+/// in every production call ([`host_shutdown_reap_loop_ready`], which
+/// [`host_shutdown_reap_loop`] delegates to with `None`) — when `Some`,
+/// it fires the instant the unix `SIGTERM` listener is installed, BEFORE
+/// this function ever awaits a signal on it. Two tests below self-signal
+/// (`kill -TERM` their OWN process) right after spawning a task that
+/// waits on this function; without a latch they would bet a fixed sleep
+/// is long enough for `tokio::signal`'s listener to have actually
+/// registered first. On a loaded box that bet can lose: an unregistered
+/// `SIGTERM` takes default disposition, which does not just fail the one
+/// test — it kills the WHOLE test BINARY outright. The latch removes the
+/// bet, and changes nothing about the control flow production sees.
+async fn wait_for_host_shutdown_signal_ready(ready: Option<tokio::sync::oneshot::Sender<()>>) {
     #[cfg(unix)]
     let term = async {
         use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut sig) = signal(SignalKind::terminate()) {
+        let sig = signal(SignalKind::terminate());
+        if let Some(tx) = ready {
+            let _ = tx.send(()); // best-effort — a dropped receiver means the test stopped watching, not a bug here.
+        }
+        if let Ok(mut sig) = sig {
             sig.recv().await;
         }
     };
     #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
+    let term = async {
+        if let Some(tx) = ready {
+            let _ = tx.send(());
+        }
+        std::future::pending::<()>().await
+    };
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
@@ -2075,10 +2261,13 @@ async fn wait_for_host_shutdown_signal() {
 /// split out so a test can inject a callback that does NOT call
 /// `std::process::exit` and still prove the wiring against a REAL
 /// delivered signal without killing the test binary. Production
-/// ([`run`]) passes a closure that reaps every currently-registered
-/// dispatch child (this file's `mission launch` subprocess via
-/// [`spawn_registered`]; `darkmux-crew`'s own curl/docker children,
-/// registered independently of this file) and force-exits — see this
+/// ([`run`]) passes [`reap_on_host_shutdown`], which SIGKILLs every
+/// registered dispatch child EXCEPT any `mission launch` child (this
+/// file's own via [`spawn_registered`]; `darkmux-crew`'s own curl/docker
+/// children, registered independently of this file, get no such
+/// exception) — see `reap_on_host_shutdown`'s own doc (#2476 review
+/// round 2, MUST FIX 2) for why the launch child is deliberately
+/// carved out rather than reached by the same blanket sweep. See this
 /// module's own doc for why `darkmux acp` needed this at all: before
 /// this fix, a SIGTERM mid-dispatch killed the process outright (default
 /// disposition, no handler installed anywhere in this file) and orphaned
@@ -2097,7 +2286,18 @@ async fn wait_for_host_shutdown_signal() {
 /// path already treats it — so `is_set()`'s never-reset contract costs
 /// nothing here, and no scoped/resettable variant needed to be built.
 async fn host_shutdown_reap_loop(on_signal: impl FnOnce() + Send + 'static) {
-    wait_for_host_shutdown_signal().await;
+    host_shutdown_reap_loop_ready(on_signal, None).await
+}
+
+/// (#2476 review round 2, CONSIDER 7) Same as [`host_shutdown_reap_loop`],
+/// threading an optional readiness latch through to
+/// [`wait_for_host_shutdown_signal_ready`] — see that function's own doc.
+/// Production ([`host_shutdown_reap_loop`], above) always passes `None`.
+async fn host_shutdown_reap_loop_ready(
+    on_signal: impl FnOnce() + Send + 'static,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    wait_for_host_shutdown_signal_ready(ready).await;
     on_signal();
 }
 
@@ -3845,21 +4045,85 @@ mod tests {
         darkmux_types::child_registry::reset_for_test();
     }
 
-    /// (#2476) `wait_for_host_shutdown_signal` must react to a REAL
-    /// SIGTERM, not a structural assertion — sends this test's OWN
-    /// process a real `kill -TERM`, the same technique `launch_guard.rs`'s
-    /// own `arm_installs_real_sigterm_and_sighup_handlers` test uses to
-    /// prove ITS handler actually fires, and asserts the future resolves
-    /// within a bound rather than hanging.
+    /// (#2476 review round 2, MUST FIX 1) `session/cancel`'s and
+    /// `session/close`'s abort path drops `run_launch_command`'s awaited
+    /// future AT its suspended `.await` inside `spawn_registered` — the
+    /// ORIGINAL `spawn_registered` deregistered via a plain statement
+    /// placed AFTER that await, which an abort never reaches, leaking the
+    /// pid in a process-wide registry forever (the pid becomes recyclable
+    /// the moment `kill_on_drop` reaps the underlying process, per
+    /// `child_registry::kill_pid`'s own doc — a long-lived host signaling
+    /// that stale entry later could hit an unrelated process). This
+    /// proves the RAII fix directly: abort a task mid-`spawn_registered`
+    /// the SAME way `handle.abort()` does at both real call sites
+    /// (`session/cancel`, `session/close`), and show the pid is gone from
+    /// `LAUNCH_CHILDREN` afterward — the bookkeeping cleaned up, not just
+    /// the OS process (that half is `kill_on_drop`, already proven by
+    /// `cancelling_a_task_holding_a_child_actually_kills_the_os_process`,
+    /// above).
+    ///
+    /// RED-proved by hand: reverting `spawn_registered` to the pre-fix
+    /// plain register/deregister pair (deregister placed after the
+    /// awaited `wait_with_output()`, as it read before this fix) makes
+    /// this test fail — the pid stays in `LAUNCH_CHILDREN` after the
+    /// abort, since the statement that would have removed it is never
+    /// reached.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_registered_deregisters_on_cancel_abort_not_just_on_completion() {
+        darkmux_types::child_registry::reset_for_test();
+        LAUNCH_CHILDREN.lock().unwrap().clear();
+
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd.kill_on_drop(true);
+
+        let handle = tokio::spawn(spawn_registered(cmd));
+        // Let the task actually reach `cmd.spawn()` (and register) before
+        // aborting it — otherwise this could abort a task that never got
+        // that far, proving nothing about the fix.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !LAUNCH_CHILDREN.lock().unwrap().is_empty(),
+            "the spawned child must have registered before this test aborts its task"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            LAUNCH_CHILDREN.lock().unwrap().is_empty(),
+            "an aborted spawn_registered task must deregister its pid via Drop — a plain \
+             register/deregister pair (deregister placed after the awaited wait) never \
+             reaches that statement when the future is dropped mid-await, leaking the pid"
+        );
+
+        darkmux_types::child_registry::reset_for_test();
+    }
+
+    /// (#2476, ready-latch added in review round 2 — CONSIDER 7)
+    /// `wait_for_host_shutdown_signal_ready` must react to a REAL
+    /// SIGTERM, not a structural assertion — sends this test's OWN process a real
+    /// `kill -TERM`, the same technique `launch_guard.rs`'s own
+    /// `arm_installs_real_sigterm_and_sighup_handlers` test uses to prove
+    /// ITS handler actually fires, and asserts the future resolves within
+    /// a bound rather than hanging.
+    ///
+    /// Waits on [`wait_for_host_shutdown_signal_ready`]'s readiness latch
+    /// rather than a fixed sleep before sending the signal — a sleep bets
+    /// the listener registered in time; on a loaded box that bet can
+    /// lose, and an unregistered `SIGTERM` takes default disposition,
+    /// which kills the whole test BINARY, not just this test.
     #[tokio::test]
     #[serial_test::serial]
     async fn wait_for_host_shutdown_signal_resolves_on_a_real_sigterm() {
         let pid = std::process::id().to_string();
-        let wait = tokio::spawn(wait_for_host_shutdown_signal());
-        // Give the spawned task a chance to actually install its listener
-        // before the signal is sent — an unregistered listener observes
-        // nothing, real signal or not.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let wait = tokio::spawn(wait_for_host_shutdown_signal_ready(Some(ready_tx)));
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+            .await
+            .expect("the SIGTERM listener did not report ready within 5s")
+            .expect("the ready sender was dropped without firing");
 
         assert!(
             std::process::Command::new("kill").args(["-TERM", &pid]).status().expect("running kill -TERM").success(),
@@ -3868,7 +4132,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(5), wait)
             .await
-            .expect("wait_for_host_shutdown_signal did not resolve within 5s of a real SIGTERM")
+            .expect("wait_for_host_shutdown_signal_ready did not resolve within 5s of a real SIGTERM")
             .expect("joining the wait task");
     }
 
@@ -3892,11 +4156,22 @@ mod tests {
     async fn host_shutdown_reap_loop_calls_on_signal_only_after_a_real_signal() {
         let called = Arc::new(AtomicBool::new(false));
         let called_for_closure = called.clone();
-        let handle = tokio::spawn(host_shutdown_reap_loop(move || {
-            called_for_closure.store(true, AtomicOrdering::SeqCst);
-        }));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(host_shutdown_reap_loop_ready(
+            move || {
+                called_for_closure.store(true, AtomicOrdering::SeqCst);
+            },
+            Some(ready_tx),
+        ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // (#2476 review round 2, CONSIDER 7) A latch, not a fixed sleep —
+        // see `wait_for_host_shutdown_signal_ready`'s own doc for why an
+        // unregistered listener is a whole-binary hazard, not just a
+        // flaky assertion.
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+            .await
+            .expect("the SIGTERM listener did not report ready within 5s")
+            .expect("the ready sender was dropped without firing");
         assert!(!called.load(AtomicOrdering::SeqCst), "on_signal must not fire before any signal arrives");
 
         let pid = std::process::id().to_string();

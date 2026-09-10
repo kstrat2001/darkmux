@@ -1149,13 +1149,25 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
 
         tokio::spawn(async move {
             shutdown_signal().await;
-            let _ = shutdown_tx.send(true);
             host_sampler_stop.store(true, Ordering::SeqCst);
-            // (#2476) Reap the fleet runner's in-flight dispatch child
-            // BEFORE the grace-window force-exit below — see
+            // (#2476, reordered in review round 2 — MUST FIX 3) Reap the
+            // fleet runner's in-flight dispatch child, and give it a
+            // bounded window to reach quiescence, BEFORE telling axum to
+            // start its own connection drain — see
             // `reap_dispatch_children_on_shutdown`'s own doc for why this
-            // is more than `kill_all` alone.
+            // is more than `kill_all` alone. The OLD ordering here
+            // (`shutdown_tx.send(true)` FIRST, reap after) let an idle
+            // daemon's near-instant axum drain — nothing gates it on this
+            // reap, since it watches `shutdown_rx_axum` directly — race
+            // ahead of the SEPARATE, unjoined runner `std::thread`'s
+            // post-wait `docker kill` check and let this whole async
+            // block (and therefore `run()`, and therefore the process)
+            // return before that check ever ran. Reaping first removes
+            // the race outright: by the time axum is told to drain, the
+            // reap (with its own bounded quiesce wait) has already
+            // finished.
             reap_dispatch_children_on_shutdown();
+            let _ = shutdown_tx.send(true);
             eprintln!(
                 "\ndarkmux serve: shutdown signal received, {SHUTDOWN_GRACE_SECS}s grace for in-flight connections"
             );
@@ -4856,9 +4868,74 @@ fn redis_value_as_str(v: &redis::Value) -> Option<&str> {
 /// this process within `SHUTDOWN_GRACE_SECS` regardless — so "never
 /// resets" costs nothing here: there is no later dispatch in this process
 /// that needs the flag to go back to false.
+///
+/// **The bounded wait at the end (#2476 review round 2, MUST FIX 3).**
+/// `kill_all` unblocks the runner thread's `wait_with_output()`
+/// synchronously, but the actual `docker kill <container>` call this
+/// function's own doc describes above runs AFTER that unblock, on the
+/// SEPARATE, unjoined runner `std::thread` — nothing here waits for it.
+/// Before this fix, this function returned immediately, and the caller
+/// (`run()`, above) told axum to start draining connections right after,
+/// with no relationship between "the runner thread has reacted" and "the
+/// process is now free to exit." On an idle daemon (no open HTTP
+/// connections — precisely the case a headless hub sits in) axum's own
+/// drain is a single poll, so `run()`'s whole future could complete, and
+/// the process exit, before the runner thread's `docker kill` had even
+/// been dispatched, let alone completed — measured structurally: the
+/// runner thread's post-`kill_all` work is a docker round-trip (10-20ms),
+/// the exit path after `kill_all` is sub-millisecond. This poll gives
+/// that thread a real window, bounded so a genuinely wedged runner can't
+/// hang shutdown past its own budget — the bulk of `SHUTDOWN_GRACE_SECS`
+/// (3s total) is left for the eprintln'd grace window + axum's own
+/// connection drain that follow this call, not consumed here.
 pub(crate) fn reap_dispatch_children_on_shutdown() {
     darkmux_types::interrupt::mark_interrupted();
     darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+    wait_for_runner_quiescence(RUNNER_QUIESCE_TIMEOUT);
+}
+
+/// (#2476 review round 2, MUST FIX 3) Bounded budget for the fleet
+/// runner thread to reach quiescence (finish `dispatch_internal.rs`'s
+/// own post-wait `docker kill <container>` check, if one was needed)
+/// after `kill_all` above unblocks its synchronous `wait_with_output()`.
+/// Deliberately a fraction of `SHUTDOWN_GRACE_SECS` (3s total) — this
+/// wait runs BEFORE axum is even told to start draining, so it directly
+/// extends how long an operator's `Ctrl-C` takes to return control even
+/// on a genuinely idle daemon; the docker round-trip itself measures
+/// 10-20ms, so 1.5s is generous headroom, not a bet on a slow call.
+///
+/// **What this does NOT cover (review round 2, CONSIDER 6).** The
+/// `SHUTDOWN_GRACE_SECS` force-exit watchdog path, below — a background
+/// thread wedged past the whole grace window forces `std::process::exit
+/// (0)` regardless of whether this quiesce wait (or the reap it follows)
+/// ever completed. That path is exercised only by a genuinely stuck
+/// background thread, which this fix does not attempt to reproduce;
+/// named here rather than left implicit.
+const RUNNER_QUIESCE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Poll `darkmux_fleet::dispatch_in_flight()` until it reports quiescent
+/// or `timeout` elapses — see `reap_dispatch_children_on_shutdown`'s own
+/// doc for why this exists. Runs on the calling tokio worker thread via
+/// blocking sleeps; acceptable here because this is a one-shot,
+/// bounded-length shutdown action rather than a hot path (same reasoning
+/// as the force-exit watchdog's own `std::thread::sleep`, a few lines
+/// below this function's only caller).
+fn wait_for_runner_quiescence(timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while darkmux_fleet::dispatch_in_flight() {
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "{}",
+                darkmux_types::style::warn(
+                    "darkmux serve: the fleet runner's dispatch did not quiesce within the \
+                     shutdown window — its container (if any) may still be `Up`; `docker ps` \
+                     after this process exits will confirm."
+                )
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Wait for SIGINT or SIGTERM to trigger graceful shutdown. SIGTERM
