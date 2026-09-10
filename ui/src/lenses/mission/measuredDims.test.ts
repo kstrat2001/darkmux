@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Node, NodeChange } from "reactflow";
-import { recordDimensions, withMeasuredDimensions } from "./measuredDims";
+import { clampCanvasHeight, recordDimensions, withMeasuredDimensions } from "./measuredDims";
 
 const dimChange = (id: string, width: number, height: number): NodeChange => ({
   id,
@@ -85,5 +85,46 @@ describe("withMeasuredDimensions", () => {
       ["b", 320, 88],
       ["c", undefined, undefined],
     ]);
+  });
+});
+
+describe("clampCanvasHeight", () => {
+  it("with no floor supplied, uses the real available space even when it is small — the #2520 round-1 shape", () => {
+    // #2520's own measurement: an 844×390 landscape phone leaves ~103px
+    // above the fixed phone drawer. Round 1 dropped the old flat `240`
+    // floor entirely (no `floor` argument at all) so this returns
+    // `available` untouched — which is exactly what made the #2618
+    // regression possible: nothing here shrinks a too-small pane, but
+    // nothing keeps it legible either. That is now the CALLER's job (see
+    // `MissionCanvas.tsx`'s own doc on where `floor` comes from).
+    expect(clampCanvasHeight(103.3125)).toBeCloseTo(103.3125);
+  });
+
+  it("still returns a valid positive length when available space is exhausted", () => {
+    expect(clampCanvasHeight(0)).toBeGreaterThan(0);
+    expect(clampCanvasHeight(-40)).toBeGreaterThan(0);
+  });
+
+  it("passes through generous desktop/portrait-phone room untouched", () => {
+    expect(clampCanvasHeight(560)).toBe(560);
+  });
+
+  it("(#2618) prefers a caller-supplied floor over a smaller available space", () => {
+    // The landscape-phone case this function's second parameter exists for:
+    // ~103px available, but the container already reserves 480px via CSS
+    // (`.missionlens .body`'s `min-height`) — the canvas should fill that
+    // reserved room rather than shrink to the sliver visible without
+    // scrolling.
+    expect(clampCanvasHeight(103.3125, 480)).toBe(480);
+  });
+
+  it("(#2618) never shrinks below available space just because the floor is smaller", () => {
+    // Portrait/desktop: plenty of room, well above any legible-content
+    // floor — the floor must be a MINIMUM, not a ceiling.
+    expect(clampCanvasHeight(560, 480)).toBe(560);
+  });
+
+  it("(#2618) still enforces the tiny MIN_VALID_CANVAS_PX safety floor even below a zero floor", () => {
+    expect(clampCanvasHeight(-40, 0)).toBeGreaterThan(0);
   });
 });
