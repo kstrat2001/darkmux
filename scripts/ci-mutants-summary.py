@@ -94,6 +94,31 @@ job was written advisory in the first place.
 
 What GATES is tool integrity: the tool did not run, or it ran and reported
 numbers we cannot reconcile. That distinction is the whole of #1716.
+
+## A fourth false-green shape: a cancelled run reading as silence (#2550)
+
+A large diff can outrun `mutants-in-diff`'s job-level `timeout-minutes`
+budget while a mutation invocation is mid-run. `cargo mutants` never gets to
+write its exit code, and — before this fix — the "Report survivors" step for
+that invocation was gated on `if: ${{ !cancelled() }}`, which GitHub Actions
+evaluates to FALSE once the job itself is cancelled. The step never ran at
+all, so that scope's whole section of the PR summary was simply ABSENT.
+Advisory-plus-cancelled then read, on the PR page, almost identically to
+advisory-plus-clean: nothing distinguished "we looked and found nothing" from
+"we never finished looking" — the same lie #1716 closed for a swallowed exit
+code, wearing a new cause.
+
+The fix has two halves, one in each file. Here: `CANCELLED_SENTINEL`, a
+sentinel exit code that shares `main()`'s existing "DID NOT RUN" branch but
+gets its own loud CANCELLED wording and its own attempt to recover partial
+progress from whatever `.txt` files cargo-mutants had already written before
+the cutoff — reached via `__main__`'s `--job-status` flag, which distinguishes
+"the job was cancelled" (this case) from every other reason `exit_code` can
+arrive empty. In `quality.yml`: the Report steps moved from `!cancelled()` to
+`always()`, so they get their chance in the ~5-minute cancellation grace
+window GitHub grants `always()`-conditioned steps — while the Mutate steps
+stay on `!cancelled()`, deliberately, so a new multi-minute mutation run
+never STARTS once cancellation is already underway.
 """
 import json
 import os
@@ -123,6 +148,29 @@ OK_CODES = {0, 2, 3}
 # "unrecognized JSON shape" fixture cannot accidentally agree with it.
 TOTALS_KEYS = ("total_mutants", "missed", "caught", "timeout", "unviable")
 
+# (#2550) A sentinel for "cargo-mutants never reported an exit code at all,
+# because the JOB was cancelled — almost certainly `quality.yml`'s own
+# `timeout-minutes` budget running out while this invocation was still
+# running (a manual cancel or a superseding `concurrency` push can also
+# cause this)". Never a real cargo-mutants exit code, so it is never in
+# `OK_CODES` and shares `main()`'s existing "DID NOT RUN" branch — but it
+# gets its OWN wording (CANCELLED, not just "DID NOT RUN") and its own
+# attempt to recover partial progress from whatever `missed.txt`/`caught.txt`
+# cargo-mutants had already written before the cutoff. See `__main__`'s
+# `--job-status` handling for how a bare, unset `exit_code` argument becomes
+# this sentinel instead of the older generic "exit_code is empty" message.
+#
+# This is the fix for the actual failure mode #2550 reports: a step gated on
+# `if: ${{ !cancelled() }}` is SKIPPED OUTRIGHT once the job is cancelled —
+# not merely "runs with an empty exit_code" — so on a large diff that times
+# out mid-mutation, the old `!cancelled()`-gated "Report survivors" step
+# never ran at all, and the PR's job summary had NOTHING for that scope:
+# indistinguishable, on the PR page, from a clean sweep. `quality.yml`'s
+# Report steps now use `always()` instead, so they get their chance in the
+# ~5-minute cancellation grace window GitHub grants `always()`-conditioned
+# steps, and land here.
+CANCELLED_SENTINEL = -1
+
 EXIT_MEANING = {
     0: "Success — ran, all mutants caught",
     1: "Usage — bad CLI arguments",
@@ -132,6 +180,8 @@ EXIT_MEANING = {
     5: "FilterDiffMismatch — the --in-diff file didn't match the source tree",
     6: "FilterDiffInvalid — the --in-diff file could not be parsed",
     70: "Software — an internal cargo-mutants error",
+    CANCELLED_SENTINEL: "Cancelled — the job was cut off (most likely its own timeout-minutes "
+    "budget) before cargo-mutants reported a final result",
 }
 
 
@@ -1164,6 +1214,63 @@ def main(
     lines = [f"## {title}", ""]
 
     if exit_code not in OK_CODES:
+        if exit_code == CANCELLED_SENTINEL:
+            # (#2550) The job was cancelled — never a real cargo-mutants exit
+            # code, so this gets its own wording rather than the generic
+            # "DID NOT RUN" below: a reader needs to know this specific run
+            # was CUT OFF, not merely that something went wrong. Attempt to
+            # recover partial progress the same way the normal path falls
+            # back to the per-category `.txt` files (below) — cargo-mutants
+            # appends to those as it goes, so whatever was on disk at the
+            # moment of cancellation is real, if incomplete.
+            lines += [
+                "**Mutation testing was CANCELLED before it finished — this is not a pass, "
+                'and it is not the same as "no survivors".**',
+                "",
+                "The job was cancelled while this invocation was still running — most likely "
+                "its own `timeout-minutes` budget ran out, though a manual cancel or a "
+                "superseding push (`concurrency`) can also cause this. cargo-mutants never "
+                "reported a final exit code either way.",
+                "",
+            ]
+            partial = load_outcomes_totals(out_dir)
+            if partial is not None:
+                p_missed = partial.get("missed", 0)
+                p_caught = partial.get("caught", 0)
+                p_timeout = partial.get("timeout", 0)
+                p_unviable = partial.get("unviable", 0)
+                p_total = partial.get(
+                    "total_mutants", p_missed + p_caught + p_timeout + p_unviable
+                )
+            elif out_dir is not None:
+                p_missed = line_count(out_dir / "missed.txt")
+                p_caught = line_count(out_dir / "caught.txt")
+                p_timeout = line_count(out_dir / "timeout.txt")
+                p_unviable = line_count(out_dir / "unviable.txt")
+                p_total = p_missed + p_caught + p_timeout + p_unviable
+            else:
+                p_total = p_missed = p_caught = p_timeout = p_unviable = 0
+            if p_total > 0:
+                lines += [
+                    f"Partial progress recovered from before the cutoff: **{p_total} "
+                    f"mutant(s) evaluated** — {p_caught} caught, {p_missed} missed, "
+                    f"{p_timeout} timed out, {p_unviable} unviable. This is NOT the full "
+                    "picture — an unknown number of mutants beyond these were never "
+                    "reached, so a zero here is not a clean result.",
+                ]
+            else:
+                lines += [
+                    "No partial results were recovered from this run — it was cut off "
+                    "before cargo-mutants evaluated any mutant (quite possibly still "
+                    "inside its own baseline build/test phase).",
+                ]
+            lines += [
+                "",
+                "Reporting this as a failure instead of a silent gap in the summary — "
+                "see #2550.",
+            ]
+            print("\n".join(lines))
+            return 1
         lines += [
             "**Mutation testing DID NOT RUN — this is not a pass.**",
             "",
@@ -1502,6 +1609,83 @@ SELF_TEST_CASES = [
         "expect_exit": 0,
         "must_contain": ["nothing to mutate"],
         "must_not_contain": ["ZERO mutants", "DID NOT RUN"],
+    },
+    # -------------------------------------------------------------------
+    # (#2550) The timeout/cancellation path. These are the rows that matter
+    # most for this fix: nothing in this repo previously asserted that a
+    # CANCELLED run reads differently from either a clean pass or the older
+    # generic "did not run" message — the whole reason a large-diff timeout
+    # read as silence on the PR page instead of a loud failure.
+    # -------------------------------------------------------------------
+    {
+        "name": "cancelled job (empty exit_code, --job-status cancelled), no partial "
+        "progress recovered — CANCELLED and fails",
+        "argv": ["", "diff", "T", "--job-status", "cancelled"],
+        "files": None,
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED", "not a pass", "No partial results"],
+        "must_not_contain": ["No surviving mutants", "nothing to mutate", "Every mutation", "DID NOT RUN"],
+    },
+    {
+        "name": "cancelled job with partial per-category .txt progress reports the "
+        "partial counts and still fails",
+        "argv": ["", "diff", "T", "--job-status", "cancelled"],
+        "files": {
+            # No outcomes.json — cargo-mutants writes that only at the very
+            # end, which never happened here. The per-category .txt files
+            # are appended to as each mutant is judged, so these ARE real
+            # progress from before the cutoff.
+            "caught.txt": "a\nb\nc\n",
+            "missed.txt": "d\n",
+        },
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED", "4 mutant(s) evaluated", "3 caught", "1 missed", "NOT the full picture"],
+        "must_not_contain": ["No surviving mutants", "nothing to mutate", "Every mutation", "No partial results"],
+    },
+    {
+        "name": "cancelled nightly sweep (full mode) reports CANCELLED and fails",
+        "argv": ["", "full", "T", "--job-status", "cancelled"],
+        "files": None,
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED"],
+        "must_not_contain": ["ZERO mutants", "direction of travel"],
+    },
+    {
+        # Pins that --job-status only changes behavior for "cancelled" —
+        # the existing generic "did not run" message (still stderr-only,
+        # still exit 2) is unchanged for every other value, including a
+        # value this script has never seen before.
+        "name": "empty exit_code with --job-status success (not cancelled) keeps the "
+        "generic did-not-run message, not the CANCELLED one",
+        "argv": ["", "diff", "T", "--job-status", "success"],
+        "files": None,
+        "expect_exit": 2,
+        "must_contain": ["exit_code is empty", "did not run"],
+        "must_not_contain": ["CANCELLED", "No surviving mutants", "nothing to mutate"],
+    },
+    # The pinned property: a TIMED-OUT run and a genuinely clean run must
+    # NEVER produce the same exit status, even when everything else about
+    # them (changed-lines count, title) is identical — that is the whole
+    # point of #2550. These two cases are deliberately matched on
+    # changed-lines=5 so the ONLY variable is exit_code/--job-status.
+    {
+        "name": "#2550 pin (1/2): TIMED OUT at changed-lines=5",
+        "argv": ["", "diff", "T", "--job-status", "cancelled", "--changed-lines", "5"],
+        "files": None,
+        "expect_exit": 1,
+        "must_contain": ["CANCELLED"],
+        "must_not_contain": ["No surviving mutants", "nothing to mutate", "Every mutation"],
+    },
+    {
+        "name": "#2550 pin (2/2): a genuinely clean pass at the SAME changed-lines=5 "
+        "— must exit differently from the TIMED OUT case directly above",
+        "argv": ["0", "diff", "T", "--changed-lines", "5"],
+        "files": {
+            "outcomes.json": _outcomes(total_mutants=5, missed=0, caught=5, timeout=0, unviable=0),
+        },
+        "expect_exit": 0,
+        "must_contain": ["Every mutation this PR made testable was caught"],
+        "must_not_contain": ["CANCELLED", "DID NOT RUN"],
     },
 ]
 
@@ -2763,7 +2947,8 @@ def self_test() -> int:
 
 USAGE = (
     "usage: ci-mutants-summary.py <exit_code> <diff|full> <title> "
-    "[--changed-lines N] [out_dir_candidate ...]\n"
+    "[--changed-lines N] [--job-status success|failure|cancelled] "
+    "[out_dir_candidate ...]\n"
     "       ci-mutants-summary.py --count-changed-lines <unified.diff> "
     "[--manifest-path <Cargo.toml>] [--mutants-list <list.json>]\n"
     "       ci-mutants-summary.py --self-test"
@@ -2810,6 +2995,27 @@ if __name__ == "__main__":
             sys.exit(2)
         del args[i : i + 2]
 
+    # (#2550) `--job-status`, when given, carries `${{ job.status }}` from
+    # the workflow: "success" | "failure" | "cancelled". Only meaningful
+    # alongside an EMPTY exit_code (below) — a real exit_code means this
+    # invocation actually produced a result and --job-status is irrelevant.
+    # "cancelled" there is the specific case this flag exists for: the job
+    # was cut off (almost always its own `timeout-minutes` budget) while
+    # THIS invocation was still running, which gets its own loud CANCELLED
+    # report (see `CANCELLED_SENTINEL`) instead of the generic "did not run"
+    # message below — the reason `quality.yml`'s Report steps moved from
+    # `!cancelled()` to `always()` is exactly so they get a chance to run
+    # (and pass this) during that cancellation instead of being skipped
+    # outright, which is the silence #2550 is about.
+    job_status = ""
+    if "--job-status" in args:
+        i = args.index("--job-status")
+        if i + 1 >= len(args):
+            print("--job-status requires a value", file=sys.stderr)
+            sys.exit(2)
+        job_status = args[i + 1]
+        del args[i : i + 2]
+
     if len(args) < 3:
         print(USAGE, file=sys.stderr)
         sys.exit(2)
@@ -2823,6 +3029,14 @@ if __name__ == "__main__":
     # reads as if THIS script received bad input, when the honest report is
     # that the mutation step upstream never executed.
     if args[0] == "":
+        if job_status == "cancelled":
+            # (#2550) The specific, previously-silent case: the job was
+            # cancelled while this invocation was running. Route through
+            # `main()`'s normal "not in OK_CODES" gate with the sentinel so
+            # it gets a real, distinguishable exit status and a report that
+            # actually lands in $GITHUB_STEP_SUMMARY (this generic branch's
+            # message, below, only ever went to stderr).
+            sys.exit(main(CANCELLED_SENTINEL, args[1], args[2], args[3:], changed_lines))
         print(
             "exit_code is empty — the mutation step did not run (skipped by an "
             "earlier failure or a cancelled job), not that it ran and failed",
