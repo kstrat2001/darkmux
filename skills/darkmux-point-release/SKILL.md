@@ -2,7 +2,7 @@
 name: darkmux-point-release
 description: Cut a routine darkmux point release (patch or minor) and ship it to the Homebrew tap. Use when work has merged to main since the last tag and you want `brew upgrade darkmux` to pick it up — e.g. "release the new features", "cut a point release", "should we update the tap". MAINTAINER skill (releasing darkmux itself), not an end-user feature; not shipped to brew installs. Do NOT use for a major (X.0.0) bump or a launch — those need the operator's launch-readiness halt, not this routine.
 user_invocable: true
-allowed-tools: "Bash(git:*), Bash(gh:*), Bash(cargo:*), Bash(curl:*), Bash(shasum:*), Bash(python3:*), Bash(grep:*), Bash(sed:*), Read, Edit, Write"
+allowed-tools: "Bash(git:*), Bash(gh:*), Bash(cargo:*), Bash(curl:*), Bash(shasum:*), Bash(python3:*), Bash(grep:*), Bash(sed:*), Bash(jq:*), Bash(mktemp:*), Bash(bash:*), Read, Edit, Write"
 ---
 
 # darkmux point release
@@ -100,75 +100,16 @@ subshell, not the terminal session it's running in; run the block itself
   set -eu
   # $NEW must be exported from step 1 — this block runs as `bash <file>`, a
   # fresh process, so a plain `NEW=x.y.z` typed into the parent shell never
-  # reaches it. Checked with an explicit `if`/`exit`, not bare `set -u` and
-  # not `${NEW:?message}`: on this repo's bash (3.2, the macOS default), a
-  # nounset-triggered abort inside a subshell that also carries an EXIT trap
-  # is silently swallowed to exit 0 — proven by running this exact shape
-  # with $NEW unset (#2589 round 3). `${NEW:?...}` hits the identical
-  # swallow because it fails the same way nounset does; only a real `exit`
-  # call after an ordinary `[ -z ... ]` test propagates correctly here.
-  if [ -z "${NEW:-}" ]; then
-    echo "NEW is not set — export it from step 1 before running this block" >&2
-    exit 1
-  fi
-  # Gate on cargo's real exit code, not a text search over its output — a
-  # build that never compiles prints no "test result:" line at all, so a
-  # grep for one finds nothing and reports a false "tests ok" (#2589). Run
-  # directly, no tee/log file: plain `cargo test` already streams live to
-  # this block's own stdout, nothing here ever reads a captured copy back,
-  # and a previous version tee'd into a temp file that went unread end to
-  # end — dead plumbing with its own trap to maintain for no gain (#2589
-  # round 3).
-  set +e
-  cargo test
-  STATUS=$?
-  set -e
-  if [ "$STATUS" -ne 0 ]; then
-    echo "investigate — cargo test exited $STATUS (compile or test failure; see output above)"
-    exit "$STATUS"
-  fi
-  echo "tests ok"
-  git add -A && git commit -m "release: $NEW — <one-line theme>"
-  git push -u origin release-$NEW
-  gh pr create --title "release: $NEW" --body "Routine point release. <what's in it>. Formula pin follows after the tag."
-)
-```
-**Merge-gate on conclusion==SUCCESS, not just completion** (the recurring trap) —
-but reading `gh pr checks`' own exit code as that gate is itself the trap.
-`gh pr checks` (plain-text mode) exits non-zero whenever any check is not yet
-green, which is the loop's entire normal in-flight state — treating that as
-fatal aborted the poll on its first iteration, before it ever polled anything
-(#2589). `--json` mode does **not** dodge this the way it looks like it
-should: `gh pr checks` errors out — non-zero exit, empty stdout, `no checks
-reported on the '<branch>' branch` on stderr — for a PR with zero checks
-registered yet, regardless of `--json`/`--jq`, because that check lives in
-gh's own source *above* the JSON exporter. That is the literal state in the
-seconds right after the PR opens, so it has to be treated as "keep waiting,"
-not a transport failure — matched on the exact message text, so any *other*
-non-zero exit (auth, network, a renamed branch) still aborts immediately
-(verified live against this repo's own `w9/apt` PR while it genuinely had
-zero checks registered — #2589 round 3):
-```bash
-(
-  set -eu
-  # $NEW must be exported from step 1 — see the note on the version-PR block
-  # above for why `set -u`/`${NEW:?...}` can't be trusted to catch this on
-  # their own in a subshell carrying an EXIT trap on this repo's bash.
-  if [ -z "${NEW:-}" ]; then
-    echo "NEW is not set — export it from step 1 before running this block" >&2
-    exit 1
-  fi
-  ERRF=$(mktemp) || { echo "mktemp failed"; exit 1; }
-  # Cleanup always runs, but INT/TERM must ALSO actually stop the poll — a
-  # trap that only cleans up and never calls `exit` doesn't terminate
-  # execution, it just runs and control falls through to whatever statement
-  # follows. Proven: the old single `trap '...' EXIT INT TERM` absorbed a
-  # SIGINT sent mid-loop and ran every remaining iteration to completion
-  # instead of stopping (#2589 round 3). INT/TERM get their own `exit` here.
-  cleanup() { rm -f "$ERRF"; }
-  trap cleanup EXIT
-  trap 'cleanup; exit 130' INT
-  trap 'cleanup; exit 143' TERM
+  # reaches it. Checked with an explicit `if`/`exit` rather than `set -u` or
+  # `${NEW:?...}` for TWO reasons, only one of which is the trap swallow:
+  #   1. An exported-but-EMPTY `NEW` passes `set -u` cleanly and would build a
+  #      `release-` branch. That is this block's live reason — this block now
+  #      carries no `trap`, so nounset alone WOULD propagate here.
+  #   2. In the merge block below (which does carry traps), a nounset abort
+  #      inside a subshell with an EXIT trap is silently swallowed to exit 0 on
+  #      bash 3.2 — proven by running that exact shape. `${NEW:?...}` swallows
+  #      identically. An ordinary `set -e` failure with the same trap still
+  #      propagates, so this is nounset-specific.
 
   # Bound: 30s x 120 attempts = 60 minutes. Measured fresh against this
   # repo's own last ~60 completed runs per workflow (createdAt -> updatedAt,
@@ -217,18 +158,26 @@ zero checks registered — #2589 round 3):
     fi
     ATTEMPTS=$((ATTEMPTS + 1))
     if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
-      echo "timed out after $((MAX_ATTEMPTS * POLL_SECONDS))s waiting for checks on release-$NEW"
+      # (MAX_ATTEMPTS - 1) sleeps actually elapse: the last attempt breaks
+      # before sleeping, so quote the real bound rather than the nominal one.
+      echo "timed out after ~$(( (MAX_ATTEMPTS - 1) * POLL_SECONDS ))s waiting for checks on release-$NEW"
       exit 1
     fi
     sleep "$POLL_SECONDS"
   done
 
   # This verdict read is deliberately a SEPARATE call from the poll above,
-  # not unified onto one source: `gh pr checks` dedupes re-run check names
-  # and folds in legacy commit statuses; the raw `check-runs` API below does
-  # neither. Not exploitable on this repo today, but the two views can in
-  # principle disagree on what "everything" means — worth a line (#2589
-  # round 3).
+  # not unified onto one source. TWO divergences, and the second is the
+  # bigger one the earlier note omitted:
+  #   * CONTENT — `gh pr checks` dedupes re-run check names and folds in
+  #     legacy commit statuses; the raw `check-runs` API below does neither.
+  #   * COMMIT — the poll keys on the PR's own head (whatever GitHub thinks
+  #     the branch tip is), while this read keys on the LOCAL `git rev-parse
+  #     HEAD`. A stale local sha yields `no-verdicts` or the older commit's
+  #     failures, and both of those block, so no false merge was constructible
+  #     — but the two calls are not asking about the same commit by
+  #     construction, only by the operator standing on the branch they pushed.
+  # Not exploitable on this repo today (#2589 round 4).
   #
   # `per_page=100` plus an explicit count assertion, not the bare default of
   # 30: the check-runs endpoint paginates, a re-run only ever ADDS rows, and
@@ -283,7 +232,9 @@ zero checks registered — #2589 round 3):
 
   if [ "$C" = "success" ]; then
     gh pr merge release-$NEW --squash --delete-branch
-    git checkout main && git pull --ff-only
+    # Separate statements, not `&&` — see the note in the version-PR block.
+    git checkout main
+    git pull --ff-only
   else
     echo "checks did not all succeed (non-skipped conclusions: $C) — not merging"
     exit 1
