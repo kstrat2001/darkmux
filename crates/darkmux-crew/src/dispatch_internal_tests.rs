@@ -12258,123 +12258,371 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(recorded.trim(), "kill darkmux-test-container-2233-panic");
     }
 
-    // ─── (#2234) TailerStopGuard — the tailer thread's RAII backstop ──────
+    // ─── (#2234) StopFlagGuard — shared RAII backstop for the tailer's
+    // `stop_flag`, the sampler's `sampler_stop`, and the watchdog's
+    // `watchdog_done` (#2234 follow-up review, MUST FIX 1 widened this
+    // from a tailer-only `TailerStopGuard` to the shared type used by all
+    // three) ────────────────────────────────────────────────────────────
 
     #[test]
-    fn tailer_stop_guard_sets_the_flag_on_normal_drop() {
+    fn stop_flag_guard_sets_the_flag_on_normal_drop() {
         // Baseline: even without a panic, constructing-then-dropping the
-        // guard must flip the flag — every explicit `stop_flag.store(true)`
-        // call on the happy/error paths already does this by hand, so the
-        // guard's own store on ordinary scope exit must be harmless and
-        // consistent with them, not a surprise second writer.
-        let stop_flag = Arc::new(AtomicBool::new(false));
+        // guard must flip the flag — every explicit `.store(true, …)` call
+        // on the happy/error paths already does this by hand for all three
+        // flags this guard backstops, so the guard's own store on ordinary
+        // scope exit must be harmless and consistent with them, not a
+        // surprise second writer.
+        let flag = Arc::new(AtomicBool::new(false));
         {
-            let _guard = TailerStopGuard(Arc::clone(&stop_flag));
+            let _guard = StopFlagGuard(Arc::clone(&flag));
         }
         assert!(
-            stop_flag.load(Ordering::SeqCst),
-            "the guard must set stop_flag on an ordinary (non-panicking) drop"
+            flag.load(Ordering::SeqCst),
+            "the guard must set the flag on an ordinary (non-panicking) drop"
         );
     }
 
     #[test]
-    fn tailer_stop_guard_fires_on_panic_unwind() {
+    #[serial]
+    fn stop_flag_guard_fires_on_panic_unwind() {
+        // (#2641 follow-up review, CONSIDER 5) `#[serial]` matches its
+        // sibling `container_kill_guard_fires_on_panic_unwind` above — both
+        // mutate the process-global panic hook via `take_hook`/`set_hook`,
+        // and without serialization a sibling test can restore the default
+        // hook mid-flight and make this test's simulated-panic output
+        // unreadable at the one moment it needs to be (observed live during
+        // the #2641 review's own mutation run, on the two tests that were
+        // missing this attribute).
         // (#2234) THE BUG this guard exists for: the tailer's only exits are
         // catching `stop_flag` or an interrupt signal — see `run_tailer`'s
-        // own doc — and every EXPLICIT `stop_flag.store(true)` call in
-        // `dispatch()` sits on a normal-return path. A panic unwinding
-        // through the ~250 lines between the tailer's spawn and those
-        // stores skips all of them, and the tailer — a SEPARATE OS thread —
-        // survives the panic in any process that catches it (the fleet
-        // runner and the serve daemon both do, on purpose, so one bad
-        // dispatch can't take the whole long-lived process down). Left
-        // unguarded, that thread polls `trajectory.jsonl` every 250ms
-        // forever. Same shape as `container_kill_guard_fires_on_panic_
-        // unwind` above: Rust runs Drop on unwind, so a bare RAII wrapper
-        // closes the gap with no extra machinery.
-        let stop_flag = Arc::new(AtomicBool::new(false));
+        // own doc — and every EXPLICIT `.store(true, …)` call on each of
+        // the three flags this guard backstops (`stop_flag`, `sampler_
+        // stop`, `watchdog_done`) sits on a normal-return path in
+        // `dispatch()`. A panic unwinding through the lines between a
+        // flag's creation and those stores skips all of them, and the
+        // thread each flag gates — a SEPARATE OS thread — survives the
+        // panic in any process that catches it (the fleet runner's
+        // `run_with_panic_guard`, which the serve daemon spawns via
+        // `darkmux_fleet::spawn_runner_thread()`, does exactly this on
+        // purpose, so one bad dispatch can't take the whole long-lived
+        // process down). Left unguarded, the tailer polls `trajectory.jsonl`
+        // every 250ms forever, the sampler keeps sampling + governing
+        // thermals every 2s forever, and the watchdog polls to its full
+        // inactivity deadline before firing a false-alarm kill. Same shape
+        // as `container_kill_guard_fires_on_panic_unwind` above: Rust runs
+        // Drop on unwind, so a bare RAII wrapper closes the gap with no
+        // extra machinery.
+        let flag = Arc::new(AtomicBool::new(false));
 
         // Silence the expected panic backtrace so test output stays clean.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let guard_stop_flag = Arc::clone(&stop_flag);
+        let guard_flag = Arc::clone(&flag);
         let result = std::panic::catch_unwind(move || {
-            let _guard = TailerStopGuard(guard_stop_flag);
-            panic!("simulated panic after the tailer thread has spawned");
+            let _guard = StopFlagGuard(guard_flag);
+            panic!("simulated panic after the guarded thread has spawned");
+        });
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the closure should have panicked");
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the guard's Drop must run on unwind and set the flag — a real \
+             guarded thread polls this exact flag and would otherwise \
+             never learn the dispatch is gone"
+        );
+    }
+
+    // ─── (#2234 follow-up review, MUST FIX 3) spawn_guarded_tailer — the
+    // tailer guard proven at dispatch()'s OWN wiring, not a hand-rolled
+    // stand-in ───────────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn spawn_guarded_tailer_wiring_survives_a_real_thread_spawn() {
+        // (#2641 follow-up review, CONSIDER 5) `#[serial]` — process-global
+        // panic hook, same reasoning as `stop_flag_guard_fires_on_panic_unwind`
+        // above.
+        // (#2234 follow-up review) The gap the prior red-prove missed:
+        // `tailer_stop_guard_fires_on_panic_unwind` (above) constructs a
+        // `StopFlagGuard` BY HAND and proves Rust's own Drop semantics —
+        // real, but it says nothing about whether `dispatch()` actually
+        // calls that construction. Deleting `dispatch()`'s call to
+        // `spawn_guarded_tailer` (or deleting the guard construction
+        // *inside* `spawn_guarded_tailer` itself) left the whole crate
+        // suite green, because nothing exercised THAT function. This test
+        // calls the exact production function `dispatch()` calls — no
+        // hand-rolled equivalent — panics immediately after (mirroring the
+        // ~250 lines of real work between the tailer's spawn and
+        // `dispatch()`'s own explicit `stop_flag.store(true, …)` calls),
+        // and then joins the REAL spawned `run_tailer` thread with a
+        // bounded wait. No Docker: `run_tailer` only reads a local
+        // `out_dir`.
+        let dir = TempDir::new().unwrap();
+        let out_dir = dir.path().to_path_buf();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let inactivity_deadline = Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600)));
+
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let handle_holder: Arc<Mutex<Option<thread::JoinHandle<TrajectorySummary>>>> =
+            Arc::new(Mutex::new(None));
+        let handle_holder_for_closure = Arc::clone(&handle_holder);
+        let stop_flag_for_closure = Arc::clone(&stop_flag);
+        let inactivity_deadline_for_closure = Arc::clone(&inactivity_deadline);
+        let result = std::panic::catch_unwind(move || {
+            let (_guard, handle) = spawn_guarded_tailer(
+                &stop_flag_for_closure,
+                out_dir,
+                "test-session".to_string(),
+                "test-role".to_string(),
+                "test-model".to_string(),
+                None,
+                None,
+                None,
+                inactivity_deadline_for_closure,
+                600,
+                None,
+                None,
+            );
+            *handle_holder_for_closure.lock().unwrap() = Some(handle);
+            panic!("simulated panic between the tailer's spawn and dispatch()'s own stores");
         });
         std::panic::set_hook(prev_hook);
         assert!(result.is_err(), "the closure should have panicked");
 
         assert!(
             stop_flag.load(Ordering::SeqCst),
-            "the guard's Drop must run on unwind and set stop_flag — a real \
-             tailer thread polls this exact flag every 250ms and would \
-             otherwise never learn the dispatch is gone"
+            "spawn_guarded_tailer's own guard must fire on unwind and set the flag"
         );
+
+        // Bounded wait, not a bare `.join()` — if the guard construction
+        // INSIDE `spawn_guarded_tailer` were ever deleted, the real tailer
+        // thread would poll `trajectory.jsonl` every 250ms forever and a
+        // bare join would hang this test (and the whole suite) rather than
+        // failing it. Poll `is_finished()` up to 3s (12x the tailer's own
+        // 250ms poll interval) instead, so the mutation is a clean FAILED,
+        // not a hang.
+        let handle = handle_holder.lock().unwrap().take().expect("handle was captured before the panic");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            handle.is_finished(),
+            "the real tailer thread spawned by spawn_guarded_tailer must have exited \
+             within 3s of the panic — if it is still running, the guard construction \
+             inside spawn_guarded_tailer is not actually wired to the thread it spawned"
+        );
+        let summary = handle.join().expect("the tailer thread itself must not have panicked");
+        let _ = summary; // just proving it returned, not inspecting its contents
     }
 
-    // ─── (#2234) effective_inactivity_timeout_seconds clamps an absurd value ─
+    // ─── (#2641 follow-up review, MUST FIX 1) spawn_guarded_sampler — the
+    // sampler's guard proven at dispatch()'s OWN wiring, not asymmetric
+    // `_`-prefixed decoration ─────────────────────────────────────────────
 
     #[test]
     #[serial]
-    fn effective_inactivity_timeout_seconds_clamps_an_absurd_configured_value() {
-        // (#2234) SUSPECTED concrete trigger the issue named: an absurd
-        // configured/env inactivity timeout reaches `Instant::now() +
-        // Duration::from_secs(inactivity_secs)` unclamped and panics on
-        // overflow — see the sibling test below, which proves that
-        // specific expression actually panics for this value. This test
-        // pins the resolution side: the single place both the
-        // container-forwarded value and the host watchdog deadline read
-        // from must never hand back something that large.
-        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
-        unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", u64::MAX.to_string()) };
+    fn spawn_guarded_sampler_wiring_survives_a_real_thread_spawn() {
+        // `#[serial]` — process-global panic hook (CONSIDER 5's convention).
+        // (#2641 follow-up review, MUST FIX 1, PROVEN) This PR's own
+        // headline production fix — the `_sampler_stop_guard` at the
+        // sampler's spawn site — had ZERO coverage: replacing that line
+        // with a comment left `cargo test -p darkmux-crew --lib` at 1670
+        // passed / 0 failed. `stop_flag_guard_fires_on_panic_unwind` only
+        // proves Rust's Drop semantics on a hand-rolled guard; it says
+        // nothing about whether `dispatch()`'s real sampler spawn site
+        // still constructs one. Same shape as
+        // `spawn_guarded_tailer_wiring_survives_a_real_thread_spawn`: call
+        // the exact production function `dispatch()` calls, panic
+        // immediately after (mirroring the ~150 lines of real work between
+        // the sampler's spawn and `dispatch()`'s own explicit
+        // `sampler_stop.store(true, …)` calls), then join the REAL spawned
+        // `run_telemetry_sampler` thread with a bounded wait. No Docker, no
+        // LMStudio: the sampler's very first `stop_flag` check sits at the
+        // top of its loop, before any `lms`/host-probe work could block it.
+        let dir = TempDir::new().unwrap();
+        let host_out = dir.path().to_path_buf();
+        let sampler_stop = Arc::new(AtomicBool::new(false));
 
-        let (secs, source) = effective_inactivity_timeout_seconds(None);
+        // Local alias so the guard-then-panic-then-capture pattern's
+        // `Arc<Mutex<Option<JoinHandle<...>>>>` scaffolding doesn't trip
+        // clippy's `type_complexity` lint.
+        type SamplerHandleSlot = Arc<Mutex<Option<thread::JoinHandle<(HostStats, HostExtras)>>>>;
 
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
-                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
-            }
-        }
-
-        assert_eq!(
-            secs, MAX_INACTIVITY_TIMEOUT_SECS,
-            "an absurd configured value must clamp to the max, not pass through raw"
-        );
-        assert_eq!(
-            source,
-            crate::dispatch_internal::InactivityBudgetSource::Resolved(
-                darkmux_types::config_access::Source::Env,
-            ),
-            "clamping the VALUE must not change which tier gets credited for it"
-        );
-    }
-
-    #[test]
-    fn instant_plus_duration_panics_on_an_unclamped_absurd_value_but_not_on_the_clamped_one() {
-        // (#2234) Proves the actual failure mode the clamp above exists to
-        // prevent — not just that the clamp function returns a smaller
-        // number, but that the smaller number is what keeps the exact
-        // expression `dispatch()` runs (`Instant::now() + Duration::
-        // from_secs(inactivity_secs)`, to build the host watchdog deadline)
-        // from panicking on overflow.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let unclamped = std::panic::catch_unwind(|| Instant::now() + Duration::from_secs(u64::MAX));
+        let handle_holder: SamplerHandleSlot = Arc::new(Mutex::new(None));
+        let handle_holder_for_closure = Arc::clone(&handle_holder);
+        let sampler_stop_for_closure = Arc::clone(&sampler_stop);
+        let host_out_for_closure = host_out.clone();
+        let result = std::panic::catch_unwind(move || {
+            let (_guard, handle) = spawn_guarded_sampler(
+                &sampler_stop_for_closure,
+                "test-role".to_string(),
+                "test-session".to_string(),
+                "test-model".to_string(),
+                None,
+                None,
+                None,
+                None,
+                host_out_for_closure,
+                None,
+            );
+            *handle_holder_for_closure.lock().unwrap() = Some(handle);
+            panic!("simulated panic between the sampler's spawn and dispatch()'s own stores");
+        });
         std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the closure should have panicked");
+
         assert!(
-            unclamped.is_err(),
-            "u64::MAX seconds must actually panic Instant's Add — if this \
-             stops panicking on some future toolchain the clamp above is \
-             defense-in-depth rather than a fix for a live crash, and this \
-             assertion is the signal to say so"
+            sampler_stop.load(Ordering::SeqCst),
+            "spawn_guarded_sampler's own guard must fire on unwind and set the flag"
         );
 
-        // The clamped value must not panic — this is what the resolution-
-        // side clamp is buying.
-        let _clamped_deadline = Instant::now() + Duration::from_secs(MAX_INACTIVITY_TIMEOUT_SECS);
+        // Bounded wait, not a bare `.join()` — if the guard construction
+        // INSIDE `spawn_guarded_sampler` were ever deleted, the real
+        // sampler thread would keep shelling out + sampling + governing
+        // thermals every 2s forever, and a bare join would hang this test
+        // (and the whole suite) rather than failing it.
+        let handle = handle_holder
+            .lock()
+            .unwrap()
+            .take()
+            .expect("handle was captured before the panic");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            handle.is_finished(),
+            "the real sampler thread spawned by spawn_guarded_sampler must have exited \
+             within 3s of the panic — if it is still running, the guard construction \
+             inside spawn_guarded_sampler is not actually wired to the thread it spawned"
+        );
+        let _ = handle.join().expect("the sampler thread itself must not have panicked");
     }
+
+    // ─── (#2641 follow-up review, MUST FIX 1 + MUST FIX 2) spawn_guarded_watchdog
+    // — the watchdog's guard proven at dispatch()'s OWN wiring, AND proven
+    // to still run the persistent kill (not silently suppress it) ─────────
+
+    #[test]
+    #[serial]
+    fn spawn_guarded_watchdog_wiring_survives_a_real_thread_spawn() {
+        // (#2641 follow-up review, MUST FIX 1 + MUST FIX 2, PROVEN) Same
+        // coverage gap as the sampler's test above, but for the watchdog —
+        // and this one doubles as the MUST FIX 2 regression test: a
+        // guard that set `watchdog_done` (the #2234-follow-up shape this PR
+        // replaces) would make the watchdog return with NO kill at all on
+        // a panic, silently trading away the persistent, retrying,
+        // probe-confirmed kill for `ContainerKillGuard`'s single
+        // fire-and-forget `docker kill`. This test proves the OPPOSITE:
+        // with `watchdog_abandoned` guarded instead, a panic makes the real
+        // spawned `run_watchdog` thread run `watchdog_finalize_kill`
+        // PROMPTLY — well before the (deliberately far-future) inactivity
+        // deadline would ever fire — via the exact production function
+        // `dispatch()` calls (`spawn_guarded_watchdog`), no hand-rolled
+        // stand-in.
+        //
+        // No real Docker daemon: `install_fake_docker` puts a script on
+        // `PATH` that echoes its argv and exits 0 for anything, so the
+        // watchdog's first `docker kill` attempt reads as an immediate,
+        // confirmed kill (`kill_container_persistently`'s `killing` branch
+        // returns `Confirmed` on any successful "kill" call) — no backoff
+        // sleeps, no liveness probe needed.
+        let dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_fake_docker(&dir);
+
+        let inactivity_deadline =
+            Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600)));
+        let watchdog_done = Arc::new(AtomicBool::new(false));
+        let watchdog_abandoned = Arc::new(AtomicBool::new(false));
+        let timeout_fired = Arc::new(AtomicBool::new(false));
+        let kill_disposition = Arc::new(AtomicU8::new(KillDisposition::Unconfirmed.code()));
+
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let handle_holder: Arc<Mutex<Option<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let handle_holder_for_closure = Arc::clone(&handle_holder);
+        let watchdog_abandoned_for_closure = Arc::clone(&watchdog_abandoned);
+        let inactivity_deadline_for_closure = Arc::clone(&inactivity_deadline);
+        let watchdog_done_for_closure = Arc::clone(&watchdog_done);
+        let timeout_fired_for_closure = Arc::clone(&timeout_fired);
+        let kill_disposition_for_closure = Arc::clone(&kill_disposition);
+        let result = std::panic::catch_unwind(move || {
+            let (_guard, handle) = spawn_guarded_watchdog(
+                &watchdog_abandoned_for_closure,
+                "darkmux-test-container-2641-watchdog".to_string(),
+                inactivity_deadline_for_closure,
+                watchdog_done_for_closure,
+                timeout_fired_for_closure,
+                kill_disposition_for_closure,
+            );
+            *handle_holder_for_closure.lock().unwrap() = Some(handle);
+            panic!("simulated panic between the watchdog's spawn and dispatch()'s own stores");
+        });
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the closure should have panicked");
+
+        assert!(
+            watchdog_abandoned.load(Ordering::SeqCst),
+            "spawn_guarded_watchdog's own guard must fire on unwind and set the flag"
+        );
+        assert!(
+            !watchdog_done.load(Ordering::SeqCst),
+            "the guard must NOT set watchdog_done — that flag means 'proven over, skip \
+             the kill', which a panic never proves (MUST FIX 2)"
+        );
+
+        // Bounded wait far shorter than the 600s inactivity deadline — if
+        // `run_watchdog` ever stopped checking `watchdog_abandoned` (or the
+        // guard construction inside `spawn_guarded_watchdog` were deleted),
+        // this thread would sit in its poll loop for the full deadline
+        // instead, and this bounded wait fails the test instead of hanging
+        // it.
+        let handle = handle_holder
+            .lock()
+            .unwrap()
+            .take()
+            .expect("handle was captured before the panic");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            handle.is_finished(),
+            "the real watchdog thread spawned by spawn_guarded_watchdog must have run its \
+             persistent kill and exited within 5s of the panic, NOT waited out the 600s \
+             inactivity deadline — if it is still running, the abandonment check inside \
+             run_watchdog / spawn_guarded_watchdog is not actually wired"
+        );
+        handle.join().expect("the watchdog thread itself must not have panicked");
+
+        restore_path(prev_path);
+
+        let recorded = std::fs::read_to_string(&record_path).expect(
+            "an abandoned watchdog must still shell out to the fake `docker` — this is the \
+             persistent kill MUST FIX 2 requires, not a suppressed one",
+        );
+        assert_eq!(
+            recorded.trim(),
+            "kill darkmux-test-container-2641-watchdog",
+            "the watchdog's persistent kill must target the exact container name, same as \
+             every other kill call site"
+        );
+    }
+
+    // ─── (#2234 follow-up review) the clamp above was REVERTED — see
+    // `effective_inactivity_timeout_seconds`'s own doc for why (invisible,
+    // silently overrode `--timeout`'s deliberately-unbounded parser,
+    // desynced `resolved_runtime_bounds_json`, and its 315_360_000 figure
+    // was ~29 billion× more aggressive than the panic it cited —
+    // 9_223_372_036_847_700_827, measured by binary search). A future
+    // clamp is tracked in the issue filed alongside this revert (see the
+    // PR body); it does not live in this file until it meets that issue's
+    // three conditions.
 
     // ─── (#2232) the watchdog's kill must be PERSISTENT, not fire-and-forget ─
 
