@@ -31,19 +31,26 @@ name: quality
 # (#2550) A CANCELLED run is the same class of lie, from a different cause.
 # A large diff can outrun `mutants-in-diff`'s `timeout-minutes` budget while
 # a mutation invocation is mid-run — the job's conclusion becomes
-# `cancelled`, distinct from both `success` and `failure`. Before this fix,
-# the "Report survivors" step for that invocation was gated on
-# `if: ${{ !cancelled() }}`, which is FALSE once the job itself is
-# cancelled — so the step never ran at all, and that scope's section of the
-# PR summary was simply ABSENT. Advisory-plus-cancelled then read, on the PR
-# page, almost identically to advisory-plus-clean: nothing distinguished "we
-# looked and found nothing" from "we never finished looking". Each Report
-# step below now runs on `always()` instead (its own Mutate step stays on
+# `cancelled`, distinct from both `success` and `failure`, and
+# `cargo mutants` never gets to write an exit code. At the time of the real
+# incident (run 34324045744, PR head `386afc48`, 2026-09-09) the "Report
+# survivors" step for that invocation was ALREADY gated on `if: always()` —
+# it DID run, with conclusion `failure` — but the summary script treated the
+# resulting empty `exit_code` as a bare parse error and printed its message
+# to **stderr** before exiting 2, so nothing ever reached
+# `$GITHUB_STEP_SUMMARY` and that scope's section of the PR summary was
+# simply ABSENT. Advisory-plus-cancelled then read, on the PR page, almost
+# identically to advisory-plus-clean: nothing distinguished "we looked and
+# found nothing" from "we never finished looking". (A day later, an
+# unrelated fix — #2602 — put these same Report steps on `!cancelled()`,
+# which really would skip a step outright on job cancellation; that is a
+# separate, real hole, not the one that produced the original incident.)
+# Each Report step below stays on `always()` (its own Mutate step stays on
 # `!cancelled()` — a new multi-minute mutation run must not START once
 # cancellation is already underway) and passes `--job-status "${{
-# job.status }}"` to the summary script, which renders a loud, distinct
+# job.status }}"` to the summary script, which now renders a loud, distinct
 # CANCELLED verdict (with whatever partial progress cargo-mutants had
-# already written) instead of a silent gap. See
+# already written) instead of erroring to stderr. See
 # `scripts/ci-mutants-summary.py`'s own `CANCELLED_SENTINEL`.
 
 on:
@@ -475,29 +482,33 @@ jobs:
           exit 0
 
       - name: Report survivors
-        # (#2550) `!cancelled()` -> `always()`. `!cancelled()` is FALSE once
-        # the JOB ITSELF is cancelled — a manual cancel, a superseding push
-        # via `concurrency`, or, the shape this issue is about, this job's
-        # own `timeout-minutes` budget running out while "Mutate only what
-        # this PR touched" above was still running — and a step gated on it
-        # is SKIPPED OUTRIGHT during that cancellation, not merely "runs
-        # with an empty exit_code". That was the actual mechanism behind
-        # #2550: a large diff times out, this step never ran at all, and the
-        # PR's job summary had NOTHING for the root scope — indistinguishable
-        # on the PR page from a clean sweep. `always()` gives this step its
-        # chance in the ~5-minute cancellation grace window GitHub grants
-        # `always()`-conditioned steps. "Mutate only what this PR touched"
-        # above stays on `!cancelled()` on purpose — it must NOT start a
-        # brand-new multi-minute mutation run once cancellation is already
-        # underway; only the (cheap, read-only) reporting step needs the
-        # wider gate.
+        # (#2550) This step was ALREADY on `always()` at the time of the
+        # real incident (run 34324045744, PR head `386afc48`, 2026-09-09) —
+        # it ran, with conclusion `failure`. The actual mechanism was in the
+        # summary script: `${{ steps.mutants.outputs.exit_code }}` arrives
+        # empty when "Mutate only what this PR touched" above is cancelled
+        # (this job's own `timeout-minutes` budget running out, most likely
+        # — a manual cancel can also cause it) mid-run, and the script's old
+        # handling of an empty `exit_code` printed its message to **stderr**
+        # and exited 2 before any Markdown reached stdout — so nothing was
+        # ever appended to `$GITHUB_STEP_SUMMARY` and the root scope's
+        # section was simply ABSENT: indistinguishable, on the PR page, from
+        # a clean sweep. (A day after the incident, an unrelated fix —
+        # #2602 — briefly put this step on `!cancelled()`, which really
+        # would skip it outright on cancellation; that was a separate, real
+        # hole, not the cause of the original incident, and this fix reverts
+        # it back to `always()`.) "Mutate only what this PR touched" above
+        # stays on `!cancelled()` on purpose — it must NOT start a brand-new
+        # multi-minute mutation run once cancellation is already underway;
+        # only the (cheap, read-only) reporting step needs the wider gate.
         #
         # `--job-status "${{ job.status }}"` lets the summary script tell
         # "this invocation was cut off by cancellation" (job.status ==
         # cancelled, exit_code empty) apart from "an earlier unrelated step
         # failed" (job.status == failure, exit_code also empty) — only the
-        # former gets the loud, distinct CANCELLED report; see
-        # ci-mutants-summary.py's own `CANCELLED_SENTINEL`.
+        # former gets the loud, distinct CANCELLED report instead of the old
+        # stderr-only error; see ci-mutants-summary.py's own
+        # `CANCELLED_SENTINEL`.
         if: ${{ always() }}
         run: |
           python3 scripts/ci-mutants-summary.py \
