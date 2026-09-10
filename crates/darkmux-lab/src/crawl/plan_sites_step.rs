@@ -123,6 +123,16 @@ impl StepKind for PlanSitesStepKind {
         None
     }
 
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` — see
+    /// `plan_step::CrawlPlanStepKind::cwd_policy`'s own doc: this kind's
+    /// tree-source path calls the SAME `plan_one_rule`, and its diff-source
+    /// path (`derive_workspace_spec` + `materialize`) goes through the same
+    /// `resolve_one`. Not a `StepKindRegistry::with_builtins()` member, so
+    /// the registry conformance test cannot see it — audited by hand.
+    fn cwd_policy(&self) -> darkmux_crew::step_kinds::CwdPolicy {
+        darkmux_crew::step_kinds::CwdPolicy::NoAmbientDependency
+    }
+
     fn display_name(&self) -> &'static str {
         "Plan sites"
     }

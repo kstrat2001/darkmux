@@ -101,6 +101,21 @@ impl StepKind for CrawlPlanStepKind {
         None
     }
 
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — the only ambient-adjacent call reachable
+    /// through this kind (`plan_one_rule` -> `materialize` -> `resolve_one`'s
+    /// first-clone `git clone --bare`, via `run_git(None, ...)`) was probed
+    /// live from a deleted process cwd and exits 0 cleanly: `git`, invoked
+    /// directly rather than through a shell, does not appear to consult the
+    /// ambient directory for a clone whose args are already absolute paths.
+    /// Every OTHER git call inside `materialize` passes an explicitly
+    /// resolved mirror/tree path. Not a `StepKindRegistry::with_builtins()`
+    /// member, so `step_kinds::registry`'s `cwd_policy` conformance test
+    /// cannot see this kind — this doc comment is the record of the audit.
+    fn cwd_policy(&self) -> darkmux_crew::step_kinds::CwdPolicy {
+        darkmux_crew::step_kinds::CwdPolicy::NoAmbientDependency
+    }
+
     fn display_name(&self) -> &'static str {
         "Plan"
     }

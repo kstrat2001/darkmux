@@ -16,7 +16,9 @@
 //! CONFIG on one of these four kinds. See `step_kinds::patterns`'s module
 //! doc for the full three-tier picture.
 
-use super::types::{MapDispatchOverride, OverrideDispatchCall, SeatClaim, StepKind, StepOutcome, StepRunCtx};
+use super::types::{
+    CwdPolicy, MapDispatchOverride, OverrideDispatchCall, SeatClaim, StepKind, StepOutcome, StepRunCtx,
+};
 use super::MIN_VIABLE_MAP_GRANT;
 use crate::remote_budget::RemoteBudget;
 use crate::types::{Step, Task};
@@ -2961,6 +2963,13 @@ impl StepKind for ProceduralShellStepKind {
         None
     }
 
+    /// (#2577) The one kind that legitimately does — see
+    /// [`CwdPolicy::AmbientWithRefusal`]'s own doc, and `resolve_shell_cwd`
+    /// below for the resolution chain and the refusal it produces when the
+    /// ambient directory has vanished.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::AmbientWithRefusal
+    }
 
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let command = require_config_str(step, self.id(), "command")?;
