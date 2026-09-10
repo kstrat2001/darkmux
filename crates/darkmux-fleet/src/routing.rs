@@ -462,6 +462,35 @@ pub fn dispatch_routed_via(
                 target,
                 local_unknown: true,
             } => {
+                // (#2584, same class as #2561/#2580) `WorkJob` carries no
+                // `resume_from` field at all, and the peer-side runner
+                // (`runner.rs`) hardcodes it absent when it reconstructs
+                // `DispatchOpts` — so a queued dispatch starts fresh on
+                // the peer and exits 0 under a name the operator chose
+                // because it looked like a resume. Refuse HERE, before
+                // the route record is emitted or the queue is touched at
+                // all: no flow record, no Redis connection, no WorkJob.
+                // Carrying the checkpoint through the wire was considered
+                // and rejected — a checkpoint is a directory on THIS
+                // machine's filesystem, and the peer has no access to it,
+                // so "resume on the peer" has no meaning to build toward
+                // without a checkpoint-transfer feature this issue does
+                // not ask for. Refusal is the correct behavior, not a
+                // smaller compromise.
+                if opts.resume_from.is_some() {
+                    return Err(anyhow!(
+                        "darkmux dispatch: --resume-from is not supported with \
+                         --machine={target} (role `{}`): a queued dispatch runs on the \
+                         PEER machine via the fleet work queue, which carries no \
+                         checkpoint — the peer would start fresh and report success \
+                         under a name that looked like a resume. darkmux never \
+                         silently starts a dispatch fresh under a name that looked \
+                         like a resume: resume on THIS machine (drop --machine) or \
+                         start this role fresh on the peer on purpose (drop \
+                         --resume-from).",
+                        opts.role_id
+                    ));
+                }
                 // PR-C.3 review MEDIUM (Wave-E.7): local machine_id is
                 // unresolvable (no DARKMUX_MACHINE_ID, hostname failed).
                 // Routing via queue is the only option — surface the
@@ -490,6 +519,23 @@ pub fn dispatch_routed_via(
                 target,
                 local_unknown: false,
             } => {
+                // (#2584) Same refusal as the `local_unknown: true` arm
+                // above — see its comment for the full mechanism and why
+                // carrying the checkpoint through the wire is not the fix.
+                if opts.resume_from.is_some() {
+                    return Err(anyhow!(
+                        "darkmux dispatch: --resume-from is not supported with \
+                         --machine={target} (role `{}`): a queued dispatch runs on the \
+                         PEER machine via the fleet work queue, which carries no \
+                         checkpoint — the peer would start fresh and report success \
+                         under a name that looked like a resume. darkmux never \
+                         silently starts a dispatch fresh under a name that looked \
+                         like a resume: resume on THIS machine (drop --machine) or \
+                         start this role fresh on the peer on purpose (drop \
+                         --resume-from).",
+                        opts.role_id
+                    ));
+                }
                 let session_id =
                     dispatch::emit_route_record_and_resolve_session(&opts, Some(&target));
                 let mut opts = opts;
@@ -664,6 +710,7 @@ pub(crate) fn completion_to_dispatch_result(c: CompletionResult) -> DispatchResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // (#842) `build_work_job` is the single constructor for every WorkJob that
     // crosses the fleet wire, and had ZERO tests. A field-swap (workdir landing
@@ -890,6 +937,694 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("injected failure"), "{err}");
+    }
+
+    // ─── #2584: `--resume-from` routed to a peer via `--machine` must
+    //     refuse BEFORE the fleet queue is ever touched ─────────────────
+    //
+    // `dispatch_via_queue` publishes a `WorkJob` that carries no
+    // `resume_from` field at all (`queue.rs`'s `WorkJob` struct has none),
+    // and the runner reconstructs `DispatchOpts` on the peer with
+    // `resume_from: None` hardcoded (`runner.rs`). Before this fix, a
+    // dispatch with `--machine <peer> --resume-from <dir>` sailed straight
+    // past `dispatch()`'s own #2561/#2580 checkpoint refusals (which live
+    // deep inside `crew::dispatch::dispatch`, never reached here) and
+    // published a job that would start FRESH on the peer and exit 0 — the
+    // exact promise-break #2561/#2580 closed on the other two routes,
+    // reachable a third way.
+    //
+    // Same ORDER discipline as `dispatch_remote_refuses_resume_from_
+    // before_the_http_call` (#2580, `darkmux-crew`): asserting only that
+    // `dispatch_routed_via` returns an `Err` whose text mentions "resume"
+    // cannot tell "refused before the queue was touched" apart from "the
+    // queue rejected the job for an unrelated reason" — both produce an
+    // `Err`. So this proves ORDER directly: a real loopback TCP listener
+    // stands in for the fleet's Redis, and it must NEVER accept a
+    // connection — `dispatch_via_queue`'s `redis::Client::open` +
+    // `publish_job` is the only thing in this path that would ever dial
+    // it.
+
+    /// Spawn a bare TCP listener that records every accepted connection on
+    /// `tx` and answers nothing (no Redis handshake, no protocol at all —
+    /// it doesn't need to LOOK like Redis, it only needs to prove whether
+    /// anything tried to connect). Deliberately simpler than
+    /// `spawn_silent_redis_peer` above: this test's claim is "zero
+    /// connections", not "the connection succeeds and then stalls", so
+    /// there is nothing to gain from completing a real Redis handshake.
+    fn spawn_connection_counting_peer() -> (u16, std::sync::mpsc::Receiver<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(_stream) = stream else { continue };
+                let _ = tx.send(());
+            }
+        });
+        // Small settling margin only — `bind` already puts the socket in LISTEN.
+        std::thread::sleep(Duration::from_millis(50));
+        (port, rx)
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_routed_via_refuses_resume_from_before_the_queue_is_touched() {
+        let (port, rx) = spawn_connection_counting_peer();
+        let flows_dir = tempfile::TempDir::new().unwrap();
+
+        let prev_machine = std::env::var("DARKMUX_MACHINE_ID").ok();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            // Local machine differs from the `--machine` target below, so
+            // `routing_decision` resolves `Remote { local_unknown: false }`
+            // — the ordinary cross-machine case, not the unresolvable-local
+            // warning arm. That sibling arm cannot be forced into
+            // `local_unknown: true` from a portable unit test (it requires
+            // BOTH `DARKMUX_MACHINE_ID` unset AND the `hostname` shell-out
+            // to fail) — its identical guard is instead proven by the
+            // structural conformance test below,
+            // `every_dispatch_via_queue_call_site_is_guarded_against_
+            // resume_from`, which reads this file's own source rather than
+            // running it.
+            std::env::set_var("DARKMUX_MACHINE_ID", "local-a");
+            // Points the fleet queue's Redis client at the counting peer.
+            // If the refusal did NOT run first, `dispatch_via_queue` would
+            // dial this exact address.
+            std::env::set_var("DARKMUX_REDIS_URL", format!("redis://127.0.0.1:{port}"));
+            // Points the flow crate's LocalFileSink at a private, empty
+            // directory. `local_sink_dir()` re-resolves this env var LIVE
+            // on every `write()` (see its own doc — deliberately not
+            // baked in at sink-construction time), so this reliably
+            // targets THIS call's record, not whatever directory an
+            // earlier test in this binary happened to freeze into the
+            // process-wide sink singleton.
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+
+        let mut opts = local_opts("pr-reviewer");
+        opts.machine = Some("peer-b".to_string());
+        opts.resume_from = Some(std::path::PathBuf::from("/tmp/darkmux-2584-checkpoint"));
+
+        let err = dispatch_routed_via(opts, |_opts| {
+            panic!(
+                "local_dispatch must never be invoked for a --machine=peer-b dispatch \
+                 (this closure is the LOCAL fall-through seam; a remote target must never \
+                 reach it regardless of resume_from)"
+            );
+        })
+        .expect_err("--resume-from with --machine=<peer> must refuse, not route to the queue");
+        let msg = format!("{err:#}");
+
+        unsafe {
+            match prev_machine {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ID", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        // POSITIVE: names the routed path and carries the same promise the
+        // other two #2561/#2580 guards state — this makes it true here too.
+        assert!(
+            msg.contains("--machine=peer-b"),
+            "must name the pinned target machine as the reason: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "darkmux never silently starts a dispatch fresh under a name that looked \
+                 like a resume"
+            ),
+            "must carry the same promise the other two guards state: {msg}"
+        );
+
+        // ORDER — no queue write, no job enqueued: the counting peer must
+        // never have been dialed. A regression that deleted the check, or
+        // moved it to run only after `dispatch_via_queue`'s
+        // `redis::Client::open`/`publish_job`, would let this connect.
+        match rx.recv_timeout(Duration::from_millis(300)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(()) => panic!(
+                "dispatch_via_queue must never run for a refused resume, but the mock \
+                 fleet-queue peer accepted a connection"
+            ),
+            Err(e) => panic!("unexpected mock channel state: {e:?}"),
+        }
+
+        // ORDER — no records emitted: `emit_route_record_and_resolve_
+        // session` (the "dispatch route" flow record) must never have run
+        // either. It writes through the LocalFileSink, which re-resolves
+        // `DARKMUX_FLOWS_DIR` live per write (see the env-var comment
+        // above) — so finding this private directory still empty proves
+        // the emit call was never reached, not merely that a write to it
+        // failed or landed elsewhere.
+        let files: Vec<_> = std::fs::read_dir(flows_dir.path())
+            .map(|rd| rd.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        assert!(
+            files.is_empty(),
+            "no flow record may be written before the resume-from refusal fires; \
+             found in {}: {files:?}",
+            flows_dir.path().display()
+        );
+    }
+
+    // ─── #2584 conformance: every call site of `dispatch_via_queue` must be
+    //     guarded against `resume_from` ─────────────────────────────────
+    //
+    // The test above pins the ONE reachable route (`local_unknown: false`,
+    // the ordinary cross-machine case). It cannot exercise the sibling
+    // `local_unknown: true` arm's guard end-to-end — that requires BOTH
+    // `DARKMUX_MACHINE_ID` unset AND the `hostname` shell-out to fail,
+    // which is not something a portable unit test can force (the existing
+    // `routing_decision_machine_set_but_local_unknown_warns` test in
+    // `darkmux-crew` covers that arm only at the pure-decision-matrix
+    // level, same limitation). This check closes that runtime gap
+    // structurally instead: it does not run `dispatch_routed_via`, it
+    // reads `routing.rs`'s own source and proves BOTH match arms carry the
+    // guard, so a future edit that (say) restores only one arm's refusal —
+    // or drops it during a refactor of this match — fails a fast test even
+    // though no realistic runtime scenario would ever exercise the
+    // untouched arm.
+    //
+    // **Same shape as `darkmux-crew`'s `every_dispatch_remote_call_site_
+    // is_guarded_against_resume_from` (#2580), NOT an extension of it.**
+    // That check is hard-pinned to one file (`dispatch_internal.rs`) and
+    // one identifier (`dispatch_remote`) in a DIFFERENT crate; generalizing
+    // it to also cover `dispatch_via_queue` here would mean a
+    // crate-or-workspace-wide scan — exactly the redesign its own doc
+    // comment says a genuine visibility change would require, not
+    // something worth building for a second, unrelated chokepoint. The
+    // lexer discipline below (comment/string-aware, brace-matched,
+    // structural if-block requirement) is copied in shape from that check
+    // — same false-positive/false-negative traps apply to any text scan
+    // over Rust source — but it is its own, separately-scoped check over
+    // `routing.rs`, matching this file's much smaller premise (one caller
+    // function, one private non-`pub` callee, no descendant module besides
+    // its own inline `mod tests`).
+    //
+    // **What this cannot see, named plainly (same limits as #2580's
+    // check, for the same reasons):**
+    // - A `pub`/`pub(crate)` widening of `dispatch_via_queue`, or a new
+    //   descendant module — both are pinned by the assertions below, so
+    //   either fails LOUD rather than silently, but if `dispatch_via_queue`
+    //   genuinely needs wider visibility this scan's premise is gone.
+    // - A reimplementation of "publish this dispatch to the fleet queue"
+    //   that never calls `dispatch_via_queue` itself.
+    // - A call reached only through a function-pointer alias.
+    // - A call inside an `impl` block method or a macro body (the function
+    //   extractor only indexes column-0 `fn`/`pub fn` items) — this FAILS
+    //   THE TEST LOUDLY (a panic naming the shape) rather than silently
+    //   certifying it.
+    // - A guard whose message text is factored into a helper function
+    //   instead of inlined at the `return Err`/`bail!` site — the anchor
+    //   match is textual against the CALLING function's own body.
+    // - The anchor match inside a qualifying block is still TEXTUAL, not a
+    //   real control-flow prover — accepted as vanishingly unlikely given
+    //   how specific the anchor phrase is, same as #2580's check accepts.
+
+    /// If `cs[i]` begins a `//` line comment, `/* */` block comment, raw
+    /// string, ordinary string, or char literal, returns the index just
+    /// past it. Otherwise `None` — genuine code. Copied in shape from
+    /// `darkmux-crew`'s `dispatch_internal_tests::skip_non_code_span`
+    /// (different crate; that one isn't reachable from here).
+    fn skip_non_code_span(cs: &[char], i: usize) -> Option<usize> {
+        let c = cs[i];
+        let next = cs.get(i + 1).copied();
+        match c {
+            '/' if next == Some('/') => {
+                let mut j = i;
+                while j < cs.len() && cs[j] != '\n' {
+                    j += 1;
+                }
+                Some(j)
+            }
+            '/' if next == Some('*') => {
+                let mut j = i + 2;
+                while j + 1 < cs.len() && !(cs[j] == '*' && cs[j + 1] == '/') {
+                    j += 1;
+                }
+                Some((j + 2).min(cs.len()))
+            }
+            'r' if next == Some('"') || next == Some('#') => {
+                let mut hashes = 0usize;
+                let mut j = i + 1;
+                while cs.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if cs.get(j) != Some(&'"') {
+                    return None;
+                }
+                j += 1;
+                loop {
+                    if j >= cs.len() {
+                        break;
+                    }
+                    if cs[j] == '"' && (1..=hashes).all(|k| cs.get(j + k) == Some(&'#')) {
+                        j += 1 + hashes;
+                        break;
+                    }
+                    j += 1;
+                }
+                Some(j)
+            }
+            '"' => {
+                let mut j = i + 1;
+                while j < cs.len() && cs[j] != '"' {
+                    if cs[j] == '\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                Some((j + 1).min(cs.len()))
+            }
+            '\'' => {
+                let is_char_lit = match next {
+                    Some('\\') => true,
+                    Some(_) => cs.get(i + 2) == Some(&'\''),
+                    None => false,
+                };
+                if is_char_lit {
+                    let mut j = i + 1;
+                    while j < cs.len() && cs[j] != '\'' {
+                        if cs[j] == '\\' {
+                            j += 1;
+                        }
+                        j += 1;
+                    }
+                    Some((j + 1).min(cs.len()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Every top-level (column-0) function in `src`, as `(name,
+    /// body_start, body_end)` byte-offset spans covering from the opening
+    /// `{` through its matching closing `}`. Same algorithm as
+    /// `darkmux-crew`'s `top_level_function_spans`.
+    fn top_level_function_spans(src: &str) -> Vec<(String, usize, usize)> {
+        let mut spans = Vec::new();
+        let cs: Vec<char> = src.chars().collect();
+        let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            let at_line_start = i == 0 || cs[i - 1] == '\n';
+            if at_line_start {
+                let rest: String = cs[i..(i + 8).min(cs.len())].iter().collect();
+                let (is_fn, kw_len) = if rest.starts_with("pub fn ") {
+                    (true, 7)
+                } else if rest.starts_with("fn ") {
+                    (true, 3)
+                } else {
+                    (false, 0)
+                };
+                if is_fn {
+                    let name_start = i + kw_len;
+                    let mut k = name_start;
+                    while k < cs.len() && (cs[k].is_alphanumeric() || cs[k] == '_') {
+                        k += 1;
+                    }
+                    let name: String = cs[name_start..k].iter().collect();
+                    let mut j = k;
+                    let mut paren_depth = 0i32;
+                    while j < cs.len() {
+                        match cs[j] {
+                            '(' => paren_depth += 1,
+                            ')' => paren_depth -= 1,
+                            '{' if paren_depth == 0 => break,
+                            ';' if paren_depth == 0 => break,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if j < cs.len() && cs[j] == '{' {
+                        let mut depth = 0i32;
+                        let mut m = j;
+                        let body_start_char = j;
+                        loop {
+                            if m >= cs.len() {
+                                break;
+                            }
+                            match cs[m] {
+                                '{' => depth += 1,
+                                '}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        let start_b = byte_offsets[body_start_char];
+                                        let end_b = if m + 1 < byte_offsets.len() {
+                                            byte_offsets[m + 1]
+                                        } else {
+                                            src.len()
+                                        };
+                                        spans.push((name.clone(), start_b, end_b));
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            m += 1;
+                        }
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        spans
+    }
+
+    /// Every top-level `mod`/`pub mod`/`pub(crate) mod` DECLARATION line in
+    /// `src` (comment/string-aware). Every module declared here is a
+    /// DESCENDANT module, and Rust makes this file's private items
+    /// (including `dispatch_via_queue`) visible to every descendant.
+    fn top_level_mod_declarations(src: &str) -> Vec<String> {
+        let cs: Vec<char> = src.chars().collect();
+        let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            let at_line_start = i == 0 || cs[i - 1] == '\n';
+            if at_line_start {
+                let lookahead: String = cs[i..(i + 15).min(cs.len())].iter().collect();
+                let is_mod_decl = lookahead.starts_with("mod ")
+                    || lookahead.starts_with("pub mod ")
+                    || lookahead.starts_with("pub(crate) mod ");
+                if is_mod_decl {
+                    let mut j = i;
+                    while j < cs.len() && cs[j] != '\n' {
+                        j += 1;
+                    }
+                    let b0 = byte_offsets[i];
+                    let b1 = if j < byte_offsets.len() { byte_offsets[j] } else { src.len() };
+                    out.push(src[b0..b1].trim().to_string());
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Every call-shaped occurrence of `name` in `src`: the whole
+    /// identifier (not a longer identifier that merely contains it), found
+    /// only at genuine code positions, followed by optional whitespace and
+    /// then `(`. Excludes the `fn <name>(` / `pub fn <name>(` declaration
+    /// itself. Returns the byte offset of the start of `name` for each hit.
+    fn find_calls(src: &str, name: &str) -> Vec<usize> {
+        let cs: Vec<char> = src.chars().collect();
+        let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
+        let name_chars: Vec<char> = name.chars().collect();
+        let mut hits = Vec::new();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            let end = i + name_chars.len();
+            let name_matches = end <= cs.len() && cs[i..end] == name_chars[..];
+            if name_matches {
+                let before_ok = i == 0 || !(cs[i - 1].is_alphanumeric() || cs[i - 1] == '_');
+                let after_ok = cs.get(end).map(|c| !(c.is_alphanumeric() || *c == '_')).unwrap_or(true);
+                if before_ok && after_ok {
+                    let mut j = end;
+                    while j < cs.len() && matches!(cs[j], ' ' | '\t' | '\r' | '\n') {
+                        j += 1;
+                    }
+                    let is_call = cs.get(j) == Some(&'(');
+                    let prefix: String = cs[i.saturating_sub(4)..i].iter().collect();
+                    let is_declaration = prefix.ends_with("fn ");
+                    if is_call && !is_declaration {
+                        hits.push(byte_offsets[i]);
+                    }
+                }
+            }
+            i += 1;
+        }
+        hits
+    }
+
+    /// Every top-level-ish `if` in `body`, as `(cond_start, block_start,
+    /// block_end)` byte offsets INTO `body`.
+    fn find_if_blocks(body: &str) -> Vec<(usize, usize, usize)> {
+        let cs: Vec<char> = body.chars().collect();
+        let byte_offsets: Vec<usize> = body.char_indices().map(|(b, _)| b).collect();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            let before_ok = i == 0 || !(cs[i - 1].is_alphanumeric() || cs[i - 1] == '_');
+            let lookahead: String = cs[i..(i + 3).min(cs.len())].iter().collect();
+            let is_if = before_ok && (lookahead.starts_with("if ") || lookahead.starts_with("if("));
+            if is_if {
+                let cond_start = i;
+                let mut j = i + 2;
+                let mut paren_depth = 0i32;
+                loop {
+                    if j >= cs.len() {
+                        break;
+                    }
+                    if let Some(skip_to) = skip_non_code_span(&cs, j) {
+                        j = skip_to;
+                        continue;
+                    }
+                    match cs[j] {
+                        '(' => paren_depth += 1,
+                        ')' => paren_depth -= 1,
+                        '{' if paren_depth <= 0 => break,
+                        ';' if paren_depth <= 0 => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j < cs.len() && cs[j] == '{' {
+                    let block_start_char = j;
+                    let mut depth = 0i32;
+                    let mut m = j;
+                    loop {
+                        if m >= cs.len() {
+                            break;
+                        }
+                        if let Some(skip_to) = skip_non_code_span(&cs, m) {
+                            m = skip_to;
+                            continue;
+                        }
+                        match cs[m] {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    let cond_start_b = byte_offsets[cond_start];
+                                    let block_start_b = byte_offsets[block_start_char];
+                                    let block_end_b =
+                                        if m + 1 < byte_offsets.len() { byte_offsets[m + 1] } else { body.len() };
+                                    out.push((cond_start_b, block_start_b, block_end_b));
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        m += 1;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Collapse Rust string-literal line continuations (a `\` immediately
+    /// followed by a newline strips the newline and the next line's
+    /// leading whitespace) — this repo wraps long operator-facing messages
+    /// that way, so a raw-byte substring search for a multi-word anchor
+    /// would be brittle to wherever the literal happens to be wrapped.
+    fn collapse_str_continuations(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let cs: Vec<char> = s.chars().collect();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if cs[i] == '\\' && cs.get(i + 1) == Some(&'\n') {
+                i += 2;
+                while i < cs.len() && matches!(cs[i], ' ' | '\t' | '\r' | '\n') {
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(cs[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// The phrase every `--machine`+`--resume-from` guard must contain —
+    /// the same promise `validate_resume_checkpoint` (container path) and
+    /// the #2561/#2580 remote-single-shot guards state, restated true for
+    /// the queued-peer route.
+    const RESUME_FROM_GUARD_ANCHOR: &str =
+        "darkmux never silently starts a dispatch fresh under a name that looked like a resume";
+
+    /// True iff `body[..call_at_in_body]` contains an `if` block whose
+    /// CONDITION mentions `resume_from`, whose block closes at or before
+    /// `call_at_in_body`, and whose block text (after `\`-continuation
+    /// collapsing) contains BOTH `RESUME_FROM_GUARD_ANCHOR` and a
+    /// diverging construct (`return Err`/`bail!`/`panic!`).
+    fn resume_from_guard_precedes(body: &str, call_at_in_body: usize) -> bool {
+        for (cond_start, block_start, block_end) in find_if_blocks(body) {
+            if block_end > call_at_in_body {
+                continue;
+            }
+            let cond_text = &body[cond_start..block_start];
+            if !cond_text.contains("resume_from") {
+                continue;
+            }
+            let block_text = collapse_str_continuations(&body[block_start..block_end]);
+            let diverges = block_text.contains("bail!")
+                || block_text.contains("return Err")
+                || block_text.contains("panic!");
+            if diverges && block_text.contains(RESUME_FROM_GUARD_ANCHOR) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Every genuine-code occurrence of the literal substring `needle` in
+    /// `src` (comment/string-aware, via `skip_non_code_span`), as byte
+    /// offsets. Needed because this conformance test's own source lives in
+    /// the SAME FILE it scans (`routing.rs`'s `mod tests` is inline, unlike
+    /// `dispatch_internal.rs` + its separate `dispatch_internal_tests.rs`
+    /// in `darkmux-crew`) — a raw `str::matches` would also count this very
+    /// test's own doc comments and the `DEFINITION_MARKER` string literal's
+    /// VALUE as "occurrences", exactly the kind of false positive #2580's
+    /// own review found and fixed for its sibling check.
+    fn find_code_substring_occurrences(src: &str, needle: &str) -> Vec<usize> {
+        let cs: Vec<char> = src.chars().collect();
+        let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
+        let needle_chars: Vec<char> = needle.chars().collect();
+        let mut hits = Vec::new();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            let end = i + needle_chars.len();
+            if end <= cs.len() && cs[i..end] == needle_chars[..] {
+                hits.push(byte_offsets[i]);
+            }
+            i += 1;
+        }
+        hits
+    }
+
+    #[test]
+    fn every_dispatch_via_queue_call_site_is_guarded_against_resume_from() {
+        const DEFINITION_MARKER: &str = "fn dispatch_via_queue(";
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routing.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {} for resume_from conformance: {e}", path.display()));
+
+        let functions = top_level_function_spans(&src);
+        assert!(
+            functions.len() > 5,
+            "sanity: found only {} top-level fns in routing.rs — the extractor is almost \
+             certainly broken, not this file suddenly tiny",
+            functions.len()
+        );
+
+        // ── pin: `dispatch_via_queue` stays module-PRIVATE ──────────────
+        let definitions = find_code_substring_occurrences(&src, DEFINITION_MARKER);
+        assert_eq!(
+            definitions.len(),
+            1,
+            "expected exactly one code-position `{DEFINITION_MARKER}` declaration — found {}",
+            definitions.len()
+        );
+        let def_at = definitions[0];
+        let line_prefix = src[..def_at].rsplit('\n').next().unwrap_or("");
+        assert_eq!(
+            line_prefix, "",
+            "`dispatch_via_queue` must stay module-PRIVATE for this scan's premise to hold — \
+             found `{line_prefix}fn dispatch_via_queue(`, which reads as widened visibility. \
+             If it genuinely needs wider visibility, this scan's premise is gone and it needs a \
+             real redesign (a crate-or-workspace-wide scan), not a bigger pin."
+        );
+
+        // ── pin: this file declares no descendant module other than its
+        //    own inline `#[cfg(test)] mod tests` ────────────────────────
+        let mod_decls = top_level_mod_declarations(&src);
+        assert_eq!(
+            mod_decls,
+            vec!["mod tests {".to_string()],
+            "this scan's premise requires this file to declare NO descendant module other than \
+             its own `#[cfg(test)] mod tests` — found: {mod_decls:?}. A new `mod` here is a \
+             place a call to `dispatch_via_queue(` could live that this scan cannot see."
+        );
+
+        let call_offsets = find_calls(&src, "dispatch_via_queue");
+        assert!(
+            !call_offsets.is_empty(),
+            "found zero calls to `dispatch_via_queue(` — either the extractor regressed or the \
+             function was deleted; either way this test's premise no longer holds"
+        );
+        assert_eq!(
+            call_offsets.len(),
+            2,
+            "expected exactly the two known call sites (both Remote arms of \
+             `dispatch_routed_via`'s match) — found {}. A new call site needs the same guard \
+             this test enforces on the existing two; update this count once it does.",
+            call_offsets.len()
+        );
+
+        for call_at in call_offsets {
+            let (fn_name, fn_start, fn_end) = functions
+                .iter()
+                .find(|(_, start, end)| *start <= call_at && call_at < *end)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a `dispatch_via_queue(` call at byte offset {call_at} is not inside any \
+                         top-level (column-0 `fn`/`pub fn`) function this scan indexes — extend \
+                         `top_level_function_spans` before this test can vouch for it."
+                    )
+                });
+            let body = &src[*fn_start..*fn_end];
+            let call_at_in_body = call_at - fn_start;
+
+            assert!(
+                resume_from_guard_precedes(body, call_at_in_body),
+                "`{fn_name}` calls `dispatch_via_queue(` at file offset {call_at} without a \
+                 `resume_from`-conditioned guard preceding it — this is the #2561/#2580/#2584 \
+                 bypass class: a caller can silently spend real tokens on a PEER machine under \
+                 a --resume-from flag that was never honored. The guard must sit inside an `if` \
+                 whose condition mentions `resume_from`, closes before the call, and contains \
+                 both {RESUME_FROM_GUARD_ANCHOR:?} and a diverging bail!/return Err/panic!."
+            );
+        }
     }
 
     // ─── `wait_for_completion` against an accepts-but-never-answers peer (#2243) ───

@@ -436,8 +436,17 @@ pub struct DispatchOpts {
     /// `DockerRunConfig::resume_checkpoint = true` so `--resume` reaches
     /// the container. `None` (every existing caller) preserves the
     /// fresh-start behavior exactly. A remote-endpoint dispatch never
-    /// reaches the gate at all and ignores `resume_from` outright — a known
-    /// bypass, filed as #2561. See `dispatch_internal`'s
+    /// reaches THIS gate at all — it forks to `dispatch_remote` before
+    /// this check runs — so it carries its OWN refusal instead (#2561,
+    /// closed by #2580): both `dispatch()`'s remote fork and the
+    /// `dispatch_local_single_shot` primitive refuse `resume_from` before
+    /// the HTTP call, rather than silently starting fresh. A `darkmux
+    /// dispatch --machine <peer>` invocation is routed to the fleet queue
+    /// even earlier than that — before `dispatch()` (and so this gate) is
+    /// ever called — and carries the analogous refusal in
+    /// `darkmux-fleet`'s `dispatch_routed_via` (#2584): the queue's
+    /// `WorkJob` has no checkpoint field, so a queued dispatch has no way
+    /// to honor one on the peer either. See `dispatch_internal`'s
     /// `validate_resume_checkpoint` (the early gate) and
     /// `write_staged_resume_checkpoint` (the later write) for the
     /// validate-then-stage mechanics and the `resumed_from` provenance
