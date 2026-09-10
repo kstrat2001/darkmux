@@ -177,6 +177,18 @@ pub struct Run {
     pub id: String,
     pub kind: RunKind,
     pub status: RunStatus,
+    /// (#1810) This field carries TWO different meanings depending on
+    /// `kind`, both labeled "machine" on the wire. A locally-tracked
+    /// mission row (`mission_to_run`) reports the MINT host — the durable
+    /// `Mission.machine`, stamped once at creation and never overwritten
+    /// by whichever host later executes the dispatches. A remote-mission
+    /// row (`flow_mission_to_run`, from `FlowMissionAgg.machine`) and a
+    /// lab row (`lab_summary_to_run`, the daemon's own declared
+    /// `machine_id`) both report the EXECUTION host instead — there is no
+    /// separate durable mint-site fact for either of those paths. A
+    /// machine-pinned filter/lens built on this field should know which
+    /// question it is answering for a given `kind`, not assume one
+    /// consistent meaning across all three.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub machine: Option<String>,
@@ -971,7 +983,10 @@ fn mission_to_run(
     // EXISTENCE survived the window; this one ATTRIBUTE on it did not. The
     // flow-derived fallback stays for missions minted before this field
     // existed (or where `resolve_machine_id()` had nothing to stamp).
-    let machine = mission.machine.clone().or_else(|| representative.and_then(|(_, s)| s.machine.clone()));
+    let machine = mission
+        .machine
+        .clone()
+        .or_else(|| representative.and_then(|(_, s)| s.machine.clone()));
     let route = remote.and_then(|(_, s)| s.endpoint.clone());
     let start_ts_str = representative.and_then(|(_, s)| s.start_ts.clone());
     // (#2487) Filtered too — and this one is the load-bearing half of the
@@ -1572,21 +1587,28 @@ fn lab_staffing_role_model_route(
 /// Tracked runs (missions, lab runs) are unaffected in EXISTENCE — they're
 /// durable records, listed and readable in full regardless of age. They
 /// are NOT unaffected in ATTRIBUTION (#1810 — an earlier version of this
-/// comment claimed otherwise, and was wrong): `route`, `role` and `model`
-/// are resolved by joining a mission to its flow SESSIONS
+/// comment claimed `route`, `role` AND `model` were all windowed; that was
+/// also wrong, just wrong in a different direction). `route` and `model`
+/// really are resolved ONLY by joining a mission to its flow SESSIONS
 /// (`mission_to_run`), and that join is exactly as windowed as ghost
-/// synthesis is. A mission whose dispatches all predate this window loses
-/// those three fields even though the mission record and the flow
-/// day-file holding the fact are both still fully intact on disk — the
-/// fact is real and durable, but the only path to it is this windowed
-/// derivation. `machine` is the one exception: since #1810 it is stamped
-/// durably on the mission record itself at creation
-/// (`Mission::machine`), so it survives the window; `lab_summary_to_run`
-/// was never affected either way, because it reads the daemon's own
-/// `machine_id` directly rather than deriving it from flow. A discoverable
-/// knob (a named const, not a magic number scattered inline) rather than
-/// adaptive-silent, per CLAUDE.md's "cadence is a recorded knob"
-/// observability doctrine.
+/// synthesis is — a mission whose dispatches all predate this window
+/// loses both fields even though the mission record and the flow
+/// day-file holding the fact are both still fully intact on disk. `role`
+/// is different: for a Dispatch-kind mission (a crew-of-one — see
+/// `classify_mission`), `mission_to_run` prefers the STRUCTURAL
+/// `Task.role_id` — the operator's requested role, on disk on the Task
+/// itself, independent of flow retention — over the flow-derived value,
+/// so role survives this window for the majority of rows. It stays
+/// flow-derived (and therefore windowed) only for a Mission-kind run,
+/// where a single mission can span many steps and therefore many
+/// distinct roles with no one durable value to prefer. `machine` is the
+/// other exception: since #1810 it is stamped durably on the mission
+/// record itself at creation (`Mission::machine`), so it survives the
+/// window; `lab_summary_to_run` was never affected either way, because it
+/// reads the daemon's own `machine_id` directly rather than deriving it
+/// from flow. A discoverable knob (a named const, not a magic number
+/// scattered inline) rather than adaptive-silent, per CLAUDE.md's
+/// "cadence is a recorded knob" observability doctrine.
 const RUNS_FLOW_SCAN_WINDOW_DAYS: i64 = 14;
 
 /// Per-session_id rollup built by ONE pass over the flow stream
@@ -4329,6 +4351,91 @@ mod tests {
             Some("durable-studio"),
             "machine must come from the mission's OWN durable field, surviving the flow retention \
              window entirely — not from the (unreachable, out-of-window) flow session: {runs:?}"
+        );
+    }
+
+    /// (#1810 QA must-fix 2) `machine` prefers the durable `Mission.machine`
+    /// even when a LIVE, in-window flow session exists and DISAGREES with
+    /// it — not just when the flow session is unreachable (the prior
+    /// test's shape, where precedence was untested: a flow-first-with-
+    /// durable-fallback order would have passed that test identically).
+    /// Pins the precedence actually chosen at `mission_to_run`'s
+    /// `let machine = mission.machine.clone().or_else(...)` line: the
+    /// mint-time host wins unconditionally. Rationale: `Mission.machine`
+    /// is stamped once, at creation, by whichever machine ran
+    /// `dispatch_as_crew_of_one::build_graph` (or `mission_launch`'s
+    /// equivalent) — it answers "where was this mission minted", a fact
+    /// that cannot be changed by a later dispatch executing somewhere
+    /// else. A future feature that wants "which host actually EXECUTED
+    /// the work" (distinct from "which host minted it") needs its own
+    /// field, not a change to this precedence.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_durable_machine_wins_over_a_disagreeing_live_flow_session() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut mission = minimal_mission(
+            "disagree-mission-1",
+            vec!["disagree-mission-1-phase".to_string()],
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+        );
+        mission.machine = Some("orchestrator-mint-host".to_string());
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase(
+            "disagree-mission-1-phase",
+            "disagree-mission-1",
+            vec!["disagree-mission-1-task".to_string()],
+        );
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task(
+            "disagree-mission-1-task",
+            "disagree-mission-1-phase",
+            vec!["disagree-mission-1-step".to_string()],
+            Some("coder"),
+        );
+        darkmux_crew::lifecycle::save_task("disagree-mission-1", &task).unwrap();
+        let step = minimal_step(
+            "disagree-mission-1-step",
+            "disagree-mission-1-task",
+            Some("crew-dispatch-disagree-xyz"),
+        );
+        darkmux_crew::lifecycle::save_step("disagree-mission-1", "disagree-mission-1-phase", &step).unwrap();
+
+        // Entirely INSIDE the flow retention window (today's day-file),
+        // stamped with a DIFFERENT machine — the peer that actually ran
+        // the dispatch — so this is a live disagreement, not an absence.
+        let day = today();
+        write_day_file(
+            flows.path(),
+            &day,
+            &[
+                serde_json::json!({
+                    "ts": format!("{day}T09:00:00Z"),
+                    "action": "dispatch start",
+                    "session_id": "crew-dispatch-disagree-xyz",
+                    "handle": "coder",
+                    "machine_id": "peer-runner-that-actually-ran-it",
+                }),
+                serde_json::json!({
+                    "ts": format!("{day}T09:10:00Z"),
+                    "action": "dispatch complete",
+                    "session_id": "crew-dispatch-disagree-xyz",
+                    "handle": "coder",
+                    "model": "qwen3.6-35b-a3b",
+                    "machine_id": "peer-runner-that-actually-ran-it",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        assert_eq!(runs.len(), 1, "exactly one Run: {runs:?}");
+        assert_eq!(runs[0].id, "disagree-mission-1");
+        assert_eq!(
+            runs[0].machine.as_deref(),
+            Some("orchestrator-mint-host"),
+            "durable Mission.machine must win over a live, in-window, DISAGREEING flow session \
+             — pinning the precedence chosen at mission_to_run's `let machine = ...` line: {runs:?}"
         );
     }
 

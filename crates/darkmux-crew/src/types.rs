@@ -362,12 +362,19 @@ pub struct Mission {
     /// mission created where `resolve_machine_id()` itself returns `None`,
     /// e.g. a sandboxed CI run with no `hostname` binary) — `mission_to_
     /// run` falls back to the flow-derived value for those, same as
-    /// before. `route`/`role`/`model` are deliberately NOT given the same
-    /// treatment: a mission can span many dispatches across many models
-    /// and (for role) many distinct steps, so there is no single durable
-    /// value to stamp for those the way there is for machine (a mission
-    /// runs on exactly one host); they stay flow-derived and therefore
-    /// still windowed.
+    /// before. `route`/`model` are deliberately NOT given the same
+    /// treatment ON THIS TYPE: a mission can span many dispatches across
+    /// many endpoints and models, so there is no single durable value to
+    /// stamp for those the way there is for machine (a mission runs on
+    /// exactly one host); they stay flow-derived and therefore still
+    /// windowed. `role` is a different case, not a third instance of the
+    /// same gap: it has no field on `Mission` either, but a Dispatch-kind
+    /// mission (a crew-of-one) already has its OWN durable, per-mission
+    /// role source — the structural `Task.role_id`, on disk on the Task —
+    /// which `mission_to_run` prefers over the flow-derived value. Only a
+    /// Mission-kind run, which genuinely can span many steps and
+    /// therefore many distinct roles, has no single durable value and
+    /// stays flow-derived (and therefore windowed) for role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
 }

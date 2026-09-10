@@ -814,7 +814,13 @@ mod tests {
         registry
     }
 
-    // ── Pure graph-construction tests ───────────────────────────────────
+    // ── Graph-construction tests (no Docker, no model) ───────────────────
+    // Not literally pure: `build_graph` calls `resolve_machine_id()`, which
+    // shells out to `hostname(1)` once per process (OnceLock-cached, #1810)
+    // when no env/config override is set. Harmless and deterministic for
+    // these tests, but "pure" overstated it — these tests need no
+    // container and no model, which is the property that actually matters
+    // here.
 
     #[test]
     fn build_graph_is_one_phase_one_task_one_step() {
