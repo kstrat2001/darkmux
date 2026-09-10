@@ -525,15 +525,36 @@ pub struct DispatchOpts {
 /// the runtime's parser verbatim — an unknown flag exits the container 2.
 ///
 /// All optional: `None` ⇒ don't pass the flag ⇒ runtime uses its
-/// hardcoded default for that knob.
+/// hardcoded default for that knob — EXCEPT `compactor_model` (#2571):
+/// omitting `--compactor-model` no longer falls back to a runtime default.
+/// It disables compaction outright for this dispatch. See that field's own
+/// doc.
+///
+/// (Third review round) Not every constructor reads the profile. The bare
+/// `darkmux dispatch` CLI path (`src/main.rs`) and a few other callers
+/// (`lab`'s `prompt` provider, `review_bench.rs`, `crawl/unit_step.rs`)
+/// build a `default()` — every field `None`, including `threshold_tokens` —
+/// and separately patch in only `context_window` from the profile's `n_ctx`
+/// as a fallback (`dispatch_internal::ensure_context_window`). Only
+/// [`Self::from_profile`] reads `threshold_tokens`, so a claim that the
+/// threshold-only trigger is "reachable whenever the primary is
+/// endpoint-bearing" is true on the `from_profile` paths (the lab providers
+/// that call it directly, e.g. `coding_task`/`tool_bench`, and the loop
+/// override in `lab/loop_report.rs`) and false on the `default()` paths,
+/// where `threshold_tokens` never becomes `Some` regardless of what the
+/// profile declares.
 #[derive(Debug, Clone, Default)]
 pub struct CompactionDispatchArgs {
     /// Absolute trigger. Set from `profile.runtime.compaction.threshold_tokens`
     /// (typed v0.1 field, #357).
     pub threshold_tokens: Option<u32>,
-    /// Compactor model override. `None` by default — the runtime falls
-    /// back to its hardcoded default compactor model (or the machine's
-    /// bound `internal.utility` model via `apply_utility_model` below).
+    /// Compactor model override. `None` by default, overlaid from the
+    /// machine's bound `internal.utility` model via `apply_utility_model`
+    /// below. **Still `None` after that overlay ⇒ no compactor at all for
+    /// this dispatch (#2571)** — the runtime no longer has a hardcoded
+    /// fallback to fall back to; omitting `--compactor-model` disables
+    /// compaction outright rather than addressing an identifier nothing
+    /// loaded. See [`Self::unset_compactor_warning`].
     pub compactor_model: Option<String>,
     /// Adaptive-trigger fraction (0.1-0.9). Set from typed
     /// `profile.runtime.compaction.threshold_ratio` (#368 T2-A).
@@ -574,11 +595,14 @@ impl CompactionDispatchArgs {
             .and_then(|c| c.threshold_tokens)
             .and_then(|v| u32::try_from(v).ok());
         // (#368 clean break) Compactor model is a typed field only —
-        // no legacy-shape `extras["model"]` fallback. Until a typed
-        // `compaction.compactor_model` field exists, the runtime uses
-        // its hardcoded default `darkmux:qwen3-4b-instruct-2507`,
-        // which matches what a dispatch loads for the standard
-        // gestalt-residency workflow.
+        // no legacy-shape `extras["model"]` fallback. There is no
+        // `compaction.compactor_model` field on the profile schema, so
+        // this always starts `None` here; `apply_utility_model` (called
+        // by dispatchers that have the machine registry) overlays the
+        // bound `internal.utility` model afterward. If THAT is also
+        // unset, `compactor_model` stays `None` all the way through —
+        // and since #2571 that means no compactor for this dispatch,
+        // not a silent fallback to the runtime's old hardcoded default.
         let compactor_model: Option<String> = None;
         // (#368 clean break) Read from the typed schema field.
         // Operators wanting the adaptive trigger set
@@ -639,11 +663,65 @@ impl CompactionDispatchArgs {
     /// `from_profile` / `apply_role_override` from any dispatcher that has the
     /// registry. The utility model is the machine's standing support model —
     /// one global model for compaction (and future estimation / mission-
-    /// compile), decoupled from the profile. `None` (no binding) ⇒
-    /// untouched, so the runtime keeps its built-in default compactor.
+    /// compile), decoupled from the profile. `None` (no binding) ⇒ left
+    /// untouched, which since #2571 means `compactor_model` stays `None` —
+    /// no compactor for this dispatch, not a fallback to a runtime default
+    /// (the runtime no longer has one). See [`Self::unset_compactor_warning`]
+    /// for the operator-facing disclosure this leaves for the caller to
+    /// surface.
     pub fn apply_utility_model(&mut self, utility_model_id: Option<&str>) {
         if self.compactor_model.is_none() {
             self.compactor_model = utility_model_id.map(str::to_string);
+        }
+    }
+
+    /// (MUST FIX 1, #2571 follow-up) The host-side twin of the runtime's
+    /// own `compactor_disclosure_message`: fires under the identical
+    /// condition (`compactor_model` still `None` after every overlay, but a
+    /// real compaction trigger IS configured, so compaction would otherwise
+    /// have fired) at the point the host is about to apply — or, in this
+    /// case, skip applying — the compaction flags to the dispatch.
+    ///
+    /// (Second review round) The original version gated on `context_window`
+    /// alone, which left the absolute-threshold-only mode silent — the
+    /// compaction trigger also fires on `threshold_tokens` with no window
+    /// at all, and `CompactionDispatchArgs::from_profile` reads that field
+    /// independently of `context_window`. (Third review round: NOT
+    /// reachable on the bare `darkmux dispatch` path — that path builds a
+    /// `default()` args struct, never `from_profile`, so `threshold_tokens`
+    /// stays `None` there regardless of the profile; only `context_window`
+    /// gets a profile-derived fallback, via `ensure_context_window`. The
+    /// threshold-only arm is reachable through the paths that DO call
+    /// `from_profile` — the lab providers that derive compaction from a
+    /// profile up front, e.g. `coding_task`/`tool_bench`, and the loop
+    /// override in `lab/loop_report.rs`, which applies its overrides on top
+    /// of an already-`from_profile`-derived config.) A dispatch configured
+    /// threshold-only with no compactor, on any of those paths, is exactly
+    /// the long dispatch that would have compacted and now silently
+    /// doesn't. Fires on EITHER trigger now;
+    /// `None` only when a compactor is configured, or when neither trigger
+    /// is set (nothing was ever going to compact either way).
+    pub fn unset_compactor_warning(&self) -> Option<String> {
+        if self.compactor_model.is_some() {
+            return None;
+        }
+        match (self.context_window, self.threshold_tokens) {
+            (None, None) => None,
+            (Some(window), _) => Some(format!(
+                "darkmux dispatch: no compactor is bound for this dispatch (`internal.utility` \
+                 is unset, and no `profile.runtime.compaction` compactor was pinned) — \
+                 compaction is OFF. The primary model's context window is {window} tokens; a \
+                 long-running dispatch will grow its transcript against that window with only \
+                 the runtime's built-in trim between it and overflow. (#2571)"
+            )),
+            (None, Some(threshold)) => Some(format!(
+                "darkmux dispatch: no compactor is bound for this dispatch (`internal.utility` \
+                 is unset, and no `profile.runtime.compaction` compactor was pinned) — \
+                 compaction is OFF. This dispatch has an absolute compaction threshold of \
+                 {threshold} tokens configured (no context window is known); a long-running \
+                 dispatch will grow its transcript toward that count with only the runtime's \
+                 built-in trim between it and overflow. (#2571)"
+            )),
         }
     }
 }
@@ -1127,6 +1205,67 @@ mod tests {
         let mut c = CompactionDispatchArgs::default();
         c.apply_utility_model(None);
         assert!(c.compactor_model.is_none());
+    }
+
+    // ─── MUST FIX 1 (#2571 follow-up): host-side unset-compactor warning ──
+
+    #[test]
+    fn unset_compactor_warning_fires_when_no_compactor_and_a_window_is_set() {
+        let c = CompactionDispatchArgs {
+            context_window: Some(101_000),
+            ..Default::default()
+        };
+        let msg = c
+            .unset_compactor_warning()
+            .expect("no compactor + a real context window must warn");
+        assert!(msg.contains("101000"), "warning must name the window: {msg}");
+        assert!(
+            msg.to_ascii_lowercase().contains("compaction is off"),
+            "warning must say plainly that compaction is off: {msg}"
+        );
+    }
+
+    #[test]
+    fn unset_compactor_warning_silent_when_a_compactor_is_bound() {
+        let mut c = CompactionDispatchArgs {
+            context_window: Some(101_000),
+            ..Default::default()
+        };
+        c.apply_utility_model(Some("darkmux:util-4b"));
+        assert_eq!(c.unset_compactor_warning(), None);
+    }
+
+    #[test]
+    fn unset_compactor_warning_silent_when_no_context_window() {
+        let c = CompactionDispatchArgs::default();
+        assert_eq!(c.unset_compactor_warning(), None);
+    }
+
+    /// (Second review round) The threshold-only reachable case: on a
+    /// `from_profile`-derived config, an endpoint-bearing primary (or any
+    /// profile with no declared `n_ctx`) leaves `context_window` `None`,
+    /// but `threshold_tokens` is read independently from
+    /// `profile.runtime.compaction.threshold_tokens` — a real, reachable
+    /// compaction trigger on the paths that call `from_profile` (the lab
+    /// providers that derive compaction from a profile up front, and the
+    /// loop override in `lab/loop_report.rs`; the bare `darkmux dispatch`
+    /// path never reads `threshold_tokens` from the profile at all — see
+    /// this struct's doc) — one the pre-fix version of this function stayed
+    /// silent about.
+    #[test]
+    fn unset_compactor_warning_fires_when_no_compactor_and_only_a_threshold_is_set() {
+        let c = CompactionDispatchArgs {
+            threshold_tokens: Some(30_000),
+            ..Default::default()
+        };
+        let msg = c
+            .unset_compactor_warning()
+            .expect("no compactor + an absolute threshold must warn, even with no window");
+        assert!(msg.contains("30000"), "warning must name the threshold: {msg}");
+        assert!(
+            msg.to_ascii_lowercase().contains("compaction is off"),
+            "warning must say plainly that compaction is off: {msg}"
+        );
     }
 
     // ─── #557 slice 2 build_telemetry_record ──────────────────────────

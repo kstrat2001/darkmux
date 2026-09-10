@@ -53,11 +53,28 @@ use crate::lmstudio::{ChatRequest, LmStudioClient, Message};
 /// at 1M.
 pub const DEFAULT_THRESHOLD_RATIO: f32 = 0.5;
 
-/// Default compactor model — the bake-off-hired utility agent
-/// (Beat 21: "the dependable utility agent"). Same model openclaw uses
-/// by convention. Override via `profile.runtime.compaction.extras.model`
-/// (openclaw-shape passthrough that survived the #357 typed schema)
-/// → host passes as `--compactor-model <id>`.
+/// The compactor model this repo's fixtures and tests default to when they
+/// want a REAL configured compactor (the bake-off-hired utility agent,
+/// Beat 21: "the dependable utility agent"). Set via `profile.runtime.
+/// compaction` → the host resolves `internal.utility`, ensures it resident
+/// under this same namespaced form, and passes it as `--compactor-model
+/// <id>` (`crates/darkmux-crew/src/dispatch_internal.rs`,
+/// `compactor_wire_model_id`).
+///
+/// **Not a runtime-side fallback (#2571).** Before #2571 this constant was
+/// ALSO what `CompactionConfig::from_overrides_with_bail_and_custom`
+/// silently substituted when the host passed no `--compactor-model` flag
+/// at all — addressing a darkmux-namespaced identifier the host never
+/// loaded. `CompactionConfig.compactor_model` is `Option<String>` now:
+/// `None` means compaction is off for this dispatch, not "assume this
+/// model." The host and the runtime always agree on what got loaded.
+///
+/// `#[cfg(test)]`-scoped rather than `#[allow(dead_code)]`: with the
+/// fallback gone, nothing in production reads this constant any more —
+/// every real `--compactor-model` id comes from the host's CLI flag. If a
+/// future edit reintroduces a production reader, that's exactly the kind
+/// of change this fix means to make visible, not something to suppress.
+#[cfg(test)]
 pub const DEFAULT_COMPACTOR_MODEL: &str = "darkmux:qwen3-4b-instruct-2507";
 
 /// Number of trailing messages to preserve uncompacted. Keeps the
@@ -233,8 +250,32 @@ pub struct CompactionConfig {
     /// this, compaction fires. Set to the typed
     /// `profile.runtime.compaction.threshold_tokens` or the default.
     pub threshold_tokens: u32,
-    /// Compactor model id (e.g. `darkmux:qwen3-4b-instruct-2507`).
-    pub compactor_model: String,
+    /// Compactor model id (e.g. `darkmux:qwen3-4b-instruct-2507`) — the
+    /// identifier the HOST already ensured resident (`--compactor-model`).
+    /// `None` when the host passed no flag at all, which means the host's
+    /// `internal.utility` binding was unset and it therefore loaded and
+    /// namespaced NOTHING for this dispatch (#2571). Pre-#2571 this field
+    /// was a bare `String` that silently fell back to
+    /// [`DEFAULT_COMPACTOR_MODEL`] in that case, so the runtime addressed a
+    /// darkmux-namespaced identifier the host never loaded — a resident
+    /// instance from an EARLIER dispatch would silently answer at whatever
+    /// context IT was loaded at, or, absent one, LMStudio would return a
+    /// flat "model not found" (an identifier can't be JIT-loaded, unlike a
+    /// bare key). `needs_compaction` now treats `None` as "compaction is
+    /// off for this dispatch."
+    ///
+    /// **This is NOT the same degraded mode a failed compactor LOAD
+    /// produces.** `ensure_utility_resident`'s own doc (`dispatch_internal.
+    /// rs`) is explicit that since #2536 a failed load no longer degrades
+    /// gracefully: the wire carries the darkmux identifier regardless, so
+    /// the dispatch DIES at its first compaction, hours in, with a warning
+    /// that says exactly that. `compactor_model: None` is a DIFFERENT,
+    /// genuinely new degraded mode chosen here — compaction never attempts
+    /// at all, and the dispatch completes (or overflows) instead of dying
+    /// mid-run. Disclosed to the operator via
+    /// [`compactor_disclosure_message`] rather than argued as precedent
+    /// this codebase already established.
+    pub compactor_model: Option<String>,
     /// Which compactor implementation runs when the trigger fires.
     /// Operator opts into tier-2 by setting
     /// `profile.runtime.compaction.strategy: "structured-slot"` (host
@@ -310,7 +351,12 @@ impl CompactionConfig {
 
     /// Construct a config that disables compaction by configuration —
     /// `threshold_tokens: u32::MAX`, no formula trigger, no
-    /// `context_window`. `needs_compaction` always returns false.
+    /// `context_window`, and (#2571) `compactor_model: None`, itself now
+    /// sufficient on its own to keep `needs_compaction` always false. The
+    /// threshold/window belt is kept alongside the identifier suspenders
+    /// deliberately: this helper's whole job is "any config; compaction
+    /// isn't the point of this test," so it stays disabled by every
+    /// mechanism `needs_compaction` has, not just the newest one.
     /// Test-scoped today: replaces the pre-#482 `Default::default()`
     /// for tests that want "any config; compaction isn't the point of
     /// this test." Lift the `#[cfg(test)]` gate if a production
@@ -321,7 +367,7 @@ impl CompactionConfig {
     pub fn never_compact() -> Self {
         Self {
             threshold_tokens: u32::MAX,
-            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            compactor_model: None,
             threshold_ratio: None,
             context_window: None,
             strategy: CompactionStrategy::Narrative,
@@ -330,9 +376,32 @@ impl CompactionConfig {
         }
     }
 
+    /// (#2571) `never_compact()`'s exact shape, except `compactor_model` is
+    /// `Some(DEFAULT_COMPACTOR_MODEL)` instead of `None` — for tests that
+    /// call [`compact`] / [`structured_compact`] DIRECTLY against a mock
+    /// server, bypassing `needs_compaction()`'s own gate entirely. Those
+    /// tests need a real wire model (the request has to go SOMEWHERE for
+    /// the mock to answer); `never_compact()` itself now deliberately
+    /// can't supply one, since `None` is exactly the state #2571 fixed
+    /// `compact`/`structured_compact` to refuse. The disabled threshold/
+    /// window fields are irrelevant once a caller bypasses
+    /// `needs_compaction`, but kept for consistency with `never_compact()`.
+    #[cfg(test)]
+    pub fn never_compact_with_model() -> Self {
+        Self { compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()), ..Self::never_compact() }
+    }
+
     /// Full override constructor with custom_instructions. All fields
     /// accept `Option` — `None` uses defaults (or disables optional
-    /// triggers). This is the host's choice point.
+    /// triggers), EXCEPT `compactor_model` (#2571): `None` there is not a
+    /// default to fill in, it is the host's own report that it loaded
+    /// nothing for this dispatch (`internal.utility` unset, so
+    /// `apply_utility_model` never touched `compactor_model` and the
+    /// residency block never ran — see `dispatch.rs`/`dispatch_internal.rs`).
+    /// Silently substituting [`DEFAULT_COMPACTOR_MODEL`] here would address
+    /// an identifier the host never ensured resident — the exact #1135
+    /// shape #2240/#2536 closed for the other two dispatch-wire sites, one
+    /// binding over. This is the host's choice point.
     pub fn from_overrides_with_bail_and_custom(
         threshold_tokens: Option<u32>,
         compactor_model: Option<String>,
@@ -377,7 +446,11 @@ impl CompactionConfig {
         };
         Self {
             threshold_tokens: resolved_threshold_tokens,
-            compactor_model: compactor_model.unwrap_or_else(|| DEFAULT_COMPACTOR_MODEL.to_string()),
+            // (#2571) No fallback: `None` means the host loaded no
+            // compactor for this dispatch, and `needs_compaction` (below)
+            // now treats that as compaction being off, not as license to
+            // invent a model id to address.
+            compactor_model,
             threshold_ratio,
             context_window,
             strategy: strategy.unwrap_or_default(),
@@ -400,6 +473,56 @@ impl CompactionConfig {
             _ => None,
         }
     }
+}
+
+/// (MUST FIX 1, #2571 follow-up) The operator-facing disclosure a dispatch
+/// owes at startup when it is about to run with NO compactor bound but a
+/// real compaction trigger configured — either a context window (the
+/// formula/window-derived trigger) or an absolute
+/// `--compact-threshold-tokens` (which needs no window at all; the
+/// original version of this function gated on `context_window` alone and
+/// left exactly that threshold-only mode silent — a dispatch configured
+/// that way is precisely the long dispatch that WOULD have compacted and
+/// now silently doesn't). Before this, an unset `internal.utility` binding
+/// produced no disclosure anywhere — no message, no trajectory event, no
+/// flow record, no envelope field — so a zero compaction count read
+/// identically to "never needed one." A long dispatch would run its
+/// transcript up against the primary model's context with only a soft trim
+/// between it and overflow, silently, with no context-overflow handling
+/// anywhere in the runtime to catch it.
+///
+/// Pure so `main.rs`'s actual `eprintln!` is testable without capturing
+/// stderr — call sites just print whatever this returns. `None` only when
+/// compaction IS configured (`compactor_model` is `Some`, nothing to warn
+/// about) — by the time production code reaches this function,
+/// `CompactionConfig::from_overrides_with_bail_and_custom` has already
+/// guaranteed a real trigger exists (either `context_window` or an
+/// explicit `threshold_tokens`; the constructor panics otherwise), so
+/// there is no "nothing was ever going to trigger" case left to stay
+/// silent for.
+pub fn compactor_disclosure_message(cfg: &CompactionConfig) -> Option<String> {
+    if cfg.compactor_model.is_some() {
+        return None;
+    }
+    let trigger_desc = match cfg.context_window {
+        Some(window) => format!(
+            "The primary model's context window is {window} tokens; this dispatch will grow \
+             its transcript against that window"
+        ),
+        None => format!(
+            "This dispatch has an absolute compaction threshold of {} tokens configured (no \
+             context window is known); it will grow its transcript toward that count",
+            cfg.threshold_tokens
+        ),
+    };
+    Some(format!(
+        "darkmux-runtime: no compactor is configured for this dispatch (#2571) — \
+         compaction is OFF. {trigger_desc} with only the built-in trim between it and \
+         overflow, and nothing will summarize the middle. This means the \
+         host's `internal.utility` binding is unset (or an old registry never set it) — bind \
+         it, or set an explicit `profile.runtime.compaction` compactor, before a long-running \
+         dispatch, or expect it to truncate or fail on overflow instead of compacting."
+    ))
 }
 
 /// (#482) CLI-input validation called from the runtime's `run`
@@ -478,15 +601,35 @@ pub fn validate_compaction_cli_inputs(
 
 /// Decide whether the conversation needs compaction before the next
 /// chat() call. True when:
+/// - A compactor is actually configured (#2571 — `cfg.compactor_model` is
+///   `Some`; see that field's doc), AND
 /// - `latest_prompt_tokens` crossed the configured threshold (the most
 ///   recent request's input was big), AND
 /// - The conversation is long enough that middle-replace has
 ///   something meaningful to replace (head + 1 middle + tail).
+///
+/// (#2571) The `compactor_model` gate is UNCONDITIONAL — checked
+/// regardless of either token trigger's own state — so a profile that
+/// happens to set an explicit `threshold_ratio`/`context_window` (which
+/// the host derives from the profile's default model regardless of
+/// whether a compactor is bound) can never trip the formula trigger into
+/// calling [`compact`] / [`structured_compact`] with nothing to address.
+/// `compact`/`structured_compact` both trust this gate: a caller invoking
+/// either directly without checking `needs_compaction` first gets a loud
+/// `Err` from them, never a silent default. (The gate is written FIRST in
+/// the function body below for readability, not because ordering is
+/// load-bearing — every branch below it already returns `false` on its
+/// own inputs and none of them returns `true` early, so nothing here is
+/// pinned by a test that would catch the gate moving later; only its
+/// unconditional presence is.)
 pub fn needs_compaction(
     latest_prompt_tokens: u32,
     message_count: usize,
     cfg: &CompactionConfig,
 ) -> bool {
+    if cfg.compactor_model.is_none() {
+        return false;
+    }
     if !conversation_long_enough_to_compact(message_count) {
         return false;
     }
@@ -568,6 +711,18 @@ pub fn compact(
     generation: u32,
     cfg: &CompactionConfig,
 ) -> Result<usize> {
+    // (#2571) `needs_compaction` is the ONLY gate every production caller
+    // checks before calling this, and it now refuses whenever
+    // `cfg.compactor_model` is `None`. This is defense-in-depth for any
+    // caller that skips that gate: a loud typed error, never a silent
+    // fallback to an identifier the host never loaded.
+    let compactor_model = cfg.compactor_model.clone().ok_or_else(|| {
+        anyhow!(
+            "compact() called with no compactor configured (CompactionConfig.compactor_model \
+             is None) — the caller must check needs_compaction() first, which now returns \
+             false in this case rather than letting compact() invent a model to address (#2571)"
+        )
+    })?;
     let n = messages.len();
     if !conversation_long_enough_to_compact(n) {
         return Err(anyhow!(
@@ -602,7 +757,7 @@ pub fn compact(
     ));
 
     let request = ChatRequest {
-        model: cfg.compactor_model.clone(),
+        model: compactor_model,
         messages: vec![compactor_system, compactor_user],
         tools: Vec::new(),
         tool_choice: None,
@@ -737,6 +892,18 @@ pub fn structured_compact(
     cfg: &CompactionConfig,
     budget: Option<BudgetSnapshot>,
 ) -> Result<(StructuredCompactionOutput, usize)> {
+    // (#2571) Same defense-in-depth gate `compact` applies — see its own
+    // comment. `needs_compaction` already refuses to call either compactor
+    // path when `cfg.compactor_model` is `None`; this is what a caller that
+    // skips that gate hits instead of a silent fallback.
+    let compactor_model = cfg.compactor_model.clone().ok_or_else(|| {
+        anyhow!(
+            "structured_compact() called with no compactor configured \
+             (CompactionConfig.compactor_model is None) — the caller must check \
+             needs_compaction() first, which now returns false in this case rather than \
+             letting structured_compact() invent a model to address (#2571)"
+        )
+    })?;
     let n = messages.len();
     if !conversation_long_enough_to_compact(n) {
         return Err(anyhow!(
@@ -756,8 +923,13 @@ pub fn structured_compact(
     let middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
     let middle_rendered = render_messages_as_excerpt(&middle_messages);
 
-    let request =
-        build_structured_compaction_request(cfg, generation, middle_count, &middle_rendered);
+    let request = build_structured_compaction_request(
+        cfg,
+        &compactor_model,
+        generation,
+        middle_count,
+        &middle_rendered,
+    );
 
     eprintln!(
         "darkmux-runtime: tier-2 compaction #{generation} — \
@@ -879,8 +1051,15 @@ fn build_compactor_user_message(
 /// (model id, hyperparameters, response_format) independently of the
 /// live LMStudio call path. Behavior unchanged from the prior inline
 /// construction.
+///
+/// (#2571) `compactor_model` is now a separate, already-resolved `&str`
+/// parameter rather than read from `cfg.compactor_model` (which is
+/// `Option<String>`) — the caller (`structured_compact`) is the one place
+/// that already unwrapped it, loudly, after checking it against `None`.
+/// Everything else this function needs still comes from `cfg`.
 fn build_structured_compaction_request(
     cfg: &CompactionConfig,
+    compactor_model: &str,
     generation: u32,
     middle_count: usize,
     middle_rendered: &str,
@@ -895,7 +1074,7 @@ fn build_structured_compaction_request(
     ));
 
     ChatRequest {
-        model: cfg.compactor_model.clone(),
+        model: compactor_model.to_string(),
         messages: vec![compactor_system, compactor_user],
         tools: Vec::new(),
         tool_choice: None,
@@ -1579,7 +1758,7 @@ mod tests {
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
         let original_len = messages.len();
-        let cfg = CompactionConfig::never_compact();
+        let cfg = CompactionConfig::never_compact_with_model();
 
         let (out, summary_chars) = structured_compact(&client, &mut messages, 7, &cfg, None)
             .expect("happy path returns parsed output");
@@ -1678,7 +1857,7 @@ mod tests {
             Message::assistant("done"),      // 7 tail
         ];
 
-        compact(&client, &mut messages, 1, &CompactionConfig::never_compact())
+        compact(&client, &mut messages, 1, &CompactionConfig::never_compact_with_model())
             .expect("compaction succeeds");
 
         // Invariant: every tool-result is immediately preceded by an
@@ -1733,7 +1912,7 @@ mod tests {
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
-        let cfg = CompactionConfig::never_compact();
+        let cfg = CompactionConfig::never_compact_with_model();
 
         let summary_chars = compact(&client, &mut messages, 3, &cfg)
             .expect("narrative compaction returns the summary char count");
@@ -1782,7 +1961,7 @@ mod tests {
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
-        let cfg = CompactionConfig::never_compact();
+        let cfg = CompactionConfig::never_compact_with_model();
 
         let result = structured_compact(&client, &mut messages, 1, &cfg, None);
         assert!(result.is_err(), "both attempts return malformed → bail");
@@ -1803,7 +1982,7 @@ mod tests {
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
         let original_len = messages.len();
-        let cfg = CompactionConfig::never_compact();
+        let cfg = CompactionConfig::never_compact_with_model();
 
         let result = structured_compact(&client, &mut messages, 1, &cfg, None);
         assert!(result.is_err());
@@ -2185,13 +2364,78 @@ mod tests {
 
     // ─── #482: explicit-param CompactionConfig (post-#482 contract) ─
 
+    /// (#2571) Renamed from `from_overrides_threshold_only_uses_default_
+    /// model` — that name and its assertion described the exact bug this
+    /// issue closed. Pre-#2571 a `None` compactor_model silently became
+    /// `DEFAULT_COMPACTOR_MODEL`; post-#2571 `None` stays `None`, so
+    /// `needs_compaction` (which gates on this field first) correctly
+    /// treats "no binding" as "compaction is off," not "assume this model."
     #[test]
-    fn from_overrides_threshold_only_uses_default_model() {
+    fn from_overrides_with_no_compactor_model_stays_unset() {
         let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, None, None);
         assert_eq!(cfg.threshold_tokens, 30_000);
-        assert_eq!(cfg.compactor_model, DEFAULT_COMPACTOR_MODEL);
+        assert_eq!(
+            cfg.compactor_model, None,
+            "no fallback to DEFAULT_COMPACTOR_MODEL — an absent binding must stay absent"
+        );
         assert!(cfg.threshold_ratio.is_none());
         assert!(cfg.context_window.is_none());
+    }
+
+    // ─── MUST FIX 1 (#2571 follow-up): the compactor-unset disclosure ────
+
+    #[test]
+    fn compactor_disclosure_fires_when_unset_with_a_context_window() {
+        let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, Some(101_000), None);
+        let msg = compactor_disclosure_message(&cfg)
+            .expect("no compactor + a real context window must disclose");
+        assert!(
+            msg.contains("101000"),
+            "disclosure must name the actual context window so an operator can act on it: {msg}"
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("compaction is off"),
+            "disclosure must say plainly that compaction is off: {msg}"
+        );
+    }
+
+    #[test]
+    fn compactor_disclosure_silent_when_a_compactor_is_bound() {
+        let cfg = CompactionConfig::from_overrides(
+            Some(30_000),
+            Some("darkmux:qwen3-4b-instruct-2507".to_string()),
+            None,
+            Some(101_000),
+            None,
+        );
+        assert_eq!(
+            compactor_disclosure_message(&cfg),
+            None,
+            "a configured compactor must not trigger the unset-compactor disclosure"
+        );
+    }
+
+    /// (MUST FIX 1, second review round) Renamed from
+    /// `compactor_disclosure_silent_when_no_context_window` — that name and
+    /// assertion described the exact gap the second review found: a
+    /// dispatch configured threshold-only (an explicit
+    /// `--compact-threshold-tokens`, no `--context-window`) has a real,
+    /// reachable compaction trigger — the absolute threshold needs no
+    /// window at all — so silence here was hiding exactly the dispatch
+    /// that would have compacted and now doesn't.
+    #[test]
+    fn compactor_disclosure_fires_when_unset_with_only_a_threshold() {
+        let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, None, None);
+        let msg = compactor_disclosure_message(&cfg)
+            .expect("no compactor + an absolute threshold must disclose, even with no window");
+        assert!(
+            msg.contains("30000"),
+            "disclosure must name the actual threshold so an operator can act on it: {msg}"
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("compaction is off"),
+            "disclosure must say plainly that compaction is off: {msg}"
+        );
     }
 
     /// (#482) Replaces the pre-#482 silent-fallback test. With no
@@ -2221,7 +2465,7 @@ mod tests {
             None,
         );
         assert_eq!(cfg.threshold_tokens, 45_000);
-        assert_eq!(cfg.compactor_model, "alt-compactor");
+        assert_eq!(cfg.compactor_model.as_deref(), Some("alt-compactor"));
         assert_eq!(cfg.threshold_ratio, Some(0.35));
         assert_eq!(cfg.context_window, Some(101_000));
     }
@@ -2229,8 +2473,16 @@ mod tests {
     #[test]
     fn needs_compaction_requires_both_size_and_length() {
         // Test threshold picked to make the boundary intent obvious;
-        // not a system default.
-        let cfg = CompactionConfig::from_overrides(Some(60_000), None, None, None, None);
+        // not a system default. (#2571) A compactor model IS supplied —
+        // `needs_compaction`'s brand-new compactor_model gate would
+        // otherwise mask everything this test exists to pin.
+        let cfg = CompactionConfig::from_overrides(
+            Some(60_000),
+            Some(DEFAULT_COMPACTOR_MODEL.to_string()),
+            None,
+            None,
+            None,
+        );
         // Tokens below threshold → no compaction even with many messages
         assert!(!needs_compaction(1000, 100, &cfg));
         // Tokens above threshold but conversation too short
@@ -2242,7 +2494,16 @@ mod tests {
     #[test]
     fn needs_compaction_boundary() {
         const TEST_THRESHOLD: u32 = 60_000;
-        let cfg = CompactionConfig::from_overrides(Some(TEST_THRESHOLD), None, None, None, None);
+        // (#2571) Same reason as the sibling test above — a real
+        // compactor_model, or the gate this fix added masks the boundary
+        // logic this test is actually about.
+        let cfg = CompactionConfig::from_overrides(
+            Some(TEST_THRESHOLD),
+            Some(DEFAULT_COMPACTOR_MODEL.to_string()),
+            None,
+            None,
+            None,
+        );
         // Exactly at threshold + minimum length
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         assert!(needs_compaction(TEST_THRESHOLD, min_len, &cfg));
@@ -2256,7 +2517,7 @@ mod tests {
     fn needs_compaction_uses_per_cfg_threshold() {
         let cfg_low = CompactionConfig {
             threshold_tokens: 5_000,
-            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: None,
             context_window: None,
             strategy: CompactionStrategy::Narrative,
@@ -2265,7 +2526,7 @@ mod tests {
         };
         let cfg_high = CompactionConfig {
             threshold_tokens: 100_000,
-            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: None,
             context_window: None,
             strategy: CompactionStrategy::Narrative,
@@ -2276,6 +2537,62 @@ mod tests {
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         assert!(needs_compaction(10_000, min_len, &cfg_low));
         assert!(!needs_compaction(10_000, min_len, &cfg_high));
+    }
+
+    /// (#2571) The core of the fix: a host that sends NO `--compactor-model`
+    /// flag (`internal.utility` unset) leaves `compactor_model: None`, and
+    /// `needs_compaction` must refuse regardless of how loudly the OTHER
+    /// triggers are crossed — both the absolute threshold (already at its
+    /// own boundary) AND the formula trigger (ratio * context_window, which
+    /// the host derives from the profile's default model independent of
+    /// whether a compactor is bound, so it can be `Some` even when
+    /// `compactor_model` is `None`). Pre-#2571 there was no such gate: this
+    /// config would have compacted against the runtime's silently-defaulted
+    /// `DEFAULT_COMPACTOR_MODEL` — an identifier the host never ensured
+    /// resident.
+    #[test]
+    fn needs_compaction_refuses_when_no_compactor_is_configured_even_past_every_threshold() {
+        let cfg = CompactionConfig {
+            threshold_tokens: 1, // already crossed by any nonzero input
+            compactor_model: None,
+            threshold_ratio: Some(0.1), // and the formula trigger too
+            context_window: Some(1_000),
+            strategy: CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+        let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
+        assert!(
+            !needs_compaction(1_000_000, min_len, &cfg),
+            "no compactor configured must refuse compaction outright, not just skip the \
+             absolute/formula math"
+        );
+    }
+
+    /// (#2571) Defense-in-depth: a caller that invokes [`compact`] /
+    /// [`structured_compact`] directly, skipping `needs_compaction`'s own
+    /// gate, must get a loud typed error naming the missing binding — never
+    /// a silent substitution of [`DEFAULT_COMPACTOR_MODEL`], which is
+    /// exactly the pre-#2571 bug (an identifier the host never loaded).
+    #[test]
+    fn compact_and_structured_compact_refuse_with_no_compactor_configured() {
+        let client = LmStudioClient::with_base_url("http://127.0.0.1:1/v1".to_string());
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let cfg = CompactionConfig::never_compact(); // compactor_model: None
+
+        let err = compact(&client, &mut messages, 1, &cfg)
+            .expect_err("compact() must refuse rather than dial an unconfigured model");
+        assert!(
+            err.to_string().contains("no compactor configured"),
+            "the error must name what's missing: {err}"
+        );
+
+        let err = structured_compact(&client, &mut messages, 1, &cfg, None)
+            .expect_err("structured_compact() must refuse the same way");
+        assert!(
+            err.to_string().contains("no compactor configured"),
+            "the error must name what's missing: {err}"
+        );
     }
 
     // ─── #368: formula trigger (threshold_ratio * context_window) ─
@@ -2306,7 +2623,7 @@ mod tests {
         // (0.35 of 100K = 35K) trips at 36K prompt tokens.
         let cfg = CompactionConfig {
             threshold_tokens: 60_000,
-            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: Some(0.35),
             context_window: Some(100_000),
             strategy: CompactionStrategy::Narrative,
@@ -2450,7 +2767,7 @@ mod tests {
         // prompt). Absolute lower at 40K — trips first.
         let cfg = CompactionConfig {
             threshold_tokens: 40_000,
-            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: Some(0.6),
             context_window: Some(100_000),
             strategy: CompactionStrategy::Narrative,
@@ -2469,7 +2786,7 @@ mod tests {
         // the formula's lower trigger should fire at 36K.
         let cfg = CompactionConfig {
             threshold_tokens: 50_000,
-            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: Some(0.35),
             context_window: Some(100_000),
             strategy: CompactionStrategy::Narrative,
@@ -2693,7 +3010,7 @@ mod tests {
     fn request_hyperparameters_v0_pinned() {
         let cfg = CompactionConfig {
             threshold_tokens: 60_000,
-            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: None,
             context_window: None,
             strategy: CompactionStrategy::StructuredSlot,
@@ -2702,6 +3019,7 @@ mod tests {
         };
         let req = build_structured_compaction_request(
             &cfg,
+            DEFAULT_COMPACTOR_MODEL,
             FIXTURE_GENERATION,
             FIXTURE_MIDDLE_COUNT,
             FIXTURE_EXCERPT,
@@ -2796,7 +3114,7 @@ mod tests {
         let mut messages = dummy_messages_long_enough_to_compact();
         let cfg = CompactionConfig {
             custom_instructions: Some("operator-test-guidance-string-7c4a".to_string()),
-            ..CompactionConfig::never_compact()
+            ..CompactionConfig::never_compact_with_model()
         };
 
         let _out = structured_compact(&client, &mut messages, 9, &cfg, None)
@@ -3334,7 +3652,7 @@ mod tests {
         let mut messages = dummy_messages_long_enough_to_compact();
         let original_len = messages.len();
 
-        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact());
+        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact_with_model());
         assert!(result.is_err(), "degenerate summary must not be installed");
         assert!(
             result.unwrap_err().to_string().contains("degenerate summary"),
@@ -3383,7 +3701,7 @@ mod tests {
         ];
         let original_len = messages.len();
 
-        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact());
+        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact_with_model());
         assert!(result.is_err(), "barely-reducing compaction must be discarded");
         assert!(
             result.unwrap_err().to_string().contains("less than"),
@@ -3412,7 +3730,7 @@ mod tests {
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
 
-        let summary_chars = compact(&client, &mut messages, 4, &CompactionConfig::never_compact())
+        let summary_chars = compact(&client, &mut messages, 4, &CompactionConfig::never_compact_with_model())
             .expect("good summary installs");
         assert_eq!(mock.hits(), 1, "one call, no retry on a good summary");
         let inserted = messages[PRESERVE_HEAD].content.as_ref().unwrap();

@@ -1241,11 +1241,33 @@ fn utility_binding_status(
     let Some(id) = registry_util else {
         return Check {
             name,
-            status: Status::Pass,
-            message: "no machine utility model registered; compaction uses the runtime default"
+            // (Third review round) Bumped from Pass to Warn. Two reasons,
+            // both about this row's own internal consistency rather than
+            // the underlying fact (which was already accurate): first, the
+            // sibling arm below already uses Warn for the NARROWER problem
+            // of a binding that's registered but not loaded — a fully
+            // unbound machine (compaction off for every dispatch) is at
+            // least as consequential and can't rank below it. Second, a
+            // Pass row's message is invisible in the default view (doctor's
+            // banner collapses passing checks into a bare count; this
+            // sentence only renders under --verbose), so leaving it at Pass
+            // buried the exact fact the MUST FIX 1 disclosures exist to
+            // surface loudly at dispatch time — the two would agree in
+            // wording but disagree in how loudly either was said. Warn
+            // doesn't mean "wrong" — deliberately running without
+            // compaction is a legitimate operator choice (operator
+            // sovereignty) — it means "worth a second look," which a count
+            // of passing checks can't convey. The hint no longer opens with
+            // "Optional:" for the same reason: that word read as downgrading
+            // a message that, two sentences later, says compaction is off
+            // machine-wide. It now says plainly that no action is needed if
+            // this is deliberate, before describing how to change it.
+            status: Status::Warn,
+            message: "no machine utility model registered; compaction is OFF for every \
+                      dispatch on this machine (no runtime fallback since #2571)"
                 .into(),
             hint: Some(
-                "Optional: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": \"<model-id>\" }`. It serves compaction (and future estimation/mission-compile) for every role, decoupled from your profiles. (#590)".into(),
+                "If you're deliberately running without compaction, no action needed. To enable it: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": \"<model-id>\" }`. It serves compaction (and future estimation/mission-compile) for every role, decoupled from your profiles — without it, long dispatches run without compaction. (#590, #2571)".into(),
             ),
         };
     };
@@ -9635,12 +9657,50 @@ mod tests {
         }
     }
 
+    /// (Third review round) Bumped from Pass to Warn — see the comment on
+    /// `utility_binding_status`'s `None` arm for why. The hint must not
+    /// open with "Optional:" any more (that read as downgrading a message
+    /// that says compaction is off machine-wide); it says plainly that no
+    /// action is needed if the operator is doing this deliberately.
     #[test]
-    fn utility_binding_unregistered_passes_with_setup_hint() {
+    fn utility_binding_unregistered_warns_with_setup_hint() {
         let c = super::utility_binding_status(None, None);
-        assert_eq!(c.status, Status::Pass);
+        assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("no machine utility model"));
-        assert!(c.hint.unwrap().contains("internal"));
+        let hint = c.hint.unwrap();
+        assert!(hint.contains("internal"));
+        assert!(
+            !hint.starts_with("Optional:"),
+            "the hint must not open by downgrading a message that says compaction is off \
+             machine-wide: {hint}"
+        );
+        assert!(
+            hint.to_ascii_lowercase().contains("no action needed"),
+            "the hint must say plainly that no action is needed if this is deliberate: {hint}"
+        );
+    }
+
+    /// (Second review round, #2571) Pins the corrected message — the
+    /// pre-fix text said "compaction uses the runtime default", which
+    /// became false the moment #2571 removed `DEFAULT_COMPACTOR_MODEL`
+    /// from production. (Third review round: this check is now a Warn, not
+    /// a Pass — see `utility_binding_status`'s `None` arm — but the wording
+    /// must still agree with the disclosure messages
+    /// (`compactor_disclosure_message` / `unset_compactor_warning`), which
+    /// is what this test pins.)
+    #[test]
+    fn utility_binding_unregistered_message_says_compaction_is_off_not_defaulted() {
+        let c = super::utility_binding_status(None, None);
+        assert!(
+            c.message.to_ascii_lowercase().contains("off"),
+            "message must say compaction is OFF, not that it falls back to a default: {}",
+            c.message
+        );
+        assert!(
+            !c.message.to_ascii_lowercase().contains("runtime default"),
+            "message must not claim a runtime default exists — #2571 removed it: {}",
+            c.message
+        );
     }
 
     #[test]

@@ -10219,7 +10219,7 @@ mod tests {
     fn loop_triggers_compaction_when_threshold_crossed() {
         let cfg = compaction::CompactionConfig {
             threshold_tokens: 1000,
-            compactor_model: "test-compactor".to_string(),
+            compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,
@@ -10364,7 +10364,7 @@ mod tests {
     fn compaction_uses_compactor_client_not_primary_client() {
         let cfg = compaction::CompactionConfig {
             threshold_tokens: 1000,
-            compactor_model: "test-compactor".to_string(),
+            compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,
@@ -10469,7 +10469,7 @@ mod tests {
     fn stale_frozen_prompt_tokens_forces_compaction_and_fires_event_once() {
         let cfg = compaction::CompactionConfig {
             threshold_tokens: 5000,
-            compactor_model: "test-compactor".to_string(),
+            compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,
@@ -10590,7 +10590,7 @@ mod tests {
     fn loop_bails_with_escalation_when_compaction_limit_reached() {
         let cfg = compaction::CompactionConfig {
             threshold_tokens: 1000,
-            compactor_model: "test-compactor".to_string(),
+            compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,
@@ -10692,7 +10692,7 @@ mod tests {
     fn loop_does_not_bail_when_bail_after_compactions_is_none() {
         let cfg = compaction::CompactionConfig {
             threshold_tokens: 1000,
-            compactor_model: "test-compactor".to_string(),
+            compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,
@@ -10799,7 +10799,7 @@ mod tests {
             // met — isolates the bail check from needing a precise token
             // count.
             threshold_tokens: 1,
-            compactor_model: "test-compactor".to_string(),
+            compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,

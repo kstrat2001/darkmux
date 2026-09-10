@@ -63,6 +63,59 @@ fn require_config_str<'a>(step: &'a Step, kind_id: &str, key: &str) -> Result<&'
     })
 }
 
+/// (#2570) The identifier a LOCAL (non-`endpoint`) `dispatch.single_shot` /
+/// `dispatch.map` step addresses — the SAME derivation each kind's `seat()`
+/// already uses to decide what residency LOADS under (an explicit
+/// `config.identifier` override, else the darkmux-namespaced form of
+/// `model`). Before #2570 `seat()` computed this identifier to claim
+/// residency and `run`/`run_map` then put the bare `config.model` string on
+/// the wire, unchanged — a step naming a bare model with no override
+/// LOADED `darkmux:<key>` and ADDRESSED `<key>`, the same load/wire split
+/// #2240 closed for the main dispatch model and #2536 closed for the
+/// compactor. This function is now the ONE place both kinds' `seat()` AND
+/// both kinds' `run`/`run_map` compute it, so all four sites agree by
+/// construction instead of by four independent copies of the same two-line
+/// expression staying in sync by hand — the drift #2537 tracks. Collapsing
+/// this with `dispatch_wire_model_id` / `compactor_wire_model_id` in
+/// `dispatch_internal.rs` (which resolve against a `Profile`, not a `Step`)
+/// is left to #2537; the shapes differ enough (a `Step.config` string vs. a
+/// `Profile.models[]` lookup) that forcing one signature over both would
+/// widen this fix rather than just closing it.
+///
+/// HOSTED steps (`config.endpoint` present) never call this: an endpoint
+/// deployment name is not something darkmux loads into local residency, so
+/// the bare `config.model` string is already the correct wire value there
+/// — see each `seat()`'s own `RemoteEndpoint` short-circuit.
+fn local_dispatch_wire_model_id(step: &Step, model: &str) -> String {
+    config_str(step, "identifier")
+        .map(str::to_string)
+        .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None))
+}
+
+/// (Also fix, #2570/#2240 class) A LOCAL step now addresses a darkmux-
+/// namespaced IDENTIFIER (`local_dispatch_wire_model_id`, above) rather
+/// than a bare model key. LMStudio 400s on an identifier it has no
+/// instance for instead of silently JIT-loading a fresh copy the way a
+/// bare key would — a real behavior change from "loads badly at the wrong
+/// context" to "fails outright" when the resident instance is gone between
+/// this step's seat claim and its actual dispatch (a TTL expiry, an `lms
+/// unload` / `darkmux machine eject` from another shell, an LMStudio
+/// restart). `dispatch_internal::residency_lost_detail` already carries
+/// this explanation for the main dispatch model's own local error path
+/// (#2240); this is the same hint, attached at both of THIS module's local
+/// arms (`dispatch.single_shot`'s local branch and `dispatch.map`'s
+/// per-item local branch) so a step-kind dispatch failure reads the same
+/// way a top-level dispatch failure already does — never silently, and
+/// never with a plain "not found" that leaves the operator to rediscover
+/// what #1274's namespace convention already explains.
+fn with_residency_lost_hint(wire_model: &str, e: anyhow::Error) -> anyhow::Error {
+    let detail = format!("{e:#}");
+    match crate::dispatch_internal::residency_lost_detail(wire_model, &detail) {
+        Some(msg) => e.context(msg),
+        None => e,
+    }
+}
+
 /// (#1230 Packet 3, reshaped by #2394) Best-effort role→profile→model
 /// resolution for [`crate::step_kinds::StepKind::seat`] implementations —
 /// NOT the dispatch's own strict preflight (that still runs in full,
@@ -822,9 +875,7 @@ impl StepKind for DispatchSingleShotStepKind {
                 reason: format!("local model `{model}` has no usable config.n_ctx"),
             };
         };
-        let identifier = config_str(step, "identifier")
-            .map(str::to_string)
-            .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None));
+        let identifier = local_dispatch_wire_model_id(step, model);
         let model_key = config_str(step, "model_key").unwrap_or(model);
         SeatClaim::LocalModel(darkmux_gestalt::Placement {
             model_key: model_key.to_string(),
@@ -887,6 +938,22 @@ impl DispatchSingleShotStepKind {
         };
 
         let model = require_config_str(step, self.id(), "model")?;
+        // (#2570) The identifier this step actually ADDRESSES: the bare
+        // `config.model` string for a hosted step (an endpoint deployment
+        // name — darkmux never loads it into local residency), or the SAME
+        // darkmux-namespaced identifier `seat()` derived above for a local
+        // one. Pre-#2570 every record below (and the local dispatch itself)
+        // used the bare `model` unconditionally, so a local step with no
+        // `config.identifier` override loaded `darkmux:<key>` and addressed
+        // `<key>` — the #2240/#2536 split, here. Computed once so the
+        // records and the actual call can never disagree about what was
+        // dispatched.
+        let is_hosted = step.config.get("endpoint").is_some();
+        let wire_model: std::borrow::Cow<'_, str> = if is_hosted {
+            std::borrow::Cow::Borrowed(model)
+        } else {
+            std::borrow::Cow::Owned(local_dispatch_wire_model_id(step, model))
+        };
         let system = config_str(step, "system").unwrap_or("");
         let base_user = config_str(step, "user").unwrap_or_default();
         let user = compose_message(base_user, input);
@@ -913,12 +980,12 @@ impl DispatchSingleShotStepKind {
             .config
             .get("endpoint")
             .and_then(|v| serde_json::from_value::<darkmux_types::ModelEndpoint>(v.clone()).ok())
-            .map(|ep| crate::dispatch_internal::remote_endpoint_label(&ep, model));
+            .map(|ep| crate::dispatch_internal::remote_endpoint_label(&ep, wire_model.as_ref()));
         let mut bookend = StepBookend::new(
             ctx,
             Self::bookend_record(
                 step,
-                model,
+                wire_model.as_ref(),
                 "dispatch start",
                 darkmux_flow::Level::Info,
                 endpoint_label.as_deref(),
@@ -926,7 +993,7 @@ impl DispatchSingleShotStepKind {
             ),
             Self::bookend_record(
                 step,
-                model,
+                wire_model.as_ref(),
                 "dispatch error",
                 darkmux_flow::Level::Error,
                 endpoint_label.as_deref(),
@@ -953,7 +1020,7 @@ impl DispatchSingleShotStepKind {
         let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
             darkmux_types::session_id::task(&step.task_id),
             None,
-            Some(model.to_string()),
+            Some(wire_model.to_string()),
         );
 
         let mut flow_records = Vec::new();
@@ -975,7 +1042,7 @@ impl DispatchSingleShotStepKind {
             let clamped_max_tokens = clamp_hosted_max_tokens(max_tokens, budget);
             let req = HostedSingleShotRequest {
                 endpoint: &endpoint,
-                model,
+                model: wire_model.as_ref(),
                 system,
                 user: &user,
                 max_tokens: clamped_max_tokens,
@@ -999,7 +1066,7 @@ impl DispatchSingleShotStepKind {
                 phase_id: None,
                 session_id: Some(darkmux_types::session_id::task(&step.task_id)),
                 source: Some("scheduler".to_string()),
-                model: Some(model.to_string()),
+                model: Some(wire_model.to_string()),
                 reasoning: None,
                 mission_id: None,
                 machine_id: None,
@@ -1026,7 +1093,7 @@ impl DispatchSingleShotStepKind {
                 .unwrap_or(0.7) as f32;
             let req = SingleShotRequest {
                 base_url: None,
-                model,
+                model: wire_model.as_ref(),
                 system,
                 user: &user,
                 temperature,
@@ -1034,6 +1101,7 @@ impl DispatchSingleShotStepKind {
                 timeout_seconds,
             };
             single_shot_chat(&req)
+                .map_err(|e| with_residency_lost_hint(wire_model.as_ref(), e))
                 .with_context(|| format!("step `{}` dispatch.single_shot (local)", step.id))?
         };
 
@@ -1045,7 +1113,7 @@ impl DispatchSingleShotStepKind {
         }
         bookend.close(Self::bookend_record(
             step,
-            model,
+            wire_model.as_ref(),
             "dispatch complete",
             darkmux_flow::Level::Info,
             endpoint_label.as_deref(),
@@ -1691,6 +1759,23 @@ impl DispatchMapStepKind {
         }
 
         let model = require_config_str(step, self.id(), "model")?;
+        // (#2570) The identifier this step actually ADDRESSES per item: the
+        // bare `config.model` string for a hosted step (an endpoint
+        // deployment name — darkmux never loads it into local residency),
+        // or the SAME darkmux-namespaced identifier `seat()` derived above
+        // for a local one. Pre-#2570 every per-item dispatch and every
+        // record below used the bare `model` unconditionally, so a local
+        // step with no `config.identifier` override loaded
+        // `darkmux:<key>` and addressed `<key>` for every item — the
+        // #2240/#2536 split, here. Computed once so the records and the
+        // actual per-item calls can never disagree about what was
+        // dispatched.
+        let is_hosted = step.config.get("endpoint").is_some();
+        let wire_model: std::borrow::Cow<'_, str> = if is_hosted {
+            std::borrow::Cow::Borrowed(model)
+        } else {
+            std::borrow::Cow::Owned(local_dispatch_wire_model_id(step, model))
+        };
         let user_template = require_config_str(step, self.id(), "user_template")?;
         let system = config_str(step, "system").unwrap_or("");
         let max_tokens = step.config.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096) as u32;
@@ -1728,12 +1813,12 @@ impl DispatchMapStepKind {
         // token records name a model and a cost but never a place.
         let endpoint_label: Option<String> = endpoint
             .as_ref()
-            .map(|ep| crate::dispatch_internal::remote_endpoint_label(ep, model));
+            .map(|ep| crate::dispatch_internal::remote_endpoint_label(ep, wire_model.as_ref()));
         let mut bookend = StepBookend::new(
             ctx,
             Self::bookend_record(
                 step,
-                model,
+                wire_model.as_ref(),
                 "dispatch start",
                 darkmux_flow::Level::Info,
                 endpoint_label.as_deref(),
@@ -1741,7 +1826,7 @@ impl DispatchMapStepKind {
             ),
             Self::bookend_record(
                 step,
-                model,
+                wire_model.as_ref(),
                 "dispatch error",
                 darkmux_flow::Level::Error,
                 endpoint_label.as_deref(),
@@ -1795,7 +1880,7 @@ impl DispatchMapStepKind {
         let session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
             darkmux_types::session_id::task(&step.task_id),
             task.role_id.clone(),
-            Some(model.to_string()),
+            Some(wire_model.to_string()),
         );
 
         // Per-EXECUTION remote allowance. When the step named a
@@ -1839,16 +1924,16 @@ impl DispatchMapStepKind {
             let user = user_template.replace("{item}", &map_item_text(payload));
             let res = match &endpoint {
                 Some(ep) => map_hosted_item(
-                    index, &bucket, ep, model, item_system, &user, max_tokens, timeout_seconds,
-                    retry_on_empty, retry_on_error, ovr,
+                    index, &bucket, ep, wire_model.as_ref(), item_system, &user, max_tokens,
+                    timeout_seconds, retry_on_empty, retry_on_error, ovr,
                 ),
                 None => map_local_item(
-                    index, model, item_system, &user, temperature, max_tokens, timeout_seconds,
-                    retry_on_empty, retry_on_error, ovr,
+                    index, wire_model.as_ref(), item_system, &user, temperature, max_tokens,
+                    timeout_seconds, retry_on_empty, retry_on_error, ovr,
                 ),
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
-            push(Self::item_record(step, model, endpoint.is_some(), &res), &mut batched);
+            push(Self::item_record(step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
             // (#1442 ship-2b, #1361 continuity) One `telemetry.tokens`
             // record per item that actually reported usage, so the fleet
             // dashboard's off-meter token sum (`category: telemetry,
@@ -1874,7 +1959,7 @@ impl DispatchMapStepKind {
                         "tokens",
                         &step.id,
                         &darkmux_types::session_id::task(&step.task_id),
-                        Some(model),
+                        Some(wire_model.as_ref()),
                         None,
                         None,
                         payload,
@@ -1904,7 +1989,7 @@ impl DispatchMapStepKind {
         // would render as the LARGEST single item, not the step's spend. The
         // aggregate's SUMMED total_tokens is >= every per-item value, so the
         // existing max-fold reads the true spend with zero viewer changes.
-        push(Self::aggregate_record(step, model, endpoint.is_some(), &results), &mut batched);
+        push(Self::aggregate_record(step, wire_model.as_ref(), endpoint.is_some(), &results), &mut batched);
 
         // (#1607) The clean terminal. `remote_tokens` is stamped only for a
         // hosted seat, and only the SUM the seat actually spent — the same
@@ -1913,7 +1998,7 @@ impl DispatchMapStepKind {
         let spent: u64 = results.iter().filter_map(|r| r.total_tokens).sum();
         let mut done = Self::bookend_record(
             step,
-            model,
+            wire_model.as_ref(),
             "dispatch complete",
             if ok_count == results.len() { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
             endpoint_label.as_deref(),
@@ -2293,6 +2378,12 @@ fn map_local_item(
             // needed to retry.
             Err(e) => {
                 if error_budget == 0 {
+                    // (Also fix, #2570 class) `model` here is always the
+                    // LOCAL wire id `run_map` resolved before this loop —
+                    // see `with_residency_lost_hint`'s own doc for why this
+                    // needs the same explanation `dispatch_internal`'s
+                    // top-level local dispatch already attaches.
+                    let e = with_residency_lost_hint(model, e);
                     return MapItemResult {
                         index,
                         ok: false,
@@ -2635,9 +2726,7 @@ impl StepKind for DispatchMapStepKind {
         else {
             return SeatClaim::LocalModelUnresolved { reason: "no usable config.n_ctx".to_string() };
         };
-        let identifier = config_str(step, "identifier")
-            .map(str::to_string)
-            .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None));
+        let identifier = local_dispatch_wire_model_id(step, model);
         // (#1442 ship-2b) `model_key` — the LOADABLE model key when it
         // differs from the wire `model` id. A local seat dispatches against
         // its darkmux-NAMESPACED identifier (`darkmux:<id>` as the wire
@@ -3093,6 +3182,614 @@ mod tests {
     /// implementations read the bus, so an empty one is sufficient here.
     fn bare_ctx() -> StepRunCtx {
         StepRunCtx::new(None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
+    }
+
+    // ── (#2570) load/wire agreement for dispatch.single_shot / dispatch.map ──
+    //
+    // Before this fix, `seat()` derived `darkmux:<key>` (or an explicit
+    // `identifier` override) to claim residency, and `run`/`run_map` then put
+    // the BARE `config.model` string on the wire, unconditionally — a local
+    // step naming a bare model with no override loaded one identifier and
+    // addressed another. The pure tests below pin `local_dispatch_wire_model_id`
+    // (the one function both `seat()`s and both `run`/`run_map` now share)
+    // against `seat()`'s own claimed `Placement.identifier`; the httpmock
+    // tests red-prove the ACTUAL dispatch — the thing #2570 is about — by
+    // pointing `DARKMUX_LMSTUDIO_URL` at a mock that only answers a request
+    // whose JSON body names the namespaced identifier.
+
+    #[test]
+    fn local_dispatch_wire_model_id_matches_what_seat_claims_without_an_override() {
+        let single = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "qwen3-4b", "user": "hi", "n_ctx": 8192 }),
+        );
+        let SeatClaim::LocalModel(placement) =
+            DispatchSingleShotStepKind.seat(&single, &empty_task(), &BTreeMap::new(), &bare_ctx())
+        else {
+            panic!("expected LocalModel");
+        };
+        assert_eq!(
+            local_dispatch_wire_model_id(&single, "qwen3-4b"),
+            placement.identifier,
+            "the wire helper must derive the identical identifier seat() claimed residency \
+             under, or load and wire disagree"
+        );
+        assert_eq!(placement.identifier, "darkmux:qwen3-4b");
+
+        let map = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "n_ctx": 8192,
+            "collection": ["a"],
+        }));
+        let SeatClaim::LocalModel(placement) =
+            DispatchMapStepKind.seat(&map, &empty_task(), &BTreeMap::new(), &bare_ctx())
+        else {
+            panic!("expected LocalModel");
+        };
+        assert_eq!(local_dispatch_wire_model_id(&map, "qwen3-4b"), placement.identifier);
+        assert_eq!(placement.identifier, "darkmux:qwen3-4b");
+    }
+
+    #[test]
+    fn local_dispatch_wire_model_id_honors_an_explicit_identifier_override() {
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "qwen3-4b", "identifier": "my-own-alias", "user": "hi", "n_ctx": 8192 }),
+        );
+        assert_eq!(local_dispatch_wire_model_id(&s, "qwen3-4b"), "my-own-alias");
+        let SeatClaim::LocalModel(placement) =
+            DispatchSingleShotStepKind.seat(&s, &empty_task(), &BTreeMap::new(), &bare_ctx())
+        else {
+            panic!("expected LocalModel");
+        };
+        assert_eq!(
+            placement.identifier, "my-own-alias",
+            "the wire helper and seat()'s own claim must still agree with an override present"
+        );
+    }
+
+    /// The sibling of the test above for `dispatch.map` — the no-override
+    /// case above already covers both kinds together, but the OVERRIDE path
+    /// was only pinned for `dispatch.single_shot`, leaving `dispatch.map`'s
+    /// own `config_str(step, "identifier")` read in `local_dispatch_wire_
+    /// model_id` unpinned for the override branch specifically.
+    #[test]
+    fn map_local_dispatch_wire_model_id_honors_an_explicit_identifier_override() {
+        let m = map_step(json!({
+            "model": "qwen3-4b",
+            "identifier": "my-own-alias",
+            "user_template": "check {item}",
+            "n_ctx": 8192,
+            "collection": ["a"],
+        }));
+        assert_eq!(local_dispatch_wire_model_id(&m, "qwen3-4b"), "my-own-alias");
+        let SeatClaim::LocalModel(placement) =
+            DispatchMapStepKind.seat(&m, &empty_task(), &BTreeMap::new(), &bare_ctx())
+        else {
+            panic!("expected LocalModel");
+        };
+        assert_eq!(
+            placement.identifier, "my-own-alias",
+            "the wire helper and seat()'s own claim must still agree with an override present"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_single_shot_local_addresses_the_namespaced_identifier_it_would_load() {
+        // (#2570) Red-proves the actual bug: before the fix, this step
+        // dispatched with `"model": "qwen3-4b"` on the wire (the bare
+        // `config.model`, verbatim) while `seat()` claimed residency for
+        // `darkmux:qwen3-4b` — so a real LMStudio, resolving the bare key,
+        // could answer with a co-resident user-loaded copy at an unknown
+        // context (the #1135 shape) instead of the instance darkmux just
+        // loaded. The mock below only answers a request whose body names
+        // the NAMESPACED identifier; a bare-key request gets no matching
+        // mock and the dispatch fails.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"model": "darkmux:qwen3-4b"}"#);
+            then.status(200).header("content-type", "application/json").json_body(json!({
+                "id": "mock-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "qwen3-4b",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            }));
+        });
+
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+
+        let out = out.expect(
+            "a local dispatch.single_shot with no identifier override must address \
+             `darkmux:qwen3-4b` — the mock only answers that body, so a failure here means the \
+             bare key went out instead",
+        );
+        assert_eq!(out.output, "ok");
+        mock.assert_hits(1);
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_map_local_addresses_the_namespaced_identifier_it_would_load() {
+        // (#2570) Same red-prove as the single_shot test above, for the
+        // per-item local dispatch loop `dispatch.map` runs.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"model": "darkmux:qwen3-4b"}"#);
+            then.status(200).header("content-type", "application/json").json_body(json!({
+                "id": "mock-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "qwen3-4b",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            }));
+        });
+
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+
+        let s = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "collection": ["a", "b"],
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+
+        let out = out.expect("dispatch.map's local per-item dispatch must not fail outright");
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| r.ok && r.content == "ok"),
+            "every item must have addressed `darkmux:qwen3-4b` — the mock only answers that \
+             body, so a bare-key item shows up here as a failure: {results:?}"
+        );
+        mock.assert_hits(2);
+
+        // (MUST FIX 5) The per-item, aggregate, and token-telemetry RECORDS
+        // this run also produced (returned batched here since `ctx` is
+        // `None`) must themselves carry the namespaced identifier, not just
+        // the wire body the mock above already proves. Reverting any of
+        // `item_record`'s / `aggregate_record`'s / the `telemetry.tokens`
+        // push's `wire_model.as_ref()` argument back to the bare `model`
+        // leaves the dispatch itself succeeding (the mock only inspects the
+        // wire body) while these records silently go back to lying about
+        // what actually ran.
+        let item_records: Vec<&darkmux_flow::FlowRecord> = out
+            .flow_records
+            .iter()
+            .filter(|r| r.action == "step result" && r.payload.as_ref().and_then(|p| p.get("index")).is_some())
+            .collect();
+        assert_eq!(item_records.len(), 2, "one `step result` record per item: {:?}", out.flow_records);
+        for rec in &item_records {
+            assert_eq!(
+                rec.model.as_deref(),
+                Some("darkmux:qwen3-4b"),
+                "item_record must carry the namespaced identifier the item actually \
+                 addressed: {rec:?}"
+            );
+        }
+
+        let aggregate = out
+            .flow_records
+            .iter()
+            .find(|r| r.action == "step result" && r.payload.as_ref().and_then(|p| p.get("items_in")).is_some())
+            .expect("aggregate_record must be present");
+        assert_eq!(
+            aggregate.model.as_deref(),
+            Some("darkmux:qwen3-4b"),
+            "aggregate_record must carry the namespaced identifier: {aggregate:?}"
+        );
+
+        let telemetry_records: Vec<&darkmux_flow::FlowRecord> =
+            out.flow_records.iter().filter(|r| r.action == "telemetry.tokens").collect();
+        assert_eq!(
+            telemetry_records.len(),
+            2,
+            "one telemetry.tokens record per item that reported usage (the mock reports usage \
+             for both): {:?}",
+            out.flow_records
+        );
+        for rec in &telemetry_records {
+            assert_eq!(
+                rec.model.as_deref(),
+                Some("darkmux:qwen3-4b"),
+                "telemetry.tokens record must carry the namespaced identifier: {rec:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_single_shot_local_streaming_bookends_carry_the_namespaced_identifier() {
+        // (MUST FIX 5) `dispatch.single_shot`'s local arm produces NO
+        // `flow_records` via the batched `run()` path (its "step result"
+        // record only exists on the HOSTED branch) — the only place a local
+        // dispatch's bookends are observable at all is the STREAMING path,
+        // through the scheduler's live-emission channel. This is the same
+        // streaming-plus-channel shape
+        // `dispatch_map_hosted_emits_liveness_bookends_carrying_the_endpoint`
+        // already uses. Reverting either `Self::bookend_record(step,
+        // wire_model.as_ref(), ...)` call back to the bare `model` leaves
+        // the dispatch itself succeeding (the mock only inspects the wire
+        // body) while the liveness bookends silently go back to naming the
+        // wrong model.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"model": "darkmux:qwen3-4b"}"#);
+            then.status(200).header("content-type", "application/json").json_body(json!({
+                "id": "mock-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "qwen3-4b",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            }));
+        });
+
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(
+            Some(tx),
+            None,
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+        let result = DispatchSingleShotStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        drop(ctx);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+
+        result.expect(
+            "a local dispatch.single_shot with no identifier override must address \
+             `darkmux:qwen3-4b` — the mock only answers that body",
+        );
+        mock.assert_hits(1);
+
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let bookends: Vec<&darkmux_flow::FlowRecord> =
+            emitted.iter().filter(|r| r.action.starts_with("dispatch ")).collect();
+        assert_eq!(
+            bookends.len(),
+            2,
+            "expected exactly a start and a complete bookend: {emitted:?}"
+        );
+        for rec in &bookends {
+            assert_eq!(
+                rec.model.as_deref(),
+                Some("darkmux:qwen3-4b"),
+                "bookend record must carry the namespaced identifier the dispatch actually \
+                 addressed, not the bare config.model: {rec:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_single_shot_local_failure_names_the_lost_residency() {
+        // (Also fix, #2570 class) When the resident darkmux-namespaced
+        // instance is gone, LMStudio answers with a "not found"-shaped
+        // error instead of silently JIT-loading a bare-key copy. Before
+        // `with_residency_lost_hint` was wired into this local arm, that
+        // surfaced as a bare, unexplained error; this pins that the hint
+        // (`dispatch_internal::residency_lost_detail`) is actually attached
+        // here, the same way it already is on the top-level local dispatch
+        // path (#2240).
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(400).header("content-type", "application/json").json_body(json!({
+                "error": { "message": "Model \"darkmux:qwen3-4b\" not found" },
+            }));
+        });
+
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+
+        let err = out.expect_err("a 400 'not found' response must surface as an Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("darkmux dispatches only to its OWN namespaced instance"),
+            "the local arm must attach residency_lost_detail's hint, not just the bare LMStudio \
+             error: {msg}"
+        );
+        mock.assert_hits(1);
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_map_local_item_failure_names_the_lost_residency() {
+        // (Also fix, #2570 class) Same as the single_shot test above, for
+        // `dispatch.map`'s per-item local arm (`map_local_item`).
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(400).header("content-type", "application/json").json_body(json!({
+                "error": { "message": "Model \"darkmux:qwen3-4b\" not found" },
+            }));
+        });
+
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+
+        let s = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "collection": ["a"],
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+
+        let out = out.expect("dispatch.map itself completes Ok even when an item fails");
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].ok, "the item must be marked failed: {results:?}");
+        let err_text = results[0].error.as_deref().unwrap_or_default();
+        assert!(
+            err_text.contains("darkmux dispatches only to its OWN namespaced instance"),
+            "map_local_item must attach residency_lost_detail's hint to the item error, not \
+             just the bare LMStudio error: {err_text}"
+        );
+        mock.assert_hits(1);
+    }
+
+    // ─── Also fix (second review round): the DROP-PATH error bookend's
+    //     model field, unpinned in both kinds ───────────────────────────
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_single_shot_local_streaming_drop_path_error_bookend_carries_the_namespaced_identifier() {
+        // (Also fix, second review round) The two streaming bookend tests
+        // above (`..._local_streaming_bookends_carry_the_namespaced_
+        // identifier`) only ever reach the CLEAN path: `bookend.close(...)`
+        // fires with `wire_model.as_ref()`, so they pin the START and the
+        // real COMPLETE record. `StepBookend`'s on_abort record — the
+        // "dispatch error" the Drop impl emits when `run_single_shot`
+        // returns early via `?` WITHOUT ever reaching `close` — is a
+        // SEPARATE construction site (line ~994, `Self::bookend_record(step,
+        // wire_model.as_ref(), "dispatch error", ...)`), and nothing
+        // exercised it: mutating that call back to the bare `model` compiled
+        // and left the whole suite green, because no test ever forced the
+        // dispatch itself to fail on the STREAMING path.
+        //
+        // This does: same streaming+channel harness as the sibling test
+        // above, but the mock answers 400 (matching `..._local_failure_
+        // names_the_lost_residency`'s shape), so `single_shot_chat(&req)?`
+        // at the end of `run_single_shot` returns early — `bookend.close`
+        // is never called, and `StepBookend`'s Drop fires the on_abort
+        // record into the channel instead.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(400).header("content-type", "application/json").json_body(json!({
+                "error": { "message": "Model \"darkmux:qwen3-4b\" not found" },
+            }));
+        });
+
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(
+            Some(tx),
+            None,
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+        let result = DispatchSingleShotStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        drop(ctx);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+
+        result.expect_err("the mocked 400 must surface as an Err — this test needs the drop path, not the clean one");
+        mock.assert_hits(1);
+
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let error_bookends: Vec<&darkmux_flow::FlowRecord> =
+            emitted.iter().filter(|r| r.action == "dispatch error").collect();
+        assert_eq!(
+            error_bookends.len(),
+            1,
+            "expected exactly the drop-emitted error bookend (no start-only or double-emit): \
+             {emitted:?}"
+        );
+        assert_eq!(
+            error_bookends[0].model.as_deref(),
+            Some("darkmux:qwen3-4b"),
+            "the DROP-PATH error bookend must carry the namespaced identifier the dispatch \
+             actually addressed, not the bare config.model: {:?}",
+            error_bookends[0]
+        );
+    }
+
+    #[test]
+    fn dispatch_map_local_streaming_drop_path_error_bookend_carries_the_namespaced_identifier() {
+        // (Also fix, second review round) `dispatch.map`'s twin of the test
+        // above. Unlike `dispatch.single_shot`, `dispatch.map`'s per-item
+        // failures are ALL isolated into `MapItemResult` by design (the
+        // "per-item error isolation" policy this kind documents) — neither
+        // `map_local_item` nor `map_hosted_item` ever propagates a `?` back
+        // through `run_map`. So there is no ordinary dispatch failure that
+        // reaches `StepBookend`'s Drop for this kind; the only route is a
+        // genuine panic between `StepBookend::new` (bookend creation) and
+        // `bookend.close` (after the per-item loop). This test drives that
+        // panic through the SAME seam a real `bucket_group` sibling failure
+        // would use in production: the `MapDispatchOverride` test seam
+        // (`StepRunCtx::dispatch_override`, already exercised in
+        // `scheduler.rs`'s `dispatch_override_intercepts_dispatch_map_items_
+        // on_the_worker_thread`) intercepts the per-item transport call —
+        // panicking there is a stand-in for a transport-layer bug the
+        // override seam exists to let tests reach without a live server.
+        //
+        // LOCAL (no `config.endpoint`) is required, not incidental: a
+        // HOSTED item's `wire_model` and its bare `config.model` are the
+        // SAME string (#2570 — hosted steps keep the bare model verbatim,
+        // since an endpoint deployment name is never loaded into local
+        // residency), so a hosted-only version of this test could not
+        // distinguish "used wire_model" from "used the bare value" — the
+        // exact mutation this test exists to catch is only observable on
+        // the LOCAL arm, where `wire_model` is the namespaced
+        // `darkmux:qwen3-4b` and the bare `config.model` is plain
+        // `qwen3-4b`.
+        let ovr: MapDispatchOverride =
+            Arc::new(|_call: &OverrideDispatchCall<'_>| -> Result<crate::single_shot::SingleShotReply> {
+                panic!("deliberate panic — this test needs run_map to exit via unwind, not `?`, \
+                        to exercise StepBookend's Drop-emitted record");
+            });
+
+        let s = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "collection": ["a"],
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(
+            Some(tx),
+            None,
+            Some(ovr),
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            DispatchMapStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx)
+        }));
+        drop(ctx);
+
+        assert!(
+            result.is_err(),
+            "the override's panic must propagate out of run_streaming — this test needs the \
+             UNWIND path, not a caught error, to reach StepBookend's Drop"
+        );
+
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let error_bookends: Vec<&darkmux_flow::FlowRecord> =
+            emitted.iter().filter(|r| r.action == "dispatch error").collect();
+        assert_eq!(
+            error_bookends.len(),
+            1,
+            "expected exactly the drop-emitted error bookend (no clean complete — run_map \
+             panicked before reaching bookend.close): {emitted:?}"
+        );
+        assert_eq!(
+            error_bookends[0].model.as_deref(),
+            Some("darkmux:qwen3-4b"),
+            "the DROP-PATH error bookend must carry the namespaced identifier the map step \
+             actually addresses, not the bare config.model: {:?}",
+            error_bookends[0]
+        );
     }
 
     #[test]
@@ -5119,6 +5816,89 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_map_local_streaming_bookends_carry_the_namespaced_identifier() {
+        // (MUST FIX 5) The LOCAL twin of the hosted bookend test above —
+        // `dispatch.map`'s bookends, like `dispatch.single_shot`'s, are only
+        // observable through the streaming channel (`StepBookend::new` only
+        // emits through a `ctx`; the batched `run()` path is inert for
+        // them). Reverting either `Self::bookend_record(step, wire_model.
+        // as_ref(), ...)` call in `run_map` back to the bare `model` leaves
+        // the per-item dispatches themselves succeeding (the mock only
+        // inspects the chat body) while the bookends silently go back to
+        // naming the wrong model.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"model": "darkmux:qwen3-4b"}"#);
+            then.status(200).header("content-type", "application/json").json_body(json!({
+                "id": "mock-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "qwen3-4b",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            }));
+        });
+
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+
+        let s = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "collection": ["a"],
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(
+            Some(tx),
+            None,
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+        let result = DispatchMapStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        drop(ctx);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+
+        result.expect("the mock only answers the namespaced body");
+        mock.assert_hits(1);
+
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let bookends: Vec<&darkmux_flow::FlowRecord> =
+            emitted.iter().filter(|r| r.action.starts_with("dispatch ")).collect();
+        assert_eq!(bookends.len(), 2, "expected a start and a complete bookend: {emitted:?}");
+        for rec in &bookends {
+            assert_eq!(
+                rec.model.as_deref(),
+                Some("darkmux:qwen3-4b"),
+                "bookend record must carry the namespaced identifier the map step actually \
+                 addressed: {rec:?}"
+            );
+        }
+    }
+
     // ── (#2344) dispatch.map — session-presence heartbeat ────────────────
 
     /// A minimal fake Redis peer that ACKS everything: it completes the two
@@ -5283,6 +6063,84 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // mutates DARKMUX_REDIS_URL and DARKMUX_LMSTUDIO_URL
+    fn dispatch_map_local_session_beat_carries_the_namespaced_identifier() {
+        // (MUST FIX 5) The content-capturing twin of the test above (which
+        // only pins that a beat fires and stops) and the LOCAL twin of
+        // `dispatch_single_shot_local_session_beat_carries_the_namespaced_
+        // identifier` below — routed through a REAL LMStudio mock (rather
+        // than the `MapDispatchOverride` seam the test above uses) so the
+        // namespaced-wire-body check and the beat-content check both apply
+        // to the SAME dispatch. Reverting `dispatch.map`'s
+        // `spawn_session_emitter` call back to the bare `model` leaves the
+        // per-item dispatch succeeding while the beat silently goes back to
+        // naming the wrong model.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"model": "darkmux:qwen3-4b"}"#);
+            then.status(200).header("content-type", "application/json").json_body(json!({
+                "id": "mock-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "qwen3-4b",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            }));
+        });
+
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let redis_port = spawn_acking_recording_redis_server(Arc::clone(&log));
+
+        let lms_key = "DARKMUX_LMSTUDIO_URL";
+        let prev_lms = std::env::var(lms_key).ok();
+        let redis_key = "DARKMUX_REDIS_URL";
+        let prev_redis = std::env::var(redis_key).ok();
+        unsafe {
+            std::env::set_var(lms_key, server.base_url());
+            std::env::set_var(redis_key, format!("redis://127.0.0.1:{redis_port}"));
+        }
+
+        let s = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "collection": ["a"],
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+
+        unsafe {
+            match prev_lms {
+                Some(v) => std::env::set_var(lms_key, v),
+                None => std::env::remove_var(lms_key),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var(redis_key, v),
+                None => std::env::remove_var(redis_key),
+            }
+        }
+
+        out.expect("the mock only answers the namespaced body, so a bare-key dispatch fails");
+        mock.assert_hits(1);
+
+        let entries = log.lock().unwrap().clone();
+        let beat_entry = entries
+            .iter()
+            .find(|e| e.contains("SET") && e.contains("darkmux:session-presence:"))
+            .unwrap_or_else(|| panic!("expected a session-presence SET beat; saw {entries:?}"));
+        assert!(
+            beat_entry.contains("darkmux:qwen3-4b"),
+            "the session-presence beat must name the namespaced identifier the map step \
+             actually addressed, not the bare `qwen3-4b` config value: {beat_entry:?}"
+        );
+    }
+
+    #[test]
     #[serial_test::serial] // mutates DARKMUX_REDIS_URL
     fn dispatch_single_shot_writes_a_session_presence_beat_and_its_liveness_bookends() {
         // (#2344, fresh-review blocker) `dispatch.single_shot` was the WORST
@@ -5392,6 +6250,87 @@ mod tests {
             1,
             "exactly one terminal per open — the Drop guard must not double-emit alongside \
              the clean close; got {actions:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_REDIS_URL and DARKMUX_LMSTUDIO_URL
+    fn dispatch_single_shot_local_session_beat_carries_the_namespaced_identifier() {
+        // (MUST FIX 5) The one record site the flow-record-only assertions
+        // elsewhere in this file structurally cannot reach: the session-
+        // presence BEAT is not a `FlowRecord` at all — it rides its own
+        // Redis SET, invisible to both the batched `run()` output and the
+        // streaming channel. The ONLY way to pin what model it actually
+        // names is to capture the real bytes on the wire, the same way
+        // `dispatch_single_shot_writes_a_session_presence_beat_and_its_
+        // liveness_bookends` above already does with
+        // `spawn_acking_recording_redis_server` — reused here unchanged,
+        // just against a LOCAL (non-hosted) dispatch instead of a hosted
+        // one, since the namespaced-identifier split (#2570) only exists on
+        // the local arm. Reverting `spawn_session_emitter`'s `Some(wire_
+        // model.to_string())` argument back to the bare `model` leaves the
+        // dispatch itself succeeding (the LMStudio mock only inspects the
+        // CHAT body, never the presence beat) while the live fleet view
+        // silently goes back to showing the wrong model for a running local
+        // seat.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"model": "darkmux:qwen3-4b"}"#);
+            then.status(200).header("content-type", "application/json").json_body(json!({
+                "id": "mock-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "qwen3-4b",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            }));
+        });
+
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let redis_port = spawn_acking_recording_redis_server(Arc::clone(&log));
+
+        let lms_key = "DARKMUX_LMSTUDIO_URL";
+        let prev_lms = std::env::var(lms_key).ok();
+        let redis_key = "DARKMUX_REDIS_URL";
+        let prev_redis = std::env::var(redis_key).ok();
+        unsafe {
+            std::env::set_var(lms_key, server.base_url());
+            std::env::set_var(redis_key, format!("redis://127.0.0.1:{redis_port}"));
+        }
+
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new());
+
+        unsafe {
+            match prev_lms {
+                Some(v) => std::env::set_var(lms_key, v),
+                None => std::env::remove_var(lms_key),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var(redis_key, v),
+                None => std::env::remove_var(redis_key),
+            }
+        }
+
+        out.expect("the mock only answers the namespaced body, so a bare-key dispatch fails");
+        mock.assert_hits(1);
+
+        let entries = log.lock().unwrap().clone();
+        let beat_entry = entries
+            .iter()
+            .find(|e| e.contains("SET") && e.contains("darkmux:session-presence:"))
+            .unwrap_or_else(|| panic!("expected a session-presence SET beat; saw {entries:?}"));
+        assert!(
+            beat_entry.contains("darkmux:qwen3-4b"),
+            "the session-presence beat must name the namespaced identifier the dispatch \
+             actually addressed, not the bare `qwen3-4b` config value: {beat_entry:?}"
         );
     }
 

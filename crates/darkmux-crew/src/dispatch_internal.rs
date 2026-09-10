@@ -4973,6 +4973,48 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                     eprintln!("{warning}");
                 }
             }
+        } else if let Some(warning) = compaction.unset_compactor_warning() {
+            // (MUST FIX 1, #2571 follow-up) `compactor_model` stayed `None`
+            // all the way through `from_profile` + `apply_utility_model` —
+            // no compactor is going to be loaded, and `apply_compaction_flags`
+            // (below, at the docker-spawn site) will therefore omit
+            // `--compactor-model` entirely. Before this, that silence was
+            // the ONLY signal: no message, no trajectory event, no flow
+            // record, no envelope field distinguished "never needed one"
+            // from "was never bound." Say so here, at the same point the
+            // bound case warns on a load failure — same class of disclosure,
+            // opposite trigger. `unset_compactor_warning` is pure and
+            // covered directly by `dispatch.rs`'s own unit tests; the WIRING
+            // of this call site is pinned by
+            // `tests/cli.rs::dispatch_host_side_unset_compactor_disclosure_
+            // fires_on_the_local_path` (a fully hermetic real-binary spawn —
+            // fake `lms`/`docker` on `PATH`, no real LMStudio or Docker
+            // touched).
+            //
+            // (Second review round, "also consider") On the direct
+            // `darkmux dispatch` CLI path the runtime ALSO prints its own
+            // twin (`compaction::compactor_disclosure_message`,
+            // `runtime/src/main.rs`) under the identical condition — the
+            // host forwards `compactor_model`/`context_window`/
+            // `threshold_tokens` to the runtime unchanged as CLI flags, so
+            // whenever this branch fires the runtime's copy will too, once
+            // its (buffered, `wait_with_output`-captured) stderr is dumped
+            // by `main.rs`'s `if !quiet && !result.stderr.is_empty()`. Kept
+            // BOTH deliberately rather than suppressing either: the runtime
+            // copy is the single canonical source reachable from every
+            // invocation path (`lab run`, a bare `docker run` against the
+            // image, any non-darkmux harness) and prints only once the whole
+            // dispatch is DONE (`wait_with_output` buffers, it doesn't
+            // stream); this host copy is the operator's only ADVANCE
+            // warning — it prints immediately, at dispatch START, which
+            // matters on a long-running dispatch where the runtime's copy
+            // might not surface for hours. Suppressing this one would trade
+            // a real property (early warning) for solving a mild
+            // duplication (two similarly-worded paragraphs, not two
+            // contradictory ones) — the actual fix for the duplication is
+            // streaming the container's stderr live instead of buffering it
+            // for the final dump, which is a separate, larger change.
+            eprintln!("{warning}");
         }
     }
 
@@ -9528,10 +9570,16 @@ fn resolve_dispatch_model_with_hosts(
 
 /// (#590) Best-effort: the machine's registered utility model
 /// (`internal.utility`), for overlaying onto the compactor. `None` if the
-/// registry isn't loadable or no utility model is registered — the runtime
-/// then keeps its built-in default compactor. Mirrors the loud-but-soft
-/// posture of `resolve_dispatch_model_internal`: a missing binding is not an
-/// error, just an absent overlay.
+/// registry isn't loadable or no utility model is registered — (#2571) NOT
+/// a case where the runtime keeps a built-in default compactor; there is no
+/// runtime default any more. This `None` flows straight through
+/// `apply_utility_model` into `compaction.compactor_model`, which stays
+/// `None`, which means compaction is OFF outright for the dispatch
+/// (disclosed loudly by `unset_compactor_warning` at the call site above).
+/// Mirrors the loud-but-soft posture of `resolve_dispatch_model_internal`: a
+/// missing binding is not an error, just an absent overlay — but "absent
+/// overlay" is a genuinely different, disclosed degraded mode now, not a
+/// silent substitution.
 fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
     darkmux_profiles::profiles::load_registry(config_path)
         .ok()
@@ -9742,13 +9790,20 @@ fn ensure_utility_resident(
 /// identifier_opt_out_and_diverge_with_one` pins both halves. Collapsing them
 /// into one shared helper is #2537's concern, not this fix's.
 ///
-/// (#2571, out of scope) This closes the shape where `internal.utility` IS
-/// bound. When it is UNSET the host skips the residency block entirely
-/// (`compaction.compactor_model` is `None`) and the runtime falls back to its
-/// own `DEFAULT_COMPACTOR_MODEL` — itself already namespaced
-/// (`darkmux:qwen3-4b-instruct-2507`, `runtime/src/compaction.rs`) — so
-/// compaction addresses a darkmux instance nothing on the host ever loaded.
-/// Pre-existing and unchanged by #2536; filed as #2571.
+/// (#2571) This function closes the shape where `internal.utility` IS
+/// bound. When it is UNSET the host skips the residency block entirely and
+/// leaves `compaction.compactor_model` as `None` — the container then
+/// receives no `--compactor-model` flag at all
+/// (`apply_compaction_flags`'s `if let Some(model) = &compaction.
+/// compactor_model`). Pre-#2571 the RUNTIME independently filled that gap
+/// with its own hardcoded `DEFAULT_COMPACTOR_MODEL` fallback, addressing a
+/// darkmux instance nothing on the host ever loaded — the #2571 fix is
+/// entirely on the runtime side (`runtime/src/compaction.rs`:
+/// `CompactionConfig.compactor_model` is `Option<String>` now, and
+/// `needs_compaction` refuses whenever it's `None`), so the host's own
+/// behavior here — correctly reporting "nothing loaded" by omitting the
+/// flag — needed no change at all. Host and runtime now agree by
+/// construction: no flag in, no compaction attempted.
 pub(crate) fn compactor_wire_model_id(compactor_id: &str) -> String {
     darkmux_gestalt::namespaced_identifier(bare_model_key(compactor_id), None)
 }

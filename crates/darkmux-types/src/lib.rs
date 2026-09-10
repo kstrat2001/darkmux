@@ -488,8 +488,12 @@ pub struct RegistryInternal {
     /// estimation / mission-compile later). The operator registers it from
     /// lab work; it is **not** capability-scored (a score could re-pick a
     /// large model for compaction and reintroduce the per-beat tax). One
-    /// global util model serves all utility hooks. Absent ⇒ the runtime
-    /// falls back to its built-in default compactor.
+    /// global util model serves all utility hooks. Absent ⇒ (#2571) NOT a
+    /// fallback to a built-in default compactor — there is no runtime
+    /// default any more. `CompactionDispatchArgs::apply_utility_model`
+    /// leaves `compactor_model` unset, and an unset compactor means
+    /// compaction is OFF outright for the dispatch (disclosed loudly at
+    /// dispatch time, not silently defaulted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utility: Option<String>,
 }
@@ -666,8 +670,12 @@ pub struct ProfileRegistry {
 
 impl ProfileRegistry {
     /// The machine's registered utility model id (`internal.utility`), if any.
-    /// `None` ⇒ no machine utility model registered; consumers fall back to
-    /// their built-in default. (#590)
+    /// `None` ⇒ no machine utility model registered. (#590) (#2571: NOT "consumers
+    /// fall back to their built-in default" — there is no runtime default any
+    /// more; consumers that overlay this onto a compactor binding
+    /// (`CompactionDispatchArgs::apply_utility_model`) are left with
+    /// `compactor_model: None`, which means compaction is OFF outright for the
+    /// dispatch, disclosed loudly rather than silently defaulted.)
     ///
     /// Surrounding whitespace is trimmed and a blank value (`""` / whitespace)
     /// is treated as **unset** — an empty binding is meaningless, and since

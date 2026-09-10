@@ -2462,6 +2462,103 @@ fn dispatch_licensed_adjacent_role_bails_at_ack_gate_before_docker() {
 }
 
 
+/// (Second review round, MUST FIX 1 follow-up: "neither disclosure call
+/// site is test-covered") Pins the HOST-side half of the unset-compactor
+/// disclosure (`CompactionDispatchArgs::unset_compactor_warning`, wired at
+/// its call site in `dispatch_internal.rs`'s compactor-residency block) at
+/// the real CLI boundary — the runtime half already gets an equivalent
+/// integration assertion (`runtime/tests/`, spawning `darkmux-runtime`
+/// directly). Before this, `dispatch_internal.rs`'s own comment on that call
+/// site said plainly: "Still NOT covered ... deleting this whole call
+/// compiles and stays green ... covering it needs a dispatch()-level
+/// integration test this crate does not have" — `darkmux-crew` cannot spawn
+/// `CARGO_BIN_EXE_darkmux` (that binary belongs to a different workspace
+/// member, so Cargo never sets the env var there); this file's own package
+/// IS that binary's package, so it can.
+///
+/// Fully hermetic, no `#[ignore]` needed: `DARKMUX_LMS_BIN` and `PATH` point
+/// at fake `lms`/`docker` stand-ins (`install_fake_docker`'s idiom in
+/// `crates/darkmux-crew/src/dispatch_internal_tests.rs`, reproduced here
+/// since a cross-crate `dev-dependency` on that test-only helper would be
+/// backwards). The fake `lms ps --json` reports `model-a` already resident
+/// under its namespaced identifier (`darkmux:model-a`) at a context >= the
+/// profile's declared `n_ctx`, so `ensure_model_resident` takes its early
+/// `return Ok(())` and never calls `lms load` — no real model dispatch, no
+/// real LMStudio contact, anywhere on this path (per the standing "do not
+/// dispatch local models" guardrail). The fixture profile registry declares
+/// no `internal.utility` binding and a real `n_ctx`, so the host reaches its
+/// compactor-residency block with `compactor_model: None` and
+/// `context_window: Some(32000)` — exactly `unset_compactor_warning`'s
+/// firing condition. `--skip-preflight` is the CLI's own existing debug
+/// escape hatch (already used this way in `darkmux-crew`'s own
+/// `dispatch_preflight_probe_opts`) and only skips the SEPARATE
+/// `check_docker_preflight` reachability/pull check; the fake `docker` on
+/// `PATH` stands in for the `docker run` the dispatch still performs right
+/// after — this test only cares what printed BEFORE that point, so the fake
+/// docker just exits 0 immediately.
+#[test]
+fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
+    let tmp = TempDir::new().unwrap();
+
+    let profiles_path = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{
+            "profiles": {
+                "fast": {
+                    "description": "no compactor bound, a real context window",
+                    "models": [
+                        {"id": "model-a", "n_ctx": 32000, "role": "primary"}
+                    ]
+                }
+            },
+            "default_profile": "fast"
+        }"#,
+    )
+    .unwrap();
+
+    let fake_bin = tmp.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_lms = fake_bin.join("lms");
+    fs::write(
+        &fake_lms,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"ps\" ]; then\n\
+         echo '[{\"identifier\":\"darkmux:model-a\",\"modelKey\":\"model-a\",\"status\":\"loaded\",\"sizeBytes\":1000000000,\"contextLength\":32000}]'\n\
+         exit 0\n\
+         fi\n\
+         exit 0\n",
+    )
+    .unwrap();
+    let fake_docker = fake_bin.join("docker");
+    fs::write(&fake_docker, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [&fake_lms, &fake_docker] {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(p, perms).unwrap();
+        }
+    }
+
+    let ack_dir = TempDir::new().unwrap();
+    let real_path = std::env::var("PATH").unwrap_or_default();
+
+    darkmux_cmd()
+        .env("DARKMUX_ACK_DIR", ack_dir.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .env("PATH", format!("{}:{real_path}", fake_bin.display()))
+        .args(["dispatch", "coder", "--skip-preflight", "smoke"])
+        .assert()
+        .stderr(
+            predicate::str::contains("no compactor is bound for this dispatch")
+                .and(predicate::str::contains("compaction is OFF"))
+                .and(predicate::str::contains("32000")),
+        );
+}
+
 // ─── #2124: SIGTERM mid-probe leaves a terminal record + no orphaned curl ──
 
 /// A tiny local server that ACCEPTS every connection and never responds —
