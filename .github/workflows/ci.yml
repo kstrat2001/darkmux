@@ -433,6 +433,15 @@ jobs:
           # never reworded; its dir is excluded from every scan.
           SCAN="README.md CONTRIBUTING.md DESIGN.md AGENTS.md CLAUDE.md ROADMAP.md DISCLAIMER.md docs/ENVIRONMENT.md docs/ENGAGEMENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/"
           EXCL="--exclude-dir=pr-review-bench"
+          # (#2589) One mktemp'd stderr file per scan below, cleaned up on
+          # exit regardless of which scan fires it — a runner is ephemeral so
+          # a leaked /tmp/*.err here was harmless, but a fixed name is still
+          # sloppy precedent (the release skill's copy of this same pattern
+          # is NOT ephemeral — see that fix — so this scan matches it).
+          PAT_ERRF=$(mktemp)
+          VERB_ERRF=$(mktemp)
+          IDENTITY_ERRF=$(mktemp)
+          trap 'rm -f "$PAT_ERRF" "$VERB_ERRF" "$IDENTITY_ERRF"' EXIT
           # (#2589) Gate on grep's real exit status, not the two-way `if cmd;
           # then` truthiness test, which conflates exit 1 (no match — clean)
           # with exit 2 (a scan error, e.g. a path in $SCAN that no longer
@@ -441,12 +450,12 @@ jobs:
           # now a loud failure with the real stderr attached, not silence.
           PAT='admin[- ]agent|admin</code>'
           set +e
-          bad=$(grep -rniE $EXCL "$PAT" $SCAN 2>/tmp/pat-scan.err)
+          bad=$(grep -rniE $EXCL "$PAT" $SCAN 2>"$PAT_ERRF")
           STATUS=$?
           set -e
           if [ "$STATUS" -eq 2 ]; then
             echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
-            cat /tmp/pat-scan.err
+            cat "$PAT_ERRF"
             exit 1
           elif [ "$STATUS" -eq 0 ]; then
             echo "::error::Retired term in user-facing docs — use 'utility', not 'admin' (the role_family loader rejects 'admin'):"
@@ -519,12 +528,12 @@ jobs:
           # its captured output as a second, exit-code-free step.
           VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close|lab runs|lab workloads|lab fixtures|lab inspect|lab compare|lab register|lab unregister|lab review-bench)\b'
           set +e
-          raw=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>/tmp/verb-scan.err)
+          raw=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>"$VERB_ERRF")
           STATUS=$?
           set -e
           if [ "$STATUS" -eq 2 ]; then
             echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
-            cat /tmp/verb-scan.err
+            cat "$VERB_ERRF"
             exit 1
           fi
           # The filter's own exit status is NOT a verdict — `grep -v` exits 1
@@ -555,12 +564,12 @@ jobs:
           # status from the first grep, filter applied as a separate step.
           IDENTITYPAT='/darkmux-swap-stack|swap stacks?|to multiplex'
           set +e
-          raw=$(grep -rniE $EXCL "$IDENTITYPAT" $SCAN 2>/tmp/identity-scan.err)
+          raw=$(grep -rniE $EXCL "$IDENTITYPAT" $SCAN 2>"$IDENTITY_ERRF")
           STATUS=$?
           set -e
           if [ "$STATUS" -eq 2 ]; then
             echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
-            cat /tmp/identity-scan.err
+            cat "$IDENTITY_ERRF"
             exit 1
           fi
           # The filter's own exit status is NOT a verdict — `grep -v` exits 1

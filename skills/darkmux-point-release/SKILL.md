@@ -81,57 +81,126 @@ Then by hand (judgment, not scriptable):
 - **⚠ Do NOT touch `packaging/homebrew/darkmux.rb` in this PR — not even its comment block.** Merging anything under `packaging/homebrew/` fires the tap-sync workflow, which would publish a pin that is still pointing at the PREVIOUS tag, racing the real pin from step 4. The formula is touched exactly once per release, in its own PR, *after* the tag exists — it cannot be pinned earlier anyway, because the `sha256` comes from the tag's tarball. (Learned the hard way on a previous release; the sweep above deliberately excludes the formula.)
 - **Every release**, regenerate the published demo world (#2032 packet 3 — this is the decided cadence: at release, not continuous, so a demo rebuild never recaptures screenshots for unshipped work): `cd scripts/demo-env && ./build.py && ./serve.py --port <free-port> &` then, once it's up, `./export_static.py --base http://127.0.0.1:<port>`, then from the repo root `bash scripts/build-demo.sh`. This is broader than "only if the viewer changed" — `demo-flow.jsonl`/`demo-runs.json` read as how long ago the demo world was last active, which drifts every release regardless of whether the UI changed, so the fixture regen runs every time and `build-demo.sh`'s narrower index.html regen rides along with it. Full command sequence, what each step writes, and the pre-commit proof checklist live in `scripts/demo-env/README.md`'s own "Refreshing the published demo" section — follow that, don't re-derive it here.
 
-Verify, then ship the PR (mechanical release-prep → external QA skipped, named; CI gates):
+Verify, then ship the PR (mechanical release-prep → external QA skipped, named; CI gates).
+**Both blocks below are meant to be saved as a script and run with `bash
+<file>`, not pasted line-by-line into an interactive shell** — each wraps its
+body in a `( ... )` subshell specifically so a failure path's `exit` ends the
+subshell, not the terminal session it's running in; run the block itself
+(not its individual lines) so that containment holds:
 ```bash
-# Gate on cargo's real exit code, not a text search over its output — a build
-# that never compiles prints no "test result:" line at all, so a grep for one
-# finds nothing and reports a false "tests ok" (#2589).
-if cargo test > /tmp/release-test.log 2>&1; then
-  echo "tests ok"
-else
-  STATUS=$?
-  echo "investigate — cargo test exited $STATUS (compile or test failure; full output in /tmp/release-test.log)"
-  tail -80 /tmp/release-test.log
-  exit 1
-fi
-git add -A && git commit -m "release: $NEW — <one-line theme>"
-git push -u origin release-$NEW
-gh pr create --title "release: $NEW" --body "Routine point release. <what's in it>. Formula pin follows after the tag."
-```
-**Merge-gate on conclusion==SUCCESS, not just completion** (the recurring trap).
-Bounded poll, gated on `gh`'s real exit code with its stderr surfaced — an
-unbounded `until` loop that only ever inspects stdout hangs forever on an
-error `gh` never gets past (expired auth, wrong repo, a rate limit), not just
-on a slow check (#2589):
-```bash
-ATTEMPTS=0
-MAX_ATTEMPTS=40   # ~20 minutes at 30s between polls — bounded, never infinite
-while :; do
-  CHECKS_OUT=$(gh pr checks release-$NEW 2>/tmp/pr-checks.err)
-  STATUS=$?
+(
+  set -eu
+  LOGF=$(mktemp) || { echo "mktemp failed"; exit 1; }
+  trap 'rm -f "$LOGF"' EXIT INT TERM
+  # Gate on cargo's real exit code, not a text search over its output — a
+  # build that never compiles prints no "test result:" line at all, so a
+  # grep for one finds nothing and reports a false "tests ok" (#2589).
+  # Output is tee'd (not just redirected) so a run that takes minutes stays
+  # visible while it's being watched; PIPESTATUS reads cargo's own exit
+  # code explicitly rather than the pipeline's (tee's), which is the exact
+  # `cmd | grep`-shaped trap this whole change exists to close (#2589).
+  set +e
+  cargo test 2>&1 | tee "$LOGF"
+  STATUS=${PIPESTATUS[0]}
+  set -e
   if [ "$STATUS" -ne 0 ]; then
-    echo "gh pr checks failed (exit $STATUS) — not retrying blindly:"
-    cat /tmp/pr-checks.err
+    echo "investigate — cargo test exited $STATUS (compile or test failure; see output above)"
+    exit "$STATUS"
+  fi
+  echo "tests ok"
+  git add -A && git commit -m "release: $NEW — <one-line theme>"
+  git push -u origin release-$NEW
+  gh pr create --title "release: $NEW" --body "Routine point release. <what's in it>. Formula pin follows after the tag."
+)
+```
+**Merge-gate on conclusion==SUCCESS, not just completion** (the recurring trap) —
+but reading `gh pr checks`' own exit code as that gate is itself the trap.
+`gh pr checks` (plain-text mode) exits non-zero whenever any check is not yet
+green, which is the loop's entire normal in-flight state — treating that as
+fatal aborted the poll on its first iteration, before it ever polled anything
+(#2589). `--json` mode exits 0 for a successful query regardless of check
+state, so a non-zero exit *there* is a genuine transport/auth failure worth
+surfacing immediately, and the check states themselves come from reading
+`bucket` in the JSON, never inferred from an exit code:
+```bash
+(
+  set -eu
+  ERRF=$(mktemp) || { echo "mktemp failed"; exit 1; }
+  trap 'rm -f "$ERRF"' EXIT INT TERM
+
+  # Bound: 30s x 120 attempts = 60 minutes. Measured on this repo: the main
+  # workflow's median run is ~5.5 min, the quality workflow's median ~11 min
+  # (max ~16 min), and one real successful release measured 22 min end to
+  # end (the poll starts right after the PR opens, so queue time counts
+  # against it too). 60 minutes is ~2.7x the slowest real run observed —
+  # raise it again if a future release routinely queues longer than that.
+  POLL_SECONDS=30
+  MAX_ATTEMPTS=120
+  ATTEMPTS=0
+  while :; do
+    set +e
+    RESULT=$(gh pr checks release-$NEW --json bucket --jq '
+      if length == 0 then "no-checks"
+      elif ([.[] | select(.bucket=="pending")] | length) > 0 then "pending"
+      else "done"
+      end
+    ' 2>"$ERRF")
+    STATUS=$?
+    set -e
+    if [ "$STATUS" -ne 0 ]; then
+      echo "gh pr checks failed (exit $STATUS) — not retrying blindly:"
+      cat "$ERRF"
+      exit 1
+    fi
+    # "no-checks" (nothing registered yet, right after the PR opened) and
+    # "pending" (still running — a check already having failed doesn't
+    # count as done while a SIBLING check is still in flight) both mean
+    # keep waiting. Only "done" — nothing left pending, pass or fail — ends
+    # the poll; the conclusion itself is judged separately below.
+    if [ "$RESULT" = "done" ]; then
+      break
+    fi
+    ATTEMPTS=$((ATTEMPTS + 1))
+    if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+      echo "timed out after $((MAX_ATTEMPTS * POLL_SECONDS))s waiting for checks on release-$NEW"
+      exit 1
+    fi
+    sleep "$POLL_SECONDS"
+  done
+
+  # A nightly-only job (mutation full sweep) legitimately reads "skipped" on
+  # every PR run, so the OLD `unique|join(",")` always included it and
+  # `[ "$C" = "success" ]` was never true on this repo — a silent no-op
+  # before this change, a hard failure on every real release after it
+  # (#2589). Filter out conclusions that aren't a verdict (skipped/neutral/
+  # null) before judging, and refuse to merge if nothing verdict-bearing is
+  # left (a run with only skipped jobs proves nothing, so it's not "success"
+  # either) — genuine bad conclusions (failure/cancelled/timed_out) are
+  # never filtered, so they still block the merge as before.
+  set +e
+  C=$(gh api "repos/kstrat2001/darkmux/commits/$(git rev-parse HEAD)/check-runs" --jq '
+    ([.check_runs[].conclusion] | map(select(. != "skipped" and . != "neutral" and . != null))) as $v
+    | if ($v | length) == 0 then "no-verdicts"
+      elif ($v | all(. == "success")) then "success"
+      else ($v | unique | join(","))
+      end
+  ' 2>"$ERRF")
+  API_STATUS=$?
+  set -e
+  if [ "$API_STATUS" -ne 0 ]; then
+    echo "gh api check-runs failed (exit $API_STATUS):"
+    cat "$ERRF"
     exit 1
   fi
-  if [ -n "$CHECKS_OUT" ] && ! printf '%s\n' "$CHECKS_OUT" | grep -q 'pending\|queued\|in_progress'; then
-    break
-  fi
-  ATTEMPTS=$((ATTEMPTS + 1))
-  if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
-    echo "timed out after $((MAX_ATTEMPTS * 30))s waiting for checks on release-$NEW"
+
+  if [ "$C" = "success" ]; then
+    gh pr merge release-$NEW --squash --delete-branch
+    git checkout main && git pull --ff-only
+  else
+    echo "checks did not all succeed (non-skipped conclusions: $C) — not merging"
     exit 1
   fi
-  sleep 30
-done
-C=$(gh api repos/kstrat2001/darkmux/commits/$(git rev-parse HEAD)/check-runs --jq '[.check_runs[].conclusion]|unique|join(",")')
-if [ "$C" = "success" ]; then
-  gh pr merge release-$NEW --squash --delete-branch
-else
-  echo "checks did not all succeed (conclusions: $C) — not merging"
-  exit 1
-fi
-git checkout main && git pull --ff-only
+)
 ```
 
 ## 2.5. The dogfood gate — verify the FEATURES on the build you are about to tag
