@@ -79,6 +79,18 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
 
 pub const FLOW_SCHEMA_VERSION: &str = "1.46.0";
 // Version history:
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #1645: `dispatch_internal.rs`'s
+//           `dispatch_remote`/`dispatch_local_single_shot` arms (the hosted and
+//           container-free local single-shot dispatch paths) now resolve
+//           `mission_id` via the SAME `resolve_mission_for_phase(phase_id)`
+//           lookup the container-agentic path already used (#714), instead of
+//           a hardcoded `None` a #1177-era TODO left in `build_remote_record`.
+//           `mission_id` is an existing optional field on every record shape —
+//           this only changes which producers populate it, not the field
+//           itself, so no new key and no shape change. A dispatch whose
+//           `phase_id` never resolves to a mission (a bare `darkmux dispatch
+//           <role>`, RADIO's answering seat) still carries no `mission_id`,
+//           same as before.
 //   1.46.0 (#2263) — the internal-runtime `dispatch complete` payload's
 //           `prompt_tokens`/`completion_tokens`/`total_tokens`/
 //           `reasoning_tokens`/`cached_tokens` now come from the live

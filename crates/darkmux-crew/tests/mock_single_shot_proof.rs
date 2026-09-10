@@ -59,6 +59,45 @@ fn write_mock_profiles_registry(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+/// Write a phase file under `<crew_dir>/missions/<mission_id>/phases/<phase_id>.json`
+/// — the exact on-disk shape `crew::lifecycle::load_phase_by_id` (and so
+/// `crew::dispatch::resolve_mission_for_phase`) reads, matching the shape
+/// `dispatch.rs`'s own `resolve_mission_for_phase_returns_mission_for_known_phase`
+/// unit test uses.
+fn write_mock_phase(crew_dir: &Path, mission_id: &str, phase_id: &str) {
+    let phases_dir = crew_dir.join("missions").join(mission_id).join("phases");
+    std::fs::create_dir_all(&phases_dir).expect("creating the mock phases dir");
+    std::fs::write(
+        phases_dir.join(format!("{phase_id}.json")),
+        format!(
+            r#"{{"id":"{phase_id}","mission_id":"{mission_id}","description":"d","status":"planned","depends_on":[],"created_ts":0}}"#
+        ),
+    )
+    .expect("writing the mock phase file");
+}
+
+/// Every flow record on disk (across every `.jsonl` day-file in `flows_dir`)
+/// whose `session_id` matches — the shared readback both tests in this file
+/// use, keyed the same way `dispatch_local_single_shot` stamps its own
+/// records.
+fn flow_records_for_session(flows_dir: &Path, session_id: &str) -> Vec<Value> {
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(flows_dir).expect("reading the isolated flows dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&path).expect("reading a flow record file");
+        for line in contents.lines() {
+            let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+            if record.get("session_id").and_then(Value::as_str) == Some(session_id) {
+                records.push(record);
+            }
+        }
+    }
+    records
+}
+
 #[test]
 // Prophylactic, not a fix for an observed race: this is the only test in
 // this file today, so DARKMUX_FLOWS_DIR isn't actually contested yet. But
@@ -175,25 +214,158 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     // "dispatch liveness" — CLAUDE.md's cross-system contracts section) —
     // proving the container-free path honors the SAME liveness bookend
     // contract the container path does, not a lighter/different one.
+    let records = flow_records_for_session(flows_dir.path(), &session_id);
     let mut saw_start = false;
     let mut saw_complete = false;
-    for entry in std::fs::read_dir(flows_dir.path()).expect("reading the isolated flows dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
+    for record in &records {
+        match record.get("action").and_then(Value::as_str) {
+            Some("dispatch start") => saw_start = true,
+            Some("dispatch complete") | Some("dispatch error") => saw_complete = true,
+            _ => {}
         }
-        let contents = std::fs::read_to_string(&path).expect("reading a flow record file");
-        for line in contents.lines() {
-            let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
-            if record.get("session_id").and_then(Value::as_str) != Some(session_id.as_str()) {
-                continue;
-            }
-            match record.get("action").and_then(Value::as_str) {
-                Some("dispatch start") => saw_start = true,
-                Some("dispatch complete") | Some("dispatch error") => saw_complete = true,
-                _ => {}
-            }
+    }
+    assert!(saw_start, "no dispatch.start flow record found for session {session_id}");
+    assert!(saw_complete, "no terminal dispatch.complete/dispatch.error flow record found for session {session_id}");
+
+    // (#1645 inverted case) This dispatch set `phase_id: None` — the exact
+    // shape RADIO's answering seat (`src/radio.rs`, `src/radio_answer.rs`)
+    // uses in production, a genuinely mission-less single-shot dispatch.
+    // Every record must carry NO `mission_id` — fabricating one here would
+    // be worse than the bug #1645 fixes (a phantom mission grouping in the
+    // viewer for a dispatch that was never part of one).
+    for record in &records {
+        assert!(
+            record.get("mission_id").is_none_or(Value::is_null),
+            "a phase_id-less dispatch must never gain a fabricated mission_id, got: {record:?}"
+        );
+    }
+}
+
+/// (#1645) `dispatch_local_single_shot`'s hosted/local single-shot records
+/// (`dispatch start`/`dispatch complete`, built by `dispatch_internal.rs`'s
+/// `build_remote_record`) used to hardcode `mission_id: None` regardless of
+/// `opts.phase_id` — a #1177-era TODO ("resolved from phase in a follow-up")
+/// that never got its follow-up. A `dispatch.internal` step targeting a
+/// remote/hosted profile takes exactly this branch (`dispatch()` routes to
+/// `dispatch_remote` BEFORE it ever reaches the container path's own
+/// `resolve_mission_for_phase` call), so a graph step whose `phase_id`
+/// resolved to a real mission still produced unstamped heartbeat/dispatch
+/// records — silently dropping out of the mission view's drill-in, the same
+/// class of gap #1645 names for the container-agentic path.
+///
+/// This test pins the fix on the container-FREE single-shot primitive
+/// directly: a real `phase_id` (backed by a real on-disk phase file naming
+/// its mission) must produce records carrying that SAME `mission_id`.
+#[test]
+#[serial_test::serial]
+fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions");
+        then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
+            "id": "mock-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "mock dispatch complete — mission-stamped." },
+                "finish_reason": "stop",
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10 },
+        }));
+    });
+
+    let registry_dir = tempfile::tempdir().expect("tempdir for profiles registry");
+    let profiles_path = write_mock_profiles_registry(registry_dir.path());
+    let flows_dir = tempfile::tempdir().expect("tempdir for flow records");
+    let crew_dir = tempfile::tempdir().expect("tempdir for the crew/phase registry");
+
+    const MISSION_ID: &str = "mock-mission-1645";
+    const PHASE_ID: &str = "mock-phase-1645";
+    write_mock_phase(crew_dir.path(), MISSION_ID, PHASE_ID);
+
+    // SAFETY: same reasoning as the sibling test above — this is the only
+    // OTHER test in this file, both are `#[serial_test::serial]`, so there
+    // is no cross-test race on either env var this test mutates.
+    let prev_flows_dir = std::env::var("DARKMUX_FLOWS_DIR").ok();
+    let prev_crew_dir = std::env::var("DARKMUX_CREW_DIR").ok();
+    unsafe {
+        std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        std::env::set_var("DARKMUX_CREW_DIR", crew_dir.path());
+    }
+
+    let session_id = format!("mock-single-shot-mission-proof-{}", std::process::id());
+    let opts = DispatchOpts {
+        brief_refs: Vec::new(),
+        workspace_read_only: false,
+        record_context: None,
+        resume_from: None,
+        host_out: None,
+        max_turns_override: None,
+        timeout_override_seconds: None,
+        role_id: "radio-router".to_string(),
+        message: "content doesn't matter — the mock server ignores it".to_string(),
+        session_id: Some(session_id.clone()),
+        timeout_seconds: 30,
+        skip_preflight: true,
+        json: false,
+        workdir: None,
+        // The one variable under test: a real phase id, backed by the real
+        // on-disk phase file written above.
+        phase_id: Some(PHASE_ID.to_string()),
+        machine: None,
+        wait: true,
+        compaction: CompactionDispatchArgs::default(),
+        profile_name: Some("mock".to_string()),
+        config_path: Some(profiles_path.to_string_lossy().to_string()),
+        force_container: false,
+        max_completion_tokens: None,
+        image: None,
+        model_base_url_override: Some(server.base_url()),
+        step_id: None,
+        system_prompt_override: None,
+    };
+
+    let result = dispatch_local_single_shot(opts);
+
+    if let Some(prev) = prev_flows_dir {
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", prev) };
+    } else {
+        unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR") };
+    }
+    if let Some(prev) = prev_crew_dir {
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", prev) };
+    } else {
+        unsafe { std::env::remove_var("DARKMUX_CREW_DIR") };
+    }
+
+    let result = result.expect("dispatch_local_single_shot must return Ok — the mock round-trip succeeded");
+    assert_eq!(result.exit_code, 0);
+    mock.assert();
+
+    let records = flow_records_for_session(flows_dir.path(), &session_id);
+    let mut saw_start = false;
+    let mut saw_complete = false;
+    for record in &records {
+        match record.get("action").and_then(Value::as_str) {
+            Some("dispatch start") => saw_start = true,
+            Some("dispatch complete") | Some("dispatch error") => saw_complete = true,
+            _ => {}
         }
+        // The fix under test: EVERY record this dispatch emits must carry
+        // the mission the phase resolves to — not the hardcoded `None`
+        // `build_remote_record` used to bake in regardless of `phase_id`.
+        assert_eq!(
+            record.get("mission_id").and_then(Value::as_str),
+            Some(MISSION_ID),
+            "record must carry mission_id resolved from phase_id={PHASE_ID:?}, got: {record:?}"
+        );
+        assert_eq!(
+            record.get("phase_id").and_then(Value::as_str),
+            Some(PHASE_ID),
+            "record must still carry the phase_id itself, got: {record:?}"
+        );
     }
     assert!(saw_start, "no dispatch.start flow record found for session {session_id}");
     assert!(saw_complete, "no terminal dispatch.complete/dispatch.error flow record found for session {session_id}");
