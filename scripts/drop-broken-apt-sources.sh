@@ -66,17 +66,46 @@
 # `[arch=amd64 signed-by=...]`), never a hostname-shaped substring found
 # anywhere else on the line, so a URL living INSIDE the options block (e.g.
 # a signing key fetched over https) is never mistaken for the source's own
-# URI. A URI's userinfo (`user:pass@`) is stripped before the host is read
-# off, cutting at the LAST `@` — this reveals the real host when the real
-# host is preceded by real credentials, and it refuses to let a URI use the
-# target hostname AS fake userinfo to disguise an unrelated real host.
+# URI. The URI's AUTHORITY is isolated first — cutting off the path, query,
+# and fragment before anything else touches the string — and only THEN is a
+# userinfo (`user:pass@`) stripped from it, cutting at its LAST `@`. Doing
+# the authority cut first matters: a path segment can itself contain an `@`,
+# and cutting at the last `@` across the WHOLE URI (path included) mistakes
+# that segment for userinfo, in both directions (verified against Python's
+# own URL parser and a real connection with curl) — reading the wrong host
+# out of a path that merely mentions the target hostname, and reading the
+# wrong host out of the real target URI when ITS path happens to contain an
+# `@`. Isolating the authority first means the userinfo cut can only ever
+# see an `@` that is actually part of the authority — real credentials
+# still reveal the real host, and a URI still can't use the target hostname
+# as fake userinfo to disguise an unrelated real host.
 #
-# A URI counts as a declared source once it is scheme-bearing (has a
-# `scheme:` prefix), regardless of WHICH scheme — a mirror using `file:`,
-# `cdrom:`, `copy:`, `ftp:`, or `tor+http(s):`, none of which carry a
-# comparable host, still has to be counted, or a mixed file whose OTHER
-# source uses one of those schemes looks like 100% of its declared sources
-# match and gets deleted whole.
+# COUNTING a declared source and MATCHING it against the target host are two
+# separate questions, and only the second one is allowed to be picky. Every
+# `deb`/`deb-src` line counts, unconditionally, the moment it's recognized as
+# one — same as every whitespace-separated `URIs:` token counts in the
+# deb822 branch, no matter what it looks like. A line only gets to COUNT AS
+# A MATCH once its URI is scheme-bearing (has a `scheme:` prefix, regardless
+# of WHICH scheme — a mirror using `file:`, `cdrom:`, `copy:`, `ftp:`, or
+# `tor+http(s):`, none of which carry a comparable host, still has to be
+# counted as a non-matching source) and its host is dl.google.com exactly.
+#
+# The classic-format branch used to gate the COUNT itself on being able to
+# cleanly extract a URI at all — which meant a `deb`/`deb-src` line this
+# script's positional extraction didn't fully understand (verified against
+# apt's own parser: a quoted URI, an option value containing `]`, or an
+# option value containing `#` are all real, apt-accepted shapes this
+# extraction mishandles) simply vanished from the tally instead of costing a
+# match. In a mixed file, that made an untouched OTHER source disappear from
+# the total, leaving the browser source alone looking like 100% of what the
+# file declares — and deleting the whole file, the other source included.
+# That is the exact failure mode the paragraph above calls out as worse than
+# the flake this script exists to fix, reached by a different door. The
+# deb822 branch never had this hole, because it always counted every token
+# it split out regardless of what the token looked like; the fix brings the
+# classic branch's counting rule into line with it, so a line this script
+# can't fully parse can only ever cost a match, in both formats alike, never
+# quietly remove one from the denominator.
 #
 # The host must match dl.google.com EXACTLY as a hostname, not a substring.
 # A file is removed only when EVERY declared source in it — every
@@ -115,6 +144,20 @@
 # honest than reporting success. It exits 0 when nothing was found, when a
 # mixed file was deliberately left in place (a judgment call, not a
 # failure of this script), and on a normal successful drop.
+#
+# New assumption this creates, named explicitly: a hard exit here now makes
+# passwordless privilege escalation (root, or `sudo` with no password
+# prompt) a DEPENDENCY of every job that calls this script, not just an
+# eventual one. Not live today — every call site in this repo runs on
+# GitHub's own hosted `ubuntu-latest` runner, where the default user already
+# has passwordless `sudo`. But before this exit-status change, a job whose
+# `sudo` broke would only have failed later, wherever it next needed
+# escalation itself: the redis job already depends on it explicitly a few
+# lines after this script runs (`sudo apt-get install redis-server`); the
+# two Playwright call sites depend on it only implicitly, inside
+# `--with-deps`'s own internal apt-get. For those two, this script's own
+# exit code is now the FIRST thing that would fail — the same dependency,
+# arriving one step earlier than before.
 set -euo pipefail
 
 # Run "$@" as root: directly if we already are root (common in a plain
@@ -133,19 +176,31 @@ as_root() {
   fi
 }
 
-# Extract the hostname from a URI: strip the scheme, drop any userinfo
-# (user[:pass]@) by cutting at the LAST '@' — never the first, so a
-# credential value can't be used to disguise the real host on either side
-# of the '@' — then cut at the first of / : ? # (whichever comes first) so
-# a port, path, or query string never leaks into the comparison.
+# Extract the hostname from a URI: strip the scheme, cut off everything from
+# the first of / ? # onward to isolate the AUTHORITY first (userinfo@host:port
+# — never the path/query/fragment), THEN drop any userinfo (user[:pass]@)
+# within that authority by cutting at its LAST '@', THEN drop a port by
+# cutting at the first remaining ':'.
+#
+# The authority must be isolated BEFORE the userinfo cut, not folded into one
+# cut across the whole remainder — a path segment can itself contain an '@'
+# (e.g. https://example.com/@dl.google.com/repo), and cutting at the LAST '@'
+# across the whole string mistakes that path segment for userinfo, reporting
+# the wrong host in both directions: an unrelated URI whose PATH merely
+# mentions the target host reads as a match (a false positive that can delete
+# an unrelated file), and the real target host followed by a path containing
+# its own '@' reads as some other host entirely (a false negative that lets
+# the real source silently survive). Isolating the authority first means the
+# only '@' ever considered is one that is actually part of the authority.
 host_of() {
-  local uri="$1" rest
+  local uri="$1" rest authority
   rest="${uri#*://}"
-  case "$rest" in
-    *@*) rest="${rest##*@}" ;;
+  authority="${rest%%[/?#]*}"
+  case "$authority" in
+    *@*) authority="${authority##*@}" ;;
   esac
-  rest="${rest%%[/:?#]*}"
-  printf '%s' "$rest"
+  authority="${authority%%:*}"
+  printf '%s' "$authority"
 }
 
 # Exact hostname match — never a substring match, so
@@ -177,7 +232,9 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
       if [ -n "$content" ]; then
         reason="$reason; escalated read also failed: $content"
       fi
-      echo "WARNING: could not read $f ($reason) — a Google Chrome apt source here, if any, was NOT checked" >&2
+      msg="could not read $f ($reason) — a Google Chrome apt source here, if any, was NOT checked"
+      echo "WARNING: $msg" >&2
+      echo "::warning::$msg"
       warned=1
       continue
     fi
@@ -260,13 +317,32 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
         rest="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]+//')"
       fi
       uri="${rest%%[[:space:]]*}"
+
+      # A `deb`/`deb-src` line ALWAYS declares a source, whether or not this
+      # script managed to extract a clean URI from it — so it is counted
+      # unconditionally, here, before any test of what the URI looks like.
+      # This is the one thing that makes the deb822 branch above and this
+      # branch agree: over there, every whitespace-separated URIs: token is
+      # counted no matter what it looks like, so a token this script doesn't
+      # understand only ever COSTS a match (protects the file); here, before
+      # this fix, a line whose URI this script couldn't cleanly extract was
+      # dropped from the tally entirely instead — the exact inversion of that
+      # rule, and the more dangerous one: it let an unparsed OTHER source
+      # vanish from a mixed file's total, making the file look like a 100%
+      # match on the browser source alone and deleting the whole thing,
+      # including the source this script never even looked at. Real apt
+      # accepts a quoted URI, an option value containing ']', and an option
+      # value containing '#' (all three verified against apt's own parser),
+      # none of which this script's positional extraction fully understands
+      # — so those shapes still often fail to yield a clean match below, but
+      # they can no longer make a mixed file's total look smaller than it is.
+      total=$((total + 1))
       [ -z "$uri" ] && continue
 
-      # Count it as a declared source whenever it's scheme-bearing (has a
-      # "scheme:" prefix), regardless of WHICH scheme. See the header note
-      # on non-web schemes for why this can't be narrowed to http(s) only.
+      # Only a scheme-bearing URI can possibly MATCH — gate the match test,
+      # never the count above, on this. See the header note on non-web
+      # schemes for why this can't be narrowed to http(s) only.
       if [[ "$uri" =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]]; then
-        total=$((total + 1))
         host=$(host_of "$uri")
         if host_matches "$host"; then
           matching=$((matching + 1))
