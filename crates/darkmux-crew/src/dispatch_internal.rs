@@ -5674,11 +5674,32 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#782) Read the runtime's token totals from metrics.json now the
     // container has exited. Best-effort — zero totals on any read failure
     // (this is observability enrichment, never a dispatch-failing path).
-    let tokens = read_token_totals(&host_out);
+    //
+    // (#2263 review) Reconciled against the live tailer's own per-invocation
+    // accumulation the same way `rest` is reconciled below — see
+    // `reconcile_token_totals`'s doc for why a metrics.json read alone can
+    // land a fabricated zero here (the loop's error arm hardcodes these
+    // fields; a hard-kill leaves no file at all) beside this dispatch's
+    // real, live-observed token counts.
+    let tokens = reconcile_token_totals(
+        read_token_totals(&host_out),
+        TokenTotals {
+            prompt: trajectory_summary.prompt_tokens,
+            completion: trajectory_summary.completion_tokens,
+            reasoning: None,
+            cached: None,
+        },
+    );
     // (#2263) Same best-effort read, same source file — the WHOLE
     // dispatch's cumulative turns/compactions across every resume, for
     // the `cumulative_turns`/`cumulative_compactions` payload fields.
-    let cumulative = read_cumulative_counts(&host_out);
+    //
+    // (#2263 review) Reconciled the same way, against the same tailer, for
+    // the same reason — see `reconcile_cumulative_counts`'s doc.
+    let cumulative = reconcile_cumulative_counts(
+        read_cumulative_counts(&host_out),
+        CumulativeCounts { turns: trajectory_summary.turns, compactions: trajectory_summary.compactions },
+    );
     // (#2094) Same best-effort read, same source file — the sum of every
     // inter-turn rest this dispatch took + how many. `wall_ms` above
     // INCLUDES this time (wall stays wall); a caller wanting model-only
@@ -6394,6 +6415,42 @@ pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
     }
 }
 
+/// (#2263 review) Merge the post-hoc `metrics.json` read
+/// ([`read_token_totals`]) with the live tailer's own per-invocation
+/// accumulation (`TrajectorySummary::prompt_tokens`/`completion_tokens`),
+/// taking the per-field MAX of the two — same pattern, same reason, as
+/// [`reconcile_rest_totals`] below.
+///
+/// Without this, `cumulative_prompt_tokens`/`cumulative_completion_tokens`
+/// inherit a FABRICATED zero on two reachable paths: the loop's error arm
+/// (`runtime::main`) hardcodes every whole-dispatch counter in
+/// `metrics.json` to `0` — not a race, certain, every time the loop
+/// returns an `Err` — and a watchdog hard-kill leaves no `metrics.json` at
+/// all. Both land `TokenTotals::default()` from `read_token_totals`, an
+/// authoritative-looking `0` sitting beside this dispatch's own per-run
+/// token counts in the thousands on the exact `dispatch.error` record an
+/// operator reads to diagnose the failure — and this field's whole purpose
+/// is to be the trustworthy whole-task total.
+///
+/// The tailer's count is real work that happened whether or not
+/// `metrics.json` survived to say so. On a RESUMED dispatch that then
+/// errors, the tailer only saw THIS invocation's tokens, so the merged
+/// result can still undercount a true whole-task cumulative that included
+/// a prior invocation's seed — the same known limitation
+/// `reconcile_rest_totals` already carries, and strictly better than
+/// reporting zero next to a live model name. `reasoning`/`cached` are not
+/// reconciled: they aren't surfaced as cumulative fields today (see
+/// `build_dispatch_complete_payload`), so there is nothing here for the
+/// tailer's side to contribute.
+pub(crate) fn reconcile_token_totals(from_metrics: TokenTotals, from_tailer: TokenTotals) -> TokenTotals {
+    TokenTotals {
+        prompt: from_metrics.prompt.max(from_tailer.prompt),
+        completion: from_metrics.completion.max(from_tailer.completion),
+        reasoning: from_metrics.reasoning,
+        cached: from_metrics.cached,
+    }
+}
+
 /// (#2263) `turns` / `compactions` as `metrics.json` reports them — the
 /// WHOLE dispatch's cumulative count across every resume (the runtime
 /// seeds both from the checkpoint on a resume; see `RunCheckpoint`'s own
@@ -6423,6 +6480,24 @@ pub fn read_cumulative_counts(out_dir: &Path) -> CumulativeCounts {
     CumulativeCounts {
         turns: v.get("turns").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
         compactions: v.get("compactions").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+    }
+}
+
+/// (#2263 review) Merge the post-hoc `metrics.json` read
+/// ([`read_cumulative_counts`]) with the live tailer's own per-invocation
+/// count (`TrajectorySummary::turns`/`compactions`), taking the per-field
+/// MAX of the two. See [`reconcile_token_totals`]'s doc, immediately above
+/// — same fabricated-zero failure (the loop's error arm hardcodes `turns`/
+/// `compactions` to `0`; a hard-kill leaves no file at all), same fix
+/// shape as the established [`reconcile_rest_totals`] precedent, same
+/// resumed-then-errored undercount limitation.
+pub(crate) fn reconcile_cumulative_counts(
+    from_metrics: CumulativeCounts,
+    from_tailer: CumulativeCounts,
+) -> CumulativeCounts {
+    CumulativeCounts {
+        turns: from_metrics.turns.max(from_tailer.turns),
+        compactions: from_metrics.compactions.max(from_tailer.compactions),
     }
 }
 
@@ -7004,14 +7079,21 @@ fn build_dispatch_complete_payload(
         "cached_tokens": summary.cached_tokens,
         // (#2263, additive, FLOW_SCHEMA_VERSION 1.46.0) The WHOLE TASK's
         // cumulative counters across every resume — what `metrics.json`
-        // itself reports (seeded from the checkpoint, then accumulated).
-        // Never read these next to `model` above as if they were this
-        // dispatch's own cost; that is exactly the corruption #2263
-        // fixes. Present for "what has this whole task cost so far,
-        // across every model that has ever touched it" — equal to the
-        // `total_turns`/`total_compactions`/`prompt_tokens`/
-        // `completion_tokens` fields above whenever this dispatch was
-        // never resumed (nothing to have seeded).
+        // itself reports (seeded from the checkpoint, then accumulated),
+        // RECONCILED against the live tailer's own per-invocation count
+        // (`reconcile_token_totals`/`reconcile_cumulative_counts` — see
+        // their docs) so a metrics.json hardcoded to zero on the loop's
+        // error arm, or entirely absent after a hard-kill, cannot land a
+        // fabricated `0` here. Never read these next to `model` above as
+        // if they were this dispatch's own cost; that is exactly the
+        // corruption #2263 fixes. Present for "what has this whole task
+        // cost so far, across every model that has ever touched it" — AT
+        // LEAST the `total_turns`/`total_compactions`/`prompt_tokens`/
+        // `completion_tokens` fields above on every path (the
+        // reconciliation floor), and exactly equal whenever this dispatch
+        // was never resumed and metrics.json survived to report its own
+        // seed-free totals (nothing to have seeded, nothing for the floor
+        // to correct).
         "cumulative_turns": cumulative.turns,
         "cumulative_compactions": cumulative.compactions,
         "cumulative_prompt_tokens": tokens.prompt,
@@ -7948,27 +8030,46 @@ impl TailerState {
                 // `usage` (such turns also don't accumulate in
                 // metrics.json — symmetric).
                 if let Some(tokens_payload) = turn_tokens_payload(&event) {
+                    // (#2263 review, minor) `u32::try_from(..).unwrap_or(u32::MAX)`,
+                    // not `as u32` — an `as` cast WRAPS on a u64 that exceeds
+                    // u32::MAX, silently truncating instead of clamping.
+                    // Unreachable with a real token count, but the
+                    // `.saturating_add` right next to each of these already
+                    // signals "clamp, never wrap" as this code's own
+                    // convention; the cast feeding it should match.
                     self.summary.prompt_tokens = self.summary.prompt_tokens.saturating_add(
-                        tokens_payload.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0)
-                            as u32,
+                        tokens_payload
+                            .get("prompt_tokens")
+                            .and_then(|n| n.as_u64())
+                            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                            .unwrap_or(0),
                     );
                     self.summary.completion_tokens =
                         self.summary.completion_tokens.saturating_add(
                             tokens_payload
                                 .get("completion_tokens")
                                 .and_then(|n| n.as_u64())
-                                .unwrap_or(0) as u32,
+                                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                                .unwrap_or(0),
                         );
                     if let Some(rt) =
                         tokens_payload.get("reasoning_tokens").and_then(|n| n.as_u64())
                     {
-                        self.summary.reasoning_tokens =
-                            Some(self.summary.reasoning_tokens.unwrap_or(0).saturating_add(rt as u32));
+                        self.summary.reasoning_tokens = Some(
+                            self.summary
+                                .reasoning_tokens
+                                .unwrap_or(0)
+                                .saturating_add(u32::try_from(rt).unwrap_or(u32::MAX)),
+                        );
                     }
                     if let Some(ct) = tokens_payload.get("cached_tokens").and_then(|n| n.as_u64())
                     {
-                        self.summary.cached_tokens =
-                            Some(self.summary.cached_tokens.unwrap_or(0).saturating_add(ct as u32));
+                        self.summary.cached_tokens = Some(
+                            self.summary
+                                .cached_tokens
+                                .unwrap_or(0)
+                                .saturating_add(u32::try_from(ct).unwrap_or(u32::MAX)),
+                        );
                     }
                     self.emit_telemetry("tokens", "telemetry.tokens", tokens_payload);
                 }

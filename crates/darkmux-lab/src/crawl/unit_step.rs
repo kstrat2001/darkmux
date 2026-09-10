@@ -453,6 +453,20 @@ type UnitDispatchOutcome = (String, u64, u64, u64, Option<String>, Option<Value>
 /// `result` is `"stop"` on a clean finish, `unit_budget_exhausted` when
 /// the runtime reported `max_turns` (#2193 — a BOUND, not a failure),
 /// `"timeout"` when stderr carries the watchdog marker, else `"error"`.
+///
+/// (#2263 review, third consumer) `prompt_tokens`/`completion_tokens` read
+/// from `/metrics/this_run/...` — THIS unit's own dispatch, never
+/// `/metrics/prompt_tokens`/`/metrics/completion_tokens` (the WHOLE-TASK
+/// cumulative counters, seeded from a resume checkpoint). This pairs the
+/// token figure with `model` above into one outcome, and the caller rolls
+/// both into `tokens_per_hour` — exactly the "a figure next to a model
+/// name" shape #2263 exists to fix. Safe today because a crawl unit never
+/// resumes (`this_run` == the cumulative fields on a never-resumed
+/// dispatch, so this changes nothing yet), but the crawl's own per-unit
+/// resume is a named coming caller of the resume path (see
+/// `RunCheckpoint`'s doc) — reading `this_run` now means that future
+/// caller doesn't inherit the misattribution the rest of #2263 already
+/// fixed.
 pub fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDispatchOutcome {
     let envelope: Option<Value> =
         if res.stdout.trim().starts_with('{') { serde_json::from_str(&res.stdout).ok() } else { None };
@@ -485,13 +499,29 @@ pub fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDis
         }
     };
     let num = |e: &Option<Value>, p: &str| e.as_ref().and_then(|e| e.pointer(p)).and_then(Value::as_u64).unwrap_or(0);
+    // (#2263 review) `this_run` first, falling back to the whole-task
+    // cumulative field only when `this_run` is absent entirely — a
+    // pre-#2263 runtime image's envelope has no `metrics.this_run` object
+    // at all (schema leniency: an older/newer binary pairing must degrade,
+    // never zero out a real number). A crawl unit never resumes, so for
+    // every runtime that DOES write `this_run`, it is byte-identical to
+    // the cumulative field anyway — this only changes behavior once the
+    // crawl's own per-unit resume (named as a coming caller in
+    // `RunCheckpoint`'s doc) exists.
+    let this_run_or_cumulative = |e: &Option<Value>, this_run_ptr: &str, cumulative_ptr: &str| {
+        e.as_ref()
+            .and_then(|e| e.pointer(this_run_ptr))
+            .and_then(Value::as_u64)
+            .or_else(|| e.as_ref().and_then(|e| e.pointer(cumulative_ptr)).and_then(Value::as_u64))
+            .unwrap_or(0)
+    };
     let model =
         envelope.as_ref().and_then(|e| e.pointer("/metrics/model")).and_then(Value::as_str).map(String::from);
     (
         result_label,
         num(&envelope, "/metrics/wall_ms"),
-        num(&envelope, "/metrics/prompt_tokens"),
-        num(&envelope, "/metrics/completion_tokens"),
+        this_run_or_cumulative(&envelope, "/metrics/this_run/prompt_tokens", "/metrics/prompt_tokens"),
+        this_run_or_cumulative(&envelope, "/metrics/this_run/completion_tokens", "/metrics/completion_tokens"),
         model,
         envelope.as_ref().and_then(|e| e.get("detections")).cloned(),
         num(&envelope, "/metrics/rest_ms"),

@@ -145,16 +145,94 @@ fn seeded_out_dir(dir: &Path, findings: usize, idle_turns: usize) -> PathBuf {
 }
 
 fn envelope(result: &str, prompt: u64, completion: u64, wall_ms: u64) -> String {
+    // (#2263 review) A never-resumed unit's `this_run` is byte-identical to
+    // the whole-task cumulative fields — mirror that here so these tests
+    // exercise the same never-resumed shape a real crawl dispatch produces.
     serde_json::json!({
         "result": result,
         "metrics": {"model": "m-1", "wall_ms": wall_ms, "prompt_tokens": prompt,
-                    "completion_tokens": completion, "rest_ms": 0}
+                    "completion_tokens": completion, "rest_ms": 0,
+                    "this_run": {"prompt_tokens": prompt, "completion_tokens": completion}}
     })
     .to_string()
 }
 
 fn ok_result(stdout: String, out: PathBuf) -> Result<DispatchResult> {
     Ok(DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id: "s".into(), out_dir: Some(out) })
+}
+
+// ── #2263 review, third consumer: interpret_dispatch_result must read
+// /metrics/this_run, not the whole-task cumulative fields ───────────────
+
+/// A never-resumed unit's `this_run` is byte-identical to the cumulative
+/// fields — the ordinary case, and what `envelope()` above already builds.
+/// Pins that `interpret_dispatch_result` reads the `this_run` figure at
+/// all (not just that it happens to equal the other one).
+#[test]
+fn interpret_dispatch_result_reads_this_run_tokens() {
+    let res = DispatchResult {
+        exit_code: 0,
+        stdout: envelope("stop", 100, 20, 5_000),
+        stderr: String::new(),
+        session_id: "s".into(),
+        out_dir: None,
+    };
+    let (result, wall_ms, prompt_tokens, completion_tokens, model, _, _, _) =
+        interpret_dispatch_result("u-0001", &res);
+    assert_eq!(result, "stop");
+    assert_eq!(wall_ms, 5_000);
+    assert_eq!(prompt_tokens, 100);
+    assert_eq!(completion_tokens, 20);
+    assert_eq!(model.as_deref(), Some("m-1"));
+}
+
+/// The MUST-FIX shape this consumer was missed on: an envelope whose
+/// `this_run` differs from the whole-task cumulative fields (a resumed
+/// unit's dispatch) must attribute the SMALLER `this_run` figure to the
+/// model that actually ran it, never the larger cumulative figure that
+/// includes a prior invocation's seed.
+#[test]
+fn interpret_dispatch_result_prefers_this_run_over_the_larger_whole_task_cumulative_figure() {
+    let stdout = serde_json::json!({
+        "result": "stop",
+        "metrics": {
+            "model": "m-2", "wall_ms": 1_000,
+            // Whole-task cumulative (as if a prior invocation had already
+            // run once) — deliberately LARGER than this_run below.
+            "prompt_tokens": 9100, "completion_tokens": 9600, "rest_ms": 0,
+            // THIS invocation's own contribution — what must be read.
+            "this_run": {"prompt_tokens": 100, "completion_tokens": 600}
+        }
+    })
+    .to_string();
+    let res =
+        DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id: "s".into(), out_dir: None };
+    let (_, _, prompt_tokens, completion_tokens, model, _, _, _) = interpret_dispatch_result("u-0001", &res);
+    assert_eq!(prompt_tokens, 100, "must attribute THIS run's tokens to m-2, not the whole-task total");
+    assert_eq!(completion_tokens, 600);
+    assert_eq!(model.as_deref(), Some("m-2"));
+}
+
+/// A pre-#2263 runtime image's envelope has no `metrics.this_run` object
+/// at all — schema leniency must fall back to the whole-task cumulative
+/// field rather than reading an absent `this_run` as an honest zero next
+/// to a real model name.
+#[test]
+fn interpret_dispatch_result_falls_back_to_cumulative_when_this_run_is_absent() {
+    let stdout = serde_json::json!({
+        "result": "stop",
+        "metrics": {
+            "model": "m-3", "wall_ms": 2_000,
+            "prompt_tokens": 300, "completion_tokens": 45, "rest_ms": 0
+        }
+    })
+    .to_string();
+    let res =
+        DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id: "s".into(), out_dir: None };
+    let (_, _, prompt_tokens, completion_tokens, model, _, _, _) = interpret_dispatch_result("u-0001", &res);
+    assert_eq!(prompt_tokens, 300, "no this_run at all → fall back, not a fabricated 0");
+    assert_eq!(completion_tokens, 45);
+    assert_eq!(model.as_deref(), Some("m-3"));
 }
 
 // ── the kind ─────────────────────────────────────────────────────────────
