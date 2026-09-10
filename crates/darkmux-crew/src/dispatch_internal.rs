@@ -1437,36 +1437,41 @@ fn effective_max_turns(max_turns_override: Option<u32>) -> Option<u32> {
 /// flow record + envelope) still does NOT reuse this helper — it hand-rolls
 /// its own `"cli"`-labeled block, the same way it hand-rolls `"launcher"`
 /// and `"forced-agentic-remote"`. The two spell the same tier the same way.
-/// (#2234) A resolved inactivity budget beyond this is certainly a mistake
-/// (a fat-fingered extra digit in `config.json` or `DARKMUX_INACTIVITY_
-/// TIMEOUT_SECONDS`) — no real dispatch runs for centuries — and left
-/// unclamped it reaches `Instant::now() + Duration::from_secs(inactivity_
-/// secs)` a few hundred lines below, which PANICS on overflow for a large
-/// enough value (`Instant`'s `Add` impl, not `Duration`'s: `Duration::
-/// from_secs` never panics, but adding a huge one to an `Instant` does).
-/// That expression runs OUTSIDE `effective_inactivity_timeout_seconds`, so
-/// clamping only there would leave every other call site exposed; clamping
-/// HERE — this function's own doc already establishes it as the single
-/// point every consumer (the container-forwarded env var AND the host
-/// watchdog deadline) resolves from — closes it for both at once, and a
-/// clamped value still round-trips through `DockerRunConfig` and the host
-/// deadline in agreement, which is this function's whole reason for
-/// existing. ~10 years is far longer than any darkmux process has run, so
-/// no real workload ever notices the clamp firing.
-const MAX_INACTIVITY_TIMEOUT_SECS: u64 = 315_360_000;
-
+///
+/// (#2234 follow-up review) A `#2234` pass briefly added a
+/// `.min(MAX_INACTIVITY_TIMEOUT_SECS)` clamp here, reverted in this same
+/// follow-up: it was invisible (no warning, no doctor row, no docs —
+/// `darkmux config get runtime.inactivity_timeout_seconds` still reported
+/// the operator's raw, unclamped value), it silently overrode
+/// `src/cli.rs`'s `--timeout` parser, which bounds the flag with
+/// `range(1..)` and an explicit prior-review comment that it is
+/// "deliberately unbounded above ... the operator's own call" — the
+/// parser refused to bound the operator and the resolver did it behind
+/// their back 5,000 lines away — and it desynchronized
+/// `resolved_runtime_bounds_json` (which resolves the config tier
+/// directly, bypassing this function) from the container/watchdog value
+/// this function actually produced, the opposite of this function's own
+/// stated purpose ("so no two of them can disagree about the budget").
+/// Its justification was also off by roughly 29 billion×: measured by
+/// binary search, `Instant::now() + Duration::from_secs(n)` does not
+/// panic until `n` reaches 9_223_372_036_847_700_827 — not the
+/// 315_360_000 (~10 years) the clamp used. See the tracking issue filed
+/// alongside this revert for the conditions a real clamp needs before it
+/// returns: routed through THIS function so the bounds record can't
+/// desync, self-disclosing (a resolution-time warning + a `darkmux
+/// doctor` row), and sized from the measured threshold rather than an
+/// assumed one.
 fn effective_inactivity_timeout_seconds(
     timeout_override_seconds: Option<u32>,
 ) -> (u64, InactivityBudgetSource) {
-    let (secs, source) = match timeout_override_seconds {
+    match timeout_override_seconds {
         Some(n) => (n as u64, InactivityBudgetSource::Cli),
         None => {
             let (secs, source) =
                 darkmux_types::config_access::inactivity_timeout_seconds_with_source();
             (secs, InactivityBudgetSource::Resolved(source))
         }
-    };
-    (secs.min(MAX_INACTIVITY_TIMEOUT_SECS), source)
+    }
 }
 
 /// (#2480 review, finding 5) Where THIS dispatch's inactivity budget came
@@ -3755,34 +3760,47 @@ impl Drop for PidRegistration {
     }
 }
 
-/// (#2234) RAII backstop for the trajectory tailer's `stop_flag`. The
-/// tailer's only exits are catching `stop_flag` set or an interrupt signal
-/// (see `run_tailer`'s own doc) — nothing else makes its loop return. Every
-/// EXPLICIT exit path in `dispatch()` downstream of the tailer's spawn
-/// already sets `stop_flag` by hand before returning (the `wait_with_
-/// output` error arm, and the natural end-of-function success path) — but a
-/// PANIC unwinding through any of the ~250 lines between the tailer's spawn
-/// and those stores skips every one of them, same gap `ContainerKillGuard`
-/// (#2233) closed for the container itself, one guard earlier. The flag
-/// stays false, and the tailer keeps polling `trajectory.jsonl` on its
-/// spawned OS thread every 250ms forever in any process that survives the
-/// panic — which is the common case, not the rare one: the fleet runner
-/// (`darkmux-fleet::runner::run_with_panic_guard`) and the serve daemon
-/// both wrap a dispatch in `catch_unwind` for exactly this reason, so ONE
-/// bad dispatch doesn't take the whole long-lived process down. Catching
-/// the panic kills only the panicking thread; the tailer is a SEPARATE
-/// thread and does not die with it.
+/// (#2234) RAII backstop for a background dispatch-lifetime thread's "stop"
+/// flag — an `Arc<AtomicBool>` a spawned thread polls to learn the dispatch
+/// is over. `dispatch()` has three of these: the trajectory tailer's
+/// `stop_flag`, the telemetry sampler's `sampler_stop`, and the inactivity
+/// watchdog's `watchdog_done`. All three follow the identical broken shape
+/// this guard exists to close: every EXPLICIT `.store(true, …)` call on
+/// each flag sits on a normal-return path in `dispatch()` (the
+/// `wait_with_output` error arm, the interrupt-and-non-success branch, the
+/// natural end-of-function success path — see each thread's own spawn site
+/// for its specific set), so a PANIC unwinding through the lines between a
+/// flag's creation and those stores skips every one of them. The flag
+/// stays false, and the thread it gates — a SEPARATE OS thread that does
+/// NOT die with a caught panic — keeps running forever in any process that
+/// survives the panic, which is the common case, not the rare one: the
+/// fleet runner's `run_with_panic_guard` (`darkmux-fleet::runner`, spawned
+/// by the serve daemon via `darkmux_fleet::spawn_runner_thread()` — ONE
+/// `catch_unwind`, not two independent ones) wraps a dispatch in
+/// `catch_unwind` for exactly this reason, so one bad dispatch doesn't take
+/// the whole long-lived process down. Catching the panic kills only the
+/// panicking thread; each of these three threads is separate and survives
+/// it. Left unguarded: the tailer keeps polling `trajectory.jsonl` every
+/// 250ms forever; the sampler keeps shelling out to enumerate loaded
+/// models, sampling host telemetry, and running the thermal governor every
+/// 2s forever — against a dead dispatch's session/role/mission, and able to
+/// write `pace.json` or a crawl mission's STOP file for a run that no
+/// longer exists; the watchdog keeps polling to its inactivity deadline
+/// and then fires a `docker kill` + operator warning for a container
+/// that — per `ContainerKillGuard` (#2233), armed the whole spawn-to-hand-
+/// off window one guard earlier — is typically already dead, a false
+/// alarm in the daemon's stderr.
 ///
 /// Same shape as `PidRegistration` / `ContainerKillGuard` above: Drop fires
 /// unconditionally, including on unwind, so there is no exit path left to
 /// enumerate by hand. Setting an already-true flag (every happy/error path
 /// already does this explicitly) is a harmless idempotent store — this
 /// guard is a backstop for the panic case, not a replacement for the
-/// existing explicit stores, which stay so the flag flips the instant the
+/// existing explicit stores, which stay so each flag flips the instant its
 /// deciding branch is known rather than waiting on scope unwind.
-struct TailerStopGuard(Arc<AtomicBool>);
+struct StopFlagGuard(Arc<AtomicBool>);
 
-impl Drop for TailerStopGuard {
+impl Drop for StopFlagGuard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
@@ -5442,14 +5460,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     ));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    // (#2234) Armed the moment `stop_flag` exists — see the guard's own
-    // doc. Held to the natural end of this function's scope (never
-    // explicitly dropped early), so it backstops every panic between here
-    // and the function's return, including the ~250 lines before the
-    // tailer thread itself is even spawned a few lines down (nothing to
-    // stop yet at that point, so the store is a harmless no-op there) and
-    // every line after.
-    let _tailer_stop_guard = TailerStopGuard(Arc::clone(&stop_flag));
     // (#threshold) Effective compaction threshold the runtime triggers at:
     // absolute `threshold_tokens` > `threshold_ratio × window` > the 0.5×window
     // default (matching the runtime's DEFAULT_THRESHOLD_RATIO). Forwarded on
@@ -5468,36 +5478,28 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .or(f)
             .or_else(|| compaction.context_window.map(|w| (w as f32 * 0.5) as u32)),
     };
-    let tailer_handle = {
-        let stop = Arc::clone(&stop_flag);
+    // (#2234) `_tailer_stop_guard` is armed the moment `spawn_guarded_tailer`
+    // is called — see that function's own doc, and `StopFlagGuard`'s. Held
+    // to the natural end of this function's scope (never explicitly dropped
+    // early), so it backstops every panic between here and this function's
+    // return, including every line after the tailer thread itself is
+    // spawned.
+    let (_tailer_stop_guard, tailer_handle) = spawn_guarded_tailer(
+        &stop_flag,
         // (#out-of-band) The trajectory now lands in the out-dir, not the
         // workspace. The tailer reads from there.
-        let out_dir = host_out.clone();
-        let session_id = session_id.clone();
-        let role_id = opts.role_id.clone();
-        let model = model.clone();
-        let mission_id = mission_id.clone();
-        let phase_id = phase_id.clone();
-        let step_id = step_id.clone();
-        let inactivity_deadline = Arc::clone(&inactivity_deadline);
-        let record_context = opts.record_context.clone();
-        thread::spawn(move || {
-            run_tailer(
-                out_dir,
-                session_id,
-                role_id,
-                model,
-                mission_id,
-                phase_id,
-                step_id,
-                stop,
-                inactivity_deadline,
-                inactivity_secs,
-                compaction_threshold,
-                record_context,
-            )
-        })
-    };
+        host_out.clone(),
+        session_id.clone(),
+        opts.role_id.clone(),
+        model.clone(),
+        mission_id.clone(),
+        phase_id.clone(),
+        step_id.clone(),
+        Arc::clone(&inactivity_deadline),
+        inactivity_secs,
+        compaction_threshold,
+        opts.record_context.clone(),
+    );
 
     // (#363, then #457) Inactivity watchdog. Phase B dogfood (Beat 39,
     // 2026-05-25) surfaced: thinking-mode models can hang intra-turn
@@ -5518,6 +5520,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // hang forever.
     let timeout_fired = Arc::new(AtomicBool::new(false));
     let watchdog_done = Arc::new(AtomicBool::new(false));
+    // (#2234 follow-up review, MUST FIX 1) Armed the moment `watchdog_done`
+    // exists — see `StopFlagGuard`'s own doc. Without this, a panic between
+    // here and the watchdog's own normal-path `.store(true, …)` calls left
+    // the flag `false`, and the watchdog thread — unaffected by a caught
+    // panic on the main thread — polled to its full inactivity deadline
+    // before firing a `docker kill` + operator warning for a container
+    // `ContainerKillGuard` (#2233) had typically already killed: a false
+    // alarm in the daemon's stderr, not just a leaked thread. This guard's
+    // Drop makes the watchdog's own `if watchdog_done.load(…) { return; }`
+    // check (top of its poll loop, every 500ms) exit promptly instead.
+    let _watchdog_done_guard = StopFlagGuard(Arc::clone(&watchdog_done));
     // (#2232) What the persistent kill established, as a `KillDisposition`
     // code. Read once, below, to decide what the timeout marker may claim —
     // only `Confirmed` licenses "was killed by the watchdog".
@@ -5623,6 +5636,18 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // `list_loaded` / host read / record never panics or aborts the dispatch —
     // it's additive observability, so starting/stopping it is non-load-bearing.
     let sampler_stop = Arc::new(AtomicBool::new(false));
+    // (#2234 follow-up review, MUST FIX 1) Armed the moment `sampler_stop`
+    // exists — see `StopFlagGuard`'s own doc. This one is strictly worse
+    // than the tailer's original gap: left unguarded on a panic, the
+    // sampler keeps shelling out to enumerate loaded models + running the
+    // host probe, emitting `category=telemetry` flow records stamped with
+    // the DEAD dispatch's session/role/mission, and running the thermal
+    // governor (which can write `pace.json` or a crawl mission's STOP
+    // file) every `TELEMETRY_SAMPLE_INTERVAL` (2s) forever, in any process
+    // that survives the panic — polluting the flow stream for a session
+    // the viewer already shows as errored, and able to halt an unrelated
+    // live crawl.
+    let _sampler_stop_guard = StopFlagGuard(Arc::clone(&sampler_stop));
     let sampler_handle = {
         let sampler_stop = Arc::clone(&sampler_stop);
         let role_id = opts.role_id.clone();
@@ -7038,6 +7063,65 @@ fn bound_emitted(v: Option<&serde_json::Value>) -> serde_json::Value {
 /// recovering the poison via `into_inner()` is sound.
 fn lock_deadline(deadline: &Mutex<Instant>) -> MutexGuard<'_, Instant> {
     deadline.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// (#2234 follow-up review, MUST FIX 3) Construct the tailer's panic-safe
+/// `StopFlagGuard` AND spawn the real `run_tailer` thread together, as ONE
+/// function — so a test that calls this exact function (not a hand-rolled
+/// `StopFlagGuard` stand-in built directly, the way the sibling Drop-
+/// semantics tests do) proves `dispatch()`'s own wiring: that the guard
+/// returned here really wraps the SAME flag the really-spawned thread
+/// reads. `dispatch()` calls this one function to get both; there is no
+/// second, guard-less way in this file to obtain a tailer thread. See
+/// `spawn_guarded_tailer_wiring_survives_a_real_thread_spawn` in the test
+/// module for the red-prove: it calls this function, panics immediately
+/// after (mirroring the ~250 lines of `dispatch()` between the tailer's
+/// spawn and its own explicit `stop_flag.store(true, …)` calls), then
+/// joins the REAL returned `JoinHandle` with a bounded wait — deleting the
+/// guard construction inside this function leaves that real thread polling
+/// forever and the test times out failing, the specific gap a standalone
+/// `StopFlagGuard` unit test cannot see (that test proves Drop semantics
+/// on a guard it builds by hand, not that `dispatch()`'s real call site
+/// still constructs one). No Docker involved — `run_tailer` only reads a
+/// local `out_dir`, so this is fully unit-testable.
+#[allow(clippy::too_many_arguments)]
+fn spawn_guarded_tailer(
+    stop_flag: &Arc<AtomicBool>,
+    out_dir: PathBuf,
+    session_id: String,
+    role_id: String,
+    model: String,
+    mission_id: Option<String>,
+    phase_id: Option<String>,
+    step_id: Option<String>,
+    inactivity_deadline: Arc<Mutex<Instant>>,
+    inactivity_secs: u64,
+    compaction_threshold: Option<u32>,
+    record_context: Option<serde_json::Value>,
+) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
+    // Armed the moment this function is called — see `StopFlagGuard`'s own
+    // doc. The caller holds the returned guard to the natural end of its
+    // own scope (never dropped early), so it backstops every panic between
+    // this point and the caller's return.
+    let guard = StopFlagGuard(Arc::clone(stop_flag));
+    let stop = Arc::clone(stop_flag);
+    let handle = thread::spawn(move || {
+        run_tailer(
+            out_dir,
+            session_id,
+            role_id,
+            model,
+            mission_id,
+            phase_id,
+            step_id,
+            stop,
+            inactivity_deadline,
+            inactivity_secs,
+            compaction_threshold,
+            record_context,
+        )
+    });
+    (guard, handle)
 }
 
 /// Run the live trajectory tailer to completion. Polls until `stop_flag`

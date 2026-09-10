@@ -64,12 +64,27 @@ impl EnvVarGuard {
         // `dispatch()` spawns. The actual guarantee: this guard sets the
         // var BEFORE `dispatch()` is called and restores it only AFTER
         // `dispatch()` returns, and `dispatch_internal::dispatch` joins
-        // its watchdog/sampler/tailer threads on every one of its exit
-        // paths before returning (see `dispatch_internal.rs`) — so by
-        // construction no thread `dispatch()` spawned is still alive,
-        // and therefore no thread still reading env, at either mutation
-        // point. This is a property of the call sequence in this file,
-        // not something `serial_test` itself proves.
+        // its watchdog/sampler/tailer threads on every ORDINARY
+        // (non-panicking) exit path before returning (see
+        // `dispatch_internal.rs`) — so by construction no thread
+        // `dispatch()` spawned is still alive, and therefore no thread
+        // still reading env, at either mutation point.
+        //
+        // (#2234 follow-up review) NOT true of a panicking `dispatch()`
+        // call: `StopFlagGuard`'s Drop on unwind only SIGNALS each
+        // background thread to stop (an atomic store) — it does not
+        // synchronously `.join()` any of them, so a thread can remain
+        // alive for up to its own poll interval (≤500ms) after
+        // `dispatch()`'s stack frame has finished unwinding. This file's
+        // tests all call `dispatch()` and let it return normally (`Ok`
+        // or `Err`, never letting a panic propagate out of it), so the
+        // guarantee above holds for what these tests actually do — but it
+        // is a property of THIS file's call sequence, not an unconditional
+        // property of `dispatch()` itself, and would need re-stating if a
+        // future test here ever drove `dispatch()` into its panic path
+        // (e.g. via `mock_dispatch_proof`-style injected-panic testing of
+        // #2234's own guards). Also not something `serial_test` itself
+        // proves.
         unsafe { std::env::set_var(key, value) };
         EnvVarGuard { key, prev }
     }
