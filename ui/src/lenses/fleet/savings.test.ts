@@ -175,6 +175,92 @@ describe("tokensOffMeter", () => {
     expect(t.cloudRuns).toBe(1);
   });
 
+  // (#2635) `dispatch.single_shot`'s session id is deliberately TASK-scoped
+  // — sibling seats fanned out within one task can complete under the SAME
+  // session id. `dcTok` used to be a single-value Map keyed by session id,
+  // so the second completion silently overwrote the first: the reviewer's
+  // exact repro was one task, two single-shot steps sharing session
+  // `task:t3`, no telemetry family — a hosted seat ({endpoint, total_tokens:
+  // 700}) and a local seat ({total_tokens: 500}). Pre-fix the LAST WRITE
+  // won regardless of order, so ordering mattered and tokens vanished
+  // (`total=500 cloud=500` when the local seat wrote last — a local seat's
+  // tokens painted on the CLOUD tile, and the 700 real hosted tokens gone
+  // entirely). Both orderings below must land on the SAME correct totals,
+  // and neither seat's tokens may be lost.
+  it("(#2635) task-scoped session collision — hosted-then-local — both seats' tokens survive, correctly attributed", () => {
+    const data: FlowRecord[] = [
+      rec({
+        session_id: "task:t3",
+        action: "dispatch.complete",
+        payload: { endpoint: "azure:h/gpt-4o", total_tokens: 700 },
+      }),
+      rec({ session_id: "task:t3", action: "dispatch.complete", payload: { total_tokens: 500 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(1200);
+    expect(t.cloud).toBe(700);
+    expect(t.local).toBe(500);
+    expect(t.unknown).toBe(0);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.runs).toBe(2);
+  });
+
+  it("(#2635) task-scoped session collision — local-then-hosted — same totals regardless of order", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "task:t3b", action: "dispatch.complete", payload: { total_tokens: 500 } }),
+      rec({
+        session_id: "task:t3b",
+        action: "dispatch.complete",
+        payload: { endpoint: "azure:h/gpt-4o", total_tokens: 700 },
+      }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(1200);
+    expect(t.cloud).toBe(700);
+    expect(t.local).toBe(500);
+    expect(t.unknown).toBe(0);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.runs).toBe(2);
+  });
+
+  it("(#2635) task-scoped session collision — two local seats — both counted, neither dropped", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "task:t3c", action: "dispatch.complete", payload: { total_tokens: 500 } }),
+      rec({ session_id: "task:t3c", action: "dispatch.complete", payload: { total_tokens: 700 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(1200);
+    expect(t.local).toBe(1200);
+    expect(t.cloud).toBe(0);
+    expect(t.unknown).toBe(0);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.runs).toBe(2);
+  });
+
+  // (CONSIDER 3, #2635) Documents a currently-inert gap rather than fixing
+  // it: a completion that carries no `endpoint` of its own is credited to
+  // `local` even when the endpoint-bearing `dispatch.start` that would have
+  // proven it hosted has scrolled outside the caller's playhead window (see
+  // `tokensOffMeter`'s module doc on the playhead gate). Every producer
+  // today stamps `endpoint` on BOTH bookends of a hosted call
+  // (builtins.rs's `bookend_record`), so this can't happen from live data —
+  // this test pins today's behavior so a future producer that stops
+  // double-stamping makes the gap LOUD (a failing test) instead of a
+  // silent misclassification.
+  it("(CONSIDER 3, #2635) a lone endpoint-less completion is credited to local, even though its hosted start may be off-window — known gap, pinned", () => {
+    const data: FlowRecord[] = [
+      rec({
+        session_id: "s11",
+        action: "dispatch.complete",
+        payload: { total_tokens: 640, prompt_tokens: 600, completion_tokens: 40 },
+      }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.local).toBe(640);
+    expect(t.cloud).toBe(0);
+    expect(t.unknown).toBe(0);
+  });
+
   it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {
     const data: FlowRecord[] = [
       rec({ session_id: "s7", action: "dispatch.start", handle: "pr-reviewer", payload: { endpoint: "gemini" } }),
