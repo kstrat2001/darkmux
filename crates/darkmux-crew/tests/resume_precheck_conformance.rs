@@ -29,24 +29,38 @@
 //! coder-phase kinds — are exactly why a source sweep, not a registry
 //! walk, is the right shape here too) and asks a narrower, CONDITIONAL
 //! question: does this file set a `resume_from`-named struct field to
-//! anything but `None`, and if so, does it (anywhere in the same file)
-//! also declare `fn resume_precheck(`?
+//! anything but `None`, and if so, does the `impl StepKind for` block
+//! that OWNS that site (see "Attribution" below — not merely any block
+//! anywhere in the same file) also declare `fn resume_precheck(`?
 //!
-//! **Why file-scoped, not impl-block-scoped (unlike `cwd_policy_
-//! conformance`).** `dispatch.internal`'s own real `resume_from` wiring
-//! does NOT live inside `impl StepKind for DispatchInternalStepKind`'s
-//! braces — it lives in `dispatch_opts_for`, a free function `run()`
-//! calls (extracted in #2480 specifically so the `Step`/`Task` ->
-//! `DispatchOpts` reconstruction is unit-testable without Docker). A
-//! block-scoped version of this scan — matching `cwd_policy_conformance`
-//! line for line — would find ZERO matches in the one file that actually
-//! needs to satisfy it, which is worse than not existing (a guard that
-//! cannot see its own only current example teaches nothing about a new
-//! one). Scoping to "the whole file, when the file also contains a
-//! production `impl StepKind for` block" catches the real shape this
-//! codebase actually uses (a StepKind's dispatch-options builder as a
-//! sibling free function in the same file) at the cost of the coarser
-//! blind spots named below.
+//! **Attribution: the NEAREST owning `impl StepKind for` block, not the
+//! whole file (#2614 review MUST-FIX 1 — see that finding for the false
+//! premise the file-scoped predecessor of this design shipped under).**
+//! `dispatch.internal`'s own real `resume_from` wiring does NOT live
+//! inside `impl StepKind for DispatchInternalStepKind`'s braces — it
+//! lives in `dispatch_opts_for`, a free function `run()` calls (extracted
+//! in #2480 specifically so the `Step`/`Task` -> `DispatchOpts`
+//! reconstruction is unit-testable without Docker), defined immediately
+//! BEFORE the `impl` block that calls it. A naively block-scoped version
+//! of this scan — matching `cwd_policy_conformance` line for line, "does
+//! THIS block contain the site AND `fn resume_precheck(`" — would find
+//! ZERO matches in the one file that actually needs to satisfy it, since
+//! the site never sits inside any block's braces at all.
+//!
+//! This scan resolves that without falling back to file-wide scope: for
+//! every flagged site, it finds the OWNING `impl StepKind for` block by,
+//! in order, (1) the block whose line range CONTAINS the site, (2) the
+//! nearest block that FOLLOWS the site in the file — the shape every
+//! production site in this workspace uses today, a free builder function
+//! immediately before the block it serves — or (3) the nearest block that
+//! PRECEDES the site, used only when nothing follows. It then requires
+//! THAT SPECIFIC block, not any block anywhere in the file, to contain
+//! `fn resume_precheck(`. A file holding five `impl StepKind for` blocks
+//! (`step_kinds/builtins.rs` holds exactly that many as of #2614) where
+//! only one wires a real resume value can no longer be satisfied by an
+//! unrelated one of the other four declaring the override — see
+//! `owning_block`'s own doc for the exact attribution rule and its
+//! remaining honest limits.
 //!
 //! **What this is: a lint, not a parser (#2572's distinction).** Read
 //! #2572 before trusting this section — it names the general failure
@@ -83,20 +97,28 @@
 //!     `Cli`/`DispatchOpts` construction in `main.rs`) is silently
 //!     skipped — there is no `StepKind` there for the requirement to
 //!     attach to, and this scan is not the place to police those.
-//!   - **File-scoped, not per-impl-block-scoped**, unlike its
-//!     `cwd_policy` sibling. A file holding TWO `impl StepKind for`
-//!     blocks where only one of them wires a real resume value, and only
-//!     the OTHER one declares `resume_precheck`, satisfies this scan even
-//!     though the wiring kind itself has no override. No file in any
-//!     swept root does this today (every `StepKind`-implementing file
-//!     that wires `resume_from` non-`None` has exactly one `impl StepKind
-//!     for` block), so this is a named boundary condition, not a live
-//!     gap.
+//!   - **Nearest-block attribution is a heuristic, not a real ownership
+//!     link.** `owning_block` never reads which function a flagged
+//!     struct-literal construction actually happens inside, nor which
+//!     `impl` block calls that function — it only compares LINE NUMBERS.
+//!     A file where a wiring free function sits between two unrelated
+//!     `impl StepKind for` blocks with neither adjacent to it (e.g. wired
+//!     kind C's builder function placed between kind A's and kind B's
+//!     blocks, with C's own block elsewhere entirely) would misattribute
+//!     the site to whichever of A or B happens to be nearest by line
+//!     distance — not C. No file in any swept root does this today (see
+//!     `owning_block`'s own doc for the case ordering this scan actually
+//!     applies), so this is a named boundary condition, not a live gap;
+//!     the moment a wiring function is no longer adjacent to its owning
+//!     block, this heuristic needs a real name-based link (the function
+//!     name the `impl` block's `run()` actually calls), not a bigger
+//!     line-distance rule.
 //!   - **Presence, not correctness.** Like `cwd_policy_conformance`, this
 //!     only checks that `fn resume_precheck(` appears as text somewhere
-//!     in the file; it cannot tell a real, careful override from one that
-//!     compiles, matches the trait signature, and unconditionally returns
-//!     `Ok(())` — a no-op wearing the guard's clothes.
+//!     inside the site's owning block; it cannot tell a real, careful
+//!     override from one that compiles, matches the trait signature, and
+//!     unconditionally returns `Ok(())` — a no-op wearing the guard's
+//!     clothes.
 //!   - **A renamed trait import or a generic impl** (`impl<T> StepKind
 //!     for Wrapper<T>`) evades the `impl StepKind for` detection entirely
 //!     — the identical blind spot `cwd_policy_conformance` names for
@@ -112,11 +134,16 @@
 //!     red-prove that ships with this module deletes the override
 //!     outright rather than block-commenting it, for exactly this reason.
 //!
-//! Red-proved: commenting out `DispatchInternalStepKind`'s
-//! `resume_precheck` override (with the free-function `resume_from,`
-//! wiring left in place in `step_kinds/builtins.rs`) makes this fail,
-//! naming that file and the flagged line; restoring the override makes
-//! the suite green again.
+//! Red-proved (#2614 review MUST-FIX 1's own exact mutation — the file-
+//! scoped predecessor of this scan stayed GREEN under it, which is the
+//! finding this design fixes): deleting `DispatchInternalStepKind`'s
+//! `resume_precheck` override outright (the free-function `resume_from,`
+//! wiring left in place) while adding a trivial `fn resume_precheck(&self,
+//! ...) -> Result<()> { Ok(()) }` to `ProceduralNoopStepKind` — an
+//! unrelated `impl StepKind for` block in the SAME file — makes this
+//! test fail, naming the file, the flagged line, and the owning block
+//! (`DispatchInternalStepKind`, which has none); restoring the deleted
+//! override and removing the decoy makes the suite green again.
 
 use std::path::{Path, PathBuf};
 
@@ -267,24 +294,41 @@ fn resume_non_none_site(line: &str, prev_char_in: Option<char>) -> (Option<Strin
     (None, new_prev_char)
 }
 
-/// One pass over `path`: whether it holds a production (non-test) `impl
-/// StepKind for` block, whether that file also declares `fn
-/// resume_precheck(` anywhere outside a test module, and every flagged
-/// `resume_from`-non-`None` site found outside a test module. Reuses the
-/// exact brace-depth / `#[cfg(test)]`-exclusion mechanism `cwd_policy_
-/// conformance::scan_file` uses, applied file-wide rather than per-impl-
-/// block (see this module's own doc for why).
-fn scan_file(path: &Path) -> (bool, bool, Vec<(usize, String)>) {
+/// One `impl StepKind for <Type>` block found outside a `#[cfg(test)]`
+/// module, its line range (1-indexed, inclusive), and whether `fn
+/// resume_precheck(` appears anywhere inside it. Line range (not just
+/// "has precheck") is what lets `owning_block` attribute a flagged site
+/// to a SPECIFIC block rather than the whole file — see this module's own
+/// doc for why file-wide attribution was the #2614 review's MUST-FIX 1.
+struct ImplBlock {
+    type_name: String,
+    start_line: usize,
+    end_line: usize,
+    has_precheck: bool,
+}
+
+/// One pass over `path`: every production (non-test) `impl StepKind for`
+/// block with its line range and whether it declares `fn
+/// resume_precheck(`, and every flagged `resume_from`-non-`None` site
+/// found outside a test module. Reuses the exact brace-depth /
+/// `#[cfg(test)]`-exclusion mechanism `cwd_policy_conformance::scan_file`
+/// uses for the block tracking, combined in one pass with
+/// `resume_non_none_site`'s cross-line `prev_char` threading (both need
+/// to walk every line of the file once, in order).
+fn scan_file(path: &Path) -> (Vec<ImplBlock>, Vec<(usize, String)>) {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     let mut depth: i64 = 0;
     let mut test_mod_depths: Vec<i64> = Vec::new();
     let mut pending_cfg_test = false;
-    let mut has_impl = false;
-    let mut has_precheck = false;
-    let mut flagged = Vec::new();
     let mut prev_char: Option<char> = None;
+    // (start_depth, start_line, type_name, has_precheck) for the impl
+    // block we're currently inside, if any.
+    let mut current_impl: Option<(i64, usize, String, bool)> = None;
+    let mut impl_blocks: Vec<ImplBlock> = Vec::new();
+    let mut flagged: Vec<(usize, String)> = Vec::new();
 
     for (idx, raw_line) in text.lines().enumerate() {
+        let line_no = idx + 1;
         let line = code_only(raw_line);
         let trimmed = line.trim();
 
@@ -300,14 +344,22 @@ fn scan_file(path: &Path) -> (bool, bool, Vec<(usize, String)>) {
         prev_char = new_prev_char;
 
         if test_mod_depths.is_empty() {
-            if line.contains("impl StepKind for ") {
-                has_impl = true;
+            if current_impl.is_none() {
+                if let Some(at) = line.find("impl StepKind for ") {
+                    let rest = &line[at + "impl StepKind for ".len()..];
+                    let type_name = rest.split([' ', '{', '<']).next().unwrap_or("").trim().to_string();
+                    if !type_name.is_empty() {
+                        current_impl = Some((depth, line_no, type_name, false));
+                    }
+                }
             }
-            if line.contains("fn resume_precheck(") {
-                has_precheck = true;
+            if let Some((_, _, _, has)) = current_impl.as_mut() {
+                if line.contains("fn resume_precheck(") {
+                    *has = true;
+                }
             }
             if let Some(site) = site {
-                flagged.push((idx + 1, site));
+                flagged.push((line_no, site));
             }
         }
 
@@ -326,12 +378,51 @@ fn scan_file(path: &Path) -> (bool, bool, Vec<(usize, String)>) {
                     if test_mod_depths.last() == Some(&depth) {
                         test_mod_depths.pop();
                     }
+                    if current_impl.as_ref().map(|t| t.0) == Some(depth) {
+                        let (_, start_line, type_name, has_precheck) = current_impl.take().unwrap();
+                        impl_blocks.push(ImplBlock { type_name, start_line, end_line: line_no, has_precheck });
+                    }
                 }
                 _ => {}
             }
         }
     }
-    (has_impl, has_precheck, flagged)
+    (impl_blocks, flagged)
+}
+
+/// Attributes a flagged `resume_from`-non-`None` site (found on 1-indexed
+/// `site_line`) to the `ImplBlock` it belongs to, in three cases tried in
+/// order:
+///  1. **Contained** — `site_line` falls inside some block's
+///     `[start_line, end_line]` range. Covers a future kind that wires
+///     `resume_from` directly inside one of its own trait-method bodies,
+///     rather than through a sibling free function.
+///  2. **Nearest FOLLOWING block** — the smallest `start_line` strictly
+///     greater than `site_line`. This is the shape every production site
+///     in this workspace uses today: `dispatch_opts_for` (see
+///     `step_kinds/builtins.rs`) is a free function defined immediately
+///     BEFORE the `impl StepKind for DispatchInternalStepKind` block that
+///     calls it, so the site (inside the free function) precedes its
+///     owning block in the file.
+///  3. **Nearest PRECEDING block** — the largest `end_line` strictly less
+///     than `site_line`, tried only when no block follows. Not exercised
+///     by any file this scan sweeps today, but not assumed away either —
+///     see this module's "Known blind spots" section for the ordering
+///     this heuristic does NOT handle (a wiring function sandwiched
+///     between two unrelated blocks, neither of which is the true owner).
+///
+/// Returns `None` only when `impl_blocks` is empty — the caller's
+/// existing "no `StepKind` in this file" skip already covers that case,
+/// so every non-empty `impl_blocks` list is guaranteed to resolve to
+/// exactly one of the three cases above.
+fn owning_block(impl_blocks: &[ImplBlock], site_line: usize) -> Option<&ImplBlock> {
+    if let Some(b) = impl_blocks.iter().find(|b| b.start_line <= site_line && site_line <= b.end_line) {
+        return Some(b);
+    }
+    if let Some(b) = impl_blocks.iter().filter(|b| b.start_line > site_line).min_by_key(|b| b.start_line) {
+        return Some(b);
+    }
+    impl_blocks.iter().filter(|b| b.end_line < site_line).max_by_key(|b| b.end_line)
 }
 
 #[test]
@@ -340,20 +431,33 @@ fn every_resume_wiring_file_declares_resume_precheck() {
     let mut seen_any_wiring = false;
     for root in sweep_roots() {
         for file in rust_files(&root) {
-            let (has_impl, has_precheck, flagged) = scan_file(&file);
+            let (impl_blocks, flagged) = scan_file(&file);
             if flagged.is_empty() {
                 continue;
             }
             seen_any_wiring = true;
-            if !has_impl {
+            if impl_blocks.is_empty() {
                 // Out of scope by design — see this module's "Known blind
                 // spots" section. There is no `StepKind` in this file for
                 // the requirement to attach to.
                 continue;
             }
-            if !has_precheck {
-                for (line_no, site) in &flagged {
-                    missing.push(format!("{}:{line_no}: {site}", file.display()));
+            for (line_no, site) in &flagged {
+                let owner = owning_block(&impl_blocks, *line_no).unwrap_or_else(|| {
+                    panic!(
+                        "{}:{line_no}: `impl_blocks` is non-empty but `owning_block` found no \
+                         owner — this attribution logic is broken, not the swept file",
+                        file.display()
+                    )
+                });
+                if !owner.has_precheck {
+                    missing.push(format!(
+                        "{}:{line_no}: {site} (attributed to `impl StepKind for {}` at line {}, \
+                         which declares no `fn resume_precheck(`)",
+                        file.display(),
+                        owner.type_name,
+                        owner.start_line
+                    ));
                 }
             }
         }
@@ -365,10 +469,11 @@ fn every_resume_wiring_file_declares_resume_precheck() {
     );
     assert!(
         missing.is_empty(),
-        "the following file(s) set a `resume_from`-shaped field to something other than `None` \
-         but declare no `fn resume_precheck(` override anywhere in the same file, so a \
-         `--resume-from`-shaped value wired through this kind's config would reach model \
-         selection with no scheduler-level checkpoint gate ever asked (see `StepKind::\
-         resume_precheck`'s own doc for the hazard this closes): {missing:?}",
+        "the following site(s) set a `resume_from`-shaped field to something other than `None` \
+         but were attributed to an `impl StepKind for` block that declares no `fn \
+         resume_precheck(` override, so a `--resume-from`-shaped value wired through this \
+         kind's config would reach model selection with no scheduler-level checkpoint gate ever \
+         asked (see `StepKind::resume_precheck`'s own doc for the hazard this closes): \
+         {missing:?}",
     );
 }

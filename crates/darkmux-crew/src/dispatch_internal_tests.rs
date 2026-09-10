@@ -2630,12 +2630,19 @@
     /// one back to its enclosing top-level function by brace-matching, and
     /// requires an `if` block (found the same lexical way) whose CONDITION
     /// mentions `resume_from`, whose block closes BEFORE the call, and
-    /// whose block contains BOTH the shared refusal anchor AND a diverging
-    /// construct (`bail!`/`return Err`/`panic!`) — i.e. the anchor has to
-    /// sit inside the actual guard, not merely appear somewhere earlier in
-    /// the function. A third call site added anywhere in this file, in any
-    /// of these shapes, without a real guard fails this test by
-    /// construction, not by someone remembering to extend a list.
+    /// whose block contains a diverging construct (`bail!`/`return
+    /// Err`/`panic!`) AND EITHER the shared refusal anchor directly OR a
+    /// call to the one named helper (`RESUME_FROM_GUARD_ALLOWED_HELPER`,
+    /// see that constant's own doc) whose OWN body — read separately,
+    /// never assumed from the name — carries the anchor (#2614 review
+    /// MUST-FIX 2: this paragraph previously said the anchor had to sit
+    /// inline, which stopped being the only path once that helper-chase
+    /// exception was added) — i.e. the anchor has to sit inside the
+    /// actual guard, or inside that one named helper it calls, not merely
+    /// appear somewhere earlier in the function. A third call site added
+    /// anywhere in this file, in any of these shapes, without a real
+    /// guard fails this test by construction, not by someone remembering
+    /// to extend a list.
     ///
     /// **What this cannot see, named plainly:**
     /// - **A `pub`/`pub(crate)` widening of `dispatch_remote`, or a new
@@ -2667,13 +2674,23 @@
     ///   the shape) rather than silently certifying it, so this is a
     ///   coverage gap that blocks, not a soundness hole. Extend the
     ///   extractor if this file ever needs that shape.
-    /// - **A guard whose message text is factored into a helper function**
-    ///   instead of inlined at the `bail!`/`return Err` site. The anchor
-    ///   match is textual against the CALLING function's own body; a
-    ///   helper that builds the message elsewhere makes the anchor
-    ///   invisible here. Deliberately not chased across a call graph —
-    ///   inline the check (matching both existing guards' shape) or extend
-    ///   this test to also scan the helper; the failure message says this.
+    /// - **A guard whose message text is factored into a helper function
+    ///   OTHER than the one named exception.** (#2614 review MUST-FIX 2:
+    ///   this bullet previously named "a guard whose message is factored
+    ///   into a helper" as a blind spot outright — false as of this same
+    ///   review's Also-fix, which added the one-helper chase:
+    ///   `resume_from_guard_precedes` now also follows
+    ///   `RESUME_FROM_GUARD_ALLOWED_HELPER` and reads ITS body for the
+    ///   anchor, so that specific factoring is exactly what this scan
+    ///   covers, not a blind spot.) The anchor match is still textual
+    ///   against the CALLING function's own body plus that one named
+    ///   helper's body — a call routed through any OTHER, unnamed helper
+    ///   remains genuinely invisible here. Deliberately not chased across
+    ///   an arbitrary call graph — inline the check (matching both
+    ///   existing guards' shape), route it through
+    ///   `resume_from_bare_hosted_refusal`, or extend
+    ///   `RESUME_FROM_GUARD_ALLOWED_HELPER`/this test to also scan the new
+    ///   helper; the failure message says this.
     ///
     /// One more honest limit, narrowed by the structural if-block
     /// requirement above but not eliminated: the anchor match inside a
@@ -2792,8 +2809,10 @@
                  factored into some OTHER helper function instead of inlined at the \
                  bail!/return site, that does not count here — inline it, route it through \
                  `resume_from_bare_hosted_refusal` (matching both existing guards' shape), or \
-                 extend `RESUME_FROM_GUARD_ALLOWED_HELPER`/this test to also scan the new \
-                 helper."
+                 point `RESUME_FROM_GUARD_ALLOWED_HELPER` at the new helper and update this \
+                 test — that constant names exactly one helper today (a single `&str`, not a \
+                 collection), so a SECOND legitimately-factored helper needs this test widened \
+                 to a set of allowed names before the constant can name both."
             );
         }
     }
@@ -3199,8 +3218,46 @@
     /// top-level fn today, but this does not assume that placement).
     /// `None` if no such function is found — the caller must treat that as
     /// "cannot vouch for it", never as "assume it's fine".
+    ///
+    /// (#2614 review MUST-FIX 3) Before #2614's own fix, this took the
+    /// FIRST textual occurrence of `fn <name>(` in `src` with no
+    /// code-versus-comment awareness, no top-level requirement, and no
+    /// uniqueness check — so a nested `fn` of the same name planted
+    /// EARLIER in the file (inside some other function's body, a test
+    /// module, anywhere) silently shadowed the real production helper and
+    /// this resolver would vouch for the DECOY's body instead. Proven
+    /// green under that version: breaking the real
+    /// `resume_from_bare_hosted_refusal`'s message so it no longer
+    /// carried `RESUME_FROM_GUARD_ANCHOR`, then adding a same-named
+    /// nested `fn` earlier in `dispatch_internal.rs` whose body DID carry
+    /// the anchor, left `every_dispatch_remote_call_site_is_guarded_
+    /// against_resume_from` passing while the guard an operator actually
+    /// hits emits text this scan never inspected. The same root cause
+    /// covers a path-qualified call to the helper from another module —
+    /// `crate::dispatch_internal::resume_from_bare_hosted_refusal(` still
+    /// contains the literal substring `resume_from_bare_hosted_refusal(`
+    /// (not `fn resume_from_bare_hosted_refusal(`, so this resolver
+    /// itself is unaffected there), but a same-named LOCAL helper in that
+    /// other module would shadow it there the same way.
+    ///
+    /// Fixed the same way this file already pins `dispatch_remote`'s own
+    /// visibility (`DEFINITION_MARKER` above, `assert_eq!(...count(), 1,
+    /// ...)`): require the marker occur EXACTLY ONCE anywhere in `src`
+    /// before trusting the first (only) match's body. Zero occurrences
+    /// returns `None` (unchanged, "cannot vouch for it"); more than one
+    /// panics loudly, naming the count, rather than silently picking
+    /// whichever occurrence happens to sort first — a shadow can no
+    /// longer hide behind "the resolver found *a* body and moved on".
     fn named_fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
         let marker = format!("fn {name}(");
+        let occurrences = src.matches(&marker).count();
+        assert!(
+            occurrences <= 1,
+            "found {occurrences} definitions of `{marker}` in the scanned source — expected at \
+             most one. A second definition of this name (anywhere in the file, nested or \
+             top-level) can shadow the real one this scan means to vouch for; see \
+             `named_fn_body`'s own doc for the #2614 review finding this pins."
+        );
         let decl_at = src.find(&marker)?;
         let cs: Vec<char> = src[decl_at..].chars().collect();
         let byte_offsets: Vec<usize> = src[decl_at..].char_indices().map(|(b, _)| b).collect();

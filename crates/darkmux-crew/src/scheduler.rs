@@ -5434,6 +5434,66 @@ mod tests {
         assert!(report.completed.contains(&"ok-step".to_string()));
     }
 
+    /// (#2614 review, Also-fix 1) Pins the ORDER the two hoisted gates run
+    /// in for a single step that fails BOTH — something neither test above
+    /// can do. `licensed_adjacent_role_never_reaches_the_wave_loader`'s
+    /// step carries no `resume_from` at all, and `resume_precheck_never_
+    /// reaches_the_wave_loader_for_a_generic_mission_graph_step`'s step is
+    /// bound to an ordinary, non-licensed-adjacent role — neither step in
+    /// either test could ever fail the OTHER gate, so neither test can
+    /// tell "ack ran first" apart from "resume ran first". This one can:
+    /// the step is bound to `health-research` (licensed-adjacent, no prior
+    /// ack — fails the ack gate) AND carries a `resume_from` pointing at a
+    /// directory with no `checkpoint.json` (would ALSO fail
+    /// `resume_precheck` if it ever ran). `RoleLocalModelKind::
+    /// resume_precheck` resolves its role the same way `dispatch_role`
+    /// does — falls through to `task.role_id`, here `"health-research"` —
+    /// so if the resume check ran FIRST it would produce its own,
+    /// distinct "RESUME CHECKPOINT NOT FOUND" message instead of the ack
+    /// gate's "requires operator acknowledgment" one: a real, observable
+    /// difference, not a coincidence of shared wording.
+    ///
+    /// Today's merged loop (`run_step_graph`'s single filter pass: ack
+    /// check, `continue` on failure BEFORE `resume_precheck` is ever
+    /// called) reports the ack message. If that ordering ever flips, this
+    /// test starts reporting the resume message instead and fails loud,
+    /// naming the mismatch — an unacknowledged role's checkpoint must
+    /// never be read off disk before the consent gate has had its say.
+    #[test]
+    #[serial_test::serial]
+    fn licensed_adjacent_ack_gate_precedes_resume_precheck_for_a_step_that_fails_both() {
+        let ack_dir = tempfile::TempDir::new().unwrap(); // empty — "health-research" has no prior ack
+        let resume_from = tempfile::TempDir::new().unwrap(); // no checkpoint.json written
+
+        let (mut doubly_failing_task, doubly_failing_step) = kinded_step(
+            "doubly-failing",
+            "test.role-local-model",
+            json!({
+                "model_key": "forbidden-model",
+                "resume_from": resume_from.path().to_str().unwrap(),
+            }),
+            &[],
+        );
+        doubly_failing_task.role_id = Some("health-research".to_string());
+
+        let (steps, report) =
+            run_consent_graph(ack_dir.path(), vec![(doubly_failing_task, doubly_failing_step)]);
+
+        assert_eq!(steps["doubly-failing-step"].status, NodeStatus::Error);
+        let message = steps["doubly-failing-step"].output.clone().unwrap_or_default();
+        assert!(
+            message.contains("requires operator acknowledgment"),
+            "the ack gate must run FIRST and its refusal must be the one reported for a step \
+             that fails both gates — got: {message}"
+        );
+        assert!(
+            !message.contains("RESUME CHECKPOINT NOT FOUND"),
+            "resume_precheck must never even run for a step the ack gate already refused — \
+             got: {message}"
+        );
+        assert!(report.errored.contains(&"doubly-failing-step".to_string()));
+    }
+
     /// (#1511, review mutation 1) The `mission.coder` shape: the TASK names
     /// a benign role, and the kind dispatches a DIFFERENT, licensed-adjacent
     /// one. The first version of this fix read
