@@ -104,15 +104,21 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // ANY dispatch bookend carrying an `endpoint` — a `dispatch.complete` that
   // named its endpoint but carried no token totals still marks its session
   // cloud (the review path's `remote_tokens`-only completes are exactly
-  // this case). `dcTok` is the single-shot hosted fallback's own totals
-  // (sessions with no `telemetry.tokens` family at all).
+  // this case). `dcTok` is the single-shot fallback's own totals (sessions
+  // with no `telemetry.tokens` family at all) — REGARDLESS of endpoint
+  // (#1853). A local single-shot dispatch (radio-router, radio-host) is
+  // exactly the endpoint-less case: gating collection on `p.endpoint` (as
+  // this loop did before #1853) meant its tokens never entered `dcTok` at
+  // all, so they landed in no bucket — not even `unknown`. Collection
+  // stays endpoint-blind; `epBySid`/`localSids` decide the bucket at
+  // classification time, below.
   const epBySid = new Map<string, string>();
   const dcTok = new Map<string, TokenPayload>();
 
   for (const r of data) {
     const p = r.payload as TokenPayload | undefined;
-    if (!r.session_id || !p || !p.endpoint) continue;
-    if (isDispatchStart(r.action) || isDispatchComplete(r.action)) {
+    if (!r.session_id || !p) continue;
+    if (p.endpoint && (isDispatchStart(r.action) || isDispatchComplete(r.action))) {
       epBySid.set(r.session_id, String(p.endpoint));
     }
     if (isDispatchComplete(r.action) && hasAnyTokenCounts(p)) {
@@ -187,11 +193,22 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     }
   }
 
-  // (#1186) Single-shot fallback — endpoint sessions with no telemetry
-  // family count their completion-record totals as cloud. The `sess.has`
-  // guard preserves the telemetry-exclusive rule that prevents
-  // double-counting. One turn means the whole prompt is first-read, so
-  // `fresh += prompt` is exact here, not an approximation.
+  // (#1186, reclassified #1853) Single-shot fallback — sessions with no
+  // telemetry family count their completion-record totals from `dcTok`.
+  // The `sess.has` guard preserves the telemetry-exclusive rule that
+  // prevents double-counting (a session that has BOTH a telemetry family
+  // and a token-bearing completion is already fully counted above and is
+  // skipped here). Classification happens HERE, not at collection — cloud
+  // when the session's own bookend named an endpoint (`epBySid`), local
+  // when it's the same positive-evidence bar `localSids` uses (a clean
+  // completion naming none). Those two sets are exhaustive over `dcTok`
+  // by construction (`dcTok` only ever holds `dispatch.complete` records,
+  // and each one satisfies exactly one of "named an endpoint" / "named
+  // none"), but the `unknown` branch stays as a defensive floor rather
+  // than assuming that invariant can never drift — an unattributed run
+  // still may not silently join `local`. One turn means the whole prompt
+  // is first-read, so `fresh += prompt` is exact here, not an
+  // approximation.
   let directRuns = 0;
   for (const [sid, p] of dcTok) {
     if (sess.has(sid)) continue;
@@ -200,7 +217,12 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     // record that reported the standard fields.
     const tt = p.total_tokens || (p.prompt_tokens || 0) + (p.completion_tokens || 0) || p.remote_tokens || 0;
     total += tt;
-    cloud += tt;
+    if (epBySid.has(sid)) {
+      cloud += tt;
+      cloudRuns++;
+    } else if (!localSids.has(sid)) {
+      unknown += tt;
+    }
     prompt += p.prompt_tokens || 0;
     completion += p.completion_tokens || 0;
     fresh += p.prompt_tokens || 0;
@@ -209,7 +231,6 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     // NO class chip.
     if (isRemoteOnlyTokens(p)) uncls += tt;
     directRuns++;
-    cloudRuns++;
   }
 
   // `local` is what is LEFT after both `cloud` and `unknown` are removed —

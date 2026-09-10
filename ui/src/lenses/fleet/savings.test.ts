@@ -115,6 +115,66 @@ describe("tokensOffMeter", () => {
     expect(t.cloudRuns).toBe(1);
   });
 
+  it("(#1853) the single-shot LOCAL fallback (no telemetry family, no endpoint, dispatch.complete carries the totals) counts as local — not invisible", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "s8", action: "dispatch.start", handle: "radio-router" }),
+      rec({
+        session_id: "s8",
+        action: "dispatch.complete",
+        payload: { total_tokens: 970, prompt_tokens: 900, completion_tokens: 70 },
+      }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(970);
+    expect(t.local).toBe(970);
+    expect(t.cloud).toBe(0);
+    expect(t.unknown).toBe(0);
+    expect(t.fresh).toBe(900); // one turn = the whole prompt is first-read
+    expect(t.runs).toBe(1);
+    // A local direct run must not inflate the cloud run count — hybridNote
+    // derives local runs as `t.runs - t.cloudRuns`.
+    expect(t.cloudRuns).toBe(0);
+  });
+
+  it("(#1853, inverted) a session with BOTH a telemetry family AND a token-bearing local dispatch.complete is not double-counted", () => {
+    // Before #1853, this session's dispatch.complete (token-bearing, no
+    // endpoint) never entered `dcTok` at all (the endpoint gate skipped
+    // collection), so the `sess.has` double-count guard below was never
+    // exercised for the endpoint-less path. Now that collection is
+    // endpoint-blind, the same guard has to hold: a session already fully
+    // counted via its telemetry family must not ALSO have its
+    // dispatch.complete totals summed in — that would double-count rather
+    // than fix the undercount.
+    const data: FlowRecord[] = [
+      rec({ session_id: "s9", action: "dispatch.start", handle: "coder" }),
+      tokenRec("s9", 1, 100, 20),
+      rec({ session_id: "s9", action: "dispatch.complete", payload: { total_tokens: 120 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(120); // NOT 240
+    expect(t.local).toBe(120);
+    expect(t.cloud).toBe(0);
+    expect(t.unknown).toBe(0);
+    expect(t.runs).toBe(1); // NOT 2 (no phantom directRun for s9)
+  });
+
+  it("(#1853, inverted) a cloud single-shot session is still classified cloud, never local, once collection is endpoint-blind", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "s10", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure-foundry" } }),
+      rec({
+        session_id: "s10",
+        action: "dispatch.complete",
+        payload: { endpoint: "azure-foundry", total_tokens: 500, prompt_tokens: 450, completion_tokens: 50 },
+      }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(500);
+    expect(t.cloud).toBe(500);
+    expect(t.local).toBe(0);
+    expect(t.unknown).toBe(0);
+    expect(t.cloudRuns).toBe(1);
+  });
+
   it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {
     const data: FlowRecord[] = [
       rec({ session_id: "s7", action: "dispatch.start", handle: "pr-reviewer", payload: { endpoint: "gemini" } }),
