@@ -37,7 +37,11 @@
 # URIs), not by a hardcoded filename, so a future runner-image rename doesn't
 # silently stop this from firing. Covers both the classic one-line `.list`
 # format (one `deb`/`deb-src` line per declared source) and the newer deb822
-# `.sources` format (one blank-line-separated stanza per declared source).
+# `.sources` format, where a single `URIs:` field can itself hold more than
+# one space-separated URI and can fold onto continuation lines (any line
+# starting with whitespace continues the field above it) — each individual
+# URI token is its own declared source, at the same granularity as one
+# `deb`/`deb-src` line in the classic format.
 #
 # The match is precise on purpose, because a naive whole-file grep for the
 # hostname is a source of real damage, not just false positives:
@@ -54,26 +58,63 @@
 #     with a misleading "unable to locate package", which is a worse, silent
 #     failure than the flake this script exists to fix.
 #
-# So: only lines/stanzas that actually DECLARE a source are considered (a
-# `deb`/`deb-src` line for .list; a stanza with a `URIs:` field for
-# .sources), only the declared URI value is inspected (never comments, never
-# option/key paths), and the host must match dl.google.com EXACTLY as a
-# hostname, not as a substring. A file is removed only when EVERY declared
-# source in it names that host. A file with a mix of sources is left
+# So: only lines/fields that actually DECLARE a source are considered (a
+# `deb`/`deb-src` line for .list; a `URIs:` field, folded across
+# continuation lines, for .sources), only the declared URI VALUE is
+# inspected — for .list, that means positionally locating it (past the
+# `deb`/`deb-src` keyword and past an optional bracketed options block like
+# `[arch=amd64 signed-by=...]`), never a hostname-shaped substring found
+# anywhere else on the line, so a URL living INSIDE the options block (e.g.
+# a signing key fetched over https) is never mistaken for the source's own
+# URI. A URI's userinfo (`user:pass@`) is stripped before the host is read
+# off, cutting at the LAST `@` — this reveals the real host when the real
+# host is preceded by real credentials, and it refuses to let a URI use the
+# target hostname AS fake userinfo to disguise an unrelated real host.
+#
+# A URI counts as a declared source once it is scheme-bearing (has a
+# `scheme:` prefix), regardless of WHICH scheme — a mirror using `file:`,
+# `cdrom:`, `copy:`, `ftp:`, or `tor+http(s):`, none of which carry a
+# comparable host, still has to be counted, or a mixed file whose OTHER
+# source uses one of those schemes looks like 100% of its declared sources
+# match and gets deleted whole.
+#
+# The host must match dl.google.com EXACTLY as a hostname, not a substring.
+# A file is removed only when EVERY declared source in it — every
+# `deb`/`deb-src` line, every whitespace-separated URI token in every
+# `URIs:` field — names that host. A file with a mix of sources is left
 # entirely in place and a warning is printed instead — this script never
-# edits a file down to a subset of its lines/stanzas, only removes a file
+# edits a file down to a subset of its lines/URIs, only removes a file
 # outright when 100% of what it declares is the one host we're after. (The
-# browser's own install script does the more surgical stanza-precise thing
-# for the older format — commenting out only its own line when other
-# sources share the file — but whole-file removal is simpler and safe here
-# because it's the ONLY case a file is removed at all.)
+# browser's own install script does the more surgical per-line thing for
+# the older format — commenting out only its own line when other sources
+# share the file — but whole-file removal is simpler and safe here because
+# it's the ONLY case a file is removed at all.) Splitting a multi-URI field
+# uses `read -a` rather than an unquoted word list, because this script
+# also turns on `nullglob`: an unquoted split would silently DROP any URI
+# token containing a glob metacharacter (e.g. a `?query=` string) that
+# happens to match no file in the working directory, undercounting the
+# file's declared sources and letting a mixed file look like a full match.
 #
 # Reads and removals escalate to root only when needed: run directly if
 # already root (a plain container job with no `sudo` binary at all), else
-# via `sudo` if available. A file that can't be read, or a source that can't
-# be removed because escalation isn't available or fails, is WARNED about —
-# never silently treated as "nothing to drop" the way a suppressed
-# permission error would.
+# via `sudo` if available. A file that can't be read, or a source that
+# can't be removed because escalation isn't available or fails, is WARNED
+# about on stderr AND as a GitHub Actions `::warning::` annotation (so the
+# finding reaches the run summary, not just a buried log line inside a
+# collapsed, exit-0 step) — never silently treated as "nothing to drop" the
+# way a suppressed permission error would. A read failure reports the
+# ORIGINAL (unprivileged) error even when a subsequent escalated read is
+# also attempted and fails without output of its own (e.g. no `sudo`
+# binary exists at all) — the first error is the informative one and is
+# never allowed to be silently overwritten by a blank one.
+#
+# Exit status: this script exits non-zero if it found a source it could NOT
+# remove (escalation unavailable or failed) — that leaves the exact flake
+# this script exists to prevent still armed, and `apt-get update` is
+# expected to fail right afterward anyway, so failing loudly here is more
+# honest than reporting success. It exits 0 when nothing was found, when a
+# mixed file was deliberately left in place (a judgment call, not a
+# failure of this script), and on a normal successful drop.
 set -euo pipefail
 
 # Run "$@" as root: directly if we already are root (common in a plain
@@ -92,12 +133,17 @@ as_root() {
   fi
 }
 
-# Extract the hostname from a URI: strip the scheme, then cut at the first
-# of / : ? # (whichever comes first) so a port, path, or query string never
-# leaks into the comparison.
+# Extract the hostname from a URI: strip the scheme, drop any userinfo
+# (user[:pass]@) by cutting at the LAST '@' — never the first, so a
+# credential value can't be used to disguise the real host on either side
+# of the '@' — then cut at the first of / : ? # (whichever comes first) so
+# a port, path, or query string never leaks into the comparison.
 host_of() {
   local uri="$1" rest
   rest="${uri#*://}"
+  case "$rest" in
+    *@*) rest="${rest##*@}" ;;
+  esac
   rest="${rest%%[/:?#]*}"
   printf '%s' "$rest"
 }
@@ -112,17 +158,26 @@ host_matches() {
 shopt -s nullglob
 dropped=0
 warned=0
+remove_failed=0
 
 for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
   # Try an unprivileged read first — these files are normally world-readable
   # and the common case (no root, no sudo, ordinary permissions) should
   # never need escalation just to look. Only escalate if the plain read
   # fails, and only warn if BOTH fail — never swallow a permission error
-  # into a silent "nothing to drop".
+  # into a silent "nothing to drop", and never lose the FIRST (usually more
+  # informative) error behind a second attempt that produced no output of
+  # its own.
   content=""
+  first_err=""
   if ! content=$(cat "$f" 2>&1); then
+    first_err="$content"
     if ! content=$(as_root cat "$f" 2>&1); then
-      echo "WARNING: could not read $f ($content) — a Google Chrome apt source here, if any, was NOT checked" >&2
+      reason="$first_err"
+      if [ -n "$content" ]; then
+        reason="$reason; escalated read also failed: $content"
+      fi
+      echo "WARNING: could not read $f ($reason) — a Google Chrome apt source here, if any, was NOT checked" >&2
       warned=1
       continue
     fi
@@ -132,25 +187,43 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
   matching=0
 
   if [[ "$f" == *.sources ]]; then
-    # deb822 stanza format: one declared source per blank-line-separated
-    # stanza. A stanza only counts as "declared" if it has a URIs: field
-    # (skips stray comment-only or metadata-only stanzas).
+    # deb822 stanza format: a stanza's URIs: field can hold more than one
+    # space-separated URI, and its value can fold onto continuation lines
+    # (any line starting with whitespace continues the field above it).
+    # Every individual URI token — not the stanza as a whole — is its own
+    # declared source, counted into the same file-wide total/matching
+    # tally the classic-format branch below uses, so the file-level "every
+    # declared source must match" rule applies at one consistent
+    # granularity instead of contradicting an "any URI in this field"
+    # stanza-level shortcut.
     stanza=""
     process_stanza() {
-      local s="$1" uris_line any_match=0 u h
-      uris_line=$(printf '%s\n' "$s" | grep -iE '^[[:space:]]*URIs:' | head -n1) || true
-      [ -z "$uris_line" ] && return 0
-      uris_line="${uris_line#*:}"
-      total=$((total + 1))
-      for u in $uris_line; do
+      local s="$1" line lc collecting=0 out="" uris=() u h
+      while IFS= read -r line; do
+        if [[ "$line" == [[:space:]]* ]]; then
+          [ "$collecting" -eq 1 ] && out+=" $line"
+          continue
+        fi
+        lc="${line,,}"
+        if [[ "$lc" == uris:* ]]; then
+          collecting=1
+          out="${line#*:}"
+        else
+          collecting=0
+        fi
+      done <<<"$s"
+      [ -z "${out//[[:space:]]/}" ] && return 0
+      # read -a splits on whitespace WITHOUT pathname expansion — see the
+      # header note on why an unquoted `for u in $out` word list is unsafe
+      # here now that the rule is "all must match" rather than "any".
+      read -ra uris <<<"$out"
+      for u in "${uris[@]}"; do
+        total=$((total + 1))
         h=$(host_of "$u")
         if host_matches "$h"; then
-          any_match=1
+          matching=$((matching + 1))
         fi
       done
-      if [ "$any_match" -eq 1 ]; then
-        matching=$((matching + 1))
-      fi
     }
     while IFS= read -r line; do
       if [ -z "$(printf '%s' "$line" | tr -d '[:space:]')" ]; then
@@ -171,12 +244,33 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
       [[ "$trimmed" == \#* ]] && continue
       [[ "$trimmed" =~ ^(deb|deb-src)[[:space:]] ]] || continue
       nocomment="${trimmed%%#*}"
-      uri=$(printf '%s' "$nocomment" | grep -oE 'https?://[^[:space:]]+' | head -n1) || true
+
+      # Positionally locate the URI: strip the deb/deb-src keyword, then an
+      # optional bracketed options block, then take the next
+      # whitespace-separated token. This is the ONLY place the URI comes
+      # from — never a hostname-shaped substring matched anywhere else on
+      # the line, which previously let a URL living INSIDE the options
+      # block (e.g. a signed-by= fetched over https) get mistaken for the
+      # source's own URI.
+      rest="${nocomment#deb-src}"
+      [ "$rest" = "$nocomment" ] && rest="${nocomment#deb}"
+      rest="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]+//')"
+      if [[ "$rest" == \[* ]]; then
+        rest="${rest#*]}"
+        rest="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]+//')"
+      fi
+      uri="${rest%%[[:space:]]*}"
       [ -z "$uri" ] && continue
-      total=$((total + 1))
-      host=$(host_of "$uri")
-      if host_matches "$host"; then
-        matching=$((matching + 1))
+
+      # Count it as a declared source whenever it's scheme-bearing (has a
+      # "scheme:" prefix), regardless of WHICH scheme. See the header note
+      # on non-web schemes for why this can't be narrowed to http(s) only.
+      if [[ "$uri" =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]]; then
+        total=$((total + 1))
+        host=$(host_of "$uri")
+        if host_matches "$host"; then
+          matching=$((matching + 1))
+        fi
       fi
     done <<<"$content"
   fi
@@ -190,15 +284,24 @@ for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
       echo "Dropped runner-shipped apt source: $f"
       dropped=$((dropped + 1))
     else
-      echo "WARNING: found a Google Chrome apt source at $f but could not remove it (privilege escalation unavailable or failed) — apt-get update may still fail because of it" >&2
+      msg="found a Google Chrome apt source at $f but could not remove it (privilege escalation unavailable or failed) — apt-get update may still fail because of it"
+      echo "WARNING: $msg" >&2
+      echo "::warning::$msg"
       warned=1
+      remove_failed=1
     fi
   elif [ "$matching" -gt 0 ]; then
-    echo "WARNING: $f declares a Google Chrome apt source (dl.google.com) alongside at least one other source — leaving the whole file in place rather than risk dropping something a job needs. Edit it by hand if it is causing apt-get update to fail." >&2
+    msg="$f declares a Google Chrome apt source (dl.google.com) alongside at least one other source — leaving the whole file in place rather than risk dropping something a job needs. Edit it by hand if it is causing apt-get update to fail."
+    echo "WARNING: $msg" >&2
+    echo "::warning::$msg"
     warned=1
   fi
 done
 
 if [ "$dropped" -eq 0 ] && [ "$warned" -eq 0 ]; then
   echo "No Google Chrome apt source found on this runner — nothing to drop."
+fi
+
+if [ "$remove_failed" -eq 1 ]; then
+  exit 1
 fi
