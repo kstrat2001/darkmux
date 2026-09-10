@@ -684,27 +684,110 @@ mod imp {
     /// Every `voltage-states*` blob on the `pmgr` node — the SoC's DVFS
     /// frequency tables. Read ONCE at probe construction (~7 ms); these are
     /// static hardware descriptors, not counters.
+    ///
+    /// (#2137) Node identification used to gate on the presence of an
+    /// `acc-clusters` key ("the pmgr node is the one carrying
+    /// `acc-clusters`"), which is what this file was originally written
+    /// against and **verified on real M5 Max hardware** (2026-09-10:
+    /// `ioreg -c AppleARMIODevice -l` shows exactly one node —
+    /// `pmgr@80600000` — carrying both `acc-clusters` and every
+    /// `voltage-states*` key on this chip). That gate silently dropped the
+    /// whole table on M1 Max, which reported `mhz: null` everywhere even
+    /// though IOReport itself worked fine.
+    ///
+    /// The M1 key spelling itself is **not verified on hardware here** — no
+    /// M1 was available to probe directly. Third-party tooling (the
+    /// `vladkens/macmon` project, issue #47, as surfaced by a public
+    /// search — treat this as a hypothesis carried over from research, not
+    /// a fact this codebase confirmed) hard-codes `voltage-states1-sram`
+    /// (E-cluster) / `voltage-states5-sram` (P-cluster) for M1-M4 and only
+    /// falls back to `acc-clusters`-based discovery on M5, which reads as
+    /// `acc-clusters` being an M5-and-later addition — consistent with the
+    /// null-everywhere symptom in #2137 (an M1 pmgr node without
+    /// `acc-clusters` would make the OLD gate here reject it outright).
+    ///
+    /// Rather than pin the lookup to either generation's specific key
+    /// NUMBERS (1/5 vs 22/23 vs whatever a future chip uses), this drops
+    /// the node-identification gate entirely and keys off the same
+    /// `voltage-states` PREFIX the table picker already uses below —
+    /// verified on this machine to be unambiguous: `pmgr` is the only
+    /// `AppleARMIODevice` node carrying any `voltage-states*` property at
+    /// all, so no gate is needed to avoid picking up an unrelated node. If
+    /// a future generation puts unrelated `voltage-states*`-prefixed data
+    /// on some other node, `cpu_freq_tables`/`gpu_freq_table`'s own
+    /// plausibility + exact-key checks (see below) are the second line of
+    /// defense — a table that fails those checks degrades to `None` rather
+    /// than reporting a wrong frequency.
     fn read_pmgr_voltage_states() -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
         iokit::for_each_service("AppleARMIODevice", |props| {
             // SAFETY: `props` is a live property dictionary for the duration
             // of the callback, and every accessor type-checks before reading.
-            unsafe {
-                // The pmgr node is the one carrying `acc-clusters`; other
-                // AppleARMIODevice nodes have no frequency tables.
-                if iokit::dict_get(props, "acc-clusters").is_none() {
-                    return;
-                }
-                for (k, v) in iokit::dict_pairs(props) {
-                    if k.starts_with("voltage-states") {
-                        if let Some(bytes) = iokit::value_bytes(v) {
-                            out.push((k, bytes));
-                        }
-                    }
-                }
-            }
+            let pairs: Vec<(String, Vec<u8>)> = unsafe {
+                iokit::dict_pairs(props)
+                    .into_iter()
+                    .filter_map(|(k, v)| iokit::value_bytes(v).map(|bytes| (k, bytes)))
+                    .collect()
+            };
+            out.extend(voltage_states_entries(pairs));
         });
         out
+    }
+
+    /// Filters one node's already-collected property pairs down to its
+    /// `voltage-states*` entries — the generation-agnostic identification
+    /// test extracted so it can be exercised without a live IORegistry.
+    /// Pure.
+    fn voltage_states_entries(
+        pairs: Vec<(String, Vec<u8>)>,
+    ) -> impl Iterator<Item = (String, Vec<u8>)> {
+        pairs
+            .into_iter()
+            .filter(|(k, _)| k.starts_with("voltage-states"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::voltage_states_entries;
+
+        /// A synthetic node shaped like #2137's report: real
+        /// `voltage-states*` keys (under the numbering third-party tooling
+        /// reports for M1 — `voltage-states1-sram`/`voltage-states5-sram`;
+        /// unverified on real M1 hardware, see the doc comment on
+        /// `read_pmgr_voltage_states`) but NO `acc-clusters` key. The OLD
+        /// gate (`if dict_get(props, "acc-clusters").is_none() { return }`)
+        /// rejected this node outright, producing an empty table and every
+        /// `mhz` field null even though the keys were right there — this is
+        /// the regression test for that: it fails if the node-identification
+        /// gate is reintroduced.
+        #[test]
+        fn identifies_a_node_with_no_acc_clusters_key_by_its_voltage_states_prefix() {
+            let pairs = vec![
+                ("some-other-property".to_string(), vec![0u8; 4]),
+                ("voltage-states1-sram".to_string(), vec![1, 2, 3, 4]),
+                ("voltage-states5-sram".to_string(), vec![5, 6, 7, 8]),
+                ("voltage-states9".to_string(), vec![9, 10, 11, 12]),
+            ];
+            let got: Vec<String> = voltage_states_entries(pairs).map(|(k, _)| k).collect();
+            assert_eq!(
+                got,
+                vec!["voltage-states1-sram", "voltage-states5-sram", "voltage-states9"],
+                "every voltage-states* key must be picked up even with no acc-clusters key present"
+            );
+        }
+
+        #[test]
+        fn drops_keys_that_are_not_voltage_states() {
+            let pairs = vec![
+                ("acc-clusters".to_string(), vec![0u8; 4]),
+                ("unrelated-blob".to_string(), vec![1u8; 4]),
+            ];
+            let got: Vec<_> = voltage_states_entries(pairs).collect();
+            assert!(
+                got.is_empty(),
+                "a node with no voltage-states* key contributes nothing"
+            );
+        }
     }
 }
 
