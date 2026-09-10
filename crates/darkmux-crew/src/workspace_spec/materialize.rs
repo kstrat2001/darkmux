@@ -363,6 +363,39 @@ fn resolve_one(
     let origin = source
         .origin()
         .ok_or_else(|| anyhow::anyhow!("source '{}' names neither `git` nor `path`", source.id))?;
+    // (#2577 review) A `path`-origin's `origin` is handed to `git clone`
+    // VERBATIM below, on a call with no `.current_dir()` set (`run_git
+    // (None, ...)`) — a RELATIVE path there resolves against darkmux's
+    // own ambient working directory (`std::env::current_dir()`, inherited
+    // by the child process), the exact process-global `CwdPolicy` exists
+    // to keep off scheduler worker threads. Two Tier-2 step kinds
+    // (`crawl.plan`, `plan.sites`) each declare `CwdPolicy::
+    // NoAmbientDependency` on the strength of an audit of THIS call —
+    // proved live: the same relative-path spec run from three different
+    // ambient directories resolved three different sources (one success,
+    // two different failures). `WorkspaceSpec::load` absolutizes a
+    // relative `path:` against the spec FILE's own directory before this
+    // function ever sees it (a real convenience for an operator-authored
+    // spec), but `materialize()` is also called directly on a spec built
+    // as a struct literal that skips `load()` entirely — see
+    // `derive_workspace_spec`'s own doc and
+    // `a_spec_built_without_load_cannot_escape_the_workspaces_root_via_name`
+    // just below, which drives exactly that bypass for the sibling `name`
+    // containment. This is the JOIN those two kinds' declarations actually
+    // depend on, so it refuses here unconditionally rather than trust every
+    // caller to have gone through `load()` first.
+    if let Some(p) = &source.path {
+        if !Path::new(p).is_absolute() {
+            bail!(
+                "source '{}': `path` origin '{p}' is not absolute — a relative path here \
+                 resolves against darkmux's own process working directory, which is neither \
+                 fixed nor safe to depend on (see `step_kinds::types::CwdPolicy`'s own doc). \
+                 Use an absolute path, or load this spec through `WorkspaceSpec::load`, which \
+                 resolves a relative `path:` against the spec file's own directory.",
+                source.id
+            );
+        }
+    }
     // Compute both paths through the containment guard ONCE, up front, so
     // neither the clone nor the worktree checkout below can run against an
     // escaping path in the first place (#1959 second-round finding,
@@ -1173,6 +1206,153 @@ mod tests {
 
     const RW: MaterializeOptions = MaterializeOptions { fetch: true, read_only: false };
     const RO: MaterializeOptions = MaterializeOptions { fetch: true, read_only: true };
+
+    /// Mirrors `step_kinds::builtins`'s own `CwdGuard` (see that struct's
+    /// doc for the full origin) — enter a directory, restore the previous
+    /// one on drop, even across a panic. A FAILED restore is loud rather
+    /// than swallowed for the identical reason: leaving the process
+    /// standing in a directory this test deleted would fail every LATER
+    /// test in this binary that reads cwd, for a reason that has nothing
+    /// to do with them.
+    struct CwdGuard {
+        prev: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            if let Err(e) = std::env::set_current_dir(&self.prev) {
+                let msg = format!("CwdGuard could not restore the process cwd to {}: {e}", self.prev.display());
+                if std::thread::panicking() {
+                    eprintln!("{msg}");
+                } else {
+                    panic!("{msg}");
+                }
+            }
+        }
+    }
+
+    /// (#2577 review) Reproduces the reviewer's own three-directory probe
+    /// against the REAL code path: before `resolve_one`'s guard, a spec
+    /// naming a RELATIVE `path`-origin resolved that origin against
+    /// darkmux's own ambient working directory — so the identical spec
+    /// gave three different answers depending only on where the process
+    /// happened to be standing when `materialize()` ran: success from a
+    /// directory that happens to contain a same-named sibling, one flavor
+    /// of failure from an unrelated directory, and (proven separately by
+    /// the reviewer) a different one again from a directory that no
+    /// longer exists. The guard removes the dependency STRUCTURALLY
+    /// rather than patching each of those three answers individually:
+    /// every ambient directory below now produces the textually IDENTICAL
+    /// refusal, because the check that fires is a `Path::is_absolute()`
+    /// test on the spec's own string — it never reads `std::env::
+    /// current_dir()` at all.
+    #[test]
+    #[serial_test::serial]
+    fn a_relative_path_origin_is_refused_identically_from_every_ambient_directory() {
+        fn spec_with_relative_origin(root: &Path) -> WorkspaceSpec {
+            WorkspaceSpec {
+                schema_version: None,
+                name: Some("t-relative".to_string()),
+                root: Some(root.to_string_lossy().into_owned()),
+                sources: vec![SourceSpec {
+                    id: "app".to_string(),
+                    git: None,
+                    // Deliberately relative — the exact shape `WorkspaceSpec::
+                    // load` would normally absolutize before `materialize`
+                    // ever sees it. Building the spec as a struct literal
+                    // (never touching `load`) is what a caller like
+                    // `derive_workspace_spec` does, and is exactly why the
+                    // load-bearing guard has to live in `resolve_one`, not
+                    // only in `load`.
+                    path: Some("origin-repo".to_string()),
+                    git_ref: Some("main".to_string()),
+                    extras: Default::default(),
+                }],
+                include: None,
+                exclude: None,
+                edges: Vec::new(),
+                rules: Vec::new(),
+                extras: Default::default(),
+            }
+        }
+
+        // Ambient A: a real git repo named "origin-repo" actually sits
+        // here as a sibling — the ONE case the pre-fix code resolved
+        // successfully (the reviewer's "success from the source's own
+        // parent").
+        let ambient_a = TempDir::new().unwrap();
+        {
+            let run = |args: &[&str]| {
+                let out = Command::new("git")
+                    .current_dir(ambient_a.path().join("origin-repo"))
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            };
+            fs::create_dir(ambient_a.path().join("origin-repo")).unwrap();
+            run(&["init", "-q", "-b", "main"]);
+            run(&["config", "user.email", "test@example.com"]);
+            run(&["config", "user.name", "test"]);
+            fs::write(ambient_a.path().join("origin-repo").join("a.txt"), "hello\n").unwrap();
+            run(&["add", "a.txt"]);
+            run(&["commit", "-q", "-m", "first"]);
+        }
+
+        // Ambient B: unrelated — no "origin-repo" here at all (the
+        // reviewer's "failure from an unrelated directory").
+        let ambient_b = TempDir::new().unwrap();
+
+        // Ambient C: existed, then vanished out from under the process
+        // (the reviewer's "failure from a deleted one").
+        let ambient_c = TempDir::new().unwrap();
+        let ambient_c_path = ambient_c.path().to_path_buf();
+
+        // Each iteration's `root:` is its OWN tempdir, independent of the
+        // ambient directory under test — the point is isolating what the
+        // AMBIENT directory changes, not sharing state across iterations.
+        let mut results: Vec<Option<String>> = Vec::new();
+        for ambient in [ambient_a.path().to_path_buf(), ambient_b.path().to_path_buf()] {
+            let workspace_root = TempDir::new().unwrap();
+            let _guard = CwdGuard::enter(&ambient);
+            let spec = spec_with_relative_origin(workspace_root.path());
+            results.push(materialize(&spec, RW).err().map(|e| e.to_string()));
+        }
+        {
+            let workspace_root = TempDir::new().unwrap();
+            let _guard = CwdGuard::enter(&ambient_c_path);
+            drop(ambient_c);
+            std::fs::remove_dir(&ambient_c_path).ok();
+            let spec = spec_with_relative_origin(workspace_root.path());
+            results.push(materialize(&spec, RW).err().map(|e| e.to_string()));
+        }
+
+        assert!(
+            results.iter().all(|r| r.is_some()),
+            "every ambient directory must be refused (not merely error, REFUSED with the same \
+             reason) once the guard is in place: {results:?}"
+        );
+        let msgs: Vec<&str> = results.iter().map(|r| r.as_deref().unwrap()).collect();
+        for m in &msgs {
+            assert!(m.contains("not absolute"), "expected the absoluteness refusal, got: {m}");
+        }
+        assert_eq!(
+            msgs[0], msgs[1],
+            "the refusal text must not depend on the ambient directory: {msgs:?}"
+        );
+        assert_eq!(
+            msgs[1], msgs[2],
+            "the refusal text must not depend on the ambient directory: {msgs:?}"
+        );
+    }
 
     /// (#2404 P4d round 3) `--no-hardlinks` is the right default for a
     /// REMOTE `git` origin (git never hardlinks across a network clone

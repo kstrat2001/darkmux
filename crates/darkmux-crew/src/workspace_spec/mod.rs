@@ -186,6 +186,33 @@ impl WorkspaceSpec {
                 .to_string();
             spec.name = Some(stem);
         }
+        // (#2577 review) A `path`-origin source's clone origin is used
+        // VERBATIM by `materialize` (`workspace_spec::materialize::
+        // resolve_one`, which now REFUSES a relative one outright — see
+        // that function's own doc for why). Absolutize a relative
+        // `path:` here, against the spec FILE's own directory — a named,
+        // stable base computed once, now, from where this file actually
+        // lives, never from the process's ambient working directory —
+        // so an operator writing `"path": "../sibling-repo"` in a spec
+        // gets "relative to this spec file" rather than a load-time
+        // refusal. `path.canonicalize()` resolves this file's own
+        // location (and any symlinks in it) before taking its parent, so
+        // the base is itself independent of whatever the process cwd
+        // happens to be when `load()` runs; only the fallback
+        // (canonicalize failing, e.g. the spec file vanished between the
+        // read above and here) leaves the source path exactly as its
+        // author wrote it, for `resolve_one`'s guard to refuse.
+        let spec_dir = path.canonicalize().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+        if let Some(spec_dir) = spec_dir {
+            for source in &mut spec.sources {
+                if let Some(p) = &source.path {
+                    let candidate = Path::new(p);
+                    if !candidate.is_absolute() {
+                        source.path = Some(spec_dir.join(candidate).to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
         let warnings = spec.validate()?;
         Ok((spec, warnings))
     }
@@ -520,6 +547,44 @@ mod tests {
         let path = write(&dir, "workspace.json", &json.to_string());
         let err = WorkspaceSpec::load(&path).unwrap_err();
         assert!(err.to_string().contains("names BOTH"), "{err}");
+    }
+
+    /// (#2577 review) `load()` absolutizes a relative `path:` against the
+    /// spec FILE's own directory — proven independent of the process's
+    /// ambient working directory by loading the SAME spec from an
+    /// unrelated ambient cwd that does not itself contain the source
+    /// directory at all. Before this fix, `origin()`'s value would have
+    /// stayed the literal relative string, and `resolve_one` (now refusing
+    /// it outright — see that function's own doc) would have resolved it
+    /// against whatever the ambient directory happened to be.
+    #[test]
+    #[serial_test::serial]
+    fn load_absolutizes_a_relative_path_source_against_the_spec_files_own_directory() {
+        let spec_dir = TempDir::new().unwrap();
+        std::fs::create_dir(spec_dir.path().join("sibling-repo")).unwrap();
+        let mut json = minimal_spec_json();
+        json["sources"][1]["path"] = serde_json::json!("sibling-repo");
+        let spec_path = write(&spec_dir, "workspace.json", &json.to_string());
+
+        // An ambient cwd elsewhere entirely, which does NOT contain
+        // "sibling-repo" — if resolution ever fell back to ambient cwd,
+        // the join below would be wrong.
+        let elsewhere = TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(elsewhere.path()).unwrap();
+        let result = WorkspaceSpec::load(&spec_path);
+        std::env::set_current_dir(&prev).unwrap();
+
+        let (spec, _) = result.unwrap();
+        let app = spec.sources.iter().find(|s| s.id == "app").unwrap();
+        let resolved = PathBuf::from(app.path.as_deref().unwrap());
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            spec_dir.path().join("sibling-repo").canonicalize().unwrap(),
+            "a relative `path:` must resolve against the SPEC FILE's own directory, not the \
+             ambient cwd it happened to load from"
+        );
     }
 
     #[test]

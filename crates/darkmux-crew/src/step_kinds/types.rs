@@ -521,13 +521,16 @@ pub enum CwdPolicy {
     /// ambient_cwd_fallback` test asserts that over the actual registered
     /// registry (a real enumeration, not a source scan) for every Tier 1
     /// builtin; it cannot see Tier 2/3 kinds registered by an individual
-    /// mission (`mods.gate`, the crawl planners, `mission.worktree`/
+    /// mission (`mods.gate`, the crawl planners `crawl.plan`/`plan.sites`,
+    /// the crawl unit kinds `crawl.unit`/`crawl.summary`, `mission.worktree`/
     /// `mission.coder`/`mission.verify`, `deliver.github_review`,
-    /// `records.gather`) since those live in separate crates with their
-    /// own registration functions and no single shared registry walks all
-    /// of them today — each was audited by hand for #2577 instead (see
-    /// that issue's investigation) and every one of them either spawns no
-    /// subprocess or always resolves an explicit directory first.
+    /// `records.gather` — ten kinds total, see that test's own comment)
+    /// since those live in separate crates with their own registration
+    /// functions and no single shared registry walks all of them today —
+    /// each carries its own explicit `cwd_policy()` override recording a
+    /// #2577 hand audit instead (see that issue's investigation, and each
+    /// kind's own doc), and every one of them either spawns no subprocess
+    /// or always resolves an explicit directory first.
     AmbientWithRefusal,
 }
 

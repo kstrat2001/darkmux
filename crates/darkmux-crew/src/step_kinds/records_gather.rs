@@ -51,7 +51,7 @@ use crate::findings::{self, FindingRecord};
 use crate::mods;
 use crate::step_kinds::deliver_github_review::{DeliverScope, GatedMod};
 use crate::step_kinds::registry::StepKindRegistry;
-use crate::step_kinds::types::{Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
+use crate::step_kinds::types::{CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -156,6 +156,19 @@ impl StepKind for RecordsGatherStepKind {
     /// `deliver.github_review`/`procedural.shell`/`procedural.noop` use.
     fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
         None
+    }
+
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — this kind spawns no subprocess at all: it
+    /// reads darkmux's own flow/findings/mods records off disk through
+    /// their own resolved paths (`findings`/`mods`/flow-store readers),
+    /// never a `Command`. Was previously covered only by the trait
+    /// default (silently, with no row naming this a checked audit) — a
+    /// #2577-review finding. Not a `StepKindRegistry::with_builtins()`
+    /// member, so the registry conformance test cannot see this kind —
+    /// audited by hand.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
     }
 
     fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {

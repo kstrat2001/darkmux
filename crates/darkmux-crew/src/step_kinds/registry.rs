@@ -300,22 +300,44 @@ mod tests {
         // above: a sixth Tier 1 kind fails HERE, the moment it is
         // registered, because `expected_cwd_policy` will not have a row
         // for it — forcing whoever adds it to state, in this table,
-        // whether it is safe to depend on the ambient directory. This
-        // test does NOT see Tier 2/3 kinds (`mods.gate`, the crawl
-        // planners, `mission.worktree`/`mission.coder`/`mission.verify`,
-        // `deliver.github_review`, `records.gather`) — those are
-        // registered by their own missions in other crates, with no
-        // single shared registry across all of them. Each was audited by
-        // hand for #2577 (see that issue) rather than enumerated here:
+        // whether it is safe to depend on the ambient directory.
+        //
+        // This test does NOT see Tier 2/3 kinds — those are registered by
+        // their own missions in other crates, with no single shared
+        // registry across all of them. An exhaustive sweep of every
+        // non-test `impl StepKind for` in the workspace (a review finding:
+        // the original #2577 sweep undercounted at 19; the reproducible
+        // count is FIFTEEN) finds ten such kinds: `mods.gate`, the two
+        // crawl planners (`crawl.plan`, `plan.sites`), the two crawl unit
+        // kinds (`crawl.unit`, `crawl.summary`), the three `mission.*`
+        // kinds (`mission.worktree`, `mission.coder`, `mission.verify`),
+        // `deliver.github_review`, and `records.gather`. Every one of
+        // them now carries its OWN explicit `cwd_policy()` override (a
+        // review finding: three of them — `mission.coder`,
+        // `deliver.github_review`, `records.gather` — previously carried
+        // none at all, silently inheriting the trait default with no row
+        // recording that as a checked audit; `crawl.unit`/`crawl.summary`
+        // were absent from this comment's roster entirely). See each
+        // kind's own `cwd_policy` doc for its audit.
+        //
         // `mods.gate` requires and validates an explicit `config.workdir`
         // (never falls through to ambient); the crawl planners' only
         // ambient-adjacent call (`workspace_spec::materialize`'s
         // first-clone `git clone --bare` with no `.current_dir()` set) was
-        // probed live from a deleted process cwd and exits 0 cleanly —
-        // `git` invoked directly (never through a shell) does not appear
-        // to consult the ambient directory the way `sh -c` does; the
-        // `mission.*` kinds in `darkmux`'s own `coder_phase` module always
-        // pass an explicitly-resolved worktree path.
+        // probed live from a deleted process cwd and reads clean at exit
+        // 0 — but NOT, as first recorded, because "`git` invoked directly
+        // never consults the ambient directory": a repeat probe (a bare
+        // `Command::new("git")`, no shell, matching `run_git` exactly)
+        // shows `git` spawns its own internal shell regardless, and that
+        // shell's `shell-init: error retrieving current directory`
+        // reaches stderr even on a clean exit. The clone is actually safe
+        // because `resolve_one` now REFUSES a relative `path`-origin
+        // unconditionally (see that function's own doc) — structural, not
+        // resting on the shell claim. The `mission.*` kinds in darkmux's
+        // own `coder_phase` module always pass an explicitly-resolved
+        // worktree path (`mission.coder` via `crew::dispatch`'s own
+        // `workdir`); `deliver.github_review` and `records.gather` spawn
+        // no subprocess at all.
         let registry = StepKindRegistry::with_builtins();
         for id in registry.ids() {
             let kind = registry.get(&id).expect("registry.ids() only yields registered kinds");

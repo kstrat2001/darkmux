@@ -782,6 +782,19 @@ impl StepKind for MissionCoderStepKind {
         &PORTS
     }
 
+    /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
+    /// stated explicitly here) — this kind spawns no subprocess of its
+    /// own; it dispatches a model turn via `crew::dispatch::dispatch`,
+    /// passing `workdir: Some(ctx.wt_path.clone())` explicitly (the same
+    /// worktree path `MissionWorktreeStepKind` resolves). Was previously
+    /// covered only by the trait default (silently, with no row naming
+    /// this a checked audit) — a #2577-review finding. Not a
+    /// `StepKindRegistry::with_builtins()` member, so the registry
+    /// conformance test cannot see this kind — audited by hand.
+    fn cwd_policy(&self) -> CwdPolicy {
+        CwdPolicy::NoAmbientDependency
+    }
+
     fn run(
         &self,
         _step: &crew::types::Step,
