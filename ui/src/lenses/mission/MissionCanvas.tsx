@@ -332,10 +332,7 @@ export function MissionCanvas({
       // not run past the fold and stopped exactly one bar short of being
       // right — the zoom controls and the minimap, which React Flow pins to
       // the canvas's own bottom edge, ended up half under "Machine info |
-      // Events" with no scroll position that could free them (an absolutely
-      // positioned control cannot be scrolled out from under a fixed bar,
-      // which is what separates this from an ordinary flow element that
-      // happens to sit low on screen).
+      // Events".
       //
       // The inset is READ from `.app-shell`'s own resolved `padding-bottom`
       // rather than restated here. That padding is the ONE rule every other
@@ -346,7 +343,30 @@ export function MissionCanvas({
       // where that rule does not apply, leaving desktop untouched.
       const shell = el.closest(".app-shell");
       const inset = shell ? parseFloat(getComputedStyle(shell).paddingBottom) || 0 : 0;
-      const h = clampCanvasHeight(window.innerHeight - top - inset);
+      // (#2618 — CI regression from #2520 round 1) `available` alone is the
+      // wrong ceiling on a landscape phone: 844×390 leaves only ~103px above
+      // the drawer, and flooring `el.style.height` to exactly that shrinks
+      // `fitView`'s pane until the wide (desktop-shape) layout hits React
+      // Flow's own 0.1 `minZoom` — the graph FITS and is unreadable, the
+      // regression `mission-lens-phone-graph-fit.spec.js`'s landscape case
+      // caught. #2520 round 1 dropped the previous flat `240` floor entirely
+      // on the theory that flooring higher than `available` ran the canvas
+      // under the drawer with "no scroll position" able to reach it — but
+      // `el`'s own parent (`.body missionlens__body`, `styles.css`) already
+      // carries an unrelated `min-height: 480px`, so that overflow, and a
+      // page tall enough to scroll to it, already exist today regardless of
+      // what height THIS canvas asks for; round 1 just left the difference
+      // as dead blank space below a needlessly shrunken graph. `floor` reads
+      // that same reserved room back out (never a second hardcoded `480`
+      // that could drift from the CSS rule that actually governs it, same
+      // pattern as `inset` above) so the canvas actually FILLS it instead —
+      // legible on a landscape phone, a no-op everywhere `available` is
+      // already bigger (portrait, desktop), and reachable by an ordinary
+      // page scroll: React Flow's controls are `position: absolute` inside
+      // this scrolling box, not `position: fixed` like the drawer, so they
+      // move with the page exactly as any other flow content would.
+      const floor = el.parentElement ? parseFloat(getComputedStyle(el.parentElement).minHeight) || 0 : 0;
+      const h = clampCanvasHeight(window.innerHeight - top - inset, floor);
       el.style.height = `${h}px`;
       // (#2376) The ACTUAL rendered pane's aspect, not the window's — a
       // landscape phone's canvas is short and wide even though `isMobile`
