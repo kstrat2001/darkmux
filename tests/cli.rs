@@ -3032,7 +3032,17 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
     let stub = HangingStubServer::start();
     let (home, darkmux_home) = isolated_roots();
     let redis_workdir = home.parent().unwrap().join("redis");
-    let (mut redis_child, redis_url) = spawn_ephemeral_redis(&redis_workdir);
+    let (redis_child_raw, redis_url) = spawn_ephemeral_redis(&redis_workdir);
+    // (#2476 review round 2 — cleanup gap caught during development) RAII,
+    // not a plain `redis_child.kill()` at the bottom of this function: an
+    // assertion panicking anywhere ABOVE that point (any of `wait_for_
+    // serve_health`, the stub-connection wait, the post-SIGTERM exit wait,
+    // or the final close/no-orphan checks) unwinds past that bare call —
+    // Rust does not run ordinary statements during an unwind, only `Drop`
+    // impls — and leaks a real `redis-server` process. Measured live: a
+    // red-prove run against this exact test left one running for hours.
+    // `DirectChildGuard` fires on every exit path, panic included.
+    let _redis_child = DirectChildGuard(redis_child_raw);
 
     let profiles_path = darkmux_home.join("profiles.json");
     fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
@@ -3043,7 +3053,7 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
     let serve_port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let mut serve_child = darkmux_std_cmd()
+    let serve_child_raw = darkmux_std_cmd()
         .env("HOME", &home)
         .env("DARKMUX_HOME", &darkmux_home)
         .env("DARKMUX_MACHINE_ID", "cli-test-serve-node")
@@ -3055,6 +3065,10 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawning darkmux serve");
+    // Same reasoning as `redis_child` above — a panicked assertion before
+    // this test's own explicit SIGTERM+wait would otherwise leak a live
+    // `darkmux serve` daemon too.
+    let mut serve_child = DirectChildGuard(serve_child_raw);
     let serve_pid = serve_child.id();
 
     wait_for_serve_health(serve_port, std::time::Duration::from_secs(15));
@@ -3120,8 +3134,45 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
     );
     assert_no_surviving_remote_curl(serve_pid, "serve");
 
-    let _ = redis_child.kill();
-    let _ = redis_child.wait();
+    // Both children are cleaned up by `DirectChildGuard`'s `Drop`, at the
+    // end of this function's scope — see that struct's own doc.
+}
+
+/// Best-effort cleanup for a `Child` this test spawned and holds
+/// DIRECTLY — always kill-then-wait on drop, regardless of which exit
+/// path (normal return, an early `assert!` panic mid-test) got there.
+/// Safe unconditionally, unlike the pid-remembering `KillOnDrop` above:
+/// this guard always holds the ORIGINAL `Child` handle rather than a
+/// bare pid, so there is no window in which the underlying pid could
+/// have been reaped and recycled onto an unrelated process before this
+/// fires — killing (or re-killing an already-exited) `Child` through its
+/// own handle is always safe (`std::process::Child::kill`'s own doc: an
+/// already-exited child is simply a no-op-ish `Err`, ignored here).
+///
+/// (#2476 review round 2 — cleanup gap caught during development, see
+/// `serve_sigterm_reaps_the_fleet_runners_curl_child`'s own comment)
+/// `Deref`/`DerefMut` to `Child` so call sites read exactly like they
+/// would against a bare `Child` (`.id()`, `.try_wait()`).
+struct DirectChildGuard(std::process::Child);
+
+impl std::ops::Deref for DirectChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DirectChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for DirectChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 // ─── #2131: the shared LaunchFinalizeGuard, ported to crawl + generic ─────
