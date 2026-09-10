@@ -99,11 +99,20 @@ pub struct GatherOutput {
     /// [`StepScan::unreadable`]. Deliberately NOT a field on
     /// [`DeliverScope`] (`deliver_github_review.rs` is owned by another
     /// concurrent change and is not touched by this fix) — sits beside
-    /// `scope` on the envelope instead. **Follow-up owed**: wire this
-    /// into `render_github_review`'s scope-line rendering (or an
-    /// adjacent line) the next time `deliver_github_review.rs` is
-    /// touched, so an unreadable input is visible on the PR comment
-    /// itself, not only in the raw envelope.
+    /// `scope` on the envelope instead. **Follow-up STILL owed** (#1748
+    /// review CONSIDER 9): wire this into `render_github_review`'s
+    /// scope-line rendering (or an adjacent line) so an unreadable input
+    /// is visible on the PR comment itself, not only in the raw envelope.
+    /// #1748's own fix pass DID touch `deliver_github_review.rs`, but its
+    /// scope was the absence-claim backstop's containment (`code_span`
+    /// on the caveat's `token`/`file`) and the token-binding fix
+    /// ([`crate::absence_backstop::detect_absence_claim`]) — wiring this
+    /// field in is a genuinely separate change (a new
+    /// `render_github_review` parameter, touching every call site in
+    /// that module including its ~30 test callers) that deserves its own
+    /// pass rather than riding along here. Recorded explicitly, again,
+    /// so the NEXT touch of this file does not have to rediscover that
+    /// the obligation is still open.
     #[serde(default)]
     pub unreadable: Vec<String>,
     /// (#1748) The mechanical absence-claim backstop's findings — one
@@ -1429,7 +1438,7 @@ mod tests {
         // the WHOLE file the diff hunk never shows.
         let tree = tmp.path().join("checkout").join("app");
         std::fs::create_dir_all(&tree).unwrap();
-        std::fs::write(&tree.join("a.ts"), "export function foo() { return 1; }\n").unwrap();
+        std::fs::write(tree.join("a.ts"), "export function foo() { return 1; }\n").unwrap();
 
         // The plan `records.gather`'s own `plan_totals` already reads —
         // this packet reads it again for `sources[].tree`.
@@ -1505,8 +1514,10 @@ mod tests {
 
         let posted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&emit_path).unwrap()).unwrap();
         let body = posted["review"]["comments"][0]["body"].as_str().expect("one posted comment");
+        // (#1748 review MUST FIX 1) The file the caveat names goes through
+        // `code_span` too, same as the token — both are model-authored.
         assert!(
-            body.contains("A mechanical check found `foo()` elsewhere in this file, at a.ts:1"),
+            body.contains("A mechanical check found `foo()` elsewhere in this file, at `a.ts`:1"),
             "the caveat reached the posted comment: {body}"
         );
     }

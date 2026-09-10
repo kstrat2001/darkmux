@@ -44,8 +44,9 @@
 //!     aliased, destructured, produced by a macro/template expansion) — a
 //!     substring search cannot see through that.
 //!   - a token quoted as a whole clause or sentence rather than a single
-//!     identifier/call span — [`looks_like_identifier_span`] refuses to
-//!     search for those, on the theory that "searching" for a sentence as
+//!     identifier/call span — `looks_like_identifier_span` (private —
+//!     see this module's own source) refuses to search for those, on
+//!     the theory that "searching" for a sentence as
 //!     a literal substring produces noise, not signal.
 //!   - a token that genuinely IS absent from the reviewed code but
 //!     appears in a COMMENT or a STRING LITERAL discussing it
@@ -55,6 +56,25 @@
 //!     registry: it is why a contradiction only ever DEMOTES/ANNOTATES a
 //!     finding (see [`AbsenceBackstopNote`]) rather than deleting or
 //!     silently "correcting" it — a human still makes the final call.
+//!   - a token that genuinely IS absent as a CALL but appears as a
+//!     SUBSTRING of an unrelated, longer identifier or word — "does not
+//!     call `run` anywhere" false-positives against
+//!     `"// we should probably rerun this later"` (`run` is a substring
+//!     of `rerun`) just as readily as against a real call. [`MIN_TOKEN_LEN`]
+//!     bounds how SHORT a token this lint will search for; it does not
+//!     bound what surrounds a match, so a short, common identifier is
+//!     exactly the shape most exposed to this (#1748 review CONSIDER 5,
+//!     PROVEN, deliberately left unfixed rather than adding a
+//!     word-boundary notion this module's plain substring/line search
+//!     does not otherwise carry — the same FALSE-POSITIVE-only,
+//!     demote-never-delete cost as the comment/string-literal case above).
+//!   - a sentence carrying MORE THAN ONE backtick span in the direction
+//!     the phrase requires ("does not call `foo()` or `bar()`") — the
+//!     token extractor binds to the NEAREST one in that direction, which
+//!     is a heuristic, not a parse; a model that lists two candidates and
+//!     means the second one produces a miss, not a false flag (this
+//!     lint's search still runs against the FIRST one, so at worst it
+//!     is silent where a human would have caught both).
 //!
 //! A check that WALKS A REAL REGISTRY (a language server's symbol index,
 //! an AST-level call graph) could rule the false-positive case above out
@@ -147,42 +167,108 @@ pub enum AbsenceCheckOutcome {
     Confirmed { token: String },
     /// The claim named `token`, and `token` DOES appear in the whole
     /// file — outside whatever window the model was shown. The finding
-    /// should be flagged, never silently confirmed as correct.
+    /// should be flagged, never silently confirmed as correct. `line` is
+    /// `Some` in every case this module's own constructor ever produces
+    /// (`check_token_against_whole_file`'s doc, private — see this
+    /// module's own source — explains why a `token`
+    /// can never straddle a line boundary); it stays `Option` so a caller
+    /// building one by hand (a test fixture, say) is not forced to invent
+    /// a line number it doesn't have.
     Contradicted { token: String, line: Option<u32> },
 }
+
+/// Recognized absence phrases whose natural English grammar puts the
+/// absent token BEFORE the phrase — a passive construction ("`X` is
+/// never called") where the subject precedes the passive verb phrase.
+/// Every other phrase in [`ABSENCE_PHRASES`] is active voice, and active
+/// voice puts its object AFTER the verb ("does not call `X`", "does not
+/// handle `X`") — see [`detect_absence_claim`]'s own doc for why that
+/// direction is not optional.
+const BEFORE_PHRASE_TOKEN: &[&str] =
+    &["is never called", "is never invoked", "is never assigned", "is never set", "isn't handled", "isn't called", "isn't invoked"];
 
 /// Extract the claimed-absent token from a finding's own claim text.
 ///
 /// Looks for a recognized absence PHRASE (case-insensitive) anywhere in
-/// the text, and — independently — the FIRST backtick-quoted span
-/// anywhere in the text. Deliberately not scoped tightly to "immediately
-/// after the phrase": a model's prose puts the token before ("`foo()` is
-/// never called") about as often as after ("does not call `foo()`"), and
-/// a positional rule would miss half of those for no benefit. `None` when
-/// no phrase matches, when a phrase matches but the text carries no
-/// backtick-quoted span at all, or when the quoted span does not look
-/// like a single identifier/call/member-access ([`looks_like_identifier_span`]).
+/// the text, then extracts the backtick-quoted span GOVERNED by that
+/// phrase, in the direction its grammar actually puts it: after the
+/// phrase for an active-voice claim ("does not call `X`", "does not
+/// handle `X`" — `X` is the verb's OBJECT, the thing claimed absent), or
+/// before it for the passive-voice claims in `BEFORE_PHRASE_TOKEN`
+/// (private — see this module's own source)
+/// ("`X` is never called" — `X` is the verb's SUBJECT). When no span
+/// exists in the required direction, this returns `None` rather than
+/// falling back to a wrong-direction span — falling back is exactly the
+/// #1748-review MUST-FIX-4 bug this function used to have: given "`X`
+/// does not call `Y`" it took the FIRST backtick span in the whole text
+/// regardless of direction, which is `X`, the phrase's SUBJECT. `X` is a
+/// symbol in the file under review and is present BY CONSTRUCTION, so
+/// binding to it turned every correctly-phrased active-voice finding into
+/// a caveat whose justification is a non-sequitur ("a mechanical check
+/// found `X` elsewhere in this file" — of course it did, `X` is what the
+/// finding is ABOUT). Worse: an active-voice phrase with NO span after it
+/// at all ("the `fetchUser` helper does not handle the 404 case" — the
+/// real claimed-absent thing, "the 404 case", carries no backtick token)
+/// used to fall back to the only span it could find, `fetchUser`, same
+/// failure. `None` also when no phrase matches, when the direction-
+/// correct span is empty, or when it does not look like a single
+/// identifier/call/member-access (`looks_like_identifier_span`, private —
+/// see this module's own source).
 pub fn detect_absence_claim(claim: &str) -> Option<String> {
     let lower = claim.to_ascii_lowercase();
-    if !ABSENCE_PHRASES.iter().any(|p| lower.contains(p)) {
-        return None;
-    }
-    let token = extract_backtick_token(claim)?;
+    let phrase = ABSENCE_PHRASES.iter().find(|p| lower.contains(**p))?;
+    let phrase_start = lower.find(*phrase)?;
+    let phrase_end = phrase_start + phrase.len();
+    let expects_before = BEFORE_PHRASE_TOKEN.contains(phrase);
+    let token = extract_directional_token(claim, phrase_start, phrase_end, expects_before)?;
     if token.chars().count() < MIN_TOKEN_LEN || !looks_like_identifier_span(&token) {
         return None;
     }
     Some(token)
 }
 
-fn extract_backtick_token(text: &str) -> Option<String> {
-    let start = text.find('`')?;
-    let rest = &text[start + 1..];
-    let end = rest.find('`')?;
-    let token = rest[..end].trim();
-    if token.is_empty() {
+/// Every backtick-delimited span in `text`, left to right, as
+/// `(open_backtick_byte_offset, byte_offset_just_past_the_close_backtick,
+/// trimmed_content)`. An unterminated trailing backtick (an odd count)
+/// yields no span for it — there is nothing to pair it with.
+fn backtick_spans(text: &str) -> Vec<(usize, usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'`' {
+            match text[idx + 1..].find('`') {
+                Some(rel_end) => {
+                    let content_start = idx + 1;
+                    let content_end = content_start + rel_end;
+                    spans.push((idx, content_end + 1, text[content_start..content_end].trim()));
+                    idx = content_end + 1;
+                }
+                None => break,
+            }
+        } else {
+            idx += 1;
+        }
+    }
+    spans
+}
+
+/// The backtick span nearest `[phrase_start, phrase_end)` in the required
+/// direction: the LAST span ending at or before `phrase_start` when
+/// `expects_before`, or the FIRST span starting at or after `phrase_end`
+/// otherwise. `None` when no span exists in that direction, or the
+/// nearest one is empty after trimming.
+fn extract_directional_token(claim: &str, phrase_start: usize, phrase_end: usize, expects_before: bool) -> Option<String> {
+    let spans = backtick_spans(claim);
+    let content = if expects_before {
+        spans.into_iter().rfind(|(_, end, _)| *end <= phrase_start).map(|(_, _, c)| c)
+    } else {
+        spans.into_iter().find(|(start, _, _)| *start >= phrase_end).map(|(_, _, c)| c)
+    }?;
+    if content.is_empty() {
         None
     } else {
-        Some(token.to_string())
+        Some(content.to_string())
     }
 }
 
@@ -207,35 +293,129 @@ pub fn check_absence_claim(claim_text: &str, whole_file: &str) -> AbsenceCheckOu
     let Some(token) = detect_absence_claim(claim_text) else {
         return AbsenceCheckOutcome::Inconclusive;
     };
-    if let Some(line) = find_line(whole_file, &token) {
-        return AbsenceCheckOutcome::Contradicted { token, line: Some(line) };
+    check_token_against_whole_file(token, whole_file)
+}
+
+/// The second half of [`check_absence_claim`], split out so
+/// [`check_absence_claim_against_file`] can detect the claim BEFORE
+/// touching disk and hand the already-extracted token straight in,
+/// without re-running the phrase/token extraction a second time.
+///
+/// (review CONSIDER 6) `find_line` alone is the whole check, and that is
+/// not an approximation: [`looks_like_identifier_span`] refuses any
+/// token containing `\n`, so a `token` that appears ANYWHERE in
+/// `whole_file` necessarily appears within the span of some single line
+/// `.lines()` produces — it cannot straddle a line boundary without
+/// containing the newline that boundary is made of. A second
+/// `whole_file.contains(&token)` fallback here (once present, to catch a
+/// "wrap" this reasoning shows can't occur) was therefore dead code that
+/// could never run, and its only two tests never actually reached it —
+/// removed along with `AbsenceCheckOutcome::Contradicted`'s now-unused
+/// `line: None` construction site.
+fn check_token_against_whole_file(token: String, whole_file: &str) -> AbsenceCheckOutcome {
+    match find_line(whole_file, &token) {
+        Some(line) => AbsenceCheckOutcome::Contradicted { token, line: Some(line) },
+        None => AbsenceCheckOutcome::Confirmed { token },
     }
-    // The token spans a wrap (present in the file but split across two
-    // lines by `.lines()`) — still a real contradiction, just without a
-    // precise line to cite.
-    if whole_file.contains(&token) {
-        return AbsenceCheckOutcome::Contradicted { token, line: None };
-    }
-    AbsenceCheckOutcome::Confirmed { token }
 }
 
 fn find_line(whole_file: &str, token: &str) -> Option<u32> {
     whole_file.lines().enumerate().find(|(_, line)| line.contains(token)).map(|(idx, _)| idx as u32 + 1)
 }
 
+/// Upper bound on how much of a candidate file this lint will read.
+///
+/// `file` is a MODEL-authored, unvalidated string
+/// ([`run_backstop`]'s own doc) — on a public-PR review it is exactly as
+/// attacker-influenced as any other finding field. Before this bound
+/// existed, a `file` naming a device node (`/dev/zero`) made
+/// [`read_bounded`]'s predecessor (a bare `std::fs::read_to_string`) read
+/// forever, growing memory without limit and wedging the host process
+/// this check runs on (never a container — see this module's own doc on
+/// what it is). 4 MiB comfortably covers any real source file a review
+/// would ever check; a candidate this large is itself a signal the lint
+/// should abstain on, not a limit worth raising.
+const MAX_FILE_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Resolve `file` against `tree_root`, refusing to leave the tree.
+///
+/// `file` is model-authored and unvalidated — `findings.rs` maps only a
+/// `/workspace/<source>/` or `<source>/` prefix and otherwise leaves it
+/// exactly as the model wrote it. Two failure shapes this closes:
+///
+/// - **An absolute `file` used to escape the tree entirely.**
+///   `Path::join` with an absolute right-hand side discards the base
+///   path, so `tree_root.join("/etc/passwd")` was `/etc/passwd`, not
+///   `tree_root/etc/passwd`. `file` is rejected outright when it is
+///   absolute, or carries a `..` component (`"../../outside.env"`),
+///   before any join happens.
+/// - **A relative path escaping via a symlink inside the tree.** The
+///   join is canonicalized and the result is required to still sit under
+///   `tree_root`'s own canonical form — a `..`-free relative path can
+///   still walk out through a symlink, and string-level checks alone
+///   cannot see that.
+///
+/// Returns `None` on any rejection, or on any canonicalization failure
+/// (a nonexistent path, most commonly) — both read identically to the
+/// caller as "cannot evaluate this finding mechanically", the same
+/// abstention contract every other failure mode in this module already
+/// has.
+fn resolve_within_tree(tree_root: &Path, file: &str) -> Option<PathBuf> {
+    let rel = Path::new(file);
+    if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return None;
+    }
+    let canon_root = tree_root.canonicalize().ok()?;
+    let canon_joined = tree_root.join(rel).canonicalize().ok()?;
+    if canon_joined.starts_with(&canon_root) {
+        Some(canon_joined)
+    } else {
+        None
+    }
+}
+
+/// Read at most [`MAX_FILE_READ_BYTES`] of `path` as UTF-8.
+///
+/// `None` on any I/O failure OR when the byte cap lands mid-codepoint (a
+/// truncated multi-byte UTF-8 sequence at the boundary) — both collapse to
+/// the same "abstain" outcome the caller already applies to every other
+/// unreadable-file case, never an error.
+fn read_bounded(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = String::new();
+    file.take(MAX_FILE_READ_BYTES).read_to_string(&mut buf).ok()?;
+    Some(buf)
+}
+
 /// [`check_absence_claim`], reading the whole file itself.
 ///
+/// **Detects before it reads.** `detect_absence_claim` runs FIRST, on
+/// `claim_text` alone (no disk access) — a finding whose `why` carries no
+/// recognized absence phrasing never touches the filesystem at all, which
+/// both saves the read for the common case and caps the blast radius of
+/// `resolve_within_tree`/`read_bounded` (both private — see this
+/// module's own source) to findings that could actually be flagged.
+///
 /// Returns [`AbsenceCheckOutcome::Inconclusive`] — never an error — when
-/// the file cannot be read (moved, deleted, outside the tree, not valid
-/// UTF-8): the caller's rule is to leave a finding untouched on any
-/// outcome that isn't `Contradicted`, so an unreadable file behaves
-/// exactly like "no claim detected" from the caller's point of view. This
-/// is the ONE place this module touches disk.
+/// no claim is detected, when `file` cannot be resolved inside
+/// `tree_root` (`resolve_within_tree`), or when the file cannot be read
+/// (moved, deleted, not valid UTF-8, too large — `read_bounded`): the
+/// caller's rule is to leave a finding untouched on any outcome that
+/// isn't `Contradicted`, so every one of these behaves exactly like "no
+/// claim detected" from the caller's point of view. This is the ONE place
+/// this module touches disk.
 pub fn check_absence_claim_against_file(claim_text: &str, tree_root: &Path, file: &str) -> AbsenceCheckOutcome {
-    let Ok(whole_file) = std::fs::read_to_string(tree_root.join(file)) else {
+    let Some(token) = detect_absence_claim(claim_text) else {
         return AbsenceCheckOutcome::Inconclusive;
     };
-    check_absence_claim(claim_text, &whole_file)
+    let Some(path) = resolve_within_tree(tree_root, file) else {
+        return AbsenceCheckOutcome::Inconclusive;
+    };
+    let Some(whole_file) = read_bounded(&path) else {
+        return AbsenceCheckOutcome::Inconclusive;
+    };
+    check_token_against_whole_file(token, &whole_file)
 }
 
 /// The mechanical backstop's per-finding outcome — present only for a
@@ -302,6 +482,15 @@ pub fn run_backstop(mission_id: &str, findings: &[FindingRecord]) -> BTreeMap<St
     let mut notes = BTreeMap::new();
     for finding in findings {
         let Some(claim) = finding.emitted.get("why").and_then(|v| v.as_str()) else { continue };
+        // Detect before resolving anything — a finding with no absence
+        // claim at all never pays for a plan-JSON read or a source-tree
+        // resolution. `check_absence_claim_against_file` re-detects (it
+        // has no way to receive an already-extracted token across this
+        // boundary without a bigger signature change), which is a second
+        // cheap string scan, not a second disk read.
+        if detect_absence_claim(claim).is_none() {
+            continue;
+        }
         let Some(rule) = rule_id_of(finding) else { continue };
         let Some(source_id) = finding.source.as_deref() else { continue };
         let Some(file) = finding.emitted.get("file").and_then(|v| v.as_str()) else { continue };
@@ -357,6 +546,43 @@ mod tests {
         assert_eq!(detect_absence_claim("There is no `.` in this file."), None);
     }
 
+    // ── RED-PROVE, review MUST FIX 4: binds to the phrase's OBJECT, ────
+    // never its SUBJECT. Both examples are the reviewer's own — the
+    // failure mode was `detect_absence_claim` taking the FIRST backtick
+    // span in the whole text, which for "X does not call Y" is X, the
+    // subject: a symbol in the file under review, present BY
+    // CONSTRUCTION, so binding to it produced a caveat whose
+    // justification is a non-sequitur on every correctly-phrased finding
+    // of this shape.
+
+    #[test]
+    fn binds_to_the_span_after_an_active_voice_phrase_not_the_subject_before_it() {
+        let claim = "`handleRequest` does not call `cleanup()` before returning.";
+        assert_eq!(detect_absence_claim(claim), Some("cleanup()".to_string()));
+    }
+
+    #[test]
+    fn abstains_when_the_only_backtick_span_is_the_subject_not_the_object() {
+        // The claimed-absent thing ("the 404 case") carries no backtick
+        // token at all — the only span in the text, `fetchUser`, is the
+        // SUBJECT of "does not handle", not its object. Binding to it
+        // (the pre-fix behavior) would flag every correct finding of this
+        // shape with an irrelevant fact.
+        let claim = "The `fetchUser` helper does not handle the 404 case.";
+        assert_eq!(detect_absence_claim(claim), None);
+    }
+
+    #[test]
+    fn a_genuine_active_voice_absence_claim_still_contradicts_end_to_end() {
+        // The property the fix above must not regress: a real,
+        // correctly-directional single-span claim whose object token
+        // actually exists elsewhere in the file must still contradict.
+        let claim = "`handleRequest` does not call `cleanup()` before returning.";
+        let whole_file = "function handleRequest() {}\nfunction cleanup() { teardown(); }\n";
+        let outcome = check_absence_claim(claim, whole_file);
+        assert_eq!(outcome, AbsenceCheckOutcome::Contradicted { token: "cleanup()".to_string(), line: Some(2) });
+    }
+
     // ── RED-PROVE, direction (a): a genuinely-present claim gets caught ─
     // ("a finding claiming absence of something that DOES exist elsewhere
     // in the file gets demoted/flagged")
@@ -389,31 +615,35 @@ mod tests {
         assert_eq!(outcome, AbsenceCheckOutcome::Confirmed { token: "bar()".to_string() });
     }
 
+    /// (review CONSIDER 6) A token genuinely SPLIT by a line wrap — here,
+    /// a string concatenation puts half the identifier on each of two
+    /// lines — is not a contiguous substring of `whole_file` at all,
+    /// wrap or no wrap: `check_token_against_whole_file`'s doc explains
+    /// why `Contradicted { line: None }` cannot be reached by this
+    /// module's own constructor. This is the CONFIRMED path (the token
+    /// genuinely does not appear), not a wrap-hit — a prior version of
+    /// this test claimed the opposite in its name; renamed to match what
+    /// it actually asserts.
     #[test]
-    fn a_token_spanning_a_line_wrap_still_contradicts_with_no_line_cited() {
+    fn a_token_split_across_a_string_concatenation_is_genuinely_absent_and_confirms() {
         let claim = "There is no `longToken` anywhere in this file.";
-        // The token is present but split across a wrap, so `.lines()`
-        // never sees it whole on any one line.
         let whole_file = "const x = \"long\" +\n  \"Token\";\n";
-        // Not actually present as a contiguous substring either (split by
-        // the concatenation), so this proves the CONFIRMED path, not a
-        // wrap-hit — see the next test for an actual wrap hit.
         assert_eq!(check_absence_claim(claim, whole_file), AbsenceCheckOutcome::Confirmed { token: "longToken".to_string() });
     }
 
+    /// (review CONSIDER 6) A token repeated within one physical line, and
+    /// again later in the same line — `find_line`'s per-line `.contains`
+    /// finds it on the FIRST line it ever appears on, citing that line
+    /// number; there is no "wrap" case to reach here (a prior version of
+    /// this test's comment claimed one, incorrectly — a token can never
+    /// contain `\n`, so it can never straddle a line boundary; see
+    /// `check_token_against_whole_file`'s doc).
     #[test]
-    fn a_token_present_but_not_isolated_on_one_line_still_contradicts() {
+    fn a_token_repeated_on_one_line_contradicts_and_cites_that_line() {
         let claim = "There is no `shared_helper` anywhere in this file.";
-        // A whole_file whose newline placement puts the token across what
-        // `find_line` treats as two neighboring lines' worth of raw text
-        // is unusual for real source, but `.contains()` on the whole
-        // string still finds it — proving `line: None` is reachable.
-        let whole_file = "one line with shared_helper embedded, all on one physical line but repeated to keep this test honest: shared_helper";
+        let whole_file = "one line with shared_helper embedded, repeated on the same line: shared_helper";
         let outcome = check_absence_claim(claim, whole_file);
-        match outcome {
-            AbsenceCheckOutcome::Contradicted { token, .. } => assert_eq!(token, "shared_helper"),
-            other => panic!("expected Contradicted, got {other:?}"),
-        }
+        assert_eq!(outcome, AbsenceCheckOutcome::Contradicted { token: "shared_helper".to_string(), line: Some(1) });
     }
 
     // ── Abstention (the "surfaced, not swallowed" requirement) ─────────
@@ -443,6 +673,85 @@ mod tests {
         let outcome =
             check_absence_claim_against_file("This does not call `foo()` anywhere.", tmp.path(), "a.ts");
         assert_eq!(outcome, AbsenceCheckOutcome::Contradicted { token: "foo()".to_string(), line: Some(1) });
+    }
+
+    // ── check_absence_claim_against_file: path containment (RED-PROVE, review MUST FIX 3) ──
+    //
+    // `file` is model-authored and unvalidated. Before `resolve_within_tree`
+    // existed, `tree_root.join(file)` let an absolute `file` (or a `..`
+    // relative one) escape the checked-out tree entirely and read whatever
+    // it named — flipping "reject and abstain" (Inconclusive) into "read
+    // and contradict" (Contradicted) for a file that was never inside the
+    // reviewed source at all.
+
+    #[test]
+    fn an_absolute_file_cannot_escape_the_tree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tree = tmp.path().join("checkout");
+        std::fs::create_dir_all(&tree).unwrap();
+        // A file OUTSIDE the tree, containing the very token the claim
+        // says is absent — proof positive this is escape-and-read, not a
+        // coincidental miss.
+        let outside = tmp.path().join("outside.env");
+        std::fs::write(&outside, "export function foo() { return 1; }\n").unwrap();
+
+        let outcome = check_absence_claim_against_file(
+            "This does not call `foo()` anywhere.",
+            &tree,
+            outside.to_str().unwrap(),
+        );
+        assert_eq!(
+            outcome,
+            AbsenceCheckOutcome::Inconclusive,
+            "an absolute `file` must be rejected before any read, never joined-and-escaped"
+        );
+    }
+
+    #[test]
+    fn a_parent_dir_relative_file_cannot_escape_the_tree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tree = tmp.path().join("checkout").join("app");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tmp.path().join("outside.env"), "export function foo() { return 1; }\n").unwrap();
+
+        let outcome =
+            check_absence_claim_against_file("This does not call `foo()` anywhere.", &tree, "../../outside.env");
+        assert_eq!(
+            outcome,
+            AbsenceCheckOutcome::Inconclusive,
+            "a `..`-bearing `file` must be rejected before any read, never joined-and-escaped"
+        );
+    }
+
+    #[test]
+    fn reading_a_device_file_is_bounded_not_blocking() {
+        // (review MUST FIX 3) Reproduces the reviewer's exact case:
+        // `/dev/zero` never reaches EOF, so an unbounded read grows memory
+        // and blocks forever. This test bounds ITSELF with a background
+        // thread + a generous-but-finite wait, so a regression here fails
+        // fast instead of wedging the suite the way the unbounded read
+        // wedged the host process.
+        if !std::path::Path::new("/dev/zero").exists() {
+            return; // POSIX device node; nothing to prove on a platform without it.
+        }
+        let handle = std::thread::spawn(|| {
+            check_absence_claim_against_file("This does not call `foo()` anywhere.", Path::new("/dev"), "zero")
+        });
+        for _ in 0..50 {
+            if handle.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            handle.is_finished(),
+            "reading a device file must be bounded by MAX_FILE_READ_BYTES, not block indefinitely"
+        );
+        // The read completed within the bound; the specific verdict
+        // doesn't matter here (NUL bytes are valid UTF-8, so this likely
+        // reads MAX_FILE_READ_BYTES of them and lands on Confirmed) — the
+        // property under test is boundedness, not this outcome.
+        let _ = handle.join().unwrap();
     }
 
     // ── resolve_source_tree + run_backstop: the pipeline-wiring seam ───

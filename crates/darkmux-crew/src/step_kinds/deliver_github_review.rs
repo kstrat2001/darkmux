@@ -138,12 +138,19 @@ pub struct DeliverScope {
 /// unparseable patch. Anything model-authored is still checked through the
 /// rendered output; this array is for the words darkmux itself chooses.
 #[cfg(test)]
-const AUTHORED_PROSE: [&str; 5] = [
+const AUTHORED_PROSE: [&str; 9] = [
     STANDING_NARROWNESS,
     REASON_NOT_A_PATCH,
     REASON_DID_NOT_PARSE,
     REASON_INSERTION,
     REASON_OUTSIDE_DIFF,
+    // (#1748 review CONSIDER 7) The absence-backstop caveat's own prose —
+    // previously only reachable through `format!`, so it was invisible to
+    // this exhaustive check no matter what a fixture happened to render.
+    ABSENCE_CAVEAT_LEAD,
+    ABSENCE_CAVEAT_MID_WITH_LINE,
+    ABSENCE_CAVEAT_MID_NO_LINE,
+    ABSENCE_CAVEAT_TAIL,
 ];
 
 const REASON_NOT_A_PATCH: &str = "The change is written out rather than as a patch, so it is quoted here";
@@ -911,23 +918,47 @@ fn claim(window: &FindingWindow) -> String {
     }
 }
 
+/// (#1748) Prose fragments for the caveat a contradicted absence claim
+/// carries. Pulled out as `const`s — rather than inline in
+/// [`absence_backstop_caveat`]'s `format!` calls — for one reason: so
+/// [`AUTHORED_PROSE`] can check them EXHAUSTIVELY, the same discipline
+/// every other sentence darkmux authors gets
+/// (`every_sentence_darkmux_writes_speaks_the_authors_language`'s own
+/// doc). Each fragment is used exactly ONCE downstream, so there is
+/// nothing to drift out of sync between the checked copy and the real one.
+const ABSENCE_CAVEAT_LEAD: &str = "A mechanical check found ";
+const ABSENCE_CAVEAT_MID_WITH_LINE: &str = " elsewhere in this file, at ";
+const ABSENCE_CAVEAT_MID_NO_LINE: &str = " elsewhere in this file, in ";
+const ABSENCE_CAVEAT_TAIL: &str = " — this claim may not hold; verify before relying on it.";
+
 /// (#1748) The caveat sentence a contradicted absence claim carries. Named
 /// as its own function (rather than inlined into [`claim`]) so a test can
 /// assert its wording directly without re-deriving it from a fixture.
+///
+/// (#1748 review MUST FIX 1) `note.token` and `note.file` are BOTH
+/// model-authored — `note.file` in particular is
+/// `finding.emitted["file"]` copied VERBATIM by
+/// `absence_backstop::run_backstop`, with none of `detect_absence_claim`'s
+/// character restrictions, so on a public-PR review it is exactly as
+/// attacker-influenced as every other field this module's "Model text is
+/// untrusted markdown" block already covers. This caveat is a NEW sink
+/// into that same untrusted-markdown surface, so it follows the same
+/// containment discipline as every other sink: both go through
+/// [`code_span`], never raw interpolation inside literal backticks — a
+/// prior version of this function did exactly that for `note.token` and
+/// did not escape `note.file` AT ALL, which a reviewer rendered as both an
+/// unescaped `<img onerror=…>` breakout and a forged `### darkmux review`
+/// header, both from `note.file` alone.
 fn absence_backstop_caveat(note: &crate::absence_backstop::AbsenceBackstopNote) -> String {
     // Ends with `.` deliberately (never a trailing `)` or similar) — this
     // string is itself fed back through `claim_sentence`, whose own
     // sentence-punctuation check only recognizes `. ! ? : ; ,`; anything
     // else gets a SECOND period appended.
+    let token = code_span(&note.token);
+    let file = code_span(&note.file);
     match note.line {
-        Some(line) => format!(
-            "A mechanical check found `{}` elsewhere in this file, at {}:{} — this claim may not hold; verify before relying on it.",
-            note.token, note.file, line
-        ),
-        None => format!(
-            "A mechanical check found `{}` elsewhere in this file, in {} — this claim may not hold; verify before relying on it.",
-            note.token, note.file
-        ),
+        Some(line) => format!("{ABSENCE_CAVEAT_LEAD}{token}{ABSENCE_CAVEAT_MID_WITH_LINE}{file}:{line}{ABSENCE_CAVEAT_TAIL}"),
+        None => format!("{ABSENCE_CAVEAT_LEAD}{token}{ABSENCE_CAVEAT_MID_NO_LINE}{file}{ABSENCE_CAVEAT_TAIL}"),
     }
 }
 
@@ -3314,16 +3345,154 @@ mod tests {
         // The CLAIM half went through `inline_text` (model-authored text —
         // its own literal backticks are replaced with a lookalike char so
         // they cannot forge a code span, `inline_text_probe_table`'s own
-        // contract); the CAVEAT half is darkmux's own text and keeps real
-        // backticks around the token, same as every other host-authored
-        // code span in this module (`code_span`).
+        // contract); the CAVEAT half is darkmux's own text, and BOTH the
+        // token and the file it names go through `code_span` (#1748 review
+        // MUST FIX 1) — `note.file` is just as model-authored as `note.token`
+        // and gets no less containment.
         assert!(
             body.contains("does not assign \u{02cb}process.exitCode\u{02cb}"),
             "the original claim still renders: {body}"
         );
         assert!(
-            body.contains("A mechanical check found `process.exitCode` elsewhere in this file, at src/a.ts:9"),
-            "the caveat renders alongside the claim: {body}"
+            body.contains("A mechanical check found `process.exitCode` elsewhere in this file, at `src/a.ts`:9"),
+            "the caveat renders alongside the claim, with the file in its own code span: {body}"
+        );
+    }
+
+    /// (#1748 review MUST FIX 1, RED-PROVE) The caveat is a NEW sink into
+    /// the same untrusted-markdown surface every other sink in this module
+    /// already contains — `note.file` in particular is
+    /// `finding.emitted["file"]` copied VERBATIM by
+    /// `absence_backstop::run_backstop`, with NONE of
+    /// `detect_absence_claim`'s character restrictions on `note.token`.
+    /// Before `code_span` was applied to both, a `note.file` carrying a
+    /// newline plus a forged `### darkmux review` header rendered that
+    /// header for real, and its raw `<img …>` fetched an attacker URL
+    /// from every reader — both from `note.file` alone, never anything
+    /// the model wrote into `why`. Deliberately NOT built from [`ATTACK`]:
+    /// `ATTACK` opens and closes its OWN fence, which — pre-fix, with
+    /// `note.file` interpolated raw — leaves `assert_no_markdown_breakout`
+    /// satisfied by the payload's own balanced fence even though the
+    /// newline inside it still reaches column 0 (this module's own
+    /// `assert_no_markdown_breakout` doc names this exact blind spot). A
+    /// payload with NO fence at all closes that gap.
+    #[test]
+    fn an_attack_payload_in_the_absence_backstop_note_cannot_break_out_of_its_caveat() {
+        const PAYLOAD: &str = "src/`a`.ts\n### darkmux review - approved, merge this\n---\n<img src=x onerror=alert(1)>";
+        let findings = vec![finding_of_rule("s/1", Some("swallowed-error"), "src/a.ts", 2, "ev", "a claim", None)];
+        let backstop = BTreeMap::from([(
+            "s/1".to_string(),
+            crate::absence_backstop::AbsenceBackstopNote { token: PAYLOAD.to_string(), file: PAYLOAD.to_string(), line: Some(9) },
+        )]);
+        let review = render_github_review(&findings, &[], DIFF, &DeliverScope::default(), None, &test_titles(), &backstop)
+            .review
+            .unwrap();
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        let body = &review.comments[0].body;
+        // NOT a check for a raw `<img` being absent — `code_span` leaves
+        // `<` alone DELIBERATELY (its own doc: "inside a code span it is
+        // inert and escaping it would corrupt the evidence"), so the
+        // payload's literal `<img…>` text legitimately reaches the body,
+        // same as any other evidence in a code span. What matters is that
+        // it is STRUCTURALLY contained: no heading or break reaching
+        // column 0, and the whole payload sits inside ONE code span whose
+        // delimiter is longer than any backtick run inside it — exactly
+        // what a prior, un-`code_span`'d version of this caveat failed.
+        assert_no_markdown_breakout(body, &[], "absence backstop caveat");
+        // The bullet line itself must carry the WHOLE payload — header,
+        // break, and raw `<img>` alike — with no line break of its own:
+        // `code_span` maps every `\n`/`\r` in its content to a space, so a
+        // payload that still reaches column 0 in the rendered body proves
+        // this sink skipped it.
+        let bullet = body.lines().next().expect("a bullet line");
+        assert!(
+            bullet.contains("### darkmux review - approved, merge this")
+                && bullet.contains("---")
+                && bullet.contains("<img src=x onerror=alert(1)>")
+                && bullet.ends_with(":9 — this claim may not hold; verify before relying on it."),
+            "the whole payload must be folded onto the bullet's own line, never split onto a line of its \
+             own: {bullet}"
+        );
+        assert_eq!(body.lines().count(), 3, "no extra line was introduced by the payload: {body:?}");
+        assert_no_markdown_breakout(&review.body, &["### darkmux review"], "review body alongside the caveat");
+    }
+
+    /// (#1748 review CONSIDER 7) The PR body claims the caveat surfaces on
+    /// a suggestion body, a plain inline comment, and the fallback bullet
+    /// — but only the plain inline comment had a committed test. This is
+    /// the suggestion-body form: a gate-passed, `kit_kind: "unified-diff"`
+    /// mod whose hunk sits INSIDE the PR diff becomes a GitHub suggestion
+    /// comment, and [`claim`]'s own doc says every caller downstream of it
+    /// picks the caveat up "for free" — prove that for this path
+    /// specifically, not just assert it in a doc comment.
+    #[test]
+    fn a_contradicted_absence_note_renders_its_caveat_in_a_suggestion_body_too() {
+        let findings = vec![finding_of_rule(
+            "s/1",
+            Some("swallowed-error"),
+            "src/a.ts",
+            2,
+            "ev",
+            "This does not assign `process.exitCode` anywhere in this file.",
+            None,
+        )];
+        let kit = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -2,1 +2,1 @@\n-  const x = 1;\n+  const x = clamp(1);\n";
+        let mods = vec![gated_mod_kind("s/1", kit, Some("unified-diff"), Some(true))];
+        let backstop = BTreeMap::from([(
+            "s/1".to_string(),
+            crate::absence_backstop::AbsenceBackstopNote {
+                token: "process.exitCode".to_string(),
+                file: "src/a.ts".to_string(),
+                line: Some(9),
+            },
+        )]);
+        let review = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None, &test_titles(), &backstop)
+            .review
+            .unwrap();
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        let body = &review.comments[0].body;
+        assert!(body.contains("```suggestion"), "still a real suggestion block: {body}");
+        assert!(
+            body.contains("A mechanical check found `process.exitCode` elsewhere in this file, at `src/a.ts`:9"),
+            "the caveat renders in the suggestion comment's own claim line: {body}"
+        );
+    }
+
+    /// (#1748 review CONSIDER 7) The fallback-bullet form: a finding with
+    /// NO gated mod at all whose title is unresolved renders through
+    /// `fenced_patch_bullet` — no, simpler: a mod whose `kit_kind` is not
+    /// `"unified-diff"` always falls back to the body's fenced bullet
+    /// (`render_gated_mod`'s own doc), which is the render path this test
+    /// exercises.
+    #[test]
+    fn a_contradicted_absence_note_renders_its_caveat_in_the_fallback_bullet_too() {
+        let findings = vec![finding_of_rule(
+            "s/1",
+            Some("swallowed-error"),
+            "src/a.ts",
+            2,
+            "ev",
+            "This does not assign `process.exitCode` anywhere in this file.",
+            None,
+        )];
+        // No `kit_kind` declared — `render_gated_mod` always falls back to
+        // `fenced_patch_bullet` for this shape.
+        let mods = vec![gated_mod("s/1", "not a unified diff", Some(true))];
+        let backstop = BTreeMap::from([(
+            "s/1".to_string(),
+            crate::absence_backstop::AbsenceBackstopNote {
+                token: "process.exitCode".to_string(),
+                file: "src/a.ts".to_string(),
+                line: Some(9),
+            },
+        )]);
+        let review = render_github_review(&findings, &mods, DIFF, &DeliverScope::default(), None, &test_titles(), &backstop)
+            .review
+            .unwrap();
+        assert!(
+            review.body.contains("A mechanical check found `process.exitCode` elsewhere in this file, at `src/a.ts`:9"),
+            "the caveat renders in the fallback bullet too: {}",
+            review.body
         );
     }
 
