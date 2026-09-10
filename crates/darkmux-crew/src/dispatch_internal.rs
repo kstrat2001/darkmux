@@ -10474,7 +10474,12 @@ fn probe_loaded_model_list() -> Result<Vec<String>> {
     // longer exists, and spawning any child from it fails outright.
     // `darkmux_profiles::lms::pin_cwd` is the one place this rule is
     // written; see its doc comment for why `/`.
-    let mut cmd = Command::new("lms");
+    //
+    // (#1939 sibling) Resolved through `darkmux_types::config_access::lms_bin()`
+    // — the one `env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"` precedence
+    // home — rather than a literal, so an operator's override is honored on
+    // this dispatch-path probe the same as everywhere else.
+    let mut cmd = Command::new(darkmux_types::config_access::lms_bin());
     darkmux_profiles::lms::pin_cwd(&mut cmd);
     let output = cmd
         .args(["ps", "--json"])

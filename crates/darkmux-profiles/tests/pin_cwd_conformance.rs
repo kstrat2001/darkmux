@@ -23,15 +23,18 @@
 //! **What this is: a lint, not an enumeration.** Rather than a
 //! hand-maintained roster of today's known sites (which a fifth spawn
 //! simply wouldn't be added to), this walks every `.rs` file under the
-//! three crates' `src/` trees and finds every line matching one of the two
+//! three crates' `src/` trees and finds every line matching one of the
 //! literal shapes this codebase actually spawns `lms` with —
-//! `Command::new("lms")` and `Command::new(lms_bin())` — the same two the
-//! grep behind #2534 found. For each match, it asserts the ENCLOSING
-//! function calls `pin_cwd(` (directly) or `run_bounded(` (transitively —
-//! `run_bounded`'s own pin is checked separately, below). A new `lms` spawn
-//! anywhere in these three crates, written the way every `lms` spawn in
-//! this codebase already is, is caught by this scan without anyone adding
-//! a row for it.
+//! `Command::new("lms")`, `Command::new(lms_bin())`, and
+//! `Command::new(darkmux_types::config_access::lms_bin())` (the last added
+//! by #1939, which resolved `dispatch_internal.rs` and `scores.rs` off the
+//! fully-qualified accessor call rather than the crate-local `lms_bin()`
+//! wrapper the other two use) — the shapes the greps behind #2534 and #1939
+//! found. For each match, it asserts the ENCLOSING function calls
+//! `pin_cwd(` (directly) or `run_bounded(` (transitively — `run_bounded`'s
+//! own pin is checked separately, below). A new `lms` spawn anywhere in
+//! these three crates, written the way every `lms` spawn in this codebase
+//! already is, is caught by this scan without anyone adding a row for it.
 //!
 //! That is the whole of the claim, and it is deliberately modest: this is
 //! **best-effort**. It catches the shapes this codebase currently writes,
@@ -78,9 +81,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// The two literal shapes this codebase spawns `lms` with (verified by
-/// grep against #2534's filed sites — see the module doc).
-const LMS_SPAWN_PATTERNS: &[&str] = &["Command::new(\"lms\")", "Command::new(lms_bin())"];
+/// The literal shapes this codebase spawns `lms` with (verified by grep
+/// against #2534's and #1939's filed sites — see the module doc).
+const LMS_SPAWN_PATTERNS: &[&str] = &[
+    "Command::new(\"lms\")",
+    "Command::new(lms_bin())",
+    "Command::new(darkmux_types::config_access::lms_bin())",
+];
 
 /// The call every `lms` spawn owes, one way or another.
 const PIN_CALL: &str = "pin_cwd(";
@@ -315,7 +322,12 @@ fn every_lms_spawn_in_the_swept_crates_pins_its_cwd() {
 /// testing anything, worse than no probe. Assert the scan actually SEES
 /// the sites #2534 was filed against (at least 7 matches: 5 in `lms.rs`,
 /// 1 in `dispatch_internal.rs`, 1 in `scores.rs`, per the grep behind this
-/// fix).
+/// fix). #1939 later rewrote the `dispatch_internal.rs` and `scores.rs`
+/// sites to resolve through the fully-qualified
+/// `darkmux_types::config_access::lms_bin()` rather than the crate-local
+/// `lms_bin()` wrapper — a third literal shape was added to
+/// `LMS_SPAWN_PATTERNS` above to keep seeing them; the expected total stays
+/// 7, only the matched literal text for two of the sites changed.
 #[test]
 fn the_scan_actually_finds_the_known_sites() {
     let total: usize = sweep_roots().iter().map(|r| all_lms_spawn_matches(r).len()).sum();
