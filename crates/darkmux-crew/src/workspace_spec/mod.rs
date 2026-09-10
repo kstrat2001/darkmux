@@ -95,6 +95,60 @@ impl SourceSpec {
     }
 }
 
+/// True iff `s` carries a URL scheme (`scheme://...`) that marks it as a
+/// REMOTE address rather than a filesystem path. Deliberately permissive
+/// about which scheme — this only needs to distinguish "this is a URL"
+/// from "this is a path", not validate which schemes `git` itself accepts
+/// for a given transport.
+fn has_url_scheme(s: &str) -> bool {
+    match s.find("://") {
+        Some(idx) if idx > 0 => {
+            s[..idx].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+        }
+        _ => false,
+    }
+}
+
+/// True iff `s` is git's scp-like remote shorthand (`[user@]host:path`,
+/// the same syntax `git@github.com:org/repo.git` uses) rather than a
+/// local filesystem path that merely happens to contain a colon.
+/// Requires an `@` or a `.` before the first colon so an ordinary
+/// relative path never matches by accident — this crate's own path
+/// handling is POSIX-only throughout (see this module's `Path`/`PathBuf`
+/// usage), so a Windows drive-letter collision (`C:\...`) isn't a case
+/// this needs to guard against.
+fn has_scp_like_host(s: &str) -> bool {
+    let Some(colon) = s.find(':') else { return false };
+    if s[colon..].starts_with("://") {
+        return false; // already a URL — `has_url_scheme` owns that case
+    }
+    let host = &s[..colon];
+    !host.is_empty() && (host.contains('@') || host.contains('.'))
+}
+
+/// True iff `origin` (a source's `git` OR `path` field value) is a
+/// filesystem path that would resolve against darkmux's own AMBIENT
+/// working directory if handed to `git`/a shell verbatim — i.e. it names
+/// neither a URL nor git's scp-like remote shorthand, and is not already
+/// an absolute path.
+///
+/// (#2612 review MUST-FIX 1) The check this predicate backs used to live
+/// on the `path` FIELD alone — but the value actually handed to `git
+/// clone` is [`SourceSpec::origin`], which PREFERS `git` over `path`, and
+/// a `git:` value is only a remote URL by convention, never by type: the
+/// same field also accepts a bare local filesystem path (`git clone
+/// ../sibling-repo` works from the right directory, which is exactly how
+/// an operator ends up writing one). Refusing/absolutizing only `path`
+/// left a relative `git:` origin reaching the same unguarded `git clone`
+/// call with no directory set — the identical #2577 hazard, one field
+/// over. See `materialize::resolve_one`'s doc for the refusal and
+/// [`WorkspaceSpec::load`]'s doc for the absolutization, both of which
+/// now apply this predicate to EITHER field rather than special-casing
+/// `path`.
+pub(crate) fn origin_is_relative_local(origin: &str) -> bool {
+    !has_url_scheme(origin) && !has_scp_like_host(origin) && !Path::new(origin).is_absolute()
+}
+
 /// A dependency edge the workspace declares: `consumer` imports `package`
 /// from `library`, both named sources in the same spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,11 +240,11 @@ impl WorkspaceSpec {
                 .to_string();
             spec.name = Some(stem);
         }
-        // (#2577 review) A `path`-origin source's clone origin is used
-        // VERBATIM by `materialize` (`workspace_spec::materialize::
-        // resolve_one`, which now REFUSES a relative one outright — see
-        // that function's own doc for why). Absolutize a relative
-        // `path:` here, against the spec FILE's own directory — a named,
+        // (#2577 review) A source's clone origin is used VERBATIM by
+        // `materialize` (`workspace_spec::materialize::resolve_one`,
+        // which now REFUSES a relative local one outright — see that
+        // function's own doc for why). Absolutize a relative local
+        // origin here, against the spec FILE's own directory — a named,
         // stable base computed once, now, from where this file actually
         // lives, never from the process's ambient working directory —
         // so an operator writing `"path": "../sibling-repo"` in a spec
@@ -200,15 +254,42 @@ impl WorkspaceSpec {
         // the base is itself independent of whatever the process cwd
         // happens to be when `load()` runs; only the fallback
         // (canonicalize failing, e.g. the spec file vanished between the
-        // read above and here) leaves the source path exactly as its
+        // read above and here) leaves the source value exactly as its
         // author wrote it, for `resolve_one`'s guard to refuse.
+        //
+        // (#2612 review MUST-FIX 1) Applied to BOTH `path` and `git` —
+        // `origin_is_relative_local` treats them identically, since a
+        // relative `git:` value is exactly as local-filesystem-shaped as
+        // a relative `path:` value (see that predicate's own doc); it
+        // just never used to be absolutized here, which left it reaching
+        // `resolve_one`'s clone call with no directory set.
+        //
+        // (#2612 review Also-fix 2) A leading `~` is deliberately
+        // EXCLUDED from this join even though `Path::new("~/foo").
+        // is_absolute()` is false: joining a spec directory onto a
+        // shell-only home-directory shorthand darkmux never expands
+        // would produce an absolute-LOOKING but nonsense path
+        // (`<spec_dir>/~/foo`) that silently PASSES `resolve_one`'s
+        // absoluteness check instead of being refused with the source
+        // named — trading a clear refusal for a confusing "not found"
+        // from `git` itself. This is a regression fix, not a feature:
+        // before this absolutization existed at all, a `~`-prefixed
+        // origin was never absolute either, so it always reached
+        // `resolve_one`'s refusal directly. Leaving it untouched here
+        // restores that path — it still satisfies
+        // `origin_is_relative_local` (no scheme, no scp-like host, not
+        // absolute) and reaches the same named refusal.
         let spec_dir = path.canonicalize().ok().and_then(|p| p.parent().map(Path::to_path_buf));
         if let Some(spec_dir) = spec_dir {
             for source in &mut spec.sources {
                 if let Some(p) = &source.path {
-                    let candidate = Path::new(p);
-                    if !candidate.is_absolute() {
-                        source.path = Some(spec_dir.join(candidate).to_string_lossy().into_owned());
+                    if origin_is_relative_local(p) && !p.starts_with('~') {
+                        source.path = Some(spec_dir.join(Path::new(p)).to_string_lossy().into_owned());
+                    }
+                }
+                if let Some(g) = &source.git {
+                    if origin_is_relative_local(g) && !g.starts_with('~') {
+                        source.git = Some(spec_dir.join(Path::new(g)).to_string_lossy().into_owned());
                     }
                 }
             }

@@ -22,26 +22,47 @@
 //! the enclosing scope satisfies the pin — "a fifth spawn simply wouldn't
 //! be added to" a roster, so the guard reads source instead. This module
 //! follows the identical shape for the identical hazard class: it does
-//! NOT enumerate step-kind ids anywhere. It walks the same three source
-//! trees (`darkmux-crew/src`, `darkmux-lab/src`, the top-level `src/`) for
-//! every `impl StepKind for <Type>` block OUTSIDE a `#[cfg(test)]` module,
-//! and fails BY NAME on any such block with no `fn cwd_policy(` inside it
-//! — so an eleventh Tier 2/3 kind arriving tomorrow, in any of these three
-//! trees, is caught here without anyone remembering to add a row.
+//! NOT enumerate step-kind ids anywhere. It walks every source tree in
+//! this workspace whose crate depends on `darkmux-crew` (`StepKind`'s
+//! defining, publicly-re-exported crate — see `sweep_roots()` for the
+//! current list) for every `impl StepKind for <Type>` block OUTSIDE a
+//! `#[cfg(test)]` module, and fails BY NAME on any such block with no
+//! `fn cwd_policy(` inside it — so an eleventh Tier 2/3 kind arriving
+//! tomorrow, in any swept tree, is caught here without anyone
+//! remembering to add a row.
 //!
 //! **What this is: a lint, not a type check.** Like its sibling, it reads
 //! text. It does not know whether a matched `fn cwd_policy(` line is a
 //! real trait-method override or a red herring (a differently-scoped
 //! function that merely shares the name inside the same braces) — no
 //! production file does that today, and a reviewer reading a failure here
-//! would notice the mismatch immediately, so the risk is asymmetric: this
-//! can produce a false PASS in an adversarial rewrite, never a false
-//! silence about a genuinely new, unexamined kind.
+//! would notice the mismatch immediately, so that risk is asymmetric:
+//! this can produce a false PASS in an adversarial rewrite of an
+//! ALREADY-KNOWN kind, never a false silence about one. It is NOT
+//! asymmetric the same way for a genuinely NEW kind, though: a renamed
+//! trait import (`use darkmux_crew::step_kinds::StepKind as SK; impl SK
+//! for Foo`) or a generic impl (`impl<T> StepKind for Wrapper<T>`) never
+//! contains the literal substring `"impl StepKind for "` this scan
+//! matches on, so either shape evades it entirely — a genuine false
+//! silence about an unexamined kind, not merely an adversarial rewrite of
+//! a known one. (#2612 review Also-fix 1 — corrects the claim two
+//! sentences up, which is only true against a kind this scan has already
+//! seen once.)
 //!
 //! **Scope, stated honestly.** This sweep does NOT see:
-//!   - A `StepKind` impl added anywhere OUTSIDE these three trees (a new
-//!     crate this repo doesn't have yet). `sweep_roots()` below is the
-//!     one place to extend when that changes.
+//!   - A `StepKind` impl added in a workspace crate that does not
+//!     currently depend on `darkmux-crew` in its `Cargo.toml` — such a
+//!     crate could not `impl` a trait it cannot name, so this is not a
+//!     live gap today, only the boundary condition that would reopen one:
+//!     if a currently-independent crate later adds that dependency,
+//!     `sweep_roots()` below needs the same addition BEFORE that crate
+//!     starts implementing `StepKind`, not after. (#2612 review MUST-FIX
+//!     2 — this bullet previously called the omitted trees "a new crate
+//!     this repo doesn't have yet", which was false: `darkmux-fleet`,
+//!     `darkmux-serve`, and `darkmux-doctor` all depend on `darkmux-crew`
+//!     today and were simply missing from the swept list, so a planted
+//!     implementation in any of them was invisible to this sweep despite
+//!     the crate already existing.)
 //!   - The five Tier 1 builtins in `step_kinds/builtins.rs` (excluded by
 //!     file path, see `is_tier1_builtins_file`) — covered by the
 //!     registry-walk test instead, a STRONGER check (pins each by VALUE
@@ -70,13 +91,31 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The three source trees every non-test `StepKind` impl in this
-/// workspace lives under today. Extend here — nowhere else — if a fourth
-/// ever exists.
+/// Every source tree in this workspace whose crate depends on
+/// `darkmux-crew` — `StepKind`'s defining, publicly re-exported crate
+/// (`step_kinds::StepKind`, re-exported from `darkmux_crew::step_kinds`)
+/// — and could therefore `impl StepKind for` a type of its own.
+///
+/// (#2612 review MUST-FIX 2) This used to name only THREE of these six
+/// trees (`darkmux-crew/src`, `darkmux-lab/src`, the top-level `src/`)
+/// and its own doc claimed a `StepKind` impl outside them lived in "a new
+/// crate this repo doesn't have yet" — false: `darkmux-fleet`,
+/// `darkmux-serve`, and `darkmux-doctor` all depend on `darkmux-crew`
+/// TODAY (see each one's own `Cargo.toml`), so a planted implementation
+/// in any of their `src/` trees was invisible to this sweep despite the
+/// crate already existing and the trait already being reachable from it.
+/// Extend here — nowhere else — the moment a workspace member's
+/// `Cargo.toml` grows a `darkmux-crew` dependency it didn't have before;
+/// see this test module's own "Scope, stated honestly" section for the
+/// boundary this still doesn't cover (a FUTURE such crate, before this
+/// list is updated for it).
 fn sweep_roots() -> Vec<PathBuf> {
     vec![
         manifest_dir().join("src"),
         manifest_dir().join("../darkmux-lab/src"),
+        manifest_dir().join("../darkmux-fleet/src"),
+        manifest_dir().join("../darkmux-serve/src"),
+        manifest_dir().join("../darkmux-doctor/src"),
         manifest_dir().join("../../src"),
     ]
 }

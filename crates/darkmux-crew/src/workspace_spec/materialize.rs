@@ -67,7 +67,7 @@
 //! rebuilding, so a peer's turn after the lock is cheap. A tree anyone
 //! has written into is still torn down and rebuilt, exactly as before.
 
-use super::{SourceSpec, WorkspaceSpec};
+use super::{origin_is_relative_local, SourceSpec, WorkspaceSpec};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -363,38 +363,54 @@ fn resolve_one(
     let origin = source
         .origin()
         .ok_or_else(|| anyhow::anyhow!("source '{}' names neither `git` nor `path`", source.id))?;
-    // (#2577 review) A `path`-origin's `origin` is handed to `git clone`
-    // VERBATIM below, on a call with no `.current_dir()` set (`run_git
-    // (None, ...)`) — a RELATIVE path there resolves against darkmux's
-    // own ambient working directory (`std::env::current_dir()`, inherited
-    // by the child process), the exact process-global `CwdPolicy` exists
-    // to keep off scheduler worker threads. Two Tier-2 step kinds
+    // (#2577 review) `origin` is handed to `git clone` VERBATIM below, on
+    // a call with no `.current_dir()` set (`run_git(None, ...)`) — a
+    // RELATIVE local path there resolves against darkmux's own ambient
+    // working directory (`std::env::current_dir()`, inherited by the
+    // child process), the exact process-global `CwdPolicy` exists to
+    // keep off scheduler worker threads. Two Tier-2 step kinds
     // (`crawl.plan`, `plan.sites`) each declare `CwdPolicy::
     // NoAmbientDependency` on the strength of an audit of THIS call —
     // proved live: the same relative-path spec run from three different
     // ambient directories resolved three different sources (one success,
-    // two different failures). `WorkspaceSpec::load` absolutizes a
-    // relative `path:` against the spec FILE's own directory before this
-    // function ever sees it (a real convenience for an operator-authored
-    // spec), but `materialize()` is also called directly on a spec built
-    // as a struct literal that skips `load()` entirely — see
-    // `derive_workspace_spec`'s own doc and
+    // two different failures).
+    //
+    // (#2612 review MUST-FIX 1) That audit — and the guard below it —
+    // used to check `source.path` alone. But `origin` above is
+    // `source.origin()`, which PREFERS `git` over `path`: `git` is only a
+    // remote URL by CONVENTION, never by type (`git clone
+    // ../sibling-repo` genuinely works, which is exactly how an operator
+    // ends up writing a relative `git:` value), so a relative `git:`
+    // origin reached this same unguarded clone with the OLD `path`-only
+    // check never firing. Proved live, reproducing the reviewer's own
+    // three-directory probe with `git` instead of `path`: the identical
+    // spec resolved to different outcomes depending only on the ambient
+    // directory the process happened to be standing in. Checking
+    // `origin` itself — via `origin_is_relative_local`, which recognizes
+    // a URL scheme and git's scp-like `user@host:path` shorthand as NOT
+    // local, so a real remote address is never refused — is what closes
+    // both fields with one check. `WorkspaceSpec::load` absolutizes a
+    // relative local origin (either field) against the spec FILE's own
+    // directory before this function ever sees it (a real convenience
+    // for an operator-authored spec), but `materialize()` is also called
+    // directly on a spec built as a struct literal that skips `load()`
+    // entirely — see `derive_workspace_spec`'s own doc and
     // `a_spec_built_without_load_cannot_escape_the_workspaces_root_via_name`
     // just below, which drives exactly that bypass for the sibling `name`
     // containment. This is the JOIN those two kinds' declarations actually
     // depend on, so it refuses here unconditionally rather than trust every
     // caller to have gone through `load()` first.
-    if let Some(p) = &source.path {
-        if !Path::new(p).is_absolute() {
-            bail!(
-                "source '{}': `path` origin '{p}' is not absolute — a relative path here \
-                 resolves against darkmux's own process working directory, which is neither \
-                 fixed nor safe to depend on (see `step_kinds::types::CwdPolicy`'s own doc). \
-                 Use an absolute path, or load this spec through `WorkspaceSpec::load`, which \
-                 resolves a relative `path:` against the spec file's own directory.",
-                source.id
-            );
-        }
+    if origin_is_relative_local(origin) {
+        bail!(
+            "source '{}': origin '{origin}' is a relative local filesystem path — it is not \
+             absolute, and it resolves against darkmux's own process working directory, which \
+             is neither fixed nor safe to depend on (see `step_kinds::types::CwdPolicy`'s own \
+             doc). Use an absolute path, a real git URL, or an scp-like remote \
+             (`user@host:path`) — or load this spec through `WorkspaceSpec::load`, which \
+             resolves a relative local `git:`/`path:` origin against the spec file's own \
+             directory.",
+            source.id
+        );
     }
     // Compute both paths through the containment guard ONCE, up front, so
     // neither the clone nor the worktree checkout below can run against an
@@ -1352,6 +1368,133 @@ mod tests {
             msgs[1], msgs[2],
             "the refusal text must not depend on the ambient directory: {msgs:?}"
         );
+    }
+
+    /// (#2612 review MUST-FIX 1) Reproduces the test just above with the
+    /// OTHER field: a relative `git:` value, not a relative `path:` one.
+    /// `SourceSpec::origin()` PREFERS `git` over `path`, and the old guard
+    /// checked `source.path` alone — so a relative `git:` value (a real,
+    /// working shorthand: `git clone ../sibling-repo` succeeds from the
+    /// right directory, which is exactly how an operator ends up writing
+    /// one) reached `resolve_one`'s clone call with no directory set and
+    /// no refusal at all. Same three-ambient probe, same expectation:
+    /// every ambient directory now produces the textually IDENTICAL
+    /// refusal, because `origin_is_relative_local` is checked against
+    /// `source.origin()` — whichever field is actually set — not against
+    /// `source.path` specifically.
+    #[test]
+    #[serial_test::serial]
+    fn a_relative_git_origin_is_refused_identically_from_every_ambient_directory() {
+        fn spec_with_relative_git_origin(root: &Path) -> WorkspaceSpec {
+            WorkspaceSpec {
+                schema_version: None,
+                name: Some("t-relative-git".to_string()),
+                root: Some(root.to_string_lossy().into_owned()),
+                sources: vec![SourceSpec {
+                    id: "app".to_string(),
+                    // Deliberately relative AND deliberately the `git`
+                    // field, not `path` — the exact shape the old
+                    // `path`-only guard could not see.
+                    git: Some("origin-repo".to_string()),
+                    path: None,
+                    git_ref: Some("main".to_string()),
+                    extras: Default::default(),
+                }],
+                include: None,
+                exclude: None,
+                edges: Vec::new(),
+                rules: Vec::new(),
+                extras: Default::default(),
+            }
+        }
+
+        // Ambient A: a real git repo named "origin-repo" sits here as a
+        // sibling — the ambient the OLD `path`-only guard would have let
+        // resolve successfully via the ambient-relative `git` origin.
+        let ambient_a = TempDir::new().unwrap();
+        {
+            let run = |args: &[&str]| {
+                let out = Command::new("git")
+                    .current_dir(ambient_a.path().join("origin-repo"))
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            };
+            fs::create_dir(ambient_a.path().join("origin-repo")).unwrap();
+            run(&["init", "-q", "-b", "main"]);
+            run(&["config", "user.email", "test@example.com"]);
+            run(&["config", "user.name", "test"]);
+            fs::write(ambient_a.path().join("origin-repo").join("a.txt"), "hello\n").unwrap();
+            run(&["add", "a.txt"]);
+            run(&["commit", "-q", "-m", "first"]);
+        }
+
+        // Ambient B: unrelated — no "origin-repo" here at all.
+        let ambient_b = TempDir::new().unwrap();
+
+        let mut results: Vec<Option<String>> = Vec::new();
+        for ambient in [ambient_a.path().to_path_buf(), ambient_b.path().to_path_buf()] {
+            let workspace_root = TempDir::new().unwrap();
+            let _guard = CwdGuard::enter(&ambient);
+            let spec = spec_with_relative_git_origin(workspace_root.path());
+            results.push(materialize(&spec, RW).err().map(|e| e.to_string()));
+        }
+
+        assert!(
+            results.iter().all(|r| r.is_some()),
+            "every ambient directory must be REFUSED (not one succeeding via an ambient-relative \
+             `git` origin) once the guard covers both fields: {results:?}"
+        );
+        let msgs: Vec<&str> = results.iter().map(|r| r.as_deref().unwrap()).collect();
+        for m in &msgs {
+            assert!(m.contains("not absolute"), "expected the absoluteness refusal, got: {m}");
+        }
+        assert_eq!(
+            msgs[0], msgs[1],
+            "the refusal text must not depend on the ambient directory, nor on which field (git \
+             vs path) named the relative origin: {msgs:?}"
+        );
+    }
+
+    /// (#2612 review Also-fix 2) A tilde-prefixed `path:` is neither
+    /// silently absolutized into a nonsense path (`<spec_dir>/~/foo`,
+    /// which would then fail as a confusing "not found" from `git`
+    /// itself with no mention of the source) nor accidentally accepted —
+    /// it still reaches the same named refusal a relative path gets,
+    /// because `WorkspaceSpec::load` deliberately excludes a leading `~`
+    /// from its absolutize join.
+    #[test]
+    fn a_tilde_prefixed_path_is_refused_naming_the_source_not_absolutized_into_nonsense() {
+        let dir = TempDir::new().unwrap();
+        let workspace_root = TempDir::new().unwrap();
+        let spec_path = dir.path().join("t-tilde.json");
+        fs::write(
+            &spec_path,
+            serde_json::json!({
+                "name": "t-tilde",
+                "root": workspace_root.path().to_string_lossy(),
+                "sources": [
+                    {"id": "app", "path": "~/some/repo", "ref": "main"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (spec, _warnings) = WorkspaceSpec::load(&spec_path)
+            .expect("load should not fail — refusal is resolve_one's job");
+        assert_eq!(
+            spec.sources[0].path.as_deref(),
+            Some("~/some/repo"),
+            "a tilde-prefixed path must be left EXACTLY as written, not joined onto the spec \
+             directory into a nonsense absolute-looking path"
+        );
+
+        let err = materialize(&spec, RW).err().map(|e| e.to_string());
+        let msg = err.expect("a tilde-prefixed path must be refused, not silently mis-resolved");
+        assert!(msg.contains("not absolute"), "expected the absoluteness refusal, got: {msg}");
+        assert!(msg.contains("app"), "the refusal must name the source: {msg}");
     }
 
     /// (#2404 P4d round 3) `--no-hardlinks` is the right default for a
