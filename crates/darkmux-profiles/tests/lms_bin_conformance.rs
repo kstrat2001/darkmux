@@ -43,6 +43,18 @@
 //!   - anything not spelled `Command::new("lms")` verbatim — a
 //!     `format!`-built command line, a shell string (`sh -c "lms ..."`),
 //!     `Command::new("lms".to_string())`.
+//!   - `plugins/darkmux-bundler-rust` and `tools/darkmux-mock-model` — both
+//!     `[workspace] exclude`d in the root `Cargo.toml` (see its comment),
+//!     so `sweep_roots()`'s `crates_dir` listing never reaches either one.
+//!     Neither plausibly spawns `lms` (a diff-bundler plugin and a mock
+//!     chat-completions server), which is why this is a defensible gap
+//!     rather than a fix — but it is a real one: planting the literal in
+//!     either tree leaves this scan green. Any other future
+//!     workspace-excluded crate has the same blind spot by construction.
+//!   - any `build.rs` — `sweep_roots()` walks each member's `src/` tree
+//!     only, and a build script lives at the crate root beside it, so a
+//!     literal there is invisible to the same degree as the two trees
+//!     above.
 //!
 //! Also out of scope, per #2572's own accounting: making the hardcoded form
 //! unrepresentable rather than detectable. That is the durable fix; this
