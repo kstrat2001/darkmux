@@ -1125,14 +1125,42 @@ mod tests {
     // site carries the guard IN THAT ARM — a future edit that restores only
     // one arm's refusal, or drops a guard during a refactor of this match,
     // fails a fast test without needing a live dispatch to reach the arm
-    // that lost it. **The per-arm scoping is load-bearing, not incidental:**
-    // an earlier version of this check searched the whole ENCLOSING
-    // FUNCTION for a preceding guard rather than the call's own match-arm
-    // block, which meant the FIRST arm's guard (textually earlier in the
-    // source) satisfied the search for the SECOND arm's call too — so
-    // deleting only the second arm's guard left this check GREEN. See
-    // `resume_from_guard_precedes`'s doc and `nearest_enclosing_block` for
-    // the fix.
+    // that lost it. **The per-arm scoping is load-bearing, not incidental,**
+    // and has needed fixing TWICE, in opposite directions:
+    // - The ORIGINAL version searched the whole ENCLOSING FUNCTION for a
+    //   preceding guard rather than the call's own match-arm scope, which
+    //   meant the FIRST arm's guard (textually earlier in the source)
+    //   satisfied the search for the SECOND arm's call too — deleting only
+    //   the second arm's guard left this check GREEN (too WIDE).
+    // - The round-1 fix scoped the search to `nearest_enclosing_block`
+    //   instead, which is itself wrong both ways: a brace-less arm has no
+    //   block of its own, so the nearest enclosing block widens back out to
+    //   the whole `match` (still too WIDE, same failure, different shape);
+    //   and a call nested one level deeper than the guard WITHIN the same
+    //   arm (an ordinary `if`, a closure body) shrinks the nearest
+    //   enclosing block down PAST that arm's own guard, failing the check
+    //   on correct code (too NARROW).
+    // The round-2 fix (`guard_search_scope` / `match_arm_span_within`)
+    // computes the arm's actual span structurally — from the enclosing
+    // match's own depth-0 `=>` boundaries — rather than proxying it with
+    // "nearest brace block". See `guard_search_scope`'s doc for the
+    // mechanism and `resume_from_guard_precedes`'s doc for why `body` must
+    // arrive pre-scoped either way.
+    //
+    // **Which layer is authoritative, for a maintainer facing one red and
+    // one green:** the runtime test
+    // (`dispatch_routed_via_refuses_resume_from_before_the_queue_is_touched`
+    // below, plus its `local_unknown: true` sibling in
+    // `resume_from_local_unknown_arm.rs`) is GROUND TRUTH — it runs the
+    // real function against a real fake peer and observes whether a
+    // connection was actually made. This structural scan is a CHEAP PROXY
+    // for that ground truth, run on every `cargo test` without needing a
+    // live dispatch; it exists to catch a regression FASTER, not to
+    // out-rank the thing it approximates. A red scan with a green runtime
+    // suite is worth investigating (the runtime tests only cover the two
+    // arm shapes that exist TODAY, not every shape a future edit could
+    // introduce) but is not proof of a live bypass by itself; a red
+    // runtime test is.
     //
     // **Same shape as `darkmux-crew`'s `every_dispatch_remote_call_site_
     // is_guarded_against_resume_from` (#2580), NOT an extension of it.**
@@ -1577,19 +1605,149 @@ mod tests {
         out
     }
 
-    /// The SMALLEST brace-delimited block in `body` that strictly contains
-    /// `at` — i.e. the nearest enclosing block, which for a call sitting
-    /// directly in a `match` arm's body is that arm's own `{ ... }` block,
-    /// NOT the whole function or the whole `match`. Falls back to the
+    /// The SMALLEST brace-delimited block in `body` that contains `at` —
+    /// i.e. the nearest enclosing block (the containment test is half-open,
+    /// `start <= at < end`, not a strict open interval). Falls back to the
     /// entire `body` span if `at` isn't inside any brace pair (shouldn't
     /// happen for a call site inside a real function body, but a scan
     /// bug here must fail wide-open rather than panic).
+    ///
+    /// (#2609 review round 2) This is no longer what scopes the guard
+    /// search for a call inside a `match` arm — see `guard_search_scope`,
+    /// which uses this only as its fallback for a call that isn't inside
+    /// any `match` at all. Using this DIRECTLY as the arm-guard scope (the
+    /// round-1 fix) was itself a proxy that broke in both directions: a
+    /// brace-less arm has no block of its own, so the smallest enclosing
+    /// block widens all the way out to the whole `match` — visible to a
+    /// SIBLING arm's guard; and a call nested one level deeper than the
+    /// guard WITHIN the same arm (an ordinary `if`, a closure body) shrinks
+    /// the smallest enclosing block down PAST the arm's own guard. Neither
+    /// failure is hypothetical — see `guard_search_scope`'s doc.
     fn nearest_enclosing_block(body: &str, at: usize) -> (usize, usize) {
         all_brace_block_spans(body)
             .into_iter()
             .filter(|(start, end)| *start <= at && at < *end)
             .min_by_key(|(start, end)| end - start)
             .unwrap_or((0, body.len()))
+    }
+
+    /// Every `=>` at bracket-depth 0 relative to `inner` (comment/string
+    /// aware, depth tracked over `(){}[]` together), as the byte offset
+    /// just PAST each one. `inner` is expected to be a brace block's
+    /// content with its own wrapping `{`/`}` already stripped, so a
+    /// `match`'s own arms — each `Pattern => body`, separated at the
+    /// match's own top level — show up at depth 0 while anything inside a
+    /// nested block (an arm's own `{ ... }` body, an `if`, a closure) does
+    /// not.
+    fn depth0_arrow_ends(inner: &str) -> Vec<usize> {
+        let cs: Vec<char> = inner.chars().collect();
+        let byte_offsets: Vec<usize> = inner.char_indices().map(|(b, _)| b).collect();
+        let mut depth = 0i32;
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < cs.len() {
+            if let Some(skip_to) = skip_non_code_span(&cs, i) {
+                i = skip_to;
+                continue;
+            }
+            match cs[i] {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                '=' if depth == 0 && cs.get(i + 1) == Some(&'>') => {
+                    let end_char = i + 2;
+                    let end_b = if end_char < byte_offsets.len() {
+                        byte_offsets[end_char]
+                    } else {
+                        inner.len()
+                    };
+                    out.push(end_b);
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// If `[block_start, block_end)` (a full brace-delimited span, braces
+    /// included, as returned by `all_brace_block_spans`) is a `match`
+    /// body — recognized STRUCTURALLY by having at least one `=>` at
+    /// bracket-depth 0 relative to its own content, which is what a
+    /// `match`'s own top level looks like and an ordinary `if`/closure/loop
+    /// block does not — returns the byte span of the ARM that contains
+    /// `at`: from just after that arm's own `=>` to just before the next
+    /// arm's `=>` (or the block's closing brace, for the last arm).
+    /// Returns `None` when `[block_start, block_end)` isn't a match body,
+    /// so the caller keeps walking outward to a bigger ancestor block.
+    ///
+    /// This is deliberately generous at the arm's END boundary: it runs up
+    /// to the NEXT arm's own `=>`, which over-includes that next arm's
+    /// pattern (and any `if <guard>` on it) as part of "this" arm's
+    /// span. Accepted as vanishingly unlikely to matter — the same kind of
+    /// textual-heuristic tolerance `resume_from_guard_precedes`'s own doc
+    /// already accepts — because a match arm's PATTERN never itself
+    /// contains a `resume_from`-conditioned guard with this exact anchor.
+    fn match_arm_span_within(
+        body: &str,
+        block_start: usize,
+        block_end: usize,
+        at: usize,
+    ) -> Option<(usize, usize)> {
+        if block_end < block_start + 2 {
+            return None;
+        }
+        let inner = &body[block_start + 1..block_end - 1];
+        let arrow_ends: Vec<usize> =
+            depth0_arrow_ends(inner).into_iter().map(|off| off + block_start + 1).collect();
+        if arrow_ends.is_empty() {
+            return None;
+        }
+        for (idx, &arm_start) in arrow_ends.iter().enumerate() {
+            let arm_end = arrow_ends.get(idx + 1).copied().unwrap_or(block_end - 1);
+            if arm_start <= at && at < arm_end {
+                return Some((arm_start, arm_end));
+            }
+        }
+        None
+    }
+
+    /// The scope `resume_from_guard_precedes` should search for the call
+    /// at `at` in `body`: when `at` sits inside a `match` arm (braced or
+    /// brace-less), the byte span of THAT ARM alone — from
+    /// `match_arm_span_within` — so a sibling arm's guard is invisible
+    /// (the too-WIDE failure a brace-less arm produces against plain
+    /// `nearest_enclosing_block`) while a nested block WITHIN the same arm
+    /// (an ordinary `if`, a closure body) stays visible (the too-NARROW
+    /// failure `nearest_enclosing_block` produces by shrinking to that
+    /// nested block instead of the whole arm). Falls back to
+    /// `nearest_enclosing_block` when `at` isn't inside any `match` at all
+    /// — there is no arm to scope to.
+    ///
+    /// (#2609 review round 2 MUST-FIX) Walks every brace block containing
+    /// `at`, SMALLEST first, and returns the first one `match_arm_span_
+    /// within` recognizes as a match body. Starting from the smallest is
+    /// what fixes the too-narrow case: a nested `if`/closure block around
+    /// the call is tried first, is correctly rejected (it has no depth-0
+    /// `=>` of its own), and the walk continues outward to the arm's own
+    /// block, then — since an arm's own `{ ... }` body ALSO has no depth-0
+    /// `=>` of its own — outward again to the `match`'s own enclosing
+    /// block, which does, and which is where `match_arm_span_within`
+    /// computes the correct per-arm boundaries regardless of how deep the
+    /// call sits inside that one arm.
+    fn guard_search_scope(body: &str, at: usize) -> (usize, usize) {
+        let mut containing: Vec<(usize, usize)> = all_brace_block_spans(body)
+            .into_iter()
+            .filter(|(start, end)| *start <= at && at < *end)
+            .collect();
+        containing.sort_by_key(|(start, end)| end - start);
+        for (start, end) in containing {
+            if let Some(span) = match_arm_span_within(body, start, end, at) {
+                return span;
+            }
+        }
+        nearest_enclosing_block(body, at)
     }
 
     /// Collapse Rust string-literal line continuations (a `\` immediately
@@ -1628,9 +1786,13 @@ mod tests {
     /// collapsing) contains BOTH `RESUME_FROM_GUARD_ANCHOR` and a
     /// diverging construct (`return Err`/`bail!`/`panic!`).
     ///
-    /// **`body` must already be scoped to the nearest enclosing block of the
-    /// call site being checked — see `nearest_enclosing_block` — never the
-    /// whole enclosing FUNCTION.** (#2584 review MUST-FIX) Both
+    /// **`body` must already be scoped to the call site's own match-arm
+    /// span (or nearest enclosing block, when the call isn't inside a
+    /// match) — see `guard_search_scope` — never the whole enclosing
+    /// FUNCTION and never just `nearest_enclosing_block` directly.**
+    /// (#2584 review MUST-FIX; scoping mechanism replaced #2609 review
+    /// round 2 — see `guard_search_scope`'s doc for why plain
+    /// `nearest_enclosing_block` is itself insufficient) Both
     /// `dispatch_via_queue` call sites live in the same function
     /// (`dispatch_routed_via`'s two `Remote` match arms), and this function
     /// only checks "some guard occurs before this call ANYWHERE in `body`" —
@@ -1639,8 +1801,8 @@ mod tests {
     /// satisfy this check for the SECOND arm's call too, even after deleting
     /// the second arm's own guard — the two arms are mutually exclusive at
     /// runtime, but textually the first arm's guard still "precedes" the
-    /// second arm's call. Scoping `body` to the call's own match-arm block
-    /// closes this: the first arm's guard sits in a sibling block the scoped
+    /// second arm's call. Scoping `body` to the call's own match-arm span
+    /// closes this: the first arm's guard sits in a sibling span the scoped
     /// search never sees.
     fn resume_from_guard_precedes(body: &str, call_at_in_body: usize) -> bool {
         for (cond_start, block_start, block_end) in find_if_blocks(body) {
@@ -1799,29 +1961,39 @@ mod tests {
             let body = &src[*fn_start..*fn_end];
             let call_at_in_body = call_at - fn_start;
 
-            // (#2584 review MUST-FIX) Scope the guard search to the call's
-            // own nearest enclosing block — for these two call sites, that
-            // is each `Remote` match arm's own `{ ... }` body — NOT the
-            // whole `{fn_name}` function. `dispatch_routed_via` holds BOTH
-            // `dispatch_via_queue` call sites (one per match arm), and a
-            // function-wide search would let one arm's guard vouch for the
-            // OTHER arm's call, since match arms are mutually exclusive at
-            // runtime but not textually ordered against each other. See
+            // (#2584 review MUST-FIX; scoping mechanism replaced #2609
+            // review round 2) Scope the guard search to the call's own
+            // match-arm SPAN — for these two call sites, that is each
+            // `Remote` match arm's own extent, computed structurally from
+            // the enclosing match's `=>` boundaries, not proxied by "the
+            // nearest brace block" (which breaks in both directions — see
+            // `guard_search_scope`'s doc) — NOT the whole `{fn_name}`
+            // function. `dispatch_routed_via` holds BOTH `dispatch_via_
+            // queue` call sites (one per match arm), and a function-wide
+            // search would let one arm's guard vouch for the OTHER arm's
+            // call, since match arms are mutually exclusive at runtime but
+            // not textually ordered against each other. See
             // `resume_from_guard_precedes`'s doc for the full mechanism.
-            let (block_start, block_end) = nearest_enclosing_block(body, call_at_in_body);
-            let scoped_body = &body[block_start..block_end];
-            let call_at_in_scoped = call_at_in_body - block_start;
+            let (scope_start, scope_end) = guard_search_scope(body, call_at_in_body);
+            let scoped_body = &body[scope_start..scope_end];
+            let call_at_in_scoped = call_at_in_body - scope_start;
 
             assert!(
                 resume_from_guard_precedes(scoped_body, call_at_in_scoped),
                 "`{fn_name}` calls `dispatch_via_queue(` at file offset {call_at} without a \
-                 `resume_from`-conditioned guard preceding it IN THE SAME MATCH ARM — this is \
-                 the #2561/#2580/#2584 bypass class: a caller can silently spend real tokens on \
-                 a PEER machine under a --resume-from flag that was never honored. The guard \
-                 must sit inside an `if` whose condition mentions `resume_from`, closes before \
-                 the call, and contains both {RESUME_FROM_GUARD_ANCHOR:?} and a diverging \
-                 bail!/return Err/panic! — all within this call's own enclosing block, not a \
-                 sibling arm's."
+                 `resume_from`-conditioned guard preceding it IN ITS OWN ENCLOSING SCOPE — the \
+                 same match arm when the call sits in one, its own enclosing block otherwise. \
+                 This is the #2561/#2580/#2584 bypass class: a caller can silently spend real \
+                 tokens on a PEER machine under a --resume-from flag that was never honored. The \
+                 guard must sit inside an `if` whose condition mentions `resume_from`, closes \
+                 before the call, and contains both {RESUME_FROM_GUARD_ANCHOR:?} and a diverging \
+                 bail!/return Err/panic! — all within that scope, not a sibling arm's or an \
+                 unrelated block's. If this assertion is RED but the runtime tests \
+                 (`dispatch_routed_via_refuses_resume_from_before_the_queue_is_touched` and \
+                 `resume_from_local_unknown_arm.rs`) are GREEN: the runtime tests are ground \
+                 truth (they run the real function against a real fake peer), this scan is a \
+                 cheap proxy for them — investigate before assuming this scan is wrong, but a \
+                 disagreement does not by itself mean this finding is a false positive."
             );
         }
     }

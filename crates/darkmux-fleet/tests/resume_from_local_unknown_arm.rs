@@ -87,13 +87,53 @@ fn spawn_connection_counting_peer() -> (u16, std::sync::mpsc::Receiver<()>) {
     (port, rx)
 }
 
+/// Restores a fixed set of env vars to their pre-test values on drop —
+/// including on an unwinding panic, unlike a plain restore block placed
+/// after the assertions it's guarding. (#2609 review round 2 Also-fix)
+/// Harmless today (this is the only test in this binary, about to exit
+/// either way), but nothing said so, and a second test added to this file
+/// would silently inherit an emptied `PATH` / unset `DARKMUX_MACHINE_ID`
+/// from any panic here and race on the leftover `DARKMUX_REDIS_URL` /
+/// `DARKMUX_FLOWS_DIR`. Captures the ORIGINAL values at construction time
+/// (before the caller mutates anything), then restores them all when
+/// dropped — including during unwind, since `Drop::drop` runs on the
+/// unwind path by default (this crate doesn't set `panic = "abort"`).
+struct EnvRestore(Vec<(&'static str, Option<String>)>);
+
+impl EnvRestore {
+    fn capture(vars: &[&'static str]) -> Self {
+        Self(vars.iter().map(|&k| (k, std::env::var(k).ok())).collect())
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        unsafe {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_the_queue_is_touched()
 {
+    // Captured BEFORE any mutation below, so this always restores the
+    // real pre-test values regardless of how (or whether) the test below
+    // returns.
+    let _restore_env = EnvRestore::capture(&[
+        "DARKMUX_MACHINE_ID",
+        "PATH",
+        "DARKMUX_REDIS_URL",
+        "DARKMUX_FLOWS_DIR",
+    ]);
+
     // ── force `resolve_machine_id()` to cache `None`, before anything else
     //    in this process can call it ──────────────────────────────────
-    let prev_machine = std::env::var("DARKMUX_MACHINE_ID").ok();
-    let prev_path = std::env::var("PATH").ok();
     unsafe {
         std::env::remove_var("DARKMUX_MACHINE_ID");
         // A single empty PATH entry means "search only the current working
@@ -106,8 +146,6 @@ fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_the_q
 
     let (port, rx) = spawn_connection_counting_peer();
     let flows_dir = tempfile::TempDir::new().unwrap();
-    let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
-    let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
     unsafe {
         std::env::set_var("DARKMUX_REDIS_URL", format!("redis://127.0.0.1:{port}"));
         std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
@@ -141,24 +179,10 @@ fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_the_q
                  to the queue");
     let msg = format!("{err:#}");
 
-    unsafe {
-        match prev_machine {
-            Some(v) => std::env::set_var("DARKMUX_MACHINE_ID", v),
-            None => std::env::remove_var("DARKMUX_MACHINE_ID"),
-        }
-        match prev_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        match prev_redis {
-            Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
-            None => std::env::remove_var("DARKMUX_REDIS_URL"),
-        }
-        match prev_flows {
-            Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
-            None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
-        }
-    }
+    // Env restoration now happens unconditionally when `_restore_env` drops
+    // at the end of this function's scope — including on an unwinding
+    // panic from any assertion above or below this point — rather than in
+    // a manual block here that only ran on the success path.
 
     assert!(
         msg.contains("--machine=peer-b"),
