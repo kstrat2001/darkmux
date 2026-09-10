@@ -440,8 +440,10 @@ jobs:
           # `if`, so a broken scan path passed this guard vacuously. Exit 2 is
           # now a loud failure with the real stderr attached, not silence.
           PAT='admin[- ]agent|admin</code>'
+          set +e
           bad=$(grep -rniE $EXCL "$PAT" $SCAN 2>/tmp/pat-scan.err)
           STATUS=$?
+          set -e
           if [ "$STATUS" -eq 2 ]; then
             echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
             cat /tmp/pat-scan.err
@@ -516,14 +518,20 @@ jobs:
           # doubly invisible. Capture cmd1's status directly, then filter
           # its captured output as a second, exit-code-free step.
           VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close|lab runs|lab workloads|lab fixtures|lab inspect|lab compare|lab register|lab unregister|lab review-bench)\b'
+          set +e
           raw=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>/tmp/verb-scan.err)
           STATUS=$?
+          set -e
           if [ "$STATUS" -eq 2 ]; then
             echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
             cat /tmp/verb-scan.err
             exit 1
           fi
-          bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.')
+          # The filter's own exit status is NOT a verdict — `grep -v` exits 1
+          # when every matched line is legitimately excluded, which under
+          # `bash -e` aborted the step on a CLEAN tree. The verdict is the
+          # emptiness test below; the FIRST grep's status is what gates, above.
+          bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.' || true)
           if [ -n "$bad" ]; then
             echo "::error::Retired verb spelling in user-facing docs (#1426/#1463/#1465) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family) / lab run list|inspect|compare (not lab runs/inspect/compare) / lab workload list (not lab workloads) / lab fixture list|register|unregister (not lab fixtures/register/unregister) / lab eval (not lab review-bench); swap + recommendations retired:"
             echo "$bad"
@@ -546,14 +554,20 @@ jobs:
           # (#2589) Same fix shape as the VERBPAT scan above — real exit
           # status from the first grep, filter applied as a separate step.
           IDENTITYPAT='/darkmux-swap-stack|swap stacks?|to multiplex'
+          set +e
           raw=$(grep -rniE $EXCL "$IDENTITYPAT" $SCAN 2>/tmp/identity-scan.err)
           STATUS=$?
+          set -e
           if [ "$STATUS" -eq 2 ]; then
             echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
             cat /tmp/identity-scan.err
             exit 1
           fi
-          bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.')
+          # The filter's own exit status is NOT a verdict — `grep -v` exits 1
+          # when every matched line is legitimately excluded, which under
+          # `bash -e` aborted the step on a CLEAN tree. The verdict is the
+          # emptiness test below; the FIRST grep's status is what gates, above.
+          bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.' || true)
           if [ -n "$bad" ]; then
             echo "::error::Retired IDENTITY language in user-facing docs (#1449) — darkmux 2.0 is a mission orchestrator and a lab, NOT a profile multiplexer. Drop the swap-stack framing (residency is internal to gestalt now); reference the multiplexer only as founding/now-internal heritage:"
             echo "$bad"
