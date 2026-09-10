@@ -12258,6 +12258,124 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(recorded.trim(), "kill darkmux-test-container-2233-panic");
     }
 
+    // ─── (#2234) TailerStopGuard — the tailer thread's RAII backstop ──────
+
+    #[test]
+    fn tailer_stop_guard_sets_the_flag_on_normal_drop() {
+        // Baseline: even without a panic, constructing-then-dropping the
+        // guard must flip the flag — every explicit `stop_flag.store(true)`
+        // call on the happy/error paths already does this by hand, so the
+        // guard's own store on ordinary scope exit must be harmless and
+        // consistent with them, not a surprise second writer.
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = TailerStopGuard(Arc::clone(&stop_flag));
+        }
+        assert!(
+            stop_flag.load(Ordering::SeqCst),
+            "the guard must set stop_flag on an ordinary (non-panicking) drop"
+        );
+    }
+
+    #[test]
+    fn tailer_stop_guard_fires_on_panic_unwind() {
+        // (#2234) THE BUG this guard exists for: the tailer's only exits are
+        // catching `stop_flag` or an interrupt signal — see `run_tailer`'s
+        // own doc — and every EXPLICIT `stop_flag.store(true)` call in
+        // `dispatch()` sits on a normal-return path. A panic unwinding
+        // through the ~250 lines between the tailer's spawn and those
+        // stores skips all of them, and the tailer — a SEPARATE OS thread —
+        // survives the panic in any process that catches it (the fleet
+        // runner and the serve daemon both do, on purpose, so one bad
+        // dispatch can't take the whole long-lived process down). Left
+        // unguarded, that thread polls `trajectory.jsonl` every 250ms
+        // forever. Same shape as `container_kill_guard_fires_on_panic_
+        // unwind` above: Rust runs Drop on unwind, so a bare RAII wrapper
+        // closes the gap with no extra machinery.
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        // Silence the expected panic backtrace so test output stays clean.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let guard_stop_flag = Arc::clone(&stop_flag);
+        let result = std::panic::catch_unwind(move || {
+            let _guard = TailerStopGuard(guard_stop_flag);
+            panic!("simulated panic after the tailer thread has spawned");
+        });
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the closure should have panicked");
+
+        assert!(
+            stop_flag.load(Ordering::SeqCst),
+            "the guard's Drop must run on unwind and set stop_flag — a real \
+             tailer thread polls this exact flag every 250ms and would \
+             otherwise never learn the dispatch is gone"
+        );
+    }
+
+    // ─── (#2234) effective_inactivity_timeout_seconds clamps an absurd value ─
+
+    #[test]
+    #[serial]
+    fn effective_inactivity_timeout_seconds_clamps_an_absurd_configured_value() {
+        // (#2234) SUSPECTED concrete trigger the issue named: an absurd
+        // configured/env inactivity timeout reaches `Instant::now() +
+        // Duration::from_secs(inactivity_secs)` unclamped and panics on
+        // overflow — see the sibling test below, which proves that
+        // specific expression actually panics for this value. This test
+        // pins the resolution side: the single place both the
+        // container-forwarded value and the host watchdog deadline read
+        // from must never hand back something that large.
+        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", u64::MAX.to_string()) };
+
+        let (secs, source) = effective_inactivity_timeout_seconds(None);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+
+        assert_eq!(
+            secs, MAX_INACTIVITY_TIMEOUT_SECS,
+            "an absurd configured value must clamp to the max, not pass through raw"
+        );
+        assert_eq!(
+            source,
+            crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::Env,
+            ),
+            "clamping the VALUE must not change which tier gets credited for it"
+        );
+    }
+
+    #[test]
+    fn instant_plus_duration_panics_on_an_unclamped_absurd_value_but_not_on_the_clamped_one() {
+        // (#2234) Proves the actual failure mode the clamp above exists to
+        // prevent — not just that the clamp function returns a smaller
+        // number, but that the smaller number is what keeps the exact
+        // expression `dispatch()` runs (`Instant::now() + Duration::
+        // from_secs(inactivity_secs)`, to build the host watchdog deadline)
+        // from panicking on overflow.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unclamped = std::panic::catch_unwind(|| Instant::now() + Duration::from_secs(u64::MAX));
+        std::panic::set_hook(prev_hook);
+        assert!(
+            unclamped.is_err(),
+            "u64::MAX seconds must actually panic Instant's Add — if this \
+             stops panicking on some future toolchain the clamp above is \
+             defense-in-depth rather than a fix for a live crash, and this \
+             assertion is the signal to say so"
+        );
+
+        // The clamped value must not panic — this is what the resolution-
+        // side clamp is buying.
+        let _clamped_deadline = Instant::now() + Duration::from_secs(MAX_INACTIVITY_TIMEOUT_SECS);
+    }
+
     // ─── (#2232) the watchdog's kill must be PERSISTENT, not fire-and-forget ─
 
     /// Same PATH-shadowing seam as `install_fake_docker`, but the stand-in

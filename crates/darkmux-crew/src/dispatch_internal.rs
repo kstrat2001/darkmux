@@ -1437,17 +1437,36 @@ fn effective_max_turns(max_turns_override: Option<u32>) -> Option<u32> {
 /// flow record + envelope) still does NOT reuse this helper — it hand-rolls
 /// its own `"cli"`-labeled block, the same way it hand-rolls `"launcher"`
 /// and `"forced-agentic-remote"`. The two spell the same tier the same way.
+/// (#2234) A resolved inactivity budget beyond this is certainly a mistake
+/// (a fat-fingered extra digit in `config.json` or `DARKMUX_INACTIVITY_
+/// TIMEOUT_SECONDS`) — no real dispatch runs for centuries — and left
+/// unclamped it reaches `Instant::now() + Duration::from_secs(inactivity_
+/// secs)` a few hundred lines below, which PANICS on overflow for a large
+/// enough value (`Instant`'s `Add` impl, not `Duration`'s: `Duration::
+/// from_secs` never panics, but adding a huge one to an `Instant` does).
+/// That expression runs OUTSIDE `effective_inactivity_timeout_seconds`, so
+/// clamping only there would leave every other call site exposed; clamping
+/// HERE — this function's own doc already establishes it as the single
+/// point every consumer (the container-forwarded env var AND the host
+/// watchdog deadline) resolves from — closes it for both at once, and a
+/// clamped value still round-trips through `DockerRunConfig` and the host
+/// deadline in agreement, which is this function's whole reason for
+/// existing. ~10 years is far longer than any darkmux process has run, so
+/// no real workload ever notices the clamp firing.
+const MAX_INACTIVITY_TIMEOUT_SECS: u64 = 315_360_000;
+
 fn effective_inactivity_timeout_seconds(
     timeout_override_seconds: Option<u32>,
 ) -> (u64, InactivityBudgetSource) {
-    match timeout_override_seconds {
+    let (secs, source) = match timeout_override_seconds {
         Some(n) => (n as u64, InactivityBudgetSource::Cli),
         None => {
             let (secs, source) =
                 darkmux_types::config_access::inactivity_timeout_seconds_with_source();
             (secs, InactivityBudgetSource::Resolved(source))
         }
-    }
+    };
+    (secs.min(MAX_INACTIVITY_TIMEOUT_SECS), source)
 }
 
 /// (#2480 review, finding 5) Where THIS dispatch's inactivity budget came
@@ -3736,6 +3755,39 @@ impl Drop for PidRegistration {
     }
 }
 
+/// (#2234) RAII backstop for the trajectory tailer's `stop_flag`. The
+/// tailer's only exits are catching `stop_flag` set or an interrupt signal
+/// (see `run_tailer`'s own doc) — nothing else makes its loop return. Every
+/// EXPLICIT exit path in `dispatch()` downstream of the tailer's spawn
+/// already sets `stop_flag` by hand before returning (the `wait_with_
+/// output` error arm, and the natural end-of-function success path) — but a
+/// PANIC unwinding through any of the ~250 lines between the tailer's spawn
+/// and those stores skips every one of them, same gap `ContainerKillGuard`
+/// (#2233) closed for the container itself, one guard earlier. The flag
+/// stays false, and the tailer keeps polling `trajectory.jsonl` on its
+/// spawned OS thread every 250ms forever in any process that survives the
+/// panic — which is the common case, not the rare one: the fleet runner
+/// (`darkmux-fleet::runner::run_with_panic_guard`) and the serve daemon
+/// both wrap a dispatch in `catch_unwind` for exactly this reason, so ONE
+/// bad dispatch doesn't take the whole long-lived process down. Catching
+/// the panic kills only the panicking thread; the tailer is a SEPARATE
+/// thread and does not die with it.
+///
+/// Same shape as `PidRegistration` / `ContainerKillGuard` above: Drop fires
+/// unconditionally, including on unwind, so there is no exit path left to
+/// enumerate by hand. Setting an already-true flag (every happy/error path
+/// already does this explicitly) is a harmless idempotent store — this
+/// guard is a backstop for the panic case, not a replacement for the
+/// existing explicit stores, which stay so the flag flips the instant the
+/// deciding branch is known rather than waiting on scope unwind.
+struct TailerStopGuard(Arc<AtomicBool>);
+
+impl Drop for TailerStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Best-effort `docker kill <name>` — the ONE place that knows how darkmux
 /// stops a container by its deterministic name, shared by the inactivity
 /// watchdog, the `wait_with_output()` error teardown, and the interrupt
@@ -5390,6 +5442,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     ));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
+    // (#2234) Armed the moment `stop_flag` exists — see the guard's own
+    // doc. Held to the natural end of this function's scope (never
+    // explicitly dropped early), so it backstops every panic between here
+    // and the function's return, including the ~250 lines before the
+    // tailer thread itself is even spawned a few lines down (nothing to
+    // stop yet at that point, so the store is a harmless no-op there) and
+    // every line after.
+    let _tailer_stop_guard = TailerStopGuard(Arc::clone(&stop_flag));
     // (#threshold) Effective compaction threshold the runtime triggers at:
     // absolute `threshold_tokens` > `threshold_ratio × window` > the 0.5×window
     // default (matching the runtime's DEFAULT_THRESHOLD_RATIO). Forwarded on
