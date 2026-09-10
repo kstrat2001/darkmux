@@ -57,6 +57,7 @@ use crate::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, Phase
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_gestalt::ModelHost;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -104,6 +105,65 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     // and becomes a harmless second no-op read of the same ack file.
     crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
         .context("licensed-adjacent role dispatch requires acknowledgment")?;
+
+    // (#2585) `--resume-from` checkpoint validation must ALSO run here, for
+    // the identical reason the ack gate above does. `run_step_graph`'s
+    // `ensure_wave_loaded` (called a few lines down) loads the step's
+    // residency-classified model BEFORE the step's own `run()` — and
+    // therefore before `dispatch_internal::dispatch`'s own #2162 copy of
+    // this exact check — ever executes. Left unreplicated here, a bad
+    // `--resume-from` on the container path paid the FULL residency cost
+    // (evicting other models, loading tens of gigabytes) before the
+    // checkpoint problem ever surfaced, and the error that came back named
+    // a model load rather than the checkpoint that actually caused it —
+    // exactly the misattribution #2585 was filed to fix.
+    //
+    // The validation is pure — it only reads `resume_from` off disk, no
+    // mutation — so calling it here and letting `dispatch_internal::
+    // dispatch`'s own #2162 call run again a moment later, deep inside the
+    // wave-loaded step, is a harmless second no-op read of the same files:
+    // the same pattern the ack gate above already relies on.
+    //
+    // `intended_workspace` mirrors, exactly, what `dispatch_internal::
+    // dispatch`'s own #2162 hoist will separately compute a moment later:
+    // `opts.workdir` canonicalized via the SAME `validate_workdir` (so a
+    // legitimate checkpoint's recorded origin path — itself canonicalized —
+    // compares equal here rather than a raw-vs-resolved mismatch spuriously
+    // rejecting it), or the deterministic no-`--workdir` auto-tempdir name.
+    // `--resume-from` is usable only alongside `--workdir` in practice (see
+    // `dispatch_internal::auto_workspace_path`'s own doc: the no-`--workdir`
+    // case always fails the workspace check downstream regardless of what's
+    // computed here), so exact agreement only matters for the `--workdir`
+    // case — achieved here by calling the identical function.
+    //
+    // Named, not fixed (#2585's own "watch for" scope note): reusing
+    // `validate_workdir` here means a `--resume-from` dispatch with an
+    // INVALID `--workdir` (missing dir, symlink escape) now also refuses
+    // before the wave — but an ORDINARY (non-resume) dispatch's own
+    // `--workdir` validation stays exactly where it was, inside
+    // `dispatch_internal::dispatch`, still stranded behind the wave. That
+    // is a real, separate instance of this same bug class; out of scope
+    // here because #2585 asks only for the checkpoint gate.
+    if let Some(resume_from) = opts.resume_from.as_ref() {
+        let intended_workspace: PathBuf = match opts.workdir.as_deref() {
+            Some(custom) => darkmux_types::workdir::validate_workdir(custom)
+                .context("darkmux dispatch --resume-from")?,
+            None => {
+                let unix_micros = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_micros())
+                    .unwrap_or(0);
+                crate::dispatch_internal::auto_workspace_path(&opts.role_id, unix_micros)
+            }
+        };
+        crate::dispatch_internal::validate_resume_checkpoint(
+            resume_from,
+            &opts.role_id,
+            &intended_workspace,
+            opts.workspace_read_only,
+        )
+        .context("darkmux dispatch --resume-from")?;
+    }
 
     let session_id = opts
         .session_id
@@ -1163,5 +1223,143 @@ mod tests {
         opts.session_id = Some("operator-pinned-session".to_string());
         let result = dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap();
         assert_eq!(result.session_id, "operator-pinned-session");
+    }
+
+    // ── #2585: the checkpoint gate must precede the residency wave ─────
+
+    /// A minimal, structurally-valid checkpoint body for `role_id` — enough
+    /// to pass `validate_resume_checkpoint`'s sanity check (object, numeric
+    /// `schema_version`, array `messages`). Mirrors
+    /// `dispatch_internal_tests::sample_checkpoint_json_for_role`, kept
+    /// separate rather than shared across the module boundary since it's a
+    /// three-field JSON literal, not worth threading a `pub(crate)` test
+    /// helper through for.
+    fn valid_checkpoint_json(role_id: &str) -> String {
+        serde_json::json!({
+            "schema_version": 3,
+            "role_id": role_id,
+            "messages": [],
+        })
+        .to_string()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_as_crew_of_one_refuses_a_bad_resume_from_before_the_wave_loads_anything() {
+        // (#2585) The mechanism this test proves: on the container path, a
+        // bad `--resume-from` must be refused BEFORE `run_step_graph`'s
+        // `ensure_wave_loaded` ever attempts to load this dispatch's model
+        // — not merely refused eventually. No `checkpoint.json` is written
+        // under `resume_from`, matching #2585's own illustrative repro.
+        let _guard = RunGuard::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let kind = FakeDispatchKind {
+            exit_code: 0,
+            stdout: r#"{"result":"stop"}"#.to_string(),
+            stderr: String::new(),
+            should_err: false,
+            placement: placement(),
+            calls: calls.clone(),
+        };
+        let registry = test_registry(kind);
+        let host = Arc::new(Mutex::new(MockHost::new().cataloged("test-model", 5_000_000_000)));
+        let host_for_factory = host.clone();
+        let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(SharedMockHost(host_for_factory.clone()))
+        };
+
+        // Canonicalized so `validate_workdir`'s symlink check has nothing to
+        // object to (macOS puts TempDirs under /var, a firmlink).
+        let workdir = TempDir::new().unwrap();
+        let workdir_path = workdir.path().canonicalize().unwrap();
+        let resume_from = TempDir::new().unwrap(); // no checkpoint.json written
+
+        let mut opts = test_opts("coder", "probe");
+        opts.resume_from = Some(resume_from.path().to_path_buf());
+        opts.workdir = Some(workdir_path);
+
+        let err = dispatch_as_crew_of_one_with(opts, &registry, &host_factory)
+            .expect_err("a --resume-from with no checkpoint must refuse");
+        let msg = format!("{err:#}");
+
+        // POSITIVE: the checkpoint gate's own greppable text, wrapped in the
+        // context this hoist adds — the same context dispatch_internal's own
+        // #2162 gate uses, so both routes report identically.
+        assert!(msg.contains("RESUME CHECKPOINT NOT FOUND"), "{msg}");
+        assert!(msg.contains("darkmux dispatch --resume-from"), "{msg}");
+        // NEGATIVE: the error must NOT read as a model-residency failure —
+        // the exact misattribution #2585 was filed over (the wording
+        // `concurrent_dispatch.rs`'s wave-load failures use).
+        assert!(!msg.contains("could not load"), "must not read as a model-load failure: {msg}");
+        assert!(!msg.contains("for this wave"), "must not read as a model-load failure: {msg}");
+
+        // ORDERING, not just refusal: the wave never touched the host at
+        // all (zero ops of any kind — `ensure_wave_loaded` was never
+        // entered), and the fake `dispatch.internal` step (standing in for
+        // `dispatch_internal::dispatch`, which carries its OWN #2162 copy
+        // of this same check) never ran either — the refusal fired before
+        // `run_step_graph` was ever called.
+        let ops = host.lock().unwrap().ops.clone();
+        assert!(ops.is_empty(), "no residency action of any kind before the refusal: {ops:?}");
+        assert!(calls.lock().unwrap().is_empty(), "the step's own run() must never be reached");
+
+        // No records emitted either: the mission/phase/task/step quadruple
+        // is minted AFTER this gate, so a refused resume leaves the run
+        // directory untouched — the same "nothing spent" standard the
+        // #2609/#2580 sibling fixes proved (a records directory that must
+        // stay empty, a listener that must receive zero connections).
+        let missions_dir = crate::loader::missions_dir();
+        let entries: Vec<_> =
+            std::fs::read_dir(&missions_dir).map(|rd| rd.collect::<Vec<_>>()).unwrap_or_default();
+        assert!(entries.is_empty(), "no mission/phase/task/step must be minted for a refused resume");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_as_crew_of_one_resumes_normally_when_the_checkpoint_is_valid() {
+        // (#2585) The hoisted gate must not break the legitimate path: a
+        // VALID checkpoint on a loadable model still runs end to end,
+        // exactly as it did before this hoist existed.
+        let _guard = RunGuard::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let kind = FakeDispatchKind {
+            exit_code: 0,
+            stdout: r#"{"result":"stop"}"#.to_string(),
+            stderr: String::new(),
+            should_err: false,
+            placement: placement(),
+            calls: calls.clone(),
+        };
+        let registry = test_registry(kind);
+        let host = Arc::new(Mutex::new(MockHost::new().cataloged("test-model", 5_000_000_000)));
+        let host_for_factory = host.clone();
+        let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(SharedMockHost(host_for_factory.clone()))
+        };
+
+        let workdir = TempDir::new().unwrap();
+        let workdir_path = workdir.path().canonicalize().unwrap();
+        let resume_from = TempDir::new().unwrap();
+        std::fs::write(
+            resume_from.path().join(crate::dispatch_internal::CHECKPOINT_FILENAME),
+            valid_checkpoint_json("coder"),
+        )
+        .unwrap();
+        crate::dispatch_internal::write_resume_origin_meta(resume_from.path(), &workdir_path, false);
+
+        let mut opts = test_opts("coder", "resume please");
+        opts.resume_from = Some(resume_from.path().to_path_buf());
+        opts.workdir = Some(workdir_path);
+
+        let result = dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(calls.lock().unwrap().len(), 1, "the step ran exactly once");
+
+        let ops = host.lock().unwrap().ops.clone();
+        let loads: Vec<_> = ops
+            .iter()
+            .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::Load { .. }))
+            .collect();
+        assert_eq!(loads.len(), 1, "the legitimate resume still loads the model exactly once: {ops:?}");
     }
 }

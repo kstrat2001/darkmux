@@ -446,11 +446,21 @@ pub struct DispatchOpts {
     /// ever called — and carries the analogous refusal in
     /// `darkmux-fleet`'s `dispatch_routed_via` (#2584): the queue's
     /// `WorkJob` has no checkpoint field, so a queued dispatch has no way
-    /// to honor one on the peer either. See `dispatch_internal`'s
-    /// `validate_resume_checkpoint` (the early gate) and
-    /// `write_staged_resume_checkpoint` (the later write) for the
-    /// validate-then-stage mechanics and the `resumed_from` provenance
-    /// this stamps into the dispatch's flow records.
+    /// to honor one on the peer either. A FOURTH route bypassed this gate
+    /// the same way: `darkmux dispatch` (the CLI's real entry point since
+    /// #1509) never calls this `dispatch()` directly — it goes through
+    /// `dispatch_as_crew_of_one`, whose `run_step_graph` call attempts the
+    /// residency wave's model load BEFORE the step's own `run()` (and
+    /// therefore before this `#2162` gate, buried inside it) ever executes.
+    /// A bad `--resume-from` there paid the FULL residency cost first and
+    /// then surfaced an error naming a model load, not the checkpoint that
+    /// actually caused it (#2585). `dispatch_as_crew_of_one_with` now calls
+    /// the SAME `validate_resume_checkpoint` early, before `run_step_graph`
+    /// — the identical pattern its own ack-gate hoist already used for the
+    /// same reason. See `dispatch_internal`'s `validate_resume_checkpoint`
+    /// (the early gate) and `write_staged_resume_checkpoint` (the later
+    /// write) for the validate-then-stage mechanics and the `resumed_from`
+    /// provenance this stamps into the dispatch's flow records.
     pub resume_from: Option<PathBuf>,
     /// (#2153) Caller-named host out dir (the `/darkmux-out` mount) to use
     /// for THIS dispatch, instead of letting `dispatch_internal::dispatch`

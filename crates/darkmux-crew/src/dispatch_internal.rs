@@ -579,7 +579,14 @@ pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 /// MISMATCH. `--resume-from` is therefore usable only alongside `--workdir`,
 /// which is the exact case. Revisit if the auto-tempdir path ever gains a
 /// way to name a prior run's workspace.
-fn auto_workspace_path(role_id: &str, unix_micros: u128) -> PathBuf {
+///
+/// `pub(crate)` (not private) since #2585: `dispatch_as_crew_of_one`'s own
+/// hoisted checkpoint gate (the container-path fix for that issue) calls
+/// this directly to compute the SAME intended-workspace name a moment
+/// before `dispatch()`'s own copy above does — one function decides the
+/// name for both callers, so they can't drift apart the way two
+/// independent derivations could.
+pub(crate) fn auto_workspace_path(role_id: &str, unix_micros: u128) -> PathBuf {
     std::env::temp_dir().join(format!("darkmux-dispatch-{role_id}-{unix_micros}"))
 }
 
