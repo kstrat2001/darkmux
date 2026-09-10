@@ -592,105 +592,6 @@ fn auto_workspace_path(role_id: &str, unix_micros: u128) -> PathBuf {
     std::env::temp_dir().join(format!("darkmux-dispatch-{role_id}-{unix_micros}"))
 }
 
-/// (#2114 follow-up / #2162) `DispatchOpts::resume_from`'s host-side
-/// validation. This is what refuses an invalid resume — the checkpoint-
-/// carrying `--resume` argv flag has existed since #2114 finding 3, but
-/// nothing constructed a `DockerRunConfig` with `resume_checkpoint: true`
-/// until this landed.
-///
-/// **#2162: called early, before model selection.** Before #2162, this
-/// validation ran only as part of a single `stage_resume_checkpoint` call
-/// positioned AFTER model selection and AFTER the workspace/`host_out`
-/// dirs were created — so a resume that was always going to be refused
-/// had already paid for a full LMStudio residency reconcile (evict + load)
-/// and materialized a workspace dir first. `dispatch()` now calls this
-/// function immediately after `--workdir` validation: a refused resume now
-/// fails with no model load, no eviction, no directory materialization and
-/// no `dispatch.start` flow record. It is NOT the first thing `dispatch()`
-/// does — the licensed-adjacent ack gate, the remote-endpoint early return,
-/// and the Docker preflight all still precede it; `auto_workspace_path`'s
-/// own doc names each and what it costs. It does
-/// everything the checkpoint gate needs to do EXCEPT the final copy into
-/// the fresh dispatch's `host_out` — that step needs `host_out` to exist,
-/// which isn't true yet this early — so it returns the checkpoint's raw
-/// (already read, already validated) file contents; the caller lands them
-/// once `host_out` exists via [`write_staged_resume_checkpoint`], with no
-/// second read/reparse and nothing able to change under the checkpoint in
-/// between. Never reuses `resume_from` as the mount source directly either
-/// way: this dispatch is a NEW run record with its own trajectory, and
-/// `resume_from` stays untouched as forensic evidence (matches the
-/// "host_out is never cleaned, even on error" contract — see
-/// `AutoWorkspaceCleanup`'s own doc for the sibling `workspace` cleanup
-/// this does NOT extend to).
-///
-/// Deliberately does NOT deserialize into `runtime::checkpoint::RunCheckpoint`
-/// — `runtime/` is a separate crate, built into the Docker image and NOT
-/// linked against this one (same boundary `apply_volume_mounts`'s doc
-/// describes for the duplicated `/darkmux-out` literal), so this crate has
-/// no access to that type. Instead this does a light schema sanity check
-/// (object shape, numeric `schema_version`, array `messages`) — enough to
-/// catch "not a checkpoint at all" (empty file, truncated write, some
-/// unrelated JSON) before the container ever spawns. The runtime remains
-/// the one authority on schema-version *compatibility*
-/// (`checkpoint::read_checkpoint` exits the container 2 on a real
-/// version mismatch); this function only rules out "not a checkpoint".
-///
-/// Fails LOUD — a distinctly-worded, greppable error — on anything short
-/// of a valid checkpoint. Never silently starts the dispatch fresh under
-/// a name that looked like a resume.
-///
-/// **What this closes, and what it does NOT (security audit, #2114 resume
-/// follow-up — read this before trusting a resume):** this function and
-/// `checkpoint::validate_for_resume` (runtime-side) together refuse a
-/// CROSS-ROLE or CROSS-PROMPT resume — a checkpoint written under a
-/// different role, a different system prompt, or a workspace this
-/// dispatch would mount more permissively than the run that wrote it.
-/// They do **NOT** defend against a SAME-ROLE forgery: a resume replays
-/// the checkpoint's `pending_tool_calls` verbatim (name checked against
-/// this run's tool allowlist, but the ARGUMENTS are never validated), and
-/// restores every prior assistant/tool message from the file with zero
-/// validation at all. `/darkmux-out` stays read-write even when
-/// `/workspace` is `:ro` (crawl-kind dispatches), so a prompt-injected
-/// model can still get a same-role checkpoint's tool arguments — or its
-/// non-pending history — to say whatever it wants, and a later
-/// `--resume-from` under the SAME role replays it. Checkpoint integrity
-/// (making the file itself untamperable by the model it's checkpointing)
-/// is a follow-up: the real fix is uid separation between the runtime
-/// process and the tool-executing processes inside the container, so a
-/// tool call can never write the runtime's own checkpoint file. Until
-/// that lands, `--resume-from` is an operator-explicit action on a
-/// same-role run the operator trusts, not a boundary against a
-/// compromised one — see `--resume-from`'s own CLI help.
-///
-/// (Security audit, #2114 resume follow-up) `expected_role_id` is the
-/// role THIS dispatch is about to run as (`opts.role_id`). The checkpoint
-/// schema (v3+) carries a `role_id` field the runtime stamps on every
-/// write; refused HERE, before the container even spawns, when it
-/// doesn't match. A schema version below 3 (no `role_id` field at all —
-/// written by a pre-fix runtime) is refused with a STALE-SCHEMA message
-/// rather than read as `role_id: "<missing>"`, which would otherwise
-/// misreport an honest version gap as a role mismatch.
-///
-/// `expected_workspace`/`expected_workspace_read_only` close the mount-mode
-/// escalation the audit also found live: a checkpoint written under a
-/// READ-ONLY workspace (a crawl-kind unit, `:ro` so the model can't touch
-/// the tree it's scanning) resumed under a READ-WRITE mount would hand a
-/// prompt-injected model write access it never had. The host has no
-/// free way to know the ORIGINAL run's mount mode from `resume_from`
-/// alone, so `write_resume_origin_meta` stamps it into every dispatch's
-/// OWN `host_out` at creation time (`RESUME_ORIGIN_FILENAME`); this reads
-/// it back from `resume_from` and refuses — never guesses — when it's
-/// missing, unparseable, names a different workspace path, or would
-/// upgrade a read-only origin to read-write. `dispatch()` passes
-/// `intended_workspace` here (the NOT-YET-CREATED path `workspace`
-/// resolution will materialize a moment later) rather than the real,
-/// already-mounted `workspace` the pre-#2162 call site passed. That is an
-/// exact match in the `--workdir` case; in the no-`--workdir` case it
-/// INVERTS the direction of error on a name collision (the old call site
-/// refused, this one accepts) — a NEW behavior in #2162, not a pre-existing
-/// one, and unreachable because a no-`--workdir` resume cannot match its
-/// origin's workspace regardless. `auto_workspace_path`'s own doc spells
-/// out both cases; read it before changing what is passed here.
 /// (#2614 review) The WORKDIR-INDEPENDENT half of
 /// [`validate_resume_checkpoint`] — existence, JSON shape, schema version,
 /// and role match. Everything this function checks is knowable from
@@ -799,6 +700,105 @@ pub(crate) fn validate_resume_checkpoint_content(
     Ok(contents)
 }
 
+/// (#2114 follow-up / #2162) `DispatchOpts::resume_from`'s host-side
+/// validation. This is what refuses an invalid resume — the checkpoint-
+/// carrying `--resume` argv flag has existed since #2114 finding 3, but
+/// nothing constructed a `DockerRunConfig` with `resume_checkpoint: true`
+/// until this landed.
+///
+/// **#2162: called early, before model selection.** Before #2162, this
+/// validation ran only as part of a single `stage_resume_checkpoint` call
+/// positioned AFTER model selection and AFTER the workspace/`host_out`
+/// dirs were created — so a resume that was always going to be refused
+/// had already paid for a full LMStudio residency reconcile (evict + load)
+/// and materialized a workspace dir first. `dispatch()` now calls this
+/// function immediately after `--workdir` validation: a refused resume now
+/// fails with no model load, no eviction, no directory materialization and
+/// no `dispatch.start` flow record. It is NOT the first thing `dispatch()`
+/// does — the licensed-adjacent ack gate, the remote-endpoint early return,
+/// and the Docker preflight all still precede it; `auto_workspace_path`'s
+/// own doc names each and what it costs. It does
+/// everything the checkpoint gate needs to do EXCEPT the final copy into
+/// the fresh dispatch's `host_out` — that step needs `host_out` to exist,
+/// which isn't true yet this early — so it returns the checkpoint's raw
+/// (already read, already validated) file contents; the caller lands them
+/// once `host_out` exists via [`write_staged_resume_checkpoint`], with no
+/// second read/reparse and nothing able to change under the checkpoint in
+/// between. Never reuses `resume_from` as the mount source directly either
+/// way: this dispatch is a NEW run record with its own trajectory, and
+/// `resume_from` stays untouched as forensic evidence (matches the
+/// "host_out is never cleaned, even on error" contract — see
+/// `AutoWorkspaceCleanup`'s own doc for the sibling `workspace` cleanup
+/// this does NOT extend to).
+///
+/// Deliberately does NOT deserialize into `runtime::checkpoint::RunCheckpoint`
+/// — `runtime/` is a separate crate, built into the Docker image and NOT
+/// linked against this one (same boundary `apply_volume_mounts`'s doc
+/// describes for the duplicated `/darkmux-out` literal), so this crate has
+/// no access to that type. Instead this does a light schema sanity check
+/// (object shape, numeric `schema_version`, array `messages`) — enough to
+/// catch "not a checkpoint at all" (empty file, truncated write, some
+/// unrelated JSON) before the container ever spawns. The runtime remains
+/// the one authority on schema-version *compatibility*
+/// (`checkpoint::read_checkpoint` exits the container 2 on a real
+/// version mismatch); this function only rules out "not a checkpoint".
+///
+/// Fails LOUD — a distinctly-worded, greppable error — on anything short
+/// of a valid checkpoint. Never silently starts the dispatch fresh under
+/// a name that looked like a resume.
+///
+/// **What this closes, and what it does NOT (security audit, #2114 resume
+/// follow-up — read this before trusting a resume):** this function and
+/// `checkpoint::validate_for_resume` (runtime-side) together refuse a
+/// CROSS-ROLE or CROSS-PROMPT resume — a checkpoint written under a
+/// different role, a different system prompt, or a workspace this
+/// dispatch would mount more permissively than the run that wrote it.
+/// They do **NOT** defend against a SAME-ROLE forgery: a resume replays
+/// the checkpoint's `pending_tool_calls` verbatim (name checked against
+/// this run's tool allowlist, but the ARGUMENTS are never validated), and
+/// restores every prior assistant/tool message from the file with zero
+/// validation at all. `/darkmux-out` stays read-write even when
+/// `/workspace` is `:ro` (crawl-kind dispatches), so a prompt-injected
+/// model can still get a same-role checkpoint's tool arguments — or its
+/// non-pending history — to say whatever it wants, and a later
+/// `--resume-from` under the SAME role replays it. Checkpoint integrity
+/// (making the file itself untamperable by the model it's checkpointing)
+/// is a follow-up: the real fix is uid separation between the runtime
+/// process and the tool-executing processes inside the container, so a
+/// tool call can never write the runtime's own checkpoint file. Until
+/// that lands, `--resume-from` is an operator-explicit action on a
+/// same-role run the operator trusts, not a boundary against a
+/// compromised one — see `--resume-from`'s own CLI help.
+///
+/// (Security audit, #2114 resume follow-up) `expected_role_id` is the
+/// role THIS dispatch is about to run as (`opts.role_id`). The checkpoint
+/// schema (v3+) carries a `role_id` field the runtime stamps on every
+/// write; refused HERE, before the container even spawns, when it
+/// doesn't match. A schema version below 3 (no `role_id` field at all —
+/// written by a pre-fix runtime) is refused with a STALE-SCHEMA message
+/// rather than read as `role_id: "<missing>"`, which would otherwise
+/// misreport an honest version gap as a role mismatch.
+///
+/// `expected_workspace`/`expected_workspace_read_only` close the mount-mode
+/// escalation the audit also found live: a checkpoint written under a
+/// READ-ONLY workspace (a crawl-kind unit, `:ro` so the model can't touch
+/// the tree it's scanning) resumed under a READ-WRITE mount would hand a
+/// prompt-injected model write access it never had. The host has no
+/// free way to know the ORIGINAL run's mount mode from `resume_from`
+/// alone, so `write_resume_origin_meta` stamps it into every dispatch's
+/// OWN `host_out` at creation time (`RESUME_ORIGIN_FILENAME`); this reads
+/// it back from `resume_from` and refuses — never guesses — when it's
+/// missing, unparseable, names a different workspace path, or would
+/// upgrade a read-only origin to read-write. `dispatch()` passes
+/// `intended_workspace` here (the NOT-YET-CREATED path `workspace`
+/// resolution will materialize a moment later) rather than the real,
+/// already-mounted `workspace` the pre-#2162 call site passed. That is an
+/// exact match in the `--workdir` case; in the no-`--workdir` case it
+/// INVERTS the direction of error on a name collision (the old call site
+/// refused, this one accepts) — a NEW behavior in #2162, not a pre-existing
+/// one, and unreachable because a no-`--workdir` resume cannot match its
+/// origin's workspace regardless. `auto_workspace_path`'s own doc spells
+/// out both cases; read it before changing what is passed here.
 pub(crate) fn validate_resume_checkpoint(
     resume_from: &Path,
     expected_role_id: &str,
@@ -4224,9 +4224,30 @@ pub(crate) fn refuse_resume_on_bare_hosted_path(opts: &DispatchOpts) -> Result<(
     if container_path_required(&role, opts.force_container) {
         return Ok(()); // agentic-remote container — resume goes through the normal gate
     }
-    bail!(
+    bail!(resume_from_bare_hosted_refusal(&opts.role_id));
+}
+
+/// (#2614 review, Also-fix — duplication) Single source of truth for the
+/// refusal text `refuse_resume_on_bare_hosted_path` above and `dispatch()`'s
+/// own inline `dispatch_remote` guard below both emit — before this, the
+/// two sites carried a byte-identical ten-line message hand-copied twice,
+/// which is exactly the drift risk this same commit's own rationale (for
+/// deleting the CLI wrapper's duplicate resume-checkpoint hoist) argues
+/// against. `dispatch()`'s own call site still duplicates the CALL to this
+/// function (`bail!(resume_from_bare_hosted_refusal(&opts.role_id))`), not
+/// the message text — `every_dispatch_remote_call_site_is_guarded_
+/// against_resume_from`'s textual scanner requires the guard's `if` block
+/// to contain a diverging construct naming the anchor phrase, and
+/// deliberately does not chase that anchor into an ordinary helper
+/// function a block merely calls (see that test's own doc for why); its
+/// escape valve for exactly this case — "extend this test to also scan
+/// the helper" — is what `resume_from_guard_precedes` does for THIS named
+/// function specifically, so both call sites can share one string without
+/// silently defeating that scan.
+pub(crate) fn resume_from_bare_hosted_refusal(role_id: &str) -> String {
+    format!(
         "darkmux dispatch: --resume-from is not supported on the \
-         remote single-shot dispatch path (role `{}` grants no \
+         remote single-shot dispatch path (role `{role_id}` grants no \
          tools, so this dispatch resolved to a bare hosted \
          chat-completions call — no Docker, no container, no \
          checkpoint). darkmux never silently starts a dispatch \
@@ -4234,9 +4255,8 @@ pub(crate) fn refuse_resume_on_bare_hosted_path(opts: &DispatchOpts) -> Result<(
          needs the container path, which a tool-granting role \
          (e.g. a coder or reviewer role with a non-empty \
          tool_palette) resolves to — or drop --resume-from to \
-         start this role fresh on purpose.",
-        opts.role_id
-    );
+         start this role fresh on purpose."
+    )
 }
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
@@ -4291,19 +4311,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // CONTAINER workspace, and this path has none — so it is
             // deliberately NOT built; the fix is refusal.
             if opts.resume_from.is_some() {
-                bail!(
-                    "darkmux dispatch: --resume-from is not supported on the \
-                     remote single-shot dispatch path (role `{}` grants no \
-                     tools, so this dispatch resolved to a bare hosted \
-                     chat-completions call — no Docker, no container, no \
-                     checkpoint). darkmux never silently starts a dispatch \
-                     fresh under a name that looked like a resume: resume \
-                     needs the container path, which a tool-granting role \
-                     (e.g. a coder or reviewer role with a non-empty \
-                     tool_palette) resolves to — or drop --resume-from to \
-                     start this role fresh on purpose.",
-                    opts.role_id
-                );
+                // (#2614 review, Also-fix — duplication) The message text
+                // itself lives in ONE place, `resume_from_bare_hosted_
+                // refusal` (see its own doc). This call site still
+                // duplicates the CALL, not the string — see that
+                // function's doc and `resume_from_guard_precedes`'s own
+                // "named helper" chase for why the conformance scan below
+                // still covers this guard.
+                bail!(resume_from_bare_hosted_refusal(&opts.role_id));
             }
             return dispatch_remote(&opts, &role, &system_prompt, &pm);
         }

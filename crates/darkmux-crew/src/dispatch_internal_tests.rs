@@ -2780,16 +2780,19 @@
             let call_at_in_body = call_at - fn_start;
 
             assert!(
-                resume_from_guard_precedes(body, call_at_in_body),
+                resume_from_guard_precedes(body, call_at_in_body, &src),
                 "`{fn_name}` calls `dispatch_remote(` at file offset {call_at} without a \
                  `resume_from`-conditioned guard preceding it — this scan requires an `if` \
-                 block whose condition mentions `resume_from`, closes BEFORE the call, and \
-                 contains BOTH the anchor {RESUME_FROM_GUARD_ANCHOR:?} and a diverging \
-                 bail!/return Err/panic!. This is the #2561/#2580 bypass class: a caller can \
-                 silently spend real tokens under a --resume-from flag that was never honored. \
-                 If the guard's message text is factored into a helper function instead of \
-                 inlined at the bail!/return site, that does not count here — inline it \
-                 (matching both existing guards' shape) or extend this test to also scan the \
+                 block whose condition mentions `resume_from`, closes BEFORE the call, contains \
+                 a diverging bail!/return Err/panic!, and EITHER inlines the anchor \
+                 {RESUME_FROM_GUARD_ANCHOR:?} directly OR calls the one named helper \
+                 {RESUME_FROM_GUARD_ALLOWED_HELPER:?} whose own body carries that anchor. This \
+                 is the #2561/#2580 bypass class: a caller can silently spend real tokens under \
+                 a --resume-from flag that was never honored. If the guard's message text is \
+                 factored into some OTHER helper function instead of inlined at the \
+                 bail!/return site, that does not count here — inline it, route it through \
+                 `resume_from_bare_hosted_refusal` (matching both existing guards' shape), or \
+                 extend `RESUME_FROM_GUARD_ALLOWED_HELPER`/this test to also scan the new \
                  helper."
             );
         }
@@ -3179,20 +3182,93 @@
     /// own failure message.
     const RESUME_FROM_GUARD_ANCHOR: &str = "not supported on the remote single-shot dispatch path";
 
+    /// (#2614 review, Also-fix — duplication) The ONE helper function this
+    /// scan chases the anchor into. `dispatch()`'s inline guard and
+    /// `refuse_resume_on_bare_hosted_path` used to hand-copy a byte-
+    /// identical ten-line message; `resume_from_bare_hosted_refusal` is
+    /// now the single place that text lives, and both `bail!` sites just
+    /// call it. See `resume_from_guard_precedes`'s own doc for why this is
+    /// the one named exception to "deliberately does not chase the anchor
+    /// into a helper function" rather than a general loophole.
+    const RESUME_FROM_GUARD_ALLOWED_HELPER: &str = "resume_from_bare_hosted_refusal";
+
+    /// The source text of `fn <name>(` — any visibility prefix
+    /// (`pub(crate) fn `, `pub fn `, bare `fn `) — from its own opening
+    /// `{` through its matching closing `}`, found anywhere in `src` (not
+    /// just column-0; `resume_from_bare_hosted_refusal` sits as a private
+    /// top-level fn today, but this does not assume that placement).
+    /// `None` if no such function is found — the caller must treat that as
+    /// "cannot vouch for it", never as "assume it's fine".
+    fn named_fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let marker = format!("fn {name}(");
+        let decl_at = src.find(&marker)?;
+        let cs: Vec<char> = src[decl_at..].chars().collect();
+        let byte_offsets: Vec<usize> = src[decl_at..].char_indices().map(|(b, _)| b).collect();
+        // Scan forward past the signature (tracking paren depth so a `{`
+        // inside a generic bound or default-arg-like construct — none
+        // exist here today, but this mirrors `top_level_function_spans`'s
+        // own discipline) to the fn's opening brace.
+        let mut j = 0usize;
+        let mut paren_depth = 0i32;
+        while j < cs.len() {
+            match cs[j] {
+                '(' => paren_depth += 1,
+                ')' => paren_depth -= 1,
+                '{' if paren_depth == 0 => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= cs.len() || cs[j] != '{' {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut m = j;
+        loop {
+            if m >= cs.len() {
+                return None;
+            }
+            match cs[m] {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let start_b = decl_at + byte_offsets[j];
+                        let end_b = if m + 1 < byte_offsets.len() {
+                            decl_at + byte_offsets[m + 1]
+                        } else {
+                            src.len()
+                        };
+                        return Some(&src[start_b..end_b]);
+                    }
+                }
+                _ => {}
+            }
+            m += 1;
+        }
+    }
+
     /// True iff `body[..call_at_in_body]` contains an `if` block (per
     /// `find_if_blocks`) whose CONDITION mentions `resume_from`, whose
     /// block closes at or before `call_at_in_body`, and whose block text
-    /// (after `\`-continuation collapsing) contains BOTH
-    /// `RESUME_FROM_GUARD_ANCHOR` and a diverging construct
-    /// (`bail!`/`return Err`/`panic!`). Requiring the anchor to sit INSIDE
-    /// the resume_from-conditioned, diverging block — not merely earlier in
-    /// the function — is what rejects an unrelated `bail!` elsewhere that
-    /// happens to mention the same phrase (the #2580 round 2 "anchor in a
-    /// sibling branch" exploit): that `bail!`'s enclosing `if` condition
-    /// won't mention `resume_from`, so it never qualifies. Deliberately
-    /// does NOT chase the anchor into a helper function the block merely
-    /// calls — see the conformance test's own doc comment for why.
-    fn resume_from_guard_precedes(body: &str, call_at_in_body: usize) -> bool {
+    /// (after `\`-continuation collapsing) contains a diverging construct
+    /// (`bail!`/`return Err`/`panic!`) AND EITHER `RESUME_FROM_GUARD_ANCHOR`
+    /// directly, OR a call to `RESUME_FROM_GUARD_ALLOWED_HELPER` whose OWN
+    /// body (found in `src`, the whole file — the helper is a sibling
+    /// top-level fn, not nested in this one) contains the anchor.
+    /// Requiring the anchor to sit INSIDE the resume_from-conditioned,
+    /// diverging block (or inside the one named helper it calls) — not
+    /// merely earlier in the function — is what rejects an unrelated
+    /// `bail!` elsewhere that happens to mention the same phrase (the
+    /// #2580 round 2 "anchor in a sibling branch" exploit): that `bail!`'s
+    /// enclosing `if` condition won't mention `resume_from`, so it never
+    /// qualifies. **Still deliberately does NOT chase the anchor into an
+    /// ARBITRARY helper function** — only the one named constant above,
+    /// and only after confirming that helper's OWN text carries the
+    /// anchor (never assumed from the name alone) — so a future guard that
+    /// calls some OTHER, unrelated helper and hopes this scan follows it
+    /// there still fails loud, exactly as before this exception existed.
+    fn resume_from_guard_precedes(body: &str, call_at_in_body: usize, src: &str) -> bool {
         for (cond_start, block_start, block_end) in find_if_blocks(body) {
             if block_end > call_at_in_body {
                 continue;
@@ -3204,8 +3280,26 @@
             let block_text = collapse_str_continuations(&body[block_start..block_end]);
             let diverges =
                 block_text.contains("bail!") || block_text.contains("return Err") || block_text.contains("panic!");
-            if diverges && block_text.contains(RESUME_FROM_GUARD_ANCHOR) {
+            if !diverges {
+                continue;
+            }
+            if block_text.contains(RESUME_FROM_GUARD_ANCHOR) {
                 return true;
+            }
+            let calls_allowed_helper =
+                block_text.contains(&format!("{RESUME_FROM_GUARD_ALLOWED_HELPER}("));
+            if calls_allowed_helper {
+                // Same `\`-continuation collapsing `block_text` above
+                // gets — the helper's own message is a multi-line string
+                // literal whose RAW source breaks the anchor phrase across
+                // a `\`-newline-indent continuation, same as every other
+                // message in this file.
+                let helper_carries_anchor = named_fn_body(src, RESUME_FROM_GUARD_ALLOWED_HELPER)
+                    .map(|helper_body| collapse_str_continuations(helper_body))
+                    .is_some_and(|helper_body| helper_body.contains(RESUME_FROM_GUARD_ANCHOR));
+                if helper_carries_anchor {
+                    return true;
+                }
             }
         }
         false

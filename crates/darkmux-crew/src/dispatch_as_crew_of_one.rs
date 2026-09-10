@@ -964,6 +964,56 @@ mod tests {
         assert_eq!(step.config["resume_from"], "/tmp/darkmux-out-coder-123456");
     }
 
+    /// (#2614 review, Also-fix — the untested link) `build_graph_step_
+    /// config_carries_resume_from` above only asserts a RAW value landed
+    /// in `step.config["resume_from"]` — it never confirms anything
+    /// actually reads that key back the way `DispatchInternalStepKind`
+    /// does. `resume_precheck_never_reaches_the_wave_loader_for_a_generic_
+    /// mission_graph_step` (`scheduler.rs`) proves the SCHEDULER's ordering
+    /// generically, but drives it with `RoleLocalModelKind`, a hand-written
+    /// test double that reads `step.config.get("resume_from")` its own
+    /// way and never goes through `dispatch_opts_for`'s real option
+    /// builder. Neither test would notice if the REAL kind's config key
+    /// spelling, or its role resolution, ever drifted from what the REAL
+    /// graph builder writes.
+    ///
+    /// This one closes that gap end to end: `build_graph` (the same
+    /// function `darkmux dispatch` itself calls) mints the step config,
+    /// `StepKindRegistry::with_builtins()` (the same registry
+    /// `dispatch_as_crew_of_one_with` constructs in production) resolves
+    /// `"dispatch.internal"` to the REAL `DispatchInternalStepKind`, and
+    /// `resume_precheck` is called on THAT pairing — no hand-built config,
+    /// no test-double kind, no crew-of-one wrapper. Red-proven (per this
+    /// module's own doc comment): renaming `dispatch_opts_for`'s
+    /// `config_str(step, "resume_from")` key to `"resume_from_x"` makes
+    /// this test fail (no error, i.e. `resume_precheck` reads `None` and
+    /// silently approves) while `build_graph_step_config_carries_resume_
+    /// from` above stays green throughout — proving the two tests check
+    /// genuinely different things.
+    #[test]
+    fn resume_precheck_refuses_through_the_real_graph_builder_and_the_real_registry() {
+        let resume_from = tempfile::TempDir::new().unwrap(); // no checkpoint.json written
+        let mut opts = test_opts("coder", "resume please");
+        opts.resume_from = Some(resume_from.path().to_path_buf());
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-2-abc", "sess-2");
+
+        let registry = StepKindRegistry::with_builtins();
+        let kind = registry.get("dispatch.internal").expect("dispatch.internal is a Tier 1 builtin");
+        let ctx = crate::step_kinds::StepRunCtx::new(
+            None,
+            None,
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+
+        let err = kind
+            .resume_precheck(&step, &task, &BTreeMap::new(), &ctx)
+            .expect_err("a --resume-from with no checkpoint, wired through the real graph \
+                         builder and resolved through the real registry, must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RESUME CHECKPOINT NOT FOUND"), "{msg}");
+    }
+
     #[test]
     fn build_graph_external_phase_id_is_a_separate_concept_from_the_graphs_own_phase() {
         // `opts.phase_id` (the CLI's `--phase-id`, external mission-phase
