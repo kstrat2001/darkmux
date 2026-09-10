@@ -34,10 +34,13 @@ pub struct MachineEntry {
     /// `"mini-1"`). Unique within a roster.
     pub id: String,
 
-    /// Tailnet address or DNS name to reach the daemon on. Examples:
-    /// `"100.64.0.2"`, `"studio.tailnet"`, `"127.0.0.1:8765"`. If no
-    /// `:port` suffix is given, `DEFAULT_DAEMON_PORT` (8765) is assumed.
-    /// Empty string is rejected at add time.
+    /// Tailnet DNS name to reach the daemon on. Examples: `"studio"`,
+    /// `"studio.tailnet.ts.net"`, `"127.0.0.1:8765"`. Prefer the DNS
+    /// name: a peer behind `tailscale serve` routes by Host header and
+    /// will 404 a bare IP. A raw `host:port` works for a daemon bound
+    /// directly to a non-loopback address. If no `:port` suffix is
+    /// given, `DEFAULT_DAEMON_PORT` (8765) is assumed. Empty string is
+    /// rejected at add time.
     pub address: String,
 
     /// Optional human-readable description for `fleet status` and the
@@ -356,6 +359,42 @@ pub fn probe_reachability(address: &str) -> ReachabilityResult {
     }
 }
 
+/// True when `address`'s host portion is a bare IP literal (v4 or v6),
+/// with or without an explicit `:port` suffix or a `scheme://` prefix — as
+/// opposed to a DNS name. (#1849) A peer behind `tailscale serve` routes by
+/// Host header and 404s a bare IP even though the daemon is healthy; this
+/// helper lets a 404 handler attach that context without resolving
+/// anything or touching the network itself.
+pub fn address_host_is_bare_ip(address: &str) -> bool {
+    let trimmed = address.trim();
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let without_scheme = without_scheme.trim_end_matches('/');
+    // A bracketed or bare v6 literal parses whole, before any host:port
+    // split — a bare v6 literal like `fd7a::1234` contains colons that
+    // would otherwise be misread as a port separator (same trick as
+    // `parse_address` below).
+    let unbracketed = without_scheme
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(without_scheme);
+    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    match without_scheme.rsplit_once(':') {
+        Some((host, _port)) => {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(host);
+            host.parse::<std::net::IpAddr>().is_ok()
+        }
+        None => false,
+    }
+}
+
 /// Parse an `address` string into a `SocketAddr`. Accepts:
 /// - bare IPs: `100.64.0.2` (port defaults to `DEFAULT_DAEMON_PORT`)
 /// - host:port: `100.64.0.2:8765` or `studio.tailnet:9999`
@@ -524,5 +563,47 @@ mod parse_address_tests {
     #[test]
     fn empty_address_errors() {
         assert!(parse_address("  ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod address_host_is_bare_ip_tests {
+    use super::*;
+
+    #[test]
+    fn bare_ipv4_is_a_bare_ip() {
+        assert!(address_host_is_bare_ip("100.74.208.36"));
+    }
+
+    #[test]
+    fn ipv4_with_port_is_a_bare_ip() {
+        assert!(address_host_is_bare_ip("100.74.208.36:8765"));
+    }
+
+    #[test]
+    fn bare_ipv6_is_a_bare_ip() {
+        assert!(address_host_is_bare_ip("fd7a:115c:a1e0::1234"));
+    }
+
+    #[test]
+    fn bracketed_ipv6_with_port_is_a_bare_ip() {
+        assert!(address_host_is_bare_ip("[fd7a:115c:a1e0::1234]:9999"));
+    }
+
+    #[test]
+    fn scheme_prefixed_ip_is_still_a_bare_ip() {
+        assert!(address_host_is_bare_ip("http://100.74.208.36:8765"));
+    }
+
+    // Inverted case (#1849 red-prove requirement): a DNS name — the form
+    // the corrected help text now recommends — must never read as a bare
+    // IP, with or without a port or scheme.
+    #[test]
+    fn dns_name_is_not_a_bare_ip() {
+        assert!(!address_host_is_bare_ip("studio"));
+        assert!(!address_host_is_bare_ip("studio:8765"));
+        assert!(!address_host_is_bare_ip("studio.tailnet.ts.net"));
+        assert!(!address_host_is_bare_ip("studio.tailnet.ts.net:8765"));
+        assert!(!address_host_is_bare_ip("http://studio.tailnet.ts.net:8765"));
     }
 }

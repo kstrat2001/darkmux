@@ -132,10 +132,10 @@ Should show one entry — this machine.
 This is the hand-coordinated step the cross-machine state issue ([#280](https://github.com/kstrat2001/darkmux/issues/280)) will close. For now: on EACH of the operator's existing machines, run:
 
 ```bash
-darkmux machine add <new-machine-id> --address <new-machine-tailnet-addr>:8765
+darkmux machine add <new-machine-id> --address <new-machine-tailnet-dns-name>:8765
 ```
 
-The `<new-machine-tailnet-addr>` is THIS machine's Tailscale IP / Magic DNS name (operator can find via `tailscale ip -4` on this machine).
+The `<new-machine-tailnet-dns-name>` is THIS machine's Tailscale Magic DNS name (operator can find via `tailscale status` on this machine, or the Tailscale admin console). Prefer the DNS name over the tailnet IP: a machine that later sits behind `tailscale serve` routes by Host header, so a roster entry pointing at the bare IP gets Tailscale's own 404 even though the daemon is healthy — the DNS name works in both setups. A raw `host:port` is fine only for a daemon bound directly to a non-loopback address (no `tailscale serve` in front of it).
 
 Surface this clearly to the operator:
 

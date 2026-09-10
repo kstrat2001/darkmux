@@ -78,10 +78,27 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
         ),
         // A 404 means the peer IS reachable — its daemon just doesn't serve
         // this route. "Could not reach" would be the wrong vocabulary.
-        Err(ureq::Error::Status(404, _)) => anyhow::bail!(
-            "peer `{id}` answered but has no `{path}` route — it may be running an older \
-             darkmux (route not found). Upgrade darkmux on `{id}` and retry."
-        ),
+        //
+        // (#1849) When this request went out to a bare IP, that 404 might
+        // not be darkmux's at all: a peer behind `tailscale serve` routes
+        // by Host header and answers a bare IP with Tailscale's own 404,
+        // not the daemon's. Name that possibility — this is a statement
+        // about the request darkmux just made and the response it got
+        // back, never a claim about how the operator's peer is actually
+        // set up (darkmux describes, never adjudicates).
+        Err(ureq::Error::Status(404, _)) => {
+            let tailscale_serve_hint = if fleet::address_host_is_bare_ip(&entry.address) {
+                " This request went to a bare IP — a peer behind `tailscale serve` answers \
+                 on its DNS name, not its IP, and would 404 exactly like this."
+            } else {
+                ""
+            };
+            anyhow::bail!(
+                "peer `{id}` answered but has no `{path}` route — it may be running an older \
+                 darkmux (route not found).{tailscale_serve_hint} Upgrade darkmux on `{id}` \
+                 and retry."
+            )
+        }
         Err(e) => anyhow::bail!("could not reach `{id}` ({url}): {e}"),
     }
 }
@@ -473,6 +490,41 @@ mod tests {
         assert!(msg.contains("older"), "names the likely cause: {msg}");
         assert!(msg.contains("route not found"), "{msg}");
         assert!(!msg.contains("could not reach"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_404_from_bare_ip_gets_the_tailscale_serve_hint() {
+        // (#1849) `one_shot_http` binds loopback, so the roster address IS
+        // a bare IP (`127.0.0.1:<port>`) — exactly the shape a 404 through
+        // `tailscale serve` looks like from the client's side.
+        let addr = one_shot_http("404 Not Found", "{}");
+        let _tmp = isolated_roster(&[("peer1", addr.as_str())]);
+        let err = fetch_peer_json("peer1", "/machine/resources").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("tailscale serve"), "{msg}");
+        assert!(msg.contains("DNS name, not its IP"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_404_from_dns_name_gets_no_tailscale_serve_hint() {
+        // Inverted case (#1849 red-prove requirement): the same 404, but
+        // reached via a DNS name (`localhost`, which resolves to the same
+        // loopback listener) rather than a bare IP. The hint must NOT
+        // appear — a DNS-addressed peer's 404 is not the bare-IP failure
+        // mode this hint exists to name.
+        let addr = one_shot_http("404 Not Found", "{}");
+        let port = addr.rsplit_once(':').expect("host:port").1;
+        let dns_addr = format!("localhost:{port}");
+        let _tmp = isolated_roster(&[("peer1", dns_addr.as_str())]);
+        let err = fetch_peer_json("peer1", "/machine/resources").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("older"), "base message still present: {msg}");
+        assert!(!msg.contains("tailscale serve"), "{msg}");
+        assert!(!msg.contains("bare IP"), "{msg}");
         unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
     }
 
