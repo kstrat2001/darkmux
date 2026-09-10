@@ -87,12 +87,22 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     let paths = paths::resolve(ResolveScope::Auto);
     paths::ensure(&paths)?;
 
-    let user_dir = if paths.scope == paths::Scope::Project || paths.scope == paths::Scope::User {
-        Some(paths.root.as_path())
-    } else {
-        None
-    };
-    let mut loaded_workload = load(&opts.workload_id, user_dir)?;
+    // (#2590) The workload USER tier is forced to the home root — a
+    // SEPARATE resolution from `paths` above. `paths` stays `Auto`
+    // (cwd-sensitive) on purpose: it governs run-artifact placement
+    // (`darkmux_types::config_access::lab_dir()`, resolved independently
+    // below) and sandbox/fixture-registry lookup (`paths.sandboxes`, used
+    // by `resolve_source_sandbox` further down) — both deliberately
+    // project-local when the cwd has a `.darkmux/`. Folding the workload
+    // *document* lookup into that same `Auto` root is what let a stale
+    // `./.darkmux/workloads/<id>.json` silently outrank the embedded
+    // workload of the same id, and let a cwd-only id resolve at all — the
+    // exact bug class #1012 closed for crew/mission state and #2432 closed
+    // for mission configs' user tier. `mission_config::load`'s
+    // `crate::loader::user_state_root()` forces `ResolveScope::ForceUser`
+    // for precisely this reason; the workload loader now does the same.
+    let user_workloads_root = paths::resolve(ResolveScope::ForceUser).root;
+    let mut loaded_workload = load(&opts.workload_id, Some(user_workloads_root.as_path()))?;
 
     // (#1004) Loop-lab A/B "with-context" arm: splice the caller-built
     // engagement-context blocks in FRONT of the workload's own prompt, so the
@@ -368,8 +378,11 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
 }
 
 pub fn lab_workloads() -> Vec<String> {
-    let paths = paths::resolve(ResolveScope::Auto);
-    list_available(Some(&paths.root))
+    // (#2590) Forced home, matching `lab_run`'s workload user-tier
+    // resolution above — a project-local `.darkmux/workloads/` must not
+    // appear in this listing either.
+    let user_root = paths::resolve(ResolveScope::ForceUser).root;
+    list_available(Some(&user_root))
 }
 
 /// (#489) Phase 2 — read the provider-written `<run_dir>/manifest.json`,
@@ -500,10 +513,212 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// RAII guard that changes the process cwd for the test's duration and
+    /// restores it on drop — mirrors `workloads::load`'s test-only `CwdGuard`
+    /// (#2432/#2553). Every caller MUST be `#[serial_test::serial]` — cwd is
+    /// a process-global resource, and `serial_test` only coordinates among
+    /// ANNOTATED tests, not any unannotated test elsewhere in this crate
+    /// that happens to read/write cwd too. RAII (not manual set/restore)
+    /// matters here specifically because these tests assert on the fix
+    /// under test: an assertion panic mid-test must still restore cwd, or a
+    /// red-proof run (which is EXPECTED to panic when the fix is reverted)
+    /// leaks the temp cwd into every test that runs after it in the same
+    /// `cargo test` process.
+    struct CwdGuard {
+        prev: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(dir: &Path) -> Self {
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    /// RAII guard for `DARKMUX_HOME`: sets it for the test's duration and
+    /// restores the PRIOR value (or removes it) on drop, for the same
+    /// red-proof-must-still-clean-up reason as `CwdGuard`. Mirrors
+    /// `crawl::unit_step_tests::HomeGuard`.
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(dir: &Path) -> Self {
+            let prev = std::env::var_os("DARKMUX_HOME");
+            unsafe { std::env::set_var("DARKMUX_HOME", dir) };
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
+            }
+        }
+    }
+
+    /// RAII guard that scopes the REAL `HOME` env var (which
+    /// `dirs::home_dir()` reads) and force-clears `DARKMUX_HOME` for the
+    /// duration, restoring both on drop. `HomeGuard` above sets
+    /// `DARKMUX_HOME`, the bootstrap override that short-circuits
+    /// `paths::resolve` BEFORE the `Auto`/`ForceUser` distinction is ever
+    /// evaluated — the wrong tool for a test that wants to actually
+    /// EXERCISE that distinction, since `DARKMUX_HOME` would make `Auto`
+    /// and `ForceUser` resolve identically regardless of cwd, silently
+    /// proving nothing. Setting `HOME` instead moves `dirs::home_dir()`'s
+    /// answer without pre-empting the branch under test. Clearing
+    /// `DARKMUX_HOME` too matters for the same reason the operator's
+    /// standing note does (`env -u DARKMUX_HOME HOME=<tmp>`): an ambient
+    /// `DARKMUX_HOME` in the shell running `cargo test` would otherwise
+    /// still win and mask the test's real HOME override.
+    struct RealHomeGuard {
+        prev_home: Option<std::ffi::OsString>,
+        prev_darkmux_home: Option<std::ffi::OsString>,
+    }
+
+    impl RealHomeGuard {
+        fn set(dir: &Path) -> Self {
+            let prev_home = std::env::var_os("HOME");
+            let prev_darkmux_home = std::env::var_os("DARKMUX_HOME");
+            unsafe {
+                std::env::set_var("HOME", dir);
+                std::env::remove_var("DARKMUX_HOME");
+            }
+            Self {
+                prev_home,
+                prev_darkmux_home,
+            }
+        }
+    }
+
+    impl Drop for RealHomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.prev_darkmux_home {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
+            }
+        }
+    }
+
+    // (#2590) `lab_workloads()` resolves the workload user tier via
+    // `paths::resolve(ResolveScope::ForceUser)`, which reads `DARKMUX_HOME` —
+    // a process-global. This test itself mutates neither, but a concurrent
+    // unannotated test could still be surprised by an in-flight guard from a
+    // SERIAL test above it if it asserted on the resolved root; it doesn't
+    // (panic-freedom only, and `list_available` tolerates any dir, existing
+    // or not), so it's serial here purely for auditability, not necessity.
+    #[serial_test::serial]
     #[test]
     fn workloads_returns_strings_without_panicking() {
         // Just verify the function doesn't panic on a fresh user dir.
         let _ = lab_workloads();
+    }
+
+    /// (#2590) The workload USER tier must NOT be cwd-sensitive: a
+    /// `.darkmux/workloads/<id>.json` planted in the shell's cwd must not
+    /// resolve, and must not appear in `lab workload list` — matching
+    /// `mission_config::load`'s `ForceUser` fix (#1012, #2432). Red-proved:
+    /// reverting `lab_workloads`'s `ResolveScope::ForceUser` back to `Auto`
+    /// makes `cwd-only-ghost` appear in this list.
+    #[serial_test::serial]
+    #[test]
+    fn workload_listing_ignores_a_cwd_local_darkmux_dir() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".darkmux").join("workloads")).unwrap();
+        std::fs::write(
+            project
+                .path()
+                .join(".darkmux")
+                .join("workloads")
+                .join("cwd-only-ghost.json"),
+            r#"{"workload":{"id":"cwd-only-ghost","provider":"prompt","prompt":"hi"}}"#,
+        )
+        .unwrap();
+
+        // An empty, isolated home — nothing here defines `cwd-only-ghost`,
+        // so if it resolves at all, it can only have come from the cwd.
+        let home = TempDir::new().unwrap();
+        let _home_guard = RealHomeGuard::set(home.path());
+        let _cwd_guard = CwdGuard::new(project.path());
+
+        let ids = lab_workloads();
+
+        assert!(
+            !ids.contains(&"cwd-only-ghost".to_string()),
+            "a cwd-local .darkmux/workloads/<id>.json must not resolve as a \
+             workload — the user tier is forced home (#2590); ids={ids:?}"
+        );
+        // Sanity: the embedded set is still there — this isn't an empty
+        // list masquerading as a pass.
+        assert!(
+            ids.contains(&"quick-q".to_string()),
+            "the embedded built-ins must still be listed; ids={ids:?}"
+        );
+    }
+
+    /// (#2590) The counterpart of `workload_listing_ignores_a_cwd_local_darkmux_dir`
+    /// for the actual DISPATCH path, not just the listing: `lab_run` must
+    /// also refuse to resolve a workload id that exists ONLY in a cwd-local
+    /// `.darkmux/workloads/`. Red-proved: reverting `lab_run`'s
+    /// `ResolveScope::ForceUser` (the workload-user-dir resolution, not the
+    /// `paths` variable used for run-artifact/sandbox placement) back to
+    /// `Auto` makes this resolve the cwd document and proceed instead of
+    /// erroring "not found".
+    #[serial_test::serial]
+    #[test]
+    fn run_ignores_a_cwd_local_darkmux_dir_for_workload_lookup() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".darkmux").join("workloads")).unwrap();
+        std::fs::write(
+            project
+                .path()
+                .join(".darkmux")
+                .join("workloads")
+                .join("cwd-only-ghost.json"),
+            r#"{"workload":{"id":"cwd-only-ghost","provider":"prompt","prompt":"hi"}}"#,
+        )
+        .unwrap();
+
+        // An empty, isolated home — nothing here defines `cwd-only-ghost`
+        // either, so the ONLY way it could resolve is via the cwd.
+        let home = TempDir::new().unwrap();
+        let _home_guard = RealHomeGuard::set(home.path());
+        let _cwd_guard = CwdGuard::new(project.path());
+
+        let err = lab_run(RunOpts {
+            workload_id: "cwd-only-ghost".into(),
+            profile_name: None,
+            runs: 1,
+            config_path: None,
+            quiet: true,
+            loop_override: None,
+            inject_context: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("not found"),
+            "lab_run must not resolve a cwd-only workload id — the user tier \
+             is forced home (#2590); got: {err}"
+        );
     }
 
     // (#488) Phase 1 — per-run COW sandbox isolation invariants. These
@@ -970,16 +1185,23 @@ mod tests {
             r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}}}"#,
         )
         .unwrap();
-        // Set up a workload manifest in the user dir.
-        let darkmux_dir = tmp.path().join(".darkmux");
-        fs::create_dir_all(darkmux_dir.join("workloads")).unwrap();
+        // (#2590) The workload user tier is forced HOME now, not cwd — a
+        // `.darkmux/workloads/` planted in the shell's cwd (this test's
+        // pre-#2590 setup) no longer resolves. Plant the workload manifest
+        // under a `DARKMUX_HOME`-scoped home dir instead; `DARKMUX_HOME` IS
+        // the darkmux root directly (no nested `.darkmux/`), so the
+        // manifest lives at `<home>/workloads/q.json`. The RAII guard also
+        // isolates `paths::resolve(Auto)`'s root (used by `lab_run` for
+        // run-artifact placement + `paths::ensure`), since `DARKMUX_HOME`
+        // wins over both `Auto` and `ForceUser` identically.
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("workloads")).unwrap();
         fs::write(
-            darkmux_dir.join("workloads/q.json"),
+            home.join("workloads").join("q.json"),
             r#"{"workload":{"id":"q","provider":"prompt","prompt":"hi"}}"#,
         )
         .unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _home_guard = HomeGuard::set(&home);
         let err = lab_run(RunOpts {
             workload_id: "q".into(),
             profile_name: None,
@@ -990,7 +1212,6 @@ mod tests {
             inject_context: None,
         })
         .unwrap_err();
-        std::env::set_current_dir(prev).unwrap();
         assert!(err.to_string().contains("default_profile"));
     }
 

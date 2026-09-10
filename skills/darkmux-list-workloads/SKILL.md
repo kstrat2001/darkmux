@@ -31,10 +31,10 @@ probe-recall
 Surface the list to the user, then offer the natural next steps:
 
 - "Pass any workload ID to `darkmux-lab-run` to dispatch it"
-- "Each ID maps to a JSON manifest under `templates/builtin/workloads/` (built-in) or `.darkmux/workloads/` (user-defined)"
+- "Each ID maps to a JSON manifest under `templates/builtin/workloads/` (built-in) or `~/.darkmux/workloads/` (user-defined)"
 
 ## Notes
 
 - The list is never empty — a fixed set of workloads (`quick-q`, `long-agentic`, `crawl-error-discard`, `quick-coding`, `medium-coding`, `tool-bench`, `demo-quickstart`) is compiled into the binary itself, so it's always available even on a bare `cargo install`/brew install with no source checkout. (Advanced: `DARKMUX_TEMPLATES_DIR` overrides where on-disk built-in templates are read from, ahead of the embedded set.)
-- User-defined workloads under `.darkmux/workloads/<id>.json` (or `.darkmux/workloads/<id>/workload.json`) shadow built-ins of the same name.
+- User-defined workloads under `~/.darkmux/workloads/<id>.json` (or `~/.darkmux/workloads/<id>/workload.json`) shadow built-ins of the same name. (#2590) This is the HOME root specifically, not the shell's cwd — a project-local `./.darkmux/workloads/` is never consulted, matching mission configs' own user tier.
 - Workload manifests follow the schema documented in the darkmux repo's `templates/builtin/workloads/` examples.

@@ -22,14 +22,27 @@
 //! checkout's templates" is one env var away, deliberately, rather than an
 //! accident of `pwd`.
 //!
-//! **This is the on-disk (`builtin_dirs`) tier only — it does NOT make the
-//! USER tier above it cwd-insensitive too.** `lab::run::lab_run` resolves
-//! that tier via `paths::resolve(ResolveScope::Auto)`, which still returns
-//! `<cwd>/.darkmux` when the shell happens to be standing inside a directory
-//! that has one, so a workload can still resolve differently by cwd through
-//! that tier. `mission_config::load` avoids this on its own user tier via
-//! `ResolveScope::ForceUser` (#1012); doing the same here is tracked
-//! separately as #2590, deliberately out of scope for this fix.
+//! **(#2590) The USER tier is now ALSO not cwd-sensitive.** #2553 closed only
+//! the on-disk tier above and left the user tier deliberately open, tracked
+//! separately: `lab::run::lab_run` and `lab::run::lab_workloads` both passed
+//! `paths::resolve(ResolveScope::Auto)`'s root as the workload user dir, which
+//! still returns `<cwd>/.darkmux` whenever that directory exists — so a
+//! `./.darkmux/workloads/<id>.json` could still silently outrank the embedded
+//! workload of the same id, and a cwd-only id could still resolve and appear
+//! in `lab workload list`, byte-for-byte the bug class #1012 closed for
+//! crew/mission state and #2432 closed for mission configs' own user tier.
+//! Two pieces of prior art in this crate already assumed the fix rather than
+//! the bug: `providers::coding_task`'s setupContent-key validation and its
+//! module doc both describe operator-installed workloads as living at
+//! `~/.darkmux/workloads/<id>.json` — home, unconditional, no cwd branch.
+//! Closed the same way: `lab_run` and `lab_workloads` now resolve the
+//! workload user dir via a SEPARATE `paths::resolve(ResolveScope::ForceUser)`
+//! call, not the `Auto`-resolved `paths` those functions also use for
+//! run-artifact placement (`config_access::lab_dir()`, independent and
+//! unchanged) and sandbox/fixture-registry lookup (`paths.sandboxes`,
+//! also unchanged) — both of which stay deliberately project-local. Only the
+//! workload id → document lookup moved to `ForceUser`; see `lab::run::lab_run`'s
+//! own doc comment for the split.
 
 use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource};
 use anyhow::{Context, Result, anyhow, bail};
@@ -113,17 +126,13 @@ fn find_embedded(id: &str) -> Option<&'static str> {
 /// wants "this checkout's templates" exactly that, on purpose:
 /// `DARKMUX_TEMPLATES_DIR=$PWD/templates/builtin`.
 ///
-/// **This does NOT make workload resolution as a whole cwd-insensitive —
-/// only this one tier.** The USER tier (searched by [`load`] before this
-/// function ever runs) still comes from `lab::run::lab_run`'s
-/// `paths::resolve(ResolveScope::Auto)`, which resolves to `<cwd>/.darkmux`
-/// whenever that directory exists — so a `./.darkmux/workloads/<id>.json`
-/// sitting in the shell's cwd still wins over every tier this function
-/// searches, same as it always did. `mission_config::load` closed that same
-/// gap on its own user tier by resolving through `ResolveScope::ForceUser`
-/// instead (#1012, `crate::loader::mission_configs_dir`); `lab_run`'s user
-/// tier was deliberately left on `Auto` here and stays cwd-sensitive by
-/// design, tracked separately as #2590.
+/// **(#2590) The USER tier (searched by [`load`] before this function ever
+/// runs) is ALSO no longer cwd-sensitive.** `lab::run::lab_run` and
+/// `lab::run::lab_workloads` now pass a SEPARATE `paths::resolve(ResolveScope::
+/// ForceUser)` root as the workload user dir, mirroring `mission_config::load`'s
+/// own user-tier fix (#1012, `crate::loader::mission_configs_dir`) — a
+/// `./.darkmux/workloads/<id>.json` sitting in the shell's cwd no longer wins
+/// over any tier, here or above.
 fn builtin_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for base in darkmux_types::config_access::templates_override_dirs() {

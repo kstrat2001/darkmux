@@ -63,6 +63,6 @@ Each run gets its own copy-on-write clone of the source fixture — the source d
 
 ## Notes
 
-- Run artifacts live under `.darkmux/runs/<run-id>/` (project-local) or `~/.darkmux/runs/<run-id>/` (user-global), depending on whether the cwd has a `.darkmux/` dir.
+- Run artifacts live under `.darkmux/runs/<run-id>/` (project-local) or `~/.darkmux/runs/<run-id>/` (user-global), depending on whether the cwd has a `.darkmux/` dir. This is OUTPUT placement only — it's independent of (#2590) which workload document resolves: a user-defined workload id always resolves from `~/.darkmux/workloads/` (home, never the cwd), regardless of where this run's artifacts land.
 - A failing verify or non-zero exit code from the runtime is reported as an error — surface it instead of silently passing through.
 - Don't kick off many runs without confirming with the user — long-task workloads can saturate the machine for 30+ minutes.
