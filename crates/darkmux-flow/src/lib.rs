@@ -3097,7 +3097,16 @@ mod tests {
         //           tokens` carry the whole-task view separately. See
         //           `schema.rs`'s own history entry for the full
         //           explanation.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.46.0");
+        //   1.47.0: `dispatch_remote`/`dispatch_local_single_shot` (the
+        //           hosted and container-free local single-shot dispatch
+        //           paths) now resolve `mission_id` the same way the
+        //           container-agentic path already did (#1645) — a
+        //           consumer reads a different answer off the same record
+        //           set, and a mixed-writer fleet (laptop source build,
+        //           hub brew/stable) would otherwise report no skew while
+        //           two shapes were live. See `schema.rs`'s own history
+        //           entry for the full explanation.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.47.0");
     }
 
     #[test]

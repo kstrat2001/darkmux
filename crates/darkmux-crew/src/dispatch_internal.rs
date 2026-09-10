@@ -2985,6 +2985,7 @@ fn build_remote_record(
     role_id: &str,
     session_id: &str,
     model: &str,
+    mission_id: Option<&str>,
     phase_id: Option<&str>,
     action: &str,
     payload: serde_json::Value,
@@ -2995,7 +2996,13 @@ fn build_remote_record(
         role_id,
         session_id,
         Some(model),
-        None, // (#1177) mission_id — resolved from phase in a follow-up
+        // (#1645) Was hardcoded `None` — every hosted/local-single-shot
+        // record went out unstamped even when `phase_id` resolved to a
+        // real mission, because this constructor never looked. Same
+        // resolution `resolve_mission_for_phase` gives the container path
+        // (#714); no caller threaded this before, now every caller of
+        // this shared builder does.
+        mission_id,
         phase_id,
         Some(payload),
     )
@@ -3127,6 +3134,30 @@ fn dispatch_remote(
     let url = remote_chat_url(ep);
     let auth = remote_auth_header(ep)?;
     let phase = opts.phase_id.as_deref();
+    // (#1645) Resolved once, same as the container path (#714) — every
+    // record this hosted arm emits below (start/error/complete) now
+    // carries the SAME mission_id, instead of the hardcoded `None` that
+    // used to bypass this lookup entirely on the remote branch.
+    let mission_id = crate::dispatch::resolve_mission_for_phase(phase);
+    // (#1645 fix-pass — same composition `dispatch_internal::dispatch`
+    // already applies, see that function's own comment on this exact
+    // call) `dispatch_opts_for` (the `dispatch.internal` StepKind's own
+    // opts builder) hands every unconfigured step the SAME config-derived
+    // `session_id::step(&step.id)` default regardless of which arm the
+    // resolved profile routes to — this hosted arm is one of the TWO
+    // routes into that default that never applied `scope_to_run` before
+    // this fix (`dispatch_local_single_shot` below is the other). Without
+    // it, two DIFFERENT missions launching the identical config's
+    // tool-less/hosted step emit the byte-identical session_id with
+    // DIFFERENT `mission_id`s now that this fix populates that field —
+    // worse than the pre-fix silence, since `is_ambiguous()` reads BOTH
+    // fields off the same session. A no-op for every session_id that
+    // doesn't start with `task-`/`step-` (a caller-chosen id, or
+    // `fresh_session_id`'s own form) — see `scope_to_run`'s own doc.
+    let session_id = match &mission_id {
+        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
+        None => session_id,
+    };
 
     // (#1230 Packet 0) `dispatch_remote` previously had NO bookend guard at
     // all — a panic mid-hosted-call (or any future early return added
@@ -3139,6 +3170,7 @@ fn dispatch_remote(
     let role_id_for_abort = opts.role_id.clone();
     let session_id_for_abort = session_id.clone();
     let model_for_abort = pm.id.clone();
+    let mission_id_for_abort = mission_id.clone();
     let phase_for_abort = phase.map(str::to_string);
     let label_for_abort = label.clone();
     let on_abort = move |_id: &str, _kind: &str| {
@@ -3148,7 +3180,7 @@ fn dispatch_remote(
             &role_id_for_abort,
             &session_id_for_abort,
             Some(&model_for_abort),
-            None,
+            mission_id_for_abort.as_deref(),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
                 "runtime": "direct",
@@ -3169,6 +3201,7 @@ fn dispatch_remote(
             &opts.role_id,
             &session_id,
             &pm.id,
+            mission_id.as_deref(),
             phase,
             "dispatch start",
             serde_json::json!({
@@ -3232,6 +3265,7 @@ fn dispatch_remote(
                     &opts.role_id,
                     &session_id,
                     &pm.id,
+                    mission_id.as_deref(),
                     phase,
                     "dispatch error",
                     serde_json::json!({ "runtime": "direct", "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
@@ -3295,6 +3329,7 @@ fn dispatch_remote(
             &opts.role_id,
             &session_id,
             &pm.id,
+            mission_id.as_deref(),
             phase,
             "dispatch complete",
             complete_payload,
@@ -3501,6 +3536,16 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         .clone()
         .unwrap_or_else(|| crate::dispatch::fresh_session_id(&opts.role_id));
     let phase = opts.phase_id.as_deref();
+    // (#1645) Same resolution `dispatch_remote` and the container path use
+    // (#714) — this container-free local arm previously never looked.
+    let mission_id = crate::dispatch::resolve_mission_for_phase(phase);
+    // (#1645 fix-pass) Same composition `dispatch_remote` and
+    // `dispatch_internal::dispatch` both apply now — see either of those
+    // call sites' own comment for the full collision this closes.
+    let session_id = match &mission_id {
+        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
+        None => session_id,
+    };
 
     let mut flow_sink = |r: darkmux_flow::FlowRecord| {
         let _ = darkmux_flow::record(r);
@@ -3508,6 +3553,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     let role_id_for_abort = opts.role_id.clone();
     let session_id_for_abort = session_id.clone();
     let model_for_abort = model_id.clone();
+    let mission_id_for_abort = mission_id.clone();
     let phase_for_abort = phase.map(str::to_string);
     let on_abort = move |_id: &str, _kind: &str| {
         crate::dispatch::build_dispatch_record_with_payload(
@@ -3516,7 +3562,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             &role_id_for_abort,
             &session_id_for_abort,
             Some(&model_for_abort),
-            None,
+            mission_id_for_abort.as_deref(),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
                 "runtime": "direct",
@@ -3534,6 +3580,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             &opts.role_id,
             &session_id,
             &model_id,
+            mission_id.as_deref(),
             phase,
             "dispatch start",
             serde_json::json!({
@@ -3595,6 +3642,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                     &opts.role_id,
                     &session_id,
                     &model_id,
+                    mission_id.as_deref(),
                     phase,
                     "dispatch error",
                     serde_json::json!({ "runtime": "direct", "wall_ms": wall_ms, "error": e.to_string() }),
@@ -3644,6 +3692,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             &opts.role_id,
             &session_id,
             &model_id,
+            mission_id.as_deref(),
             phase,
             "dispatch complete",
             complete_payload,
@@ -4657,13 +4706,18 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // step-lifecycle bookends did. This is the SAME resolved `mission_id`
     // this function already uses for those records' `mission_id` field
     // (the comment above) — composing it into `session_id` too closes the
-    // collision for the ONE producer that streams its own records
-    // directly (bypassing `StepOutcome.flow_records`/`StepRunCtx::emit`,
-    // both of which the launcher's `emit`-wrap already scopes — see
+    // collision for this producer, which streams its own records directly
+    // (bypassing `StepOutcome.flow_records`/`StepRunCtx::emit`, both of
+    // which the launcher's `emit`-wrap already scopes — see
     // `darkmux_types::session_id::scope_to_run`'s doc for the full
-    // producer inventory). A no-op for crew-of-one's `{mission_id}-task`-
-    // embedded ids and coder-phase/review's explicit `mission-run-<…>`
-    // session — both already carry their own run identity.
+    // producer inventory). (#1645 fix-pass) NOT the only such producer any
+    // more: `dispatch_remote` and `dispatch_local_single_shot` (this same
+    // file) route around this function entirely for a remote-resolved
+    // profile, and both apply the identical composition at their own
+    // `mission_id` resolution site now — see either one's own comment. A
+    // no-op for crew-of-one's `{mission_id}-task`-embedded ids and
+    // coder-phase/review's explicit `mission-run-<…>` session — both
+    // already carry their own run identity.
     let session_id = match &mission_id {
         Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
         None => session_id,
