@@ -9,6 +9,16 @@ repository = "https://github.com/kstrat2001/darkmux"
 authors = ["Kain Osterholt"]
 rust-version = "1.80"
 
+[features]
+# (#2632 CONSIDER 3) Mirrors `darkmux-types`'s own `test-support` feature —
+# forwarded straight through so a DEPENDENT crate (darkmux-crew) can enable
+# it as a dev-dependency and get the #2632 env-read audit's `audit_env_read`
+# calls compiled into `profiles.rs`'s own `DARKMUX_HOME`/`DARKMUX_PROFILES`
+# reads even when darkmux-profiles itself is linked as crew's NORMAL
+# (non-test) dependency. Off in the release binary — never enabled outside
+# a dev-dependency declaration.
+test-support = ["darkmux-types/test-support"]
+
 [dependencies]
 darkmux-types = { path = "../darkmux-types" }
 # (#1274 packet 2b) The gestalt port traits + fact types the `gestalt_host`

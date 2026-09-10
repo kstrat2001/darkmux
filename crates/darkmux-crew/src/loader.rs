@@ -536,34 +536,6 @@ pub fn load_roles() -> Result<Vec<Role>> {
     }).collect())
 }
 
-/// (#2632) The embedded-only half of [`load_roles`] — parses `BUILTIN_ROLES`
-/// straight out of the binary, with no `roles_dir()`/`user_state_root()`
-/// call anywhere in the path, so it depends on no `DARKMUX_*` env var at
-/// all. `load_roles()` itself can't drop that dependency (an operator's
-/// user-authored roles/prompt overrides are the whole point of the merge),
-/// but a test asserting a property of a BUILTIN role manifest — never a
-/// user override — doesn't need the merge and shouldn't pay for it: every
-/// `roles_dir()`/`user_state_root()` call is a `DARKMUX_CREW_DIR`/
-/// `DARKMUX_HOME` read, and unless the calling test is
-/// `#[serial_test::serial]` that read races every other test's transient
-/// override of either var (#2632 — `dialectic_seats_contract` observed a
-/// `TempDir` another, unrelated test had already dropped). Test-only:
-/// nothing in the release binary calls this.
-#[cfg(test)]
-pub(crate) fn load_builtin_roles_only() -> Result<Vec<Role>> {
-    let mut map: BTreeMap<String, Role> = BTreeMap::new();
-    for (id, json) in BUILTIN_ROLES {
-        match serde_json::from_str::<Role>(json) {
-            Ok(role) => {
-                validate_role_family(&role, RoleSource::Builtin)?;
-                map.entry(id.to_string()).or_insert(role);
-            }
-            Err(e) => eprintln!("warning: failed to parse builtin role \"{id}\": {e}"),
-        }
-    }
-    Ok(map.into_values().collect())
-}
-
 /// Where a Role came from. Drives the error message in
 /// `validate_role_family` — user-authored manifests get an actionable
 /// file path; builtin manifests can't be operator-edited and get a

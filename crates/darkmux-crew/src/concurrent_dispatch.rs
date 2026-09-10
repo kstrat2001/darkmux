@@ -112,6 +112,42 @@ pub type DispatchJob<T> = Box<dyn FnOnce() -> JobOutcome<T> + Send>;
 /// rather than spelled inline at every call site.
 type ResultsSink<T> = Mutex<Vec<(usize, JobOutcome<T>)>>;
 
+/// Spawn a scoped worker thread that inherits the CURRENT thread's name
+/// instead of `std::thread::scope`'s default unnamed. Purely a debugging
+/// nicety in production (readable thread names in panics/backtraces) — but
+/// load-bearing for the #2632 env-read audit: `darkmux_types::env_audit::
+/// audit_env_read` attributes a read to `std::thread::current().name()`,
+/// so an unnamed worker thread made every env read inside it unattributable
+/// to the test that ultimately caused it (`scripts/env-audit-report.py`
+/// used to silently drop those lines; it now treats an unattributable read
+/// of a mutated key as a loud failure — see that script's module doc).
+/// Proven case: a `procedural.shell` job reads
+/// `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS` three `thread::scope` hops below
+/// the test's own thread (this module's outer scope spawn, then
+/// [`run_local_waves`]'s per-wave `wave_scope.spawn` or
+/// [`run_capped_batches`]'s `batch_scope.spawn`) — without name propagation
+/// at every hop the read showed up as `<unnamed>` and a real race against
+/// `bounded_command`'s two `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS`-mutating
+/// tests was invisible to the audit (seven `scheduler.rs` tests were
+/// unguarded readers of it).
+pub(crate) fn spawn_scoped_named<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    f: F,
+) -> std::thread::ScopedJoinHandle<'scope, T>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("darkmux-worker")
+        .to_string();
+    std::thread::Builder::new()
+        .name(name)
+        .spawn_scoped(scope, f)
+        .expect("darkmux: failed to spawn scoped worker thread")
+}
+
 /// One job queued for [`run_bounded`]. `index` is the CALLER's own
 /// bookkeeping key (e.g. a future Step id's position) — results come back
 /// tagged with it rather than assuming the job list itself is
@@ -228,15 +264,16 @@ pub fn run_bounded<T: Send + 'static>(
     std::thread::scope(|scope| {
         // Sibling scoped threads — genuinely interleaved wall-clock windows
         // (module doc: "interleaved with, never blocked behind").
-        let local_track = (!local_by_seat.is_empty() || !schedule.refusals.is_empty())
-            .then(|| scope.spawn(|| run_local_waves(schedule, local_by_seat, &results, est, host_factory)));
-        let remote_track =
-            (!remote_jobs.is_empty()).then(|| scope.spawn(|| run_capped_batches(remote_jobs, remote_cap.max(1), &results)));
+        let local_track = (!local_by_seat.is_empty() || !schedule.refusals.is_empty()).then(|| {
+            spawn_scoped_named(scope, || run_local_waves(schedule, local_by_seat, &results, est, host_factory))
+        });
+        let remote_track = (!remote_jobs.is_empty())
+            .then(|| spawn_scoped_named(scope, || run_capped_batches(remote_jobs, remote_cap.max(1), &results)));
         // (#2394) The third sibling. Same batching mechanism as the remote
         // track, a DIFFERENT cap — and running on its own thread means a
         // long dispatch-free wait never occupies a hosted-endpoint slot.
         let dispatch_free_track = (!dispatch_free_jobs.is_empty()).then(|| {
-            scope.spawn(|| run_capped_batches(dispatch_free_jobs, dispatch_free_cap.max(1), &results))
+            spawn_scoped_named(scope, || run_capped_batches(dispatch_free_jobs, dispatch_free_cap.max(1), &results))
         });
 
         // (#1452) Join each track EXPLICITLY. A track thread panics when one
@@ -353,7 +390,7 @@ fn run_local_waves<T: Send + 'static>(
         std::thread::scope(|wave_scope| {
             for placement in wave {
                 let Some((index, job)) = by_seat.remove(&placement.seat) else { continue };
-                wave_scope.spawn(move || {
+                spawn_scoped_named(wave_scope, move || {
                     let outcome = job();
                     results.lock().expect("results mutex poisoned").push((index, outcome));
                 });
@@ -613,7 +650,7 @@ fn run_capped_batches<T: Send + 'static>(
                 // into the spawned thread without fighting the borrow
                 // checker over a `chunks_mut` slice element.
                 let job: DispatchJob<T> = std::mem::replace(job, Box::new(|| unreachable!()));
-                batch_scope.spawn(move || {
+                spawn_scoped_named(batch_scope, move || {
                     let outcome = job();
                     results.lock().expect("results mutex poisoned").push((index, outcome));
                 });

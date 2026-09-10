@@ -35,7 +35,19 @@
 //!
 //! `scripts/env-audit-report.py` turns the raw log into a report: every
 //! reading test cross-referenced against whether it carries
-//! `#[serial_test::serial]`.
+//! `#[serial_test::serial]`. A read whose thread has no name (a spawned
+//! worker thread `cargo test`'s harness never named — see below) is NOT
+//! silently dropped: the script buckets it as unattributable and fails
+//! loud on it, same as a genuinely unguarded named reader (#2632 fix
+//! pass — an earlier version of the script `continue`d past these,
+//! which is how seven `darkmux-crew::scheduler` tests raced
+//! `bounded_command`'s two `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS`-
+//! mutating tests invisibly: the read happened three `thread::scope`
+//! hops below the test's own thread). `darkmux-crew::concurrent_dispatch::
+//! spawn_scoped_named` now propagates the current thread's name at every
+//! `thread::scope`/`scope.spawn` boundary a dispatch job crosses, so a
+//! read on one of those worker threads still attributes back to the test
+//! that ultimately caused it instead of showing up unnamed.
 //!
 //! ## Chokepoints instrumented (as of #2632)
 //!
@@ -45,10 +57,24 @@
 //!   `darkmux-types` and `darkmux-crew`, since crew reads config through
 //!   these accessors rather than raw `std::env::var`).
 //! - `paths::resolve` — `DARKMUX_HOME` (the bootstrap pointer, which can't
-//!   live inside the config it locates) and `DARKMUX_NOTEBOOK_DIR`.
-//! - `dispatch_liveness::liveness_root` — a direct `DARKMUX_HOME` read
+//!   live inside the config it locates), read directly in `resolve`
+//!   itself. `paths::paths_from_root` (called by `resolve`, and shared by
+//!   every scope it resolves) additionally reads `DARKMUX_NOTEBOOK_DIR`.
+//! - `dispatch_liveness::liveness_dir` — a direct `DARKMUX_HOME` read
 //!   outside both chokepoints above.
-//! - `residency_lease` — a second direct `DARKMUX_HOME` read site.
+//! - `residency_lease::residency_dir` — a second direct `DARKMUX_HOME`
+//!   read site, mirroring `liveness_dir`'s resolution exactly.
+//! - `darkmux-profiles::profiles::default_locations` (`DARKMUX_HOME`) and
+//!   `profiles::load_registry` (`DARKMUX_PROFILES`) — a fifth chokepoint,
+//!   in a DIFFERENT crate (#2632 CONSIDER 3). `darkmux-crew` calls
+//!   `load_registry` at five production sites and its tests mutate both
+//!   keys, so this one matters for crew's own sweep even though
+//!   `darkmux-profiles` isn't itself among the crates
+//!   `scripts/env-audit-report.py` sweeps for `#[serial]` annotations.
+//!   Wired via a forwarded `test-support` feature (darkmux-profiles'
+//!   `test-support` → `darkmux-types/test-support`), the same shape as
+//!   every other dev-dependency-only feature gate in this workspace —
+//!   see darkmux-profiles' and darkmux-crew's `Cargo.toml`.
 //!
 //! This module deliberately does NOT try to intercept literal
 //! `std::env::var("DARKMUX_...")` calls made directly inside test bodies
@@ -57,6 +83,29 @@
 //! for `set_var`/`remove_var` call sites, which — unlike "does this test
 //! transitively depend on env state" — IS a fully mechanical, unambiguous
 //! textual fact (see the PR body for how that half of the sweep was done).
+//!
+//! ## Known gaps (honest, not exhaustive)
+//!
+//! Not every `DARKMUX_*`-reading spawn boundary in `darkmux-crew`
+//! propagates the thread name the way `concurrent_dispatch::
+//! spawn_scoped_named` does for the dispatch-execution path — three
+//! production `thread::spawn` calls in `dispatch_internal.rs` (the
+//! tailer, the inactivity watchdog, the thermal sampler) and several
+//! test-local `thread::spawn` calls (`absence_backstop.rs`,
+//! `remote_budget.rs`, `workspace_spec/materialize.rs`,
+//! `step_kinds/builtins.rs`'s mock Redis server) do not. A read on one of
+//! those threads still logs (as `<unnamed>`) rather than vanishing, and
+//! the report script now fails loud on it rather than silently passing —
+//! but closing every one of those gaps with real attribution is left as
+//! follow-up, not done here. This module also covers only
+//! `darkmux-types` + `darkmux-crew` (plus the one `darkmux-profiles`
+//! chokepoint above); `darkmux-flow`, `darkmux-lab`, `darkmux-serve`, and
+//! the `runtime/` crate (structurally unreachable — it's a separate
+//! Docker-image binary, not linked into this workspace) are unswept.
+//! Tracked as #2643, with the concrete counts (34 unguarded when
+//! `SRC_DIRS` is pointed at `darkmux-flow`; the 4 residual unattributable
+//! `DARKMUX_FLOWS_DIR`/`DARKMUX_MACHINE_ID` reads from the
+//! `dispatch_internal.rs` gap above) recorded there.
 #[cfg(any(test, feature = "test-support"))]
 pub fn audit_env_read(key: &str) {
     if !key.starts_with("DARKMUX_") {
@@ -74,11 +123,14 @@ pub fn audit_env_read(key: &str) {
         .name()
         .unwrap_or("<unnamed>")
         .to_string();
-    // One `write_all` call, not `writeln!` — `writeln!` on a raw `File` can
-    // issue more than one underlying `write(2)` syscall (one per format
-    // piece), and two threads' writes can then interleave mid-line. Building
-    // the whole line first and writing it in a single syscall keeps each
-    // append atomic under O_APPEND.
+    // One `write_all` call on the whole pre-built line, not `writeln!` —
+    // `writeln!` on a raw `File` issues one `write(2)` per format piece, and
+    // two threads' writes can then interleave mid-line. `write_all` still
+    // loops internally on a short write, so this is not a hard OS-level
+    // atomicity guarantee (a genuinely partial `write(2)` under O_APPEND
+    // could still interleave in principle) — it is "one syscall in the
+    // overwhelmingly common case" for a short single-line append on a local
+    // filesystem, which is what this sink actually writes.
     let line = format!("{thread}\t{key}\n");
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()

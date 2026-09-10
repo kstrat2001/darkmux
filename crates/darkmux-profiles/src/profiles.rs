@@ -24,6 +24,14 @@ pub fn default_locations() -> Vec<PathBuf> {
     // change) wrote there too — config.json in the scoped root, profiles.json
     // in the real home. Gated on the var being SET so that an install without
     // it keeps this list byte-identical to before.
+    // (#2632 CONSIDER 3) Logged BEFORE the `is_ok_and` guard below, not
+    // just on the set branch: the "DARKMUX_HOME is unset" observation is
+    // exactly the race-relevant one when a sibling test is between
+    // `set_var` and `remove_var` on this key, and the guard would
+    // otherwise decide + branch without ever recording that it read the
+    // var at all.
+    #[cfg(any(test, feature = "test-support"))]
+    darkmux_types::env_audit::audit_env_read("DARKMUX_HOME");
     if env::var("DARKMUX_HOME").is_ok_and(|v| !v.trim().is_empty()) {
         out.push(darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).profiles);
     }
@@ -56,6 +64,11 @@ pub fn load_registry(explicit: Option<&str>) -> Result<LoadedRegistry> {
     if let Some(p) = explicit {
         return load_from(PathBuf::from(p), "--profiles flag");
     }
+    // (#2632 CONSIDER 3) The one instrumented chokepoint for
+    // `DARKMUX_PROFILES` — previously had no audited path at all, so crew's
+    // 15 test-side mutations of this key were invisible to the sweep.
+    #[cfg(any(test, feature = "test-support"))]
+    darkmux_types::env_audit::audit_env_read("DARKMUX_PROFILES");
     if let Ok(p) = env::var("DARKMUX_PROFILES") {
         if !p.is_empty() {
             return load_from(PathBuf::from(p), "DARKMUX_PROFILES env var");
