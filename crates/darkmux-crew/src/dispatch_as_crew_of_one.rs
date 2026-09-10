@@ -347,6 +347,12 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Miss
     // operator-authored — always a run instance on the board.
     origin: Some(crate::types::MissionSpecOrigin::Builtin),
         }),
+        // (#1810) Stamped once at mint time so `/runs` has a durable
+        // machine to read even after this mission ages out of the
+        // RUNS_FLOW_SCAN_WINDOW_DAYS-bounded flow join. `None` only in the
+        // rare case `resolve_machine_id()` itself can't resolve anything
+        // (no env/config override and no `hostname` binary).
+        machine: darkmux_flow::resolve_machine_id(),
     };
 
     let phase = Phase {
@@ -808,7 +814,13 @@ mod tests {
         registry
     }
 
-    // ── Pure graph-construction tests ───────────────────────────────────
+    // ── Graph-construction tests (no Docker, no model) ───────────────────
+    // Not literally pure: `build_graph` calls `resolve_machine_id()`, which
+    // shells out to `hostname(1)` once per process (OnceLock-cached, #1810)
+    // when no env/config override is set. Harmless and deterministic for
+    // these tests, but "pure" overstated it — these tests need no
+    // container and no model, which is the property that actually matters
+    // here.
 
     #[test]
     fn build_graph_is_one_phase_one_task_one_step() {

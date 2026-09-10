@@ -854,6 +854,7 @@ mod tests {
             source_input: None,
             ticket: None,
             spec: None,
+            machine: None,
         };
         write_json(&lifecycle::mission_path(id), &m);
         m

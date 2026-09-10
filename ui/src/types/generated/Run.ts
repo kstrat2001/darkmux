@@ -9,7 +9,22 @@ import type { RunStatus } from "./RunStatus";
  * persisted, so there's no schema-version discipline to carry; a future
  * consumer (the step-4 Runs lens) just reads whatever's present.
  */
-export type Run = { id: string, kind: RunKind, status: RunStatus, machine?: string, 
+export type Run = { id: string, kind: RunKind, status: RunStatus, 
+/**
+ * (#1810) This field carries TWO different meanings depending on
+ * `kind`, both labeled "machine" on the wire. A locally-tracked
+ * mission row (`mission_to_run`) reports the MINT host — the durable
+ * `Mission.machine`, stamped once at creation and never overwritten
+ * by whichever host later executes the dispatches. A remote-mission
+ * row (`flow_mission_to_run`, from `FlowMissionAgg.machine`) and a
+ * lab row (`lab_summary_to_run`, the daemon's own declared
+ * `machine_id`) both report the EXECUTION host instead — there is no
+ * separate durable mint-site fact for either of those paths. A
+ * machine-pinned filter/lens built on this field should know which
+ * question it is answering for a given `kind`, not assume one
+ * consistent meaning across all three.
+ */
+machine?: string, 
 /**
  * Endpoint label (e.g. `"azure:host/gpt-4o"`) when any of the run's
  * dispatches used a hosted endpoint; `None` = local LMStudio (or no
