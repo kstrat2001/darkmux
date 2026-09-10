@@ -106,6 +106,17 @@ pub struct GatherOutput {
     /// itself, not only in the raw envelope.
     #[serde(default)]
     pub unreadable: Vec<String>,
+    /// (#1748) The mechanical absence-claim backstop's findings — one
+    /// [`crate::absence_backstop::AbsenceBackstopNote`] per finding KEY
+    /// whose "X is missing"/"X is never called" claim the backstop
+    /// CONTRADICTED against the whole file. Additive (`#[serde(default)]`),
+    /// so an older `GatherOutput` on disk simply has none. Never removes a
+    /// finding from [`Self::findings`] or shrinks its count — see
+    /// [`crate::absence_backstop::run_backstop`]'s own doc for why a
+    /// finding this check cannot evaluate is absent from the map rather
+    /// than flagged either way.
+    #[serde(default)]
+    pub absence_backstop: BTreeMap<String, crate::absence_backstop::AbsenceBackstopNote>,
 }
 
 pub struct RecordsGatherStepKind;
@@ -252,6 +263,14 @@ impl StepKind for RecordsGatherStepKind {
             not_attempted,
             errored: scan.errored,
         };
+        // (#1748) The mechanical absence-claim backstop — checks every
+        // finding's own "X is missing"/"X is never called" claim against
+        // the WHOLE FILE `plan.sites` checked out, not just the hunk the
+        // reviewing seat was shown. Additive: never removes a finding
+        // from `findings` above or changes its count, only annotates the
+        // ones it CONTRADICTS — see `absence_backstop::run_backstop`'s own
+        // doc.
+        let absence_backstop = crate::absence_backstop::run_backstop(&mission_id, &findings);
         let out = GatherOutput {
             schema_version: GATHER_OUTPUT_SCHEMA_VERSION.to_string(),
             findings,
@@ -259,6 +278,7 @@ impl StepKind for RecordsGatherStepKind {
             diff,
             scope,
             unreadable: scan.unreadable,
+            absence_backstop,
         };
         let wrapped = crate::step_output::Output::wrap(
             RECORDS_GATHER_OUTPUT_KIND,
@@ -1386,6 +1406,109 @@ mod tests {
         // field.
         let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(step_output["emit"], json!("-"));
+    }
+
+    /// (#1748) The full mechanical-absence-backstop wiring, end to end:
+    /// `records.gather` resolves the finding's rule + source tree from a
+    /// real `plan/<rule>.json` on disk, reads the WHOLE file (not the
+    /// diff hunk), finds the finding's claimed-absent token elsewhere in
+    /// it, and hands `deliver.github_review` a note it renders as a
+    /// caveat on the posted comment — with NO real dispatch, NO model,
+    /// and NO `step.config` literal for the backstop map (it only ever
+    /// arrives via the same-task-predecessor `GatherOutput`, exactly the
+    /// path `deliver_github_review_reads_a_records_gather_step_as_its_own_task_predecessor`
+    /// above exercises for `findings`/`mods`/`diff`/`scope`).
+    #[test]
+    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    fn the_absence_backstop_flows_from_records_gather_through_to_the_posted_comment() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        save_phase();
+
+        // The checked-out source tree `plan.sites` would have written —
+        // the WHOLE file the diff hunk never shows.
+        let tree = tmp.path().join("checkout").join("app");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(&tree.join("a.ts"), "export function foo() { return 1; }\n").unwrap();
+
+        // The plan `records.gather`'s own `plan_totals` already reads —
+        // this packet reads it again for `sources[].tree`.
+        let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        std::fs::write(
+            plan_dir.join("existing-solution.json"),
+            serde_json::to_string(&json!({
+                "kind": "crawl.plan",
+                "schema_version": "1",
+                "body": {
+                    "schema_version": "1.1",
+                    "workspace": "ws",
+                    "planned_at": "2026-09-10T00:00:00Z",
+                    "sources": [{"id": "app", "sha": "abc123", "ref": "main", "tree": tree.to_string_lossy(), "files_walked": 1}],
+                    "units": [],
+                    "totals": {"units": 0, "est_tokens": 0, "by_rule": {}, "skipped": [], "edges": []},
+                    "rules": ["existing-solution"],
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // A finding claiming `foo()` does not exist — false, per the file
+        // above — anchored to a diff hunk that touches `a.ts` line 1 (so
+        // it renders as a plain inline comment, not just a body count).
+        let finding = findings::build_record(
+            "sess-a",
+            1,
+            "2026-09-10T00:00:00Z".to_string(),
+            "create_finding",
+            Proposer { handle: "reviewer".into(), model: "test".into(), machine_id: None },
+            Scope { mission_id: Some(MISSION.to_string()), phase_id: None, step_id: None },
+            Some(json!({"rule": "existing-solution", "source": "app"})),
+            json!({
+                "file": "a.ts", "line": 1, "pattern": "existing-solution", "evidence": "ev",
+                "why": "This module does not call `foo()` anywhere in this file."
+            }),
+        );
+        findings::materialize(&findings::findings_dir(), &finding).unwrap();
+
+        let diff_path = tmp.path().join("d.diff");
+        std::fs::write(&diff_path, "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ a.ts\n@@ -1,1 +1,1 @@\n-old\n+export function foo() { return 1; }\n").unwrap();
+
+        let gather_out = RecordsGatherStepKind
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .unwrap();
+        // The backstop's own finding-level output, before it ever reaches
+        // `deliver.github_review` — proves the WIRING point, not just the
+        // pure check (already covered in `absence_backstop`'s own tests).
+        let wrapped =
+            crate::step_output::Output::<GatherOutput>::read(&gather_out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert_eq!(wrapped.body.absence_backstop.len(), 1, "{:?}", wrapped.body.absence_backstop);
+        let note = wrapped.body.absence_backstop.get("sess-a/1").expect("the finding key is flagged");
+        assert_eq!(note.token, "foo()");
+
+        let mut input = BTreeMap::new();
+        input.insert("records-gather-step".to_string(), gather_out.output);
+        let emit_path = tmp.path().join("review.json");
+        let deliver_step = Step {
+            id: "deliver-step".into(),
+            task_id: "deliver".into(),
+            kind: super::super::deliver_github_review::DELIVER_GITHUB_REVIEW_KIND.into(),
+            gate: None,
+            status: NodeStatus::Planned,
+            config: json!({ "emit": emit_path.to_string_lossy() }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        super::super::deliver_github_review::DeliverGithubReviewStepKind.run(&deliver_step, &task(), &input).unwrap();
+
+        let posted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&emit_path).unwrap()).unwrap();
+        let body = posted["review"]["comments"][0]["body"].as_str().expect("one posted comment");
+        assert!(
+            body.contains("A mechanical check found `foo()` elsewhere in this file, at a.ts:1"),
+            "the caveat reached the posted comment: {body}"
+        );
     }
 
     /// (silent-miss audit, 2026-09-06) Before this fix, `_ => {}` meant a

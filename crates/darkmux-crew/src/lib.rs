@@ -12,6 +12,11 @@
 //!   crew::loader — read JSON manifests from `~/.darkmux/crew/<entity>/`
 //!                  with binary-embedded built-ins as fallback
 
+/// (#1748) The mechanical absence-claim backstop — a text-search lint
+/// plus a whole-file check, run against a finding's own "X is missing"
+/// claim before that claim reaches a reader unqualified. See the module
+/// doc for exactly what it catches and what it misses.
+pub mod absence_backstop;
 // (#1230 Packet 1) Bounded concurrent-dispatch executor over gestalt's
 // `plan_waves` — see the module doc. No production caller in this packet;
 // Packet 2's `run_step_graph` scheduler is the intended first consumer.

@@ -199,27 +199,34 @@ pub struct JudgedFlag {
     /// the tier is then `Archived`, with this flag recording why.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub demoted_by_verify: bool,
-    /// (#1748) Present iff the mechanical, zero-token absence-claim
-    /// backstop ([`apply_absence_backstop`]) found the claimed-absent
-    /// token in the WHOLE FILE and demoted this flag from `Confirmed` to
-    /// `NeedsCheck`. Distinct from `demoted_by_pass2`/`demoted_by_verify`
-    /// (both AI-driven demotions) — this one is a plain substring check
-    /// against `FileSource`, run BEFORE the (optional, costlier) verify
-    /// stage even sees the flag. Absent (and never serialized) whenever
-    /// the check never fired or agreed with the finding — a flag the
-    /// backstop left untouched serializes byte-identically to today.
+    /// (#1748, superseded — see below) DATA ONLY: present on a past run's
+    /// envelope iff the bespoke funnel's own mechanical absence-claim
+    /// backstop (deleted with the rest of that funnel in #2310 P4d, along
+    /// with `apply_absence_backstop`/`extract_claimed_absent_token`, the
+    /// two functions this field's doc used to link — both gone, hence
+    /// this rewrite) found the claimed-absent token in the WHOLE FILE and
+    /// demoted this flag from `Confirmed` to `NeedsCheck`. The CURRENT
+    /// review path's own version of this check lives in
+    /// `darkmux_crew::absence_backstop` (`run_backstop`,
+    /// `check_absence_claim`) and annotates a finding's RENDERED claim
+    /// text directly rather than a `JudgedFlag`, which no longer exists on
+    /// that path — this field is retained only so an old envelope on disk
+    /// still deserializes and the viewer can still render it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absence_backstop: Option<AbsenceBackstopNote>,
 }
 
-/// (#1748) The mechanical absence-claim backstop's per-flag outcome —
-/// present on a [`JudgedFlag`] only when the check actually demoted it.
-/// See [`apply_absence_backstop`] for the full check.
+/// (#1748, superseded — see [`JudgedFlag::absence_backstop`]'s own doc)
+/// DATA ONLY, kept for old envelopes: the bespoke funnel's mechanical
+/// absence-claim backstop's per-flag outcome. The check that PRODUCED
+/// this shape (`apply_absence_backstop`) is deleted; the current
+/// equivalent is `darkmux_crew::absence_backstop::AbsenceBackstopNote`, a
+/// same-shaped but separate type on the funnel's replacement pipeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AbsenceBackstopNote {
     /// The token the finding claimed was absent (`process.exitCode`,
-    /// `.catch`) — the single backtick-quoted span
-    /// [`extract_claimed_absent_token`] pulled from the decisive judge
+    /// `.catch`) — the single backtick-quoted span the deleted
+    /// `extract_claimed_absent_token` pulled from the decisive judge
     /// record's `note_for_author`/`decisive_evidence`.
     pub token: String,
     /// The repo-relative file the token was found in.
