@@ -963,12 +963,39 @@ pub fn reconcile_mint_failure_with_payload(mission_id: &str, reason: &str, paylo
 
 /// `phase start <id>` — Planned/Abandoned → Running.
 /// Sets `started_ts = now()`; clears `abandoned_ts` if it was set.
+///
+/// (#1507) Also refuses when the owning mission has already reached a
+/// terminal status (`Finalized`/`Aborted`). Without this, `phase_start`
+/// could re-liven a phase inside a mission #1504 already closed — the
+/// mission↔phase terminality invariant #1504 enforces at the
+/// finalize/abort chokepoint (a mission can't be MADE terminal with a live
+/// phase) was silently reversible from the START side (a terminal
+/// mission's phase could be re-STARTED). The #1463 retirement of the old
+/// "Finalized mission with a non-terminal phase" drift arm assumed that
+/// shape was unreachable once finalize/abort started reconciling their
+/// phases; this guard is what keeps that assumption true, by refusing the
+/// reachable path directly rather than detecting the damage after the
+/// fact. Mirrors `load_mission_by_id`'s own "unknown status" doctrine: a
+/// mission that can't be loaded (missing/unparseable) is NOT a reason to
+/// refuse — this guard fails open on unknown, and closed only on a
+/// confirmed terminal status.
 pub fn phase_start(id: &str) -> Result<Phase> {
     let mut phase = load_phase_by_id(id)?;
     match phase.status {
         PhaseStatus::Planned | PhaseStatus::Abandoned => {}
         PhaseStatus::Running => bail!("phase `{id}` is already Running"),
         PhaseStatus::Complete => bail!("phase `{id}` is Complete (terminal) — create a new phase instead"),
+    }
+    if let Ok(mission) = load_mission_by_id(&phase.mission_id) {
+        match mission.status {
+            MissionStatus::Finalized | MissionStatus::Aborted => bail!(
+                "mission `{}` is {:?} (terminal) — phase `{id}` can't be restarted; a terminal \
+                 mission's phases are frozen, launch a fresh mission instead (#1507)",
+                phase.mission_id,
+                mission.status
+            ),
+            MissionStatus::Active | MissionStatus::Paused => {}
+        }
     }
     phase.status = PhaseStatus::Running;
     phase.started_ts = Some(now_unix());
@@ -1504,6 +1531,73 @@ mod tests {
         assert_eq!(updated.status, PhaseStatus::Running);
         assert!(updated.started_ts.is_some());
         assert!(updated.abandoned_ts.is_none(), "restart clears abandoned_ts");
+    }
+
+    // (#1507) A terminal mission's phases are frozen — `phase_start` must
+    // refuse to re-liven one, on BOTH terminal statuses, and must still
+    // allow the legitimate recovery path (Abandoned → Running) on any
+    // non-terminal mission status. Four cases below enumerate every arm of
+    // the guard's `match mission.status`; the "mission can't be loaded"
+    // exit is exercised implicitly by every OTHER phase_start test above
+    // and below, none of which seed a mission at all.
+
+    #[serial_test::serial]
+    #[test]
+    fn phase_start_refuses_when_mission_finalized() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Finalized);
+        seed_phase("s1507-fin", PhaseStatus::Abandoned);
+
+        let err = phase_start("s1507-fin").unwrap_err();
+        assert!(err.to_string().contains("Finalized"), "{err}");
+        assert!(err.to_string().contains("terminal"), "{err}");
+
+        // The phase itself must be untouched on disk — a refused
+        // transition is not a partial one.
+        let on_disk = load_phase_by_id("s1507-fin").unwrap();
+        assert_eq!(on_disk.status, PhaseStatus::Abandoned);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn phase_start_refuses_when_mission_aborted() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Aborted);
+        seed_phase("s1507-abrt", PhaseStatus::Abandoned);
+
+        let err = phase_start("s1507-abrt").unwrap_err();
+        assert!(err.to_string().contains("Aborted"), "{err}");
+
+        let on_disk = load_phase_by_id("s1507-abrt").unwrap();
+        assert_eq!(on_disk.status, PhaseStatus::Abandoned);
+    }
+
+    /// INVERTED case: the same Abandoned → Running transition must still
+    /// succeed when the owning mission is Active — a one-directional test
+    /// here would block real recovery work (re-starting an abandoned
+    /// phase inside a mission that is very much still open).
+    #[serial_test::serial]
+    #[test]
+    fn phase_start_succeeds_when_mission_active() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Active);
+        seed_phase("s1507-act", PhaseStatus::Abandoned);
+
+        let updated = phase_start("s1507-act").unwrap();
+        assert_eq!(updated.status, PhaseStatus::Running);
+    }
+
+    /// Same inverted case, Paused mission — the guard's other non-terminal
+    /// arm.
+    #[serial_test::serial]
+    #[test]
+    fn phase_start_succeeds_when_mission_paused() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Paused);
+        seed_phase("s1507-pause", PhaseStatus::Abandoned);
+
+        let updated = phase_start("s1507-pause").unwrap();
+        assert_eq!(updated.status, PhaseStatus::Running);
     }
 
     #[serial_test::serial]
